@@ -49,11 +49,11 @@ Important: your existing setup uses a container image where `llama-server` is pr
    # Try starting the server with your normal start script to confirm the proxy fallback will work
    /home/rgardler/projects/llm/start-llama.sh qwen3
 
-4) Restart the proxy service and verify
+4) Restart the proxy service and verify (if you use a system service unit you created)
 
    sudo systemctl daemon-reload
-   sudo systemctl restart llama-proxy
-   sudo journalctl -u llama-proxy -f
+   sudo systemctl restart <your-unit-name>
+   sudo journalctl -u <your-unit-name> -f
 
    # Verify proxy health
    curl http://localhost:8000/health

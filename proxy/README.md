@@ -13,7 +13,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
-- **Systemd Integration**: Runs as a system service with automatic restart
+-- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo.
 
 ## Requirements
 
@@ -36,7 +36,6 @@ This will:
 1. Create a Python virtual environment
 2. Install dependencies
 3. Create the log directory
-4. Install the systemd service
 
 ### Manual Install
 
@@ -52,10 +51,8 @@ pip install -r requirements.txt
 sudo mkdir -p /var/log/llama-proxy
 sudo chown $USER:$USER /var/log/llama-proxy
 
-# Install systemd service (optional)
-sudo cp llama-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable llama-proxy
+<!-- systemd unit installation removed from repo distribution -->
+<!-- If you wish to run the proxy as a systemd unit, create and manage service files outside of this repository. -->
 ```
 
 ## Configuration
@@ -151,17 +148,7 @@ openai:
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
 
-For systemd, add environment variables:
-
-```bash
-sudo systemctl edit llama-proxy
-```
-
-Add:
-```ini
-[Service]
-Environment="OPENAI_API_KEY=sk-..."
-```
+Systemd-specific instructions removed. If you run systemd units outside this repository, add environment variables via `systemctl edit <unit>` or your system's preferred method.
 
 ## Usage
 
@@ -173,10 +160,11 @@ source .venv/bin/activate
 python -m uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-**Production (systemd):**
+**Production:** Run the proxy under your platform's service manager or keep it as a manually started process:
+
 ```bash
-sudo systemctl start llama-proxy
-sudo systemctl status llama-proxy
+# Manual start (recommended for repo-managed installs)
+sudo systemctl start llama-proxy  # only if you created and installed a unit externally
 ```
 
 ### Web UI
@@ -328,7 +316,7 @@ Clients should handle this by retrying after the specified delay.
 
 Logs are written with time-based rotation:
 
-**Production (systemd):** `/var/log/llama-proxy/`
+**Production:** `/var/log/llama-proxy/` (if you configure logging to this directory when running under a service manager)
 **Development (no root):** `./logs/` (fallback when `/var/log/llama-proxy` is not writable)
 
 ### Log Files

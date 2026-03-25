@@ -1,7 +1,7 @@
 session_name: Dev
-start_directory: ~/projects/llm
 windows:
   - name: LLM
+    cwd: ~/projects/llm
     panes:
       - cmd: "opencode -c"
         cwd: "~/projects/llm"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Setup script to enable user linger, ensure newuidmap/newgidmap are installed and setuid,
-# and restart the user llama-proxy service. Designed to be run as root (via sudo).
+# and restart the user service. Designed to be run as root (via sudo).
 
 USERNAME="rgardler"
 
@@ -88,14 +88,17 @@ if ! grep -E "^${USERNAME}:" /etc/subuid >/dev/null 2>&1 || ! grep -E "^${USERNA
   fi
 fi
 
-echo "[INFO] Reloading and restarting user service as $USERNAME"
+echo "[INFO] Reloading and restarting user service as $USERNAME (no unit name specified)"
+echo "If you use a user systemd unit, replace 'llama-proxy' below with your unit name. This script will attempt to reload and restart the user's units if systemctl is available."
 # Use runuser or su/sudo to run the user systemctl commands as the target user
 if command -v runuser >/dev/null 2>&1; then
-  runuser -l "$USERNAME" -c 'systemctl --user daemon-reload && systemctl --user restart llama-proxy.service || true'
+  runuser -l "$USERNAME" -c 'systemctl --user daemon-reload || true'
+  runuser -l "$USERNAME" -c 'echo "Please restart your user service (e.g. systemctl --user restart <unit-name>)"'
 elif command -v su >/dev/null 2>&1; then
-  su - "$USERNAME" -c 'systemctl --user daemon-reload && systemctl --user restart llama-proxy.service || true'
+  su - "$USERNAME" -c 'systemctl --user daemon-reload || true'
+  su - "$USERNAME" -c 'echo "Please restart your user service (e.g. systemctl --user restart <unit-name>)"'
 else
-  echo "[WARN] Cannot run user systemctl command automatically; please run as the user: systemctl --user daemon-reload && systemctl --user restart llama-proxy.service" >&2
+  echo "[WARN] Cannot run user systemctl command automatically; please run as the user: systemctl --user daemon-reload && systemctl --user restart <unit-name>" >&2
 fi
 
-echo "[INFO] Done. Check the user service logs with: sudo -u $USERNAME journalctl --user -u llama-proxy -n 200 --no-pager"
+echo "[INFO] Done. If you use a user service, check the logs with: sudo -u $USERNAME journalctl --user -u <unit-name> -n 200 --no-pager"
