@@ -1,0 +1,8 @@
+default_model: ""
+models: {}
+default_remote:
+  enabled: false
+server:
+  host: "127.0.0.1"
+  port: 8000
+  llama_server_port: 8080

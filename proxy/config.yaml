@@ -1,0 +1,98 @@
+# LLama Proxy Server Configuration
+
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 8000
+  # Path to the llama start script
+  llama_start_script: "/home/rgardler/projects/llm/start-llama.sh"
+  # Distrobox container name where llama-server runs
+  distrobox_name: "llama"
+  # Port the llama-server listens on
+  llama_server_port: 8080
+  # Timeout in seconds to wait for llama-server to start
+  llama_startup_timeout: 300
+  # Health check interval in seconds
+  llama_health_check_interval: 10
+
+# Default model to load on startup
+default_model: "qwen3"
+
+# Logging configuration
+logging:
+  directory: "/var/log/llama-proxy"
+  # Log rotation interval in hours
+  rotation_hours: 6
+  # Number of days to retain logs
+  retention_days: 90
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+
+# Model routing configuration
+# Each model can be routed to either "local" (llama-server) or "remote" (external API)
+# Aliases support wildcard patterns:
+#   - '*' matches any sequence of characters
+#   - '?' matches any single character
+#   - '[seq]' matches any character in seq
+#   - '[!seq]' matches any character not in seq
+# Exact matches take priority over wildcard patterns
+models:
+  # Local models served by llama-server
+  qwen3:
+    type: "local"
+    # This maps to the model name used by start-llama.sh
+    llama_model: "qwen3"
+    # Model name aliases that clients might use
+    aliases:
+      - "qwen3*"
+      - "Qwen3*"
+  
+  gpt120:
+    type: "local"
+    llama_model: "gpt120"
+    aliases:
+      - "gpt-oss-120b"
+      - "gpt-oss*"      # Matches any model starting with gpt-oss
+      - "GPT-OSS*"      # Matches any model starting with GPT-OSS
+
+  # Remote models routed to external APIs
+  github:
+    type: "remote"
+    endpoint: "https://models.inference.ai.azure.com"
+    api_key_env: "GITHUB_TOKEN"
+    aliases:
+      - "github-*"
+
+  openai:
+    type: "remote"
+    endpoint: "https://api.openai.com/v1"
+    # API key can be set here or via environment variable OPENAI_API_KEY
+    api_key_env: "OPENAI_API_KEY"
+    aliases:
+      - "gpt-4"
+      - "gpt-4-turbo"
+      - "gpt-4o"
+      - "gpt-4o-mini"
+      - "gpt-3.5-turbo"
+      - "gpt-*"         # Matches any model starting with gpt- (e.g., gpt-4, gpt-3.5-turbo)
+      - "o1-*"          # Matches o1-preview, o1-mini, etc.
+      - "chatgpt-*"     # Matches chatgpt-4o-latest, etc.
+  
+  anthropic:
+    type: "remote"
+    endpoint: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    # Some APIs need header transformations
+    headers:
+      anthropic-version: "2023-06-01"
+    aliases:
+      - "claude-3-opus"
+      - "claude-3-sonnet"
+      - "claude-3-haiku"
+      - "claude-*"      # Matches any model starting with claude-
+
+# Default remote endpoint for unknown models
+default_remote:
+  enabled: false
+  endpoint: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"

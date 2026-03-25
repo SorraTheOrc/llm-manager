@@ -1,0 +1,48 @@
+[Unit]
+Description=LLama Proxy Server
+Documentation=https://github.com/rgardler/llama
+# Ensure networking and container socket are up before starting
+After=network-online.target podman.socket
+Wants=network-online.target
+Requires=podman.socket
+
+[Service]
+Type=simple
+User=rgardler
+Group=rgardler
+WorkingDirectory=/home/rgardler/projects/llm/proxy
+Environment="PATH=/home/rgardler/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml"
+# Add any API keys needed for remote services
+# Environment="OPENAI_API_KEY=your-key-here"
+# Environment="ANTHROPIC_API_KEY=your-key-here"
+
+# ROCm/AMD GPU environment variables
+Environment="HSA_OVERRIDE_GFX_VERSION=11.5.1"
+Environment="ROCM_LLVM_PRE_VEGA=1"
+
+# Prefer running as a user service for distrobox/podman (see llama-proxy.user.service)
+# If you must run as a system service, ensure ReadWritePaths includes /run/user/1000
+# and the container runtime socket is writable by the service user.
+
+ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-proxy
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/llama-proxy
+ReadWritePaths=/home/rgardler/projects/llm/proxy
+ReadWritePaths=/home/rgardler/.local/share/containers
+ReadWritePaths=/home/rgardler/.cache
+
+[Install]
+WantedBy=multi-user.target
