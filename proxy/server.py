@@ -8,7 +8,6 @@ or remote API services based on configuration.
 
 import asyncio
 import json
-import re
 import logging
 import os
 import signal
@@ -425,60 +424,6 @@ async def _periodic_broadcast_loop():
                 pass
     finally:
         periodic_broadcast_task = None
-
-
-def detect_log_severity(line: str) -> Optional[str]:
-    """Detect severity from a log line. Returns 'error'|'warning'|'info'|'debug' or None."""
-    if not line:
-        return None
-    try:
-        trimmed = line.strip()
-        # Prefer JSON structured logs
-        if trimmed.startswith('{'):
-            try:
-                j = json.loads(trimmed)
-                lvl_raw = None
-                for key in ('level', 'severity', 'levelname', 'level_name', 'levelName', 'loglevel'):
-                    if key in j:
-                        lvl_raw = j.get(key)
-                        break
-                if lvl_raw is not None:
-                    lvl = str(lvl_raw).lower()
-                    if 'err' in lvl:
-                        return 'error'
-                    if 'warn' in lvl:
-                        return 'warning'
-                    if 'info' in lvl:
-                        return 'info'
-                    if any(k in lvl for k in ('debug', 'trace', 'verb')):
-                        return 'debug'
-            except Exception:
-                pass
-        up = trimmed.upper()
-        parts = re.split('[^A-Z]+', up)
-        for p in parts:
-            if not p:
-                continue
-            if p in ('ERROR', 'ERR'):
-                return 'error'
-            if p in ('WARN', 'WARNING'):
-                return 'warning'
-            if p == 'INFO':
-                return 'info'
-            if p in ('DEBUG', 'TRACE', 'VERB'):
-                return 'debug'
-        # fallback substring checks
-        if ' - INFO - ' in up or '[INFO]' in up or re.search(r'LEVEL[:=]\s*INFO', up):
-            return 'info'
-        if ' - ERROR - ' in up or '[ERROR]' in up or re.search(r'LEVEL[:=]\s*ERROR', up):
-            return 'error'
-        if ' - WARN - ' in up or '[WARN]' in up or re.search(r'LEVEL[:=]\s*WARN', up):
-            return 'warning'
-        if ' - DEBUG - ' in up or '[DEBUG]' in up or re.search(r'LEVEL[:=]\s*DEBUG', up):
-            return 'debug'
-    except Exception:
-        pass
-    return None
 
 
 async def _increment_count(key: str):
@@ -2769,21 +2714,9 @@ async def tail_logs(request: Request, lines: int = 100):
                     lines_bytes = data.splitlines()[-n:]
                     return b"\n".join(lines_bytes).decode("utf-8", errors="replace")
 
-            # Send initial block of lines as an array of {line, severity} objects
+            # Send initial block of lines
             initial = await asyncio.to_thread(read_last_n, lines)
-            initial_lines = []
-            try:
-                for l in initial.splitlines():
-                    try:
-                        sev = detect_log_severity(l)
-                    except Exception:
-                        sev = None
-                    initial_lines.append({'line': l, 'severity': sev})
-            except Exception:
-                # Fallback: send the raw initial string if something goes wrong
-                yield f"data: {json.dumps({'initial': initial})}\n\n"
-            else:
-                yield f"data: {json.dumps({'initial': initial_lines})}\n\n"
+            yield f"data: {json.dumps({'initial': initial})}\n\n"
 
             # Register for counts updates
             counts_queue: asyncio.Queue | None = None
@@ -2846,11 +2779,7 @@ async def tail_logs(request: Request, lines: int = 100):
 
                     # Send each new line as its own SSE message
                     for line in new.splitlines():
-                        try:
-                            sev = detect_log_severity(line)
-                        except Exception:
-                            sev = None
-                        yield f"data: {json.dumps({'line': line, 'severity': sev})}\n\n"
+                        yield f"data: {json.dumps({'line': line})}\n\n"
                 else:
                     # No new file data; send keepalive
                     yield ": keepalive\n\n"
@@ -2934,11 +2863,6 @@ async def view_logs(request: Request):
             --success: #4caf50;
             --warning: #ff9800;
             --border: #2a3a5a;
-            /* Severity colours default to existing tokens when available */
-            --log-error: var(--error, #ff4d4f);
-            --log-warning: var(--warning, #ff9800);
-            --log-info: var(--accent, #4f8cff);
-            --log-debug: var(--text-secondary, #9aa4b2);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -2955,34 +2879,8 @@ async def view_logs(request: Request):
         button { background:var(--accent); color:#fff; border:none; padding:0.4rem 0.6rem; border-radius:6px; cursor:pointer; }
         button:disabled { opacity:0.5; cursor:not-allowed; }
         .log { height: calc(100vh - 140px); overflow:auto; padding:1rem; font-family: monospace; background: linear-gradient(180deg, var(--bg-card), rgba(15,18,30,1)); border-radius:8px; border:1px solid var(--border); white-space:pre-wrap; }
-        .line { display:flex; gap:0.5rem; align-items:center; padding:0.25rem 0; border-bottom:1px solid rgba(255,255,255,0.02); }
+        .line { padding:0 0 4px 0; border-bottom:1px solid rgba(255,255,255,0.02); }
         .muted { color:var(--text-secondary); font-size:0.9rem; }
-
-        /* Severity badge */
-        .badge-sev {
-            display:inline-flex; align-items:center; gap:0.4rem; padding:0.12rem 0.45rem; border-radius:6px; font-weight:700; font-size:0.75rem; color:#fff;
-        }
-        .sev-error { background: var(--log-error); }
-        .sev-warning { background: var(--log-warning); }
-        .sev-info { background: var(--log-info); }
-        .sev-debug { background: var(--log-debug); color: #000; }
-
-        .sev-icon { font-weight:700; margin-right:0.2rem; }
-        .line-text { white-space:pre-wrap; color:var(--text-primary); }
-
-        /* When the user enables colourization, apply semantic colours to the
-           line text itself for better scanability. The outer `.colorize-on`
-           class is toggled by the Colorize checkbox so users can disable this
-           behaviour without losing the badge/text markers. */
-        .colorize-on .line.sev-error .line-text { color: var(--log-error); }
-        .colorize-on .line.sev-warning .line-text { color: var(--log-warning); }
-        .colorize-on .line.sev-info .line-text { color: var(--log-info); }
-        .colorize-on .line.sev-debug .line-text { color: var(--log-debug); }
-
-        /* Low-contrast fallback: ensure badges have minimum contrast */
-        @media (prefers-contrast: high) {
-          .badge-sev { box-shadow: 0 0 0 2px rgba(0,0,0,0.15) inset; }
-        }
     </style>
 </head>
 <body>
@@ -2998,7 +2896,6 @@ async def view_logs(request: Request):
         <button id="disconnect" disabled>Disconnect</button>
         <button id="clear">Clear</button>
         <label class="muted" style="margin-left:12px;"><input id="autoscroll" type="checkbox" checked /> Auto-scroll</label>
-        <label class="muted" style="margin-left:8px;"><input id="colorize" type="checkbox" checked /> Colorize</label>
         <button id="download">Download</button>
       </div>
     </div>
@@ -3017,7 +2914,7 @@ async def view_logs(request: Request):
         </div>
       </div>
     </div>
-    <div id="log" class="log" role="log" aria-live="polite"></div>
+    <div id="log" class="log"></div>
   </div>
 
   <script>
@@ -3027,178 +2924,16 @@ async def view_logs(request: Request):
     const disconnectBtn = document.getElementById('disconnect');
     const clearBtn = document.getElementById('clear');
     const autoscrollCb = document.getElementById('autoscroll');
-    const colorizeCb = document.getElementById('colorize');
     const downloadBtn = document.getElementById('download');
     let es = null;
 
-    // Heuristics to detect severity from a log line.
-    // Improved to find common severity tokens anywhere in the line (timestamps
-    // and prefixes like "2026-... - INFO - ..." are handled).
-    function detectSeverity(line) {
-      try {
-        const trimmed = (line || '').toString().trim();
-
-        // 1) If the line is structured JSON and contains a standard level field,
-        //    prefer that value (common keys: level, severity, levelname).
-        if (trimmed.startsWith('{')) {
-          try {
-            const j = JSON.parse(trimmed);
-            const lvlRaw = j.level || j.severity || j.levelname || j.level_name || j.levelName || j.loglevel;
-            if (lvlRaw) {
-              const lvl = String(lvlRaw).toLowerCase();
-              if (lvl.indexOf('err') !== -1) return 'error';
-              if (lvl.indexOf('warn') !== -1) return 'warning';
-              if (lvl.indexOf('info') !== -1) return 'info';
-              if (lvl.indexOf('debug') !== -1 || lvl.indexOf('trace') !== -1 || lvl.indexOf('verb') !== -1) return 'debug';
-            }
-          } catch (e) {
-            // not JSON - continue to text heuristics
-          }
-        }
-
-        // 2) Text heuristics: split on non-alpha characters and look for tokens.
-        //    Splitting is more robust than relying on \b word boundaries which
-        //    can be affected by punctuation or unusual unicode characters.
-        const up = (trimmed || '').toUpperCase();
-        const parts = up.split(/[^A-Z]+/);
-        for (let i = 0; i < parts.length; i++) {
-          const p = parts[i];
-          if (!p) continue;
-          if (p === 'ERROR' || p === 'ERR') return 'error';
-          if (p === 'WARN' || p === 'WARNING') return 'warning';
-          if (p === 'INFO') return 'info';
-          if (p === 'DEBUG' || p === 'TRACE' || p === 'VERB') return 'debug';
-        }
-
-        // 3) Fallback substring checks for common log patterns
-        if (up.indexOf(' - INFO - ') !== -1 || up.indexOf('[INFO]') !== -1 || /LEVEL[:=]\s*INFO/.test(up)) return 'info';
-        if (up.indexOf(' - ERROR - ') !== -1 || up.indexOf('[ERROR]') !== -1 || /LEVEL[:=]\s*ERROR/.test(up)) return 'error';
-        if (up.indexOf(' - WARN - ') !== -1 || up.indexOf('[WARN]') !== -1 || /LEVEL[:=]\s*WARN/.test(up)) return 'warning';
-        if (up.indexOf(' - DEBUG - ') !== -1 || up.indexOf('[DEBUG]') !== -1 || /LEVEL[:=]\s*DEBUG/.test(up)) return 'debug';
-
-        // no severity found
-        return null;
-      } catch (e) {
-        return null;
-      }
-    }
-
-    function createLineElement(text) {
+    function appendLine(text) {
       const div = document.createElement('div');
       div.className = 'line';
-
-      const severity = detectSeverity(text);
-      const useColor = colorizeCb && colorizeCb.checked;
-
-      if (severity) {
-        // Add a severity class on the line so CSS can target both badge and
-        // the text. This also makes it easier to unit-test detection via DOM
-        // inspection.
-        div.classList.add('sev-' + severity);
-      }
-
-      if (useColor && severity) {
-        const badge = document.createElement('span');
-        badge.className = 'badge-sev sev-' + severity;
-        badge.setAttribute('role', 'status');
-        badge.setAttribute('aria-label', severity);
-
-        const icon = document.createElement('span');
-        icon.className = 'sev-icon';
-        // Use simple ASCII-like icons to keep broad compatibility
-        icon.textContent = severity === 'error' ? '!' : (severity === 'warning' ? '!' : (severity === 'info' ? 'i' : 'd'));
-        badge.appendChild(icon);
-
-        const label = document.createElement('span');
-        label.className = 'sev-label';
-        label.textContent = severity.toUpperCase();
-        badge.appendChild(label);
-
-        div.appendChild(badge);
-      }
-
-      const textSpan = document.createElement('div');
-      textSpan.className = 'line-text';
-      textSpan.textContent = text;
-      div.appendChild(textSpan);
-
-      return div;
-    }
-
-    function appendLine(text) {
-      try {
-        const el = createLineElement(text);
-        logEl.appendChild(el);
-
-        // Keep the page-level colorization state in sync. We toggle this
-        // on the root container so text colour rules apply to existing lines
-        // when the user toggles the checkbox.
-        if (colorizeCb && colorizeCb.checked) {
-          document.documentElement.classList.add('colorize-on');
-        } else {
-          document.documentElement.classList.remove('colorize-on');
-        }
-
-        if (autoscrollCb.checked) {
-          logEl.scrollTop = logEl.scrollHeight;
-        }
-      } catch (e) {
-        // Fallback to simple append if something goes wrong
-        const div = document.createElement('div');
-        div.className = 'line';
-        div.textContent = text;
-        logEl.appendChild(div);
-      }
-    }
-
-    // Append a line with an explicit severity hint (used when server provides severity)
-    function appendLineWithSeverity(text, severity) {
-      try {
-        // If severity is provided, create element similarly to createLineElement but skip re-detection
-        const div = document.createElement('div');
-        div.className = 'line';
-        if (severity) {
-          div.classList.add('sev-' + severity);
-        }
-
-        const useColor = colorizeCb && colorizeCb.checked;
-        if (useColor && severity) {
-          const badge = document.createElement('span');
-          badge.className = 'badge-sev sev-' + severity;
-          badge.setAttribute('role', 'status');
-          badge.setAttribute('aria-label', severity);
-
-          const icon = document.createElement('span');
-          icon.className = 'sev-icon';
-          icon.textContent = severity === 'error' ? '!' : (severity === 'warning' ? '!' : (severity === 'info' ? 'i' : 'd'));
-          badge.appendChild(icon);
-
-          const label = document.createElement('span');
-          label.className = 'sev-label';
-          label.textContent = (severity || '').toUpperCase();
-          badge.appendChild(label);
-
-          div.appendChild(badge);
-        }
-
-        const textSpan = document.createElement('div');
-        textSpan.className = 'line-text';
-        textSpan.textContent = text;
-        div.appendChild(textSpan);
-
-        logEl.appendChild(div);
-
-        if (colorizeCb && colorizeCb.checked) {
-          document.documentElement.classList.add('colorize-on');
-        } else {
-          document.documentElement.classList.remove('colorize-on');
-        }
-
-        if (autoscrollCb.checked) {
-          logEl.scrollTop = logEl.scrollHeight;
-        }
-      } catch (e) {
-        appendLine(text);
+      div.textContent = text;
+      logEl.appendChild(div);
+      if (autoscrollCb.checked) {
+        logEl.scrollTop = logEl.scrollHeight;
       }
     }
 
@@ -3299,35 +3034,10 @@ async def view_logs(request: Request):
           const obj = JSON.parse(e.data);
           if (obj.initial) {
             appendLine('--- initial log ---');
-            // Initial may be either a string (legacy) or an array of {line,severity}
-            if (typeof obj.initial === 'string') {
-              obj.initial.split(String.fromCharCode(10)).forEach(l => appendLine(l));
-            } else if (Array.isArray(obj.initial)) {
-              obj.initial.forEach(item => {
-                try {
-                  if (item && typeof item === 'object' && 'line' in item) {
-                    const sev = item.severity || null;
-                    appendLineWithSeverity(item.line, sev);
-                  } else if (typeof item === 'string') {
-                    appendLine(item);
-                  }
-                } catch (e) { appendLine(item.line || JSON.stringify(item)); }
-              });
-            }
+            obj.initial.split(String.fromCharCode(10)).forEach(l => appendLine(l));
             appendLine('--- end initial ---');
           } else if (obj.line) {
-            // obj.line may be string (legacy) or present with severity
-            if (typeof obj.line === 'string') {
-              // Try to use provided severity if present on the object
-              if ('severity' in obj && obj.severity) {
-                appendLineWithSeverity(obj.line, obj.severity);
-              } else {
-                appendLine(obj.line);
-              }
-            } else if (typeof obj.line === 'object' && obj.line !== null) {
-              // New shape: {line: '...', severity: 'info'}
-              appendLineWithSeverity(obj.line.line || String(obj.line), obj.line.severity || null);
-            }
+            appendLine(obj.line);
           } else if (obj.counts) {
             // Update counts snapshot and re-render unified summary
             try {
@@ -3346,8 +3056,7 @@ async def view_logs(request: Request):
             appendLine('[error] ' + JSON.stringify(obj));
           }
         } catch (err) {
-          // If parsing fails, append raw data
-          try { appendLine(e.data); } catch (e) { /* ignore */ }
+          appendLine(e.data);
         }
       };
 
