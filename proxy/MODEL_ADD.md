@@ -3,6 +3,42 @@
 
 This document describes the checklist and a worked example for adding a new model to the proxy. It is intended for engineers who need to add small local or remote models (including embeddings models) to the proxy.
 
+## Adding the model to the local start script
+
+- When running a local fallback the proxy expects models to be startable by the repository `start-llama.sh` script (`/home/rgardler/projects/llm/start-llama.sh`). To make a new local model available via that script you must add a case block for the model name to the script.
+- Steps to add your model to `start-llama.sh`:
+  1. Pick the canonical model name that will be used in `proxy/config.yaml` `llama_model:` and in requests to the proxy. The `start-llama.sh` script lowercases the first CLI argument, so use a lowercase name in the case pattern.
+  2. In `start-llama.sh` add a `case "$model" in` entry (follow the existing examples `qwen3`, `qwen2.5`, `gpt120`). At minimum set these variables inside the block: `REPOID`, `MODEL`, `QUANTIZATION`, `CONTEXT`, `BATCH_SIZE`, and any of `CHAT_TEMPLATE_KWARGS`, `REASONING_FORMAT`, `TEMP`, `TOP_P`, `TOP_K`, `MIN_P`, `EXTRA_CMD_SWITCHES` as needed for the model.
+     - Example block (copy and adapt fields as necessary):
+
+```bash
+  mymodel)
+    REPOID=Vendor
+    MODEL=MyModel-Name-GGUF
+    QUANTIZATION=Q5_K_M
+    CONTEXT=131072
+    BATCH_SIZE=512
+
+    CHAT_TEMPLATE_KWARGS='{"reasoning_effort": "medium"}'
+    REASONING_FORMAT=none
+
+    TEMP=0.7
+    TOP_P=1.0
+    TOP_K=40
+    MIN_P=0
+
+    EXTRA_CMD_SWITCHES="--jinja"
+    ;;
+```
+
+  3. Update the final `*)` default section of the script (if appropriate) to include the new model name in the recognised list shown to users (the script prints the supported models when an unrecognised name is provided).
+  4. If you maintain a container image that packages `start-llama.sh` (see `proxy/container/Containerfile` and `proxy/CONTAINERS.md`), update any documentation or container build steps if the model requires additional artifacts or mount points.
+  5. Test locally by running the script directly from repo root, e.g. `/home/rgardler/projects/llm/start-llama.sh mymodel` and ensure the llama-server process starts and exposes embeddings (if required) on the configured port.
+
+Notes:
+- The proxy passes the configured `llama_model` value through to the local start script. Keep the name consistent between `proxy/config.yaml` `llama_model:` and the `case` pattern in `start-llama.sh`.
+- The script lowercases the first argument before matching; use lowercase in your `case` pattern to avoid mismatches.
+
 ## Model configuration
 
  - Add an entry under the `models:` section of `proxy/config.yaml`. Required/typical fields (follow existing config style):
@@ -52,7 +88,43 @@ models:
 - Create an integration test under `proxy/tests/test_embeddings_integration.py` that:
   - Spins up the proxy (or uses a test harness) and a test llama-server hosting `mxbai-embed-large-v1`.
   - POSTs to `/v1/embeddings` with `model: "embeddings"` and `input: "test string"`.
-  - Validates the response follows the OpenAI embeddings format and that the returned vector length equals the documented dimension.
+- Validates the response follows the OpenAI embeddings format and that the returned vector length equals the documented dimension.
+
+## Adding the model to the local start script
+
+- When running a local fallback the proxy expects models to be startable by the repository `start-llama.sh` script (`/home/rgardler/projects/llm/start-llama.sh`). To make a new local model available via that script you must add a case block for the model name to the script.
+- Steps to add your model to `start-llama.sh`:
+  1. Pick the canonical model name that will be used in `proxy/config.yaml` `llama_model:` and in requests to the proxy. The `start-llama.sh` script lowercases the first CLI argument, so use a lowercase name in the case pattern.
+  2. In `start-llama.sh` add a `case "$model" in` entry (follow the existing examples `qwen3`, `qwen2.5`, `gpt120`). At minimum set these variables inside the block: `REPOID`, `MODEL`, `QUANTIZATION`, `CONTEXT`, `BATCH_SIZE`, and any of `CHAT_TEMPLATE_KWARGS`, `REASONING_FORMAT`, `TEMP`, `TOP_P`, `TOP_K`, `MIN_P`, `EXTRA_CMD_SWITCHES` as needed for the model.
+     - Example block (copy and adapt fields as necessary):
+
+```bash
+  mymodel)
+    REPOID=Vendor
+    MODEL=MyModel-Name-GGUF
+    QUANTIZATION=Q5_K_M
+    CONTEXT=131072
+    BATCH_SIZE=512
+
+    CHAT_TEMPLATE_KWARGS='{"reasoning_effort": "medium"}'
+    REASONING_FORMAT=none
+
+    TEMP=0.7
+    TOP_P=1.0
+    TOP_K=40
+    MIN_P=0
+
+    EXTRA_CMD_SWITCHES="--jinja"
+    ;;
+```
+
+  3. Update the final `*)` default section of the script (if appropriate) to include the new model name in the recognised list shown to users (the script prints the supported models when an unrecognised name is provided).
+  4. If you maintain a container image that packages `start-llama.sh` (see `proxy/container/Containerfile` and `proxy/CONTAINERS.md`), update any documentation or container build steps if the model requires additional artifacts or mount points.
+  5. Test locally by running the script directly from repo root, e.g. `/home/rgardler/projects/llm/start-llama.sh mymodel` and ensure the llama-server process starts and exposes embeddings (if required) on the configured port.
+
+Notes:
+- The proxy passes the configured `llama_model` value through to the local start script. Keep the name consistent between `proxy/config.yaml` `llama_model:` and the `case` pattern in `start-llama.sh`.
+- The script lowercases the first argument before matching; use lowercase in your `case` pattern to avoid mismatches.
 
 ## Runtime & deployment notes
 

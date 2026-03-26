@@ -21,3 +21,6 @@ Worklog Specific Ignores
 # Ignore files created by editors as backups that end with a tilde
 # e.g. "file.txt~"
 *~
+
+# Python virtualenv
+.venv/

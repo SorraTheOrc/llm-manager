@@ -46,7 +46,6 @@ models:
     aliases:
       - "qwen3*"
       - "Qwen3*"
-  
   gpt120:
     type: "local"
     llama_model: "gpt120"
@@ -54,7 +53,10 @@ models:
       - "gpt-oss-120b"
       - "gpt-oss*"      # Matches any model starting with gpt-oss
       - "GPT-OSS*"      # Matches any model starting with GPT-OSS
-
+  embed:
+    type: "local"
+    llama_model: "mxbai-embed"
+    aliases: "embed"
   # Remote models routed to external APIs
   github:
     type: "remote"

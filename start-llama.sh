@@ -36,7 +36,6 @@ case "$model" in
     QUANTIZATION=Q5_K_M
     CONTEXT=163840 # Max is 262144, max tried so far  131072
     BATCH_SIZE=512
-    
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
@@ -48,21 +47,21 @@ case "$model" in
     EXTRA_CMD_SWITCHES="--jinja"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
-  qwen2.5)
-    REPOID=Qwen
-    MODEL=Qwen2.5-Coder-32B-Instruct-GGUF
-    QUANTIZATION=Q5_K_M
-    CONTEXT=0
-
+  mxbai-embed)
+    REPOID=magicunicorn
+    MODEL=mxbai-embed-large-v1-Q8_0-GGUF
+    QUANTIZATION=Q8_0
+    CONTEXT=2048
+    BATCH_SIZE=512
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
-    TEMP=0.7
-    TOP_P=1.0
-    TOP_K=20
+    TEMP=1.0
+    TOP_P=0.95
+    TOP_K=40
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--jinja"
+    EXTRA_CMD_SWITCHES=""
     ;;
   *)
     echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen2.5"
