@@ -286,17 +286,67 @@ async def _tokens_persist_loop():
         tokens_persist_task = None
 
 
+async def query_llama_status() -> dict:
+    """
+    Query llama-server HTTP endpoints for model metadata.
+    
+    Attempts HTTP GET to /model then /status and returns parsed JSON if successful.
+    If those endpoints are not present or do not include n_ctx / KV cache values,
+    returns null for those fields.
+    
+    Returns dict with:
+      - n_ctx: max context size (int) or None
+      - kv_cache_tokens: KV cache token count (int) or None
+      - llama_server_running: bool
+    """
+    result = {
+        "n_ctx": None,
+        "kv_cache_tokens": None,
+        "llama_server_running": llama_process is not None and llama_process.poll() is None
+    }
+    
+    if not result["llama_server_running"]:
+        return result
+    
+    server_config = config.get("server", {})
+    llama_port = server_config.get("llama_server_port", 8080)
+    
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for endpoint in ["/model", "/status"]:
+            try:
+                url = f"http://localhost:{llama_port}{endpoint}"
+                response = await client.get(url)
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        if result["n_ctx"] is None:
+                            result["n_ctx"] = data.get("n_ctx") or data.get("n_ctx_total")
+                        if result["kv_cache_tokens"] is None:
+                            result["kv_cache_tokens"] = (
+                                data.get("kv_cache_tokens") or 
+                                data.get("kv_cache_token_count")
+                            )
+                        if result["n_ctx"] is not None and result["kv_cache_tokens"] is not None:
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    
+    return result
+
+
 async def _periodic_broadcast_loop():
     """Periodically broadcast current counts/tokens to connected log-tail clients.
 
     This ensures UI updates even if no direct increment message races occur.
+    Also queries llama-server for status and broadcasts stats.
     """
     global periodic_broadcast_task
     try:
         while True:
             try:
                 await asyncio.sleep(1.0)
-                # snapshot counts and tokens
                 snap_c = {}
                 snap_t = {}
                 async with counts_lock:
@@ -304,13 +354,45 @@ async def _periodic_broadcast_loop():
                 async with token_lock:
                     snap_t = dict(token_counts)
 
+                llama_status = await query_llama_status()
+                
+                total_sent = token_counts.get("total_sent", 0)
+                total_recv = token_counts.get("total_recv", 0)
+
                 if log_tail_clients:
                     for q in list(log_tail_clients):
                         try:
-                            # send both in one message
-                            q.put_nowait({"counts": snap_c, "tokens": snap_t})
+                            q.put_nowait({
+                                "counts": snap_c, 
+                                "tokens": snap_t,
+                                "llama_status": llama_status,
+                                "total_sent": total_sent,
+                                "total_recv": total_recv
+                            })
                         except asyncio.QueueFull:
                             continue
+                
+                if sse_clients:
+                    status_data = {
+                        "type": "status",
+                        "current_model": current_model,
+                        "llama_server_running": llama_status["llama_server_running"],
+                        "n_ctx": llama_status["n_ctx"],
+                        "kv_cache_tokens": llama_status["kv_cache_tokens"],
+                        "total_sent": total_sent,
+                        "total_recv": total_recv
+                    }
+                    event_data = json.dumps(status_data)
+                    message = f"data: {event_data}\n\n"
+                    dead_clients = set()
+                    for q in sse_clients:
+                        try:
+                            q.put_nowait(message)
+                        except asyncio.QueueFull:
+                            dead_clients.add(q)
+                    for client in dead_clients:
+                        sse_clients.discard(client)
+                        
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1626,6 +1708,78 @@ async def index(request: Request):
             word-wrap: break-word;
             margin: 0;
         }}
+        .stats-panel {{
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            overflow: hidden;
+        }}
+        .stats-panel-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            font-weight: 500;
+            color: var(--accent);
+        }}
+        .btn-close-stats {{
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.2rem;
+            cursor: pointer;
+            padding: 0 0.25rem;
+            line-height: 1;
+        }}
+        .btn-close-stats:hover {{
+            color: var(--text-primary);
+        }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1px;
+            background: var(--border);
+        }}
+        .stats-item {{
+            display: flex;
+            flex-direction: column;
+            padding: 0.75rem 1rem;
+            background: var(--bg-card);
+        }}
+        .stats-label {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 0.25rem;
+        }}
+        .stats-value {{
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            font-family: monospace;
+        }}
+        .stats-unknown {{
+            color: var(--warning);
+            font-style: italic;
+            cursor: help;
+        }}
+        .stats-toggle {{
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.25rem 0.5rem;
+            font-size: 0.75rem;
+            color: var(--accent);
+            cursor: pointer;
+            margin-left: 1rem;
+        }}
+        .stats-toggle:hover {{
+            background: var(--accent);
+            color: #fff;
+        }}
     </style>
 </head>
 <body>
@@ -1648,7 +1802,49 @@ async def index(request: Request):
             </div>
         </div>
 
-        <p class="section-title">Quick Links</p>
+        <div id="statsPanel" class="stats-panel" style="display: none;">
+            <div class="stats-panel-header">
+                <span>Model Statistics</span>
+                <button class="btn-close-stats" onclick="toggleStatsPanel()">&times;</button>
+            </div>
+            <div class="stats-grid">
+                <div class="stats-item">
+                    <span class="stats-label">Model</span>
+                    <span class="stats-value" id="statsModel">-</span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Llama-server status</span>
+                    <span class="stats-value" id="statsLlamaStatus">-</span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Max context</span>
+                    <span class="stats-value" id="statsNCtx">
+                        <span class="stats-val">-</span>
+                        <span class="stats-unknown" title="Value not available from backend" style="display:none;">unknown</span>
+                    </span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">KV cache tokens</span>
+                    <span class="stats-value" id="statsKvCache">
+                        <span class="stats-val">-</span>
+                        <span class="stats-unknown" title="Value not available from backend" style="display:none;">unknown</span>
+                    </span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Total tokens sent</span>
+                    <span class="stats-value" id="statsTokensSent">0</span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Total tokens received</span>
+                    <span class="stats-value" id="statsTokensRecv">0</span>
+                </div>
+            </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;">
+            <p class="section-title" style="margin-bottom: 0;">Quick Links</p>
+            <button class="stats-toggle" onclick="toggleStatsPanel()">Show Model Stats</button>
+        </div>
         <div class="nav-links">
             <a href="/health">Health Check</a>
             <a href="/v1/models">List Models</a>
@@ -1890,8 +2086,85 @@ API Endpoints
         const llamaStatusEl = document.getElementById('llamaServerStatus');
         const statusEl = document.getElementById('statusMessage');
         
+        // Stats panel elements
+        const statsPanel = document.getElementById('statsPanel');
+        const statsModelEl = document.getElementById('statsModel');
+        const statsLlamaStatusEl = document.getElementById('statsLlamaStatus');
+        const statsNCtxEl = document.getElementById('statsNCtx');
+        const statsKvCacheEl = document.getElementById('statsKvCache');
+        const statsTokensSentEl = document.getElementById('statsTokensSent');
+        const statsTokensRecvEl = document.getElementById('statsTokensRecv');
+        
         // Track the actual current model (updated after successful operations)
         let actualCurrentModel = '{current_model or "None"}';
+        
+        // Toggle stats panel visibility
+        function toggleStatsPanel() {{
+            if (statsPanel.style.display === 'none') {{
+                statsPanel.style.display = 'block';
+                document.querySelector('.stats-toggle').textContent = 'Hide Model Stats';
+            }} else {{
+                statsPanel.style.display = 'none';
+                document.querySelector('.stats-toggle').textContent = 'Show Model Stats';
+            }}
+        }}
+        
+        // Update stats panel with new values (only if changed)
+        function updateStatsPanel(data) {{
+            if (!data) return;
+            
+            if (data.current_model !== undefined) {{
+                const val = data.current_model || '-';
+                if (statsModelEl.textContent !== val) {{
+                    statsModelEl.textContent = val;
+                }}
+            }}
+            
+            if (data.llama_server_running !== undefined) {{
+                const val = data.llama_server_running ? 'Running' : 'Stopped';
+                if (statsLlamaStatusEl.textContent !== val) {{
+                    statsLlamaStatusEl.textContent = val;
+                }}
+            }}
+            
+            if (data.n_ctx !== undefined) {{
+                const valSpan = statsNCtxEl.querySelector('.stats-val');
+                const unknownSpan = statsNCtxEl.querySelector('.stats-unknown');
+                if (data.n_ctx === null || data.n_ctx === undefined) {{
+                    if (valSpan) valSpan.textContent = '-';
+                    if (unknownSpan) unknownSpan.style.display = 'inline';
+                }} else {{
+                    if (valSpan) valSpan.textContent = data.n_ctx;
+                    if (unknownSpan) unknownSpan.style.display = 'none';
+                }}
+            }}
+            
+            if (data.kv_cache_tokens !== undefined) {{
+                const valSpan = statsKvCacheEl.querySelector('.stats-val');
+                const unknownSpan = statsKvCacheEl.querySelector('.stats-unknown');
+                if (data.kv_cache_tokens === null || data.kv_cache_tokens === undefined) {{
+                    if (valSpan) valSpan.textContent = '-';
+                    if (unknownSpan) unknownSpan.style.display = 'inline';
+                }} else {{
+                    if (valSpan) valSpan.textContent = data.kv_cache_tokens;
+                    if (unknownSpan) unknownSpan.style.display = 'none';
+                }}
+            }}
+            
+            if (data.total_sent !== undefined) {{
+                const val = String(data.total_sent);
+                if (statsTokensSentEl.textContent !== val) {{
+                    statsTokensSentEl.textContent = val;
+                }}
+            }}
+            
+            if (data.total_recv !== undefined) {{
+                const val = String(data.total_recv);
+                if (statsTokensRecvEl.textContent !== val) {{
+                    statsTokensRecvEl.textContent = val;
+                }}
+            }}
+        }}
         
         // Helper function to show model switching status
         function showSwitchingStatus(targetModel) {{
@@ -1951,12 +2224,12 @@ API Endpoints
                     
                     switch (data.type) {{
                         case 'status':
-                            // Initial status update
                             if (data.current_model) {{
                                 actualCurrentModel = data.current_model;
                                 currentModelEl.textContent = data.current_model;
                             }}
                             llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
+                            updateStatsPanel(data);
                             break;
                             
                         case 'switching':
@@ -2314,18 +2587,22 @@ async def status_events():
     sse_clients.add(queue)
 
     async def event_generator():
-        # local queue reference for counts/tokens updates (reserved for symmetry)
-        _local_counts_queue = None
         try:
-            # Send initial status
+            llama_status = await query_llama_status()
+            total_sent = token_counts.get("total_sent", 0)
+            total_recv = token_counts.get("total_recv", 0)
+            
             initial_status = json.dumps({
                 "type": "status",
                 "current_model": current_model,
-                "llama_server_running": llama_process is not None and llama_process.poll() is None
+                "llama_server_running": llama_status["llama_server_running"],
+                "n_ctx": llama_status["n_ctx"],
+                "kv_cache_tokens": llama_status["kv_cache_tokens"],
+                "total_sent": total_sent,
+                "total_recv": total_recv
             })
             yield f"data: {initial_status}\n\n"
 
-            # Keep connection alive and forward messages from the queue
             while True:
                 try:
                     message = await asyncio.wait_for(queue.get(), timeout=30.0)
