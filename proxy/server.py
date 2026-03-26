@@ -1814,7 +1814,7 @@ async def index(request: Request):
         <div class="status-bar">
             <div class="status-item">
                 <div class="status-dot"></div>
-                <span>Server Running</span>
+                <span>Proxy Running</span>
             </div>
             <div class="status-item">
                 <strong>Current Model:</strong>
