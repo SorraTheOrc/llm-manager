@@ -311,27 +311,51 @@ async def query_llama_status() -> dict:
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
     
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    client = httpx.AsyncClient(timeout=5.0)
+    try:
         for endpoint in ["/model", "/status"]:
             try:
                 url = f"http://localhost:{llama_port}{endpoint}"
                 response = await client.get(url)
-                if response.status_code == 200:
+                if getattr(response, "status_code", None) == 200:
                     try:
-                        data = response.json()
-                        if result["n_ctx"] is None:
-                            result["n_ctx"] = data.get("n_ctx") or data.get("n_ctx_total")
-                        if result["kv_cache_tokens"] is None:
-                            result["kv_cache_tokens"] = (
-                                data.get("kv_cache_tokens") or 
-                                data.get("kv_cache_token_count")
-                            )
-                        if result["n_ctx"] is not None and result["kv_cache_tokens"] is not None:
-                            break
+                        # httpx Response.json may be sync or async in tests; handle both
+                        data = None
+                        if hasattr(response, 'json'):
+                            try:
+                                maybe = response.json()
+                                if asyncio.iscoroutine(maybe):
+                                    data = await maybe
+                                else:
+                                    data = maybe
+                            except Exception:
+                                data = None
+                        if data is None and hasattr(response, 'text'):
+                            try:
+                                txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
+                                data = json.loads(txt)
+                            except Exception:
+                                data = None
+
+                        if isinstance(data, dict):
+                            if result["n_ctx"] is None:
+                                result["n_ctx"] = data.get("n_ctx") or data.get("n_ctx_total")
+                            if result["kv_cache_tokens"] is None:
+                                result["kv_cache_tokens"] = (
+                                    data.get("kv_cache_tokens") or 
+                                    data.get("kv_cache_token_count")
+                                )
+                            if result["n_ctx"] is not None and result["kv_cache_tokens"] is not None:
+                                break
                     except Exception:
                         pass
             except Exception:
                 pass
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
     
     return result
 
