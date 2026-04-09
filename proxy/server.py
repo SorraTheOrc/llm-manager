@@ -1147,37 +1147,55 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if is_streaming:
         # Streaming response - client must stay open during streaming
         client = httpx.AsyncClient(timeout=None)
-        
+        # Manually open the httpx stream so we can capture backend headers
+        cm = client.stream(
+            request.method,
+            target_url,
+            headers=headers,
+            content=body
+        )
+
+        # Enter the stream to obtain the response and headers
+        response = await cm.__aenter__()
+        # Normalize backend headers for streaming (remove content-length if TE present)
+        outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
+        # Ensure Cache-Control is present
+        if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
+            outgoing_headers['Cache-Control'] = 'no-cache'
+
+        media_type = response.headers.get('content-type', 'text/event-stream')
+
         async def stream_generator():
             try:
-                async with client.stream(
-                    request.method,
-                    target_url,
-                    headers=headers,
-                    content=body
-                ) as response:
-                    async for chunk in response.aiter_bytes():
-                        # count tokens in this chunk (best-effort)
+                async for chunk in response.aiter_bytes():
+                    # count tokens in this chunk (best-effort)
+                    try:
+                        chunk_text = chunk.decode('utf-8', errors='replace')
+                        # simple heuristic: count tokens in chunk text
+                        chunk_tokens = count_text_tokens(chunk_text, model_name)
                         try:
-                            chunk_text = chunk.decode('utf-8', errors='replace')
-                            # simple heuristic: count tokens in chunk text
-                            chunk_tokens = count_text_tokens(chunk_text, model_name)
-                            try:
-                                loop = asyncio.get_running_loop()
-                                loop.create_task(_increment_tokens('recv', key, chunk_tokens))
-                            except RuntimeError:
-                                asyncio.run(_increment_tokens('recv', key, chunk_tokens))
-                        except Exception:
-                            pass
-                        yield chunk
-                        log_response_chunk(chunk)
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(_increment_tokens('recv', key, chunk_tokens))
+                        except RuntimeError:
+                            asyncio.run(_increment_tokens('recv', key, chunk_tokens))
+                    except Exception:
+                        pass
+                    yield chunk
+                    log_response_chunk(chunk)
             finally:
-                await client.aclose()
-        
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
         return StreamingResponse(
             stream_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"}
+            media_type=media_type,
+            headers=outgoing_headers
         )
     else:
         # Non-streaming response
@@ -1262,57 +1280,71 @@ async def proxy_to_remote(
     if is_streaming:
         # Streaming response - client must stay open during streaming
         client = httpx.AsyncClient(timeout=None)
-        
+        cm = client.stream(
+            request.method,
+            target_url,
+            headers=headers,
+            content=body
+        )
+
+        response = await cm.__aenter__()
+        outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
+        if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
+            outgoing_headers['Cache-Control'] = 'no-cache'
+
+        media_type = response.headers.get('content-type', 'text/event-stream')
+
         async def stream_generator():
             try:
-                async with client.stream(
-                    request.method,
-                    target_url,
-                    headers=headers,
-                    content=body
-                ) as response:
-                    async for chunk in response.aiter_bytes():
-                        # parse OpenAI-style SSE chunks for delta content when possible
-                        try:
-                            s = chunk.decode('utf-8', errors='replace')
-                            # look for lines starting with 'data: '
-                            texts = []
-                            for line in s.splitlines():
-                                line = line.strip()
-                                if not line.startswith('data:'):
-                                    continue
-                                payload = line[5:].strip()
-                                if payload == '[DONE]':
-                                    continue
-                                try:
-                                    j = json.loads(payload)
-                                    # extract any delta.content fields
-                                    for choice in j.get('choices', []):
-                                        delta = choice.get('delta', {})
-                                        if isinstance(delta, dict) and 'content' in delta:
-                                            texts.append(str(delta.get('content', '')))
-                                except Exception:
-                                    # fallback: treat payload as plain text
-                                    texts.append(payload)
-                            if texts:
-                                chunk_text = '\n'.join(texts)
-                                chunk_tokens = count_text_tokens(chunk_text, model_name)
-                                try:
-                                    loop = asyncio.get_running_loop()
-                                    loop.create_task(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
-                                except RuntimeError:
-                                    asyncio.run(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
-                        except Exception:
-                            pass
-                        yield chunk
-                        log_response_chunk(chunk)
+                async for chunk in response.aiter_bytes():
+                    # parse OpenAI-style SSE chunks for delta content when possible
+                    try:
+                        s = chunk.decode('utf-8', errors='replace')
+                        # look for lines starting with 'data: '
+                        texts = []
+                        for line in s.splitlines():
+                            line = line.strip()
+                            if not line.startswith('data:'):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == '[DONE]':
+                                continue
+                            try:
+                                j = json.loads(payload)
+                                # extract any delta.content fields
+                                for choice in j.get('choices', []):
+                                    delta = choice.get('delta', {})
+                                    if isinstance(delta, dict) and 'content' in delta:
+                                        texts.append(str(delta.get('content', '')))
+                            except Exception:
+                                # fallback: treat payload as plain text
+                                texts.append(payload)
+                        if texts:
+                            chunk_text = '\n'.join(texts)
+                            chunk_tokens = count_text_tokens(chunk_text, model_name)
+                            try:
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
+                            except RuntimeError:
+                                asyncio.run(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
+                    except Exception:
+                        pass
+                    yield chunk
+                    log_response_chunk(chunk)
             finally:
-                await client.aclose()
-        
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
         return StreamingResponse(
             stream_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"}
+            media_type=media_type,
+            headers=outgoing_headers
         )
     else:
         async with httpx.AsyncClient(timeout=None) as client:
