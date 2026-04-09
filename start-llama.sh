@@ -1,7 +1,55 @@
 #!/bin/bash
 set -euo pipefail
 
-model="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+model_arg="${1:-}"
+model="$(printf '%s' "${model_arg}" | tr '[:upper:]' '[:lower:]')"
+router_mode=0
+
+if [[ -z "${model}" || "${model}" == "router" ]]; then
+  router_mode=1
+fi
+
+##
+# Configure the server
+##
+: "${PORT:=8080}"
+export HSA_OVERRIDE_GFX_VERSION=11.5.1
+export ROCM_LLVM_PRE_VEGA=1
+export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1 {print $2}' | cut -d'/' -f1)
+
+if [[ "$router_mode" -eq 1 ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  MODELS_INI="${LLAMA_MODELS_PRESET:-${2:-"$SCRIPT_DIR/models.ini"}}"
+  MODELS_MAX="${LLAMA_MODELS_MAX:-4}"
+
+  echo "Server Environment"
+  echo
+  echo "IP_ADDRESS=$IP_ADDRESS"
+  echo "PORT=$PORT"
+  echo
+  echo "ROUTER_MODE=true"
+  echo "MODELS_INI=$MODELS_INI"
+  echo "MODELS_MAX=$MODELS_MAX"
+  echo
+  echo
+  echo
+
+  LLAMA_CMD=(
+    llama-server
+    --models-preset "$MODELS_INI"
+    --models-max "$MODELS_MAX"
+    --models-autoload
+    --host 0.0.0.0
+    --port $PORT
+  )
+
+  if [[ -n "${LLAMA_MODELS_DIR:-}" ]]; then
+    LLAMA_CMD+=(--models-dir "$LLAMA_MODELS_DIR")
+  fi
+
+  "${LLAMA_CMD[@]}"
+  exit 0
+fi
 
 ##
 # Configure the model defaults
@@ -64,18 +112,10 @@ case "$model" in
     EXTRA_CMD_SWITCHES=""
     ;;
   *)
-    echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen2.5"
+    echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen2.5, MXBAI-Embed, Router"
     exit 1
     ;;
 esac
-
-##
-# Configure the server
-##
-: "${PORT:=8080}"
-export HSA_OVERRIDE_GFX_VERSION=11.5.1
-export ROCM_LLVM_PRE_VEGA=1
-export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1 {print $2}' | cut -d'/' -f1)
 
 ##
 # Log the config
