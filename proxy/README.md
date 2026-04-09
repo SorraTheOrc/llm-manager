@@ -65,6 +65,11 @@ server:
   host: "0.0.0.0"
   port: 8000
   llama_start_script: "/home/rgardler/projects/llm/start-llama.sh"
+  llama_router_mode: true
+  llama_router_preload:
+    - "embeddings"
+    - "qwen3"
+  llama_models_max: 2
   distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
   llama_startup_timeout: 300
@@ -311,6 +316,13 @@ If loading fails, the proxy returns HTTP 503 with a `Retry-After` header:
 ```
 
 Clients should handle this by retrying after the specified delay.
+
+### Router Mode (Multi-Model)
+
+When `llama_router_mode` is enabled, the proxy launches llama-server in router mode and
+preloads the embeddings model plus the configured primary model. Requests are routed
+to the appropriate model without stopping the server. The router exposes management
+endpoints like `GET /models` and `POST /models/load`.
 
 ## Logging
 

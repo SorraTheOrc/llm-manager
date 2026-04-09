@@ -6,17 +6,31 @@ server:
   port: 8000
   # Path to the llama start script
   llama_start_script: "/home/rgardler/projects/llm/start-llama.sh"
+  # Enable llama-server router mode for multi-model co-residency
+  llama_router_mode: true
+  # Models to preload on startup (optional)
+  llama_router_preload:
+    - "embeddings"
+    - "gpt120"
+  # Maximum concurrent models in router mode
+  llama_models_max: 2
   # Distrobox container name where llama-server runs
   distrobox_name: "llama"
+  # Default embeddings preset name (as defined in models.ini)
+  embeddings_model: "mxbai-embed"
+  # How long (s) to wait for embeddings to be (re)loaded when enforcing pinning
+  llama_embed_load_timeout: 30
   # Port the llama-server listens on
   llama_server_port: 8080
   # Timeout in seconds to wait for llama-server to start
   llama_startup_timeout: 300
+  # Timeout in seconds to wait for router model load
+  llama_model_load_timeout: 600
   # Health check interval in seconds
   llama_health_check_interval: 10
 
 # Default model to load on startup
-default_model: "qwen3"
+default_model: "gpt120"
 
 # Logging configuration
 logging:
@@ -56,7 +70,9 @@ models:
   embed:
     type: "local"
     llama_model: "mxbai-embed"
-    aliases: "embed"
+    aliases:
+      - "embeddings"
+      - "embed"
   # Remote models routed to external APIs
   github:
     type: "remote"

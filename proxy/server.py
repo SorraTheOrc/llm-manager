@@ -289,30 +289,55 @@ async def _tokens_persist_loop():
 async def query_llama_status() -> dict:
     """
     Query llama-server HTTP endpoints for model metadata.
-    
+
     Attempts HTTP GET to /model then /status and returns parsed JSON if successful.
     If those endpoints are not present or do not include n_ctx / KV cache values,
     returns null for those fields.
-    
+
     Returns dict with:
       - n_ctx: max context size (int) or None
       - kv_cache_tokens: KV cache token count (int) or None
       - llama_server_running: bool
+      - router_mode: bool
     """
     result = {
         "n_ctx": None,
         "kv_cache_tokens": None,
-        "llama_server_running": llama_process is not None and llama_process.poll() is None
+        "llama_server_running": llama_process is not None and llama_process.poll() is None,
+        "router_mode": False
     }
-    
+
     if not result["llama_server_running"]:
         return result
-    
+
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
-    
+
     client = httpx.AsyncClient(timeout=5.0)
     try:
+        # Router mode metadata
+        try:
+            props_url = f"http://localhost:{llama_port}/props"
+            response = await client.get(props_url)
+            if getattr(response, "status_code", None) == 200:
+                props = None
+                if hasattr(response, "json"):
+                    try:
+                        maybe = response.json()
+                        props = await maybe if asyncio.iscoroutine(maybe) else maybe
+                    except Exception:
+                        props = None
+                if props is None and hasattr(response, "text"):
+                    try:
+                        txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
+                        props = json.loads(txt)
+                    except Exception:
+                        props = None
+                if isinstance(props, dict):
+                    result["router_mode"] = True
+        except Exception:
+            pass
+
         for endpoint in ["/model", "/status"]:
             try:
                 url = f"http://localhost:{llama_port}{endpoint}"
@@ -356,7 +381,7 @@ async def query_llama_status() -> dict:
             await client.aclose()
         except Exception:
             pass
-    
+
     return result
 
 
@@ -566,7 +591,10 @@ def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
     """Get the llama model name for a given model."""
     model_cfg = get_model_config(model_name)
     if model_cfg and model_cfg.get("type") == "local":
-        return model_cfg.get("llama_model")
+        llama_model = model_cfg.get("llama_model")
+        if llama_model:
+            return llama_model
+        return model_name
     return None
 
 
@@ -605,7 +633,106 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
     return False
 
 
-def start_llama_server(model: str) -> Optional[subprocess.Popen]:
+async def router_load_model(model_name: str) -> bool:
+    """Request router-mode llama-server to load a model."""
+    server_config = config.get("server", {})
+    llama_port = server_config.get("llama_server_port", 8080)
+    url = f"http://localhost:{llama_port}/models/load"
+    payload = {"model": model_name}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload, timeout=30)
+            if response.status_code != 200:
+                body = response.text
+                if response.status_code == 400 and "already loaded" in body.lower():
+                    logger.info(f"Router model already loaded: {model_name}")
+                    return True
+                logger.error(f"Router load failed for {model_name}: {response.status_code} {body}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Router load failed for {model_name}: {e}")
+            return False
+
+
+async def router_list_models() -> Optional[dict]:
+    """List models from router-mode llama-server."""
+    server_config = config.get("server", {})
+    llama_port = server_config.get("llama_server_port", 8080)
+    url = f"http://localhost:{llama_port}/models"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, timeout=10)
+            if response.status_code != 200:
+                logger.warning(f"Router list models failed: {response.status_code} {response.text}")
+                return None
+            return response.json()
+        except Exception as e:
+            logger.warning(f"Router list models failed: {e}")
+            return None
+
+
+def _extract_router_model_ids(router_models: Optional[dict]) -> list[str]:
+    if not isinstance(router_models, dict):
+        return []
+    models_payload = router_models.get("data") or router_models.get("models") or []
+    if isinstance(models_payload, list):
+        return [str(m.get("id")) for m in models_payload if isinstance(m, dict) and m.get("id")]
+    return []
+
+
+async def router_is_model_loaded(model_name: str) -> bool:
+    router_models = await router_list_models()
+    return model_name in _extract_router_model_ids(router_models)
+
+
+async def router_wait_for_model(model_name: str, timeout: int = 300, interval: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await router_is_model_loaded(model_name):
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+async def router_preload_models(model_names: list[str]) -> bool:
+    """Preload a list of models in router mode."""
+    for model_name in model_names:
+        if not await router_load_model(model_name):
+            return False
+    return True
+
+
+def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dict:
+    """Normalize headers before sending to clients.
+
+    - If buffered=True (we are sending a full body via Response), remove
+      any Transfer-Encoding header so frameworks/servers may set a proper
+      Content-Length for the buffered body.
+    - If buffered=False (we are streaming and will not pre-compute a
+      Content-Length), remove Content-Length if Transfer-Encoding is present
+      to avoid sending both headers.
+    """
+    if not in_headers:
+        return {}
+    lc_map = {k.lower(): k for k in in_headers.keys()}
+    out = dict(in_headers)
+
+    if buffered:
+        # We're returning a buffered body; ensure Transfer-Encoding is not forwarded
+        if 'transfer-encoding' in lc_map:
+            out.pop(lc_map['transfer-encoding'], None)
+    else:
+        # Streaming or unknown delivery: do not forward Content-Length when TE exists
+        if 'transfer-encoding' in lc_map and 'content-length' in lc_map:
+            out.pop(lc_map['content-length'], None)
+
+    return out
+
+
+def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     """Start the llama-server with the specified model inside distrobox."""
     global llama_process, llama_log_file, current_model, last_start_failure
     
@@ -622,7 +749,14 @@ def start_llama_server(model: str) -> Optional[subprocess.Popen]:
     env = os.environ.copy()
     env["PORT"] = str(llama_port)
     
-    logger.info(f"Starting llama-server with model: {model} in distrobox '{distrobox_name}'")
+    router_mode = False
+    if model is None:
+        router_mode = True
+    elif isinstance(model, str) and model.strip().lower() == "router":
+        router_mode = True
+
+    mode_label = "router" if router_mode else f"model: {model}"
+    logger.info(f"Starting llama-server with {mode_label} in distrobox '{distrobox_name}'")
 
     # Rotate llama-server logs (keep last 15)
     if log_dir:
@@ -636,8 +770,23 @@ def start_llama_server(model: str) -> Optional[subprocess.Popen]:
     # fall back to running the start script directly. Capture and log errors
     # so failures after reboot are diagnosable. Implement a short retry loop
     # with backoff to tolerate boot-order races.
-    distrobox_cmd = ["distrobox", "enter", distrobox_name, "--", script_path, model]
-    direct_cmd = [script_path, model]
+    if router_mode:
+        llama_models_max = server_config.get("llama_models_max")
+        if llama_models_max:
+            env["LLAMA_MODELS_MAX"] = str(llama_models_max)
+        llama_models_preset = server_config.get("llama_models_preset")
+        if llama_models_preset:
+            env["LLAMA_MODELS_PRESET"] = str(llama_models_preset)
+
+        distrobox_cmd = ["distrobox", "enter", distrobox_name, "--", script_path, "router"]
+    else:
+        if model is None:
+            msg = "Model name is required when not running in router mode"
+            logger.error(msg)
+            last_start_failure = msg
+            broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
+            return None
+        distrobox_cmd = ["distrobox", "enter", distrobox_name, "--", script_path, model]
 
     # Helper to start a subprocess and capture immediate stderr/stdout if it
     # exits quickly. Returns a tuple (Popen|None, captured_output_str|None).
@@ -708,7 +857,7 @@ def start_llama_server(model: str) -> Optional[subprocess.Popen]:
         proc, out = _spawn_and_capture(distrobox_cmd)
         tried_cmds.append((distrobox_cmd, out))
         if proc is not None:
-            current_model = model
+            current_model = None if router_mode else model
             return proc
         # If out is present, the command exited quickly with output; log and retry
         logger.warning(f"distrobox attempt {attempt+1} failed quickly: {out}")
@@ -822,6 +971,9 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
     llama_model = get_local_model_name(requested_model)
     if llama_model is None:
         return False
+
+    server_config = config.get("server", {})
+    router_mode = server_config.get("llama_router_mode", False)
     
     async with model_switch_lock:
         if current_model == llama_model and llama_process is not None:
@@ -836,13 +988,62 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
             "target_model": llama_model,
             "previous_model": current_model
         })
-        
+
+        timeout = server_config.get("llama_startup_timeout", 300)
+
+        if router_mode:
+            if llama_process is None or llama_process.poll() is not None:
+                llama_process = start_llama_server(None)
+
+                if llama_process is None:
+                    logger.error("start_llama_server failed to spawn router process")
+                    return False
+
+                if not await wait_for_llama_server(timeout):
+                    await broadcast_status("error", {
+                        "message": "Failed to start router-mode llama-server",
+                        "current_model": None,
+                        "llama_server_running": False
+                    })
+                    stop_llama_server()
+                    return False
+
+            if not await router_load_model(llama_model):
+                await broadcast_status("error", {
+                    "message": f"Failed to load model {llama_model} via router",
+                    "current_model": None,
+                    "llama_server_running": True
+                })
+                return False
+
+            # Enforce embeddings pinned: ensure embeddings preset remains loaded
+            embeddings_preset = server_config.get("embeddings_model")
+            if embeddings_preset:
+                try:
+                    await router_load_model(embeddings_preset)
+                    await router_wait_for_model(embeddings_preset, timeout=server_config.get("llama_embed_load_timeout", 30))
+                except Exception:
+                    logger.warning("Failed to ensure embeddings preset is loaded/pinned")
+
+            load_timeout = server_config.get("llama_model_load_timeout", timeout)
+            if not await router_wait_for_model(llama_model, timeout=load_timeout):
+                await broadcast_status("error", {
+                    "message": f"Timed out waiting for model {llama_model} to load",
+                    "current_model": None,
+                    "llama_server_running": True
+                })
+                return False
+
+            current_model = llama_model
+            await broadcast_status("ready", {
+                "current_model": llama_model,
+                "llama_server_running": True
+            })
+            return True
+
         # Need to switch models or restart
         stop_llama_server()
-        
-        server_config = config.get("server", {})
-        timeout = server_config.get("llama_startup_timeout", 300)
-        
+
         llama_process = start_llama_server(llama_model)
 
         # If starting the process failed immediately (start_llama_server returns None),
@@ -899,6 +1100,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not model_name:
         model_name = current_model
 
+    # If router mode is enabled, translate model aliases to llama preset ids
+    if server_config.get("llama_router_mode", False) and isinstance(body_json, dict):
+        requested = body_json.get("model")
+        if requested:
+            llama_model = get_local_model_name(requested)
+            if llama_model and llama_model != requested:
+                body_json["model"] = llama_model
+                body = json.dumps(body_json).encode("utf-8")
+
     # Token accounting: estimate tokens sent
     try:
         tokens_sent = 0
@@ -937,37 +1147,55 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if is_streaming:
         # Streaming response - client must stay open during streaming
         client = httpx.AsyncClient(timeout=None)
-        
+        # Manually open the httpx stream so we can capture backend headers
+        cm = client.stream(
+            request.method,
+            target_url,
+            headers=headers,
+            content=body
+        )
+
+        # Enter the stream to obtain the response and headers
+        response = await cm.__aenter__()
+        # Normalize backend headers for streaming (remove content-length if TE present)
+        outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
+        # Ensure Cache-Control is present
+        if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
+            outgoing_headers['Cache-Control'] = 'no-cache'
+
+        media_type = response.headers.get('content-type', 'text/event-stream')
+
         async def stream_generator():
             try:
-                async with client.stream(
-                    request.method,
-                    target_url,
-                    headers=headers,
-                    content=body
-                ) as response:
-                    async for chunk in response.aiter_bytes():
-                        # count tokens in this chunk (best-effort)
+                async for chunk in response.aiter_bytes():
+                    # count tokens in this chunk (best-effort)
+                    try:
+                        chunk_text = chunk.decode('utf-8', errors='replace')
+                        # simple heuristic: count tokens in chunk text
+                        chunk_tokens = count_text_tokens(chunk_text, model_name)
                         try:
-                            chunk_text = chunk.decode('utf-8', errors='replace')
-                            # simple heuristic: count tokens in chunk text
-                            chunk_tokens = count_text_tokens(chunk_text, model_name)
-                            try:
-                                loop = asyncio.get_running_loop()
-                                loop.create_task(_increment_tokens('recv', key, chunk_tokens))
-                            except RuntimeError:
-                                asyncio.run(_increment_tokens('recv', key, chunk_tokens))
-                        except Exception:
-                            pass
-                        yield chunk
-                        log_response_chunk(chunk)
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(_increment_tokens('recv', key, chunk_tokens))
+                        except RuntimeError:
+                            asyncio.run(_increment_tokens('recv', key, chunk_tokens))
+                    except Exception:
+                        pass
+                    yield chunk
+                    log_response_chunk(chunk)
             finally:
-                await client.aclose()
-        
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
         return StreamingResponse(
             stream_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"}
+            media_type=media_type,
+            headers=outgoing_headers
         )
     else:
         # Non-streaming response
@@ -996,7 +1224,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=dict(response.headers)
+                headers=_normalize_outgoing_headers(dict(response.headers), buffered=True)
             )
 
 
@@ -1052,57 +1280,71 @@ async def proxy_to_remote(
     if is_streaming:
         # Streaming response - client must stay open during streaming
         client = httpx.AsyncClient(timeout=None)
-        
+        cm = client.stream(
+            request.method,
+            target_url,
+            headers=headers,
+            content=body
+        )
+
+        response = await cm.__aenter__()
+        outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
+        if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
+            outgoing_headers['Cache-Control'] = 'no-cache'
+
+        media_type = response.headers.get('content-type', 'text/event-stream')
+
         async def stream_generator():
             try:
-                async with client.stream(
-                    request.method,
-                    target_url,
-                    headers=headers,
-                    content=body
-                ) as response:
-                    async for chunk in response.aiter_bytes():
-                        # parse OpenAI-style SSE chunks for delta content when possible
-                        try:
-                            s = chunk.decode('utf-8', errors='replace')
-                            # look for lines starting with 'data: '
-                            texts = []
-                            for line in s.splitlines():
-                                line = line.strip()
-                                if not line.startswith('data:'):
-                                    continue
-                                payload = line[5:].strip()
-                                if payload == '[DONE]':
-                                    continue
-                                try:
-                                    j = json.loads(payload)
-                                    # extract any delta.content fields
-                                    for choice in j.get('choices', []):
-                                        delta = choice.get('delta', {})
-                                        if isinstance(delta, dict) and 'content' in delta:
-                                            texts.append(str(delta.get('content', '')))
-                                except Exception:
-                                    # fallback: treat payload as plain text
-                                    texts.append(payload)
-                            if texts:
-                                chunk_text = '\n'.join(texts)
-                                chunk_tokens = count_text_tokens(chunk_text, model_name)
-                                try:
-                                    loop = asyncio.get_running_loop()
-                                    loop.create_task(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
-                                except RuntimeError:
-                                    asyncio.run(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
-                        except Exception:
-                            pass
-                        yield chunk
-                        log_response_chunk(chunk)
+                async for chunk in response.aiter_bytes():
+                    # parse OpenAI-style SSE chunks for delta content when possible
+                    try:
+                        s = chunk.decode('utf-8', errors='replace')
+                        # look for lines starting with 'data: '
+                        texts = []
+                        for line in s.splitlines():
+                            line = line.strip()
+                            if not line.startswith('data:'):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == '[DONE]':
+                                continue
+                            try:
+                                j = json.loads(payload)
+                                # extract any delta.content fields
+                                for choice in j.get('choices', []):
+                                    delta = choice.get('delta', {})
+                                    if isinstance(delta, dict) and 'content' in delta:
+                                        texts.append(str(delta.get('content', '')))
+                            except Exception:
+                                # fallback: treat payload as plain text
+                                texts.append(payload)
+                        if texts:
+                            chunk_text = '\n'.join(texts)
+                            chunk_tokens = count_text_tokens(chunk_text, model_name)
+                            try:
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
+                            except RuntimeError:
+                                asyncio.run(_increment_tokens('recv', f"{request.method.upper()} {request.url.path} -> remote", chunk_tokens))
+                    except Exception:
+                        pass
+                    yield chunk
+                    log_response_chunk(chunk)
             finally:
-                await client.aclose()
-        
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
         return StreamingResponse(
             stream_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"}
+            media_type=media_type,
+            headers=outgoing_headers
         )
     else:
         async with httpx.AsyncClient(timeout=None) as client:
@@ -1132,7 +1374,7 @@ async def proxy_to_remote(
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=dict(response.headers)
+                headers=_normalize_outgoing_headers(dict(response.headers), buffered=True)
             )
 
 
@@ -1248,9 +1490,18 @@ async def lifespan(app: FastAPI):
     # full model-load time (potentially 5+ minutes) and also handles the
     # boot-order race where distrobox/podman isn't ready yet.
     default_model = config.get("default_model", "qwen3")
+    router_mode = config.get("server", {}).get("llama_router_mode", False)
+    router_preload = config.get("server", {}).get("llama_router_preload", [])
+    router_preload_list = list(router_preload) if isinstance(router_preload, list) else []
+    if router_mode:
+        if "embeddings" not in router_preload_list:
+            router_preload_list.append("embeddings")
+        if default_model and default_model not in router_preload_list:
+            router_preload_list.append(default_model)
 
     async def _load_default_model():
         """Load the default model with retries, running in the background."""
+        global current_model, llama_process
         max_attempts = 6
         retry_delays = [0, 30, 60, 120, 240, 300]  # first attempt immediate
         for attempt, delay in enumerate(retry_delays[:max_attempts], 1):
@@ -1261,10 +1512,28 @@ async def lifespan(app: FastAPI):
                 )
                 await asyncio.sleep(delay)
             # If something else loaded a model while we were waiting, stop
-            if current_model is not None:
+            if current_model is not None and not router_mode:
                 logger.info("Model already loaded by another request, stopping background loader")
                 return
             try:
+                if router_mode:
+                    if llama_process is None or llama_process.poll() is not None:
+                        llama_process = start_llama_server(None)
+                        if llama_process is None:
+                            raise RuntimeError("Failed to start router-mode llama-server")
+                    if not await wait_for_llama_server(config.get("server", {}).get("llama_startup_timeout", 300)):
+                        raise RuntimeError("Router-mode llama-server failed to become ready")
+
+                    resolved = []
+                    if router_preload_list:
+                        resolved = [get_local_model_name(name) or name for name in router_preload_list]
+                        if not await router_preload_models(resolved):
+                            raise RuntimeError(f"Router preload failed for {router_preload_list}")
+                        logger.info(f"Router preload complete: {router_preload_list}")
+                        if resolved:
+                            current_model = resolved[0]
+                    return
+
                 if await ensure_model_loaded(default_model):
                     logger.info(f"Default model '{default_model}' loaded successfully")
                     return
@@ -1351,6 +1620,11 @@ async def index(request: Request):
     local_model_names = [name for name, cfg in config.get("models", {}).items() if cfg.get("type") == "local"]
     local_model_names_json = json.dumps(local_model_names)
 
+    router_mode = config.get("server", {}).get("llama_router_mode", False)
+    router_models = None
+    if router_mode:
+        router_models = await router_list_models()
+
     # Base URL from incoming request (includes scheme and host:port)
     base = str(request.base_url).rstrip('/')
 
@@ -1393,7 +1667,8 @@ async def index(request: Request):
         .subtitle {{ color: var(--text-secondary); margin-bottom: 2rem; font-size: 1.1rem; }}
         .status-bar {{
             display: flex;
-            gap: 2rem;
+            flex-wrap: wrap;
+            gap: 1.5rem;
             background: var(--bg-card);
             padding: 1rem 1.5rem;
             border-radius: 8px;
@@ -1820,6 +2095,10 @@ async def index(request: Request):
                 <strong>Current Model:</strong>
                 <code id="currentModelStatus">{current_model or 'None'}</code>
             </div>
+            <div class="status-item" id="routerModeStatus" data-router-mode="{'true' if router_mode else 'false'}" style="display: {'flex' if router_mode else 'none'};">
+                <strong>Router:</strong>
+                <span id="routerModeLabel">{'Enabled' if router_mode else 'Disabled'}</span>
+            </div>
             <div class="status-item">
                 <strong>llama-server:</strong>
                 <span id="llamaServerStatus">{'Running' if llama_process and llama_process.poll() is None else 'Stopped'}</span>
@@ -2109,6 +2388,8 @@ API Endpoints
         const currentModelEl = document.getElementById('currentModelStatus');
         const llamaStatusEl = document.getElementById('llamaServerStatus');
         const statusEl = document.getElementById('statusMessage');
+        const routerModeEl = document.getElementById('routerModeStatus');
+        const routerModeLabel = document.getElementById('routerModeLabel');
         
         // Stats panel elements
         const statsPanel = document.getElementById('statsPanel');
@@ -2121,6 +2402,15 @@ API Endpoints
         
         // Track the actual current model (updated after successful operations)
         let actualCurrentModel = '{current_model or "None"}';
+        const routerModeEnabled = Boolean(window.__ROUTER_MODE);
+        const routerModels = window.__ROUTER_MODELS;
+
+        if (routerModeEl) {{
+            const serverFlag = routerModeEl.dataset.routerMode === 'true';
+            const enabled = routerModeEnabled || serverFlag;
+            routerModeEl.style.display = enabled ? 'flex' : 'none';
+            if (routerModeLabel) routerModeLabel.textContent = enabled ? 'Enabled' : 'Disabled';
+        }}
         
         // Toggle stats panel visibility
         function toggleStatsPanel() {{
@@ -2139,6 +2429,13 @@ API Endpoints
             
             if (data.current_model !== undefined) {{
                 const val = data.current_model || '-';
+                if (statsModelEl.textContent !== val) {{
+                    statsModelEl.textContent = val;
+                }}
+            }}
+
+            if (data.loaded_models !== undefined) {{
+                const val = data.loaded_models.length ? data.loaded_models.join(', ') : '-';
                 if (statsModelEl.textContent !== val) {{
                     statsModelEl.textContent = val;
                 }}
@@ -2233,6 +2530,9 @@ API Endpoints
                     currentModelEl.textContent = data.current_model;
                     llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
                 }}
+                if (data.loaded_models) {{
+                    statsModelEl.textContent = data.loaded_models.join(', ');
+                }}
             }} catch (e) {{
                 // Ignore errors
             }}
@@ -2251,6 +2551,9 @@ API Endpoints
                             if (data.current_model) {{
                                 actualCurrentModel = data.current_model;
                                 currentModelEl.textContent = data.current_model;
+                            }}
+                            if (data.loaded_models) {{
+                                statsModelEl.textContent = data.loaded_models.join(', ');
                             }}
                             llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
                             updateStatsPanel(data);
@@ -2591,15 +2894,26 @@ API Endpoints
     </script>
 </body>
 </html>"""
+    html_content = html_content.replace(
+        '</body>',
+        f'<script>window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script></body>'
+    )
     return HTMLResponse(content=html_content)
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    router_mode = config.get("server", {}).get("llama_router_mode", False)
+    loaded_models = None
+    if router_mode:
+        router_models = await router_list_models()
+        loaded_models = _extract_router_model_ids(router_models)
+
     return {
         "status": "healthy",
         "current_model": current_model,
+        "loaded_models": loaded_models,
         "llama_server_running": llama_process is not None and llama_process.poll() is None
     }
 
@@ -2616,9 +2930,15 @@ async def status_events():
             total_sent = token_counts.get("total_sent", 0)
             total_recv = token_counts.get("total_recv", 0)
             
+            loaded_models = None
+            if llama_status.get("router_mode"):
+                router_models = await router_list_models()
+                loaded_models = _extract_router_model_ids(router_models)
+
             initial_status = json.dumps({
                 "type": "status",
                 "current_model": current_model,
+                "loaded_models": loaded_models,
                 "llama_server_running": llama_status["llama_server_running"],
                 "n_ctx": llama_status["n_ctx"],
                 "kv_cache_tokens": llama_status["kv_cache_tokens"],
@@ -3100,6 +3420,10 @@ async def view_logs(request: Request):
         tokens_snapshot = dict(token_counts)
 
     model_list = list(config.get("models", {}).keys())
+    router_mode = config.get("server", {}).get("llama_router_mode", False)
+    router_models = None
+    if router_mode:
+        router_models = await router_list_models()
     model_list_json = json.dumps(model_list)
     initial_stats_json = json.dumps({"counts": counts_snapshot, "tokens": tokens_snapshot})
 
@@ -3108,7 +3432,7 @@ async def view_logs(request: Request):
     html = html.replace('{tokens_html}', '')
 
     # Inject initial stats and model list script before </body>
-    html = html.replace('</body>', f'<script>window.__INITIAL_STATS = {initial_stats_json}; window.__MODEL_LIST = {model_list_json};</script></body>')
+    html = html.replace('</body>', f'<script>window.__INITIAL_STATS = {initial_stats_json}; window.__MODEL_LIST = {model_list_json}; window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script></body>')
     return HTMLResponse(content=html)
 
 
@@ -3190,14 +3514,16 @@ async def create_embeddings(request: Request):
         )
     
     if model_cfg.get("type") == "local":
+        server_config = config.get("server", {})
+        router_mode = server_config.get("llama_router_mode", False)
         # Check if we need to switch models
         llama_model = model_cfg.get("llama_model")
-        
-        if current_model != llama_model:
+
+        if current_model != llama_model and not router_mode:
             logger.info(
                 f"Model switch requested for embeddings: {current_model} -> {llama_model}"
             )
-            
+
             if not await ensure_model_loaded(model_name):
                 raise HTTPException(
                     status_code=503,
@@ -3208,7 +3534,18 @@ async def create_embeddings(request: Request):
                     },
                     headers={"Retry-After": "30"}
                 )
-        
+
+        if router_mode and not await ensure_model_loaded(model_name):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "model_loading",
+                    "message": f"Failed to load model {model_name}",
+                    "retry_after": 30
+                },
+                headers={"Retry-After": "30"}
+            )
+
         return await proxy_to_local(request, "v1/embeddings")
     
     elif model_cfg.get("type") == "remote":
@@ -3264,14 +3601,16 @@ async def proxy_openai_api(request: Request, path: str):
         )
     
     if model_cfg.get("type") == "local":
+        server_config = config.get("server", {})
+        router_mode = server_config.get("llama_router_mode", False)
         # Check if we need to switch models
         llama_model = model_cfg.get("llama_model")
-        
-        if current_model != llama_model:
+
+        if current_model != llama_model and not router_mode:
             logger.info(
                 f"Model switch requested: {current_model} -> {llama_model}"
             )
-            
+
             # Return 503 with Retry-After header
             # This tells the client to retry after the model loads
             if not await ensure_model_loaded(model_name):
@@ -3284,7 +3623,18 @@ async def proxy_openai_api(request: Request, path: str):
                     },
                     headers={"Retry-After": "30"}
                 )
-        
+
+        if router_mode and not await ensure_model_loaded(model_name):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "model_loading",
+                    "message": f"Failed to load model {model_name}",
+                    "retry_after": 30
+                },
+                headers={"Retry-After": "30"}
+            )
+
         return await proxy_to_local(request, f"v1/{path}")
     
     elif model_cfg.get("type") == "remote":
