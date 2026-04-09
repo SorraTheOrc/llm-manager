@@ -705,22 +705,30 @@ async def router_preload_models(model_names: list[str]) -> bool:
     return True
 
 
-def _normalize_outgoing_headers(in_headers: dict) -> dict:
+def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dict:
     """Normalize headers before sending to clients.
 
-    Ensure we do not send conflicting HTTP/1.1 framing headers.
-    If both Transfer-Encoding and Content-Length are present, remove
-    Content-Length so clients (e.g. Node/undici) do not fail with
-    HPE_UNEXPECTED_CONTENT_LENGTH.
+    - If buffered=True (we are sending a full body via Response), remove
+      any Transfer-Encoding header so frameworks/servers may set a proper
+      Content-Length for the buffered body.
+    - If buffered=False (we are streaming and will not pre-compute a
+      Content-Length), remove Content-Length if Transfer-Encoding is present
+      to avoid sending both headers.
     """
     if not in_headers:
         return {}
-    # Map lowercase header name to the actual key present so we can delete original-cased key
     lc_map = {k.lower(): k for k in in_headers.keys()}
     out = dict(in_headers)
-    if 'transfer-encoding' in lc_map and 'content-length' in lc_map:
-        # remove Content-Length header by its original key name
-        out.pop(lc_map['content-length'], None)
+
+    if buffered:
+        # We're returning a buffered body; ensure Transfer-Encoding is not forwarded
+        if 'transfer-encoding' in lc_map:
+            out.pop(lc_map['transfer-encoding'], None)
+    else:
+        # Streaming or unknown delivery: do not forward Content-Length when TE exists
+        if 'transfer-encoding' in lc_map and 'content-length' in lc_map:
+            out.pop(lc_map['content-length'], None)
+
     return out
 
 
@@ -1198,7 +1206,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=_normalize_outgoing_headers(dict(response.headers))
+                headers=_normalize_outgoing_headers(dict(response.headers), buffered=True)
             )
 
 
@@ -1334,7 +1342,7 @@ async def proxy_to_remote(
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=_normalize_outgoing_headers(dict(response.headers))
+                headers=_normalize_outgoing_headers(dict(response.headers), buffered=True)
             )
 
 
