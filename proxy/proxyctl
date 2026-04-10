@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="proxyctl"
+
+PID_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy"
+PID_FILE="$PID_DIR/proxy.pid"
+LOG_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy/logs"
+LOG_FILE="$LOG_DIR/proxy.log"
+CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.yaml"
+
+ensure_dirs() {
+  mkdir -p "$PID_DIR"
+  mkdir -p "$LOG_DIR"
+}
+
+read_config_start_script() {
+  # Respect environment override first
+  if [[ -n "${LLAMA_START_SCRIPT:-}" ]]; then
+    echo "$LLAMA_START_SCRIPT"
+    return
+  fi
+
+  # Try to parse proxy/config.yaml for llama_start_script
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # crude YAML parse: look for the first occurrence of "llama_start_script" and extract the value
+    local val
+    val=$(awk -F ':' '/llama_start_script/ { $1=""; sub(/^[: \t]+/, "", $0); print $0; exit }' "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//') || true
+    if [[ -n "$val" ]]; then
+      echo "$val"
+      return
+    fi
+  fi
+
+  # Fallback to top-level start script
+  echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)/start-llama.sh"
+}
+
+is_running() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+cmd_start() {
+  ensure_dirs
+  if pid=$(is_running); then
+    echo "proxy already running (PID $pid)"
+    exit 0
+  fi
+
+  start_script=$(read_config_start_script)
+  if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+    echo "Start script not found: $start_script" >&2
+    exit 2
+  fi
+
+  echo "Starting proxy using: $start_script"
+  # Run in background, redirecting output to log file.
+  nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+  echo "Started (PID $pid). Logs: $LOG_FILE"
+}
+
+cmd_stop() {
+  if ! pid=$(is_running); then
+    echo "proxy not running"
+    exit 0
+  fi
+  echo "Stopping proxy (PID $pid)"
+  kill -TERM "$pid" 2>/dev/null || true
+  # wait up to 10s
+  local t=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    t=$((t+1))
+    if [[ $t -ge 10 ]]; then
+      echo "Process did not exit, sending SIGKILL"
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+  done
+  rm -f "$PID_FILE"
+  echo "Stopped"
+}
+
+cmd_status() {
+  if pid=$(is_running); then
+    echo "proxy running (PID $pid)"
+    if ps -p "$pid" >/dev/null 2>&1; then
+      start_time=$(ps -p "$pid" -o lstart= 2>/dev/null || true)
+      if [[ -n "$start_time" ]]; then
+        echo "Started: $start_time"
+      fi
+    fi
+    exit 0
+  else
+    echo "proxy not running"
+    exit 3
+  fi
+}
+
+cmd_restart() {
+  cmd_stop || true
+  sleep 1
+  cmd_start
+}
+
+cmd_logs() {
+  ensure_dirs
+  if [[ ! -f "$LOG_FILE" ]]; then
+    echo "Logfile does not exist yet: $LOG_FILE"
+    exit 1
+  fi
+  tail -n +1 -f "$LOG_FILE"
+}
+
+usage() {
+  cat <<EOF
+$SCRIPT_NAME - manage local llama proxy
+
+Usage: $SCRIPT_NAME <command>
+
+Commands:
+  start     Start the proxy (uses config or start-llama.sh)
+  stop      Stop the running proxy (SIGTERM then SIGKILL)
+  restart   Stop then start
+  status    Show running status, PID and start time
+  logs      Tail the proxy log produced by $SCRIPT_NAME
+  help      Show this message
+
+Environment:
+  LLAMA_START_SCRIPT  Override the start script path
+  XDG_STATE_HOME      Base dir for state (defaults to ~/.local/state)
+
+Install:
+  Copy this file to a location on PATH and make it executable, e.g.
+    sudo install -m 0755 proxy/proxyctl /usr/local/bin/proxyctl
+
+EOF
+}
+
+main() {
+  if [[ ${#@} -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+  cmd="$1"
+  shift || true
+  case "$cmd" in
+    start) cmd_start ;; 
+    stop) cmd_stop ;; 
+    restart) cmd_restart ;; 
+    status) cmd_status ;; 
+    logs) cmd_logs ;; 
+    help|-h|--help) usage ;; 
+    *) echo "Unknown command: $cmd"; usage; exit 2 ;;
+  esac
+}
+
+main "$@"
