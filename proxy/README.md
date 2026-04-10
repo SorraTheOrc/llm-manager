@@ -55,6 +55,27 @@ sudo chown $USER:$USER /var/log/llama-proxy
 <!-- If you wish to run the proxy as a systemd unit, create and manage service files outside of this repository. -->
 ```
 
+## proxyctl (CLI)
+
+A small bash CLI `proxyctl` is included to manage a user-local proxy process. It supports: `start`, `stop`, `restart`, `status`, and `logs`.
+
+Installation example:
+
+```sh
+sudo install -m 0755 proxy/proxyctl /usr/local/bin/proxyctl
+```
+
+Usage examples:
+
+```sh
+proxyctl start    # start using proxy/config.yaml llama_start_script or start-llama.sh
+proxyctl status   # show running status and PID
+proxyctl logs     # tail the proxy logs
+proxyctl stop     # stop the running proxy
+```
+
+The script respects `LLAMA_START_SCRIPT` environment variable and `proxy/config.yaml` `server.llama_start_script` entry when determining what to run.
+
 ## Configuration
 
 Edit `config.yaml` to configure the server:
