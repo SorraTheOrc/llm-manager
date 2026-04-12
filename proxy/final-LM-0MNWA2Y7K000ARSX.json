@@ -1,0 +1,26 @@
+{
+  "items": [],
+  "o": 4,
+  "m": 8,
+  "p": 16,
+  "overheads": {
+    "coordination": 2,
+    "review": 1,
+    "testing": 2,
+    "risk_buffer": 2
+  },
+  "parent": {
+    "probability": 2,
+    "impact": 2
+  },
+  "children": [],
+  "certainty": 75,
+  "assumptions": [
+    "Uses existing SSE infra in server.py",
+    "No breaking changes to production log paths"
+  ],
+  "unknowns": [
+    "Production log read permissions may differ",
+    "If merged stream used, client parsing must be updated"
+  ]
+}

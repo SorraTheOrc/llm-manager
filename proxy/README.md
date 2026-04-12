@@ -413,6 +413,21 @@ journalctl -u llama-proxy -f
 
 The project includes end-to-end tests using Playwright to verify the Web UI and SSE functionality.
 
+### Python tests (pytest)
+
+The proxy backend includes Python tests. To run them from the `proxy` folder:
+
+```bash
+# from repository root
+cd proxy
+source .venv/bin/activate   # if you have a virtualenv
+# or create one: python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pytest
+```
+
+Some integration tests expect a local proxy/llama-server to be running (see test files for details).
+
 ### Setup
 
 ```bash
