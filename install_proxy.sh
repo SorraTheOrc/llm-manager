@@ -5,8 +5,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.venv"
-LOG_DIR="$SCRIPT_DIR/logs"
+PROXY_DIR="$SCRIPT_DIR/proxy"
+VENV_DIR="$PROXY_DIR/.venv"
+LOG_DIR="$PROXY_DIR/logs"
 
 echo "=========================================="
 echo "LLama Proxy Server Installation"
@@ -32,7 +33,7 @@ echo
 echo "[2/5] Installing Python dependencies..."
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip > /dev/null
-pip install -r "$SCRIPT_DIR/requirements.txt"
+pip install -r "$PROXY_DIR/requirements.txt"
 echo
 
 echo "[3/5] Setting up log directory..."
@@ -51,7 +52,7 @@ echo "Configuration"
 echo "=========================================="
 echo
 echo "1. Edit the configuration file:"
-echo "   $SCRIPT_DIR/config.yaml"
+echo "   $PROXY_DIR/config.yaml"
 echo
 echo "2. Set API keys for remote services (if needed):"
 echo "   export OPENAI_API_KEY='your-key'"
@@ -66,9 +67,9 @@ echo "Running the Server"
 echo "=========================================="
 echo
 echo "Manual start (development):"
-echo "   cd $SCRIPT_DIR"
+echo "   cd $PROXY_DIR"
 echo "   source .venv/bin/activate"
-echo "   python -m uvicorn server:app --host 0.0.0.0 --port 8000"
+echo "   python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000"
 echo
 echo "Service start (production):"
 echo "   If you installed a service unit outside this repo, start it with your service manager (example: systemd):"
