@@ -75,6 +75,9 @@ _http_client: Optional[httpx.AsyncClient] = None
 _llama_status_endpoint_cache: Optional[str] = None
 # Record recent failures for endpoints to avoid hammering endpoints that 404
 _llama_status_endpoint_failures: dict = {}
+# One-time discovery markers: avoid repeated discovery for the same process
+_llama_status_discovered: bool = False
+_llama_status_discovered_pid: Optional[int] = None
 
 def schedule_background_load(model_name: str) -> bool:
     """Schedule model load in background if not already running.
@@ -411,45 +414,47 @@ async def query_llama_status() -> dict:
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
 
-    # resilient endpoint discovery/caching to avoid repeated 404s
+    # One-time discovery: probe metadata endpoints once per llama-server process
     client = _http_client if _http_client else httpx.AsyncClient(timeout=5.0)
     try:
-        # endpoints to try in order of preference. many llama-server variants
-        # expose either /model or /status; some expose router endpoints like
-        # /models or OpenAI-compatible /v1/models. Try cached endpoint first.
-        endpoints = ["/model", "/status", "/models", "/v1/models"]
-
-        # Prefer a previously-cached working endpoint to avoid repeatedly
-        # hitting endpoints that returned 404. During pytest runs we avoid
-        # using the cache to prevent cross-test pollution (pytest sets
-        # PYTEST_CURRENT_TEST in the environment).
-        cached = None
-        try:
-            if 'PYTEST_CURRENT_TEST' not in os.environ:
-                cached = _llama_status_endpoint_cache
-        except Exception:
-            cached = None
-
-        # cooldown (seconds) to avoid hammering endpoints that recently 404'd
-        server_cfg = config.get("server", {})
-        cooldown = server_cfg.get("llama_status_fail_cooldown", 300)
-
-        # If we have a cached endpoint, try it first (unless it's on cooldown)
-        tried = set()
-        if cached:
-            last_fail = _llama_status_endpoint_failures.get(cached)
-            if last_fail and (time.time() - last_fail) < cooldown:
-                # recently failed; skip cached endpoint and try discovery below
-                cached = None
-
-        if cached:
+        async def _do_discovery_if_needed():
+            """Discover a working metadata endpoint once per process."""
+            global _llama_status_endpoint_cache, _llama_status_discovered, _llama_status_discovered_pid
+            # If discovery was already done for this pid, skip.
             try:
-                url = f"http://localhost:{llama_port}{cached}"
+                current_pid = getattr(llama_process, 'pid', None)
+            except Exception:
+                current_pid = None
+            if _llama_status_discovered and _llama_status_discovered_pid == current_pid:
+                return
+
+            endpoints = ["/model", "/status", "/models", "/v1/models"]
+            for endpoint in endpoints:
+                try:
+                    url = f"http://localhost:{llama_port}{endpoint}"
+                    resp = await client.get(url, timeout=5.0)
+                    if getattr(resp, 'status_code', None) == 200:
+                        _llama_status_endpoint_cache = endpoint
+                        _llama_status_endpoint_failures.pop(endpoint, None)
+                        break
+                except Exception:
+                    # ignore and try next
+                    continue
+            # Mark discovery done for this pid even if none found
+            _llama_status_discovered = True
+            try:
+                _llama_status_discovered_pid = getattr(llama_process, 'pid', None)
+            except Exception:
+                _llama_status_discovered_pid = None
+
+        await _do_discovery_if_needed()
+
+        # If we have a cached endpoint, try it first
+        if _llama_status_endpoint_cache:
+            try:
+                url = f"http://localhost:{llama_port}{_llama_status_endpoint_cache}"
                 response = await client.get(url, timeout=5.0)
-                status = getattr(response, "status_code", None)
-                if status == 200:
-                    _llama_status_endpoint_cache = cached
-                    # parse response same as below
+                if getattr(response, 'status_code', None) == 200:
                     data = None
                     if hasattr(response, 'json'):
                         try:
@@ -469,73 +474,19 @@ async def query_llama_status() -> dict:
                             result["n_ctx"] = data.get("n_ctx") or data.get("n_ctx_total")
                         if result["kv_cache_tokens"] is None:
                             result["kv_cache_tokens"] = (
-                                data.get("kv_cache_tokens") or 
-                                data.get("kv_cache_token_count")
+                                data.get("kv_cache_tokens") or data.get("kv_cache_token_count")
                             )
-                    # Successful cached endpoint - done
-                    return result
                 else:
-                    # Cache produced non-200 (maybe 404) - record failure timestamp
-                    if status == 404:
-                        _llama_status_endpoint_failures[cached] = time.time()
-                    # fall through to normal discovery
+                    # cache no longer valid; clear and allow future rediscovery
+                    _llama_status_endpoint_failures[_llama_status_endpoint_cache] = time.time()
+                    _llama_status_endpoint_cache = None
+                    _llama_status_discovered = False
+                    _llama_status_discovered_pid = None
             except Exception:
-                # network error - fall through to discovery
-                pass
-            finally:
-                tried.add(cached)
-
-        for endpoint in endpoints:
-            if endpoint in tried:
-                continue
-            # skip endpoints that recently returned 404 to avoid hammering them
-            last_fail = _llama_status_endpoint_failures.get(endpoint)
-            if last_fail and (time.time() - last_fail) < cooldown:
-                continue
-            try:
-                url = f"http://localhost:{llama_port}{endpoint}"
-                response = await client.get(url, timeout=5.0)
-                status = getattr(response, "status_code", None)
-                if status == 200:
-                    # Remember successful endpoint for future diagnostics
-                    _llama_status_endpoint_cache = endpoint
-                    # clear any recorded failures for this endpoint
-                    _llama_status_endpoint_failures.pop(endpoint, None)
-                    try:
-                        data = None
-                        if hasattr(response, 'json'):
-                            try:
-                                maybe = response.json()
-                                data = await maybe if asyncio.iscoroutine(maybe) else maybe
-                            except Exception:
-                                data = None
-                        if data is None and hasattr(response, 'text'):
-                            try:
-                                txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
-                                data = json.loads(txt)
-                            except Exception:
-                                data = None
-
-                        if isinstance(data, dict):
-                            if result["n_ctx"] is None:
-                                result["n_ctx"] = data.get("n_ctx") or data.get("n_ctx_total")
-                            if result["kv_cache_tokens"] is None:
-                                result["kv_cache_tokens"] = (
-                                    data.get("kv_cache_tokens") or 
-                                    data.get("kv_cache_token_count")
-                                )
-                            if result["n_ctx"] is not None and result["kv_cache_tokens"] is not None:
-                                break
-                    except Exception:
-                        # ignore JSON parse errors and continue to next endpoint
-                        pass
-                else:
-                    # non-200 responses: try next candidate
-                    pass
-            except Exception:
-                # transient network errors: ignore and try next endpoint
+                # ignore and fallthrough to props check
                 pass
 
+        # As a fallback, check /props to detect router mode
         try:
             props_url = f"http://localhost:{llama_port}/props"
             response = await client.get(props_url, timeout=5.0)
