@@ -89,7 +89,7 @@ server:
   llama_router_mode: true
   llama_router_preload:
     - "embeddings"
-    - "qwen3"
+    - "gemma4"    # preload the configured default model (gemma4)
   llama_models_max: 2
   distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
