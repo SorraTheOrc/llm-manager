@@ -267,3 +267,62 @@ async def test_query_llama_status_concurrent_requests_do_not_block(mock_config):
                     assert result["n_ctx"] == 4096
                 
                 assert elapsed < 1.0
+
+
+@pytest.mark.asyncio
+async def test_status_request_during_streaming_request(mock_config):
+    """Verify status requests complete even when a streaming request is active.
+    
+    This test simulates the scenario described in LP-0MNWEZMUX009XL9B where
+    the /llama/local/status endpoint hangs while llama-server is busy processing
+    a streaming OpenAI request. With connection pooling, the status request
+    should complete within a reasonable time.
+    """
+    from proxy.server import query_llama_status
+    
+    mock_process = MagicMock()
+    mock_process.poll.return_value = None
+    
+    status_response_received = asyncio.Event()
+    
+    async def slow_status_get(*args, **kwargs):
+        await asyncio.sleep(0.1)
+        return MockResponse(200, {"n_ctx": 4096})
+    
+    async def blocking_stream_get(*args, **kwargs):
+        await status_response_received.wait()
+        return MockResponse(200, {"content": b"data: chunk\n\n"})
+    
+    mock_status_client = MagicMock()
+    mock_status_client.get = slow_status_get
+    mock_status_client.aclose = AsyncMock()
+    
+    async def run_test():
+        nonlocal status_response_received
+        
+        async def streaming_request():
+            status_response_received.set()
+            await asyncio.sleep(0.2)
+            return [b"data: chunk\n\n"]
+        
+        async def status_request():
+            return await query_llama_status()
+        
+        results = await asyncio.gather(
+            streaming_request(),
+            status_request()
+        )
+        return results
+    
+    with patch('proxy.server.config', mock_config):
+        with patch('proxy.server.llama_process', mock_process):
+            with patch('proxy.server._http_client', mock_status_client):
+                start = asyncio.get_event_loop().time()
+                
+                results = await asyncio.wait_for(run_test(), timeout=2.0)
+                
+                elapsed = asyncio.get_event_loop().time() - start
+                
+                assert results[1]["llama_server_running"] is True
+                assert results[1]["n_ctx"] == 4096
+                assert elapsed < 1.0
