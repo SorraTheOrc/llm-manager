@@ -88,7 +88,11 @@ test.describe('LLama Proxy Status Bar', () => {
     console.log('Initial model:', initialModel);
     
     // Determine which model to switch to
-    const targetModel = initialModel === 'qwen3' ? 'gpt120' : 'qwen3';
+    // Updated defaults: prefer switching between qwen3 and gpt120 for the test.
+    // If the initial model is neither, fall back to qwen3.
+    const alt1 = 'qwen3';
+    const alt2 = 'gpt120';
+    const targetModel = initialModel === alt1 ? alt2 : alt1;
     console.log('Switching to:', targetModel);
     
     // Set up a promise to detect SSE switching event

@@ -1770,7 +1770,8 @@ async def lifespan(app: FastAPI):
     # blocking systemd (which waits for the lifespan to complete) for the
     # full model-load time (potentially 5+ minutes) and also handles the
     # boot-order race where distrobox/podman isn't ready yet.
-    default_model = config.get("default_model", "qwen3")
+    # Read default_model from config; default to gemma4 if not present
+    default_model = config.get("default_model", "gemma4")
     router_mode = config.get("server", {}).get("llama_router_mode", False)
     router_preload = config.get("server", {}).get("llama_router_preload", [])
     router_preload_list = list(router_preload) if isinstance(router_preload, list) else []
