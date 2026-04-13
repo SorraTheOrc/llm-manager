@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch
-from httpx import AsyncClient
+import httpx
 
 
 @pytest.mark.asyncio
@@ -10,8 +10,9 @@ async def test_llama_local_status_not_running():
     async def fake_query():
         return {"llama_server_running": False}
 
+    transport = httpx.ASGITransport(app=app)
     with patch("proxy.server.query_llama_status", side_effect=fake_query):
-        async with AsyncClient(app=app, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             resp = await ac.get("/llama/local/status")
             assert resp.status_code == 200
             j = resp.json()
@@ -34,13 +35,14 @@ async def test_llama_local_status_running_and_switch():
         def locked(self):
             return True
 
+    transport = httpx.ASGITransport(app=app)
     with patch("proxy.server.query_llama_status", side_effect=fake_query):
         # patch the model_switch_lock and background_loads
         with patch.object(server, "model_switch_lock", DummyLock()):
             with patch.object(server, "background_loads", {"m": True}):
                 # also set a current_model value
                 with patch.object(server, "current_model", "test-model"):
-                    async with AsyncClient(app=app, base_url="http://test") as ac:
+                    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
                         resp = await ac.get("/llama/local/status")
                         assert resp.status_code == 200
                         j = resp.json()

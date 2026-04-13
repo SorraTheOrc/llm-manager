@@ -659,7 +659,8 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
     health_url = f"http://localhost:{llama_port}/health"
     
     start_time = time.time()
-    async with httpx.AsyncClient() as client:
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    try:
         while time.time() - start_time < timeout:
             # Check if llama process died
             if llama_process is not None and llama_process.poll() is not None:
@@ -682,6 +683,12 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
             except asyncio.CancelledError:
                 logger.info("Wait for llama-server cancelled")
                 raise
+    finally:
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
     
     logger.error(f"llama-server failed to start within {timeout} seconds")
     return False
@@ -694,7 +701,8 @@ async def router_load_model(model_name: str) -> bool:
     url = f"http://localhost:{llama_port}/models/load"
     payload = {"model": model_name}
 
-    async with httpx.AsyncClient() as client:
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+    try:
         try:
             response = await client.post(url, json=payload, timeout=30)
             if response.status_code != 200:
@@ -708,6 +716,12 @@ async def router_load_model(model_name: str) -> bool:
         except Exception as e:
             logger.error(f"Router load failed for {model_name}: {e}")
             return False
+    finally:
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 async def router_list_models() -> Optional[dict]:
@@ -1560,13 +1574,10 @@ async def lifespan(app: FastAPI):
     logger = setup_logging(config)
     logger.info("Starting LLama Proxy Server")
 
-    if hasattr(httpx, 'Limits') and hasattr(httpx, 'Timeout'):
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(5.0),
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
-        )
-    else:
-        _http_client = httpx.AsyncClient(timeout=5.0)
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(5.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    )
 
     # One-time podman rootless state reset. After a reboot, crash-loop, or
     # when the service was previously run under incompatible systemd sandbox

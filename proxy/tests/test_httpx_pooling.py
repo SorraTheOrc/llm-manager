@@ -3,9 +3,6 @@ Integration tests for httpx connection pooling behavior.
 
 These tests verify that the shared httpx client with connection pooling
 allows concurrent requests to complete without blocking each other.
-
-NOTE: These tests require the real httpx package and should be run
-from outside the proxy directory to avoid importing the local httpx shim.
 """
 import asyncio
 import pytest
@@ -13,8 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import sys
 import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '.venv', 'lib', 'python3.12', 'site-packages'))
 
 import httpx
 
@@ -98,8 +93,6 @@ async def test_connection_pooling_allows_concurrent_status_requests():
     This test creates a real HTTP server and uses httpx with connection pooling
     to verify that multiple concurrent status requests complete without blocking.
     """
-    import httpx
-    
     handler = SlowHTTPHandler(delay=0.1)
     server, addr = await start_test_server(handler)
     port = addr[1]
@@ -138,8 +131,6 @@ async def test_status_request_not_blocked_by_streaming_request():
     when a streaming request is in progress, and verifies that connection
     pooling prevents this blocking.
     """
-    import httpx
-    
     streaming_started = asyncio.Event()
     server_ready = asyncio.Event()
     
@@ -224,14 +215,108 @@ async def test_status_request_not_blocked_by_streaming_request():
 
 
 @pytest.mark.asyncio
+async def test_status_request_with_limited_connections_and_blocking_stream():
+    """Verify status completes even when streaming requests hold all but one connection.
+    
+    This test simulates the real bug scenario where:
+    1. Multiple streaming requests are in progress (holding connections)
+    2. A status request needs to complete
+    3. With a shared connection pool, the status should still complete
+    
+    With a limit of 2 max connections, where 1 is held by a slow streaming request,
+    the status request should still be able to complete using the second connection.
+    """
+    server_ready = asyncio.Event()
+    
+    class LimitedConnectionHandler:
+        async def handle(self, reader, writer):
+            data = await reader.read(1024)
+            request_line = data.decode().split('\r\n')[0]
+            
+            if '/stream' in request_line:
+                await self._handle_slow_stream(writer, server_ready)
+            elif '/status' in request_line:
+                await self._handle_quick_status(writer)
+            else:
+                await self._handle_not_found(writer)
+            
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        
+        async def _handle_quick_status(self, writer):
+            body = b'{"n_ctx": 4096}'
+            response = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode() + body
+            writer.write(response)
+        
+        async def _handle_not_found(self, writer):
+            response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+            writer.write(response)
+        
+        async def _handle_slow_stream(self, writer, server_ready):
+            body = b'{"model": "slow"}'
+            response = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode() + body
+            writer.write(response)
+            await writer.drain()
+            server_ready.set()
+            await asyncio.sleep(3.0)
+    
+    handler = LimitedConnectionHandler()
+    server, addr = await start_test_server(handler)
+    port = addr[1]
+    
+    try:
+        limits = httpx.Limits(max_connections=2, max_keepalive_connections=1)
+        async with httpx.AsyncClient(limits=limits, timeout=10.0) as client:
+            async def make_status_request():
+                response = await client.get(f"http://localhost:{port}/status")
+                return response.json()
+            
+            async def make_streaming_request():
+                response = await client.get(f"http://localhost:{port}/stream")
+                return response.json()
+            
+            streaming_task_1 = asyncio.create_task(make_streaming_request())
+            await server_ready.wait()
+            
+            streaming_task_2 = asyncio.create_task(make_streaming_request())
+            await asyncio.sleep(0.1)
+            
+            status_task = asyncio.create_task(make_status_request())
+            
+            done, pending = await asyncio.wait(
+                [status_task],
+                timeout=3.0
+            )
+            
+            assert status_task in done, "Status request did not complete in time (connection pool exhausted)"
+            
+            status_result = await status_task
+            assert status_result["n_ctx"] == 4096
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_without_connection_pooling_blocks():
     """Verify that WITHOUT connection pooling, requests would block.
     
     This test creates a NEW client per request (no pooling) and shows
     that concurrent requests complete slower than with pooling.
     """
-    import httpx
-    
     handler = SlowHTTPHandler(delay=0.2)
     server, addr = await start_test_server(handler)
     port = addr[1]
