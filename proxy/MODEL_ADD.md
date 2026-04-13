@@ -37,6 +37,19 @@ This document describes the checklist and a worked example for adding a new mode
 
 ### Making gemma4 downloadable from Hugging Face
 
+Intro
+
+Regardless of whether the proxy is running in router mode or single-model mode, the model files should come from a canonical source such as Hugging Face. The easiest and most reliable approach is to let the llama-server perform the download. To do this:
+
+- Add the new model mapping to `start-llama.sh` (see steps below).
+- Start the llama-server inside the container (distrobox) and invoke the start script with the model name, for example:
+
+  ```bash
+  distrobox enter llama -- ~/projects/llm/start-llama.sh <model_name>
+  ```
+
+  The start script will construct the `-hf` argument for `llama-server` and the server will fetch the model from Hugging Face, storing it in the configured models location. When the download completes you can `exit` the container and run the proxy normally; the proxy will use the downloaded model whether it runs in router or non-router mode.
+
 What you must change to make `gemma4` download from Hugging Face:
 
 - If you run the start script (non-router fallback):
