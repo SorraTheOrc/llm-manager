@@ -716,16 +716,22 @@ async def router_list_models() -> Optional[dict]:
     llama_port = server_config.get("llama_server_port", 8080)
     url = f"http://localhost:{llama_port}/models"
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, timeout=10)
-            if response.status_code != 200:
-                logger.warning(f"Router list models failed: {response.status_code} {response.text}")
-                return None
-            return response.json()
-        except Exception as e:
-            logger.warning(f"Router list models failed: {e}")
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=5.0)
+    try:
+        response = await client.get(url)
+        if response.status_code != 200:
+            logger.warning(f"Router list models failed: {response.status_code} {response.text}")
             return None
+        return response.json()
+    except Exception as e:
+        logger.warning(f"Router list models failed: {e}")
+        return None
+    finally:
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 def _extract_router_model_ids(router_models: Optional[dict]) -> list[str]:
