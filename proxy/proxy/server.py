@@ -367,7 +367,7 @@ async def query_llama_status() -> dict:
         for endpoint in ["/model", "/status"]:
             try:
                 url = f"http://localhost:{llama_port}{endpoint}"
-                response = await client.get(url)
+                response = await client.get(url, timeout=5.0)
                 if getattr(response, "status_code", None) == 200:
                     try:
                         data = None
@@ -404,7 +404,7 @@ async def query_llama_status() -> dict:
 
         try:
             props_url = f"http://localhost:{llama_port}/props"
-            response = await client.get(props_url)
+            response = await client.get(props_url, timeout=5.0)
             if getattr(response, "status_code", None) == 200:
                 props = None
                 if hasattr(response, "json"):
@@ -718,7 +718,7 @@ async def router_list_models() -> Optional[dict]:
 
     client = _http_client if _http_client else httpx.AsyncClient(timeout=5.0)
     try:
-        response = await client.get(url)
+        response = await client.get(url, timeout=5.0)
         if response.status_code != 200:
             logger.warning(f"Router list models failed: {response.status_code} {response.text}")
             return None
