@@ -1041,7 +1041,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
 
     # Retry loop configuration
     retries = 4
-    backoff = 2  # seconds base
+    backoff = 3  # seconds base (initial retry period)
     tried_cmds = []
 
     # The server MUST run inside distrobox/container. Do not fall back to
@@ -1068,7 +1068,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
             return proc
         # If out is present, the command exited quickly with output; log and retry
         logger.warning(f"distrobox attempt {attempt+1} failed quickly: {out}")
-        time.sleep(backoff * (attempt + 1))
+        time.sleep(backoff * (2 ** attempt))
 
     # All distrobox attempts failed — assemble a helpful diagnostic message
     msg_lines = ["Failed to start llama-server using distrobox. Attempts:"]
@@ -1404,7 +1404,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             request.method,
             target_url,
             headers=headers,
-            data=body
+            content=body
         )
 
         # Enter the stream to obtain the response and headers
@@ -1473,7 +1473,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 response = await getattr(client, method)(
                     target_url,
                     headers=headers,
-                    data=body
+                    content=body
                 )
 
                 # Non-streaming: count tokens in response body
@@ -1560,7 +1560,7 @@ async def proxy_to_remote(
             request.method,
             target_url,
             headers=headers,
-            data=body
+            content=body
         )
 
         response = await cm.__aenter__()
@@ -1628,7 +1628,7 @@ async def proxy_to_remote(
             response = await getattr(client, method)(
                 target_url,
                 headers=headers,
-                data=body
+                content=body
             )
 
             # Non-streaming: count tokens in response
