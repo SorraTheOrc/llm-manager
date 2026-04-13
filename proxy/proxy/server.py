@@ -418,7 +418,12 @@ async def query_llama_status() -> dict:
     client = _http_client if _http_client else httpx.AsyncClient(timeout=5.0)
     try:
         async def _do_discovery_if_needed():
-            """Discover a working metadata endpoint once per process."""
+            """Discover a working metadata endpoint once per process.
+
+            Returns a (n_ctx, kv_cache_tokens) tuple discovered during probing
+            so callers can use the data without re-requesting mocked responses
+            (important for tests that provide a sequence of responses).
+            """
             global _llama_status_endpoint_cache, _llama_status_discovered, _llama_status_discovered_pid
             # If discovery was already done for this pid, skip.
             try:
@@ -426,20 +431,49 @@ async def query_llama_status() -> dict:
             except Exception:
                 current_pid = None
             if _llama_status_discovered and _llama_status_discovered_pid == current_pid:
-                return
+                return None, None
 
             endpoints = ["/model", "/status", "/models", "/v1/models"]
+            found_n = None
+            found_kv = None
             for endpoint in endpoints:
                 try:
                     url = f"http://localhost:{llama_port}{endpoint}"
                     resp = await client.get(url, timeout=5.0)
                     if getattr(resp, 'status_code', None) == 200:
-                        _llama_status_endpoint_cache = endpoint
+                        # remember endpoint
+                        if not _llama_status_endpoint_cache:
+                            _llama_status_endpoint_cache = endpoint
                         _llama_status_endpoint_failures.pop(endpoint, None)
-                        break
+
+                        # attempt to parse JSON/text for n_ctx / kv fields
+                        data = None
+                        if hasattr(resp, 'json'):
+                            try:
+                                maybe = resp.json()
+                                data = await maybe if asyncio.iscoroutine(maybe) else maybe
+                            except Exception:
+                                data = None
+                        if data is None and hasattr(resp, 'text'):
+                            try:
+                                txt = resp.text if not asyncio.iscoroutine(resp.text) else await resp.text
+                                data = json.loads(txt)
+                            except Exception:
+                                data = None
+
+                        if isinstance(data, dict):
+                            if found_n is None:
+                                found_n = data.get("n_ctx") or data.get("n_ctx_total")
+                            if found_kv is None:
+                                found_kv = data.get("kv_cache_tokens") or data.get("kv_cache_token_count")
+
+                        # If we've discovered both values, stop probing
+                        if found_n is not None and found_kv is not None:
+                            break
                 except Exception:
                     # ignore and try next
                     continue
+
             # Mark discovery done for this pid even if none found
             _llama_status_discovered = True
             try:
@@ -447,7 +481,16 @@ async def query_llama_status() -> dict:
             except Exception:
                 _llama_status_discovered_pid = None
 
-        await _do_discovery_if_needed()
+            return found_n, found_kv
+
+        # Run discovery and capture any discovered metadata so we can
+        # return parsed values immediately (important for tests that
+        # provide a sequence of mocked responses consumed during discovery).
+        found_n, found_kv = await _do_discovery_if_needed()
+        if found_n is not None:
+            result["n_ctx"] = found_n
+        if found_kv is not None:
+            result["kv_cache_tokens"] = found_kv
 
         # If we have a cached endpoint, try it first
         if _llama_status_endpoint_cache:
