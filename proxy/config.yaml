@@ -30,7 +30,9 @@ server:
   llama_health_check_interval: 10
 
 # Default model to load on startup
-default_model: "gpt120"
+# Set the system-wide default model to `gemma4` while keeping other models
+# (like `gpt120`) available as selectable options.
+default_model: "gemma4"
 
 # Logging configuration
 logging:
@@ -67,6 +69,14 @@ models:
       - "gpt-oss-120b"
       - "gpt-oss*"      # Matches any model starting with gpt-oss
       - "GPT-OSS*"      # Matches any model starting with GPT-OSS
+  gemma4:
+    type: "local"
+    llama_model: "gemma4"
+    aliases:
+      - "gemma4"
+      - "Gemma4"
+      - "Casey"        # Operator/developer-facing alias that should resolve to gemma4
+      - "casey"        # include lowercase to be explicit
   embed:
     type: "local"
     llama_model: "mxbai-embed"

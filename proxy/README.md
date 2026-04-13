@@ -96,7 +96,8 @@ server:
   llama_startup_timeout: 300
 
 # Default model to load on startup
-default_model: "qwen3"
+# Set the default to `gemma4` in examples and docs; other models (e.g., `gpt120`) remain available.
+default_model: "gemma4"
 
 # Logging configuration
 logging:
