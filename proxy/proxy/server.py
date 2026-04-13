@@ -38,6 +38,8 @@ last_start_failure: Optional[str] = None
 model_switch_lock = asyncio.Lock()
 # Mark if a background model load is in progress (model_name -> True)
 background_loads: dict = {}
+# Shared httpx client for connection pooling
+_http_client: Optional[httpx.AsyncClient] = None
 
 def schedule_background_load(model_name: str) -> bool:
     """Schedule model load in background if not already running.
@@ -360,19 +362,14 @@ async def query_llama_status() -> dict:
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
 
-    client = httpx.AsyncClient(timeout=5.0)
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=5.0)
     try:
-        # First probe /model and /status endpoints in order. Tests that mock
-        # httpx.AsyncClient expect the first calls to correspond to these
-        # endpoints; probing /props first would consume their canned
-        # responses and lead to incorrect results.
         for endpoint in ["/model", "/status"]:
             try:
                 url = f"http://localhost:{llama_port}{endpoint}"
                 response = await client.get(url)
                 if getattr(response, "status_code", None) == 200:
                     try:
-                        # httpx Response.json may be sync or async in tests; handle both
                         data = None
                         if hasattr(response, 'json'):
                             try:
@@ -405,7 +402,6 @@ async def query_llama_status() -> dict:
             except Exception:
                 pass
 
-        # After probing model/status, check /props to detect router mode if present.
         try:
             props_url = f"http://localhost:{llama_port}/props"
             response = await client.get(props_url)
@@ -428,10 +424,11 @@ async def query_llama_status() -> dict:
         except Exception:
             pass
     finally:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     return result
 
@@ -1550,12 +1547,20 @@ def log_response_chunk(chunk: bytes):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global config, logger, llama_process
+    global config, logger, llama_process, _http_client
     
     # Startup
     config = load_config()
     logger = setup_logging(config)
     logger.info("Starting LLama Proxy Server")
+
+    if hasattr(httpx, 'Limits') and hasattr(httpx, 'Timeout'):
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+        )
+    else:
+        _http_client = httpx.AsyncClient(timeout=5.0)
 
     # One-time podman rootless state reset. After a reboot, crash-loop, or
     # when the service was previously run under incompatible systemd sandbox
@@ -1675,6 +1680,12 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down LLama Proxy Server")
+    if _http_client is not None:
+        try:
+            await _http_client.aclose()
+        except Exception:
+            pass
+        _http_client = None
     stop_llama_server()
 
 
