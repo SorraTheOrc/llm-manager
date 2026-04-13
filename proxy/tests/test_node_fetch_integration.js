@@ -1,9 +1,9 @@
 // Node integration test for strict HTTP parsing clients (undici/fetch)
-// Usage: run with Node in CI or locally. Assumes proxy listening on http://localhost:3000
+// Usage: run with Node in CI or locally. Assumes proxy listening on http://localhost:8000
 import fetch from 'node-fetch';
 
 async function main() {
-  const base = 'http://localhost:3000';
+  const base = 'http://localhost:8000';
   const payload = {
     model: 'qwen3',
     messages: [{ role: 'user', content: 'Hello' }],
