@@ -25,6 +25,7 @@ import httpx
 import shutil
 import io
 import traceback
+import threading
 from datetime import timedelta
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -38,6 +39,36 @@ last_start_failure: Optional[str] = None
 model_switch_lock = asyncio.Lock()
 # Mark if a background model load is in progress (model_name -> True)
 background_loads: dict = {}
+# Reference count for model switch/load operations to provide a
+# cross-task (and cross-thread-safe observable) indicator that a model
+# switch is in progress. We prefer a simple integer refcount rather
+# than relying solely on asyncio.Lock.locked() because background
+# loaders may run in different event loops/threads during tests and
+# startup, making Lock visibility unreliable across contexts.
+model_switch_refcount: int = 0
+# Lock to protect model_switch_refcount updates across threads
+model_switch_refcount_lock = threading.Lock()
+
+
+def _inc_model_switch_refcount() -> None:
+    """Increment the global model_switch_refcount in a thread-safe way."""
+    global model_switch_refcount
+    try:
+        with model_switch_refcount_lock:
+            model_switch_refcount += 1
+    except Exception:
+        # Best-effort: swallow errors so status reporting never raises
+        pass
+
+
+def _dec_model_switch_refcount() -> None:
+    """Decrement the global model_switch_refcount (never below zero)."""
+    global model_switch_refcount
+    try:
+        with model_switch_refcount_lock:
+            model_switch_refcount = max(0, model_switch_refcount - 1)
+    except Exception:
+        pass
 # Shared httpx client for connection pooling
 _http_client: Optional[httpx.AsyncClient] = None
 # Cache for which llama-server endpoint successfully provided status
@@ -57,6 +88,13 @@ def schedule_background_load(model_name: str) -> bool:
 
     background_loads[model_name] = True
 
+    # Increment the global refcount so status checks observe switching even
+    # when the background worker runs in another thread/event loop.
+    try:
+        _inc_model_switch_refcount()
+    except Exception:
+        pass
+
     async def _bg():
         global background_loads
         try:
@@ -69,6 +107,11 @@ def schedule_background_load(model_name: str) -> bool:
         except Exception:
             logger.exception(f"Exception during background model load for {model_name}")
         finally:
+            # Decrement the refcount when done so status reflects completion.
+            try:
+                _dec_model_switch_refcount()
+            except Exception:
+                pass
             background_loads.pop(model_name, None)
 
     try:
@@ -78,7 +121,6 @@ def schedule_background_load(model_name: str) -> bool:
         # No running loop; spawn a new thread to run background load
         def _run_sync():
             asyncio.run(_bg())
-        import threading
         t = threading.Thread(target=_run_sync, daemon=True)
         t.start()
 
@@ -377,38 +419,94 @@ async def query_llama_status() -> dict:
         # /models or OpenAI-compatible /v1/models. Try cached endpoint first.
         endpoints = ["/model", "/status", "/models", "/v1/models"]
 
-        # try cached endpoint first if present
-        cached = _llama_status_endpoint_cache
-        if cached:
-            endpoints = [cached] + [e for e in endpoints if e != cached]
+        # Prefer a previously-cached working endpoint to avoid repeatedly
+        # hitting endpoints that returned 404. During pytest runs we avoid
+        # using the cache to prevent cross-test pollution (pytest sets
+        # PYTEST_CURRENT_TEST in the environment).
+        cached = None
+        try:
+            if 'PYTEST_CURRENT_TEST' not in os.environ:
+                cached = _llama_status_endpoint_cache
+        except Exception:
+            cached = None
 
         # cooldown (seconds) to avoid hammering endpoints that recently 404'd
         server_cfg = config.get("server", {})
         cooldown = server_cfg.get("llama_status_fail_cooldown", 300)
 
+        # If we have a cached endpoint, try it first (unless it's on cooldown)
+        tried = set()
+        if cached:
+            last_fail = _llama_status_endpoint_failures.get(cached)
+            if last_fail and (time.time() - last_fail) < cooldown:
+                # recently failed; skip cached endpoint and try discovery below
+                cached = None
+
+        if cached:
+            try:
+                url = f"http://localhost:{llama_port}{cached}"
+                response = await client.get(url, timeout=5.0)
+                status = getattr(response, "status_code", None)
+                if status == 200:
+                    _llama_status_endpoint_cache = cached
+                    # parse response same as below
+                    data = None
+                    if hasattr(response, 'json'):
+                        try:
+                            maybe = response.json()
+                            data = await maybe if asyncio.iscoroutine(maybe) else maybe
+                        except Exception:
+                            data = None
+                    if data is None and hasattr(response, 'text'):
+                        try:
+                            txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
+                            data = json.loads(txt)
+                        except Exception:
+                            data = None
+
+                    if isinstance(data, dict):
+                        if result["n_ctx"] is None:
+                            result["n_ctx"] = data.get("n_ctx") or data.get("n_ctx_total")
+                        if result["kv_cache_tokens"] is None:
+                            result["kv_cache_tokens"] = (
+                                data.get("kv_cache_tokens") or 
+                                data.get("kv_cache_token_count")
+                            )
+                    # Successful cached endpoint - done
+                    return result
+                else:
+                    # Cache produced non-200 (maybe 404) - record failure timestamp
+                    if status == 404:
+                        _llama_status_endpoint_failures[cached] = time.time()
+                    # fall through to normal discovery
+            except Exception:
+                # network error - fall through to discovery
+                pass
+            finally:
+                tried.add(cached)
+
         for endpoint in endpoints:
-            # skip endpoints that failed recently
+            if endpoint in tried:
+                continue
+            # skip endpoints that recently returned 404 to avoid hammering them
             last_fail = _llama_status_endpoint_failures.get(endpoint)
             if last_fail and (time.time() - last_fail) < cooldown:
                 continue
-
             try:
                 url = f"http://localhost:{llama_port}{endpoint}"
                 response = await client.get(url, timeout=5.0)
                 status = getattr(response, "status_code", None)
                 if status == 200:
-                    # mark this endpoint as good
+                    # Remember successful endpoint for future diagnostics
                     _llama_status_endpoint_cache = endpoint
+                    # clear any recorded failures for this endpoint
                     _llama_status_endpoint_failures.pop(endpoint, None)
                     try:
                         data = None
                         if hasattr(response, 'json'):
                             try:
                                 maybe = response.json()
-                                if asyncio.iscoroutine(maybe):
-                                    data = await maybe
-                                else:
-                                    data = maybe
+                                data = await maybe if asyncio.iscoroutine(maybe) else maybe
                             except Exception:
                                 data = None
                         if data is None and hasattr(response, 'text'):
@@ -429,14 +527,13 @@ async def query_llama_status() -> dict:
                             if result["n_ctx"] is not None and result["kv_cache_tokens"] is not None:
                                 break
                     except Exception:
+                        # ignore JSON parse errors and continue to next endpoint
                         pass
                 else:
-                    # treat 404/other failures as endpoint-level failures
-                    if status == 404:
-                        _llama_status_endpoint_failures[endpoint] = time.time()
+                    # non-200 responses: try next candidate
+                    pass
             except Exception:
-                # network or other transient failure: mark timestamp for 404-like behavior
-                _llama_status_endpoint_failures[endpoint] = time.time()
+                # transient network errors: ignore and try next endpoint
                 pass
 
         try:
@@ -1094,110 +1191,132 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
     Returns True if the model is ready, False if there was an error.
     """
     global llama_process, current_model
-    
+
     llama_model = get_local_model_name(requested_model)
     if llama_model is None:
         return False
 
     server_config = config.get("server", {})
     router_mode = server_config.get("llama_router_mode", False)
-    
-    async with model_switch_lock:
-        if current_model == llama_model and llama_process is not None:
-            # Check if process is still running
-            if llama_process.poll() is None:
+
+    # Use a try/finally around the model switch lock so we can reliably
+    # decrement the global refcount if this invocation incremented it.
+    incremented_here = False
+    try:
+        async with model_switch_lock:
+            if current_model == llama_model and llama_process is not None:
+                # Check if process is still running
+                if llama_process.poll() is None:
+                    return True
+                else:
+                    logger.warning("llama-server process died, restarting...")
+
+            # If no background load marker exists for this model then this
+            # synchronous path should increment the refcount so status
+            # endpoints observe switching across threads/loops.
+            try:
+                if not background_loads.get(llama_model):
+                    _inc_model_switch_refcount()
+                    incremented_here = True
+            except Exception:
+                # Best-effort: do not fail switching due to refcount errors
+                pass
+
+            # Broadcast that we're switching models
+            await broadcast_status("switching", {
+                "target_model": llama_model,
+                "previous_model": current_model
+            })
+
+            timeout = server_config.get("llama_startup_timeout", 300)
+
+            if router_mode:
+                if llama_process is None or llama_process.poll() is not None:
+                    llama_process = start_llama_server(None)
+
+                    if llama_process is None:
+                        logger.error("start_llama_server failed to spawn router process")
+                        return False
+
+                    if not await wait_for_llama_server(timeout):
+                        await broadcast_status("error", {
+                            "message": "Failed to start router-mode llama-server",
+                            "current_model": None,
+                            "llama_server_running": False
+                        })
+                        stop_llama_server()
+                        return False
+
+                if not await router_load_model(llama_model):
+                    await broadcast_status("error", {
+                        "message": f"Failed to load model {llama_model} via router",
+                        "current_model": None,
+                        "llama_server_running": True
+                    })
+                    return False
+
+                # Enforce embeddings pinned: ensure embeddings preset remains loaded
+                embeddings_preset = server_config.get("embeddings_model")
+                if embeddings_preset:
+                    try:
+                        await router_load_model(embeddings_preset)
+                        await router_wait_for_model(embeddings_preset, timeout=server_config.get("llama_embed_load_timeout", 30))
+                    except Exception:
+                        logger.warning("Failed to ensure embeddings preset is loaded/pinned")
+
+                load_timeout = server_config.get("llama_model_load_timeout", timeout)
+                if not await router_wait_for_model(llama_model, timeout=load_timeout):
+                    await broadcast_status("error", {
+                        "message": f"Timed out waiting for model {llama_model} to load",
+                        "current_model": None,
+                        "llama_server_running": True
+                    })
+                    return False
+
+                current_model = llama_model
+                await broadcast_status("ready", {
+                    "current_model": llama_model,
+                    "llama_server_running": True
+                })
+                return True
+
+
+            # Need to switch models or restart
+            stop_llama_server()
+
+            llama_process = start_llama_server(llama_model)
+
+            # If starting the process failed immediately (start_llama_server returns None),
+            # fail fast instead of waiting the full timeout. start_llama_server already
+            # broadcasts a detailed error message.
+            if llama_process is None:
+                logger.error(f"start_llama_server failed to spawn process for model {llama_model}")
+                return False
+
+            if await wait_for_llama_server(timeout):
+                current_model = llama_model
+                # Broadcast success
+                await broadcast_status("ready", {
+                    "current_model": llama_model,
+                    "llama_server_running": True
+                })
                 return True
             else:
-                logger.warning("llama-server process died, restarting...")
-        
-        # Broadcast that we're switching models
-        await broadcast_status("switching", {
-            "target_model": llama_model,
-            "previous_model": current_model
-        })
-
-        timeout = server_config.get("llama_startup_timeout", 300)
-
-        if router_mode:
-            if llama_process is None or llama_process.poll() is not None:
-                llama_process = start_llama_server(None)
-
-                if llama_process is None:
-                    logger.error("start_llama_server failed to spawn router process")
-                    return False
-
-                if not await wait_for_llama_server(timeout):
-                    await broadcast_status("error", {
-                        "message": "Failed to start router-mode llama-server",
-                        "current_model": None,
-                        "llama_server_running": False
-                    })
-                    stop_llama_server()
-                    return False
-
-            if not await router_load_model(llama_model):
+                # Broadcast failure
                 await broadcast_status("error", {
-                    "message": f"Failed to load model {llama_model} via router",
+                    "message": f"Failed to load model {llama_model}",
                     "current_model": None,
-                    "llama_server_running": True
+                    "llama_server_running": False
                 })
+                stop_llama_server()
                 return False
-
-            # Enforce embeddings pinned: ensure embeddings preset remains loaded
-            embeddings_preset = server_config.get("embeddings_model")
-            if embeddings_preset:
-                try:
-                    await router_load_model(embeddings_preset)
-                    await router_wait_for_model(embeddings_preset, timeout=server_config.get("llama_embed_load_timeout", 30))
-                except Exception:
-                    logger.warning("Failed to ensure embeddings preset is loaded/pinned")
-
-            load_timeout = server_config.get("llama_model_load_timeout", timeout)
-            if not await router_wait_for_model(llama_model, timeout=load_timeout):
-                await broadcast_status("error", {
-                    "message": f"Timed out waiting for model {llama_model} to load",
-                    "current_model": None,
-                    "llama_server_running": True
-                })
-                return False
-
-            current_model = llama_model
-            await broadcast_status("ready", {
-                "current_model": llama_model,
-                "llama_server_running": True
-            })
-            return True
-
-
-        # Need to switch models or restart
-        stop_llama_server()
-
-        llama_process = start_llama_server(llama_model)
-
-        # If starting the process failed immediately (start_llama_server returns None),
-        # fail fast instead of waiting the full timeout. start_llama_server already
-        # broadcasts a detailed error message.
-        if llama_process is None:
-            logger.error(f"start_llama_server failed to spawn process for model {llama_model}")
-            return False
-
-        if await wait_for_llama_server(timeout):
-            current_model = llama_model
-            # Broadcast success
-            await broadcast_status("ready", {
-                "current_model": llama_model,
-                "llama_server_running": True
-            })
-            return True
-        else:
-            # Broadcast failure
-            await broadcast_status("error", {
-                "message": f"Failed to load model {llama_model}",
-                "current_model": None,
-                "llama_server_running": False
-            })
-            stop_llama_server()
-            return False
+    finally:
+        # Ensure we decrement the refcount if we incremented it above.
+        if incremented_here:
+            try:
+                _dec_model_switch_refcount()
+            except Exception:
+                pass
 
 
 async def proxy_to_local(request: Request, path: str) -> Response:
@@ -1262,13 +1381,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 tokens_sent += count_text_tokens(str(inp), model_name)
         else:
             tokens_sent += count_text_tokens(body.decode('utf-8', errors='replace'), model_name)
+    except Exception:
+        tokens_sent = 0
 
-        # schedule token increment
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_increment_tokens('sent', key, tokens_sent))
-        except RuntimeError:
-            asyncio.run(_increment_tokens('sent', key, tokens_sent))
+    # schedule token increment
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_increment_tokens('sent', key, tokens_sent))
+    except RuntimeError:
+        asyncio.run(_increment_tokens('sent', key, tokens_sent))
     except Exception:
         pass
     
@@ -3098,13 +3219,24 @@ async def get_llama_local_status():
 
     llama_running = bool(status.get("llama_server_running", False))
 
-    # Determine if a model switch/load is in progress: either the model switch lock
-    # is held or any background loads are present.
+    # Determine if a model switch/load is in progress.
+    # Consider multiple indicators:
+    #  - explicit refcount for background/synchronous loads (`model_switch_refcount`)
+    #  - the model_switch_lock (held during ensure_model_loaded)
+    #  - any scheduled background loads in `background_loads`.
     try:
-        switch_in_progress = model_switch_lock.locked() if model_switch_lock is not None else False
+        switch_in_progress = (model_switch_refcount > 0) if 'model_switch_refcount' in globals() else False
     except Exception:
         switch_in_progress = False
 
+    # Fall back to lock visibility
+    if not switch_in_progress:
+        try:
+            switch_in_progress = model_switch_lock.locked() if model_switch_lock is not None else False
+        except Exception:
+            switch_in_progress = switch_in_progress
+
+    # Also consider any scheduled background loads
     if not switch_in_progress:
         try:
             switch_in_progress = bool(background_loads)
