@@ -35,6 +35,15 @@ This document describes the checklist and a worked example for adding a new mode
   4. If you maintain a container image that packages `start-llama.sh` (see `proxy/container/Containerfile` and `proxy/CONTAINERS.md`), update any documentation or container build steps if the model requires additional artifacts or mount points.
   5. Test locally by running the script directly from repo root, e.g. `/home/rgardler/projects/llm/start-llama.sh mymodel` and ensure the llama-server process starts and exposes embeddings (if required) on the configured port.
 
+### Making gemma4 downloadable from Hugging Face
+
+What you must change to make `gemma4` download from Hugging Face:
+
+- If you run the start script (non-router fallback):
+  1. Add a `gemma4)` case block in `start-llama.sh` matching the lowercase model name (the script lowercases the arg).
+  2. Set `REPOID`, `MODEL`, `QUANTIZATION`, etc., inside that block so the script builds the correct `-hf` value for `llama-server`.
+  3. Example: create a block that sets `REPOID=owner`, `MODEL=gemma4-gguf`, `QUANTIZATION=Q8_0`, then llama-server gets `-hf "owner/gemma4-gguf:Q8_0"`.
+
 Notes:
 - The proxy passes the configured `llama_model` value through to the local start script. Keep the name consistent between `proxy/config.yaml` `llama_model:` and the `case` pattern in `start-llama.sh`.
 - The script lowercases the first argument before matching; use lowercase in your `case` pattern to avoid mismatches.
