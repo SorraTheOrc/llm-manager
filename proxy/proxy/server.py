@@ -40,6 +40,10 @@ model_switch_lock = asyncio.Lock()
 background_loads: dict = {}
 # Shared httpx client for connection pooling
 _http_client: Optional[httpx.AsyncClient] = None
+# Cache for which llama-server endpoint successfully provided status
+_llama_status_endpoint_cache: Optional[str] = None
+# Record recent failures for endpoints to avoid hammering endpoints that 404
+_llama_status_endpoint_failures: dict = {}
 
 def schedule_background_load(model_name: str) -> bool:
     """Schedule model load in background if not already running.
@@ -349,6 +353,9 @@ async def query_llama_status() -> dict:
       - llama_server_running: bool
       - router_mode: bool
     """
+    # allow updating/reading endpoint cache/failures
+    global _llama_status_endpoint_cache, _llama_status_endpoint_failures
+
     result = {
         "n_ctx": None,
         "kv_cache_tokens": None,
@@ -362,13 +369,37 @@ async def query_llama_status() -> dict:
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
 
+    # resilient endpoint discovery/caching to avoid repeated 404s
     client = _http_client if _http_client else httpx.AsyncClient(timeout=5.0)
     try:
-        for endpoint in ["/model", "/status"]:
+        # endpoints to try in order of preference. many llama-server variants
+        # expose either /model or /status; some expose router endpoints like
+        # /models or OpenAI-compatible /v1/models. Try cached endpoint first.
+        endpoints = ["/model", "/status", "/models", "/v1/models"]
+
+        # try cached endpoint first if present
+        cached = _llama_status_endpoint_cache
+        if cached:
+            endpoints = [cached] + [e for e in endpoints if e != cached]
+
+        # cooldown (seconds) to avoid hammering endpoints that recently 404'd
+        server_cfg = config.get("server", {})
+        cooldown = server_cfg.get("llama_status_fail_cooldown", 300)
+
+        for endpoint in endpoints:
+            # skip endpoints that failed recently
+            last_fail = _llama_status_endpoint_failures.get(endpoint)
+            if last_fail and (time.time() - last_fail) < cooldown:
+                continue
+
             try:
                 url = f"http://localhost:{llama_port}{endpoint}"
                 response = await client.get(url, timeout=5.0)
-                if getattr(response, "status_code", None) == 200:
+                status = getattr(response, "status_code", None)
+                if status == 200:
+                    # mark this endpoint as good
+                    _llama_status_endpoint_cache = endpoint
+                    _llama_status_endpoint_failures.pop(endpoint, None)
                     try:
                         data = None
                         if hasattr(response, 'json'):
@@ -399,7 +430,13 @@ async def query_llama_status() -> dict:
                                 break
                     except Exception:
                         pass
+                else:
+                    # treat 404/other failures as endpoint-level failures
+                    if status == 404:
+                        _llama_status_endpoint_failures[endpoint] = time.time()
             except Exception:
+                # network or other transient failure: mark timestamp for 404-like behavior
+                _llama_status_endpoint_failures[endpoint] = time.time()
                 pass
 
         try:
