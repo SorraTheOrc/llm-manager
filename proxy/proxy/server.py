@@ -353,6 +353,9 @@ async def query_llama_status() -> dict:
       - llama_server_running: bool
       - router_mode: bool
     """
+    # allow updating/reading endpoint cache/failures
+    global _llama_status_endpoint_cache, _llama_status_endpoint_failures
+
     result = {
         "n_ctx": None,
         "kv_cache_tokens": None,
@@ -395,7 +398,6 @@ async def query_llama_status() -> dict:
                 status = getattr(response, "status_code", None)
                 if status == 200:
                     # mark this endpoint as good
-                    global _llama_status_endpoint_cache
                     _llama_status_endpoint_cache = endpoint
                     _llama_status_endpoint_failures.pop(endpoint, None)
                     try:
