@@ -222,3 +222,48 @@ async def test_query_llama_status_custom_port(mock_config):
                 result = await query_llama_status()
                 
                 assert "localhost:9090" in mock_client.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_query_llama_status_concurrent_requests_do_not_block(mock_config):
+    """Verify multiple concurrent status requests complete without blocking.
+    
+    This test verifies that when using a shared httpx client with connection pooling,
+    multiple concurrent calls to query_llama_status complete in a reasonable time
+    rather than blocking each other.
+    """
+    from proxy.server import query_llama_status
+    
+    mock_process = MagicMock()
+    mock_process.poll.return_value = None
+    
+    async def slow_get(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return MockResponse(200, {"n_ctx": 4096})
+    
+    mock_client = MagicMock()
+    mock_client.get = slow_get
+    mock_client.aclose = AsyncMock()
+    
+    with patch('proxy.server.config', mock_config):
+        with patch('proxy.server.llama_process', mock_process):
+            with patch('proxy.server._http_client', mock_client):
+                start = asyncio.get_event_loop().time()
+                
+                results = await asyncio.wait_for(
+                    asyncio.gather(
+                        query_llama_status(),
+                        query_llama_status(),
+                        query_llama_status()
+                    ),
+                    timeout=2.0
+                )
+                
+                elapsed = asyncio.get_event_loop().time() - start
+                
+                assert len(results) == 3
+                for result in results:
+                    assert result["llama_server_running"] is True
+                    assert result["n_ctx"] == 4096
+                
+                assert elapsed < 1.0
