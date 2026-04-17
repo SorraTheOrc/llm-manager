@@ -1,134 +1,86 @@
-# LLama Proxy Server Configuration
-
-# Server settings
-server:
-  host: "0.0.0.0"
-  port: 8000
-  # Path to the llama start script
-  llama_start_script: "/home/rgardler/projects/llm/start-llama.sh"
-  # Enable llama-server router mode for multi-model co-residency
-  llama_router_mode: true
-  # Models to preload on startup (optional)
-  llama_router_preload:
-    - "embeddings"
-    - "gemma4"
-  # Maximum concurrent models in router mode
-  llama_models_max: 2
-  # Distrobox container name where llama-server runs
-  distrobox_name: "llama"
-  # Default embeddings preset name (as defined in models.ini)
-  # NOTE: this must match the preset id in models.ini (typo fixed below)
-  embeddings_model: "mxbai-embed"
-  # How long (s) to wait for embeddings to be (re)loaded when enforcing pinning
-  llama_embed_load_timeout: 30
-  # Port the llama-server listens on
-  llama_server_port: 8080
-  # Path to the llama-server binary to use inside the distrobox/start script.
-  # If set, the proxy will export LLAMA_SERVER_BIN into the distrobox environment
-  # so the start script may use the exact host-built binary (e.g. /home/rgardler/llama.cpp/build/bin/llama-server).
-  llama_server_bin: "/home/rgardler/llama.cpp/build/bin/llama-server"
-  # Timeout in seconds to wait for llama-server to start
-  llama_startup_timeout: 300
-  # Timeout in seconds to wait for router model load
-  llama_model_load_timeout: 600
-  # Health check interval in seconds
-  llama_health_check_interval: 10
-
-# Default model to load on startup
-# Set the system-wide default model to `gemma4` while keeping other models
-# (like `gpt120`) available as selectable options.
-default_model: "gemma4"
-
-# Logging configuration
-logging:
-  directory: "/var/log/llama-proxy"
-  # Log rotation interval in hours
-  rotation_hours: 6
-  # Number of days to retain logs
-  retention_days: 90
-  # Log level: DEBUG, INFO, WARNING, ERROR
-  level: "INFO"
-
-# Model routing configuration
-# Each model can be routed to either "local" (llama-server) or "remote" (external API)
-# Aliases support wildcard patterns:
-#   - '*' matches any sequence of characters
-#   - '?' matches any single character
-#   - '[seq]' matches any character in seq
-#   - '[!seq]' matches any character not in seq
-# Exact matches take priority over wildcard patterns
-models:
-  # Local models served by llama-server
-  qwen3:
-    type: "local"
-    # This maps to the model name used by start-llama.sh
-    llama_model: "qwen3"
-    # Model name aliases that clients might use
-    aliases:
-      - "qwen3*"
-      - "Qwen3*"
-  gpt120:
-    type: "local"
-    llama_model: "gpt120"
-    aliases:
-      - "gpt-oss-120b"
-      - "gpt-oss*"      # Matches any model starting with gpt-oss
-      - "GPT-OSS*"      # Matches any model starting with GPT-OSS
-  gemma4:
-    type: "local"
-    # Map the logical proxy name `gemma4` to the exact llama-server/router id
-    # exposed by your llama-server when started with the start-server command.
-    # The router lists: ggml-org/gemma-4-31B-it-GGUF:Q8_0
-    llama_model: "gemma4"
-    aliases:
-      - "gemma4"
-      - "Gemma4"
-      - "Casey"        # Operator/developer-facing alias that should resolve to gemma4
-      - "casey"        # include lowercase to be explicit
-  embed:
-    type: "local"
-    llama_model: "mxbai-embed"
-    aliases:
-      - "embeddings"
-      - "embed"
-  # Remote models routed to external APIs
-  github:
-    type: "remote"
-    endpoint: "https://models.inference.ai.azure.com"
-    api_key_env: "GITHUB_TOKEN"
-    aliases:
-      - "github-*"
-
-  openai:
-    type: "remote"
-    endpoint: "https://api.openai.com/v1"
-    # API key can be set here or via environment variable OPENAI_API_KEY
-    api_key_env: "OPENAI_API_KEY"
-    aliases:
-      - "gpt-4"
-      - "gpt-4-turbo"
-      - "gpt-4o"
-      - "gpt-4o-mini"
-      - "gpt-3.5-turbo"
-      - "gpt-*"         # Matches any model starting with gpt- (e.g., gpt-4, gpt-3.5-turbo)
-      - "o1-*"          # Matches o1-preview, o1-mini, etc.
-      - "chatgpt-*"     # Matches chatgpt-4o-latest, etc.
-  
-  anthropic:
-    type: "remote"
-    endpoint: "https://api.anthropic.com/v1"
-    api_key_env: "ANTHROPIC_API_KEY"
-    # Some APIs need header transformations
-    headers:
-      anthropic-version: "2023-06-01"
-    aliases:
-      - "claude-3-opus"
-      - "claude-3-sonnet"
-      - "claude-3-haiku"
-      - "claude-*"      # Matches any model starting with claude-
-
-# Default remote endpoint for unknown models
+default_model: gemma4
 default_remote:
+  api_key_env: OPENAI_API_KEY
   enabled: false
-  endpoint: "https://api.openai.com/v1"
-  api_key_env: "OPENAI_API_KEY"
+  endpoint: https://api.openai.com/v1
+logging:
+  directory: /var/log/llama-proxy
+  level: INFO
+  retention_days: 90
+  rotation_hours: 6
+models:
+  anthropic:
+    aliases:
+    - claude-3-opus
+    - claude-3-sonnet
+    - claude-3-haiku
+    - claude-*
+    api_key_env: ANTHROPIC_API_KEY
+    endpoint: https://api.anthropic.com/v1
+    headers:
+      anthropic-version: '2023-06-01'
+    type: remote
+  embed:
+    aliases:
+    - embeddings
+    - embed
+    llama_model: mxbai-embed
+    type: local
+  gemma4:
+    aliases:
+    - gemma4
+    - Gemma4
+    - Casey
+    - casey
+    llama_model: gemma4
+    type: local
+  github:
+    aliases:
+    - github-*
+    api_key_env: GITHUB_TOKEN
+    endpoint: https://models.inference.ai.azure.com
+    type: remote
+  gpt120:
+    aliases:
+    - gpt-oss-120b
+    - gpt-oss*
+    - GPT-OSS*
+    llama_model: gpt120
+    type: local
+  openai:
+    aliases:
+    - gpt-4
+    - gpt-4-turbo
+    - gpt-4o
+    - gpt-4o-mini
+    - gpt-3.5-turbo
+    - gpt-*
+    - o1-*
+    - chatgpt-*
+    api_key_env: OPENAI_API_KEY
+    endpoint: https://api.openai.com/v1
+    type: remote
+  qwen3:
+    aliases:
+    - qwen3*
+    - Qwen3*
+    llama_model: qwen3
+    type: local
+server:
+  distrobox_name: llama
+  embeddings_model: mxbai-embed
+  host: 0.0.0.0
+  llama_allow_host_fallback: true
+  llama_embed_load_timeout: 30
+  llama_health_check_interval: 10
+  llama_model_load_timeout: 600
+  llama_models_max: 2
+  llama_router_mode: true
+  llama_router_preload:
+  - embeddings
+  - gemma4
+  llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
+  llama_server_port: 8080
+  llama_start_script: /home/rgardler/projects/llm/start-llama.sh
+  llama_startup_timeout: 300
+  port: 8000
