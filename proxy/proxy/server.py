@@ -1104,26 +1104,6 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # record last failure for diagnostics and broadcast
     last_start_failure = msg
     broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
-    # As a last-resort fallback (useful on developer hosts where container
-    # creation is blocked by polkit), try running the start script directly
-    # on the host. This avoids requiring immediate host configuration changes
-    # and restores model loading quickly. Admins can disable this by setting
-    # `server.llama_allow_host_fallback: false` in config.
-    allow_fallback = server_config.get("llama_allow_host_fallback", True)
-    if allow_fallback:
-        logger.warning("Attempting host fallback: running start script directly as last resort")
-        if router_mode:
-            direct_cmd = [script_path, "router"]
-        else:
-            direct_cmd = [script_path, model]
-
-        # Try direct host invocation with the same spawn-and-capture helper
-        proc, out = _spawn_and_capture(direct_cmd)
-        if proc is not None:
-            logger.warning("Host fallback started start script directly; running without distrobox")
-            return proc
-        logger.error(f"Host fallback failed: {out}")
-
     return None
 
 

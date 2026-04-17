@@ -70,7 +70,10 @@ server:
   distrobox_name: llama
   embeddings_model: mxbai-embed
   host: 0.0.0.0
-  llama_allow_host_fallback: true
+  # Fallback to host start is not permitted in production. This flag is
+  # reserved for temporary developer troubleshooting only and must not be
+  # committed in infra-managed production deployments.
+  llama_allow_host_fallback: false
   llama_embed_load_timeout: 30
   llama_health_check_interval: 10
   llama_model_load_timeout: 600
