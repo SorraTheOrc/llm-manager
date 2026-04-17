@@ -75,7 +75,7 @@ server:
   llama_health_check_interval: 10
   llama_model_load_timeout: 600
   llama_models_max: 2
-  llama_router_mode: true
+  llama_router_mode: false
   llama_router_preload:
   - embeddings
   - gemma4
