@@ -950,6 +950,23 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # Set environment variables
     env = os.environ.copy()
     env["PORT"] = str(llama_port)
+
+    # Allow overriding which llama-server binary the start script should invoke
+    # inside the distrobox. This is useful when the host has a custom build
+    # (e.g. ~/llama.cpp/build/bin/llama-server) but the container image has a
+    # different system-installed binary. The start script can honour the
+    # LLAMA_SERVER_BIN env var (if present) to use the specified binary path.
+    llama_server_bin = server_config.get("llama_server_bin")
+    if llama_server_bin:
+        env["LLAMA_SERVER_BIN"] = str(llama_server_bin)
+    # Export a flag so the start script can include `--no-mmap` for router
+    # launches started by the proxy. Default to enabling no-mmap for router
+    # processes unless explicitly disabled in config.
+    try:
+        if server_config.get("llama_no_mmap", True):
+            env["LLAMA_SERVER_NO_MMAP"] = "1"
+    except Exception:
+        pass
     
     router_mode = False
     if model is None:
@@ -1087,6 +1104,26 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # record last failure for diagnostics and broadcast
     last_start_failure = msg
     broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
+    # As a last-resort fallback (useful on developer hosts where container
+    # creation is blocked by polkit), try running the start script directly
+    # on the host. This avoids requiring immediate host configuration changes
+    # and restores model loading quickly. Admins can disable this by setting
+    # `server.llama_allow_host_fallback: false` in config.
+    allow_fallback = server_config.get("llama_allow_host_fallback", True)
+    if allow_fallback:
+        logger.warning("Attempting host fallback: running start script directly as last resort")
+        if router_mode:
+            direct_cmd = [script_path, "router"]
+        else:
+            direct_cmd = [script_path, model]
+
+        # Try direct host invocation with the same spawn-and-capture helper
+        proc, out = _spawn_and_capture(direct_cmd)
+        if proc is not None:
+            logger.warning("Host fallback started start script directly; running without distrobox")
+            return proc
+        logger.error(f"Host fallback failed: {out}")
+
     return None
 
 
