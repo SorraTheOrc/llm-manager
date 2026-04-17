@@ -11,17 +11,22 @@ server:
   # Models to preload on startup (optional)
   llama_router_preload:
     - "embeddings"
-    - "gpt120"
+    - "gemma4"
   # Maximum concurrent models in router mode
   llama_models_max: 2
   # Distrobox container name where llama-server runs
   distrobox_name: "llama"
   # Default embeddings preset name (as defined in models.ini)
+  # NOTE: this must match the preset id in models.ini (typo fixed below)
   embeddings_model: "mxbai-embed"
   # How long (s) to wait for embeddings to be (re)loaded when enforcing pinning
   llama_embed_load_timeout: 30
   # Port the llama-server listens on
   llama_server_port: 8080
+  # Path to the llama-server binary to use inside the distrobox/start script.
+  # If set, the proxy will export LLAMA_SERVER_BIN into the distrobox environment
+  # so the start script may use the exact host-built binary (e.g. /home/rgardler/llama.cpp/build/bin/llama-server).
+  llama_server_bin: "/home/rgardler/llama.cpp/build/bin/llama-server"
   # Timeout in seconds to wait for llama-server to start
   llama_startup_timeout: 300
   # Timeout in seconds to wait for router model load
@@ -71,6 +76,9 @@ models:
       - "GPT-OSS*"      # Matches any model starting with GPT-OSS
   gemma4:
     type: "local"
+    # Map the logical proxy name `gemma4` to the exact llama-server/router id
+    # exposed by your llama-server when started with the start-server command.
+    # The router lists: ggml-org/gemma-4-31B-it-GGUF:Q8_0
     llama_model: "gemma4"
     aliases:
       - "gemma4"
