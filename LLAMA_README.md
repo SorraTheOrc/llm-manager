@@ -22,8 +22,6 @@ distrobox create \
   --additional-flags "--device=/dev/kfd --device=/dev/dri --group-add=video --group-add=render --security-opt=seccomp=unconfined"
 ```
 
-
-
 # Building llama.cpp with SSL support
 
 The `-hf` flag for downloading models from Hugging Face requires SSL support. 
@@ -56,38 +54,12 @@ If OpenSSL is not available, install it first:
 ```bash
 # Fedora/RHEL
 sudo dnf install openssl-devel
-
-# Ubuntu/Debian
-sudo apt install libssl-dev
 ```
 
 Alternative SSL options (use one):
 - `-DLLAMA_OPENSSL=ON` - Use system OpenSSL (recommended)
 - `-DLLAMA_BUILD_BORINGSSL=ON` - Build with BoringSSL
 - `-DLLAMA_BUILD_LIBRESSL=ON` - Build with LibreSSL
-
-# Build/Rebuild the container (DEPRECATED METHOD)
-
-```bash
-# Build the container image
-distrobox create llama \
-  --image docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7rc-rocwmma \
-  --additional-flags "--device /dev/dri --device /dev/kfd --group-add video --group-add render --security-opt seccomp=unconfined"
-
-# Enter the container
-distrobox enter llama
-
-# Build latest llama.cpp
-git pull
-
-cmake -B build -S . \
-  -DGGML_HIP=ON \
-  -DAMDGPU_TARGETS="gfx1151" \
-  -DGGML_HIP_ROCWMMA_FATTN=ON \
-  -DLLAMA_OPENSSL=ON
-
-cmake --build build --config Release -j$(nproc)
-```
 
 # Running the Proxy
 
@@ -106,7 +78,7 @@ Access the web UI at `http://localhost:8000/`. See [proxy/README.md](proxy/READM
 To run llama-server directly without the proxy:
 
 ```bash
-start-llama.sh [model]
+~/project/llmstart-llama.sh [model]
 ```
 
 

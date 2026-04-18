@@ -3,7 +3,7 @@ windows:
   - name: LLM
     cwd: ~/projects/llm
     panes:
-      - cmd: "opencode -c"
+      - cmd: "pi --continue"
         cwd: "~/projects/llm"
         focus: true
       - cmd: "wl tui"

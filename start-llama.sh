@@ -34,12 +34,27 @@ if [[ "$router_mode" -eq 1 ]]; then
   echo
   echo
 
+  # Prefer an explicit LLAMA_SERVER_BIN when provided (proxy exports this env var
+  # to force the distrobox start script to use a host-built binary). Fall back
+  # to the system `llama-server` on PATH or the literal name.
+  if [[ -n "${LLAMA_SERVER_BIN:-}" ]]; then
+    LLAMA_BIN="${LLAMA_SERVER_BIN}"
+  else
+    LLAMA_BIN="$(command -v llama-server 2>/dev/null || true)"
+    if [[ -z "$LLAMA_BIN" ]]; then
+      LLAMA_BIN="llama-server"
+    fi
+  fi
+
+  echo "Using llama-server binary: $LLAMA_BIN"
+
   LLAMA_CMD=(
-    llama-server
+    "$LLAMA_BIN"
     --models-preset "$MODELS_INI"
     --models-max "$MODELS_MAX"
     --models-autoload
     --host 0.0.0.0
+    --no-mmap
     --port $PORT
   )
 
@@ -76,7 +91,11 @@ case "$model" in
     MIN_P=0
 
     #EXTRA_CMD_SWITCHES="--jinja --no-context-shift --flash-attn off --reasoning-format=llama3"
-    EXTRA_CMD_SWITCHES="--gpt-oss-120b-default"
+    # For large GPT-oss models we recommend disabling mmap if you have
+    # sufficient RAM. When tensor overrides place some tensors on CPU,
+    # using mmap can cause additional page-fault overhead. `--no-mmap`
+    # forces weights to be loaded into memory which often improves throughput.
+    EXTRA_CMD_SWITCHES="--gpt-oss-120b-default --no-mmap"
     ;;
   qwen3)
     REPOID=Qwen
@@ -111,8 +130,24 @@ case "$model" in
 
     EXTRA_CMD_SWITCHES=""
     ;;
+  gemma4)
+    REPOID=ggml-org
+    MODEL=gemma-4-31B-it-GGUF
+    QUANTIZATION=Q8_0
+    CONTEXT=262144
+    BATCH_SIZE=512
+    CHAT_TEMPLATE_KWARGS=""
+    REASONING_FORMAT=none
+
+    TEMP=1.0
+    TOP_P=0.95
+    TOP_K=64
+    MIN_P=0
+
+    EXTRA_CMD_SWITCHES="--jinja"
+    ;;
   *)
-    echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen2.5, MXBAI-Embed, Router"
+    echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen2.5, MXBAI-Embed, gemma4, Router"
     exit 1
     ;;
 esac
@@ -144,8 +179,22 @@ echo
 ##
 # Start the Server
 ##
+##
+## Determine which llama-server binary to use for single-model invocations
+##
+if [[ -n "${LLAMA_SERVER_BIN:-}" ]]; then
+  LLAMA_BIN="${LLAMA_SERVER_BIN}"
+else
+  LLAMA_BIN="$(command -v llama-server 2>/dev/null || true)"
+  if [[ -z "$LLAMA_BIN" ]]; then
+    LLAMA_BIN="llama-server"
+  fi
+fi
+
+echo "Using llama-server binary: $LLAMA_BIN"
+
 LLAMA_CMD=(
-  llama-server
+  "$LLAMA_BIN"
   -hf "$REPOID/$MODEL:$QUANTIZATION"
   --ctx-size "$CONTEXT"
   --batch-size $BATCH_SIZE

@@ -39,6 +39,8 @@ last_start_failure: Optional[str] = None
 model_switch_lock = asyncio.Lock()
 # Mark if a background model load is in progress (model_name -> True)
 background_loads: dict = {}
+# Track last-used timestamps for models (model_id -> ISO8601 string)
+model_last_used: dict = {}
 # Reference count for model switch/load operations to provide a
 # cross-task (and cross-thread-safe observable) indicator that a model
 # switch is in progress. We prefer a simple integer refcount rather
@@ -157,6 +159,12 @@ try:
     import tiktoken  # type: ignore
 except Exception:
     tiktoken = None
+
+# Optional process metrics (psutil)
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 def _get_tiktoken_encoding_for_model(model_name: str | None):
     if not tiktoken:
@@ -837,9 +845,19 @@ async def router_load_model(model_name: str) -> bool:
                 body = response.text
                 if response.status_code == 400 and "already loaded" in body.lower():
                     logger.info(f"Router model already loaded: {model_name}")
+                    # update last-used timestamp when model already loaded
+                    try:
+                        model_last_used[model_name] = datetime.utcnow().isoformat()
+                    except Exception:
+                        pass
                     return True
                 logger.error(f"Router load failed for {model_name}: {response.status_code} {body}")
                 return False
+            # Update last-used timestamp on successful load
+            try:
+                model_last_used[model_name] = datetime.utcnow().isoformat()
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.error(f"Router load failed for {model_name}: {e}")
@@ -4224,6 +4242,40 @@ async def admin_dump_counts():
     async with token_lock:
         snap_t = dict(token_counts)
     return {"counts": snap_c, "tokens": snap_t}
+
+
+@app.get("/admin/metrics")
+async def admin_metrics():
+    """Return router/memory/metrics for observability."""
+    server_config = config.get("server", {})
+    models_max = server_config.get("llama_models_max")
+    router_mode = server_config.get("llama_router_mode", False)
+    loaded_models = None
+    if router_mode:
+        router_models = await router_list_models()
+        loaded_models = _extract_router_model_ids(router_models)
+
+    per_model = {}
+    for m in loaded_models or []:
+        per_model[m] = {"last_used": model_last_used.get(m), "rss_bytes": None}
+
+    process_rss = None
+    try:
+        if 'psutil' in globals() and psutil and llama_process is not None:
+            pid = getattr(llama_process, 'pid', None)
+            if pid:
+                p = psutil.Process(pid)
+                mem = p.memory_info()
+                process_rss = getattr(mem, 'rss', None)
+    except Exception:
+        process_rss = None
+
+    return {
+        "models_max": models_max,
+        "loaded_models": loaded_models,
+        "per_model": per_model,
+        "process_rss_bytes": process_rss,
+    }
 
 
 @app.post("/admin/reset-counts")
