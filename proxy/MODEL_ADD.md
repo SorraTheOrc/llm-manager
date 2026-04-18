@@ -6,7 +6,28 @@ This document describes the checklist and a worked example for adding a new mode
 ## Adding the model to the local start script
 
 - When running a local fallback the proxy expects models to be startable by the repository `start-llama.sh` script (`/home/rgardler/projects/llm/start-llama.sh`). To make a new local model available via that script you must add a case block for the model name to the script.
-- Steps to add your model to `start-llama.sh`:
+ - Steps to add your model to `start-llama.sh`:
+
+ ### 1) Register the model preset for router-mode (models.ini)
+
+ - If you run llama-server in router mode (the proxy talks to a router process on a fixed port), you must also register a preset in the router's `models.ini` so the router knows how to start/download the model. Add a new section using the exact model id the router will expose (example below). After editing, restart or reload the router process so it re-reads `models.ini`.
+
+ Example `models.ini` snippet:
+
+ ```ini
+ [ggml-org/gemma-4-31B-it-GGUF:Q8_0]
+ hf-repo = ggml-org/gemma-4-31B-it-GGUF:Q8_0
+ ctx-size = 262144
+ # Optional: embeddings = true, pooling = mean, etc.
+ ```
+
+ Verify the router knows the model:
+
+ ```bash
+ curl -sS http://localhost:8080/models | jq .
+ curl -sS -X POST http://localhost:8080/models/load -H "Content-Type: application/json" -d '{"model":"ggml-org/gemma-4-31B-it-GGUF:Q8_0"}' -v
+ ```
+
   1. Pick the canonical model name that will be used in `proxy/config.yaml` `llama_model:` and in requests to the proxy. The `start-llama.sh` script lowercases the first CLI argument, so use a lowercase name in the case pattern.
   2. In `start-llama.sh` add a `case "$model" in` entry (follow the existing examples `qwen3`, `qwen2.5`, `gpt120`). At minimum set these variables inside the block: `REPOID`, `MODEL`, `QUANTIZATION`, `CONTEXT`, `BATCH_SIZE`, and any of `CHAT_TEMPLATE_KWARGS`, `REASONING_FORMAT`, `TEMP`, `TOP_P`, `TOP_K`, `MIN_P`, `EXTRA_CMD_SWITCHES` as needed for the model.
      - Example block (copy and adapt fields as necessary):
