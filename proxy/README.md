@@ -12,6 +12,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Streaming Support**: Full support for streaming responses (SSE)
 - **Request/Response Logging**: Comprehensive logging with time-based rotation
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
+- **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo.
 
@@ -317,6 +318,128 @@ curl -X POST http://localhost:8000/admin/reset-counts
 ```
 
 Resets in-memory request/token counters and triggers immediate persistence.
+
+## Session-Based Incremental Ingestion
+
+The proxy supports session-based incremental prompt ingestion to reduce CPU usage and latency for multi-turn conversations. When a session is established, the proxy tracks per-session message history and forwards only new messages on subsequent requests, leveraging llama-server's KV cache.
+
+### How It Works
+
+1. Client sends a chat completion request with an `X-Session-Id` header (or without one, in which case the proxy generates a UUID v4 session ID).
+2. The proxy tracks the message history for each session.
+3. On subsequent requests with the same session ID, the proxy computes the delta (new messages) and forwards only the delta to llama-server, along with `session_id` and `cache_prompt` fields to reuse the KV cache.
+4. The proxy returns `X-Session-Id`, `X-Session-Created`, and `X-Session-Delta` response headers.
+5. Sessions expire after 3 hours of inactivity and are automatically cleaned up.
+
+### Limitations
+
+- **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
+- **Context window limits**: llama-server's KV cache has finite capacity. Very long conversations may exceed the context window.
+- **Ephemeral sessions**: Sessions are held in memory and are lost when the proxy restarts. Cross-restart persistence is not supported in this version.
+
+### Using Sessions
+
+#### Python Example
+
+```python
+import httpx
+
+# Start a session - no X-Session-Id header
+response = httpx.post(
+    "http://localhost:8000/v1/chat/completions",
+    json={
+        "model": "gemma4",
+        "messages": [
+            {"role": "user", "content": "Hello!"}
+        ]
+    }
+)
+
+# The proxy returns X-Session-Id in the response headers
+session_id = response.headers.get("x-session-id")
+print(f"Session ID: {session_id}")
+
+# Next turn - include X-Session-Id header
+response2 = httpx.post(
+    "http://localhost:8000/v1/chat/completions",
+    json={
+        "model": "gemma4",
+        "messages": [
+            {"role": "user", "content": "Hello!"},
+            {"role": "assistant", "content": "Hi! How can I help?"},
+            {"role": "user", "content": "Tell me about sessions."}
+        ]
+    },
+    headers={"X-Session-Id": session_id}
+)
+
+# X-Session-Delta header shows incremental ingestion was used
+delta = response2.headers.get("x-session-delta")
+print(f"Delta request: {delta}")  # "true" when only new messages were sent
+```
+
+#### Curl Example
+
+```bash
+# First request - proxy generates a session ID
+SESSION_ID=$(curl -s -D - http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gemma4", "messages": [{"role": "user", "content": "Hello"}]}' \
+  | grep -i "^x-session-id:" | tr -d '\r' | cut -d' ' -f2)
+
+echo "Session ID: $SESSION_ID"
+
+# Second request - use the session ID
+# Only new messages need to be sent (the proxy computes the delta)
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Id: $SESSION_ID" \
+  -d '{
+    "model": "gemma4",
+    "messages": [
+      {"role": "user", "content": "Hello"},
+      {"role": "assistant", "content": "Hi there!"},
+      {"role": "user", "content": "What are sessions?"}
+    ]
+  }'
+```
+
+### Session Client Example
+
+A complete Python client example is provided in `examples/session_client.py`:
+
+```bash
+# Run 3-turn conversation with session reuse
+python examples/session_client.py --model gemma4 --turns 3
+
+# Run comparison benchmark (with vs without session)
+python examples/session_client.py --compare
+```
+
+### Session Admin Endpoints
+
+```bash
+# List all active sessions
+GET /admin/sessions
+
+curl http://localhost:8000/admin/sessions
+
+# Delete a specific session
+curl -X DELETE http://localhost:8000/admin/sessions/<session-id>
+```
+
+### Session Metrics
+
+Session metrics are available on the `/admin/metrics` endpoint:
+
+```bash
+curl http://localhost:8000/admin/metrics | jq '.session_metrics'
+```
+
+Returns:
+- `sessions_active`: Number of currently active sessions
+- `sessions_created_total`: Total sessions created since proxy started
+- `sessions_expired_total`: Total sessions expired since proxy started
 
 ## Model Switching Behavior
 
