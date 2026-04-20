@@ -73,6 +73,16 @@ sudo systemctl start llama-proxy
 
 Access the web UI at `http://localhost:8000/`. See [proxy/README.md](proxy/README.md) for full documentation.
 
+# Session-Based Prompt Caching
+
+The proxy supports session-based incremental prompt ingestion through `X-Session-Id` headers. When a session ID is provided or auto-generated, the proxy:
+
+1. Tracks per-session message history
+2. Sends only new messages (delta) on subsequent requests within the same session
+3. Passes `session_id` and `cache_prompt` to llama-server for KV cache reuse
+
+This significantly reduces CPU usage and latency for multi-turn conversations. See [proxy/README.md](proxy/README.md#session-based-incremental-ingestion) for detailed documentation and examples.
+
 # Starting the LLM (Direct)
 
 To run llama-server directly without the proxy:
