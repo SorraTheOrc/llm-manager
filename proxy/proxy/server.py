@@ -19,7 +19,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from fnmatch import fnmatch
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import shutil
@@ -30,6 +30,8 @@ from datetime import timedelta
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
+
+from proxy.session_manager import SessionManager, DEFAULT_SESSION_TTL_SECONDS
 
 # Global state
 llama_process: Optional[subprocess.Popen] = None
@@ -50,6 +52,9 @@ model_last_used: dict = {}
 model_switch_refcount: int = 0
 # Lock to protect model_switch_refcount updates across threads
 model_switch_refcount_lock = threading.Lock()
+
+# Session manager for incremental prompt ingestion
+session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
 
 
 def _inc_model_switch_refcount() -> None:
@@ -192,6 +197,51 @@ def count_text_tokens(text: str, model_name: str | None = None) -> int:
     # heuristic: 1 token ~ 4 bytes UTF-8
     return max(1, len(text.encode('utf-8')) // 4)
 config: dict = {}
+
+
+def _extract_assistant_content(resp_json: dict) -> Optional[str]:
+    """Extract assistant content from a non-streaming OpenAI API response.
+
+    Looks for choices[0].message.content and returns it.
+    Returns None if unable to extract content.
+    """
+    try:
+        choices = resp_json.get("choices", [])
+        if choices:
+            message = choices[0].get("message", {})
+            content = message.get("content")
+            if content is not None:
+                return str(content)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
+    """Extract concatenated assistant content from SSE stream text.
+
+    Parses 'data: {json}' lines, extracting delta.content from each chunk.
+    Returns concatenated content string, or None if nothing found.
+    """
+    parts: list[str] = []
+    for line in sse_text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            j = json.loads(payload)
+            for choice in j.get("choices", []):
+                delta = choice.get("delta", {})
+                if isinstance(delta, dict) and "content" in delta:
+                    c = delta["content"]
+                    if c is not None:
+                        parts.append(str(c))
+        except Exception:
+            continue
+    return "".join(parts) if parts else None
 log_dir: Optional[Path] = None
 logger: logging.Logger = logging.getLogger("llama-proxy")
 
@@ -1349,7 +1399,16 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
 
 async def proxy_to_local(request: Request, path: str) -> Response:
-    """Proxy request to local llama-server."""
+    """Proxy request to local llama-server with optional session-based
+    incremental ingestion.
+
+    When a request includes an ``X-Session-Id`` header (or the proxy
+    generates one), the proxy tracks per-session message history so that
+    only new messages are forwarded to llama-server on subsequent
+    requests within the same session.  llama-server's ``session_id``
+    and ``cache_prompt`` parameters are used to preserve the KV cache
+    across requests.
+    """
     global active_queries
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
@@ -1366,6 +1425,67 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         body_json = json.loads(body) if body else {}
     except Exception:
         body_json = {}
+
+    # ------------------------------------------------------------------
+    # Session handling – incremental prompt ingestion
+    # ------------------------------------------------------------------
+    session_id_header = request.headers.get("x-session-id")
+    session_created = False
+    delta_messages: Optional[List[Dict[str, Any]]] = None
+    is_delta_request = False
+    original_message_count = 0
+
+    if isinstance(body_json, dict) and "messages" in body_json:
+        original_message_count = len(body_json["messages"])
+        try:
+            session, session_created = await session_manager.get_or_create(
+                session_id_header
+            )
+            session_id = session.session_id
+
+            if not session_created and session.message_count > 0:
+                # Session has priorhistory – compute delta
+                delta_messages, history_matches = session_manager.compute_delta(
+                    session.messages, body_json["messages"]
+                )
+                if history_matches and len(delta_messages) > 0:
+                    # Prefix matches – send only new messages
+                    is_delta_request = True
+                    body_json["messages"] = delta_messages
+                    logger.info(
+                        f"Session {session_id[:8]}... delta: "
+                        f"{original_message_count} -> {len(delta_messages)} messages"
+                    )
+                elif not history_matches:
+                    # History was edited – invalidate session, send full history
+                    await session_manager.invalidate(session_id)
+                    session, session_created = await session_manager.get_or_create(
+                        session_id
+                    )
+                    is_delta_request = False
+                    logger.info(
+                        f"Session {session_id[:8]}... history edited, "
+                        "falling back to full ingestion"
+                    )
+                else:
+                    # No new messages (same request re-sent)
+                    is_delta_request = False
+
+            # Add session_id and cache_prompt to request body for llama-server
+            body_json["cache_prompt"] = True
+            body_json["session_id"] = session_id
+            body = json.dumps(body_json).encode("utf-8")
+        except Exception:
+            # Session handling failed – fall back to full history
+            logger.warning(
+                "Session handling failed, falling back to full history",
+                exc_info=True,
+            )
+            session_id = None
+            is_delta_request = False
+    else:
+        # Not a chat-completion request – no session handling
+        session_id = None
 
     method = request.method.upper()
     key = f"{method} {request.url.path} -> local"
@@ -1459,10 +1579,17 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
             outgoing_headers['Cache-Control'] = 'no-cache'
 
+        # Add session header for incremental ingestion
+        if session_id:
+            outgoing_headers["X-Session-Id"] = session_id
+            outgoing_headers["X-Session-Created"] = "true" if session_created else "false"
+            outgoing_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
         media_type = response.headers.get('content-type', 'text/event-stream')
 
         async def stream_generator():
             global active_queries
+            # Track assistant response for session history update
+            collected_content: list[str] = []
             try:
                 async for chunk in response.aiter_bytes():
                     # count tokens in this chunk (best-effort)
@@ -1477,9 +1604,59 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             asyncio.run(_increment_tokens('recv', key, chunk_tokens))
                     except Exception:
                         pass
+
+                    # Collect content for session history if session is active
+                    if session_id:
+                        try:
+                            collected_content.append(chunk.decode('utf-8', errors='replace'))
+                        except Exception:
+                            pass
+
                     yield chunk
                     log_response_chunk(chunk)
             finally:
+                # Update session history with the full conversation
+                if session_id and original_message_count > 0:
+                    try:
+                        # For streaming, we collect partial content; best effort update
+                        if collected_content:
+                            full_response = ''.join(collected_content)
+                            # Attempt to extract assistant content from SSE chunks
+                            assistant_content = _extract_assistant_content_from_sse(full_response)
+                            if assistant_content:
+                                full_messages = list(body_json.get('messages', [])) if not is_delta_request else list(delta_messages or [])
+                                # If we sent a delta, we need the full message list
+                                if is_delta_request and delta_messages:
+                                    try:
+                                        session_obj = await session_manager.get(session_id)
+                                        if session_obj:
+                                            full_messages = list(session_obj.messages) + list(delta_messages)
+                                        else:
+                                            full_messages = list(delta_messages)
+                                    except Exception:
+                                        full_messages = list(delta_messages)
+                                full_messages.append({"role": "assistant", "content": assistant_content})
+                                await session_manager.update_messages(session_id, full_messages)
+                            else:
+                                # Could not parse assistant content; store messages without response
+                                if is_delta_request and delta_messages:
+                                    try:
+                                        session_obj = await session_manager.get(session_id)
+                                        if session_obj:
+                                            await session_manager.append_messages(session_id, delta_messages)
+                                    except Exception:
+                                        pass
+                                elif not is_delta_request and original_message_count > 0:
+                                    await session_manager.update_messages(session_id, body_json.get('messages', []))
+                        else:
+                            # No content collected; still store user messages
+                            if not is_delta_request and original_message_count > 0:
+                                await session_manager.update_messages(session_id, body_json.get('messages', []))
+                            elif is_delta_request and delta_messages:
+                                await session_manager.append_messages(session_id, delta_messages)
+                    except Exception:
+                        logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
+
                 try:
                     await cm.__aexit__(None, None, None)
                 except Exception:
@@ -1523,12 +1700,40 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 except Exception:
                     pass
 
+                # Update session history for non-streaming responses
+                if session_id and isinstance(body_json, dict) and 'messages' in body_json:
+                    try:
+                        resp_content = response.content.decode('utf-8', errors='replace')
+                        resp_json = json.loads(resp_content) if resp_content else {}
+                        assistant_content = _extract_assistant_content(resp_json)
+                        # Build full message list for session
+                        if is_delta_request and delta_messages:
+                            session_obj = await session_manager.get(session_id)
+                            if session_obj:
+                                full_messages = list(session_obj.messages) + list(delta_messages)
+                            else:
+                                full_messages = list(delta_messages)
+                        else:
+                            full_messages = list(body_json.get('messages', []))
+                        if assistant_content:
+                            full_messages.append({"role": "assistant", "content": assistant_content})
+                        await session_manager.update_messages(session_id, full_messages)
+                    except Exception:
+                        logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
+
                 log_response(response.status_code, response.content)
+
+                # Build response headers with session info
+                resp_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+                if session_id:
+                    resp_headers["X-Session-Id"] = session_id
+                    resp_headers["X-Session-Created"] = "true" if session_created else "false"
+                    resp_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
 
                 return Response(
                     content=response.content,
                     status_code=response.status_code,
-                    headers=_normalize_outgoing_headers(dict(response.headers), buffered=True)
+                    headers=resp_headers
                 )
         finally:
             # decrement active queries when non-streaming finishes or failures occur
@@ -1880,11 +2085,22 @@ async def lifespan(app: FastAPI):
             periodic_broadcast_task = loop.create_task(_periodic_broadcast_loop())
     except RuntimeError:
         pass
+
+    # Start session manager cleanup task
+    try:
+        session_manager.start_cleanup_task()
+    except Exception as e:
+        logger.warning(f"Failed to start session cleanup task: {e}")
     
     yield
     
     # Shutdown
     logger.info("Shutting down LLama Proxy Server")
+    # Stop session manager cleanup task
+    try:
+        session_manager.stop_cleanup_task()
+    except Exception:
+        pass
     if _http_client is not None:
         try:
             await _http_client.aclose()
@@ -4275,6 +4491,7 @@ async def admin_metrics():
         "loaded_models": loaded_models,
         "per_model": per_model,
         "process_rss_bytes": process_rss,
+        "session_metrics": session_manager.get_metrics(),
     }
 
 
@@ -4310,6 +4527,26 @@ async def admin_reset_counts():
             continue
 
     return {"status": "success", "message": "Counts reset"}
+
+
+@app.get("/admin/sessions")
+async def admin_list_sessions():
+    """List all active sessions with their metadata."""
+    sessions = []
+    for session_id in list(session_manager._sessions.keys()):
+        info = session_manager.get_session_info(session_id)
+        if info is not None:
+            sessions.append(info)
+    return {"sessions": sessions, "total": len(sessions)}
+
+
+@app.delete("/admin/sessions/{session_id}")
+async def admin_delete_session(session_id: str):
+    """Delete a specific session by ID."""
+    removed = await session_manager.remove(session_id)
+    if removed:
+        return {"status": "success", "message": f"Session {session_id} deleted"}
+    raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
 
 def main():
