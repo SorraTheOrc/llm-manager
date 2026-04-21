@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from proxy.session_manager import SessionManager, DEFAULT_SESSION_TTL_SECONDS
+import proxy.metrics as metrics
 
 # Global state
 llama_process: Optional[subprocess.Popen] = None
@@ -908,6 +909,10 @@ async def router_load_model(model_name: str) -> bool:
                 model_last_used[model_name] = datetime.utcnow().isoformat()
             except Exception:
                 pass
+            try:
+                metrics.record_model_loaded(model_name)
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.error(f"Router load failed for {model_name}: {e}")
@@ -1239,6 +1244,7 @@ def stop_llama_server():
         # test mock or invalid object, skip process cleanup.
         is_real_process = hasattr(llama_process, 'terminate') or hasattr(llama_process, 'kill')
         if is_real_process:
+            previous_model = current_model
             llama_process.terminate()
             try:
                 llama_process.wait(timeout=30)
@@ -1249,6 +1255,11 @@ def stop_llama_server():
                 if hasattr(llama_process, 'wait'):
                     llama_process.wait()
             llama_process = None
+            try:
+                if previous_model:
+                    metrics.record_model_unloaded(previous_model)
+            except Exception:
+                pass
             current_model = None
             logger.info("llama-server stopped")
         else:
@@ -1353,6 +1364,10 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                     return False
 
                 current_model = llama_model
+                try:
+                    metrics.record_model_loaded(llama_model)
+                except Exception:
+                    pass
                 await broadcast_status("ready", {
                     "current_model": llama_model,
                     "llama_server_running": True
@@ -1374,6 +1389,10 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
             if await wait_for_llama_server(timeout):
                 current_model = llama_model
+                try:
+                    metrics.record_model_loaded(llama_model)
+                except Exception:
+                    pass
                 # Broadcast success
                 await broadcast_status("ready", {
                     "current_model": llama_model,
@@ -4486,6 +4505,22 @@ async def admin_metrics():
     except Exception:
         process_rss = None
 
+    # Estimate per-model RSS bytes when possible (approximation for router-mode)
+    if process_rss is not None and loaded_models:
+        try:
+            per = int(process_rss // len(loaded_models))
+            for m in loaded_models:
+                per_model[m]['rss_bytes'] = per
+        except Exception:
+            for m in loaded_models:
+                per_model[m]['rss_bytes'] = None
+
+    # Update Prometheus metrics (best-effort)
+    try:
+        metrics.update_metrics(process_rss, loaded_models)
+    except Exception:
+        pass
+
     return {
         "models_max": models_max,
         "loaded_models": loaded_models,
@@ -4493,6 +4528,16 @@ async def admin_metrics():
         "process_rss_bytes": process_rss,
         "session_metrics": session_manager.get_metrics(),
     }
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus scrape endpoint (text/plain, exposition format)."""
+    try:
+        payload, content_type = metrics.generate_metrics_payload()
+        return Response(content=payload, media_type=content_type)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Prometheus metrics unavailable")
 
 
 @app.post("/admin/reset-counts")

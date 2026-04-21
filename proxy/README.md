@@ -441,6 +441,28 @@ Returns:
 - `sessions_created_total`: Total sessions created since proxy started
 - `sessions_expired_total`: Total sessions expired since proxy started
 
+## Prometheus metrics
+
+The proxy exposes Prometheus exposition-format metrics at `/metrics` (text/plain).
+Available metrics (best-effort):
+
+- `llama_process_rss_bytes` (gauge) — process RSS in bytes.
+- `llama_model_rss_bytes{model="..."}` (gauge) — estimated per-model RSS (when multiple models are loaded the proxy divides process RSS evenly across models as an approximation).
+- `llama_model_load_events_total{model="...",event="load|unload"}` (counter) — model lifecycle events.
+- `llama_models_loaded` (gauge) — number of loaded models reported by router-mode.
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'llama-proxy'
+    static_configs:
+      - targets: ['localhost:8000']
+```
+
+Alerting rules (warning at 75% of 90GB; critical at 90GB) are provided in `monitoring/llama_memory_alerts.yaml`.
+A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json`.
+
 ## Model Switching Behavior
 
 When a request specifies a model that differs from the currently loaded model:
