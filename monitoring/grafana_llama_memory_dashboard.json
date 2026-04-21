@@ -1,0 +1,36 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "graph",
+      "title": "llama-server RSS (bytes)",
+      "id": 1,
+      "targets": [
+        {
+          "expr": "llama_process_rss_bytes",
+          "legendFormat": "process_rss"
+        }
+      ],
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "type": "graph",
+      "title": "Models loaded",
+      "id": 2,
+      "targets": [
+        {
+          "expr": "llama_models_loaded",
+          "legendFormat": "models_loaded"
+        }
+      ],
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 8}
+    }
+  ],
+  "schemaVersion": 16,
+  "title": "LLama Server Memory",
+  "version": 1
+}
