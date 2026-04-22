@@ -56,6 +56,25 @@ sudo chown $USER:$USER /var/log/llama-proxy
 <!-- If you wish to run the proxy as a systemd unit, create and manage service files outside of this repository. -->
 ```
 
+## Testing
+
+To run the test suite, activate the virtual environment contained in the `proxy` folder. The repository's install script creates a `.venv` under `proxy/` — activate it and run the tests as follows:
+
+```bash
+cd proxy
+source .venv/bin/activate
+# (optional) install/update dependencies
+pip install -r requirements.txt
+# run tests
+pytest -q
+```
+
+If you prefer not to activate the virtualenv, you can run pytest directly from the venv binary:
+
+```bash
+proxy/.venv/bin/pytest -q
+```
+
 ## proxyctl (CLI)
 
 A small bash CLI `proxyctl` is included to manage a user-local proxy process. It supports: `start`, `stop`, `restart`, `status`, and `logs`.
