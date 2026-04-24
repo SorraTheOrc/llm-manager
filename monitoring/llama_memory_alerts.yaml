@@ -1,0 +1,20 @@
+groups:
+  - name: llama-memory.rules
+    rules:
+      - alert: LlamaMemoryHighWarning
+        expr: llama_process_rss_bytes > 0.75 * 90 * 1024 * 1024 * 1024
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLama process memory usage > 75% of 90GB"
+          description: "Process RSS for llama-server ({{ $labels.instance }}) is above 75% of the 90GB threshold ({{ $value }} bytes)."
+
+      - alert: LlamaMemoryHighCritical
+        expr: llama_process_rss_bytes > 90 * 1024 * 1024 * 1024
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLama process memory usage > 90GB (critical)"
+          description: "Process RSS for llama-server ({{ $labels.instance }}) is above 90GB ({{ $value }} bytes). Immediate attention required."
