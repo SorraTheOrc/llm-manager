@@ -56,6 +56,25 @@ sudo chown $USER:$USER /var/log/llama-proxy
 <!-- If you wish to run the proxy as a systemd unit, create and manage service files outside of this repository. -->
 ```
 
+## Testing
+
+To run the test suite, activate the virtual environment contained in the `proxy` folder. The repository's install script creates a `.venv` under `proxy/` — activate it and run the tests as follows:
+
+```bash
+cd proxy
+source .venv/bin/activate
+# (optional) install/update dependencies
+pip install -r requirements.txt
+# run tests
+pytest -q
+```
+
+If you prefer not to activate the virtualenv, you can run pytest directly from the venv binary:
+
+```bash
+proxy/.venv/bin/pytest -q
+```
+
 ## proxyctl (CLI)
 
 A small bash CLI `proxyctl` is included to manage a user-local proxy process. It supports: `start`, `stop`, `restart`, `status`, and `logs`.
@@ -440,6 +459,28 @@ Returns:
 - `sessions_active`: Number of currently active sessions
 - `sessions_created_total`: Total sessions created since proxy started
 - `sessions_expired_total`: Total sessions expired since proxy started
+
+## Prometheus metrics
+
+The proxy exposes Prometheus exposition-format metrics at `/metrics` (text/plain).
+Available metrics (best-effort):
+
+- `llama_process_rss_bytes` (gauge) — process RSS in bytes.
+- `llama_model_rss_bytes{model="..."}` (gauge) — estimated per-model RSS (when multiple models are loaded the proxy divides process RSS evenly across models as an approximation).
+- `llama_model_load_events_total{model="...",event="load|unload"}` (counter) — model lifecycle events.
+- `llama_models_loaded` (gauge) — number of loaded models reported by router-mode.
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'llama-proxy'
+    static_configs:
+      - targets: ['localhost:8000']
+```
+
+Alerting rules (warning at 75% of 90GB; critical at 90GB) are provided in `monitoring/llama_memory_alerts.yaml`.
+A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json`.
 
 ## Model Switching Behavior
 
