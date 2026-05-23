@@ -1473,20 +1473,17 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id = session.session_id
 
             if not session_created and session.message_count > 0:
-                # Session has prior history – compute delta for logging only
-                # NOTE: Do NOT send delta to llama-server because slot cache reuse
-                # across sessions causes wrong context restoration (LCP similarity match
-                # on shared system prompt leads to cross-session cache pollution).
+                # Session has prior history – compute delta
                 delta_messages, history_matches = session_manager.compute_delta(
                     session.messages, body_json["messages"]
                 )
                 if history_matches and len(delta_messages) > 0:
-                    # History matches but send FULL messages to avoid cache pollution
-                    is_delta_request = False
+                    # Prefix matches – send only new messages
+                    is_delta_request = True
+                    body_json["messages"] = delta_messages
                     logger.info(
-                        f"Session {session_id[:8]}... history match "
-                        f"({len(delta_messages)} new messages) — sending full prompt "
-                        f"to avoid slot cache pollution"
+                        f"Session {session_id[:8]}... delta: "
+                        f"{original_message_count} -> {len(delta_messages)} messages"
                     )
                 elif not history_matches:
                     # History was edited – invalidate session, send full history

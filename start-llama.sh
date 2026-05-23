@@ -53,7 +53,7 @@ if [[ "$router_mode" -eq 1 ]]; then
     --models-preset "$MODELS_INI"
     --models-max "$MODELS_MAX"
     --models-autoload
-    --parallel 2
+    --parallel 4
     --host 0.0.0.0
     --no-mmap
     --port $PORT
