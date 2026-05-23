@@ -960,7 +960,17 @@ def _extract_router_model_ids(router_models: Optional[dict]) -> list[str]:
 
 async def router_is_model_loaded(model_name: str) -> bool:
     router_models = await router_list_models()
-    return model_name in _extract_router_model_ids(router_models)
+    if not isinstance(router_models, dict):
+        return False
+    models_payload = router_models.get("data") or router_models.get("models") or []
+    if not isinstance(models_payload, list):
+        return False
+    for m in models_payload:
+        if isinstance(m, dict) and m.get("id") == model_name:
+            status = m.get("status", {})
+            if isinstance(status, dict):
+                return status.get("value") == "loaded"
+    return False
 
 
 async def router_wait_for_model(model_name: str, timeout: int = 300, interval: float = 2.0) -> bool:
@@ -1448,7 +1458,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # ------------------------------------------------------------------
     # Session handling – incremental prompt ingestion
     # ------------------------------------------------------------------
-    session_id_header = request.headers.get("x-session-id")
+    session_id_header = request.headers.get("x-session-id") or request.headers.get("session_id")
     session_created = False
     delta_messages: Optional[List[Dict[str, Any]]] = None
     is_delta_request = False
@@ -1541,7 +1551,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Check llama-server slot availability for chat requests
     if path == "v1/chat/completions" or path.endswith("chat/completions"):
         try:
-            slots_url = f"http://localhost:{llama_port}/slots"
+            # Determine model name for slot query
+            slot_model = model_name or current_model or "Qwen3"
+            slots_url = f"http://localhost:{llama_port}/slots?model={slot_model}"
             client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
             slots_resp = await client.get(slots_url, timeout=5.0)
             if slots_resp.status_code == 200:
@@ -1550,7 +1562,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 total_slots = 0
                 if isinstance(slots_data, list):
                     total_slots = len(slots_data)
-                    available_slots = sum(1 for s in slots_data if s.get("state") == "idle")
+                    available_slots = sum(1 for s in slots_data if not s.get("is_processing", True))
                 if available_slots == 0 and total_slots > 0:
                     logger.warning(f"No available slots ({total_slots} total), rejecting request")
                     raise HTTPException(status_code=503, detail=f"Model server busy: 0/{total_slots} slots available. Retry later.")

@@ -98,20 +98,20 @@ case "$model" in
     EXTRA_CMD_SWITCHES="--gpt-oss-120b-default --no-mmap"
     ;;
   qwen3)
-    REPOID=Qwen
-    MODEL=Qwen3-Coder-Next-GGUF
-    QUANTIZATION=Q5_K_M
+    REPOID=unsloth
+    MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
+    QUANTIZATION=Q8_0
     CONTEXT=163840 # Max is 262144, max tried so far  131072
     BATCH_SIZE=512
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
-    TEMP=1.0
+    TEMP=0.6	
     TOP_P=0.95
-    TOP_K=40
+    TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--jinja"
+    EXTRA_CMD_SWITCHES="--preence-penalty 0.0 --min-p 0.0"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   mxbai-embed)

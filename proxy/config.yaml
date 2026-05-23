@@ -1,4 +1,4 @@
-default_model: gemma4
+default_model: Qwen3
 default_remote:
   api_key_env: OPENAI_API_KEY
   enabled: false
@@ -30,8 +30,6 @@ models:
     aliases:
     - gemma4
     - Gemma4
-    - Casey
-    - casey
     llama_model: gemma4
     type: local
   github:
@@ -45,6 +43,8 @@ models:
     - gpt-oss-120b
     - gpt-oss*
     - GPT-OSS*
+    - Casey
+    - casey
     llama_model: gpt120
     type: local
   openai:
@@ -64,7 +64,7 @@ models:
     aliases:
     - qwen3*
     - Qwen3*
-    llama_model: qwen3
+    llama_model: Qwen3
     type: local
 server:
   distrobox_name: llama
@@ -78,10 +78,12 @@ server:
   llama_health_check_interval: 10
   llama_model_load_timeout: 600
   llama_models_max: 2
+  llama_request_timeout: 300
   llama_router_mode: true
+  max_concurrent_queries: 8
   llama_router_preload:
   - embeddings
-  - gemma4
+  - Qwen3
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
   llama_start_script: /home/rgardler/projects/llm/start-llama.sh
