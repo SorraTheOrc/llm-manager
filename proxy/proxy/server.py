@@ -1526,6 +1526,40 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 body_json["model"] = llama_model
                 body = json.dumps(body_json).encode("utf-8")
 
+    # Check concurrency limit before accepting request
+    max_queries = server_config.get("max_concurrent_queries", 8)
+    try:
+        async with active_queries_lock:
+            if active_queries >= max_queries:
+                logger.warning(f"Max concurrent queries reached ({active_queries}/{max_queries}), rejecting request")
+                raise HTTPException(status_code=503, detail=f"Server overloaded: {active_queries} queries active. Retry later.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Check llama-server slot availability for chat requests
+    if path == "v1/chat/completions" or path.endswith("chat/completions"):
+        try:
+            slots_url = f"http://localhost:{llama_port}/slots"
+            client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+            slots_resp = await client.get(slots_url, timeout=5.0)
+            if slots_resp.status_code == 200:
+                slots_data = slots_resp.json()
+                available_slots = 0
+                total_slots = 0
+                if isinstance(slots_data, list):
+                    total_slots = len(slots_data)
+                    available_slots = sum(1 for s in slots_data if s.get("state") == "idle")
+                if available_slots == 0 and total_slots > 0:
+                    logger.warning(f"No available slots ({total_slots} total), rejecting request")
+                    raise HTTPException(status_code=503, detail=f"Model server busy: 0/{total_slots} slots available. Retry later.")
+        except HTTPException:
+            raise
+        except Exception:
+            # If slot check fails, proceed anyway (best effort)
+            pass
+
     # Mark that a local query is active for status reporting
     try:
         async with active_queries_lock:
@@ -1570,9 +1604,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Check if streaming is requested
     is_streaming = body_json.get("stream", False)
     
+    request_timeout = httpx.Timeout(server_config.get("llama_request_timeout", 300))
+    
     if is_streaming:
         # Streaming response - client must stay open during streaming
-        client = httpx.AsyncClient(timeout=None)
+        client = httpx.AsyncClient(timeout=request_timeout)
         # Manually open the httpx stream so we can capture backend headers
         cm = client.stream(
             request.method,
@@ -1699,7 +1735,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     else:
         # Non-streaming response
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
                 method = request.method.lower()
                 response = await getattr(client, method)(
                     target_url,
@@ -1810,11 +1846,12 @@ async def proxy_to_remote(
     if not model_name:
         model_name = current_model or model_config.get('name') or model_config.get('id') or 'unknown'
 
+    remote_timeout = httpx.Timeout(config.get("server", {}).get("llama_request_timeout", 300))
     is_streaming = body_json.get("stream", False)
     
     if is_streaming:
         # Streaming response - client must stay open during streaming
-        client = httpx.AsyncClient(timeout=None)
+        client = httpx.AsyncClient(timeout=remote_timeout)
         cm = client.stream(
             request.method,
             target_url,
@@ -1882,7 +1919,7 @@ async def proxy_to_remote(
             headers=outgoing_headers
         )
     else:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=remote_timeout) as client:
             method = request.method.lower()
             response = await getattr(client, method)(
                 target_url,
@@ -1970,7 +2007,7 @@ def log_response_chunk(chunk: bytes):
     """Log streaming response chunk."""
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
-        logger.debug(f"STREAM CHUNK | {chunk_str}")
+        logger.info(f"STREAM CHUNK | {chunk_str}")
     except Exception:
         pass
 
@@ -3811,7 +3848,7 @@ async def view_logs(request: Request):
 
     tokens_html = await get_tokens_html()
 
-    html = """<!DOCTYPE html>
+    html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -4007,7 +4044,7 @@ async def view_logs(request: Request):
             try {
               const m = k.match(/^[A-Z]+\s+(\S+)\s+->/);
               const reqPath = m ? m[1] : null;
-              const pathNoV1 = path.replace(/^\\/v1\\//, '/');
+              const pathNoV1 = path.replace(/^\/v1\//, '/');
               if (reqPath && (reqPath === path || reqPath === pathNoV1) && !k.includes('-> model:')) {
                 reqTotal += Number(v || 0);
               }
