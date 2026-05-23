@@ -1473,17 +1473,24 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id = session.session_id
 
             if not session_created and session.message_count > 0:
-                # Session has prior history – compute delta
+                # Session has prior history – compute delta for logging only
+                # NOTE: Do NOT send delta to llama-server because llama-server's
+                # prompt cache is keyed by the FULL prompt. If session_id was working,
+                # we would see "slot load_session: loading KV cache for session_id=..."
+                # in the logs. Since we only see LCP matching, session_id-based cache
+                # restore is not functioning. Sending deltas causes the llama-server
+                # to match the wrong cached prompt via LCP similarity on the shared
+                # system prompt, corrupting context.
                 delta_messages, history_matches = session_manager.compute_delta(
                     session.messages, body_json["messages"]
                 )
                 if history_matches and len(delta_messages) > 0:
-                    # Prefix matches – send only new messages
-                    is_delta_request = True
-                    body_json["messages"] = delta_messages
+                    # History matches but send FULL messages – deltas don't work with llama-server cache
+                    is_delta_request = False
                     logger.info(
-                        f"Session {session_id[:8]}... delta: "
-                        f"{original_message_count} -> {len(delta_messages)} messages"
+                        f"Session {session_id[:8]}... history match "
+                        f"({len(delta_messages)} new messages) — sending full prompt, "
+                        f"session_id-based cache restore not functioning"
                     )
                 elif not history_matches:
                     # History was edited – invalidate session, send full history
