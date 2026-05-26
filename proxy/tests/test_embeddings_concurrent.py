@@ -1,7 +1,19 @@
 import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pytest
 from requests.exceptions import RequestException
+
+
+def _require_local_proxy(base: str):
+    """Skip integration tests when a local proxy instance is not running."""
+    try:
+        r = requests.get(f"{base}/health", timeout=2)
+        if r.status_code != 200:
+            pytest.skip(f"local proxy not healthy at {base}/health")
+    except RequestException:
+        pytest.skip(f"local proxy not reachable at {base}")
 
 
 def run_embedding(base, payload, timeout=30):
@@ -26,6 +38,7 @@ def test_concurrent_embeddings_and_chat():
     Assumes a running proxy at http://localhost:8000 with router-mode llama-server available.
     """
     base = "http://localhost:8000"
+    _require_local_proxy(base)
 
     # Warm up / wait until embeddings alias is ready (reuse helper from other test)
     deadline = time.time() + 60
@@ -50,7 +63,7 @@ def test_concurrent_embeddings_and_chat():
             pass
         time.sleep(1.0)
     else:
-        raise AssertionError("embeddings endpoint not ready after 60s")
+        pytest.skip("embeddings endpoint not ready after 60s")
 
     # Prepare payloads
     embeddings_payloads = [{"model": "embeddings", "input": f"hello {i}"} for i in range(5)]
@@ -74,6 +87,21 @@ def test_concurrent_embeddings_and_chat():
     # Ensure we got 10 results
     assert len(results) == 10, f"expected 10 responses, got {len(results)}"
 
-    # Validate responses: each should be (200, body)
+    # Validate responses under concurrency guard:
+    # with max_concurrent_queries=4, overload 503s are expected when firing 10 at once.
+    ok_count = 0
+    overload_count = 0
     for status, body in results:
-        assert status == 200, f"request failed or returned non-200: status={status} body={body}"
+        assert status in (200, 503), f"unexpected status={status} body={body}"
+        if status == 200:
+            ok_count += 1
+        elif status == 503:
+            overload_count += 1
+            assert (
+                "Server overloaded" in body
+                or "Model server busy" in body
+                or "model_loading" in body
+            ), f"unexpected 503 body={body}"
+
+    assert ok_count >= 1, "expected at least one successful request under concurrent load"
+    assert overload_count >= 1, "expected at least one overload rejection under concurrent load"

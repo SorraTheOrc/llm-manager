@@ -80,7 +80,12 @@ server:
   llama_models_max: 2
   llama_request_timeout: 300
   llama_router_mode: true
-  max_concurrent_queries: 8
+  max_concurrent_queries: 4
+  backend_retry_attempts: 3
+  backend_retry_base_delay_seconds: 0.25
+  backend_retry_max_delay_seconds: 2.0
+  backend_retry_jitter_ratio: 0.25
+  llama_watchdog_interval_seconds: 5
   llama_router_preload:
   - embeddings
   - Qwen3

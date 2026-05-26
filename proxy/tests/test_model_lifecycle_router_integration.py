@@ -52,7 +52,10 @@ async def test_stub_router_integration(monkeypatch):
                 return httpx.Response(200, json={"ok": True})
             return httpx.Response(400, json={"error": "missing model"})
         if path == '/models' and method == 'GET':
-            return httpx.Response(200, json={"data": [{"id": m} for m in loaded]})
+            return httpx.Response(
+                200,
+                json={"data": [{"id": m, "status": {"value": "loaded"}} for m in loaded]},
+            )
         return httpx.Response(404)
 
     transport = httpx.MockTransport(handler)

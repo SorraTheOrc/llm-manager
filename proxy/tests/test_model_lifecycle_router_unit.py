@@ -104,10 +104,10 @@ async def test_create_embeddings_schedules_background_load_when_not_loaded(monke
     body = json.dumps({"model": "embeddings", "input": "hello"}).encode('utf-8')
     req = DummyRequest(body)
 
-    with pytest.raises(HTTPException) as excinfo:
-        await server.create_embeddings(req)
+    resp = await server.create_embeddings(req)
 
-    assert excinfo.value.status_code == 503
+    assert isinstance(resp, Response)
+    assert resp.status_code == 503
     assert scheduled.get('model') in ("embeddings", "mxbai-embed")
 
 

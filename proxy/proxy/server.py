@@ -151,6 +151,21 @@ periodic_broadcast_task: Optional[asyncio.Task] = None
 active_queries: int = 0
 active_queries_lock = asyncio.Lock()
 
+# Backend resilience/observability signals
+backend_signal_counts: dict = {
+    "connect_failures": 0,
+    "read_failures": 0,
+    "timeout_failures": 0,
+    "other_failures": 0,
+    "concurrency_rejects": 0,
+}
+
+# Health/readiness signal for local backend
+backend_ready: bool = False
+
+# Background watchdog task (started in lifespan)
+backend_watchdog_task: Optional[asyncio.Task] = None
+
 # Token counting
 token_counts: dict = {}
 token_lock = asyncio.Lock()
@@ -222,6 +237,85 @@ def _model_loading_response(requested_model: Optional[str], target_model: str, s
         content=payload,
         headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
     )
+
+
+def _record_backend_signal(signal_name: str) -> None:
+    """Increment a backend signal counter for observability."""
+    try:
+        if signal_name in backend_signal_counts:
+            backend_signal_counts[signal_name] = int(backend_signal_counts.get(signal_name, 0)) + 1
+    except Exception:
+        pass
+
+
+def _classify_backend_exception(exc: Exception) -> str:
+    """Map backend transport exceptions to signal buckets."""
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "connect_failures"
+    if isinstance(exc, (httpx.ReadError,)):
+        return "read_failures"
+    if isinstance(exc, (httpx.ReadTimeout, httpx.TimeoutException)):
+        return "timeout_failures"
+    return "other_failures"
+
+
+def _is_retryable_backend_exception(exc: Exception) -> bool:
+    """Return True when an exception is a retryable backend transport failure."""
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.ReadTimeout, httpx.TimeoutException))
+
+
+def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitter_ratio: float) -> float:
+    """Compute bounded exponential backoff with jitter."""
+    base = max(0.0, float(base_delay)) * (2 ** max(0, attempt - 1))
+    delay = min(base, max(0.0, float(max_delay)))
+    if jitter_ratio > 0 and delay > 0:
+        jitter = delay * min(max(float(jitter_ratio), 0.0), 1.0)
+        delay += jitter * (2 * (os.urandom(1)[0] / 255.0) - 1.0)
+        delay = max(0.0, min(delay, max(0.0, float(max_delay))))
+    return delay
+
+
+async def _call_with_backend_retries(call_factory, path: str, stream: bool = False):
+    """Execute backend call with bounded retries on connect/read failures."""
+    server_cfg = config.get("server", {})
+    max_attempts = int(server_cfg.get("backend_retry_attempts", 3) or 3)
+    base_delay = float(server_cfg.get("backend_retry_base_delay_seconds", 0.25) or 0.25)
+    max_delay = float(server_cfg.get("backend_retry_max_delay_seconds", 2.0) or 2.0)
+    jitter_ratio = float(server_cfg.get("backend_retry_jitter_ratio", 0.25) or 0.25)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await call_factory()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_backend_exception(exc) or attempt >= max_attempts:
+                _record_backend_signal(_classify_backend_exception(exc))
+                try:
+                    global backend_ready
+                    backend_ready = False
+                except Exception:
+                    pass
+                raise
+
+            signal_name = _classify_backend_exception(exc)
+            _record_backend_signal(signal_name)
+            delay = _compute_retry_delay(attempt, base_delay, max_delay, jitter_ratio)
+            logger.warning(
+                "backend_retry path=%s stream=%s attempt=%s/%s delay=%.3fs signal=%s error=%s",
+                path,
+                stream,
+                attempt,
+                max_attempts,
+                delay,
+                signal_name,
+                type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("backend retry loop exhausted without exception")
 
 
 config: dict = {}
@@ -1257,7 +1351,7 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
 
 def stop_llama_server():
     """Stop the currently running llama-server."""
-    global llama_process, llama_log_file, current_model
+    global llama_process, llama_log_file, current_model, backend_ready
     
     server_config = config.get("server", {})
     distrobox_name = server_config.get("distrobox_name", "llama")
@@ -1298,9 +1392,11 @@ def stop_llama_server():
             except Exception:
                 pass
             current_model = None
+            backend_ready = False
             logger.info("llama-server stopped")
         else:
             llama_process = None
+            backend_ready = False
             logger.info("llama-server stop skipped (no valid process)")
     
     # Close log file if open
@@ -1317,10 +1413,11 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
     Ensure the requested model is loaded in llama-server.
     Returns True if the model is ready, False if there was an error.
     """
-    global llama_process, current_model
+    global llama_process, current_model, backend_ready
 
     llama_model = get_local_model_name(requested_model)
     if llama_model is None:
+        backend_ready = False
         return False
 
     server_config = config.get("server", {})
@@ -1334,6 +1431,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
             if current_model == llama_model and llama_process is not None:
                 # Check if process is still running
                 if llama_process.poll() is None:
+                    backend_ready = True
                     return True
                 else:
                     logger.warning("llama-server process died, restarting...")
@@ -1363,6 +1461,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
                     if llama_process is None:
                         logger.error("start_llama_server failed to spawn router process")
+                        backend_ready = False
                         return False
 
                     if not await wait_for_llama_server(timeout):
@@ -1372,6 +1471,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                             "llama_server_running": False
                         })
                         stop_llama_server()
+                        backend_ready = False
                         return False
 
                 if not await router_load_model(llama_model):
@@ -1380,6 +1480,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                         "current_model": None,
                         "llama_server_running": True
                     })
+                    backend_ready = False
                     return False
 
                 # Enforce embeddings pinned: ensure embeddings preset remains loaded
@@ -1398,6 +1499,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                         "current_model": None,
                         "llama_server_running": True
                     })
+                    backend_ready = False
                     return False
 
                 current_model = llama_model
@@ -1409,8 +1511,8 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                     "current_model": llama_model,
                     "llama_server_running": True
                 })
+                backend_ready = True
                 return True
-
 
             # Need to switch models or restart
             stop_llama_server()
@@ -1422,6 +1524,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
             # broadcasts a detailed error message.
             if llama_process is None:
                 logger.error(f"start_llama_server failed to spawn process for model {llama_model}")
+                backend_ready = False
                 return False
 
             if await wait_for_llama_server(timeout):
@@ -1435,6 +1538,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                     "current_model": llama_model,
                     "llama_server_running": True
                 })
+                backend_ready = True
                 return True
             else:
                 # Broadcast failure
@@ -1444,6 +1548,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                     "llama_server_running": False
                 })
                 stop_llama_server()
+                backend_ready = False
                 return False
     finally:
         # Ensure we decrement the refcount if we incremented it above.
@@ -1465,7 +1570,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     and ``cache_prompt`` parameters are used to preserve the KV cache
     across requests.
     """
-    global active_queries
+    global active_queries, backend_ready
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
     target_url = f"http://localhost:{llama_port}/{path}"
@@ -1571,11 +1676,17 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 body = json.dumps(body_json).encode("utf-8")
 
     # Check concurrency limit before accepting request
-    max_queries = server_config.get("max_concurrent_queries", 8)
+    max_queries = server_config.get("max_concurrent_queries", 4)
     try:
         async with active_queries_lock:
             if active_queries >= max_queries:
-                logger.warning(f"Max concurrent queries reached ({active_queries}/{max_queries}), rejecting request")
+                _record_backend_signal("concurrency_rejects")
+                logger.warning(
+                    "concurrency_reject active=%s max=%s path=%s",
+                    active_queries,
+                    max_queries,
+                    path,
+                )
                 raise HTTPException(status_code=503, detail=f"Server overloaded: {active_queries} queries active. Retry later.")
     except HTTPException:
         raise
@@ -1655,22 +1766,35 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if is_streaming:
         # Streaming response - client must stay open during streaming
         client = httpx.AsyncClient(timeout=request_timeout)
-        # Manually open the httpx stream so we can capture backend headers
-        cm = client.stream(
-            request.method,
-            target_url,
-            headers=headers,
-            content=body
-        )
 
-        # Enter the stream to obtain the response and headers
+        async def _open_stream_once():
+            stream_cm = client.stream(
+                request.method,
+                target_url,
+                headers=headers,
+                content=body,
+            )
+            stream_resp = await stream_cm.__aenter__()
+            return stream_cm, stream_resp
+
+        # Enter the stream with bounded retries on transient backend failures
         try:
-            response = await cm.__aenter__()
+            cm, response = await _call_with_backend_retries(
+                _open_stream_once,
+                path=path,
+                stream=True,
+            )
+            backend_ready = True
         except Exception:
+            backend_ready = False
             # If stream setup failed, ensure active_queries is decremented
             try:
                 async with active_queries_lock:
                     active_queries = max(0, active_queries - 1)
+            except Exception:
+                pass
+            try:
+                await client.aclose()
             except Exception:
                 pass
             raise
@@ -1852,11 +1976,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         try:
             async with httpx.AsyncClient(timeout=request_timeout) as client:
                 method = request.method.lower()
-                response = await getattr(client, method)(
-                    target_url,
-                    headers=headers,
-                    content=body
-                )
+
+                async def _send_once():
+                    return await getattr(client, method)(
+                        target_url,
+                        headers=headers,
+                        content=body,
+                    )
+
+                response = await _call_with_backend_retries(_send_once, path=path, stream=False)
+                backend_ready = True
 
                 # Non-streaming: count tokens in response body
                 try:
@@ -2171,15 +2300,65 @@ def log_response_chunk(chunk: bytes):
         pass
 
 
+async def _backend_watchdog_loop() -> None:
+    """Watch local backend process and trigger best-effort recovery."""
+    global llama_process, current_model, backend_ready
+
+    while True:
+        try:
+            interval = float(config.get("server", {}).get("llama_watchdog_interval_seconds", 5.0) or 5.0)
+            await asyncio.sleep(max(1.0, interval))
+
+            proc = llama_process
+            if proc is None:
+                continue
+
+            code = None
+            try:
+                code = proc.poll()
+            except Exception:
+                code = None
+
+            if code is None:
+                continue
+
+            router_mode = bool(config.get("server", {}).get("llama_router_mode", False))
+            logger.error("watchdog detected llama-server exit code=%s model=%s", code, current_model)
+            backend_ready = False
+            _record_backend_signal("other_failures")
+            llama_process = None
+            current_model = None
+
+            # In router mode, attempt best-effort automatic restart.
+            if router_mode:
+                try:
+                    restarted = start_llama_server(None)
+                    if restarted is not None:
+                        llama_process = restarted
+                        timeout = int(config.get("server", {}).get("llama_startup_timeout", 300) or 300)
+                        backend_ready = await wait_for_llama_server(timeout)
+                        logger.info("watchdog router restart backend_ready=%s", backend_ready)
+                    else:
+                        logger.error("watchdog failed to restart router process")
+                except Exception:
+                    logger.exception("watchdog restart attempt failed")
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("watchdog loop error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global config, logger, llama_process, _http_client
+    global config, logger, llama_process, _http_client, backend_watchdog_task, backend_ready
     
     # Startup
     config = load_config()
     logger = setup_logging(config)
     logger.info("Starting LLama Proxy Server")
+    backend_ready = False
 
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(5.0),
@@ -2238,7 +2417,7 @@ async def lifespan(app: FastAPI):
 
     async def _load_default_model():
         """Load the default model with retries, running in the background."""
-        global current_model, llama_process
+        global current_model, llama_process, backend_ready
         max_attempts = 6
         retry_delays = [0, 30, 60, 120, 240, 300]  # first attempt immediate
         for attempt, delay in enumerate(retry_delays[:max_attempts], 1):
@@ -2260,6 +2439,7 @@ async def lifespan(app: FastAPI):
                             raise RuntimeError("Failed to start router-mode llama-server")
                     if not await wait_for_llama_server(config.get("server", {}).get("llama_startup_timeout", 300)):
                         raise RuntimeError("Router-mode llama-server failed to become ready")
+                    backend_ready = True
 
                     resolved = []
                     if router_preload_list:
@@ -2272,6 +2452,7 @@ async def lifespan(app: FastAPI):
                     return
 
                 if await ensure_model_loaded(default_model):
+                    backend_ready = True
                     logger.info(f"Default model '{default_model}' loaded successfully")
                     return
             except Exception as e:
@@ -2282,7 +2463,11 @@ async def lifespan(app: FastAPI):
             f"Model will be loaded on first matching request."
         )
 
-    asyncio.get_running_loop().create_task(_load_default_model())
+    loop = asyncio.get_running_loop()
+    loop.create_task(_load_default_model())
+
+    if backend_watchdog_task is None:
+        backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
 
     # Load persisted request counts and token counts
     load_counts()
@@ -2322,6 +2507,16 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         _http_client = None
+
+    if backend_watchdog_task is not None:
+        backend_watchdog_task.cancel()
+        try:
+            await backend_watchdog_task
+        except Exception:
+            pass
+        backend_watchdog_task = None
+
+    backend_ready = False
     stop_llama_server()
 
 
@@ -3727,18 +3922,23 @@ async def get_llama_local_status():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint with readiness gating."""
     router_mode = config.get("server", {}).get("llama_router_mode", False)
     loaded_models = None
     if router_mode:
         router_models = await router_list_models()
         loaded_models = _extract_router_model_ids(router_models)
 
+    llama_running = llama_process is not None and llama_process.poll() is None
+    ready = bool(llama_running and backend_ready)
+
     return {
-        "status": "healthy",
+        "status": "healthy" if ready else "degraded",
+        "ready": ready,
         "current_model": current_model,
         "loaded_models": loaded_models,
-        "llama_server_running": llama_process is not None and llama_process.poll() is None
+        "llama_server_running": llama_running,
+        "backend_signals": dict(backend_signal_counts),
     }
 
 
@@ -4717,6 +4917,8 @@ async def admin_metrics():
         "per_model": per_model,
         "process_rss_bytes": process_rss,
         "session_metrics": session_manager.get_metrics(),
+        "backend_ready": bool(backend_ready),
+        "backend_signals": dict(backend_signal_counts),
     }
 
 

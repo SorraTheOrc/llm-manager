@@ -21,6 +21,12 @@ server:
     - "embeddings"
     - "qwen3"
   llama_models_max: 2
+  max_concurrent_queries: 4
+  backend_retry_attempts: 3
+  backend_retry_base_delay_seconds: 0.25
+  backend_retry_max_delay_seconds: 2.0
+  backend_retry_jitter_ratio: 0.25
+  llama_watchdog_interval_seconds: 5
 ```
 
 ## Running
@@ -42,3 +48,6 @@ The router exposes:
 
 - `models.ini` must include both the embeddings model and the primary model preset.
 - `llama_models_max` limits concurrent models and controls LRU eviction.
+- The proxy health endpoint (`/health`) is readiness-gated (`ready: true/false`); after a router crash it reports `status: degraded` until watchdog recovery completes.
+- Backend crash-path signals are exposed via `/health` and `/admin/metrics` in `backend_signals` for triage.
+- Repro fault injection script: `proxy/scripts/fault-injection-backend-crash.sh` captures health/metrics snapshots and log signatures during a forced backend crash.

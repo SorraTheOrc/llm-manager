@@ -262,8 +262,16 @@ Response:
 ```json
 {
   "status": "healthy",
+  "ready": true,
   "current_model": "qwen3",
-  "llama_server_running": true
+  "llama_server_running": true,
+  "backend_signals": {
+    "connect_failures": 0,
+    "read_failures": 0,
+    "timeout_failures": 0,
+    "other_failures": 0,
+    "concurrency_rejects": 0
+  }
 }
 ```
 
@@ -459,6 +467,8 @@ Returns:
 - `sessions_active`: Number of currently active sessions
 - `sessions_created_total`: Total sessions created since proxy started
 - `sessions_expired_total`: Total sessions expired since proxy started
+- `backend_ready`: readiness gate used by `/health`
+- `backend_signals`: counters for `connect_failures`, `read_failures`, `timeout_failures`, `other_failures`, and `concurrency_rejects`
 
 ## Prometheus metrics
 
@@ -502,6 +512,44 @@ If loading fails, the proxy returns HTTP 503 with a `Retry-After` header:
 ```
 
 Clients should handle this by retrying after the specified delay.
+
+### Crash-path safeguards
+
+The proxy now adds bounded backend retries for transient local transport failures
+(connect/read/timeout). Retry behavior is controlled by:
+
+- `server.backend_retry_attempts`
+- `server.backend_retry_base_delay_seconds`
+- `server.backend_retry_max_delay_seconds`
+- `server.backend_retry_jitter_ratio`
+
+Concurrency pressure is controlled by `server.max_concurrent_queries` (default 4).
+When the guard rejects a request, the proxy returns a 503 and increments
+`backend_signals.concurrency_rejects`.
+
+A watchdog loop monitors the child llama-server process. If the process exits,
+health switches to `degraded`, backend readiness is gated to `ready: false`, and
+router mode attempts a best-effort restart.
+
+#### Fault-injection validation (reproducible)
+
+Run the crash-path repro script:
+
+```bash
+cd proxy
+./scripts/fault-injection-backend-crash.sh
+```
+
+Artifacts are written under `proxy/logs/fault-injection/run-<timestamp>/`.
+Expected triage signatures include:
+
+- `backend_retry path=... signal=connect_failures|read_failures|timeout_failures`
+- `concurrency_reject active=... max=...`
+- `watchdog detected llama-server exit code=...`
+- `watchdog router restart backend_ready=...`
+
+Use `/health` and `/admin/metrics` snapshots from the run directory to verify
+readiness transitions and backend signal counters.
 
 ### Router Mode (Multi-Model)
 
