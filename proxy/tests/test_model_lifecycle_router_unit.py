@@ -210,6 +210,34 @@ async def test_ensure_model_loaded_refcount_and_loading_state(monkeypatch, mock_
 
 
 @pytest.mark.asyncio
+async def test_router_is_model_loaded_treats_presence_without_status_as_loaded(monkeypatch):
+    """router_is_model_loaded should treat present model entries as loaded when status metadata is absent."""
+
+    monkeypatch.setattr(
+        server,
+        'router_list_models',
+        AsyncMock(return_value={"data": [{"id": "Qwen3"}]}),
+    )
+
+    ok = await server.router_is_model_loaded("Qwen3")
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_router_is_model_loaded_respects_non_loaded_status(monkeypatch):
+    """router_is_model_loaded should return False when status explicitly says not loaded."""
+
+    monkeypatch.setattr(
+        server,
+        'router_list_models',
+        AsyncMock(return_value={"data": [{"id": "Qwen3", "status": {"value": "loading"}}]}),
+    )
+
+    ok = await server.router_is_model_loaded("Qwen3")
+    assert ok is False
+
+
+@pytest.mark.asyncio
 async def test_stop_server_and_background_load_clears_background_and_refcount(monkeypatch, mock_config):
     """Stopping the server clears current_model and scheduling a background load increments refcount and sets background_loads; it should clear after load completes."""
     monkeypatch.setattr(server, 'config', mock_config)

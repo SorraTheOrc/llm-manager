@@ -1086,11 +1086,38 @@ async def router_is_model_loaded(model_name: str) -> bool:
     models_payload = router_models.get("data") or router_models.get("models") or []
     if not isinstance(models_payload, list):
         return False
+
     for m in models_payload:
-        if isinstance(m, dict) and m.get("id") == model_name:
-            status = m.get("status", {})
-            if isinstance(status, dict):
-                return status.get("value") == "loaded"
+        if not (isinstance(m, dict) and m.get("id") == model_name):
+            continue
+
+        # Different llama-server/router builds expose model readiness with
+        # varying schemas. Treat model presence as loaded when no explicit
+        # status is provided to avoid false negatives that can pin
+        # background_loads and keep returning scheduled=False + 503.
+        status = m.get("status")
+        if status is None:
+            return True
+
+        if isinstance(status, dict):
+            value = str(status.get("value", "")).strip().lower()
+            if value in {"loaded", "ready", "running", "active"}:
+                return True
+            if value in {"loading", "unloaded", "error", "failed"}:
+                return False
+            # Unknown status value: fall back to presence as loaded.
+            return True
+
+        if isinstance(status, str):
+            value = status.strip().lower()
+            if value in {"loaded", "ready", "running", "active"}:
+                return True
+            if value in {"loading", "unloaded", "error", "failed"}:
+                return False
+
+        # Presence with unrecognized status shape/value: consider loaded.
+        return True
+
     return False
 
 
