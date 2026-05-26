@@ -29,7 +29,7 @@ import threading
 from datetime import timedelta
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from proxy.session_manager import SessionManager, DEFAULT_SESSION_TTL_SECONDS
 import proxy.metrics as metrics
@@ -197,6 +197,33 @@ def count_text_tokens(text: str, model_name: str | None = None) -> int:
             pass
     # heuristic: 1 token ~ 4 bytes UTF-8
     return max(1, len(text.encode('utf-8')) // 4)
+
+
+def _model_loading_response(requested_model: Optional[str], target_model: str, scheduled: bool, endpoint: str) -> JSONResponse:
+    """Build a consistent JSON 503 payload when a model is loading."""
+    retry_after = int(config.get("server", {}).get("model_loading_retry_after", 30) or 30)
+    payload = {
+        "error": {
+            "type": "model_loading",
+            "code": "model_loading",
+            "message": f"Model {target_model} is loading, retry shortly"
+        },
+        "status": 503,
+        "requested_model": requested_model,
+        "target_model": target_model,
+        "scheduled": bool(scheduled),
+        "current_model": current_model,
+        "llama_server_running": llama_process is not None and llama_process.poll() is None,
+        "retry_after": retry_after,
+        "endpoint": endpoint,
+    }
+    return JSONResponse(
+        status_code=503,
+        content=payload,
+        headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+    )
+
+
 config: dict = {}
 
 
@@ -1647,6 +1674,36 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             except Exception:
                 pass
             raise
+        upstream_status = response.status_code
+        upstream_content_type = response.headers.get('content-type', '')
+
+        # If upstream returned an error (or a non-SSE payload), return a buffered
+        # response with the real status code so clients don't parse it as SSE.
+        if upstream_status >= 400 or 'text/event-stream' not in upstream_content_type.lower():
+            try:
+                body_bytes = await response.aread()
+            except Exception:
+                body_bytes = b''
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+            err_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+            if session_id:
+                err_headers["X-Session-Id"] = session_id
+                err_headers["X-Session-Created"] = "true" if session_created else "false"
+                err_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+            return Response(
+                content=body_bytes,
+                status_code=upstream_status,
+                headers=err_headers,
+            )
+
         # Normalize backend headers for streaming (remove content-length if TE present)
         outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
         # Ensure Cache-Control is present
@@ -1664,6 +1721,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             global active_queries
             # Track assistant response for session history update
             collected_content: list[str] = []
+            saw_done = False
+            saw_finish = False
             try:
                 async for chunk in response.aiter_bytes():
                     # count tokens in this chunk (best-effort)
@@ -1679,6 +1738,28 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     except Exception:
                         pass
 
+                    # Inspect SSE-style 'data:' lines for finish indicators
+                    try:
+                        txt = chunk.decode('utf-8', errors='replace')
+                        for line in txt.splitlines():
+                            line = line.strip()
+                            if not line.startswith('data:'):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == '[DONE]':
+                                saw_done = True
+                            else:
+                                try:
+                                    j = json.loads(payload)
+                                    for choice in j.get('choices', []):
+                                        if choice.get('finish_reason') is not None:
+                                            saw_finish = True
+                                except Exception:
+                                    # ignore non-json payloads
+                                    pass
+                    except Exception:
+                        pass
+
                     # Collect content for session history if session is active
                     if session_id:
                         try:
@@ -1689,6 +1770,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     yield chunk
                     log_response_chunk(chunk)
             finally:
+                # If the upstream closed the stream without sending a final finish marker,
+                # synthesize a final SSE event so clients expecting a finish_reason get one.
+                try:
+                    if not saw_done and not saw_finish:
+                        try:
+                            final_obj = {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}
+                            final_bytes = (f"data: {json.dumps(final_obj)}\n\n").encode('utf-8')
+                            yield final_bytes
+                            log_response_chunk(final_bytes)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 # Update session history with the full conversation
                 if session_id and original_message_count > 0:
                     try:
@@ -1749,7 +1844,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         return StreamingResponse(
             stream_generator(),
             media_type=media_type,
-            headers=outgoing_headers
+            headers=outgoing_headers,
+            status_code=upstream_status,
         )
     else:
         # Non-streaming response
@@ -1879,6 +1975,30 @@ async def proxy_to_remote(
         )
 
         response = await cm.__aenter__()
+        upstream_status = response.status_code
+        upstream_content_type = response.headers.get('content-type', '')
+
+        # If upstream returned an error (or non-SSE payload), return a buffered
+        # response with the real status code so clients can handle it as an API error.
+        if upstream_status >= 400 or 'text/event-stream' not in upstream_content_type.lower():
+            try:
+                body_bytes = await response.aread()
+            except Exception:
+                body_bytes = b''
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            return Response(
+                content=body_bytes,
+                status_code=upstream_status,
+                headers=_normalize_outgoing_headers(dict(response.headers), buffered=True),
+            )
+
         outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
         if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
             outgoing_headers['Cache-Control'] = 'no-cache'
@@ -1886,6 +2006,8 @@ async def proxy_to_remote(
         media_type = response.headers.get('content-type', 'text/event-stream')
 
         async def stream_generator():
+            saw_done = False
+            saw_finish = False
             try:
                 async for chunk in response.aiter_bytes():
                     # parse OpenAI-style SSE chunks for delta content when possible
@@ -1899,9 +2021,14 @@ async def proxy_to_remote(
                                 continue
                             payload = line[5:].strip()
                             if payload == '[DONE]':
+                                saw_done = True
                                 continue
                             try:
                                 j = json.loads(payload)
+                                # detect finish_reason if present
+                                for choice in j.get('choices', []):
+                                    if choice.get('finish_reason') is not None:
+                                        saw_finish = True
                                 # extract any delta.content fields
                                 for choice in j.get('choices', []):
                                     delta = choice.get('delta', {})
@@ -1923,10 +2050,22 @@ async def proxy_to_remote(
                     yield chunk
                     log_response_chunk(chunk)
             finally:
+                # If upstream closed without finish markers, synthesize a final SSE chunk
                 try:
+                    if not saw_done and not saw_finish:
+                        try:
+                            final_obj = {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}
+                            final_bytes = (f"data: {json.dumps(final_obj)}\n\n").encode('utf-8')
+                            yield final_bytes
+                            log_response_chunk(final_bytes)
+                        except Exception:
+                            pass
                     await cm.__aexit__(None, None, None)
                 except Exception:
-                    pass
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
                 try:
                     await client.aclose()
                 except Exception:
@@ -1935,7 +2074,8 @@ async def proxy_to_remote(
         return StreamingResponse(
             stream_generator(),
             media_type=media_type,
-            headers=outgoing_headers
+            headers=outgoing_headers,
+            status_code=upstream_status,
         )
     else:
         async with httpx.AsyncClient(timeout=remote_timeout) as client:
@@ -4354,14 +4494,11 @@ async def create_embeddings(request: Request):
         target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
         scheduled = schedule_background_load(target_model)
         logger.info(f"Scheduled background load for embeddings request: {target_model} scheduled={scheduled}")
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "model_loading",
-                "message": f"Model {model_name} is loading, try again later",
-                "retry_after": 30
-            },
-            headers={"Retry-After": "30"}
+        return _model_loading_response(
+            requested_model=model_name if isinstance(model_name, str) else None,
+            target_model=target_model,
+            scheduled=scheduled,
+            endpoint="/v1/embeddings",
         )
     
     elif model_cfg.get("type") == "remote":
@@ -4447,14 +4584,11 @@ async def proxy_openai_api(request: Request, path: str):
         target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
         scheduled = schedule_background_load(target_model)
         logger.info(f"Scheduled background load for request: model={target_model} scheduled={scheduled}")
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "model_loading",
-                "message": f"Model {model_name} is loading, try again later",
-                "retry_after": 30
-            },
-            headers={"Retry-After": "30"}
+        return _model_loading_response(
+            requested_model=model_name if isinstance(model_name, str) else None,
+            target_model=target_model,
+            scheduled=scheduled,
+            endpoint=f"/v1/{path}",
         )
     
     elif model_cfg.get("type") == "remote":
