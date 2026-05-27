@@ -223,6 +223,28 @@ class TestRestoreContract:
 
         assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
 
+    def test_detect_restore_signal_from_log_slice(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("before\n")
+        start_offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot update_slots restored context checkpoint\n")
+
+        assert _detect_restore_signal_from_log_slice(log_file, start_offset) is True
+
+    def test_detect_restore_signal_from_log_slice_negative(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("before\n")
+        start_offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot update_slots normal processing\n")
+
+        assert _detect_restore_signal_from_log_slice(log_file, start_offset) is False
+
 
 class TestRestoreObservability:
     """Observability counters for strict restore behavior."""

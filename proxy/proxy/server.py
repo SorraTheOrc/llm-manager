@@ -450,6 +450,35 @@ def _has_explicit_restore_signal(
     return False
 
 
+def _detect_restore_signal_from_log_slice(
+    log_path: Path,
+    start_offset: int,
+) -> bool:
+    """Return True when restore evidence exists in newly appended log bytes."""
+    if not log_path.exists():
+        return False
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(max(0, int(start_offset)))
+            data = f.read()
+    except Exception:
+        return False
+
+    if not data:
+        return False
+
+    text = data.lower()
+    phrases = (
+        "restored context checkpoint",
+        "load_session",
+        "session restore",
+        "restore session",
+        "loading kv cache",
+        "kv cache restored",
+    )
+    return any(p in text for p in phrases)
+
+
 def _detect_restore_signal_from_llama_log(
     session_id: Optional[str],
     log_path: Optional[Path] = None,
@@ -457,8 +486,7 @@ def _detect_restore_signal_from_llama_log(
 ) -> bool:
     """Best-effort compatibility signal from llama-server logs.
 
-    We only treat this as explicit evidence when the line contains both
-    the session id and a restore-related phrase.
+    Prefer session-id-specific lines when available.
     """
     if not session_id:
         return False
@@ -481,15 +509,16 @@ def _detect_restore_signal_from_llama_log(
         "restore session",
         "loading kv cache",
         "kv cache restored",
+        "restored context checkpoint",
     )
 
     for line in reversed(lines):
         text = line.strip().lower()
-        if sid_lower not in text:
-            continue
-        if any(p in text for p in phrases):
+        if sid_lower in text and any(p in text for p in phrases):
             return True
-    return False
+
+    # Fallback: if no session id appears in log format, accept recent restore phrases.
+    return any(any(p in line.strip().lower() for p in phrases) for line in lines)
 
 
 log_dir: Optional[Path] = None
@@ -1918,6 +1947,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         if k.lower() not in ("host", "content-length")
     }
     
+    # Capture llama log cursor so we can attribute restore events during this request.
+    llama_log_path = _resolve_log_path("llama")
+    try:
+        llama_log_offset = llama_log_path.stat().st_size if llama_log_path.exists() else 0
+    except Exception:
+        llama_log_offset = 0
+
     # Check if streaming is requested
     is_streaming = body_json.get("stream", False)
     
@@ -2078,6 +2114,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 # Strict restore confirmation state comes from explicit backend signal.
                 if session_id:
                     try:
+                        if not restore_signal_detected:
+                            restore_signal_detected = _detect_restore_signal_from_log_slice(
+                                llama_log_path,
+                                llama_log_offset,
+                            )
                         if restore_signal_detected:
                             _record_restore_success()
                         await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
@@ -2186,6 +2227,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         )
                         if session_id and not restore_signal_detected:
                             restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
+                        if session_id and not restore_signal_detected:
+                            restore_signal_detected = _detect_restore_signal_from_log_slice(
+                                llama_log_path,
+                                llama_log_offset,
+                            )
                         if restore_signal_detected:
                             _record_restore_success()
                         await session_manager.set_restore_confirmed(session_id, restore_signal_detected)

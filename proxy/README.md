@@ -354,7 +354,9 @@ The proxy supports session-based incremental prompt ingestion to reduce CPU usag
 
 Delta routing is only enabled when the proxy has explicit backend evidence that session restore works for that session.
 
-- If restore evidence is missing in API headers/body, the proxy performs a compatibility check against recent llama-server logs for session-specific restore phrases (for example `load_session` + session id).
+- If restore evidence is missing in API headers/body, the proxy performs compatibility checks against llama-server logs:
+  - session-specific restore phrases when available, and
+  - restore markers (`restored context checkpoint`, `load_session`, etc.) that appear in log lines appended during the active request window.
 - If neither API nor log evidence is found, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
 - If message history was edited, the proxy invalidates the session and falls back with `X-Session-Fallback-Reason: history_mismatch`.
 - When no previous history exists, requests are full-ingestion by design.
