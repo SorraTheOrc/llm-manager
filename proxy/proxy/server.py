@@ -746,12 +746,14 @@ def _should_cutoff_for_repetition(
         return False
     pattern_len = max(1, int(min_pattern_chars))
     repeats = max(2, int(min_repeats))
-    if len(response_text) < pattern_len * repeats:
+    tail_len = pattern_len * repeats
+    if len(response_text) < tail_len:
         return False
-    pattern = response_text[-pattern_len:]
+    tail = response_text[-tail_len:]
+    pattern = tail[-pattern_len:]
     if not pattern.strip():
         return False
-    return response_text.count(pattern) >= repeats
+    return tail == pattern * repeats
 
 
 def evaluate_stream_guardrail(
@@ -2524,10 +2526,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 max_runtime_seconds = float(server_config.get("session_guardrail_max_runtime_seconds", 120) or 120)
                 max_completion_tokens = int(server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048)
                 repetition_min_pattern_chars = int(
-                    server_config.get("session_guardrail_repetition_min_pattern_chars", 8) or 8
+                    server_config.get("session_guardrail_repetition_min_pattern_chars", 64) or 64
                 )
                 repetition_min_repeats = int(
-                    server_config.get("session_guardrail_repetition_min_repeats", 4) or 4
+                    server_config.get("session_guardrail_repetition_min_repeats", 10) or 10
                 )
                 invalidate_on_guardrail = bool(
                     server_config.get("session_guardrail_invalidate_on_cutoff", True)
@@ -2656,7 +2658,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 logger.debug("Failed to set restore-confirmed state", exc_info=True)
 
                         # Update session history with the full conversation
-                        if session_id and original_message_count > 0 and not guardrail_reason:
+                        if session_id and original_message_count > 0 and (collected_content or not guardrail_reason):
                             try:
                                 if collected_content:
                                     full_response = ''.join(collected_content)

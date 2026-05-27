@@ -121,8 +121,8 @@ server:
   session_slot_timeout_seconds: 3.0
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048
-  session_guardrail_repetition_min_pattern_chars: 8
-  session_guardrail_repetition_min_repeats: 4
+  session_guardrail_repetition_min_pattern_chars: 64
+  session_guardrail_repetition_min_repeats: 10
   session_guardrail_invalidate_on_cutoff: true
   session_guardrail_invalidate_on_repetition: false
   session_require_restore_signal: false

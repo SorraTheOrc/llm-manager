@@ -502,12 +502,22 @@ class TestStreamGuardrails:
     def test_repetition_detection_triggers_for_pathological_output(self):
         from proxy.server import _should_cutoff_for_repetition
 
-        repeated_text = "abc123 " * 20
+        repeated_text = "abc123" * 20
         assert _should_cutoff_for_repetition(
             repeated_text,
             min_pattern_chars=6,
             min_repeats=4,
         ) is True
+
+    def test_repetition_detection_requires_consecutive_suffix(self):
+        from proxy.server import _should_cutoff_for_repetition
+
+        repeated_text = ("abc123" * 3) + "xyz"
+        assert _should_cutoff_for_repetition(
+            repeated_text,
+            min_pattern_chars=6,
+            min_repeats=3,
+        ) is False
 
     def test_repetition_detection_ignores_healthy_output(self):
         from proxy.server import _should_cutoff_for_repetition
@@ -564,7 +574,7 @@ class TestStreamGuardrails:
             evaluate_stream_guardrail(
                 runtime_seconds=5.0,
                 completion_tokens=20,
-                response_text=("loop-me-forever " * 10),
+                response_text=("loopfore" * 6),
                 max_runtime_seconds=10.0,
                 max_completion_tokens=100,
                 repetition_min_pattern_chars=8,
