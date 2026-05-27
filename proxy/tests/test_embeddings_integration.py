@@ -37,6 +37,7 @@ def test_router_mode_serves_embeddings_and_chat():
     # race conditions with router preload. Poll until a successful embeddings
     # response is returned or we hit the timeout.
     wait_for_embeddings(base, timeout=60)
+    wait_for_chat(base, chat_payload, timeout=120)
 
     embeddings_resp = requests.post(f"{base}/v1/embeddings", json=embeddings_payload, timeout=30)
     chat_resp = requests.post(f"{base}/v1/chat/completions", json=chat_payload, timeout=60)
@@ -111,3 +112,21 @@ def wait_for_embeddings(base, timeout=30, interval=1.0):
         time.sleep(interval)
 
     pytest.skip(f"embeddings endpoint not ready after {timeout}s: {emb_url}")
+
+
+def wait_for_chat(base, payload, timeout=60, interval=1.0):
+    """Poll the proxy until the chat endpoint is ready for the model."""
+    deadline = time.time() + timeout
+    chat_url = f"{base}/v1/chat/completions"
+
+    while time.time() < deadline:
+        try:
+            r = requests.post(chat_url, json=payload, timeout=15)
+            if r.status_code == 200:
+                return
+        except RequestException:
+            pass
+
+        time.sleep(interval)
+
+    pytest.skip(f"chat endpoint not ready after {timeout}s: {chat_url}")

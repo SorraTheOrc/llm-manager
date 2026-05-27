@@ -46,9 +46,72 @@ cmake -B build -S . \
 
 cmake --build build --config Release -j$(nproc)
 
-# Install the binaries
+# Install the binaries (optional; skip if you use build/bin directly)
+# If sudo cannot write install_manifest.txt in the build dir, use --prefix ~/.local
 sudo cmake --install build
 ```
+
+## Slot save/restore endpoints (KV persistence)
+
+Slot persistence is required for stable KV cache reuse across requests. The
+llama-server API exposes slot save/restore endpoints using a query parameter
+syntax:
+
+```bash
+# Save slot 0 prompt cache
+curl -X POST "http://127.0.0.1:55833/slots/0?action=save" \
+  -H "Content-Type: application/json" \
+  -d '{"filename":"slot_session.bin"}'
+
+# Restore slot 0 prompt cache
+curl -X POST "http://127.0.0.1:55833/slots/0?action=restore" \
+  -H "Content-Type: application/json" \
+  -d '{"filename":"slot_session.bin"}'
+```
+
+These files are stored under the directory supplied with `--slot-save-path`.
+When running in router mode, the slot endpoints live on the **child model
+ports** (not the router port). Use `GET /slots?model=<model-id>` on the router
+port to find active slots.
+
+**Note:** slot save/restore is not supported for multimodal models. If your
+model downloads a `mmproj` file automatically, disable it with `--no-mmproj`
+(or `no-mmproj = true` in `models.ini`) so slot persistence works.
+
+### Rebuild recipe (reproducible)
+
+This repo expects llama.cpp commit:
+
+```bash
+git -C ~/llama.cpp rev-parse HEAD
+# e97492369888f5311e4d1f3beb325a36bbed70e9
+```
+
+To reproduce the build inside the llama distrobox container:
+
+```bash
+# Enter the container
+distrobox enter llama
+cd ~/llama.cpp
+
+git fetch --all --tags
+git checkout e97492369888f5311e4d1f3beb325a36bbed70e9
+
+cmake -B build -S . \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS="gfx1151" \
+  -DGGML_HIP_ROCWMMA_FATTN=ON \
+  -DLLAMA_OPENSSL=ON
+
+cmake --build build --config Release -j$(nproc)
+
+# Install the binaries (optional; skip if you use build/bin directly)
+# If sudo cannot write install_manifest.txt in the build dir, use --prefix ~/.local
+sudo cmake --install build
+```
+
+Ensure the server is started with `--slot-save-path /home/rgardler/projects/llm/slot-cache`
+(see `start-llama.sh` + `models.ini`) so the slot endpoints return 200.
 
 If OpenSSL is not available, install it first:
 ```bash

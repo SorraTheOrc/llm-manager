@@ -672,3 +672,22 @@ class TestSlotPersistenceHelpers:
         filename = _slot_filename_for_session("session:123/abc", tmp_path)
         assert str(tmp_path) in filename
         assert "session_123_abc" in filename
+
+    @pytest.mark.asyncio
+    async def test_call_slot_endpoint_uses_action_query_and_basename(self, tmp_path, monkeypatch):
+        from proxy import server
+
+        response = MagicMock()
+        response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=response)
+        monkeypatch.setattr(server, "_http_client", mock_client)
+
+        filename = tmp_path / "slot_session.bin"
+        ok = await server._call_slot_endpoint(1234, 2, "save", str(filename), timeout=1.0)
+
+        assert ok is True
+        mock_client.post.assert_awaited_once()
+        args, kwargs = mock_client.post.call_args
+        assert args[0] == "http://localhost:1234/slots/2?action=save"
+        assert kwargs["json"]["filename"] == "slot_session.bin"

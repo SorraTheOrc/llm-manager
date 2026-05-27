@@ -284,8 +284,8 @@ async def _call_slot_endpoint(
 ) -> bool:
     if not filename:
         return False
-    url = f"http://localhost:{llama_port}/slots/{slot_id}/{action}"
-    payload = {"filename": filename}
+    url = f"http://localhost:{llama_port}/slots/{slot_id}?action={action}"
+    payload = {"filename": Path(filename).name}
     client = _http_client if _http_client else httpx.AsyncClient(timeout=timeout)
     try:
         response = await client.post(url, json=payload, timeout=timeout)

@@ -117,7 +117,7 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--preence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full"
+    EXTRA_CMD_SWITCHES="--preence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   mxbai-embed)
