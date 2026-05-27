@@ -91,6 +91,7 @@ server:
   session_guardrail_repetition_min_pattern_chars: 8
   session_guardrail_repetition_min_repeats: 4
   session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
   session_require_restore_signal: false
   backend_retry_attempts: 3
   backend_retry_base_delay_seconds: 0.25

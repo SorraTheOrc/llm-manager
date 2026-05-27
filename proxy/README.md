@@ -124,6 +124,7 @@ server:
   session_guardrail_repetition_min_pattern_chars: 8
   session_guardrail_repetition_min_repeats: 4
   session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
   session_require_restore_signal: false
 
 # Default model to load on startup
@@ -514,7 +515,8 @@ Guardrails stop runaway responses and invalidate sessions when configured:
 - `server.session_guardrail_max_completion_tokens` — cutoff on excessive output
 - `server.session_guardrail_repetition_min_pattern_chars` — repetition pattern length
 - `server.session_guardrail_repetition_min_repeats` — repetition count to trigger cutoff
-- `server.session_guardrail_invalidate_on_cutoff` — invalidate session after cutoff
+- `server.session_guardrail_invalidate_on_cutoff` — invalidate session after runtime/token cutoff
+- `server.session_guardrail_invalidate_on_repetition` — invalidate session after repetition cutoff
 
 When a guardrail triggers, `/admin/metrics` exposes `guardrail_metrics` with the
 cutoff reason and invalidation counters for observability.

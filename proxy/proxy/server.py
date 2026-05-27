@@ -772,6 +772,18 @@ def evaluate_stream_guardrail(
     return None
 
 
+def _should_invalidate_on_guardrail(
+    guardrail_reason: Optional[str],
+    invalidate_on_cutoff: bool,
+    invalidate_on_repetition: bool,
+) -> bool:
+    if not guardrail_reason:
+        return False
+    if guardrail_reason == "repetition":
+        return bool(invalidate_on_repetition)
+    return bool(invalidate_on_cutoff)
+
+
 def merge_session_history_for_update(
     existing_messages: List[Dict[str, Any]],
     request_messages: List[Dict[str, Any]],
@@ -2520,6 +2532,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 invalidate_on_guardrail = bool(
                     server_config.get("session_guardrail_invalidate_on_cutoff", True)
                 )
+                invalidate_on_repetition = server_config.get(
+                    "session_guardrail_invalidate_on_repetition",
+                    False,
+                )
 
                 async def stream_generator():
                     global active_queries
@@ -2586,7 +2602,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         session_id[:8] if session_id else "unknown",
                                         guardrail_reason,
                                     )
-                                    if session_id and invalidate_on_guardrail:
+                                    should_invalidate = _should_invalidate_on_guardrail(
+                                        guardrail_reason,
+                                        invalidate_on_guardrail,
+                                        bool(invalidate_on_repetition),
+                                    )
+                                    if session_id and should_invalidate:
                                         await _invalidate_session_and_slot(
                                             session_id,
                                             f"guardrail_{guardrail_reason}",
@@ -2775,9 +2796,18 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             invalidate_on_guardrail = bool(
                                 server_config.get("session_guardrail_invalidate_on_cutoff", True)
                             )
+                            invalidate_on_repetition = server_config.get(
+                                "session_guardrail_invalidate_on_repetition",
+                                False,
+                            )
                             if max_completion_tokens and recv_tokens >= max_completion_tokens:
                                 _record_guardrail_cutoff("completion_tokens")
-                                if session_id and invalidate_on_guardrail:
+                                should_invalidate = _should_invalidate_on_guardrail(
+                                    "completion_tokens",
+                                    invalidate_on_guardrail,
+                                    bool(invalidate_on_repetition),
+                                )
+                                if session_id and should_invalidate:
                                     await _invalidate_session_and_slot(
                                         session_id,
                                         "guardrail_completion_tokens",

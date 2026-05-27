@@ -573,6 +573,39 @@ class TestStreamGuardrails:
             == "repetition"
         )
 
+    def test_guardrail_invalidation_respects_repetition_override(self):
+        from proxy.server import _should_invalidate_on_guardrail
+
+        assert _should_invalidate_on_guardrail(
+            "repetition",
+            invalidate_on_cutoff=True,
+            invalidate_on_repetition=False,
+        ) is False
+        assert _should_invalidate_on_guardrail(
+            "repetition",
+            invalidate_on_cutoff=False,
+            invalidate_on_repetition=True,
+        ) is True
+
+    def test_guardrail_invalidation_defaults_to_cutoff(self):
+        from proxy.server import _should_invalidate_on_guardrail
+
+        assert _should_invalidate_on_guardrail(
+            "runtime",
+            invalidate_on_cutoff=True,
+            invalidate_on_repetition=False,
+        ) is True
+        assert _should_invalidate_on_guardrail(
+            "completion_tokens",
+            invalidate_on_cutoff=False,
+            invalidate_on_repetition=True,
+        ) is False
+        assert _should_invalidate_on_guardrail(
+            None,
+            invalidate_on_cutoff=True,
+            invalidate_on_repetition=True,
+        ) is False
+
 
 class TestSessionHistoryIntegrityHelpers:
     def test_merge_session_history_preserves_existing_and_delta_without_duplicates(self):
