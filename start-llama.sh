@@ -63,6 +63,11 @@ if [[ "$router_mode" -eq 1 ]]; then
     LLAMA_CMD+=(--models-dir "$LLAMA_MODELS_DIR")
   fi
 
+  if [[ -n "${LLAMA_SLOT_SAVE_PATH:-}" ]]; then
+    mkdir -p "$LLAMA_SLOT_SAVE_PATH"
+    LLAMA_CMD+=(--slot-save-path "$LLAMA_SLOT_SAVE_PATH")
+  fi
+
   "${LLAMA_CMD[@]}"
   exit 0
 fi
@@ -112,7 +117,7 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--preence-penalty 0.0 --min-p 0.0"
+    EXTRA_CMD_SWITCHES="--preence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   mxbai-embed)
@@ -209,6 +214,11 @@ LLAMA_CMD=(
   --host 0.0.0.0
   --port $PORT
 )
+
+if [[ -n "${LLAMA_SLOT_SAVE_PATH:-}" ]]; then
+  mkdir -p "$LLAMA_SLOT_SAVE_PATH"
+  LLAMA_CMD+=(--slot-save-path "$LLAMA_SLOT_SAVE_PATH")
+fi
 
 if [[ -n "${CHAT_TEMPLATE_KWARGS:-}" ]]; then
   LLAMA_CMD+=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")

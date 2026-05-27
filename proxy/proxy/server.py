@@ -7,9 +7,11 @@ or remote API services based on configuration.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -258,6 +260,70 @@ def _record_session_invalidation(reason: str) -> None:
         pass
 
 
+def _ensure_slot_dir(slot_path: Optional[str]) -> Optional[Path]:
+    if not slot_path:
+        return None
+    try:
+        path = Path(slot_path)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception:
+        return None
+
+
+def _slot_persistence_enabled(slot_path: Optional[Path | str], slot_pool_size: int) -> bool:
+    return bool(slot_path and slot_pool_size > 0)
+
+
+async def _call_slot_endpoint(
+    llama_port: int,
+    slot_id: int,
+    action: str,
+    filename: str,
+    timeout: float,
+) -> bool:
+    if not filename:
+        return False
+    url = f"http://localhost:{llama_port}/slots/{slot_id}/{action}"
+    payload = {"filename": filename}
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=timeout)
+    try:
+        response = await client.post(url, json=payload, timeout=timeout)
+        return getattr(response, "status_code", None) == 200
+    except Exception as exc:
+        logger.warning("slot_%s failed slot=%s error=%s", action, slot_id, exc)
+        return False
+    finally:
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
+async def _restore_slot_snapshot(
+    llama_port: int,
+    slot_id: int,
+    filename: str,
+    timeout: float,
+) -> bool:
+    try:
+        if not Path(filename).exists():
+            return False
+    except Exception:
+        return False
+    return await _call_slot_endpoint(llama_port, slot_id, "restore", filename, timeout)
+
+
+async def _save_slot_snapshot(
+    llama_port: int,
+    slot_id: int,
+    filename: str,
+    timeout: float,
+) -> bool:
+    return await _call_slot_endpoint(llama_port, slot_id, "save", filename, timeout)
+
+
 # Health/readiness signal for local backend
 backend_ready: bool = False
 
@@ -492,6 +558,87 @@ def _extract_delta_text_from_sse_chunk(chunk_text: str) -> str:
                 if value is not None:
                     parts.append(str(value))
     return "".join(parts)
+
+
+def _sanitize_session_id(session_id: str) -> str:
+    if not session_id:
+        return ""
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id)
+
+
+def _slot_id_for_session(session_id: str, pool_size: int) -> Optional[int]:
+    if not session_id or pool_size <= 0:
+        return None
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % int(pool_size)
+
+
+def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
+    safe_id = _sanitize_session_id(session_id)
+    return str(Path(base_dir) / f"slot_{safe_id}.bin")
+
+
+def _build_slot_context(
+    server_config: dict,
+    session_id: Optional[str],
+) -> tuple[Optional[int], Optional[str], float]:
+    slot_path = server_config.get("session_slot_save_path")
+    slot_pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
+    slot_timeout = float(server_config.get("session_slot_timeout_seconds", 3.0) or 3.0)
+    slot_dir = _ensure_slot_dir(slot_path)
+    if not session_id or not _slot_persistence_enabled(slot_dir, slot_pool_size):
+        return None, None, slot_timeout
+    slot_id = _slot_id_for_session(session_id, slot_pool_size)
+    if slot_id is None:
+        return None, None, slot_timeout
+    return slot_id, _slot_filename_for_session(session_id, slot_dir), slot_timeout
+
+
+async def _invalidate_session_and_slot(
+    session_id: Optional[str],
+    reason: str,
+    slot_filename: Optional[str],
+) -> None:
+    if session_id:
+        try:
+            await session_manager.invalidate(session_id)
+        except Exception:
+            pass
+    if reason:
+        _record_session_invalidation(reason)
+    if slot_filename:
+        try:
+            Path(slot_filename).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+class SlotLockCoordinator:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def acquire(self, slot_id: Optional[int]):
+        @asynccontextmanager
+        async def _guard():
+            if slot_id is None:
+                yield
+                return
+            async with self._lock:
+                lock = self._locks.get(slot_id)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self._locks[slot_id] = lock
+            await lock.acquire()
+            try:
+                yield
+            finally:
+                lock.release()
+
+        return _guard()
+
+
+slot_lock_coordinator = SlotLockCoordinator()
 
 
 class SessionSingleFlightRejected(Exception):
@@ -1576,6 +1723,9 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     llama_server_bin = server_config.get("llama_server_bin")
     if llama_server_bin:
         env["LLAMA_SERVER_BIN"] = str(llama_server_bin)
+    slot_save_path = server_config.get("session_slot_save_path")
+    if slot_save_path:
+        env["LLAMA_SLOT_SAVE_PATH"] = str(slot_save_path)
     # Export a flag so the start script can include `--no-mmap` for router
     # launches started by the proxy. Default to enabling no-mmap for router
     # processes unless explicitly disabled in config.
@@ -2046,8 +2196,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     )
                 else:
                     if session_fallback_reason == "history_mismatch":
-                        await session_manager.invalidate(session_id)
-                        _record_session_invalidation("history_mismatch")
+                        _, slot_filename, _ = _build_slot_context(server_config, session_id)
+                        await _invalidate_session_and_slot(
+                            session_id,
+                            "history_mismatch",
+                            slot_filename,
+                        )
                         session, session_created = await session_manager.get_or_create(
                             session_id
                         )
@@ -2077,6 +2231,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     else:
         # Not a chat-completion request – no session handling
         session_id = None
+
+    slot_id, slot_filename, slot_timeout = _build_slot_context(server_config, session_id)
+    slot_enabled = slot_id is not None and slot_filename is not None
 
     method = request.method.upper()
     key = f"{method} {request.url.path} -> local"
@@ -2204,10 +2361,27 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             single_flight_mode,
             single_flight_max_queue_depth,
         )
+        slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
             async with session_guard:
-                # Streaming response - client must stay open during streaming
-                client = httpx.AsyncClient(timeout=request_timeout)
+                async with slot_guard:
+                    if slot_enabled:
+                        restored = await _restore_slot_snapshot(
+                            llama_port,
+                            slot_id,
+                            slot_filename,
+                            slot_timeout,
+                        )
+                        if restored:
+                            logger.info(
+                                "slot_restore success session=%s slot=%s",
+                                session_id[:8] if session_id else "unknown",
+                                slot_id,
+                            )
+                    slot_save_allowed = slot_enabled
+
+                    # Streaming response - client must stay open during streaming
+                    client = httpx.AsyncClient(timeout=request_timeout)
 
                 async def _open_stream_once():
                     stream_cm = client.stream(
@@ -2308,7 +2482,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                 async def stream_generator():
                     global active_queries
-                    nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total
+                    nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed
                     # Track assistant response for session history update
                     collected_content: list[str] = []
                     saw_done = False
@@ -2372,8 +2546,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         guardrail_reason,
                                     )
                                     if session_id and invalidate_on_guardrail:
-                                        await session_manager.invalidate(session_id)
-                                        _record_session_invalidation(f"guardrail_{guardrail_reason}")
+                                        await _invalidate_session_and_slot(
+                                            session_id,
+                                            f"guardrail_{guardrail_reason}",
+                                            slot_filename,
+                                        )
+                                        slot_save_allowed = False
                                     break
 
                             # Collect content for session history if session is active
@@ -2442,6 +2620,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             except Exception:
                                 logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
 
+                        if slot_save_allowed and slot_enabled and upstream_status < 400:
+                            saved = await _save_slot_snapshot(
+                                llama_port,
+                                slot_id,
+                                slot_filename,
+                                slot_timeout,
+                            )
+                            if saved:
+                                logger.info(
+                                    "slot_save success session=%s slot=%s",
+                                    session_id[:8] if session_id else "unknown",
+                                    slot_id,
+                                )
+
                         try:
                             await cm.__aexit__(None, None, None)
                         except Exception:
@@ -2487,107 +2679,142 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             single_flight_mode,
             single_flight_max_queue_depth,
         )
+        slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
             async with session_guard:
-                # Non-streaming response
-                try:
-                    async with httpx.AsyncClient(timeout=request_timeout) as client:
-                        method = request.method.lower()
-
-                        async def _send_once():
-                            return await getattr(client, method)(
-                                target_url,
-                                headers=headers,
-                                content=body,
+                async with slot_guard:
+                    if slot_enabled:
+                        restored = await _restore_slot_snapshot(
+                            llama_port,
+                            slot_id,
+                            slot_filename,
+                            slot_timeout,
+                        )
+                        if restored:
+                            logger.info(
+                                "slot_restore success session=%s slot=%s",
+                                session_id[:8] if session_id else "unknown",
+                                slot_id,
                             )
+                    slot_save_allowed = slot_enabled
 
-                        response = await _call_with_backend_retries(_send_once, path=path, stream=False)
-                        backend_ready = True
+                    # Non-streaming response
+                    try:
+                        async with httpx.AsyncClient(timeout=request_timeout) as client:
+                            method = request.method.lower()
 
-                        recv_tokens = 0
-                        # Non-streaming: count tokens in response body
-                        try:
-                            resp_text = response.content.decode('utf-8', errors='replace')
-                            recv_tokens = count_text_tokens(resp_text, model_name)
+                            async def _send_once():
+                                return await getattr(client, method)(
+                                    target_url,
+                                    headers=headers,
+                                    content=body,
+                                )
+
+                            response = await _call_with_backend_retries(_send_once, path=path, stream=False)
+                            backend_ready = True
+
+                            recv_tokens = 0
+                            # Non-streaming: count tokens in response body
                             try:
-                                loop = asyncio.get_running_loop()
-                                loop.create_task(_increment_tokens('recv', key, recv_tokens))
-                            except RuntimeError:
-                                asyncio.run(_increment_tokens('recv', key, recv_tokens))
+                                resp_text = response.content.decode('utf-8', errors='replace')
+                                recv_tokens = count_text_tokens(resp_text, model_name)
+                                try:
+                                    loop = asyncio.get_running_loop()
+                                    loop.create_task(_increment_tokens('recv', key, recv_tokens))
+                                except RuntimeError:
+                                    asyncio.run(_increment_tokens('recv', key, recv_tokens))
+                            except Exception:
+                                pass
+
+                            max_completion_tokens = int(
+                                server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
+                            )
+                            invalidate_on_guardrail = bool(
+                                server_config.get("session_guardrail_invalidate_on_cutoff", True)
+                            )
+                            if max_completion_tokens and recv_tokens >= max_completion_tokens:
+                                _record_guardrail_cutoff("completion_tokens")
+                                if session_id and invalidate_on_guardrail:
+                                    await _invalidate_session_and_slot(
+                                        session_id,
+                                        "guardrail_completion_tokens",
+                                        slot_filename,
+                                    )
+                                    slot_save_allowed = False
+
+                            # Update session history for non-streaming responses
+                            if session_id and isinstance(body_json, dict) and 'messages' in body_json:
+                                try:
+                                    resp_content = response.content.decode('utf-8', errors='replace')
+                                    resp_json = json.loads(resp_content) if resp_content else {}
+                                    restore_signal_detected = _has_explicit_restore_signal(
+                                        dict(response.headers),
+                                        resp_json if isinstance(resp_json, dict) else None,
+                                    )
+                                    if session_id and not restore_signal_detected:
+                                        restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
+                                    if session_id and not restore_signal_detected:
+                                        restore_signal_detected = _detect_restore_signal_from_log_slice(
+                                            llama_log_path,
+                                            llama_log_offset,
+                                        )
+                                    if restore_signal_detected:
+                                        _record_restore_success()
+                                    await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
+                                    assistant_content = _extract_assistant_content(resp_json)
+                                    existing_messages = []
+                                    if is_delta_request and delta_messages:
+                                        session_obj = await session_manager.get(session_id)
+                                        if session_obj:
+                                            existing_messages = list(session_obj.messages)
+                                    full_messages = merge_session_history_for_update(
+                                        existing_messages=existing_messages,
+                                        request_messages=list(body_json.get('messages', [])),
+                                        delta_messages=delta_messages,
+                                        is_delta_request=is_delta_request,
+                                        assistant_content=assistant_content,
+                                    )
+                                    await session_manager.update_messages(session_id, full_messages)
+                                except Exception:
+                                    logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
+
+                            if slot_save_allowed and slot_enabled and response.status_code < 400:
+                                saved = await _save_slot_snapshot(
+                                    llama_port,
+                                    slot_id,
+                                    slot_filename,
+                                    slot_timeout,
+                                )
+                                if saved:
+                                    logger.info(
+                                        "slot_save success session=%s slot=%s",
+                                        session_id[:8] if session_id else "unknown",
+                                        slot_id,
+                                    )
+
+                            log_response(response.status_code, response.content)
+
+                            # Build response headers with session info
+                            resp_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+                            if session_id:
+                                resp_headers["X-Session-Id"] = session_id
+                                resp_headers["X-Session-Created"] = "true" if session_created else "false"
+                                resp_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+                                if session_fallback_reason:
+                                    resp_headers["X-Session-Fallback-Reason"] = session_fallback_reason
+
+                            return Response(
+                                content=response.content,
+                                status_code=response.status_code,
+                                headers=resp_headers
+                            )
+                    finally:
+                        # decrement active queries when non-streaming finishes or failures occur
+                        try:
+                            async with active_queries_lock:
+                                active_queries = max(0, active_queries - 1)
                         except Exception:
                             pass
-
-                        max_completion_tokens = int(
-                            server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
-                        )
-                        invalidate_on_guardrail = bool(
-                            server_config.get("session_guardrail_invalidate_on_cutoff", True)
-                        )
-                        if max_completion_tokens and recv_tokens >= max_completion_tokens:
-                            _record_guardrail_cutoff("completion_tokens")
-                            if session_id and invalidate_on_guardrail:
-                                await session_manager.invalidate(session_id)
-                                _record_session_invalidation("guardrail_completion_tokens")
-
-                        # Update session history for non-streaming responses
-                        if session_id and isinstance(body_json, dict) and 'messages' in body_json:
-                            try:
-                                resp_content = response.content.decode('utf-8', errors='replace')
-                                resp_json = json.loads(resp_content) if resp_content else {}
-                                restore_signal_detected = _has_explicit_restore_signal(
-                                    dict(response.headers),
-                                    resp_json if isinstance(resp_json, dict) else None,
-                                )
-                                if session_id and not restore_signal_detected:
-                                    restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
-                                if session_id and not restore_signal_detected:
-                                    restore_signal_detected = _detect_restore_signal_from_log_slice(
-                                        llama_log_path,
-                                        llama_log_offset,
-                                    )
-                                if restore_signal_detected:
-                                    _record_restore_success()
-                                await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
-                                assistant_content = _extract_assistant_content(resp_json)
-                                existing_messages = []
-                                if is_delta_request and delta_messages:
-                                    session_obj = await session_manager.get(session_id)
-                                    if session_obj:
-                                        existing_messages = list(session_obj.messages)
-                                full_messages = merge_session_history_for_update(
-                                    existing_messages=existing_messages,
-                                    request_messages=list(body_json.get('messages', [])),
-                                    delta_messages=delta_messages,
-                                    is_delta_request=is_delta_request,
-                                    assistant_content=assistant_content,
-                                )
-                                await session_manager.update_messages(session_id, full_messages)
-                            except Exception:
-                                logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
-
-                        log_response(response.status_code, response.content)
-
-                        # Build response headers with session info
-                        resp_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
-                        if session_id:
-                            resp_headers["X-Session-Id"] = session_id
-                            resp_headers["X-Session-Created"] = "true" if session_created else "false"
-                            resp_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
-                            if session_fallback_reason:
-                                resp_headers["X-Session-Fallback-Reason"] = session_fallback_reason
-
-                        return Response(
-                            content=response.content,
-                            status_code=response.status_code,
-                            headers=resp_headers
-                        )
-                finally:
-                    # decrement active queries when non-streaming finishes or failures occur
-                    try:
-                        async with active_queries_lock:
-                            active_queries = max(0, active_queries - 1)
-                    except Exception:
-                        pass
         except SessionSingleFlightRejected as exc:
             try:
                 async with active_queries_lock:

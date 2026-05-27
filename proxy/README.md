@@ -116,6 +116,9 @@ server:
   llama_startup_timeout: 300
   session_single_flight_mode: "queue"
   session_single_flight_max_queue_depth: 1
+  session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
+  session_slot_pool_size: 2
+  session_slot_timeout_seconds: 3.0
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 8
@@ -515,6 +518,23 @@ Guardrails stop runaway responses and invalidate sessions when configured:
 
 When a guardrail triggers, `/admin/metrics` exposes `guardrail_metrics` with the
 cutoff reason and invalidation counters for observability.
+
+### Slot persistence (KV save/restore)
+
+To avoid llama-server invalidating KV checkpoints between turns, the proxy can
+restore and save slot snapshots on each request. This requires llama-server to
+run with `--slot-save-path` pointing at the same path.
+
+Config keys:
+- `server.session_slot_save_path` — directory for slot snapshot files
+- `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
+- `server.session_slot_timeout_seconds` — timeout for save/restore calls
+
+The proxy restores the slot before each request and saves it after the response.
+If a session is invalidated (history mismatch or guardrail), the slot file is
+removed to avoid stale restores. Ensure llama-server is launched with
+`--slot-save-path` (see `start-llama.sh` / `models.ini`) and, for SWA/hybrid
+models, `--swa-full` to prevent checkpoint invalidation.
 
 ### Operator verification checklist
 

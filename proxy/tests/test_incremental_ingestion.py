@@ -650,3 +650,25 @@ class TestSessionHistoryIntegrityHelpers:
         )
 
         assert merged == existing_messages
+
+
+class TestSlotPersistenceHelpers:
+    def test_slot_id_for_session_is_deterministic(self):
+        from proxy.server import _slot_id_for_session
+
+        slot_id = _slot_id_for_session("session-123", 4)
+        assert slot_id == _slot_id_for_session("session-123", 4)
+        assert slot_id in range(4)
+
+    def test_slot_id_for_session_returns_none_when_pool_invalid(self):
+        from proxy.server import _slot_id_for_session
+
+        assert _slot_id_for_session("session-123", 0) is None
+        assert _slot_id_for_session("session-123", -1) is None
+
+    def test_slot_filename_for_session_sanitizes_id(self, tmp_path):
+        from proxy.server import _slot_filename_for_session
+
+        filename = _slot_filename_for_session("session:123/abc", tmp_path)
+        assert str(tmp_path) in filename
+        assert "session_123_abc" in filename
