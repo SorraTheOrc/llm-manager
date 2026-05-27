@@ -38,6 +38,7 @@ class TestSession:
         assert s.message_count == 0
         assert s.messages == []
         assert s.invalidated is False
+        assert s.restore_confirmed is False
         assert s.age_seconds >= 0
         assert s.idle_seconds >= 0
 
@@ -230,6 +231,15 @@ class TestSessionManagerMessages:
         assert session.message_count == 3
         assert session.messages[-1]["content"] == "msg-2-extra"
 
+    @pytest.mark.asyncio
+    async def test_set_restore_confirmed(self):
+        mgr = SessionManager()
+        await mgr.get_or_create("s1")
+        assert await mgr.set_restore_confirmed("s1", True) is True
+        session = await mgr.get("s1")
+        assert session is not None
+        assert session.restore_confirmed is True
+
 
 class TestDeltaComputation:
     def test_delta_empty_existing(self):
@@ -299,6 +309,36 @@ class TestDeltaComputation:
         assert delta == incoming
 
 
+class TestDeltaMetrics:
+    def test_delta_metrics_reports_reduction_for_repeated_session(self):
+        mgr = SessionManager()
+        existing = _make_messages(6)
+        incoming = existing + _make_messages(2, prefix="next")
+
+        metrics = mgr.compute_delta_metrics(existing, incoming)
+
+        assert metrics["history_matches"] is True
+        assert metrics["mode"] == "delta"
+        assert metrics["fallback_reason"] is None
+        assert metrics["delta_message_count"] == 2
+        assert metrics["full_payload_bytes"] > metrics["delta_payload_bytes"]
+        assert metrics["reduction_percent"] >= 30.0
+
+    def test_delta_metrics_marks_history_mismatch_as_full_fallback(self):
+        mgr = SessionManager()
+        existing = _make_messages(4)
+        incoming = list(existing)
+        incoming[2] = {"role": incoming[2]["role"], "content": "edited"}
+        incoming.append({"role": "user", "content": "new"})
+
+        metrics = mgr.compute_delta_metrics(existing, incoming)
+
+        assert metrics["history_matches"] is False
+        assert metrics["mode"] == "full"
+        assert metrics["fallback_reason"] == "history_mismatch"
+        assert metrics["reduction_percent"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Session info and removal
 # ---------------------------------------------------------------------------
@@ -313,6 +353,7 @@ class TestSessionManagerInfo:
         assert info["session_id"] == "test-s1"
         assert info["message_count"] == 0
         assert info["invalidated"] is False
+        assert info["restore_confirmed"] is False
         assert isinstance(info["idle_seconds"], float)
         assert isinstance(info["age_seconds"], float)
 

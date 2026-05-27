@@ -81,6 +81,15 @@ class TestDeltaComputationIntegration:
         assert len(delta) == 2
         assert delta[0]["content"] == "Tell me about sessions."
 
+        metrics = session_manager.compute_delta_metrics(session.messages, extended_messages)
+        assert metrics["reduction_percent"] >= 30.0
+        assert metrics["full_payload_bytes"] > metrics["delta_payload_bytes"]
+        # Diagnostic-only latency capture: informational, not pass/fail gated.
+        start = asyncio.get_event_loop().time()
+        _ = session_manager.compute_delta_metrics(session.messages, extended_messages)
+        elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000.0
+        assert elapsed_ms >= 0
+
     @pytest.mark.asyncio
     async def test_edited_message_invalidates_session(self, session_manager, sample_messages):
         """If the user edits an earlier message, the session is invalidated."""
@@ -158,6 +167,70 @@ class TestSessionHeaderHandling:
 # ---------------------------------------------------------------------------
 # Assistant content extraction
 # ---------------------------------------------------------------------------
+
+class TestRestoreContract:
+    """Strict restore signal contract tests."""
+
+    def test_classify_delta_routing_requires_restore_signal(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+        )
+        assert use_delta is False
+        assert reason == "missing_restore_signal"
+
+    def test_classify_delta_routing_allows_delta_when_signal_confirmed(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=True,
+        )
+        assert use_delta is True
+        assert reason is None
+
+    def test_has_explicit_restore_signal_positive_and_negative(self):
+        from proxy.server import _has_explicit_restore_signal
+
+        assert _has_explicit_restore_signal(
+            {"X-Llama-Session-Restored": "true"},
+            None,
+        ) is True
+        assert _has_explicit_restore_signal({}, {"session_restored": True}) is True
+        # Regression guard: history match without explicit signal is not restore success.
+        assert _has_explicit_restore_signal({}, {"session_restored": False}) is False
+
+
+class TestRestoreObservability:
+    """Observability counters for strict restore behavior."""
+
+    def test_restore_observability_counters(self):
+        from proxy.server import (
+            session_restore_observability,
+            _record_restore_success,
+            _record_restore_fallback,
+            _record_delta_payload_bytes,
+        )
+
+        session_restore_observability["restore_success_total"] = 0
+        session_restore_observability["restore_fallback_total"] = {}
+        session_restore_observability["delta_payload_bytes_total"] = 0
+
+        _record_restore_success()
+        _record_restore_fallback("missing_restore_signal")
+        _record_restore_fallback("missing_restore_signal")
+        _record_restore_fallback("history_mismatch")
+        _record_delta_payload_bytes(123)
+
+        assert session_restore_observability["restore_success_total"] == 1
+        assert session_restore_observability["restore_fallback_total"]["missing_restore_signal"] == 2
+        assert session_restore_observability["restore_fallback_total"]["history_mismatch"] == 1
+        assert session_restore_observability["delta_payload_bytes_total"] == 123
+
 
 class TestContentExtraction:
     """Test extracting assistant content from responses."""

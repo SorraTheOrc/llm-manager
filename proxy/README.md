@@ -348,15 +348,24 @@ Resets in-memory request/token counters and triggers immediate persistence.
 
 ## Session-Based Incremental Ingestion
 
-The proxy supports session-based incremental prompt ingestion to reduce CPU usage and latency for multi-turn conversations. When a session is established, the proxy tracks per-session message history and forwards only new messages on subsequent requests, leveraging llama-server's KV cache.
+The proxy supports session-based incremental prompt ingestion to reduce CPU usage and latency for multi-turn conversations.
+
+### Strict restore policy (important)
+
+Delta routing is only enabled when the proxy has explicit backend evidence that session restore works for that session.
+
+- If restore evidence is missing, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
+- If message history was edited, the proxy invalidates the session and falls back with `X-Session-Fallback-Reason: history_mismatch`.
+- When no previous history exists, requests are full-ingestion by design.
 
 ### How It Works
 
 1. Client sends a chat completion request with an `X-Session-Id` header (or without one, in which case the proxy generates a UUID v4 session ID).
-2. The proxy tracks the message history for each session.
-3. On subsequent requests with the same session ID, the proxy computes the delta (new messages) and forwards only the delta to llama-server, along with `session_id` and `cache_prompt` fields to reuse the KV cache.
-4. The proxy returns `X-Session-Id`, `X-Session-Created`, and `X-Session-Delta` response headers.
-5. Sessions expire after 3 hours of inactivity and are automatically cleaned up.
+2. The proxy tracks full message history for each session.
+3. For subsequent requests, the proxy computes a delta against prior history.
+4. The proxy forwards delta messages **only** when strict restore confirmation has been observed for that session; otherwise it forwards the full prompt.
+5. The proxy returns `X-Session-Id`, `X-Session-Created`, `X-Session-Delta`, and (when applicable) `X-Session-Fallback-Reason`.
+6. Sessions expire after 3 hours of inactivity and are automatically cleaned up.
 
 ### Limitations
 
@@ -457,18 +466,36 @@ curl -X DELETE http://localhost:8000/admin/sessions/<session-id>
 
 ### Session Metrics
 
-Session metrics are available on the `/admin/metrics` endpoint:
+Session and restore metrics are available on `/admin/metrics`:
 
 ```bash
-curl http://localhost:8000/admin/metrics | jq '.session_metrics'
+curl http://localhost:8000/admin/metrics
 ```
 
-Returns:
-- `sessions_active`: Number of currently active sessions
-- `sessions_created_total`: Total sessions created since proxy started
-- `sessions_expired_total`: Total sessions expired since proxy started
-- `backend_ready`: readiness gate used by `/health`
-- `backend_signals`: counters for `connect_failures`, `read_failures`, `timeout_failures`, `other_failures`, and `concurrency_rejects`
+Important fields:
+- `session_metrics.sessions_active`
+- `session_metrics.sessions_created_total`
+- `session_metrics.sessions_expired_total`
+- `restore_success_total`
+- `restore_fallback_total` (per-reason map, e.g. `missing_restore_signal`, `history_mismatch`)
+- `delta_payload_bytes_total`
+- `backend_ready`
+- `backend_signals`
+
+### Operator verification checklist
+
+Use these steps to validate strict restore behavior in your environment:
+
+1. Start a chat request without `X-Session-Id`; capture returned `X-Session-Id`.
+2. Repeat with the same session id and appended messages.
+3. Check headers:
+   - `X-Session-Delta: true` indicates delta forwarding.
+   - `X-Session-Delta: false` plus `X-Session-Fallback-Reason` explains fallback.
+4. Check `/admin/metrics`:
+   - `restore_success_total` increases when backend restore evidence is observed.
+   - `restore_fallback_total` increments by reason when strict policy blocks delta.
+   - `delta_payload_bytes_total` grows only when delta forwarding is used.
+5. Confirm payload reduction over repeated turns (target baseline >=30% reduction for representative conversations).
 
 ## Prometheus metrics
 

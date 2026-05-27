@@ -160,6 +160,44 @@ backend_signal_counts: dict = {
     "concurrency_rejects": 0,
 }
 
+# Session restore observability
+session_restore_observability: dict = {
+    "restore_success_total": 0,
+    "restore_fallback_total": {},
+    "delta_payload_bytes_total": 0,
+}
+
+
+def _record_restore_success() -> None:
+    try:
+        session_restore_observability["restore_success_total"] = int(
+            session_restore_observability.get("restore_success_total", 0)
+        ) + 1
+    except Exception:
+        pass
+
+
+def _record_restore_fallback(reason: str) -> None:
+    if not reason:
+        return
+    try:
+        bucket = session_restore_observability.setdefault("restore_fallback_total", {})
+        bucket[reason] = int(bucket.get(reason, 0)) + 1
+    except Exception:
+        pass
+
+
+def _record_delta_payload_bytes(value: int) -> None:
+    if value <= 0:
+        return
+    try:
+        session_restore_observability["delta_payload_bytes_total"] = int(
+            session_restore_observability.get("delta_payload_bytes_total", 0)
+        ) + int(value)
+    except Exception:
+        pass
+
+
 # Health/readiness signal for local backend
 backend_ready: bool = False
 
@@ -364,6 +402,54 @@ def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
         except Exception:
             continue
     return "".join(parts) if parts else None
+
+
+def _classify_delta_routing(
+    history_matches: bool,
+    delta_message_count: int,
+    restore_confirmed: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Decide whether to use delta routing under strict restore policy."""
+    if not history_matches:
+        return False, "history_mismatch"
+    if delta_message_count <= 0:
+        return False, "no_new_messages"
+    if not restore_confirmed:
+        return False, "missing_restore_signal"
+    return True, None
+
+
+def _has_explicit_restore_signal(
+    response_headers: Dict[str, str],
+    response_json: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return True only when explicit backend restore evidence is present."""
+    header_candidates = {
+        "x-llama-session-restored",
+        "x-session-restored",
+        "x-llama-cache-restored",
+        "x-kv-cache-restored",
+        "x-cache-restored",
+    }
+    for key, value in response_headers.items():
+        if key.lower() not in header_candidates:
+            continue
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "restored", "hit"}:
+            return True
+
+    if isinstance(response_json, dict):
+        for field in (
+            "session_restored",
+            "cache_restored",
+            "restore_success",
+            "kv_cache_restored",
+        ):
+            if response_json.get(field) is True:
+                return True
+    return False
+
+
 log_dir: Optional[Path] = None
 logger: logging.Logger = logging.getLogger("llama-proxy")
 
@@ -1621,6 +1707,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     session_created = False
     delta_messages: Optional[List[Dict[str, Any]]] = None
     is_delta_request = False
+    session_fallback_reason: Optional[str] = None
     original_message_count = 0
 
     if isinstance(body_json, dict) and "messages" in body_json:
@@ -1632,39 +1719,42 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id = session.session_id
 
             if not session_created and session.message_count > 0:
-                # Session has prior history – compute delta for logging only
-                # NOTE: Do NOT send delta to llama-server because llama-server's
-                # prompt cache is keyed by the FULL prompt. If session_id was working,
-                # we would see "slot load_session: loading KV cache for session_id=..."
-                # in the logs. Since we only see LCP matching, session_id-based cache
-                # restore is not functioning. Sending deltas causes the llama-server
-                # to match the wrong cached prompt via LCP similarity on the shared
-                # system prompt, corrupting context.
                 delta_messages, history_matches = session_manager.compute_delta(
                     session.messages, body_json["messages"]
                 )
-                if history_matches and len(delta_messages) > 0:
-                    # History matches but send FULL messages – deltas don't work with llama-server cache
-                    is_delta_request = False
+                is_delta_request, session_fallback_reason = _classify_delta_routing(
+                    history_matches=history_matches,
+                    delta_message_count=len(delta_messages),
+                    restore_confirmed=bool(session.restore_confirmed),
+                )
+
+                if is_delta_request:
+                    body_json["messages"] = list(delta_messages)
+                    try:
+                        _record_delta_payload_bytes(
+                            len(json.dumps(delta_messages, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+                        )
+                    except Exception:
+                        pass
                     logger.info(
-                        f"Session {session_id[:8]}... history match "
-                        f"({len(delta_messages)} new messages) — sending full prompt, "
-                        f"session_id-based cache restore not functioning"
-                    )
-                elif not history_matches:
-                    # History was edited – invalidate session, send full history
-                    await session_manager.invalidate(session_id)
-                    session, session_created = await session_manager.get_or_create(
-                        session_id
-                    )
-                    is_delta_request = False
-                    logger.info(
-                        f"Session {session_id[:8]}... history edited, "
-                        "falling back to full ingestion"
+                        f"Session {session_id[:8]}... strict restore confirmed; "
+                        f"forwarding delta ({len(delta_messages)} new messages)"
                     )
                 else:
-                    # No new messages (same request re-sent)
-                    is_delta_request = False
+                    if session_fallback_reason == "history_mismatch":
+                        await session_manager.invalidate(session_id)
+                        session, session_created = await session_manager.get_or_create(
+                            session_id
+                        )
+                    if session_fallback_reason:
+                        _record_restore_fallback(session_fallback_reason)
+                    logger.info(
+                        f"Session {session_id[:8]}... history match={history_matches} "
+                        f"delta_messages={len(delta_messages)} using full prompt "
+                        f"reason={session_fallback_reason or 'none'}"
+                    )
+            elif session_created:
+                session_fallback_reason = "no_existing_history"
 
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True
@@ -1678,6 +1768,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             )
             session_id = None
             is_delta_request = False
+            session_fallback_reason = "session_handling_error"
     else:
         # Not a chat-completion request – no session handling
         session_id = None
@@ -1812,6 +1903,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 stream=True,
             )
             backend_ready = True
+            restore_signal_detected = _has_explicit_restore_signal(dict(response.headers), None)
         except Exception:
             backend_ready = False
             # If stream setup failed, ensure active_queries is decremented
@@ -1849,6 +1941,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 err_headers["X-Session-Id"] = session_id
                 err_headers["X-Session-Created"] = "true" if session_created else "false"
                 err_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+                if session_fallback_reason:
+                    err_headers["X-Session-Fallback-Reason"] = session_fallback_reason
             return Response(
                 content=body_bytes,
                 status_code=upstream_status,
@@ -1866,6 +1960,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             outgoing_headers["X-Session-Id"] = session_id
             outgoing_headers["X-Session-Created"] = "true" if session_created else "false"
             outgoing_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+            if session_fallback_reason:
+                outgoing_headers["X-Session-Fallback-Reason"] = session_fallback_reason
         media_type = response.headers.get('content-type', 'text/event-stream')
 
         async def stream_generator():
@@ -1934,6 +2030,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             pass
                 except Exception:
                     pass
+
+                # Strict restore confirmation state comes from explicit backend signal.
+                if session_id:
+                    try:
+                        if restore_signal_detected:
+                            _record_restore_success()
+                        await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
+                    except Exception:
+                        logger.debug("Failed to set restore-confirmed state", exc_info=True)
 
                 # Update session history with the full conversation
                 if session_id and original_message_count > 0:
@@ -2031,6 +2136,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     try:
                         resp_content = response.content.decode('utf-8', errors='replace')
                         resp_json = json.loads(resp_content) if resp_content else {}
+                        restore_signal_detected = _has_explicit_restore_signal(
+                            dict(response.headers),
+                            resp_json if isinstance(resp_json, dict) else None,
+                        )
+                        if restore_signal_detected:
+                            _record_restore_success()
+                        await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
                         assistant_content = _extract_assistant_content(resp_json)
                         # Build full message list for session
                         if is_delta_request and delta_messages:
@@ -2055,6 +2167,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     resp_headers["X-Session-Id"] = session_id
                     resp_headers["X-Session-Created"] = "true" if session_created else "false"
                     resp_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+                    if session_fallback_reason:
+                        resp_headers["X-Session-Fallback-Reason"] = session_fallback_reason
 
                 return Response(
                     content=response.content,
@@ -4944,6 +5058,9 @@ async def admin_metrics():
         "per_model": per_model,
         "process_rss_bytes": process_rss,
         "session_metrics": session_manager.get_metrics(),
+        "restore_success_total": int(session_restore_observability.get("restore_success_total", 0)),
+        "restore_fallback_total": dict(session_restore_observability.get("restore_fallback_total", {})),
+        "delta_payload_bytes_total": int(session_restore_observability.get("delta_payload_bytes_total", 0)),
         "backend_ready": bool(backend_ready),
         "backend_signals": dict(backend_signal_counts),
     }

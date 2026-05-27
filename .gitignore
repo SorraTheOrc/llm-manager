@@ -24,3 +24,6 @@ Worklog Specific Ignores
 
 # Python virtualenv
 .venv/
+
+# Runtime logs
+logs/
