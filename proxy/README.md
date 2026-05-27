@@ -354,7 +354,8 @@ The proxy supports session-based incremental prompt ingestion to reduce CPU usag
 
 Delta routing is only enabled when the proxy has explicit backend evidence that session restore works for that session.
 
-- If restore evidence is missing, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
+- If restore evidence is missing in API headers/body, the proxy performs a compatibility check against recent llama-server logs for session-specific restore phrases (for example `load_session` + session id).
+- If neither API nor log evidence is found, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
 - If message history was edited, the proxy invalidates the session and falls back with `X-Session-Fallback-Reason: history_mismatch`.
 - When no previous history exists, requests are full-ingestion by design.
 
@@ -491,11 +492,12 @@ Use these steps to validate strict restore behavior in your environment:
 3. Check headers:
    - `X-Session-Delta: true` indicates delta forwarding.
    - `X-Session-Delta: false` plus `X-Session-Fallback-Reason` explains fallback.
-4. Check `/admin/metrics`:
+4. If fallback is `missing_restore_signal`, inspect llama-server logs for session-specific restore lines (for example phrases containing `load_session` and the same session id).
+5. Check `/admin/metrics`:
    - `restore_success_total` increases when backend restore evidence is observed.
    - `restore_fallback_total` increments by reason when strict policy blocks delta.
    - `delta_payload_bytes_total` grows only when delta forwarding is used.
-5. Confirm payload reduction over repeated turns (target baseline >=30% reduction for representative conversations).
+6. Confirm payload reduction over repeated turns (target baseline >=30% reduction for representative conversations).
 
 ## Prometheus metrics
 

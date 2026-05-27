@@ -450,6 +450,48 @@ def _has_explicit_restore_signal(
     return False
 
 
+def _detect_restore_signal_from_llama_log(
+    session_id: Optional[str],
+    log_path: Optional[Path] = None,
+    lookback_lines: int = 400,
+) -> bool:
+    """Best-effort compatibility signal from llama-server logs.
+
+    We only treat this as explicit evidence when the line contains both
+    the session id and a restore-related phrase.
+    """
+    if not session_id:
+        return False
+
+    target_path = log_path or _resolve_log_path("llama")
+    if not target_path.exists():
+        return False
+
+    try:
+        with open(target_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-max(1, int(lookback_lines)):]
+    except Exception:
+        return False
+
+    sid = str(session_id).strip()
+    sid_lower = sid.lower()
+    phrases = (
+        "load_session",
+        "session restore",
+        "restore session",
+        "loading kv cache",
+        "kv cache restored",
+    )
+
+    for line in reversed(lines):
+        text = line.strip().lower()
+        if sid_lower not in text:
+            continue
+        if any(p in text for p in phrases):
+            return True
+    return False
+
+
 log_dir: Optional[Path] = None
 logger: logging.Logger = logging.getLogger("llama-proxy")
 
@@ -1904,6 +1946,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             )
             backend_ready = True
             restore_signal_detected = _has_explicit_restore_signal(dict(response.headers), None)
+            if session_id and not restore_signal_detected:
+                restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
         except Exception:
             backend_ready = False
             # If stream setup failed, ensure active_queries is decremented
@@ -2140,6 +2184,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             dict(response.headers),
                             resp_json if isinstance(resp_json, dict) else None,
                         )
+                        if session_id and not restore_signal_detected:
+                            restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
                         if restore_signal_detected:
                             _record_restore_success()
                         await session_manager.set_restore_confirmed(session_id, restore_signal_detected)

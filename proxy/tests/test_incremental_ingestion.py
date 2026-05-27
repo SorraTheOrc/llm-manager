@@ -204,6 +204,25 @@ class TestRestoreContract:
         # Regression guard: history match without explicit signal is not restore success.
         assert _has_explicit_restore_signal({}, {"session_restored": False}) is False
 
+    def test_detect_restore_signal_from_llama_log_matches_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "INFO slot update\n"
+            "INFO slot load_session: loading KV cache for session_id=abc-123\n"
+        )
+
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_detect_restore_signal_from_llama_log_requires_signal_and_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO slot update without restore\n")
+
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
 
 class TestRestoreObservability:
     """Observability counters for strict restore behavior."""
