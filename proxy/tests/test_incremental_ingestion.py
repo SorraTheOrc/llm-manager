@@ -519,6 +519,18 @@ class TestStreamGuardrails:
             min_repeats=4,
         ) is False
 
+    def test_extract_delta_text_from_sse_chunk_ignores_wrapper(self):
+        from proxy.server import _extract_delta_text_from_sse_chunk
+
+        wrapper_only = 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n'
+        assert _extract_delta_text_from_sse_chunk(wrapper_only) == ""
+
+        mixed = (
+            'data: {"choices":[{"delta":{"reasoning_content":"Think"}}]}\n'
+            'data: {"choices":[{"delta":{"content":"Hello"}}]}\n'
+        )
+        assert _extract_delta_text_from_sse_chunk(mixed) == "ThinkHello"
+
     def test_guardrail_evaluation_prioritizes_runtime_then_length_then_repetition(self):
         from proxy.server import evaluate_stream_guardrail
 

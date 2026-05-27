@@ -464,6 +464,36 @@ def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
     return "".join(parts) if parts else None
 
 
+def _extract_delta_text_from_sse_chunk(chunk_text: str) -> str:
+    """Extract assistant delta content from a single SSE chunk.
+
+    Uses delta.content and delta.reasoning_content fields and ignores wrapper JSON.
+    """
+    if not chunk_text:
+        return ""
+    parts: list[str] = []
+    for line in chunk_text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            j = json.loads(payload)
+        except Exception:
+            continue
+        for choice in j.get("choices", []):
+            delta = choice.get("delta", {})
+            if not isinstance(delta, dict):
+                continue
+            for key in ("reasoning_content", "content"):
+                value = delta.get(key)
+                if value is not None:
+                    parts.append(str(value))
+    return "".join(parts)
+
+
 class SessionSingleFlightRejected(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -2289,8 +2319,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             try:
                                 chunk_text = chunk.decode('utf-8', errors='replace')
                                 chunk_tokens = count_text_tokens(chunk_text, model_name)
-                                completion_tokens_total += chunk_tokens
-                                guardrail_response_text = (guardrail_response_text + chunk_text)[-2000:]
+                                delta_text = _extract_delta_text_from_sse_chunk(chunk_text)
+                                if delta_text:
+                                    completion_tokens_total += count_text_tokens(delta_text, model_name)
+                                    guardrail_response_text = (guardrail_response_text + delta_text)[-2000:]
                                 try:
                                     loop = asyncio.get_running_loop()
                                     loop.create_task(_increment_tokens('recv', key, chunk_tokens))
@@ -2298,6 +2330,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     asyncio.run(_increment_tokens('recv', key, chunk_tokens))
                             except Exception:
                                 chunk_text = ""
+                                delta_text = ""
 
                             # Inspect SSE-style 'data:' lines for finish indicators
                             try:
