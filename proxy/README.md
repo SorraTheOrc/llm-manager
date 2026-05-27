@@ -114,6 +114,14 @@ server:
   distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
   llama_startup_timeout: 300
+  session_single_flight_mode: "queue"
+  session_single_flight_max_queue_depth: 1
+  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_completion_tokens: 2048
+  session_guardrail_repetition_min_pattern_chars: 8
+  session_guardrail_repetition_min_repeats: 4
+  session_guardrail_invalidate_on_cutoff: true
+  session_require_restore_signal: false
 
 # Default model to load on startup
 # Set the default to `gemma4` in examples and docs; other models (e.g., `gpt120`) remain available.
@@ -352,12 +360,12 @@ The proxy supports session-based incremental prompt ingestion to reduce CPU usag
 
 ### Strict restore policy (important)
 
-Delta routing is only enabled when the proxy has explicit backend evidence that session restore works for that session.
+Delta routing is only gated on explicit backend restore evidence when `server.session_require_restore_signal` is enabled. The default configuration (`false`) favors optimistic delta forwarding while still invalidating on history mismatch.
 
 - If restore evidence is missing in API headers/body, the proxy performs compatibility checks against llama-server logs:
   - session-specific restore phrases when available, and
   - restore markers (`restored context checkpoint`, `load_session`, etc.) that appear in log lines appended during the active request window.
-- If neither API nor log evidence is found, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
+- If neither API nor log evidence is found and strict restore is enabled, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
 - If message history was edited, the proxy invalidates the session and falls back with `X-Session-Fallback-Reason: history_mismatch`.
 - When no previous history exists, requests are full-ingestion by design.
 
@@ -372,6 +380,7 @@ Delta routing is only enabled when the proxy has explicit backend evidence that 
 
 ### Limitations
 
+- **KV cache ownership**: The proxy never stores or mutates KV tensors; llama-server owns the cache. The proxy only passes session metadata and deltas so llama-server can restore/cache internally.
 - **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
 - **Context window limits**: llama-server's KV cache has finite capacity. Very long conversations may exceed the context window.
 - **Ephemeral sessions**: Sessions are held in memory and are lost when the proxy restarts. Cross-restart persistence is not supported in this version.
@@ -482,8 +491,30 @@ Important fields:
 - `restore_success_total`
 - `restore_fallback_total` (per-reason map, e.g. `missing_restore_signal`, `history_mismatch`)
 - `delta_payload_bytes_total`
+- `single_flight_metrics` (queue/reject/active session counters)
+- `guardrail_metrics` (cutoff + invalidation counters)
 - `backend_ready`
 - `backend_signals`
+
+### Single-flight + guardrails
+
+The proxy enforces **per-session single-flight** by default. Only one in-flight
+request per session is allowed; additional requests are queued or rejected based
+on config.
+
+Config keys:
+- `server.session_single_flight_mode` — `queue` (default) or `reject`
+- `server.session_single_flight_max_queue_depth` — max waiting requests per session
+
+Guardrails stop runaway responses and invalidate sessions when configured:
+- `server.session_guardrail_max_runtime_seconds` — cutoff streaming after N seconds
+- `server.session_guardrail_max_completion_tokens` — cutoff on excessive output
+- `server.session_guardrail_repetition_min_pattern_chars` — repetition pattern length
+- `server.session_guardrail_repetition_min_repeats` — repetition count to trigger cutoff
+- `server.session_guardrail_invalidate_on_cutoff` — invalidate session after cutoff
+
+When a guardrail triggers, `/admin/metrics` exposes `guardrail_metrics` with the
+cutoff reason and invalidation counters for observability.
 
 ### Operator verification checklist
 

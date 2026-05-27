@@ -193,6 +193,18 @@ class TestRestoreContract:
         assert use_delta is True
         assert reason is None
 
+    def test_classify_delta_routing_allows_delta_when_restore_signal_not_required(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+            require_restore_signal=False,
+        )
+        assert use_delta is True
+        assert reason is None
+
     def test_has_explicit_restore_signal_positive_and_negative(self):
         from proxy.server import _has_explicit_restore_signal
 
@@ -405,3 +417,224 @@ class TestSessionDeltaFlow:
         delta, matches = mgr.compute_delta(session_new.messages, edited_msgs)
         assert matches is True
         assert delta == edited_msgs
+
+
+# ---------------------------------------------------------------------------
+# Proxy stabilization helpers
+# ---------------------------------------------------------------------------
+
+class TestSessionSingleFlightCoordinator:
+    @pytest.mark.asyncio
+    async def test_queue_mode_serializes_same_session_requests(self):
+        from proxy.server import SessionSingleFlightCoordinator
+
+        coordinator = SessionSingleFlightCoordinator()
+        active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+
+        async def worker():
+            nonlocal active, max_active
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=8):
+                async with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                async with lock:
+                    active -= 1
+
+        await asyncio.gather(worker(), worker(), worker())
+        assert max_active == 1
+
+        metrics = coordinator.metrics_snapshot()
+        assert metrics["queue_events_total"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_reject_mode_rejects_second_inflight_request(self):
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+
+        coordinator = SessionSingleFlightCoordinator()
+
+        async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
+            with pytest.raises(SessionSingleFlightRejected) as excinfo:
+                async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
+                    pass
+
+        assert excinfo.value.reason == "active_inflight"
+        metrics = coordinator.metrics_snapshot()
+        assert metrics["reject_events_total"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_enforces_queue_depth(self):
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+
+        coordinator = SessionSingleFlightCoordinator()
+        first_entered = asyncio.Event()
+        first_release = asyncio.Event()
+
+        async def first_request():
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
+                first_entered.set()
+                await first_release.wait()
+
+        async def second_request():
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
+                return "ok"
+
+        first_task = asyncio.create_task(first_request())
+        await first_entered.wait()
+
+        queued_task = asyncio.create_task(second_request())
+        await asyncio.sleep(0.01)
+
+        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
+                pass
+
+        assert excinfo.value.reason == "queue_full"
+
+        first_release.set()
+        await first_task
+        assert await queued_task == "ok"
+
+
+class TestStreamGuardrails:
+    def test_repetition_detection_triggers_for_pathological_output(self):
+        from proxy.server import _should_cutoff_for_repetition
+
+        repeated_text = "abc123 " * 20
+        assert _should_cutoff_for_repetition(
+            repeated_text,
+            min_pattern_chars=6,
+            min_repeats=4,
+        ) is True
+
+    def test_repetition_detection_ignores_healthy_output(self):
+        from proxy.server import _should_cutoff_for_repetition
+
+        healthy_text = "This response uses varied words and does not loop over a fixed suffix."
+        assert _should_cutoff_for_repetition(
+            healthy_text,
+            min_pattern_chars=6,
+            min_repeats=4,
+        ) is False
+
+    def test_guardrail_evaluation_prioritizes_runtime_then_length_then_repetition(self):
+        from proxy.server import evaluate_stream_guardrail
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=11.0,
+                completion_tokens=20,
+                response_text="healthy",
+                max_runtime_seconds=10.0,
+                max_completion_tokens=100,
+                repetition_min_pattern_chars=8,
+                repetition_min_repeats=4,
+            )
+            == "runtime"
+        )
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=120,
+                response_text="healthy",
+                max_runtime_seconds=10.0,
+                max_completion_tokens=100,
+                repetition_min_pattern_chars=8,
+                repetition_min_repeats=4,
+            )
+            == "completion_tokens"
+        )
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=20,
+                response_text=("loop-me-forever " * 10),
+                max_runtime_seconds=10.0,
+                max_completion_tokens=100,
+                repetition_min_pattern_chars=8,
+                repetition_min_repeats=4,
+            )
+            == "repetition"
+        )
+
+
+class TestSessionHistoryIntegrityHelpers:
+    def test_merge_session_history_preserves_existing_and_delta_without_duplicates(self):
+        from proxy.server import merge_session_history_for_update
+
+        existing = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        delta = [{"role": "user", "content": "next question"}]
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing,
+            request_messages=[],
+            delta_messages=delta,
+            is_delta_request=True,
+            assistant_content=None,
+        )
+
+        assert merged == existing + delta
+
+    def test_merge_session_history_appends_assistant_content_once(self):
+        from proxy.server import merge_session_history_for_update
+
+        request_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+
+        merged = merge_session_history_for_update(
+            existing_messages=[],
+            request_messages=request_messages,
+            delta_messages=None,
+            is_delta_request=False,
+            assistant_content="hello",
+        )
+
+        assert merged[-1] == {"role": "assistant", "content": "hello"}
+        assert merged.count({"role": "assistant", "content": "hello"}) == 1
+
+    def test_merge_session_history_with_delta_and_assistant(self):
+        from proxy.server import merge_session_history_for_update
+
+        existing_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        delta_messages = [{"role": "user", "content": "next"}]
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing_messages,
+            request_messages=[],
+            delta_messages=delta_messages,
+            is_delta_request=True,
+            assistant_content="assistant reply",
+        )
+
+        assert merged == existing_messages + delta_messages + [{"role": "assistant", "content": "assistant reply"}]
+
+    def test_merge_session_history_avoids_duplicate_assistant(self):
+        from proxy.server import merge_session_history_for_update
+
+        existing_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "assistant", "content": "assistant reply"},
+        ]
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing_messages,
+            request_messages=existing_messages,
+            delta_messages=None,
+            is_delta_request=False,
+            assistant_content="assistant reply",
+        )
+
+        assert merged == existing_messages

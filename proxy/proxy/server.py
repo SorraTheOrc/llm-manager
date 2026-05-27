@@ -167,6 +167,22 @@ session_restore_observability: dict = {
     "delta_payload_bytes_total": 0,
 }
 
+# Session single-flight observability
+session_single_flight_observability: dict = {
+    "queue_events_total": 0,
+    "reject_events_total": 0,
+    "active_sessions_current": 0,
+    "queue_depth_current": 0,
+}
+
+# Guardrail & invalidation observability
+session_guardrail_observability: dict = {
+    "guardrail_cutoff_total": 0,
+    "guardrail_cutoff_reasons": {},
+    "session_invalidation_total": 0,
+    "session_invalidation_reasons": {},
+}
+
 
 def _record_restore_success() -> None:
     try:
@@ -194,6 +210,50 @@ def _record_delta_payload_bytes(value: int) -> None:
         session_restore_observability["delta_payload_bytes_total"] = int(
             session_restore_observability.get("delta_payload_bytes_total", 0)
         ) + int(value)
+    except Exception:
+        pass
+
+
+def _record_single_flight_queue() -> None:
+    try:
+        session_single_flight_observability["queue_events_total"] = int(
+            session_single_flight_observability.get("queue_events_total", 0)
+        ) + 1
+    except Exception:
+        pass
+
+
+def _record_single_flight_reject() -> None:
+    try:
+        session_single_flight_observability["reject_events_total"] = int(
+            session_single_flight_observability.get("reject_events_total", 0)
+        ) + 1
+    except Exception:
+        pass
+
+
+def _record_guardrail_cutoff(reason: str) -> None:
+    if not reason:
+        return
+    try:
+        session_guardrail_observability["guardrail_cutoff_total"] = int(
+            session_guardrail_observability.get("guardrail_cutoff_total", 0)
+        ) + 1
+        bucket = session_guardrail_observability.setdefault("guardrail_cutoff_reasons", {})
+        bucket[reason] = int(bucket.get(reason, 0)) + 1
+    except Exception:
+        pass
+
+
+def _record_session_invalidation(reason: str) -> None:
+    if not reason:
+        return
+    try:
+        session_guardrail_observability["session_invalidation_total"] = int(
+            session_guardrail_observability.get("session_invalidation_total", 0)
+        ) + 1
+        bucket = session_guardrail_observability.setdefault("session_invalidation_reasons", {})
+        bucket[reason] = int(bucket.get(reason, 0)) + 1
     except Exception:
         pass
 
@@ -404,17 +464,156 @@ def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
     return "".join(parts) if parts else None
 
 
+class SessionSingleFlightRejected(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class SessionSingleFlightCoordinator:
+    def __init__(self) -> None:
+        self._state_lock = asyncio.Lock()
+        self._states: dict[str, dict[str, Any]] = {}
+
+    async def _get_state(self, session_id: str) -> dict[str, Any]:
+        async with self._state_lock:
+            state = self._states.get(session_id)
+            if state is None:
+                state = {"lock": asyncio.Lock(), "waiters": 0, "active": False}
+                self._states[session_id] = state
+            return state
+
+    def acquire(self, session_id: Optional[str], mode: str, max_queue_depth: int):
+        @asynccontextmanager
+        async def _guard():
+            if not session_id:
+                yield
+                return
+
+            state = await self._get_state(session_id)
+            mode_norm = (mode or "queue").strip().lower()
+            if mode_norm not in {"queue", "reject"}:
+                mode_norm = "queue"
+
+            is_waiting = False
+            async with self._state_lock:
+                if state["lock"].locked():
+                    if mode_norm == "reject":
+                        _record_single_flight_reject()
+                        raise SessionSingleFlightRejected("active_inflight")
+                    if max_queue_depth is not None and state["waiters"] >= max_queue_depth:
+                        _record_single_flight_reject()
+                        raise SessionSingleFlightRejected("queue_full")
+                    state["waiters"] += 1
+                    is_waiting = True
+                    _record_single_flight_queue()
+
+            await state["lock"].acquire()
+            async with self._state_lock:
+                if is_waiting:
+                    state["waiters"] = max(0, state["waiters"] - 1)
+                state["active"] = True
+                session_single_flight_observability["active_sessions_current"] = sum(
+                    1 for s in self._states.values() if s.get("active")
+                )
+                session_single_flight_observability["queue_depth_current"] = sum(
+                    int(s.get("waiters", 0)) for s in self._states.values()
+                )
+
+            try:
+                yield
+            finally:
+                state["lock"].release()
+                async with self._state_lock:
+                    state["active"] = False
+                    if not state["lock"].locked() and state["waiters"] == 0:
+                        self._states.pop(session_id, None)
+                    session_single_flight_observability["active_sessions_current"] = sum(
+                        1 for s in self._states.values() if s.get("active")
+                    )
+                    session_single_flight_observability["queue_depth_current"] = sum(
+                        int(s.get("waiters", 0)) for s in self._states.values()
+                    )
+
+        return _guard()
+
+    def metrics_snapshot(self) -> dict:
+        return dict(session_single_flight_observability)
+
+
+def _should_cutoff_for_repetition(
+    response_text: str,
+    min_pattern_chars: int,
+    min_repeats: int,
+) -> bool:
+    if not response_text:
+        return False
+    pattern_len = max(1, int(min_pattern_chars))
+    repeats = max(2, int(min_repeats))
+    if len(response_text) < pattern_len * repeats:
+        return False
+    pattern = response_text[-pattern_len:]
+    if not pattern.strip():
+        return False
+    return response_text.count(pattern) >= repeats
+
+
+def evaluate_stream_guardrail(
+    runtime_seconds: float,
+    completion_tokens: int,
+    response_text: str,
+    max_runtime_seconds: Optional[float],
+    max_completion_tokens: Optional[int],
+    repetition_min_pattern_chars: int,
+    repetition_min_repeats: int,
+) -> Optional[str]:
+    if max_runtime_seconds and runtime_seconds >= max_runtime_seconds:
+        return "runtime"
+    if max_completion_tokens and completion_tokens >= max_completion_tokens:
+        return "completion_tokens"
+    if _should_cutoff_for_repetition(response_text, repetition_min_pattern_chars, repetition_min_repeats):
+        return "repetition"
+    return None
+
+
+def merge_session_history_for_update(
+    existing_messages: List[Dict[str, Any]],
+    request_messages: List[Dict[str, Any]],
+    delta_messages: Optional[List[Dict[str, Any]]],
+    is_delta_request: bool,
+    assistant_content: Optional[str],
+) -> List[Dict[str, Any]]:
+    if is_delta_request and delta_messages:
+        merged = list(existing_messages) + list(delta_messages)
+    else:
+        merged = list(request_messages)
+
+    if assistant_content:
+        if not merged or merged[-1].get("role") != "assistant" or merged[-1].get("content") != assistant_content:
+            merged.append({"role": "assistant", "content": assistant_content})
+    return merged
+
+
+# Single-flight coordinator for per-session concurrency
+session_single_flight_coordinator = SessionSingleFlightCoordinator()
+
+
 def _classify_delta_routing(
     history_matches: bool,
     delta_message_count: int,
     restore_confirmed: bool,
+    require_restore_signal: bool = True,
 ) -> Tuple[bool, Optional[str]]:
-    """Decide whether to use delta routing under strict restore policy."""
+    """Decide whether to use delta routing.
+
+    When ``require_restore_signal`` is True, delta routing requires explicit
+    restore confirmation from backend signals/logs.
+    """
     if not history_matches:
         return False, "history_mismatch"
     if delta_message_count <= 0:
         return False, "no_new_messages"
-    if not restore_confirmed:
+    if require_restore_signal and not restore_confirmed:
         return False, "missing_restore_signal"
     return True, None
 
@@ -1775,6 +1974,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Session handling – incremental prompt ingestion
     # ------------------------------------------------------------------
     session_id_header = request.headers.get("x-session-id") or request.headers.get("session_id")
+    session_id: Optional[str] = None
     session_created = False
     delta_messages: Optional[List[Dict[str, Any]]] = None
     is_delta_request = False
@@ -1797,6 +1997,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     history_matches=history_matches,
                     delta_message_count=len(delta_messages),
                     restore_confirmed=bool(session.restore_confirmed),
+                    require_restore_signal=bool(
+                        server_config.get("session_require_restore_signal", False)
+                    ),
                 )
 
                 if is_delta_request:
@@ -1814,6 +2017,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 else:
                     if session_fallback_reason == "history_mismatch":
                         await session_manager.invalidate(session_id)
+                        _record_session_invalidation("history_mismatch")
                         session, session_created = await session_manager.get_or_create(
                             session_id
                         )
@@ -1863,6 +2067,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             if llama_model and llama_model != requested:
                 body_json["model"] = llama_model
                 body = json.dumps(body_json).encode("utf-8")
+
+    single_flight_mode = server_config.get("session_single_flight_mode", "queue")
+    single_flight_max_queue_depth = int(
+        server_config.get("session_single_flight_max_queue_depth", 1) or 1
+    )
 
     # Check concurrency limit before accepting request
     max_queries = server_config.get("max_concurrent_queries", 4)
@@ -1960,320 +2169,410 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     request_timeout = httpx.Timeout(server_config.get("llama_request_timeout", 300))
     
     if is_streaming:
-        # Streaming response - client must stay open during streaming
-        client = httpx.AsyncClient(timeout=request_timeout)
-
-        async def _open_stream_once():
-            stream_cm = client.stream(
-                request.method,
-                target_url,
-                headers=headers,
-                content=body,
-            )
-            stream_resp = await stream_cm.__aenter__()
-            return stream_cm, stream_resp
-
-        # Enter the stream with bounded retries on transient backend failures
-        try:
-            cm, response = await _call_with_backend_retries(
-                _open_stream_once,
-                path=path,
-                stream=True,
-            )
-            backend_ready = True
-            restore_signal_detected = _has_explicit_restore_signal(dict(response.headers), None)
-            if session_id and not restore_signal_detected:
-                restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
-        except Exception:
-            backend_ready = False
-            # If stream setup failed, ensure active_queries is decremented
-            try:
-                async with active_queries_lock:
-                    active_queries = max(0, active_queries - 1)
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-            raise
-        upstream_status = response.status_code
-        upstream_content_type = response.headers.get('content-type', '')
-
-        # If upstream returned an error (or a non-SSE payload), return a buffered
-        # response with the real status code so clients don't parse it as SSE.
-        if upstream_status >= 400 or 'text/event-stream' not in upstream_content_type.lower():
-            try:
-                body_bytes = await response.aread()
-            except Exception:
-                body_bytes = b''
-            try:
-                await cm.__aexit__(None, None, None)
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-            err_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
-            if session_id:
-                err_headers["X-Session-Id"] = session_id
-                err_headers["X-Session-Created"] = "true" if session_created else "false"
-                err_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
-                if session_fallback_reason:
-                    err_headers["X-Session-Fallback-Reason"] = session_fallback_reason
-            return Response(
-                content=body_bytes,
-                status_code=upstream_status,
-                headers=err_headers,
-            )
-
-        # Normalize backend headers for streaming (remove content-length if TE present)
-        outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
-        # Ensure Cache-Control is present
-        if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
-            outgoing_headers['Cache-Control'] = 'no-cache'
-
-        # Add session header for incremental ingestion
-        if session_id:
-            outgoing_headers["X-Session-Id"] = session_id
-            outgoing_headers["X-Session-Created"] = "true" if session_created else "false"
-            outgoing_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
-            if session_fallback_reason:
-                outgoing_headers["X-Session-Fallback-Reason"] = session_fallback_reason
-        media_type = response.headers.get('content-type', 'text/event-stream')
-
-        async def stream_generator():
-            global active_queries
-            # Track assistant response for session history update
-            collected_content: list[str] = []
-            saw_done = False
-            saw_finish = False
-            try:
-                async for chunk in response.aiter_bytes():
-                    # count tokens in this chunk (best-effort)
-                    try:
-                        chunk_text = chunk.decode('utf-8', errors='replace')
-                        # simple heuristic: count tokens in chunk text
-                        chunk_tokens = count_text_tokens(chunk_text, model_name)
-                        try:
-                            loop = asyncio.get_running_loop()
-                            loop.create_task(_increment_tokens('recv', key, chunk_tokens))
-                        except RuntimeError:
-                            asyncio.run(_increment_tokens('recv', key, chunk_tokens))
-                    except Exception:
-                        pass
-
-                    # Inspect SSE-style 'data:' lines for finish indicators
-                    try:
-                        txt = chunk.decode('utf-8', errors='replace')
-                        for line in txt.splitlines():
-                            line = line.strip()
-                            if not line.startswith('data:'):
-                                continue
-                            payload = line[5:].strip()
-                            if payload == '[DONE]':
-                                saw_done = True
-                            else:
-                                try:
-                                    j = json.loads(payload)
-                                    for choice in j.get('choices', []):
-                                        if choice.get('finish_reason') is not None:
-                                            saw_finish = True
-                                except Exception:
-                                    # ignore non-json payloads
-                                    pass
-                    except Exception:
-                        pass
-
-                    # Collect content for session history if session is active
-                    if session_id:
-                        try:
-                            collected_content.append(chunk.decode('utf-8', errors='replace'))
-                        except Exception:
-                            pass
-
-                    yield chunk
-                    log_response_chunk(chunk)
-            finally:
-                # If the upstream closed the stream without sending a final finish marker,
-                # synthesize a final SSE event so clients expecting a finish_reason get one.
-                try:
-                    if not saw_done and not saw_finish:
-                        try:
-                            final_obj = {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}
-                            final_bytes = (f"data: {json.dumps(final_obj)}\n\n").encode('utf-8')
-                            yield final_bytes
-                            log_response_chunk(final_bytes)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # Strict restore confirmation state comes from explicit backend signal.
-                if session_id:
-                    try:
-                        if not restore_signal_detected:
-                            restore_signal_detected = _detect_restore_signal_from_log_slice(
-                                llama_log_path,
-                                llama_log_offset,
-                            )
-                        if restore_signal_detected:
-                            _record_restore_success()
-                        await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
-                    except Exception:
-                        logger.debug("Failed to set restore-confirmed state", exc_info=True)
-
-                # Update session history with the full conversation
-                if session_id and original_message_count > 0:
-                    try:
-                        # For streaming, we collect partial content; best effort update
-                        if collected_content:
-                            full_response = ''.join(collected_content)
-                            # Attempt to extract assistant content from SSE chunks
-                            assistant_content = _extract_assistant_content_from_sse(full_response)
-                            if assistant_content:
-                                full_messages = list(body_json.get('messages', [])) if not is_delta_request else list(delta_messages or [])
-                                # If we sent a delta, we need the full message list
-                                if is_delta_request and delta_messages:
-                                    try:
-                                        session_obj = await session_manager.get(session_id)
-                                        if session_obj:
-                                            full_messages = list(session_obj.messages) + list(delta_messages)
-                                        else:
-                                            full_messages = list(delta_messages)
-                                    except Exception:
-                                        full_messages = list(delta_messages)
-                                full_messages.append({"role": "assistant", "content": assistant_content})
-                                await session_manager.update_messages(session_id, full_messages)
-                            else:
-                                # Could not parse assistant content; store messages without response
-                                if is_delta_request and delta_messages:
-                                    try:
-                                        session_obj = await session_manager.get(session_id)
-                                        if session_obj:
-                                            await session_manager.append_messages(session_id, delta_messages)
-                                    except Exception:
-                                        pass
-                                elif not is_delta_request and original_message_count > 0:
-                                    await session_manager.update_messages(session_id, body_json.get('messages', []))
-                        else:
-                            # No content collected; still store user messages
-                            if not is_delta_request and original_message_count > 0:
-                                await session_manager.update_messages(session_id, body_json.get('messages', []))
-                            elif is_delta_request and delta_messages:
-                                await session_manager.append_messages(session_id, delta_messages)
-                    except Exception:
-                        logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
-
-                try:
-                    await cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-                # decrement active queries when streaming finishes
-                try:
-                    async with active_queries_lock:
-                        active_queries = max(0, active_queries - 1)
-                except Exception:
-                    pass
-
-        return StreamingResponse(
-            stream_generator(),
-            media_type=media_type,
-            headers=outgoing_headers,
-            status_code=upstream_status,
+        session_guard = session_single_flight_coordinator.acquire(
+            session_id,
+            single_flight_mode,
+            single_flight_max_queue_depth,
         )
-    else:
-        # Non-streaming response
         try:
-            async with httpx.AsyncClient(timeout=request_timeout) as client:
-                method = request.method.lower()
+            async with session_guard:
+                # Streaming response - client must stay open during streaming
+                client = httpx.AsyncClient(timeout=request_timeout)
 
-                async def _send_once():
-                    return await getattr(client, method)(
+                async def _open_stream_once():
+                    stream_cm = client.stream(
+                        request.method,
                         target_url,
                         headers=headers,
                         content=body,
                     )
+                    stream_resp = await stream_cm.__aenter__()
+                    return stream_cm, stream_resp
 
-                response = await _call_with_backend_retries(_send_once, path=path, stream=False)
-                backend_ready = True
-
-                # Non-streaming: count tokens in response body
+                # Enter the stream with bounded retries on transient backend failures
                 try:
-                    resp_text = response.content.decode('utf-8', errors='replace')
-                    recv_tokens = count_text_tokens(resp_text, model_name)
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(_increment_tokens('recv', key, recv_tokens))
-                    except RuntimeError:
-                        asyncio.run(_increment_tokens('recv', key, recv_tokens))
+                    cm, response = await _call_with_backend_retries(
+                        _open_stream_once,
+                        path=path,
+                        stream=True,
+                    )
+                    backend_ready = True
+                    restore_signal_detected = _has_explicit_restore_signal(dict(response.headers), None)
+                    if session_id and not restore_signal_detected:
+                        restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
                 except Exception:
-                    pass
-
-                # Update session history for non-streaming responses
-                if session_id and isinstance(body_json, dict) and 'messages' in body_json:
+                    backend_ready = False
+                    # If stream setup failed, ensure active_queries is decremented
                     try:
-                        resp_content = response.content.decode('utf-8', errors='replace')
-                        resp_json = json.loads(resp_content) if resp_content else {}
-                        restore_signal_detected = _has_explicit_restore_signal(
-                            dict(response.headers),
-                            resp_json if isinstance(resp_json, dict) else None,
-                        )
-                        if session_id and not restore_signal_detected:
-                            restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
-                        if session_id and not restore_signal_detected:
-                            restore_signal_detected = _detect_restore_signal_from_log_slice(
-                                llama_log_path,
-                                llama_log_offset,
-                            )
-                        if restore_signal_detected:
-                            _record_restore_success()
-                        await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
-                        assistant_content = _extract_assistant_content(resp_json)
-                        # Build full message list for session
-                        if is_delta_request and delta_messages:
-                            session_obj = await session_manager.get(session_id)
-                            if session_obj:
-                                full_messages = list(session_obj.messages) + list(delta_messages)
-                            else:
-                                full_messages = list(delta_messages)
-                        else:
-                            full_messages = list(body_json.get('messages', []))
-                        if assistant_content:
-                            full_messages.append({"role": "assistant", "content": assistant_content})
-                        await session_manager.update_messages(session_id, full_messages)
+                        async with active_queries_lock:
+                            active_queries = max(0, active_queries - 1)
                     except Exception:
-                        logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
+                        pass
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                    raise
+                upstream_status = response.status_code
+                upstream_content_type = response.headers.get('content-type', '')
 
-                log_response(response.status_code, response.content)
+                # If upstream returned an error (or a non-SSE payload), return a buffered
+                # response with the real status code so clients don't parse it as SSE.
+                if upstream_status >= 400 or 'text/event-stream' not in upstream_content_type.lower():
+                    try:
+                        body_bytes = await response.aread()
+                    except Exception:
+                        body_bytes = b''
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
 
-                # Build response headers with session info
-                resp_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+                    err_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+                    if session_id:
+                        err_headers["X-Session-Id"] = session_id
+                        err_headers["X-Session-Created"] = "true" if session_created else "false"
+                        err_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+                        if session_fallback_reason:
+                            err_headers["X-Session-Fallback-Reason"] = session_fallback_reason
+                    return Response(
+                        content=body_bytes,
+                        status_code=upstream_status,
+                        headers=err_headers,
+                    )
+
+                # Normalize backend headers for streaming (remove content-length if TE present)
+                outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
+                # Ensure Cache-Control is present
+                if 'cache-control' not in {k.lower() for k in outgoing_headers.keys()}:
+                    outgoing_headers['Cache-Control'] = 'no-cache'
+
+                # Add session header for incremental ingestion
                 if session_id:
-                    resp_headers["X-Session-Id"] = session_id
-                    resp_headers["X-Session-Created"] = "true" if session_created else "false"
-                    resp_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+                    outgoing_headers["X-Session-Id"] = session_id
+                    outgoing_headers["X-Session-Created"] = "true" if session_created else "false"
+                    outgoing_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
                     if session_fallback_reason:
-                        resp_headers["X-Session-Fallback-Reason"] = session_fallback_reason
+                        outgoing_headers["X-Session-Fallback-Reason"] = session_fallback_reason
+                media_type = response.headers.get('content-type', 'text/event-stream')
 
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    headers=resp_headers
+                guardrail_reason: Optional[str] = None
+                guardrail_response_text = ""
+                completion_tokens_total = 0
+                stream_start = time.monotonic()
+                max_runtime_seconds = float(server_config.get("session_guardrail_max_runtime_seconds", 120) or 120)
+                max_completion_tokens = int(server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048)
+                repetition_min_pattern_chars = int(
+                    server_config.get("session_guardrail_repetition_min_pattern_chars", 8) or 8
                 )
-        finally:
-            # decrement active queries when non-streaming finishes or failures occur
+                repetition_min_repeats = int(
+                    server_config.get("session_guardrail_repetition_min_repeats", 4) or 4
+                )
+                invalidate_on_guardrail = bool(
+                    server_config.get("session_guardrail_invalidate_on_cutoff", True)
+                )
+
+                async def stream_generator():
+                    global active_queries
+                    nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total
+                    # Track assistant response for session history update
+                    collected_content: list[str] = []
+                    saw_done = False
+                    saw_finish = False
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            # count tokens in this chunk (best-effort)
+                            try:
+                                chunk_text = chunk.decode('utf-8', errors='replace')
+                                chunk_tokens = count_text_tokens(chunk_text, model_name)
+                                completion_tokens_total += chunk_tokens
+                                guardrail_response_text = (guardrail_response_text + chunk_text)[-2000:]
+                                try:
+                                    loop = asyncio.get_running_loop()
+                                    loop.create_task(_increment_tokens('recv', key, chunk_tokens))
+                                except RuntimeError:
+                                    asyncio.run(_increment_tokens('recv', key, chunk_tokens))
+                            except Exception:
+                                chunk_text = ""
+
+                            # Inspect SSE-style 'data:' lines for finish indicators
+                            try:
+                                txt = chunk.decode('utf-8', errors='replace')
+                                for line in txt.splitlines():
+                                    line = line.strip()
+                                    if not line.startswith('data:'):
+                                        continue
+                                    payload = line[5:].strip()
+                                    if payload == '[DONE]':
+                                        saw_done = True
+                                    else:
+                                        try:
+                                            j = json.loads(payload)
+                                            for choice in j.get('choices', []):
+                                                if choice.get('finish_reason') is not None:
+                                                    saw_finish = True
+                                        except Exception:
+                                            # ignore non-json payloads
+                                            pass
+                            except Exception:
+                                pass
+
+                            if not guardrail_reason:
+                                guardrail_reason = evaluate_stream_guardrail(
+                                    runtime_seconds=time.monotonic() - stream_start,
+                                    completion_tokens=completion_tokens_total,
+                                    response_text=guardrail_response_text,
+                                    max_runtime_seconds=max_runtime_seconds,
+                                    max_completion_tokens=max_completion_tokens,
+                                    repetition_min_pattern_chars=repetition_min_pattern_chars,
+                                    repetition_min_repeats=repetition_min_repeats,
+                                )
+                                if guardrail_reason:
+                                    _record_guardrail_cutoff(guardrail_reason)
+                                    logger.warning(
+                                        "session_guardrail_cutoff session=%s reason=%s",
+                                        session_id[:8] if session_id else "unknown",
+                                        guardrail_reason,
+                                    )
+                                    if session_id and invalidate_on_guardrail:
+                                        await session_manager.invalidate(session_id)
+                                        _record_session_invalidation(f"guardrail_{guardrail_reason}")
+                                    break
+
+                            # Collect content for session history if session is active
+                            if session_id:
+                                try:
+                                    collected_content.append(chunk.decode('utf-8', errors='replace'))
+                                except Exception:
+                                    pass
+
+                            yield chunk
+                            log_response_chunk(chunk)
+                    finally:
+                        # If the upstream closed the stream without sending a final finish marker,
+                        # synthesize a final SSE event so clients expecting a finish_reason get one.
+                        try:
+                            if not saw_done and not saw_finish:
+                                try:
+                                    finish_reason = "stop" if not guardrail_reason else "stop"
+                                    final_obj = {"choices": [{"delta": {}, "finish_reason": finish_reason, "index": 0}]}
+                                    final_bytes = (f"data: {json.dumps(final_obj)}\n\n").encode('utf-8')
+                                    yield final_bytes
+                                    log_response_chunk(final_bytes)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # Strict restore confirmation state comes from explicit backend signal.
+                        if session_id:
+                            try:
+                                if not restore_signal_detected:
+                                    restore_signal_detected = _detect_restore_signal_from_log_slice(
+                                        llama_log_path,
+                                        llama_log_offset,
+                                    )
+                                if restore_signal_detected:
+                                    _record_restore_success()
+                                await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
+                            except Exception:
+                                logger.debug("Failed to set restore-confirmed state", exc_info=True)
+
+                        # Update session history with the full conversation
+                        if session_id and original_message_count > 0 and not guardrail_reason:
+                            try:
+                                if collected_content:
+                                    full_response = ''.join(collected_content)
+                                    assistant_content = _extract_assistant_content_from_sse(full_response)
+                                    existing_messages = []
+                                    if is_delta_request and delta_messages:
+                                        session_obj = await session_manager.get(session_id)
+                                        if session_obj:
+                                            existing_messages = list(session_obj.messages)
+                                    full_messages = merge_session_history_for_update(
+                                        existing_messages=existing_messages,
+                                        request_messages=list(body_json.get('messages', [])),
+                                        delta_messages=delta_messages,
+                                        is_delta_request=is_delta_request,
+                                        assistant_content=assistant_content,
+                                    )
+                                    await session_manager.update_messages(session_id, full_messages)
+                                else:
+                                    if not is_delta_request and original_message_count > 0:
+                                        await session_manager.update_messages(session_id, body_json.get('messages', []))
+                                    elif is_delta_request and delta_messages:
+                                        await session_manager.append_messages(session_id, delta_messages)
+                            except Exception:
+                                logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
+
+                        try:
+                            await cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        try:
+                            await client.aclose()
+                        except Exception:
+                            pass
+                        # decrement active queries when streaming finishes
+                        try:
+                            async with active_queries_lock:
+                                active_queries = max(0, active_queries - 1)
+                        except Exception:
+                            pass
+
+                return StreamingResponse(
+                    stream_generator(),
+                    media_type=media_type,
+                    headers=outgoing_headers,
+                    status_code=upstream_status,
+                )
+        except SessionSingleFlightRejected as exc:
             try:
                 async with active_queries_lock:
                     active_queries = max(0, active_queries - 1)
             except Exception:
                 pass
+            payload = {
+                "error": {
+                    "type": "session_single_flight",
+                    "code": "session_single_flight",
+                    "message": "Another request is already active for this session",
+                    "reason": exc.reason,
+                },
+                "status": 429,
+                "session_id": session_id,
+                "mode": single_flight_mode,
+            }
+            return JSONResponse(status_code=429, content=payload)
+    else:
+        session_guard = session_single_flight_coordinator.acquire(
+            session_id,
+            single_flight_mode,
+            single_flight_max_queue_depth,
+        )
+        try:
+            async with session_guard:
+                # Non-streaming response
+                try:
+                    async with httpx.AsyncClient(timeout=request_timeout) as client:
+                        method = request.method.lower()
+
+                        async def _send_once():
+                            return await getattr(client, method)(
+                                target_url,
+                                headers=headers,
+                                content=body,
+                            )
+
+                        response = await _call_with_backend_retries(_send_once, path=path, stream=False)
+                        backend_ready = True
+
+                        recv_tokens = 0
+                        # Non-streaming: count tokens in response body
+                        try:
+                            resp_text = response.content.decode('utf-8', errors='replace')
+                            recv_tokens = count_text_tokens(resp_text, model_name)
+                            try:
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(_increment_tokens('recv', key, recv_tokens))
+                            except RuntimeError:
+                                asyncio.run(_increment_tokens('recv', key, recv_tokens))
+                        except Exception:
+                            pass
+
+                        max_completion_tokens = int(
+                            server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
+                        )
+                        invalidate_on_guardrail = bool(
+                            server_config.get("session_guardrail_invalidate_on_cutoff", True)
+                        )
+                        if max_completion_tokens and recv_tokens >= max_completion_tokens:
+                            _record_guardrail_cutoff("completion_tokens")
+                            if session_id and invalidate_on_guardrail:
+                                await session_manager.invalidate(session_id)
+                                _record_session_invalidation("guardrail_completion_tokens")
+
+                        # Update session history for non-streaming responses
+                        if session_id and isinstance(body_json, dict) and 'messages' in body_json:
+                            try:
+                                resp_content = response.content.decode('utf-8', errors='replace')
+                                resp_json = json.loads(resp_content) if resp_content else {}
+                                restore_signal_detected = _has_explicit_restore_signal(
+                                    dict(response.headers),
+                                    resp_json if isinstance(resp_json, dict) else None,
+                                )
+                                if session_id and not restore_signal_detected:
+                                    restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
+                                if session_id and not restore_signal_detected:
+                                    restore_signal_detected = _detect_restore_signal_from_log_slice(
+                                        llama_log_path,
+                                        llama_log_offset,
+                                    )
+                                if restore_signal_detected:
+                                    _record_restore_success()
+                                await session_manager.set_restore_confirmed(session_id, restore_signal_detected)
+                                assistant_content = _extract_assistant_content(resp_json)
+                                existing_messages = []
+                                if is_delta_request and delta_messages:
+                                    session_obj = await session_manager.get(session_id)
+                                    if session_obj:
+                                        existing_messages = list(session_obj.messages)
+                                full_messages = merge_session_history_for_update(
+                                    existing_messages=existing_messages,
+                                    request_messages=list(body_json.get('messages', [])),
+                                    delta_messages=delta_messages,
+                                    is_delta_request=is_delta_request,
+                                    assistant_content=assistant_content,
+                                )
+                                await session_manager.update_messages(session_id, full_messages)
+                            except Exception:
+                                logger.debug(f"Failed to update session {session_id[:8]}... history", exc_info=True)
+
+                        log_response(response.status_code, response.content)
+
+                        # Build response headers with session info
+                        resp_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+                        if session_id:
+                            resp_headers["X-Session-Id"] = session_id
+                            resp_headers["X-Session-Created"] = "true" if session_created else "false"
+                            resp_headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+                            if session_fallback_reason:
+                                resp_headers["X-Session-Fallback-Reason"] = session_fallback_reason
+
+                        return Response(
+                            content=response.content,
+                            status_code=response.status_code,
+                            headers=resp_headers
+                        )
+                finally:
+                    # decrement active queries when non-streaming finishes or failures occur
+                    try:
+                        async with active_queries_lock:
+                            active_queries = max(0, active_queries - 1)
+                    except Exception:
+                        pass
+        except SessionSingleFlightRejected as exc:
+            try:
+                async with active_queries_lock:
+                    active_queries = max(0, active_queries - 1)
+            except Exception:
+                pass
+            payload = {
+                "error": {
+                    "type": "session_single_flight",
+                    "code": "session_single_flight",
+                    "message": "Another request is already active for this session",
+                    "reason": exc.reason,
+                },
+                "status": 429,
+                "session_id": session_id,
+                "mode": single_flight_mode,
+            }
+            return JSONResponse(status_code=429, content=payload)
 
 
 async def proxy_to_remote(
@@ -5153,6 +5452,13 @@ async def admin_metrics():
         "restore_success_total": int(session_restore_observability.get("restore_success_total", 0)),
         "restore_fallback_total": dict(session_restore_observability.get("restore_fallback_total", {})),
         "delta_payload_bytes_total": int(session_restore_observability.get("delta_payload_bytes_total", 0)),
+        "single_flight_metrics": dict(session_single_flight_observability),
+        "guardrail_metrics": {
+            "guardrail_cutoff_total": int(session_guardrail_observability.get("guardrail_cutoff_total", 0)),
+            "guardrail_cutoff_reasons": dict(session_guardrail_observability.get("guardrail_cutoff_reasons", {})),
+            "session_invalidation_total": int(session_guardrail_observability.get("session_invalidation_total", 0)),
+            "session_invalidation_reasons": dict(session_guardrail_observability.get("session_invalidation_reasons", {})),
+        },
         "backend_ready": bool(backend_ready),
         "backend_signals": dict(backend_signal_counts),
     }

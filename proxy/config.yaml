@@ -81,6 +81,14 @@ server:
   llama_request_timeout: 300
   llama_router_mode: true
   max_concurrent_queries: 4
+  session_single_flight_mode: queue
+  session_single_flight_max_queue_depth: 1
+  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_completion_tokens: 2048
+  session_guardrail_repetition_min_pattern_chars: 8
+  session_guardrail_repetition_min_repeats: 4
+  session_guardrail_invalidate_on_cutoff: true
+  session_require_restore_signal: false
   backend_retry_attempts: 3
   backend_retry_base_delay_seconds: 0.25
   backend_retry_max_delay_seconds: 2.0
