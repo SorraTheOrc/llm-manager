@@ -684,10 +684,32 @@ class TestSlotPersistenceHelpers:
         monkeypatch.setattr(server, "_http_client", mock_client)
 
         filename = tmp_path / "slot_session.bin"
-        ok = await server._call_slot_endpoint(1234, 2, "save", str(filename), timeout=1.0)
+        ok = await server._call_slot_endpoint(
+            1234,
+            2,
+            "save",
+            str(filename),
+            timeout=1.0,
+            model="Qwen3",
+        )
 
         assert ok is True
         mock_client.post.assert_awaited_once()
         args, kwargs = mock_client.post.call_args
         assert args[0] == "http://localhost:1234/slots/2?action=save"
         assert kwargs["json"]["filename"] == "slot_session.bin"
+        assert kwargs["json"]["model"] == "Qwen3"
+
+    def test_resolve_slot_model_name_in_router_mode(self):
+        from proxy import server
+
+        server.config = server.load_config()
+        resolved = server._resolve_slot_model_name("qwen3", None, {"llama_router_mode": True})
+        assert resolved == "Qwen3"
+
+    def test_resolve_slot_model_name_uses_current_model_when_missing(self):
+        from proxy import server
+
+        server.config = server.load_config()
+        resolved = server._resolve_slot_model_name(None, "Qwen3", {"llama_router_mode": True})
+        assert resolved == "Qwen3"

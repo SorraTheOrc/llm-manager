@@ -281,11 +281,14 @@ async def _call_slot_endpoint(
     action: str,
     filename: str,
     timeout: float,
+    model: Optional[str] = None,
 ) -> bool:
     if not filename:
         return False
     url = f"http://localhost:{llama_port}/slots/{slot_id}?action={action}"
     payload = {"filename": Path(filename).name}
+    if model:
+        payload["model"] = model
     client = _http_client if _http_client else httpx.AsyncClient(timeout=timeout)
     try:
         response = await client.post(url, json=payload, timeout=timeout)
@@ -306,13 +309,21 @@ async def _restore_slot_snapshot(
     slot_id: int,
     filename: str,
     timeout: float,
+    model: Optional[str] = None,
 ) -> bool:
     try:
         if not Path(filename).exists():
             return False
     except Exception:
         return False
-    return await _call_slot_endpoint(llama_port, slot_id, "restore", filename, timeout)
+    return await _call_slot_endpoint(
+        llama_port,
+        slot_id,
+        "restore",
+        filename,
+        timeout,
+        model=model,
+    )
 
 
 async def _save_slot_snapshot(
@@ -320,8 +331,16 @@ async def _save_slot_snapshot(
     slot_id: int,
     filename: str,
     timeout: float,
+    model: Optional[str] = None,
 ) -> bool:
-    return await _call_slot_endpoint(llama_port, slot_id, "save", filename, timeout)
+    return await _call_slot_endpoint(
+        llama_port,
+        slot_id,
+        "save",
+        filename,
+        timeout,
+        model=model,
+    )
 
 
 # Health/readiness signal for local backend
@@ -1493,6 +1512,23 @@ def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
     return None
 
 
+def _resolve_slot_model_name(
+    requested_model: Optional[str],
+    current_model: Optional[str],
+    server_config: dict,
+) -> Optional[str]:
+    """Resolve the llama model name used for slot endpoints in router mode."""
+    candidate = requested_model or current_model
+    if not candidate:
+        return None
+    if server_config.get("llama_router_mode", False):
+        try:
+            return get_local_model_name(candidate) or candidate
+        except HTTPException:
+            return candidate
+    return candidate
+
+
 async def wait_for_llama_server(timeout: int = 300) -> bool:
     """Wait for llama-server to be ready."""
     server_config = config.get("server", {})
@@ -2240,20 +2276,24 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # determine model for token attribution (fallback to current_model)
     model_name = None
     try:
-        model_name = body_json.get('model')
+        model_name = body_json.get("model")
     except Exception:
         model_name = None
     if not model_name:
         model_name = current_model
 
+    slot_model_name = _resolve_slot_model_name(model_name, current_model, server_config)
+
     # If router mode is enabled, translate model aliases to llama preset ids
     if server_config.get("llama_router_mode", False) and isinstance(body_json, dict):
-        requested = body_json.get("model")
-        if requested:
-            llama_model = get_local_model_name(requested)
-            if llama_model and llama_model != requested:
-                body_json["model"] = llama_model
-                body = json.dumps(body_json).encode("utf-8")
+        if slot_model_name and body_json.get("model") != slot_model_name:
+            body_json["model"] = slot_model_name
+            body = json.dumps(body_json).encode("utf-8")
+
+    if slot_model_name:
+        model_name = slot_model_name
+
+    slot_model_payload = slot_model_name if server_config.get("llama_router_mode", False) else None
 
     single_flight_mode = server_config.get("session_single_flight_mode", "queue")
     single_flight_max_queue_depth = int(
@@ -2282,7 +2322,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if path == "v1/chat/completions" or path.endswith("chat/completions"):
         try:
             # Determine model name for slot query
-            slot_model = model_name or current_model or "Qwen3"
+            slot_model = slot_model_name or model_name or current_model or "Qwen3"
             slots_url = f"http://localhost:{llama_port}/slots?model={slot_model}"
             client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
             slots_resp = await client.get(slots_url, timeout=5.0)
@@ -2371,6 +2411,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             slot_id,
                             slot_filename,
                             slot_timeout,
+                            model=slot_model_payload,
                         )
                         if restored:
                             logger.info(
@@ -2626,6 +2667,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 slot_id,
                                 slot_filename,
                                 slot_timeout,
+                                model=slot_model_payload,
                             )
                             if saved:
                                 logger.info(
@@ -2689,6 +2731,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             slot_id,
                             slot_filename,
                             slot_timeout,
+                            model=slot_model_payload,
                         )
                         if restored:
                             logger.info(
@@ -2784,6 +2827,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     slot_id,
                                     slot_filename,
                                     slot_timeout,
+                                    model=slot_model_payload,
                                 )
                                 if saved:
                                     logger.info(
