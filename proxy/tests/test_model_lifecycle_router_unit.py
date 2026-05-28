@@ -104,10 +104,10 @@ async def test_create_embeddings_schedules_background_load_when_not_loaded(monke
     body = json.dumps({"model": "embeddings", "input": "hello"}).encode('utf-8')
     req = DummyRequest(body)
 
-    with pytest.raises(HTTPException) as excinfo:
-        await server.create_embeddings(req)
+    resp = await server.create_embeddings(req)
 
-    assert excinfo.value.status_code == 503
+    assert isinstance(resp, Response)
+    assert resp.status_code == 503
     assert scheduled.get('model') in ("embeddings", "mxbai-embed")
 
 
@@ -207,6 +207,34 @@ async def test_ensure_model_loaded_refcount_and_loading_state(monkeypatch, mock_
     # After completion the refcount should be decremented to zero
     assert getattr(server, 'model_switch_refcount', 0) == 0
     assert server.current_model == 'mxbai-embed'
+
+
+@pytest.mark.asyncio
+async def test_router_is_model_loaded_treats_presence_without_status_as_loaded(monkeypatch):
+    """router_is_model_loaded should treat present model entries as loaded when status metadata is absent."""
+
+    monkeypatch.setattr(
+        server,
+        'router_list_models',
+        AsyncMock(return_value={"data": [{"id": "Qwen3"}]}),
+    )
+
+    ok = await server.router_is_model_loaded("Qwen3")
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_router_is_model_loaded_respects_non_loaded_status(monkeypatch):
+    """router_is_model_loaded should return False when status explicitly says not loaded."""
+
+    monkeypatch.setattr(
+        server,
+        'router_list_models',
+        AsyncMock(return_value={"data": [{"id": "Qwen3", "status": {"value": "loading"}}]}),
+    )
+
+    ok = await server.router_is_model_loaded("Qwen3")
+    assert ok is False
 
 
 @pytest.mark.asyncio

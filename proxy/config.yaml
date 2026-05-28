@@ -65,6 +65,7 @@ models:
     - qwen3*
     - Qwen3*
     llama_model: Qwen3
+    force_full_prompt: true
     type: local
 server:
   distrobox_name: llama
@@ -80,7 +81,24 @@ server:
   llama_models_max: 2
   llama_request_timeout: 300
   llama_router_mode: true
-  max_concurrent_queries: 8
+  max_concurrent_queries: 4
+  session_single_flight_mode: queue
+  session_single_flight_max_queue_depth: 1
+  session_slot_save_path: /home/rgardler/projects/llm/slot-cache
+  session_slot_pool_size: 1
+  session_slot_timeout_seconds: 3.0
+  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_completion_tokens: 2048
+  session_guardrail_repetition_min_pattern_chars: 64
+  session_guardrail_repetition_min_repeats: 10
+  session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
+  session_require_restore_signal: false
+  backend_retry_attempts: 3
+  backend_retry_base_delay_seconds: 0.25
+  backend_retry_max_delay_seconds: 2.0
+  backend_retry_jitter_ratio: 0.25
+  llama_watchdog_interval_seconds: 5
   llama_router_preload:
   - embeddings
   - Qwen3

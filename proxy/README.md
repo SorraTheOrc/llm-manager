@@ -114,6 +114,18 @@ server:
   distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
   llama_startup_timeout: 300
+  session_single_flight_mode: "queue"
+  session_single_flight_max_queue_depth: 1
+  session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
+  session_slot_pool_size: 1
+  session_slot_timeout_seconds: 3.0
+  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_completion_tokens: 2048
+  session_guardrail_repetition_min_pattern_chars: 64
+  session_guardrail_repetition_min_repeats: 10
+  session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
+  session_require_restore_signal: false
 
 # Default model to load on startup
 # Set the default to `gemma4` in examples and docs; other models (e.g., `gpt120`) remain available.
@@ -131,6 +143,7 @@ models:
   qwen3:
     type: "local"
     llama_model: "qwen3"
+    force_full_prompt: true  # Disable delta routing for this model
     aliases:
       - "qwen3"
       - "qwen3-coder"
@@ -262,8 +275,16 @@ Response:
 ```json
 {
   "status": "healthy",
+  "ready": true,
   "current_model": "qwen3",
-  "llama_server_running": true
+  "llama_server_running": true,
+  "backend_signals": {
+    "connect_failures": 0,
+    "read_failures": 0,
+    "timeout_failures": 0,
+    "other_failures": 0,
+    "concurrency_rejects": 0
+  }
 }
 ```
 
@@ -340,21 +361,35 @@ Resets in-memory request/token counters and triggers immediate persistence.
 
 ## Session-Based Incremental Ingestion
 
-The proxy supports session-based incremental prompt ingestion to reduce CPU usage and latency for multi-turn conversations. When a session is established, the proxy tracks per-session message history and forwards only new messages on subsequent requests, leveraging llama-server's KV cache.
+The proxy supports session-based incremental prompt ingestion to reduce CPU usage and latency for multi-turn conversations.
+
+### Strict restore policy (important)
+
+Delta routing is only gated on explicit backend restore evidence when `server.session_require_restore_signal` is enabled. The default configuration (`false`) favors optimistic delta forwarding while still invalidating on history mismatch.
+
+- If restore evidence is missing in API headers/body, the proxy performs compatibility checks against llama-server logs:
+  - session-specific restore phrases when available, and
+  - restore markers (`restored context checkpoint`, `load_session`, etc.) that appear in log lines appended during the active request window.
+- If neither API nor log evidence is found and strict restore is enabled, the proxy sends the full prompt and sets `X-Session-Fallback-Reason: missing_restore_signal`.
+- If message history was edited, the proxy invalidates the session and falls back with `X-Session-Fallback-Reason: history_mismatch`.
+- When no previous history exists, requests are full-ingestion by design.
 
 ### How It Works
 
-1. Client sends a chat completion request with an `X-Session-Id` header (or without one, in which case the proxy generates a UUID v4 session ID).
-2. The proxy tracks the message history for each session.
-3. On subsequent requests with the same session ID, the proxy computes the delta (new messages) and forwards only the delta to llama-server, along with `session_id` and `cache_prompt` fields to reuse the KV cache.
-4. The proxy returns `X-Session-Id`, `X-Session-Created`, and `X-Session-Delta` response headers.
-5. Sessions expire after 3 hours of inactivity and are automatically cleaned up.
+1. Client sends a chat completion request with an `X-Session-Id` header (preferred), or one of the compatible headers `session_id`, `X-Client-Request-Id`, or `X-Session-Affinity` (the proxy generates a UUID v4 if none are present).
+2. The proxy tracks full message history for each session.
+3. For subsequent requests, the proxy computes a delta against prior history.
+4. The proxy forwards delta messages **only** when strict restore confirmation has been observed for that session; otherwise it forwards the full prompt.
+5. The proxy returns `X-Session-Id`, `X-Session-Created`, `X-Session-Delta`, and (when applicable) `X-Session-Fallback-Reason`.
+6. Sessions expire after 3 hours of inactivity and are automatically cleaned up.
 
 ### Limitations
 
+- **KV cache ownership**: The proxy never stores or mutates KV tensors; llama-server owns the cache. The proxy only passes session metadata and deltas so llama-server can restore/cache internally.
 - **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
 - **Context window limits**: llama-server's KV cache has finite capacity. Very long conversations may exceed the context window.
 - **Ephemeral sessions**: Sessions are held in memory and are lost when the proxy restarts. Cross-restart persistence is not supported in this version.
+- **Per-model delta disable**: Set `force_full_prompt: true` (or `disable_delta: true`) in a model config to always send full history. Use this for models that force full prompt reprocessing (SWA/hybrid/recurrent cache behavior).
 
 ### Using Sessions
 
@@ -378,7 +413,7 @@ response = httpx.post(
 session_id = response.headers.get("x-session-id")
 print(f"Session ID: {session_id}")
 
-# Next turn - include X-Session-Id header
+# Next turn - include X-Session-Id header (or session_id/X-Client-Request-Id)
 response2 = httpx.post(
     "http://localhost:8000/v1/chat/completions",
     json={
@@ -449,16 +484,79 @@ curl -X DELETE http://localhost:8000/admin/sessions/<session-id>
 
 ### Session Metrics
 
-Session metrics are available on the `/admin/metrics` endpoint:
+Session and restore metrics are available on `/admin/metrics`:
 
 ```bash
-curl http://localhost:8000/admin/metrics | jq '.session_metrics'
+curl http://localhost:8000/admin/metrics
 ```
 
-Returns:
-- `sessions_active`: Number of currently active sessions
-- `sessions_created_total`: Total sessions created since proxy started
-- `sessions_expired_total`: Total sessions expired since proxy started
+Important fields:
+- `session_metrics.sessions_active`
+- `session_metrics.sessions_created_total`
+- `session_metrics.sessions_expired_total`
+- `restore_success_total`
+- `restore_fallback_total` (per-reason map, e.g. `missing_restore_signal`, `history_mismatch`)
+- `delta_payload_bytes_total`
+- `single_flight_metrics` (queue/reject/active session counters)
+- `guardrail_metrics` (cutoff + invalidation counters)
+- `backend_ready`
+- `backend_signals`
+
+### Single-flight + guardrails
+
+The proxy enforces **per-session single-flight** by default. Only one in-flight
+request per session is allowed; additional requests are queued or rejected based
+on config.
+
+Config keys:
+- `server.session_single_flight_mode` — `queue` (default) or `reject`
+- `server.session_single_flight_max_queue_depth` — max waiting requests per session
+
+Guardrails stop runaway responses and invalidate sessions when configured:
+- `server.session_guardrail_max_runtime_seconds` — cutoff streaming after N seconds
+- `server.session_guardrail_max_completion_tokens` — cutoff on excessive output
+- `server.session_guardrail_repetition_min_pattern_chars` — repetition pattern length
+- `server.session_guardrail_repetition_min_repeats` — repetition count to trigger cutoff
+- `server.session_guardrail_invalidate_on_cutoff` — invalidate session after runtime/token cutoff
+- `server.session_guardrail_invalidate_on_repetition` — invalidate session after repetition cutoff
+
+When a guardrail triggers, `/admin/metrics` exposes `guardrail_metrics` with the
+cutoff reason and invalidation counters for observability.
+
+### Slot persistence (KV save/restore)
+
+To avoid llama-server invalidating KV checkpoints between turns, the proxy can
+restore and save slot snapshots on each request. This requires llama-server to
+run with `--slot-save-path` pointing at the same path.
+
+Config keys:
+- `server.session_slot_save_path` — directory for slot snapshot files
+- `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
+- `server.session_slot_timeout_seconds` — timeout for save/restore calls
+
+The proxy restores the slot before each request and saves it after the response.
+To avoid slot mismatches, keep `session_slot_pool_size` aligned with
+llama-server's `--parallel` setting; for single-slot debugging set both to 1.
+If a session is invalidated (history mismatch or guardrail), the slot file is
+removed to avoid stale restores. Ensure llama-server is launched with
+`--slot-save-path` (see `start-llama.sh` / `models.ini`) and, for SWA/hybrid
+models, `--swa-full` to prevent checkpoint invalidation.
+
+### Operator verification checklist
+
+Use these steps to validate strict restore behavior in your environment:
+
+1. Start a chat request without `X-Session-Id`; capture returned `X-Session-Id`.
+2. Repeat with the same session id and appended messages.
+3. Check headers:
+   - `X-Session-Delta: true` indicates delta forwarding.
+   - `X-Session-Delta: false` plus `X-Session-Fallback-Reason` explains fallback.
+4. If fallback is `missing_restore_signal`, inspect llama-server logs for session-specific restore lines (for example phrases containing `load_session` and the same session id).
+5. Check `/admin/metrics`:
+   - `restore_success_total` increases when backend restore evidence is observed.
+   - `restore_fallback_total` increments by reason when strict policy blocks delta.
+   - `delta_payload_bytes_total` grows only when delta forwarding is used.
+6. Confirm payload reduction over repeated turns (target baseline >=30% reduction for representative conversations).
 
 ## Prometheus metrics
 
@@ -502,6 +600,44 @@ If loading fails, the proxy returns HTTP 503 with a `Retry-After` header:
 ```
 
 Clients should handle this by retrying after the specified delay.
+
+### Crash-path safeguards
+
+The proxy now adds bounded backend retries for transient local transport failures
+(connect/read/timeout). Retry behavior is controlled by:
+
+- `server.backend_retry_attempts`
+- `server.backend_retry_base_delay_seconds`
+- `server.backend_retry_max_delay_seconds`
+- `server.backend_retry_jitter_ratio`
+
+Concurrency pressure is controlled by `server.max_concurrent_queries` (default 4).
+When the guard rejects a request, the proxy returns a 503 and increments
+`backend_signals.concurrency_rejects`.
+
+A watchdog loop monitors the child llama-server process. If the process exits,
+health switches to `degraded`, backend readiness is gated to `ready: false`, and
+router mode attempts a best-effort restart.
+
+#### Fault-injection validation (reproducible)
+
+Run the crash-path repro script:
+
+```bash
+cd proxy
+./scripts/fault-injection-backend-crash.sh
+```
+
+Artifacts are written under `proxy/logs/fault-injection/run-<timestamp>/`.
+Expected triage signatures include:
+
+- `backend_retry path=... signal=connect_failures|read_failures|timeout_failures`
+- `concurrency_reject active=... max=...`
+- `watchdog detected llama-server exit code=...`
+- `watchdog router restart backend_ready=...`
+
+Use `/health` and `/admin/metrics` snapshots from the run directory to verify
+readiness transitions and backend signal counters.
 
 ### Router Mode (Multi-Model)
 

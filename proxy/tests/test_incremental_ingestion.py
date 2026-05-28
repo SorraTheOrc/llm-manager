@@ -1,6 +1,6 @@
 """Tests for session-based incremental prompt ingestion.
 
-Tests verify that the proxy correctly handles X-Session-Id headers,
+Tests verify that the proxy correctly handles session headers,
 computes message deltas, and falls back to full history when needed.
 These tests use mocked llama-server responses to validate behavior
 without requiring a running llama-server instance.
@@ -8,6 +8,7 @@ without requiring a running llama-server instance.
 
 import asyncio
 import json
+import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -81,6 +82,15 @@ class TestDeltaComputationIntegration:
         assert len(delta) == 2
         assert delta[0]["content"] == "Tell me about sessions."
 
+        metrics = session_manager.compute_delta_metrics(session.messages, extended_messages)
+        assert metrics["reduction_percent"] >= 30.0
+        assert metrics["full_payload_bytes"] > metrics["delta_payload_bytes"]
+        # Diagnostic-only latency capture: informational, not pass/fail gated.
+        start = asyncio.get_event_loop().time()
+        _ = session_manager.compute_delta_metrics(session.messages, extended_messages)
+        elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000.0
+        assert elapsed_ms >= 0
+
     @pytest.mark.asyncio
     async def test_edited_message_invalidates_session(self, session_manager, sample_messages):
         """If the user edits an earlier message, the session is invalidated."""
@@ -133,7 +143,7 @@ class TestDeltaComputationIntegration:
 # ---------------------------------------------------------------------------
 
 class TestSessionHeaderHandling:
-    """Test that X-Session-Id header is extracted and processed correctly."""
+    """Test that session headers are extracted and processed correctly."""
 
     def test_extract_session_id_from_header(self):
         """Test extracting session ID from request headers."""
@@ -141,6 +151,56 @@ class TestSessionHeaderHandling:
         mgr = SessionManager()
         # A None session ID should generate a UUID
         assert mgr.active_session_count == 0
+
+    def test_resolve_session_id_header_prefers_explicit_session_id(self):
+        from proxy.server import _resolve_session_id_header
+
+        headers = {
+            "x-session-id": "primary-session",
+            "session_id": "fallback-session",
+            "x-client-request-id": "client-session",
+            "x-session-affinity": "affinity-session",
+        }
+        session_id, source = _resolve_session_id_header(headers)
+        assert session_id == "primary-session"
+        assert source == "x-session-id"
+
+    def test_resolve_session_id_header_falls_back_to_client_request_id(self):
+        from proxy.server import _resolve_session_id_header
+
+        headers = {
+            "x-client-request-id": "client-session",
+            "x-session-affinity": "affinity-session",
+        }
+        session_id, source = _resolve_session_id_header(headers)
+        assert session_id == "client-session"
+        assert source == "x-client-request-id"
+
+    def test_resolve_session_id_header_uses_affinity_as_last_resort(self):
+        from proxy.server import _resolve_session_id_header
+
+        headers = {
+            "x-session-affinity": "affinity-session",
+        }
+        session_id, source = _resolve_session_id_header(headers)
+        assert session_id == "affinity-session"
+        assert source == "x-session-affinity"
+
+    def test_log_session_header_resolution_with_header(self, caplog):
+        from proxy.server import _log_session_header_resolution
+
+        caplog.set_level(logging.INFO, logger="llama-proxy")
+        _log_session_header_resolution("primary-session", "x-session-id")
+        assert "Session header resolved" in caplog.text
+        assert "source=x-session-id" in caplog.text
+        assert "session=primary-" in caplog.text
+
+    def test_log_session_header_resolution_without_header(self, caplog):
+        from proxy.server import _log_session_header_resolution
+
+        caplog.set_level(logging.INFO, logger="llama-proxy")
+        _log_session_header_resolution(None, None)
+        assert "No session header provided" in caplog.text
 
     @pytest.mark.asyncio
     async def test_session_id_echo_response(self, session_manager):
@@ -154,10 +214,147 @@ class TestSessionHeaderHandling:
         assert created2 is False
         assert session2.session_id == "my-client-session"
 
+    def test_force_full_prompt_config(self):
+        from proxy.server import _should_force_full_prompt
+
+        assert _should_force_full_prompt({"force_full_prompt": True}) is True
+        assert _should_force_full_prompt({"disable_delta": True}) is True
+        assert _should_force_full_prompt({"force_full_prompt": False}) is False
+        assert _should_force_full_prompt(None) is False
+
 
 # ---------------------------------------------------------------------------
 # Assistant content extraction
 # ---------------------------------------------------------------------------
+
+class TestRestoreContract:
+    """Strict restore signal contract tests."""
+
+    def test_classify_delta_routing_requires_restore_signal(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+        )
+        assert use_delta is False
+        assert reason == "missing_restore_signal"
+
+    def test_classify_delta_routing_allows_delta_when_signal_confirmed(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=True,
+        )
+        assert use_delta is True
+        assert reason is None
+
+    def test_classify_delta_routing_allows_delta_when_restore_signal_not_required(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+            require_restore_signal=False,
+        )
+        assert use_delta is True
+        assert reason is None
+
+    def test_classify_delta_routing_respects_force_full_prompt(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=True,
+            force_full_prompt=True,
+        )
+        assert use_delta is False
+        assert reason == "delta_disabled"
+
+    def test_has_explicit_restore_signal_positive_and_negative(self):
+        from proxy.server import _has_explicit_restore_signal
+
+        assert _has_explicit_restore_signal(
+            {"X-Llama-Session-Restored": "true"},
+            None,
+        ) is True
+        assert _has_explicit_restore_signal({}, {"session_restored": True}) is True
+        # Regression guard: history match without explicit signal is not restore success.
+        assert _has_explicit_restore_signal({}, {"session_restored": False}) is False
+
+    def test_detect_restore_signal_from_llama_log_matches_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "INFO slot update\n"
+            "INFO slot load_session: loading KV cache for session_id=abc-123\n"
+        )
+
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_detect_restore_signal_from_llama_log_requires_signal_and_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO slot update without restore\n")
+
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+    def test_detect_restore_signal_from_log_slice(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("before\n")
+        start_offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot update_slots restored context checkpoint\n")
+
+        assert _detect_restore_signal_from_log_slice(log_file, start_offset) is True
+
+    def test_detect_restore_signal_from_log_slice_negative(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("before\n")
+        start_offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot update_slots normal processing\n")
+
+        assert _detect_restore_signal_from_log_slice(log_file, start_offset) is False
+
+
+class TestRestoreObservability:
+    """Observability counters for strict restore behavior."""
+
+    def test_restore_observability_counters(self):
+        from proxy.server import (
+            session_restore_observability,
+            _record_restore_success,
+            _record_restore_fallback,
+            _record_delta_payload_bytes,
+        )
+
+        session_restore_observability["restore_success_total"] = 0
+        session_restore_observability["restore_fallback_total"] = {}
+        session_restore_observability["delta_payload_bytes_total"] = 0
+
+        _record_restore_success()
+        _record_restore_fallback("missing_restore_signal")
+        _record_restore_fallback("missing_restore_signal")
+        _record_restore_fallback("history_mismatch")
+        _record_delta_payload_bytes(123)
+
+        assert session_restore_observability["restore_success_total"] == 1
+        assert session_restore_observability["restore_fallback_total"]["missing_restore_signal"] == 2
+        assert session_restore_observability["restore_fallback_total"]["history_mismatch"] == 1
+        assert session_restore_observability["delta_payload_bytes_total"] == 123
+
 
 class TestContentExtraction:
     """Test extracting assistant content from responses."""
@@ -291,3 +488,347 @@ class TestSessionDeltaFlow:
         delta, matches = mgr.compute_delta(session_new.messages, edited_msgs)
         assert matches is True
         assert delta == edited_msgs
+
+
+# ---------------------------------------------------------------------------
+# Proxy stabilization helpers
+# ---------------------------------------------------------------------------
+
+class TestSessionSingleFlightCoordinator:
+    @pytest.mark.asyncio
+    async def test_queue_mode_serializes_same_session_requests(self):
+        from proxy.server import SessionSingleFlightCoordinator
+
+        coordinator = SessionSingleFlightCoordinator()
+        active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+
+        async def worker():
+            nonlocal active, max_active
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=8):
+                async with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                async with lock:
+                    active -= 1
+
+        await asyncio.gather(worker(), worker(), worker())
+        assert max_active == 1
+
+        metrics = coordinator.metrics_snapshot()
+        assert metrics["queue_events_total"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_reject_mode_rejects_second_inflight_request(self):
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+
+        coordinator = SessionSingleFlightCoordinator()
+
+        async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
+            with pytest.raises(SessionSingleFlightRejected) as excinfo:
+                async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
+                    pass
+
+        assert excinfo.value.reason == "active_inflight"
+        metrics = coordinator.metrics_snapshot()
+        assert metrics["reject_events_total"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_enforces_queue_depth(self):
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+
+        coordinator = SessionSingleFlightCoordinator()
+        first_entered = asyncio.Event()
+        first_release = asyncio.Event()
+
+        async def first_request():
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
+                first_entered.set()
+                await first_release.wait()
+
+        async def second_request():
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
+                return "ok"
+
+        first_task = asyncio.create_task(first_request())
+        await first_entered.wait()
+
+        queued_task = asyncio.create_task(second_request())
+        await asyncio.sleep(0.01)
+
+        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+            async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
+                pass
+
+        assert excinfo.value.reason == "queue_full"
+
+        first_release.set()
+        await first_task
+        assert await queued_task == "ok"
+
+
+class TestStreamGuardrails:
+    def test_repetition_detection_triggers_for_pathological_output(self):
+        from proxy.server import _should_cutoff_for_repetition
+
+        repeated_text = "abc123" * 20
+        assert _should_cutoff_for_repetition(
+            repeated_text,
+            min_pattern_chars=6,
+            min_repeats=4,
+        ) is True
+
+    def test_repetition_detection_requires_consecutive_suffix(self):
+        from proxy.server import _should_cutoff_for_repetition
+
+        repeated_text = ("abc123" * 3) + "xyz"
+        assert _should_cutoff_for_repetition(
+            repeated_text,
+            min_pattern_chars=6,
+            min_repeats=3,
+        ) is False
+
+    def test_repetition_detection_ignores_healthy_output(self):
+        from proxy.server import _should_cutoff_for_repetition
+
+        healthy_text = "This response uses varied words and does not loop over a fixed suffix."
+        assert _should_cutoff_for_repetition(
+            healthy_text,
+            min_pattern_chars=6,
+            min_repeats=4,
+        ) is False
+
+    def test_extract_delta_text_from_sse_chunk_ignores_wrapper(self):
+        from proxy.server import _extract_delta_text_from_sse_chunk
+
+        wrapper_only = 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n'
+        assert _extract_delta_text_from_sse_chunk(wrapper_only) == ""
+
+        mixed = (
+            'data: {"choices":[{"delta":{"reasoning_content":"Think"}}]}\n'
+            'data: {"choices":[{"delta":{"content":"Hello"}}]}\n'
+        )
+        assert _extract_delta_text_from_sse_chunk(mixed) == "ThinkHello"
+
+    def test_guardrail_evaluation_prioritizes_runtime_then_length_then_repetition(self):
+        from proxy.server import evaluate_stream_guardrail
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=11.0,
+                completion_tokens=20,
+                response_text="healthy",
+                max_runtime_seconds=10.0,
+                max_completion_tokens=100,
+                repetition_min_pattern_chars=8,
+                repetition_min_repeats=4,
+            )
+            == "runtime"
+        )
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=120,
+                response_text="healthy",
+                max_runtime_seconds=10.0,
+                max_completion_tokens=100,
+                repetition_min_pattern_chars=8,
+                repetition_min_repeats=4,
+            )
+            == "completion_tokens"
+        )
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=20,
+                response_text=("loopfore" * 6),
+                max_runtime_seconds=10.0,
+                max_completion_tokens=100,
+                repetition_min_pattern_chars=8,
+                repetition_min_repeats=4,
+            )
+            == "repetition"
+        )
+
+    def test_guardrail_invalidation_respects_repetition_override(self):
+        from proxy.server import _should_invalidate_on_guardrail
+
+        assert _should_invalidate_on_guardrail(
+            "repetition",
+            invalidate_on_cutoff=True,
+            invalidate_on_repetition=False,
+        ) is False
+        assert _should_invalidate_on_guardrail(
+            "repetition",
+            invalidate_on_cutoff=False,
+            invalidate_on_repetition=True,
+        ) is True
+
+    def test_guardrail_invalidation_defaults_to_cutoff(self):
+        from proxy.server import _should_invalidate_on_guardrail
+
+        assert _should_invalidate_on_guardrail(
+            "runtime",
+            invalidate_on_cutoff=True,
+            invalidate_on_repetition=False,
+        ) is True
+        assert _should_invalidate_on_guardrail(
+            "completion_tokens",
+            invalidate_on_cutoff=False,
+            invalidate_on_repetition=True,
+        ) is False
+        assert _should_invalidate_on_guardrail(
+            None,
+            invalidate_on_cutoff=True,
+            invalidate_on_repetition=True,
+        ) is False
+
+
+class TestSessionHistoryIntegrityHelpers:
+    def test_merge_session_history_preserves_existing_and_delta_without_duplicates(self):
+        from proxy.server import merge_session_history_for_update
+
+        existing = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        delta = [{"role": "user", "content": "next question"}]
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing,
+            request_messages=[],
+            delta_messages=delta,
+            is_delta_request=True,
+            assistant_content=None,
+        )
+
+        assert merged == existing + delta
+
+    def test_merge_session_history_appends_assistant_content_once(self):
+        from proxy.server import merge_session_history_for_update
+
+        request_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+
+        merged = merge_session_history_for_update(
+            existing_messages=[],
+            request_messages=request_messages,
+            delta_messages=None,
+            is_delta_request=False,
+            assistant_content="hello",
+        )
+
+        assert merged[-1] == {"role": "assistant", "content": "hello"}
+        assert merged.count({"role": "assistant", "content": "hello"}) == 1
+
+    def test_merge_session_history_with_delta_and_assistant(self):
+        from proxy.server import merge_session_history_for_update
+
+        existing_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        delta_messages = [{"role": "user", "content": "next"}]
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing_messages,
+            request_messages=[],
+            delta_messages=delta_messages,
+            is_delta_request=True,
+            assistant_content="assistant reply",
+        )
+
+        assert merged == existing_messages + delta_messages + [{"role": "assistant", "content": "assistant reply"}]
+
+    def test_merge_session_history_avoids_duplicate_assistant(self):
+        from proxy.server import merge_session_history_for_update
+
+        existing_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "assistant", "content": "assistant reply"},
+        ]
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing_messages,
+            request_messages=existing_messages,
+            delta_messages=None,
+            is_delta_request=False,
+            assistant_content="assistant reply",
+        )
+
+        assert merged == existing_messages
+
+
+class TestSlotPersistenceHelpers:
+    def test_slot_id_for_session_is_deterministic(self):
+        from proxy.server import _slot_id_for_session
+
+        slot_id = _slot_id_for_session("session-123", 4)
+        assert slot_id == _slot_id_for_session("session-123", 4)
+        assert slot_id in range(4)
+
+    def test_slot_id_for_session_single_slot(self):
+        from proxy.server import _slot_id_for_session
+
+        assert _slot_id_for_session("session-123", 1) == 0
+
+    def test_slot_id_for_session_returns_none_when_pool_invalid(self):
+        from proxy.server import _slot_id_for_session
+
+        assert _slot_id_for_session("session-123", 0) is None
+        assert _slot_id_for_session("session-123", -1) is None
+
+    def test_slot_filename_for_session_sanitizes_id(self, tmp_path):
+        from proxy.server import _slot_filename_for_session
+
+        filename = _slot_filename_for_session("session:123/abc", tmp_path)
+        assert str(tmp_path) in filename
+        assert "session_123_abc" in filename
+
+    @pytest.mark.asyncio
+    async def test_call_slot_endpoint_uses_action_query_and_basename(self, tmp_path, monkeypatch):
+        from proxy import server
+
+        response = MagicMock()
+        response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=response)
+        monkeypatch.setattr(server, "_http_client", mock_client)
+
+        filename = tmp_path / "slot_session.bin"
+        ok = await server._call_slot_endpoint(
+            1234,
+            2,
+            "save",
+            str(filename),
+            timeout=1.0,
+            model="Qwen3",
+        )
+
+        assert ok is True
+        mock_client.post.assert_awaited_once()
+        args, kwargs = mock_client.post.call_args
+        assert args[0] == "http://localhost:1234/slots/2?action=save"
+        assert kwargs["json"]["filename"] == "slot_session.bin"
+        assert kwargs["json"]["model"] == "Qwen3"
+
+    def test_resolve_slot_model_name_in_router_mode(self):
+        from proxy import server
+
+        server.config = server.load_config()
+        resolved = server._resolve_slot_model_name("qwen3", None, {"llama_router_mode": True})
+        assert resolved == "Qwen3"
+
+    def test_resolve_slot_model_name_uses_current_model_when_missing(self):
+        from proxy import server
+
+        server.config = server.load_config()
+        resolved = server._resolve_slot_model_name(None, "Qwen3", {"llama_router_mode": True})
+        assert resolved == "Qwen3"

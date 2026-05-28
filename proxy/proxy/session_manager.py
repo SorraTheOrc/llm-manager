@@ -15,6 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+import json
 
 logger = logging.getLogger("llama-proxy")
 
@@ -34,6 +35,8 @@ class Session:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     # Tracks whether the session has been invalidated (e.g. due to message edit)
     invalidated: bool = False
+    # Set to True after explicit backend restore evidence is observed.
+    restore_confirmed: bool = False
 
     @property
     def age_seconds(self) -> float:
@@ -173,7 +176,7 @@ class SessionManager:
         self,
         existing_messages: List[Dict[str, Any]],
         incoming_messages: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         """Compute the delta (new messages) between existing and incoming.
 
         The incoming message list must start with the same messages as the
@@ -216,6 +219,58 @@ class SessionManager:
         delta = incoming_messages[len(existing_messages) :]
         return delta, True
 
+    def compute_delta_metrics(
+        self,
+        existing_messages: List[Dict[str, Any]],
+        incoming_messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Return deterministic payload metrics for full vs delta ingestion.
+
+        The output is intended for tests/diagnostics and can be used to
+        quantify payload reduction independently from backend restore behavior.
+        """
+        delta_messages, history_matches = self.compute_delta(
+            existing_messages, incoming_messages
+        )
+
+        # Stable JSON serialization for byte-size comparisons.
+        full_payload_bytes = len(
+            json.dumps(incoming_messages, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        delta_payload_bytes = len(
+            json.dumps(delta_messages, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+
+        reduction_ratio = 0.0
+        if full_payload_bytes > 0:
+            reduction_ratio = max(0.0, min(1.0, 1.0 - (delta_payload_bytes / full_payload_bytes)))
+
+        reason: Optional[str] = None
+        mode = "delta"
+        if not history_matches:
+            mode = "full"
+            reason = "history_mismatch"
+            reduction_ratio = 0.0
+        elif not existing_messages:
+            mode = "full"
+            reason = "no_existing_history"
+            reduction_ratio = 0.0
+        elif not delta_messages:
+            mode = "delta"
+            reason = "no_new_messages"
+
+        return {
+            "history_matches": history_matches,
+            "mode": mode,
+            "fallback_reason": reason,
+            "full_payload_bytes": full_payload_bytes,
+            "delta_payload_bytes": delta_payload_bytes,
+            "reduction_ratio": reduction_ratio,
+            "reduction_percent": round(reduction_ratio * 100.0, 2),
+            "delta_message_count": len(delta_messages),
+            "incoming_message_count": len(incoming_messages),
+        }
+
     async def update_messages(
         self,
         session_id: str,
@@ -234,6 +289,16 @@ class SessionManager:
                 return False
             session.messages = list(messages)
             session.message_count = len(messages)
+            session.touch()
+            return True
+
+    async def set_restore_confirmed(self, session_id: str, confirmed: bool) -> bool:
+        """Update strict restore-confirmed state for a session."""
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.restore_confirmed = bool(confirmed)
             session.touch()
             return True
 
@@ -353,4 +418,5 @@ class SessionManager:
             "idle_seconds": round(session.idle_seconds, 1),
             "age_seconds": round(session.age_seconds, 1),
             "invalidated": session.invalidated,
+            "restore_confirmed": session.restore_confirmed,
         }

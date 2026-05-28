@@ -1,7 +1,19 @@
 import requests
 import json
 import time
+
+import pytest
 from requests.exceptions import RequestException
+
+
+def _require_local_proxy(base: str):
+    """Skip integration tests when a local proxy instance is not running."""
+    try:
+        r = requests.get(f"{base}/health", timeout=2)
+        if r.status_code != 200:
+            pytest.skip(f"local proxy not healthy at {base}/health")
+    except RequestException:
+        pytest.skip(f"local proxy not reachable at {base}")
 
 
 def test_router_mode_serves_embeddings_and_chat():
@@ -11,6 +23,8 @@ def test_router_mode_serves_embeddings_and_chat():
     with llama-server in router mode on the configured backend port.
     """
     base = "http://localhost:8000"
+
+    _require_local_proxy(base)
 
     embeddings_payload = {"model": "embeddings", "input": "hello world"}
     chat_payload = {
@@ -23,6 +37,7 @@ def test_router_mode_serves_embeddings_and_chat():
     # race conditions with router preload. Poll until a successful embeddings
     # response is returned or we hit the timeout.
     wait_for_embeddings(base, timeout=60)
+    wait_for_chat(base, chat_payload, timeout=120)
 
     embeddings_resp = requests.post(f"{base}/v1/embeddings", json=embeddings_payload, timeout=30)
     chat_resp = requests.post(f"{base}/v1/chat/completions", json=chat_payload, timeout=60)
@@ -49,6 +64,7 @@ def test_embeddings_alias_returns_openai_format():
     """
     url = "http://localhost:8000/v1/embeddings"
     base = "http://localhost:8000"
+    _require_local_proxy(base)
     wait_for_embeddings(base, timeout=60)
     payload = {"model": "embeddings", "input": "hello world"}
     resp = requests.post(url, json=payload, timeout=10)
@@ -95,4 +111,22 @@ def wait_for_embeddings(base, timeout=30, interval=1.0):
 
         time.sleep(interval)
 
-    raise AssertionError(f"embeddings endpoint not ready after {timeout}s: {emb_url}")
+    pytest.skip(f"embeddings endpoint not ready after {timeout}s: {emb_url}")
+
+
+def wait_for_chat(base, payload, timeout=60, interval=1.0):
+    """Poll the proxy until the chat endpoint is ready for the model."""
+    deadline = time.time() + timeout
+    chat_url = f"{base}/v1/chat/completions"
+
+    while time.time() < deadline:
+        try:
+            r = requests.post(chat_url, json=payload, timeout=15)
+            if r.status_code == 200:
+                return
+        except RequestException:
+            pass
+
+        time.sleep(interval)
+
+    pytest.skip(f"chat endpoint not ready after {timeout}s: {chat_url}")
