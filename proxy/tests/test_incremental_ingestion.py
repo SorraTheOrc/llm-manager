@@ -1,6 +1,6 @@
 """Tests for session-based incremental prompt ingestion.
 
-Tests verify that the proxy correctly handles X-Session-Id headers,
+Tests verify that the proxy correctly handles session headers,
 computes message deltas, and falls back to full history when needed.
 These tests use mocked llama-server responses to validate behavior
 without requiring a running llama-server instance.
@@ -8,6 +8,7 @@ without requiring a running llama-server instance.
 
 import asyncio
 import json
+import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -142,7 +143,7 @@ class TestDeltaComputationIntegration:
 # ---------------------------------------------------------------------------
 
 class TestSessionHeaderHandling:
-    """Test that X-Session-Id header is extracted and processed correctly."""
+    """Test that session headers are extracted and processed correctly."""
 
     def test_extract_session_id_from_header(self):
         """Test extracting session ID from request headers."""
@@ -150,6 +151,56 @@ class TestSessionHeaderHandling:
         mgr = SessionManager()
         # A None session ID should generate a UUID
         assert mgr.active_session_count == 0
+
+    def test_resolve_session_id_header_prefers_explicit_session_id(self):
+        from proxy.server import _resolve_session_id_header
+
+        headers = {
+            "x-session-id": "primary-session",
+            "session_id": "fallback-session",
+            "x-client-request-id": "client-session",
+            "x-session-affinity": "affinity-session",
+        }
+        session_id, source = _resolve_session_id_header(headers)
+        assert session_id == "primary-session"
+        assert source == "x-session-id"
+
+    def test_resolve_session_id_header_falls_back_to_client_request_id(self):
+        from proxy.server import _resolve_session_id_header
+
+        headers = {
+            "x-client-request-id": "client-session",
+            "x-session-affinity": "affinity-session",
+        }
+        session_id, source = _resolve_session_id_header(headers)
+        assert session_id == "client-session"
+        assert source == "x-client-request-id"
+
+    def test_resolve_session_id_header_uses_affinity_as_last_resort(self):
+        from proxy.server import _resolve_session_id_header
+
+        headers = {
+            "x-session-affinity": "affinity-session",
+        }
+        session_id, source = _resolve_session_id_header(headers)
+        assert session_id == "affinity-session"
+        assert source == "x-session-affinity"
+
+    def test_log_session_header_resolution_with_header(self, caplog):
+        from proxy.server import _log_session_header_resolution
+
+        caplog.set_level(logging.INFO, logger="llama-proxy")
+        _log_session_header_resolution("primary-session", "x-session-id")
+        assert "Session header resolved" in caplog.text
+        assert "source=x-session-id" in caplog.text
+        assert "session=primary-" in caplog.text
+
+    def test_log_session_header_resolution_without_header(self, caplog):
+        from proxy.server import _log_session_header_resolution
+
+        caplog.set_level(logging.INFO, logger="llama-proxy")
+        _log_session_header_resolution(None, None)
+        assert "No session header provided" in caplog.text
 
     @pytest.mark.asyncio
     async def test_session_id_echo_response(self, session_manager):
@@ -162,6 +213,14 @@ class TestSessionHeaderHandling:
         session2, created2 = await session_manager.get_or_create("my-client-session")
         assert created2 is False
         assert session2.session_id == "my-client-session"
+
+    def test_force_full_prompt_config(self):
+        from proxy.server import _should_force_full_prompt
+
+        assert _should_force_full_prompt({"force_full_prompt": True}) is True
+        assert _should_force_full_prompt({"disable_delta": True}) is True
+        assert _should_force_full_prompt({"force_full_prompt": False}) is False
+        assert _should_force_full_prompt(None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +263,18 @@ class TestRestoreContract:
         )
         assert use_delta is True
         assert reason is None
+
+    def test_classify_delta_routing_respects_force_full_prompt(self):
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=True,
+            force_full_prompt=True,
+        )
+        assert use_delta is False
+        assert reason == "delta_disabled"
 
     def test_has_explicit_restore_signal_positive_and_negative(self):
         from proxy.server import _has_explicit_restore_signal
@@ -702,6 +773,11 @@ class TestSlotPersistenceHelpers:
         slot_id = _slot_id_for_session("session-123", 4)
         assert slot_id == _slot_id_for_session("session-123", 4)
         assert slot_id in range(4)
+
+    def test_slot_id_for_session_single_slot(self):
+        from proxy.server import _slot_id_for_session
+
+        assert _slot_id_for_session("session-123", 1) == 0
 
     def test_slot_id_for_session_returns_none_when_pool_invalid(self):
         from proxy.server import _slot_id_for_session

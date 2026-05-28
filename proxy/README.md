@@ -117,7 +117,7 @@ server:
   session_single_flight_mode: "queue"
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
-  session_slot_pool_size: 2
+  session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048
@@ -143,6 +143,7 @@ models:
   qwen3:
     type: "local"
     llama_model: "qwen3"
+    force_full_prompt: true  # Disable delta routing for this model
     aliases:
       - "qwen3"
       - "qwen3-coder"
@@ -375,7 +376,7 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 
 ### How It Works
 
-1. Client sends a chat completion request with an `X-Session-Id` header (or without one, in which case the proxy generates a UUID v4 session ID).
+1. Client sends a chat completion request with an `X-Session-Id` header (preferred), or one of the compatible headers `session_id`, `X-Client-Request-Id`, or `X-Session-Affinity` (the proxy generates a UUID v4 if none are present).
 2. The proxy tracks full message history for each session.
 3. For subsequent requests, the proxy computes a delta against prior history.
 4. The proxy forwards delta messages **only** when strict restore confirmation has been observed for that session; otherwise it forwards the full prompt.
@@ -388,6 +389,7 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 - **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
 - **Context window limits**: llama-server's KV cache has finite capacity. Very long conversations may exceed the context window.
 - **Ephemeral sessions**: Sessions are held in memory and are lost when the proxy restarts. Cross-restart persistence is not supported in this version.
+- **Per-model delta disable**: Set `force_full_prompt: true` (or `disable_delta: true`) in a model config to always send full history. Use this for models that force full prompt reprocessing (SWA/hybrid/recurrent cache behavior).
 
 ### Using Sessions
 
@@ -411,7 +413,7 @@ response = httpx.post(
 session_id = response.headers.get("x-session-id")
 print(f"Session ID: {session_id}")
 
-# Next turn - include X-Session-Id header
+# Next turn - include X-Session-Id header (or session_id/X-Client-Request-Id)
 response2 = httpx.post(
     "http://localhost:8000/v1/chat/completions",
     json={
@@ -533,6 +535,8 @@ Config keys:
 - `server.session_slot_timeout_seconds` — timeout for save/restore calls
 
 The proxy restores the slot before each request and saves it after the response.
+To avoid slot mismatches, keep `session_slot_pool_size` aligned with
+llama-server's `--parallel` setting; for single-slot debugging set both to 1.
 If a session is invalidated (history mismatch or guardrail), the slot file is
 removed to avoid stale restores. Ensure llama-server is launched with
 `--slot-save-path` (see `start-llama.sh` / `models.ini`) and, for SWA/hybrid

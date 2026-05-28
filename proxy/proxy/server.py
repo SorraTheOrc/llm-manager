@@ -813,6 +813,7 @@ def _classify_delta_routing(
     delta_message_count: int,
     restore_confirmed: bool,
     require_restore_signal: bool = True,
+    force_full_prompt: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """Decide whether to use delta routing.
 
@@ -823,6 +824,8 @@ def _classify_delta_routing(
         return False, "history_mismatch"
     if delta_message_count <= 0:
         return False, "no_new_messages"
+    if force_full_prompt:
+        return False, "delta_disabled"
     if require_restore_signal and not restore_confirmed:
         return False, "missing_restore_signal"
     return True, None
@@ -1509,6 +1512,12 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
     return None
 
 
+def _should_force_full_prompt(model_cfg: Optional[dict]) -> bool:
+    if not isinstance(model_cfg, dict):
+        return False
+    return bool(model_cfg.get("force_full_prompt") or model_cfg.get("disable_delta"))
+
+
 def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
     """Get the llama model name for a given model."""
     model_cfg = get_model_config(model_name)
@@ -2172,16 +2181,61 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                 pass
 
 
+def _resolve_session_id_header(headers: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve session id from supported client headers.
+
+    Priority order:
+    1. X-Session-Id (proxy-native)
+    2. session_id (OpenAI cache header)
+    3. X-Client-Request-Id (OpenAI-compatible)
+    4. X-Session-Affinity (Anthropic-compatible)
+    """
+    if headers is None:
+        return None, None
+    candidates = [
+        ("x-session-id", headers.get("x-session-id")),
+        ("session_id", headers.get("session_id")),
+        ("x-client-request-id", headers.get("x-client-request-id")),
+        ("x-session-affinity", headers.get("x-session-affinity")),
+    ]
+    for name, value in candidates:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped, name
+    return None, None
+
+
+def _log_session_header_resolution(
+    session_id_header: Optional[str],
+    header_source: Optional[str],
+) -> None:
+    """Log whether a session header was provided on the request."""
+    try:
+        if header_source:
+            prefix = session_id_header[:8] if session_id_header else "unknown"
+            logger.info(
+                "Session header resolved: source=%s session=%s...",
+                header_source,
+                prefix,
+            )
+        else:
+            logger.info("No session header provided; proxy will generate session id")
+    except Exception:
+        pass
+
+
 async def proxy_to_local(request: Request, path: str) -> Response:
     """Proxy request to local llama-server with optional session-based
     incremental ingestion.
 
-    When a request includes an ``X-Session-Id`` header (or the proxy
-    generates one), the proxy tracks per-session message history so that
-    only new messages are forwarded to llama-server on subsequent
-    requests within the same session.  llama-server's ``session_id``
-    and ``cache_prompt`` parameters are used to preserve the KV cache
-    across requests.
+    When a request includes a supported session header (``X-Session-Id``,
+    ``session_id``, ``X-Client-Request-Id``, or ``X-Session-Affinity``),
+    or the proxy generates one, the proxy tracks per-session message
+    history so that only new messages are forwarded to llama-server on
+    subsequent requests within the same session. llama-server's
+    ``session_id`` and ``cache_prompt`` parameters are used to preserve
+    the KV cache across requests.
     """
     global active_queries, backend_ready
     server_config = config.get("server", {})
@@ -2200,10 +2254,18 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     except Exception:
         body_json = {}
 
+    requested_model_name = None
+    try:
+        requested_model_name = body_json.get("model")
+    except Exception:
+        requested_model_name = None
+    model_cfg = get_model_config(requested_model_name) if requested_model_name else get_model_config(current_model)
+    force_full_prompt = _should_force_full_prompt(model_cfg)
+
     # ------------------------------------------------------------------
     # Session handling – incremental prompt ingestion
     # ------------------------------------------------------------------
-    session_id_header = request.headers.get("x-session-id") or request.headers.get("session_id")
+    session_id_header, session_header_source = _resolve_session_id_header(request.headers)
     session_id: Optional[str] = None
     session_created = False
     delta_messages: Optional[List[Dict[str, Any]]] = None
@@ -2213,6 +2275,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     if isinstance(body_json, dict) and "messages" in body_json:
         original_message_count = len(body_json["messages"])
+        _log_session_header_resolution(session_id_header, session_header_source)
         try:
             session, session_created = await session_manager.get_or_create(
                 session_id_header
@@ -2230,6 +2293,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     require_restore_signal=bool(
                         server_config.get("session_require_restore_signal", False)
                     ),
+                    force_full_prompt=force_full_prompt,
                 )
 
                 if is_delta_request:
