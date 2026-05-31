@@ -504,6 +504,24 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
 config: dict = {}
 
 
+def normalize_provider_name(name: Optional[str]) -> Optional[str]:
+    """Normalize provider display/identifier strings.
+
+    Current compatibility rules:
+      - "Local Proxy" (case-insensitive) is treated as "Proxy".
+    """
+    if not name:
+        return name
+    try:
+        n = str(name).strip()
+    except Exception:
+        return name
+    if n.lower() == "local proxy":
+        return "Proxy"
+    return n
+
+
+
 def _extract_assistant_content(resp_json: dict) -> Optional[str]:
     """Extract assistant content from a non-streaming OpenAI API response.
 
@@ -3517,8 +3535,15 @@ async def index(request: Request):
     if router_mode:
         router_models = await router_list_models()
 
+    # Prefer configured provider host when present (e.g. Tailscale mapping)
+    providers_cfg = config.get('providers') if isinstance(config.get('providers'), dict) else {}
+    proxy_cfg = providers_cfg.get('Proxy') if providers_cfg else None
+    provider_host = None
+    if isinstance(proxy_cfg, dict):
+        provider_host = proxy_cfg.get('host') or proxy_cfg.get('url') or proxy_cfg.get('base')
+    provider_host_html = f'<div class="status-item"><strong>Provider:</strong> <code id="providerHost">{provider_host}</code></div>' if provider_host else ''
     # Base URL from incoming request (includes scheme and host:port)
-    base = str(request.base_url).rstrip('/')
+    base = provider_host.rstrip('/') if provider_host else str(request.base_url).rstrip('/')
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -3983,6 +4008,7 @@ async def index(request: Request):
                 <div class="status-dot"></div>
                 <span>Proxy Running</span>
             </div>
+            {provider_host_html}
             <div class="status-item">
                 <strong>Current Model:</strong>
                 <code id="currentModelStatus">{current_model or 'None'}</code>

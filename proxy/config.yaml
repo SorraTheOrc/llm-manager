@@ -3,6 +3,13 @@ default_remote:
   api_key_env: OPENAI_API_KEY
   enabled: false
   endpoint: https://api.openai.com/v1
+
+# Optional named provider endpoints (e.g., Tailscale based host mapping)
+providers:
+  Proxy:
+    host: "http://100.79.231.101:8000"
+    type: local
+
 logging:
   directory: /var/log/llama-proxy
   level: INFO
@@ -85,7 +92,7 @@ server:
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
-  session_slot_pool_size: 1
+  session_slot_pool_size: 2
   session_slot_timeout_seconds: 3.0
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048
