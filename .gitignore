@@ -28,3 +28,5 @@ Worklog Specific Ignores
 # Local slot cache (large runtime artifacts) — must not be committed
 slot-cache/
 
+
+bundles/
