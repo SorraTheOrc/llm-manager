@@ -954,6 +954,122 @@ def _detect_restore_signal_from_llama_log(
 log_dir: Optional[Path] = None
 logger: logging.Logger = logging.getLogger("llama-proxy")
 
+
+def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
+    """Extract concatenated delta.content strings from an SSE chunk string.
+
+    Returns the concatenated content (may include newlines as provided by the delta.content
+    values) or None if no parseable content is found.
+    """
+    if not chunk_str:
+        return None
+    try:
+        contents: list[str] = []
+        # First attempt: parse lines prefixed with 'data:' (SSE style)
+        for line in chunk_str.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                payload = line[len("data:"):].strip()
+                try:
+                    j = json.loads(payload)
+                except Exception:
+                    # ignore non-json data: lines
+                    continue
+                if isinstance(j, dict):
+                    choices = j.get("choices") or []
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        delta = choice.get("delta") or {}
+                        if isinstance(delta, dict) and "content" in delta:
+                            content_piece = delta.get("content")
+                            if content_piece is not None:
+                                contents.append(str(content_piece))
+        if contents:
+            return "".join(contents)
+
+        # Second attempt: try to parse the whole chunk as JSON
+        s = chunk_str.strip()
+        if s:
+            try:
+                j = json.loads(s)
+                if isinstance(j, dict):
+                    choices = j.get("choices") or []
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        delta = choice.get("delta") or {}
+                        if isinstance(delta, dict) and "content" in delta:
+                            content_piece = delta.get("content")
+                            if content_piece is not None:
+                                contents.append(str(content_piece))
+                if contents:
+                    return "".join(contents)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+class ContentOnlyConsoleHandler(logging.StreamHandler):
+    """Console handler that prints only streamed content for STREAM CHUNK records.
+
+    For log records whose formatted message begins with the prefix
+    "STREAM CHUNK | ", this handler will attempt to extract delta.content
+    values from any JSON payloads inside the chunk and write only the
+    concatenated content to the console stream (without adding extra
+    newlines). For other records, normal formatting is used.
+    """
+
+    PREFIX = "STREAM CHUNK | "
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - exercised by integration
+        try:
+            msg = record.getMessage()
+            if isinstance(msg, str) and msg.startswith(self.PREFIX):
+                chunk_str = msg[len(self.PREFIX):]
+                content = extract_streamed_content_from_chunk(chunk_str)
+                if content is not None:
+                    # Ensure stream exists
+                    if getattr(self, 'stream', None) is None:
+                        self.stream = sys.stderr
+                    try:
+                        # Write content as-is. Do not append an extra newline;
+                        # the content may include its own newline characters.
+                        self.stream.write(content)
+                        try:
+                            self.flush()
+                        except Exception:
+                            pass
+                        return
+                    except Exception:
+                        # Fall back to printing original chunk below
+                        pass
+                # If we couldn't extract content, fall back to printing the original chunk
+                try:
+                    if getattr(self, 'stream', None) is None:
+                        self.stream = sys.stderr
+                    self.stream.write(chunk_str)
+                    try:
+                        self.flush()
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    # As a last resort, emit using the default handler formatting
+                    super().emit(record)
+            # Not a stream chunk — use default formatting
+            super().emit(record)
+        except Exception:
+            # Best-effort: do not allow logging errors to crash application
+            try:
+                super().emit(record)
+            except Exception:
+                pass
+
 # SSE clients for real-time status updates
 sse_clients: set[asyncio.Queue] = set()
 # SSE clients for log tail updates (counts + other notifications)
@@ -1012,8 +1128,8 @@ def setup_logging(config: dict) -> logging.Logger:
     ))
     logger.addHandler(file_handler)
     
-    # Console handler for debugging
-    console_handler = logging.StreamHandler()
+    # Console handler for debugging (content-only for STREAM CHUNK messages)
+    console_handler = ContentOnlyConsoleHandler()
     console_handler.setFormatter(logging.Formatter(
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
