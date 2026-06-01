@@ -10,7 +10,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Remote API Routing**: Forward requests to OpenAI, Anthropic, or other OpenAI-compatible APIs
 - **Hot Model Switching**: Automatically switches local models when a different model is requested
 - **Streaming Support**: Full support for streaming responses (SSE)
-- **Request/Response Logging**: Comprehensive logging with time-based rotation
+- **Request/Response Logging**: Comprehensive logging with time-based rotation. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
@@ -117,7 +117,7 @@ server:
   session_single_flight_mode: "queue"
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
-  session_slot_pool_size: 1
+  session_slot_pool_size: 2
   session_slot_timeout_seconds: 3.0
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048
