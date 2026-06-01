@@ -27,3 +27,6 @@ Worklog Specific Ignores
 
 # Runtime logs
 logs/
+
+# runtime slot saves
+slot-cache/
