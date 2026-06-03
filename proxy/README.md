@@ -73,7 +73,7 @@ pytest -m refactor_parity -q
 ```
 
 The `refactor_parity` selection covers the contract paths that must remain stable during refactor slices:
-- routing/model lifecycle (`test_model_lifecycle_router_unit.py`, `test_model_lifecycle_router_integration.py`)
+- routing/model lifecycle (`test_model_lifecycle_router_unit.py`, `test_model_lifecycle_router_integration.py`, `test_backend_resilience.py`)
 - session/delta behavior (`test_incremental_ingestion.py`, `test_session_manager.py`)
 - observability/status/log endpoints (`test_llama_local_status.py`, `test_logs.py`)
 

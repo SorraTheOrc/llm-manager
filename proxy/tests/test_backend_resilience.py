@@ -1,10 +1,13 @@
 import asyncio
+import json
 
 import httpx
 import pytest
 from fastapi import HTTPException
 
 import proxy.server as server
+
+pytestmark = pytest.mark.refactor_parity
 
 
 @pytest.fixture(autouse=True)
@@ -122,3 +125,59 @@ async def test_proxy_to_local_concurrency_reject_increments_signal(monkeypatch):
 
     assert excinfo.value.status_code == 503
     assert server.backend_signal_counts["concurrency_rejects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_model_loading_response_is_machine_readable(monkeypatch):
+    monkeypatch.setattr(server, "config", {"server": {"model_loading_retry_after": 17}})
+    monkeypatch.setattr(server, "current_model", None)
+    monkeypatch.setattr(server, "llama_process", None)
+
+    resp = server._model_loading_response(
+        requested_model="gemma4",
+        target_model="gemma4",
+        scheduled=True,
+        endpoint="/v1/chat/completions",
+    )
+
+    body = resp.body.decode("utf-8")
+    data = json.loads(body)
+
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "17"
+    assert data["error"]["type"] == "model_loading"
+    assert data["error"]["code"] == "model_loading"
+    assert data["status"] == 503
+    assert data["requested_model"] == "gemma4"
+    assert data["target_model"] == "gemma4"
+    assert data["scheduled"] is True
+    assert data["endpoint"] == "/v1/chat/completions"
+    assert data["retry_after"] == 17
+
+
+@pytest.mark.asyncio
+async def test_backend_watchdog_marks_backend_degraded_on_exit(monkeypatch):
+    class Proc:
+        def poll(self):
+            return 7
+
+    monkeypatch.setattr(server, "llama_process", Proc())
+    monkeypatch.setattr(server, "current_model", "qwen3")
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "config", {"server": {"llama_router_mode": False, "llama_watchdog_interval_seconds": 0}})
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_delay):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] > 1:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await server._backend_watchdog_loop()
+
+    assert server.backend_ready is False
+    assert server.llama_process is None
+    assert server.current_model is None
+    assert server.backend_signal_counts["other_failures"] == 1
