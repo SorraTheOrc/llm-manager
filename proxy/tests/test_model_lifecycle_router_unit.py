@@ -7,6 +7,8 @@ from fastapi import Response, HTTPException
 
 import proxy.server as server
 
+pytestmark = pytest.mark.refactor_parity
+
 
 class DummyRequest:
     def __init__(self, body: bytes):

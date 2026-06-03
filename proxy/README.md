@@ -67,7 +67,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 # run tests
 pytest -q
+
+# refactor parity baseline (used during proxy/server.py extraction)
+pytest -m refactor_parity -q
 ```
+
+The `refactor_parity` selection covers the contract paths that must remain stable during refactor slices:
+- routing/model lifecycle (`test_model_lifecycle_router_unit.py`, `test_model_lifecycle_router_integration.py`)
+- session/delta behavior (`test_incremental_ingestion.py`, `test_session_manager.py`)
+- observability/status/log endpoints (`test_llama_local_status.py`, `test_logs.py`)
 
 If you prefer not to activate the virtualenv, you can run pytest directly from the venv binary:
 

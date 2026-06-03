@@ -3679,6 +3679,10 @@ async def index(request: Request):
             --success: #4caf50;
             --warning: #ff9800;
             --border: #2a3a5a;
+            --log-error: #b00020;
+            --log-warning: #f59e0b;
+            --log-info: #60a5fa;
+            --log-debug: #9ca3af;
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
@@ -5301,6 +5305,10 @@ async def view_logs(request: Request):
             --success: #4caf50;
             --warning: #ff9800;
             --border: #2a3a5a;
+            --log-error: #b00020;
+            --log-warning: #f59e0b;
+            --log-info: #60a5fa;
+            --log-debug: #9ca3af;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {

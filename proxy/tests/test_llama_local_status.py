@@ -2,6 +2,8 @@ import pytest
 from unittest.mock import patch
 import httpx
 
+pytestmark = pytest.mark.refactor_parity
+
 
 @pytest.mark.asyncio
 async def test_llama_local_status_not_running():

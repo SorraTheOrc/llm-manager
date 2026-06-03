@@ -14,6 +14,8 @@ from proxy.session_manager import (
     DEFAULT_SESSION_TTL_SECONDS,
 )
 
+pytestmark = pytest.mark.refactor_parity
+
 
 # ---------------------------------------------------------------------------
 # Helper

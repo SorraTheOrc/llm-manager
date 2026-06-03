@@ -4,6 +4,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
+pytestmark = pytest.mark.refactor_parity
+
 
 @pytest.mark.asyncio
 async def test_resolve_log_path():

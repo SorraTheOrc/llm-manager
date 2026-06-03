@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from proxy.session_manager import SessionManager, Session
 
+pytestmark = pytest.mark.refactor_parity
+
 
 # ---------------------------------------------------------------------------
 # Fixtures

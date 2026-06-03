@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, AsyncMock
 
 import proxy.server as server
 
+pytestmark = pytest.mark.refactor_parity
+
 
 @pytest.mark.asyncio
 @pytest.mark.slow
