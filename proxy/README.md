@@ -395,7 +395,9 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 
 - **KV cache ownership**: The proxy never stores or mutates KV tensors; llama-server owns the cache. The proxy only passes session metadata and deltas so llama-server can restore/cache internally.
 - **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
-- **Context window limits**: llama-server's KV cache has finite capacity. Very long conversations may exceed the context window.
+- **Context window limits**: llama-server's KV cache has finite capacity. The Qwen3 model is configured with a **128k (131,072) token context window**. Very long conversations may exceed this limit. The context window size is set in [`models.ini`](../models.ini) (router mode) and [`start-llama.sh`](../start-llama.sh) (single-model mode).
+
+  > **Resource note**: A 128k context window increases RAM usage for llama-server. On GPU with 64 GB+ VRAM, running Qwen3.6-35B-A3B at 128k context is feasible but may require disabling mmap (`--no-mmap`) and using an appropriate quantization (Q5_K_M or lower). For hosts with less memory, consider reducing the context size or switching to a smaller model. The canonical size can be adjusted by changing `ctx-size` in `models.ini` and `CONTEXT` in `start-llama.sh`.
 - **Ephemeral sessions**: Sessions are held in memory and are lost when the proxy restarts. Cross-restart persistence is not supported in this version.
 - **Per-model delta disable**: Set `force_full_prompt: true` (or `disable_delta: true`) in a model config to always send full history. Use this for models that force full prompt reprocessing (SWA/hybrid/recurrent cache behavior).
 

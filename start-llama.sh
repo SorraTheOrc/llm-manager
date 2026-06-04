@@ -107,7 +107,7 @@ case "$model" in
     REPOID=unsloth
     MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
     QUANTIZATION=Q8_0
-    CONTEXT=163840 # Max is 262144, max tried so far  131072
+    CONTEXT=131072 # 128k context window (canonical size; max supported is 262144)
     BATCH_SIZE=512
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
