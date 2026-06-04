@@ -10,6 +10,38 @@ if [[ -z "${model}" || "${model}" == "router" ]]; then
 fi
 
 ##
+# Helper: read ctx-size from models.ini for a given model name
+# Usage: get_ctx_size <model-name> [models-ini-path]
+##
+get_ctx_size() {
+  local target_model="$1"
+  local ini_file="${2:-models.ini}"
+
+  if [[ ! -f "$ini_file" ]]; then
+    return 1
+  fi
+
+  # Use awk to find the matching [section] and extract ctx-size
+  # Case-insensitive section matching
+  awk -v target="$target_model" 'BEGIN { found=0; ctx="" }
+  /^\[/ {
+    gsub(/\[|\]/, "")
+    if (tolower($0) == tolower(target)) {
+      found=1
+    } else {
+      found=0
+    }
+  }
+  found && /^ctx-size/ {
+    gsub(/.*=/, "")
+    gsub(/^[ \t]+|[ \t]+$/, "")
+    ctx=$0
+    exit
+  }
+  END { if (ctx != "") print ctx }' "$ini_file"
+}
+
+##
 # Configure the server
 ##
 : "${PORT:=8080}"
@@ -157,6 +189,19 @@ case "$model" in
     exit 1
     ;;
 esac
+
+##
+# Override CONTEXT from models.ini if available (single source of truth)
+##
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODELS_INI_FILE="${LLAMA_MODELS_PRESET:-${SCRIPT_DIR}/models.ini}"
+INI_CTX=$(get_ctx_size "$model" "$MODELS_INI_FILE" 2>/dev/null || true)
+if [[ -n "$INI_CTX" ]]; then
+  echo "Read ctx-size=$INI_CTX from $MODELS_INI_FILE for model '$model' (overriding CONTEXT=$CONTEXT)"
+  CONTEXT="$INI_CTX"
+else
+  echo "No ctx-size found in $MODELS_INI_FILE for model '$model'; using CONTEXT=$CONTEXT"
+fi
 
 ##
 # Log the config
