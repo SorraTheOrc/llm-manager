@@ -1021,7 +1021,8 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
     "STREAM CHUNK | ", this handler will attempt to extract delta.content
     values from any JSON payloads inside the chunk and write only the
     concatenated content to the console stream (without adding extra
-    newlines). For other records, normal formatting is used.
+    newlines). Raw JSON is never displayed in the console - only extracted
+    text content is shown. For other records, normal formatting is used.
     """
 
     PREFIX = "STREAM CHUNK | "
@@ -1032,7 +1033,7 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
             if isinstance(msg, str) and msg.startswith(self.PREFIX):
                 chunk_str = msg[len(self.PREFIX):]
                 content = extract_streamed_content_from_chunk(chunk_str)
-                if content is not None:
+                if content is not None and content:
                     # Ensure stream exists
                     if getattr(self, 'stream', None) is None:
                         self.stream = sys.stderr
@@ -1044,23 +1045,11 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
                             self.flush()
                         except Exception:
                             pass
-                        return
-                    except Exception:
-                        # Fall back to printing original chunk below
-                        pass
-                # If we couldn't extract content, fall back to printing the original chunk
-                try:
-                    if getattr(self, 'stream', None) is None:
-                        self.stream = sys.stderr
-                    self.stream.write(chunk_str)
-                    try:
-                        self.flush()
                     except Exception:
                         pass
-                    return
-                except Exception:
-                    # As a last resort, emit using the default handler formatting
-                    super().emit(record)
+                # Always return for STREAM CHUNK - never show raw JSON in console
+                # Raw JSON is written to the log file by the file handler
+                return
             # Not a stream chunk — use default formatting
             super().emit(record)
         except Exception:
@@ -2007,6 +1996,19 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
                             for line in src:
                                 dst.write(line)
                                 dst.flush()
+                                # Display prompt processing progress to console
+                                try:
+                                    line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
+                                    # Detect prompt processing progress lines from llama-server
+                                    # Format: "slot N : prompt processing ..." or similar
+                                    if 'prompt processing' in line_str.lower() or 'prompt eval' in line_str.lower():
+                                        # Extract meaningful progress info and display to stderr
+                                        progress_line = line_str.strip()
+                                        if progress_line:
+                                            sys.stderr.write(f"\r{progress_line}\n")
+                                            sys.stderr.flush()
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
@@ -3373,7 +3375,11 @@ def log_response(status_code: int, content: bytes):
 
 
 def log_response_chunk(chunk: bytes):
-    """Log streaming response chunk."""
+    """Log streaming response chunk.
+    
+    The ContentOnlyConsoleHandler extracts and displays just the content to console.
+    Raw JSON is written to the log file only.
+    """
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
         logger.info(f"STREAM CHUNK | {chunk_str}")

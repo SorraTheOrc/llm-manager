@@ -48,12 +48,13 @@ def test_console_prints_delta_content(tmp_path, chunk, expected):
     assert out == expected
 
 
-def test_console_fallback_prints_original_chunk(tmp_path):
+def test_console_suppresses_non_json_chunks(tmp_path):
+    """Non-JSON chunks should not display raw content in console."""
     logger, ch, strio = _configure_logger_for_test(tmp_path)
 
     chunk = b"this-is-not-json"
     server.log_response_chunk(chunk)
 
     out = strio.getvalue()
-    # Fallback should write the original chunk (decoded)
-    assert out == chunk.decode("utf-8")
+    # Raw content should NOT appear in console - only extracted delta.content
+    assert out == ""
