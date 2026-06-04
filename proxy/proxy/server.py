@@ -2547,7 +2547,22 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     available_slots = sum(1 for s in slots_data if not s.get("is_processing", True))
                 if available_slots == 0 and total_slots > 0:
                     logger.warning(f"No available slots ({total_slots} total), rejecting request")
-                    raise HTTPException(status_code=503, detail=f"Model server busy: 0/{total_slots} slots available. Retry later.")
+                    retry_after = int(server_config.get("slot_unavailable_retry_after", 5) or 5)
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": {
+                                "type": "server_busy",
+                                "code": "no_slots_available",
+                                "message": f"Model server busy: 0/{total_slots} slots available. Please retry later.",
+                            },
+                            "status": 503,
+                            "retry_after": retry_after,
+                            "total_slots": total_slots,
+                            "available_slots": 0,
+                        },
+                        headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+                    )
         except HTTPException:
             raise
         except Exception:

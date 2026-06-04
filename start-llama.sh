@@ -85,7 +85,7 @@ if [[ "$router_mode" -eq 1 ]]; then
     --models-preset "$MODELS_INI"
     --models-max "$MODELS_MAX"
     --models-autoload
-    --parallel 1
+    --parallel 2
     --host 0.0.0.0
     --no-mmap
     --port $PORT
@@ -135,7 +135,7 @@ case "$model" in
     # forces weights to be loaded into memory which often improves throughput.
     EXTRA_CMD_SWITCHES="--gpt-oss-120b-default --no-mmap"
     ;;
-  qwen3)
+  qwen3|qwen3-next)
     REPOID=unsloth
     MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
     QUANTIZATION=Q8_0
@@ -249,10 +249,10 @@ LLAMA_CMD=(
   -hf "$REPOID/$MODEL:$QUANTIZATION"
   --ctx-size "$CONTEXT"
   --batch-size $BATCH_SIZE
-  -np 1
+  -np 2
   -ngl 99
   --no-mmap
-  --parallel 1
+  --parallel 2
   $EXTRA_CMD_SWITCHES
   --embeddings
   --pooling mean

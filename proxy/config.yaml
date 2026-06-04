@@ -74,6 +74,14 @@ models:
     llama_model: Qwen3
     force_full_prompt: true
     type: local
+  qwen3-next:
+    aliases:
+    - qwen3-next
+    - qwen3-coder-next
+    - qwen3-next*
+    llama_model: Qwen3-Next
+    force_full_prompt: true
+    type: local
 server:
   distrobox_name: llama
   embeddings_model: mxbai-embed
@@ -94,6 +102,7 @@ server:
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   session_slot_pool_size: 2
   session_slot_timeout_seconds: 3.0
+  slot_unavailable_retry_after: 5
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 64
