@@ -956,10 +956,11 @@ logger: logging.Logger = logging.getLogger("llama-proxy")
 
 
 def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
-    """Extract concatenated delta.content strings from an SSE chunk string.
+    """Extract concatenated delta.content and delta.reasoning_content strings from an SSE chunk.
 
-    Returns the concatenated content (may include newlines as provided by the delta.content
-    values) or None if no parseable content is found.
+    Returns the concatenated content (may include newlines as provided by the delta values)
+    or None if no parseable content is found. Handles both 'content' and 'reasoning_content'
+    fields used by models like Qwen3 during their thinking/reasoning phase.
     """
     if not chunk_str:
         return None
@@ -983,10 +984,12 @@ def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
                         if not isinstance(choice, dict):
                             continue
                         delta = choice.get("delta") or {}
-                        if isinstance(delta, dict) and "content" in delta:
-                            content_piece = delta.get("content")
-                            if content_piece is not None:
-                                contents.append(str(content_piece))
+                        if isinstance(delta, dict):
+                            # Extract both content and reasoning_content
+                            for key in ("reasoning_content", "content"):
+                                content_piece = delta.get(key)
+                                if content_piece is not None:
+                                    contents.append(str(content_piece))
         if contents:
             return "".join(contents)
 
@@ -1001,10 +1004,12 @@ def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
                         if not isinstance(choice, dict):
                             continue
                         delta = choice.get("delta") or {}
-                        if isinstance(delta, dict) and "content" in delta:
-                            content_piece = delta.get("content")
-                            if content_piece is not None:
-                                contents.append(str(content_piece))
+                        if isinstance(delta, dict):
+                            # Extract both content and reasoning_content
+                            for key in ("reasoning_content", "content"):
+                                content_piece = delta.get(key)
+                                if content_piece is not None:
+                                    contents.append(str(content_piece))
                 if contents:
                     return "".join(contents)
             except Exception:
