@@ -1344,25 +1344,35 @@ def load_config(config_path: Optional[str] = None) -> dict:
 def setup_logging(config: dict) -> logging.Logger:
     """Setup logging with time-based rotation."""
     global log_dir
-    
+
+    # Check for dev mode
+    is_dev = os.environ.get("LLAMA_PROXY_DEV") == "1"
+
     log_config = config.get("logging", {})
-    log_dir = Path(log_config.get("directory", "/var/log/llama-proxy"))
     rotation_hours = log_config.get("rotation_hours", 6)
     retention_days = log_config.get("retention_days", 90)
     log_level = log_config.get("level", "INFO")
-    
-    # Try to create log directory, fall back to local logs directory if permission denied
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        log_dir = Path(__file__).parent / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Using local log directory: {log_dir}")
-    
+
+    if is_dev:
+        # Dev mode: use XDG-based dev log directory with DEBUG level
+        xdg_state = os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
+        log_dir = Path(xdg_state) / "llama-proxy-dev" / "logs"
+        log_level = "DEBUG"
+        print(f"[INFO] Dev mode: using log directory {log_dir} at level {log_level}")
+    else:
+        log_dir = Path(log_config.get("directory", "/var/log/llama-proxy"))
+        # Try to create log directory, fall back to local logs directory if permission denied
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            log_dir = Path(__file__).parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[INFO] Using local log directory: {log_dir}")
+
     # Calculate backup count based on retention days and rotation interval
     # (retention_days * 24 hours / rotation_hours)
     backup_count = (retention_days * 24) // rotation_hours
-    
+
     # Create logger
     logger = logging.getLogger("llama-proxy")
     logger.setLevel(getattr(logging, log_level.upper()))
