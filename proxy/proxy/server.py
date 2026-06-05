@@ -2211,11 +2211,43 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
                                     # Detect prompt processing progress lines from llama-server
                                     # Format: "slot N : prompt processing ..." or similar
                                     if 'prompt processing' in line_str.lower() or 'prompt eval' in line_str.lower():
-                                        # Extract meaningful progress info and display to stderr
-                                        progress_line = line_str.strip()
-                                        if progress_line:
-                                            sys.stderr.write(f"\r{progress_line}\n")
-                                            sys.stderr.flush()
+                                        # Try to parse structured progress information and show a
+                                        # concise, in-place progress indicator. Fall back to
+                                        # printing the raw line if parsing/display fails.
+                                        try:
+                                            parsed = extract_progress_data(line_str)
+                                            if parsed:
+                                                n_tokens, prog_frac = parsed
+                                                # Estimate total tokens when progress fraction is available
+                                                try:
+                                                    total_tokens = int(n_tokens / prog_frac) if prog_frac and prog_frac > 0 else n_tokens
+                                                except Exception:
+                                                    total_tokens = n_tokens
+                                                try:
+                                                    progress_str = format_progress(n_tokens, total_tokens, prog_frac)
+                                                    # Write the progress string in-place (no newline)
+                                                    sys.stderr.write(progress_str)
+                                                    sys.stderr.flush()
+                                                except Exception:
+                                                    # Formatting failed — fall back to raw line
+                                                    progress_line = line_str.strip()
+                                                    if progress_line:
+                                                        sys.stderr.write(f"\r{progress_line}\n")
+                                                        sys.stderr.flush()
+                                            else:
+                                                # No structured progress found — print raw line
+                                                progress_line = line_str.strip()
+                                                if progress_line:
+                                                    sys.stderr.write(f"\r{progress_line}\n")
+                                                    sys.stderr.flush()
+                                        except Exception:
+                                            try:
+                                                progress_line = line_str.strip()
+                                                if progress_line:
+                                                    sys.stderr.write(f"\r{progress_line}\n")
+                                                    sys.stderr.flush()
+                                            except Exception:
+                                                pass
                                 except Exception:
                                     pass
                         except Exception:
