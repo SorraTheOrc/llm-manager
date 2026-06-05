@@ -93,14 +93,14 @@ server:
   llama_embed_load_timeout: 30
   llama_health_check_interval: 10
   llama_model_load_timeout: 600
-  llama_models_max: 2
+  llama_models_max: 1
   llama_request_timeout: 300
   llama_router_mode: true
   max_concurrent_queries: 16
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
-  session_slot_pool_size: 2
+  session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
   session_guardrail_max_runtime_seconds: 120

@@ -118,14 +118,14 @@ server:
   llama_router_preload:
     - "embeddings"
     - "gemma4"    # preload the configured default model (gemma4)
-  llama_models_max: 2
+  llama_models_max: 1
   distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
   llama_startup_timeout: 300
   session_single_flight_mode: "queue"
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
-  session_slot_pool_size: 2
+  session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   session_guardrail_max_runtime_seconds: 120
   session_guardrail_max_completion_tokens: 2048

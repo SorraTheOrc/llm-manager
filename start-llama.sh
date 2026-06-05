@@ -52,7 +52,7 @@ export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1
 if [[ "$router_mode" -eq 1 ]]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   MODELS_INI="${LLAMA_MODELS_PRESET:-${2:-"$SCRIPT_DIR/models.ini"}}"
-  MODELS_MAX="${LLAMA_MODELS_MAX:-4}"
+  MODELS_MAX="${LLAMA_MODELS_MAX:-1}"
 
   echo "Server Environment"
   echo
@@ -85,7 +85,7 @@ if [[ "$router_mode" -eq 1 ]]; then
     --models-preset "$MODELS_INI"
     --models-max "$MODELS_MAX"
     --models-autoload
-    --parallel 2
+    --parallel 1
     --host 0.0.0.0
     --no-mmap
     --port $PORT
@@ -249,10 +249,10 @@ LLAMA_CMD=(
   -hf "$REPOID/$MODEL:$QUANTIZATION"
   --ctx-size "$CONTEXT"
   --batch-size $BATCH_SIZE
-  -np 2
+  -np 1
   -ngl 99
   --no-mmap
-  --parallel 2
+  --parallel 1
   $EXTRA_CMD_SWITCHES
   --embeddings
   --pooling mean
