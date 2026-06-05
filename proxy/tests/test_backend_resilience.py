@@ -294,8 +294,11 @@ async def test_proxy_preserves_backend_error_when_not_self_healing(monkeypatch):
     monkeypatch.setattr(server, "active_queries", 0)
     monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
 
-    with pytest.raises(httpx.ConnectError):
-        await server.proxy_to_local(DummyRequest(), "v1/completions")
+    response = await server.proxy_to_local(DummyRequest(), "v1/completions")
+    payload = json.loads(response.body.decode("utf-8"))
+    assert response.status_code == 503
+    assert payload["status"] == 503
+    assert payload["error"]["code"] == "backend_error"
 
 
 @pytest.mark.asyncio
@@ -437,3 +440,47 @@ async def test_health_endpoint_healthy_when_probe_succeeds(monkeypatch):
     assert health["status"] == "healthy"
     assert health["backend_reachable"] is True
     assert health["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_proxy_handles_history_mismatch_and_backend_failure(monkeypatch):
+    # Prepare a session that will mismatch incoming history
+    sid = "sess-abc"
+    # Create an existing session with different messages
+    session, created = await server.session_manager.get_or_create(sid)
+    await server.session_manager.update_messages(sid, [{"role": "user", "content": "old message"}])
+
+    class DummyRequest:
+        headers = {"x-session-id": sid}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/chat/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","messages":[{"role":"user","content":"new message"}]}'
+
+    async def fail_call(*_args, **_kwargs):
+        raise httpx.ConnectError("connect failed", request=httpx.Request("POST", "http://test"))
+
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "llama_request_timeout": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
+
+    response = await server.proxy_to_local(DummyRequest(), "v1/chat/completions")
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 503
+    assert payload["status"] == 503
+    # Ensure session headers are present and show the session was re-created
+    assert response.headers.get("X-Session-Id") == sid
+    assert response.headers.get("X-Session-Created") == "true"

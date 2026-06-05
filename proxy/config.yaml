@@ -93,7 +93,7 @@ server:
   llama_embed_load_timeout: 30
   llama_health_check_interval: 10
   llama_model_load_timeout: 600
-  llama_models_max: 1
+  llama_models_max: 2
   llama_request_timeout: 300
   llama_router_mode: true
   max_concurrent_queries: 16

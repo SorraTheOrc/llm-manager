@@ -1994,9 +1994,10 @@ async def router_load_model(model_name: str) -> bool:
             response = await client.post(url, json=payload, timeout=30)
             if response.status_code != 200:
                 body = response.text
-                if response.status_code == 400 and "already loaded" in body.lower():
+                body_l = (body or "").lower()
+                if response.status_code == 400 and ("already loaded" in body_l or "already running" in body_l):
                     logger.info(f"Router model already loaded: {model_name}")
-                    # update last-used timestamp when model already loaded
+                    # update last-used timestamp when model already loaded/running
                     try:
                         model_last_used[model_name] = datetime.utcnow().isoformat()
                     except Exception:
@@ -2987,7 +2988,26 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         pass
                     if _is_self_healing_active():
                         return _self_healing_response(path)
-                    raise
+                    # Return a 503 response indicating backend error instead of raising
+                    retry_after = _self_heal_retry_after_seconds()
+                    headers_err = {"Retry-After": str(retry_after), "Cache-Control": "no-store"}
+                    if session_id:
+                        headers_err["X-Session-Id"] = session_id
+                        headers_err["X-Session-Created"] = "true" if session_created else "false"
+                        headers_err["X-Session-Delta"] = "true" if is_delta_request else "false"
+                        if session_fallback_reason:
+                            headers_err["X-Session-Fallback-Reason"] = session_fallback_reason
+                    payload = {
+                        "error": {
+                            "type": "backend_error",
+                            "code": "backend_error",
+                            "message": "Backend unavailable, please retry later"
+                        },
+                        "status": 503,
+                        "path": f"/{path}",
+                        "retry_after": retry_after,
+                    }
+                    return JSONResponse(status_code=503, content=payload, headers=headers_err)
                 upstream_status = response.status_code
                 upstream_content_type = response.headers.get('content-type', '')
 
@@ -3299,7 +3319,26 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 backend_ready = False
                                 if _is_self_healing_active():
                                     return _self_healing_response(path)
-                                raise
+                                # Return a 503 response indicating backend error instead of raising
+                                retry_after = _self_heal_retry_after_seconds()
+                                headers_err = {"Retry-After": str(retry_after), "Cache-Control": "no-store"}
+                                if session_id:
+                                    headers_err["X-Session-Id"] = session_id
+                                    headers_err["X-Session-Created"] = "true" if session_created else "false"
+                                    headers_err["X-Session-Delta"] = "true" if is_delta_request else "false"
+                                    if session_fallback_reason:
+                                        headers_err["X-Session-Fallback-Reason"] = session_fallback_reason
+                                payload = {
+                                    "error": {
+                                        "type": "backend_error",
+                                        "code": "backend_error",
+                                        "message": "Backend unavailable, please retry later"
+                                    },
+                                    "status": 503,
+                                    "path": f"/{path}",
+                                    "retry_after": retry_after,
+                                }
+                                return JSONResponse(status_code=503, content=payload, headers=headers_err)
 
                             recv_tokens = 0
                             # Non-streaming: count tokens in response body
