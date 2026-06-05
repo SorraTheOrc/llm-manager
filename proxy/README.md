@@ -625,9 +625,21 @@ Concurrency pressure is controlled by `server.max_concurrent_queries` (default 4
 When the guard rejects a request, the proxy returns a 503 and increments
 `backend_signals.concurrency_rejects`.
 
-A watchdog loop monitors the child llama-server process. If the process exits,
-health switches to `degraded`, backend readiness is gated to `ready: false`, and
-router mode attempts a best-effort restart.
+A watchdog loop monitors the backend process and, in router mode, also checks
+for unhealthy worker children (for example zombie/defunct states). If a crash or
+worker failure is detected, health switches to `degraded`, `backend_reachable`
+becomes `false`, and router mode starts automatic self-healing.
+
+Self-healing uses exponential backoff and is capped by:
+
+- `server.llama_self_heal_max_attempts` (default `3`)
+- `server.llama_self_heal_window_seconds` (default `300`)
+- `server.llama_self_heal_backoff_base_seconds` (default `1`)
+- `server.llama_self_heal_retry_after_seconds` (default `30`)
+
+While self-healing is active, proxy requests return HTTP `503` with
+`Retry-After: 30` and a machine-readable `backend_recovery_in_progress` payload.
+When self-healing is not active, existing backend failure behavior is unchanged.
 
 #### Fault-injection validation (reproducible)
 
@@ -647,7 +659,8 @@ Expected triage signatures include:
 - `watchdog router restart backend_ready=...`
 
 Use `/health` and `/admin/metrics` snapshots from the run directory to verify
-readiness transitions and backend signal counters.
+readiness transitions and backend signal counters. `/health` now includes
+`backend_reachable`, `self_healing_in_progress`, and `backend_recovery`.
 
 ### Router Mode (Multi-Model)
 

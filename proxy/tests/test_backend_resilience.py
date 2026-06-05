@@ -26,6 +26,18 @@ def reset_backend_state(monkeypatch):
     monkeypatch.setattr(server, "backend_ready", False)
     monkeypatch.setattr(
         server,
+        "backend_recovery_state",
+        {
+            "in_progress": False,
+            "attempt_timestamps": [],
+            "max_attempts": 3,
+            "window_seconds": 300,
+            "retry_after_seconds": 30,
+            "last_failure": None,
+        },
+    )
+    monkeypatch.setattr(
+        server,
         "config",
         {
             "server": {
@@ -33,6 +45,10 @@ def reset_backend_state(monkeypatch):
                 "backend_retry_base_delay_seconds": 0,
                 "backend_retry_max_delay_seconds": 0,
                 "backend_retry_jitter_ratio": 0,
+                "llama_self_heal_max_attempts": 3,
+                "llama_self_heal_window_seconds": 300,
+                "llama_self_heal_backoff_base_seconds": 1,
+                "llama_self_heal_retry_after_seconds": 30,
             }
         },
     )
@@ -181,3 +197,243 @@ async def test_backend_watchdog_marks_backend_degraded_on_exit(monkeypatch):
     assert server.llama_process is None
     assert server.current_model is None
     assert server.backend_signal_counts["other_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_degraded_when_backend_probe_fails(monkeypatch):
+    class Proc:
+        def poll(self):
+            return None
+
+    async def fake_probe(_port):
+        return False
+
+    monkeypatch.setattr(server, "llama_process", Proc())
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "current_model", "qwen3")
+    monkeypatch.setattr(server, "config", {"server": {"llama_router_mode": False, "llama_server_port": 8080}})
+    monkeypatch.setattr(server, "_probe_backend_reachable", fake_probe)
+
+    health = await server.health_check()
+
+    assert health["status"] == "degraded"
+    assert health["backend_reachable"] is False
+    assert health["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_proxy_returns_503_during_active_self_healing(monkeypatch):
+    class DummyRequest:
+        headers = {}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","prompt":"hello"}'
+
+    async def fail_call(*_args, **_kwargs):
+        raise httpx.ConnectError("connect failed", request=httpx.Request("POST", "http://test"))
+
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "llama_request_timeout": 1,
+                "llama_self_heal_retry_after_seconds": 30,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "backend_recovery_state", {
+        "in_progress": True,
+        "attempt_timestamps": [],
+        "max_attempts": 3,
+        "window_seconds": 300,
+        "retry_after_seconds": 30,
+        "last_failure": "backend crashed",
+    })
+    monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
+
+    response = await server.proxy_to_local(DummyRequest(), "v1/completions")
+
+    payload = json.loads(response.body.decode("utf-8"))
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "30"
+    assert payload["error"]["message"] == "Backend error detected, team is working on recovery. Please retry after 30 seconds."
+
+
+@pytest.mark.asyncio
+async def test_proxy_preserves_backend_error_when_not_self_healing(monkeypatch):
+    class DummyRequest:
+        headers = {}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","prompt":"hello"}'
+
+    async def fail_call(*_args, **_kwargs):
+        raise httpx.ConnectError("connect failed", request=httpx.Request("POST", "http://test"))
+
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "llama_request_timeout": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
+
+    with pytest.raises(httpx.ConnectError):
+        await server.proxy_to_local(DummyRequest(), "v1/completions")
+
+
+@pytest.mark.asyncio
+async def test_watchdog_detects_worker_failure_and_triggers_router_recovery(monkeypatch):
+    class Proc:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+    calls = {"recover": 0}
+
+    async def fake_recover():
+        calls["recover"] += 1
+        return False
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_delay):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] > 1:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(server, "llama_process", Proc())
+    monkeypatch.setattr(server, "current_model", "qwen3")
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "config", {"server": {"llama_router_mode": True, "llama_watchdog_interval_seconds": 0}})
+    monkeypatch.setattr(server, "_worker_process_unhealthy", lambda _proc: True)
+    monkeypatch.setattr(server, "_attempt_router_self_heal", fake_recover)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await server._backend_watchdog_loop()
+
+    assert calls["recover"] == 1
+    assert server.backend_signal_counts["other_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_router_self_heal_uses_exponential_backoff_and_attempt_cap(monkeypatch):
+    class Proc:
+        pid = 999
+
+        def poll(self):
+            return None
+
+    start_calls = {"n": 0}
+    sleep_calls = []
+
+    def fake_start(_model):
+        start_calls["n"] += 1
+        return Proc()
+
+    async def fake_wait(_timeout):
+        return False
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(server, "start_llama_server", fake_start)
+    monkeypatch.setattr(server, "wait_for_llama_server", fake_wait)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(server, "config", {"server": {
+        "llama_self_heal_max_attempts": 3,
+        "llama_self_heal_window_seconds": 300,
+        "llama_self_heal_backoff_base_seconds": 1,
+        "llama_self_heal_retry_after_seconds": 30,
+        "llama_startup_timeout": 1,
+    }})
+    monkeypatch.setattr(server, "backend_recovery_state", {
+        "in_progress": False,
+        "attempt_timestamps": [],
+        "max_attempts": 3,
+        "window_seconds": 300,
+        "retry_after_seconds": 30,
+        "last_failure": None,
+    })
+
+    recovered = await server._attempt_router_self_heal()
+
+    assert recovered is False
+    assert start_calls["n"] == 3
+    assert sleep_calls == [1, 2]
+    assert len(server.backend_recovery_state["attempt_timestamps"]) == 3
+    assert server.backend_recovery_state["in_progress"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_self_heal_recovers_backend_on_success(monkeypatch):
+    class Proc:
+        pid = 1001
+
+        def poll(self):
+            return None
+
+    start_calls = {"n": 0}
+
+    def fake_start(_model):
+        start_calls["n"] += 1
+        return Proc()
+
+    async def fake_wait(_timeout):
+        return True
+
+    monkeypatch.setattr(server, "start_llama_server", fake_start)
+    monkeypatch.setattr(server, "wait_for_llama_server", fake_wait)
+    monkeypatch.setattr(server, "config", {"server": {
+        "llama_self_heal_max_attempts": 3,
+        "llama_self_heal_window_seconds": 300,
+        "llama_self_heal_backoff_base_seconds": 1,
+        "llama_self_heal_retry_after_seconds": 30,
+        "llama_startup_timeout": 1,
+    }})
+
+    recovered = await server._attempt_router_self_heal()
+
+    assert recovered is True
+    assert start_calls["n"] == 1
+    assert server.backend_ready is True
+    assert server.backend_recovery_state["in_progress"] is False
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_healthy_when_probe_succeeds(monkeypatch):
+    class Proc:
+        def poll(self):
+            return None
+
+    async def fake_probe(_port):
+        return True
+
+    monkeypatch.setattr(server, "llama_process", Proc())
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "current_model", "qwen3")
+    monkeypatch.setattr(server, "config", {"server": {"llama_router_mode": False, "llama_server_port": 8080}})
+    monkeypatch.setattr(server, "_probe_backend_reachable", fake_probe)
+
+    health = await server.health_check()
+
+    assert health["status"] == "healthy"
+    assert health["backend_reachable"] is True
+    assert health["ready"] is True

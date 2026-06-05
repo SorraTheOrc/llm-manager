@@ -27,6 +27,11 @@ server:
   backend_retry_max_delay_seconds: 2.0
   backend_retry_jitter_ratio: 0.25
   llama_watchdog_interval_seconds: 5
+  llama_backend_probe_timeout_seconds: 2
+  llama_self_heal_max_attempts: 3
+  llama_self_heal_window_seconds: 300
+  llama_self_heal_backoff_base_seconds: 1
+  llama_self_heal_retry_after_seconds: 30
 ```
 
 ## Running
@@ -48,6 +53,8 @@ The router exposes:
 
 - `models.ini` must include both the embeddings model and the primary model preset.
 - `llama_models_max` limits concurrent models and controls LRU eviction.
-- The proxy health endpoint (`/health`) is readiness-gated (`ready: true/false`); after a router crash it reports `status: degraded` until watchdog recovery completes.
-- Backend crash-path signals are exposed via `/health` and `/admin/metrics` in `backend_signals` for triage.
+- The proxy health endpoint (`/health`) is readiness-gated (`ready: true/false`) and includes active backend probing (`backend_reachable`). After router/worker crashes it reports `status: degraded` until watchdog recovery completes.
+- Router worker zombie/defunct states are treated as backend failures and trigger self-healing.
+- During active self-healing, requests return `503` with `Retry-After: 30` and a `backend_recovery_in_progress` error payload.
+- Backend crash-path signals are exposed via `/health` and `/admin/metrics` in `backend_signals`, and current recovery progress is reported in `backend_recovery`.
 - Repro fault injection script: `proxy/scripts/fault-injection-backend-crash.sh` captures health/metrics snapshots and log signatures during a forced backend crash.

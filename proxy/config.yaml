@@ -115,6 +115,11 @@ server:
   backend_retry_max_delay_seconds: 2.0
   backend_retry_jitter_ratio: 0.25
   llama_watchdog_interval_seconds: 5
+  llama_backend_probe_timeout_seconds: 2
+  llama_self_heal_max_attempts: 3
+  llama_self_heal_window_seconds: 300
+  llama_self_heal_backoff_base_seconds: 1
+  llama_self_heal_retry_after_seconds: 30
   llama_router_preload:
   - embeddings
   - Qwen3

@@ -506,6 +506,16 @@ async def _save_slot_snapshot(
 # Health/readiness signal for local backend
 backend_ready: bool = False
 
+# Self-healing state for backend recovery attempts
+backend_recovery_state: dict = {
+    "in_progress": False,
+    "attempt_timestamps": [],
+    "max_attempts": 3,
+    "window_seconds": 300,
+    "retry_after_seconds": 30,
+    "last_failure": None,
+}
+
 # Background watchdog task (started in lifespan)
 backend_watchdog_task: Optional[asyncio.Task] = None
 
@@ -659,6 +669,51 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("backend retry loop exhausted without exception")
+
+
+def _self_heal_retry_after_seconds() -> int:
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    configured = server_cfg.get("llama_self_heal_retry_after_seconds", backend_recovery_state.get("retry_after_seconds", 30))
+    try:
+        retry_after = int(configured or 30)
+    except Exception:
+        retry_after = 30
+    retry_after = max(1, retry_after)
+    backend_recovery_state["retry_after_seconds"] = retry_after
+    return retry_after
+
+
+def _is_self_healing_active() -> bool:
+    try:
+        return bool(backend_recovery_state.get("in_progress"))
+    except Exception:
+        return False
+
+
+def _self_healing_response(path: str) -> JSONResponse:
+    retry_after = _self_heal_retry_after_seconds()
+    message = "Backend error detected, team is working on recovery. Please retry after 30 seconds."
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "type": "backend_recovery",
+                "code": "backend_recovery_in_progress",
+                "message": message,
+            },
+            "status": 503,
+            "retry_after": retry_after,
+            "path": f"/{path.lstrip('/')}",
+        },
+        headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+    )
+
+
+def _backend_recovery_snapshot() -> dict:
+    state = dict(backend_recovery_state)
+    attempts = state.get("attempt_timestamps")
+    state["attempt_count"] = len(attempts) if isinstance(attempts, list) else 0
+    return state
 
 
 config: dict = {}
@@ -2618,6 +2673,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     server_config = config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
     target_url = f"http://localhost:{llama_port}/{path}"
+
+    if _is_self_healing_active():
+        return _self_healing_response(path)
     
     # Get request body
     body = await request.body()
@@ -2927,6 +2985,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         await client.aclose()
                     except Exception:
                         pass
+                    if _is_self_healing_active():
+                        return _self_healing_response(path)
                     raise
                 upstream_status = response.status_code
                 upstream_content_type = response.headers.get('content-type', '')
@@ -3232,8 +3292,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     content=body,
                                 )
 
-                            response = await _call_with_backend_retries(_send_once, path=path, stream=False)
-                            backend_ready = True
+                            try:
+                                response = await _call_with_backend_retries(_send_once, path=path, stream=False)
+                                backend_ready = True
+                            except Exception:
+                                backend_ready = False
+                                if _is_self_healing_active():
+                                    return _self_healing_response(path)
+                                raise
 
                             recv_tokens = 0
                             # Non-streaming: count tokens in response body
@@ -3628,6 +3694,144 @@ def log_response_chunk(chunk: bytes):
         pass
 
 
+def _worker_process_unhealthy(proc: Optional[subprocess.Popen]) -> bool:
+    """Detect unhealthy llama worker states (for example zombie children)."""
+    if proc is None or psutil is None:
+        return False
+
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return False
+
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+    except Exception:
+        return False
+
+    zombie_statuses = {"zombie", "dead"}
+    try:
+        zombie_statuses.add(str(psutil.STATUS_ZOMBIE).lower())
+    except Exception:
+        pass
+    try:
+        zombie_statuses.add(str(psutil.STATUS_DEAD).lower())
+    except Exception:
+        pass
+
+    for child in children:
+        try:
+            status = str(child.status()).lower()
+        except Exception:
+            continue
+        if status in zombie_statuses:
+            logger.error(
+                "watchdog detected unhealthy worker pid=%s status=%s parent_pid=%s",
+                getattr(child, "pid", "unknown"),
+                status,
+                pid,
+            )
+            return True
+
+    return False
+
+
+def _prune_recovery_attempts(attempts: list[float], now_ts: float, window_seconds: int) -> list[float]:
+    window = max(1, int(window_seconds))
+    return [float(ts) for ts in attempts if now_ts - float(ts) <= window]
+
+
+async def _attempt_router_self_heal() -> bool:
+    """Attempt router-mode self-healing with capped exponential backoff."""
+    global llama_process, current_model, backend_ready
+
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    max_attempts = max(1, int(server_cfg.get("llama_self_heal_max_attempts", 3) or 3))
+    window_seconds = max(1, int(server_cfg.get("llama_self_heal_window_seconds", 300) or 300))
+    base_backoff = max(0.0, float(server_cfg.get("llama_self_heal_backoff_base_seconds", 1.0) or 1.0))
+    startup_timeout = int(server_cfg.get("llama_startup_timeout", 300) or 300)
+    retry_after = _self_heal_retry_after_seconds()
+
+    now_ts = time.time()
+    attempts = backend_recovery_state.get("attempt_timestamps", [])
+    if not isinstance(attempts, list):
+        attempts = []
+    attempts = _prune_recovery_attempts(attempts, now_ts, window_seconds)
+
+    backend_recovery_state["attempt_timestamps"] = attempts
+    backend_recovery_state["max_attempts"] = max_attempts
+    backend_recovery_state["window_seconds"] = window_seconds
+    backend_recovery_state["retry_after_seconds"] = retry_after
+
+    if len(attempts) >= max_attempts:
+        backend_recovery_state["in_progress"] = False
+        backend_recovery_state["last_failure"] = (
+            f"self-heal throttled: max {max_attempts} attempts in {window_seconds}s"
+        )
+        logger.error(
+            "self-heal giving up: max attempts reached (%s attempts in %ss); manual intervention required",
+            max_attempts,
+            window_seconds,
+        )
+        return False
+
+    backend_recovery_state["in_progress"] = True
+    remaining = max_attempts - len(attempts)
+
+    try:
+        for local_attempt in range(remaining):
+            attempt_started = time.time()
+            attempts.append(attempt_started)
+            backend_recovery_state["attempt_timestamps"] = attempts
+            attempt_number = len(attempts)
+
+            logger.warning(
+                "self-heal attempt %s/%s started (window=%ss)",
+                attempt_number,
+                max_attempts,
+                window_seconds,
+            )
+
+            try:
+                restarted = start_llama_server(None)
+                if restarted is None:
+                    raise RuntimeError("start_llama_server returned None")
+
+                llama_process = restarted
+                backend_ready = await wait_for_llama_server(startup_timeout)
+                if backend_ready:
+                    backend_recovery_state["last_failure"] = None
+                    logger.info("self-heal succeeded on attempt %s/%s", attempt_number, max_attempts)
+                    return True
+
+                raise RuntimeError("wait_for_llama_server returned False")
+            except Exception as exc:
+                backend_ready = False
+                llama_process = None
+                current_model = None
+                backend_recovery_state["last_failure"] = str(exc)
+                logger.error(
+                    "self-heal attempt %s/%s failed: %s",
+                    attempt_number,
+                    max_attempts,
+                    exc,
+                )
+
+            if local_attempt < remaining - 1:
+                delay = base_backoff * (2 ** local_attempt)
+                logger.warning("self-heal backoff sleeping %.1fs before retry", delay)
+                await asyncio.sleep(delay)
+
+        logger.error(
+            "self-heal exhausted after %s attempt(s) within %ss; manual intervention required",
+            remaining,
+            window_seconds,
+        )
+        return False
+    finally:
+        backend_recovery_state["in_progress"] = False
+
+
 async def _backend_watchdog_loop() -> None:
     """Watch local backend process and trigger best-effort recovery."""
     global llama_process, current_model, backend_ready
@@ -3635,7 +3839,7 @@ async def _backend_watchdog_loop() -> None:
     while True:
         try:
             interval = float(config.get("server", {}).get("llama_watchdog_interval_seconds", 5.0) or 5.0)
-            await asyncio.sleep(max(1.0, interval))
+            await asyncio.sleep(max(0.0, interval))
 
             proc = llama_process
             if proc is None:
@@ -3647,29 +3851,31 @@ async def _backend_watchdog_loop() -> None:
             except Exception:
                 code = None
 
+            worker_unhealthy = False
             if code is None:
-                continue
+                worker_unhealthy = _worker_process_unhealthy(proc)
+                if not worker_unhealthy:
+                    continue
 
             router_mode = bool(config.get("server", {}).get("llama_router_mode", False))
-            logger.error("watchdog detected llama-server exit code=%s model=%s", code, current_model)
+            if code is None and worker_unhealthy:
+                logger.error("watchdog detected unhealthy worker while main process is alive model=%s", current_model)
+                try:
+                    if hasattr(proc, "terminate"):
+                        proc.terminate()
+                except Exception:
+                    pass
+            else:
+                logger.error("watchdog detected llama-server exit code=%s model=%s", code, current_model)
+
             backend_ready = False
             _record_backend_signal("other_failures")
             llama_process = None
             current_model = None
 
-            # In router mode, attempt best-effort automatic restart.
             if router_mode:
-                try:
-                    restarted = start_llama_server(None)
-                    if restarted is not None:
-                        llama_process = restarted
-                        timeout = int(config.get("server", {}).get("llama_startup_timeout", 300) or 300)
-                        backend_ready = await wait_for_llama_server(timeout)
-                        logger.info("watchdog router restart backend_ready=%s", backend_ready)
-                    else:
-                        logger.error("watchdog failed to restart router process")
-                except Exception:
-                    logger.exception("watchdog restart attempt failed")
+                recovered = await _attempt_router_self_heal()
+                logger.info("watchdog router self-heal recovered=%s", recovered)
 
         except asyncio.CancelledError:
             return
@@ -3680,13 +3886,21 @@ async def _backend_watchdog_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global config, logger, llama_process, _http_client, backend_watchdog_task, backend_ready
+    global config, logger, llama_process, _http_client, backend_watchdog_task, backend_ready, backend_recovery_state
     
     # Startup
     config = load_config()
     logger = setup_logging(config)
     logger.info("Starting LLama Proxy Server")
     backend_ready = False
+    backend_recovery_state = {
+        "in_progress": False,
+        "attempt_timestamps": [],
+        "max_attempts": int(config.get("server", {}).get("llama_self_heal_max_attempts", 3) or 3),
+        "window_seconds": int(config.get("server", {}).get("llama_self_heal_window_seconds", 300) or 300),
+        "retry_after_seconds": int(config.get("server", {}).get("llama_self_heal_retry_after_seconds", 30) or 30),
+        "last_failure": None,
+    }
 
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(5.0),
@@ -5260,17 +5474,58 @@ async def get_llama_local_status():
     return result
 
 
+async def _probe_backend_reachable(llama_port: int) -> bool:
+    """Actively probe backend reachability so /health reflects real connectivity."""
+    if llama_port <= 0:
+        return False
+
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    router_mode = bool(server_cfg.get("llama_router_mode", False))
+    timeout_seconds = float(server_cfg.get("llama_backend_probe_timeout_seconds", 2.0) or 2.0)
+
+    probe_paths: list[str] = []
+    if router_mode and current_model:
+        probe_paths.append(f"/slots?model={current_model}")
+    if router_mode:
+        probe_paths.extend(["/models", "/health"])
+    else:
+        probe_paths.append("/health")
+
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+    try:
+        for probe_path in probe_paths:
+            try:
+                url = f"http://localhost:{llama_port}{probe_path}"
+                response = await client.get(url, timeout=timeout_seconds)
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if 200 <= status_code < 500:
+                    return True
+            except Exception:
+                continue
+        return False
+    finally:
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint with readiness gating."""
-    router_mode = config.get("server", {}).get("llama_router_mode", False)
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    router_mode = bool(server_cfg.get("llama_router_mode", False))
     loaded_models = None
     if router_mode:
         router_models = await router_list_models()
         loaded_models = _extract_router_model_ids(router_models)
 
     llama_running = llama_process is not None and llama_process.poll() is None
-    ready = bool(llama_running and backend_ready)
+    llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+    backend_reachable = bool(llama_running and await _probe_backend_reachable(llama_port))
+    self_healing = _is_self_healing_active()
+    ready = bool(llama_running and backend_ready and backend_reachable and not self_healing)
 
     return {
         "status": "healthy" if ready else "degraded",
@@ -5278,6 +5533,9 @@ async def health_check():
         "current_model": current_model,
         "loaded_models": loaded_models,
         "llama_server_running": llama_running,
+        "backend_reachable": backend_reachable,
+        "self_healing_in_progress": self_healing,
+        "backend_recovery": _backend_recovery_snapshot(),
         "backend_signals": dict(backend_signal_counts),
     }
 
@@ -6272,6 +6530,7 @@ async def admin_metrics():
             "session_invalidation_reasons": dict(session_guardrail_observability.get("session_invalidation_reasons", {})),
         },
         "backend_ready": bool(backend_ready),
+        "backend_recovery": _backend_recovery_snapshot(),
         "backend_signals": dict(backend_signal_counts),
     }
 
