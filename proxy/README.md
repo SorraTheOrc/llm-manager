@@ -96,13 +96,17 @@ sudo install -m 0755 proxy/proxyctl /usr/local/bin/proxyctl
 Usage examples:
 
 ```sh
-proxyctl start    # start using proxy/config.yaml llama_start_script or start-llama.sh
-proxyctl status   # show running status and PID
-proxyctl logs     # tail the proxy logs
-proxyctl stop     # stop the running proxy
+proxyctl start              # start using proxy/config.yaml llama_start_script or start-llama.sh
+proxyctl start --dev        # start dev instance (port 8001, DEBUG logging, auto-reload)
+proxyctl status             # show running status and PID
+proxyctl status --dev       # show dev instance status
+proxyctl logs               # tail the proxy logs
+proxyctl logs --dev         # tail dev instance logs
+proxyctl stop               # stop the running proxy
+proxyctl stop --dev         # stop the dev instance
 ```
 
-The script respects `LLAMA_START_SCRIPT` environment variable and `proxy/config.yaml` `server.llama_start_script` entry when determining what to run.
+The script respects `LLAMA_START_SCRIPT` environment variable and `proxy/config.yaml` `server.llama_start_script` entry when determining what to run. Use the `--dev` flag to run in development mode, or set `LLAMA_PROXY_DEV=1` to force dev mode via environment variable.
 
 ## Configuration
 
@@ -213,8 +217,65 @@ openai:
 | Variable | Description |
 |----------|-------------|
 | `LLAMA_PROXY_CONFIG` | Path to config file (default: `./config.yaml`) |
+| `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
+| `LLAMA_START_SCRIPT` | Override the start script path (used by proxyctl) |
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
+| `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
+| `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
+| `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
+| `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
+
+### Development Mode
+
+The proxy supports a development mode that allows running a dev instance side-by-side with the production proxy. Dev mode uses alternate ports, DEBUG logging, and auto-reload for rapid iteration.
+
+#### Dev Mode Ports
+
+| Component | Default (prod) | Default (dev) | Overridable via |
+|-----------|---------------|---------------|----------------|
+| Proxy web server | 8000 | 8001 | `PROXY_PORT` env var |
+| llama-server backend | 8080 | 8081 | `LLAMA_SERVER_PORT` or `PORT` env var |
+
+#### Using Dev Mode with proxyctl
+
+```bash
+# Start dev instance (auto-reload + DEBUG logging)
+proxyctl start --dev
+
+# Check dev instance status
+proxyctl status --dev
+
+# View dev logs
+proxyctl logs --dev
+
+# Restart dev instance
+proxyctl restart --dev
+
+# Stop dev instance
+proxyctl stop --dev
+```
+
+#### Direct uvicorn invocation
+
+You can also run the proxy directly with uvicorn for development:
+
+```bash
+source .venv/bin/activate
+export LLAMA_PROXY_DEV=1
+python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
+```
+
+#### Dev Mode Details
+
+- **Opt-in only**: Dev mode must be explicitly enabled via `--dev` flag or `LLAMA_PROXY_DEV=1` environment variable
+- **Separate PID file**: Dev instances use `proxy.dev.pid` to avoid conflicts with production
+- **Separate log directory**: Dev logs go to `$XDG_STATE_HOME/llama-proxy-dev/logs/` (or `~/.local/state/llama-proxy-dev/logs/`)
+- **Auto-reload**: Code changes trigger automatic server restarts during development
+- **DEBUG logging**: All log levels are emitted for maximum visibility during development
+- **No production impact**: Dev mode does not modify production config or defaults
+
+> **Warning**: Ensure no other service is listening on port 8001 or 8081 before starting the dev instance.
 
 Systemd-specific instructions removed. If you run systemd units outside this repository, add environment variables via `systemctl edit <unit>` or your system's preferred method.
 
@@ -222,10 +283,24 @@ Systemd-specific instructions removed. If you run systemd units outside this rep
 
 ### Starting the Server
 
-**Development:**
+**With proxyctl (recommended):**
+```bash
+# Production (default port 8000)
+proxyctl start
+
+# Development (port 8001, DEBUG logging, auto-reload)
+proxyctl start --dev
+```
+
+**Direct uvicorn:**
 ```bash
 source .venv/bin/activate
-python -m uvicorn server:app --host 0.0.0.0 --port 8000
+# Production
+python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
+
+# Development (with auto-reload and DEBUG logging)
+LLAMA_PROXY_DEV=1 python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
+```
 ```
 
 **Production:** Run the proxy under your platform's service manager or keep it as a manually started process:
