@@ -140,6 +140,40 @@ def schedule_background_load(model_name: str) -> bool:
     return True
 
     
+def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
+    """Extract `n_tokens` and `progress` from llama-server stdout progress lines.
+
+    Returns a tuple (n_tokens: int, progress: float) or None if the line does
+    not contain valid progress data.
+
+    Examples of supported lines:
+        "slot 1 : prompt processing progress, n_tokens = 26988, progress = 0.658083"
+    The parser is conservative: it requires both `n_tokens` and `progress`
+    fields and at least one comma to avoid false positives from unrelated
+    text that mentions the word 'progress'.
+    """
+    if not isinstance(line, str):
+        return None
+    text = line.strip()
+    if not text:
+        return None
+    # Require explicit field markers to avoid false positives
+    if 'n_tokens' not in text or 'progress' not in text:
+        return None
+    # Require at least one comma present to resemble expected formats
+    if ',' not in text:
+        return None
+    try:
+        m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
+        m_progress = re.search(r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b', text, flags=re.IGNORECASE)
+        if not m_tokens or not m_progress:
+            return None
+        n_tokens = int(m_tokens.group(1))
+        progress = float(m_progress.group(1))
+        return (n_tokens, progress)
+    except Exception:
+        return None
+
 # Request counting
 request_counts: dict = {}
 counts_lock = asyncio.Lock()
