@@ -174,6 +174,108 @@ def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
     except Exception:
         return None
 
+# Polling state for /slots API (model -> latest data)
+slot_polling_state: dict = {}
+# Internal record of active polling tasks (model -> asyncio.Task)
+_slot_polling_tasks: dict = {}
+
+async def poll_slots_for_model(model: str, llama_port: int = 0, interval: float = 0.5, max_polls: Optional[int] = None) -> None:
+    """Poll the llama-server `/slots` endpoint for a given model and update
+    `slot_polling_state[model]` with a dict containing `is_processing` and
+    `n_decoded` (or None).
+
+    This function is intentionally conservative: it tolerates a variety of
+    response formats (list-of-slots or single-slot dict) and never raises
+    on parse errors — instead it records `None` values for missing data.
+
+    The optional ``max_polls`` parameter is useful for tests to limit the
+    number of iterations.
+    """
+    polls = 0
+    if not model:
+        return None
+    slots_url = f"http://localhost:{llama_port}/slots?model={model}"
+    while True:
+        try:
+            client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+            # Support either an injected async client instance or creating a
+            # temporary AsyncClient context when none is provided.
+            if getattr(client, '__aenter__', None):
+                # client supports async context manager
+                async with client as c:
+                    resp = await c.get(slots_url, timeout=5.0)
+            else:
+                resp = await client.get(slots_url, timeout=5.0)
+
+            if resp is not None and getattr(resp, 'status_code', None) == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = None
+
+                n_decoded = None
+                is_processing = False
+                if isinstance(data, list):
+                    if data:
+                        slot = data[0]
+                        is_processing = bool(slot.get('is_processing', False))
+                        next_token = slot.get('next_token') if isinstance(slot.get('next_token'), dict) else None
+                        if next_token is not None and 'n_decoded' in next_token:
+                            n_decoded = next_token.get('n_decoded')
+                        else:
+                            # Fallback to top-level field if present
+                            n_decoded = slot.get('n_decoded')
+                elif isinstance(data, dict):
+                    is_processing = bool(data.get('is_processing', False))
+                    next_token = data.get('next_token')
+                    if isinstance(next_token, dict) and 'n_decoded' in next_token:
+                        n_decoded = next_token.get('n_decoded')
+                    else:
+                        n_decoded = data.get('n_decoded')
+
+                slot_polling_state[model] = {'is_processing': is_processing, 'n_decoded': n_decoded}
+            else:
+                # Non-200 or missing response — mark as not processing
+                slot_polling_state[model] = {'is_processing': False, 'n_decoded': None}
+        except Exception:
+            # On any error, record a safe fallback and continue
+            slot_polling_state[model] = {'is_processing': False, 'n_decoded': None}
+
+        polls += 1
+        if max_polls is not None and polls >= max_polls:
+            break
+
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_slot_polling(model: str, llama_port: int, interval: float = 0.5) -> None:
+    """Start an asyncio task to poll the slots endpoint for `model`.
+
+    If an active poller already exists for the model it will not start a
+    duplicate. If called from a non-async context (no running loop) a
+    background thread will be created that runs its own asyncio loop.
+    """
+    if not model:
+        return None
+    if model in _slot_polling_tasks and not _slot_polling_tasks[model].done():
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(poll_slots_for_model(model, llama_port, interval, None))
+        _slot_polling_tasks[model] = task
+    except RuntimeError:
+        # No running event loop in this thread — spawn a thread to run one
+        def _run():
+            try:
+                asyncio.run(poll_slots_for_model(model, llama_port, interval, None))
+            except Exception:
+                pass
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
 # Request counting
 request_counts: dict = {}
 counts_lock = asyncio.Lock()
