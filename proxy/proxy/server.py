@@ -1357,6 +1357,7 @@ def setup_logging(config: dict) -> logging.Logger:
         # Dev mode: use XDG-based dev log directory with DEBUG level
         xdg_state = os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
         log_dir = Path(xdg_state) / "llama-proxy-dev" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         log_level = "DEBUG"
         print(f"[INFO] Dev mode: using log directory {log_dir} at level {log_level}")
     else:
