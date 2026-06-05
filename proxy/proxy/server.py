@@ -276,6 +276,30 @@ def start_slot_polling(model: str, llama_port: int, interval: float = 0.5) -> No
         t = threading.Thread(target=_run, daemon=True)
         t.start()
 
+def format_progress(n_tokens: int, total_tokens: int, progress: float) -> str:
+    """Return a formatted, ANSI-dimmed, in-place-updating progress string.
+
+    The returned string begins with a carriage return ("\r") so it can be
+    written to stderr repeatedly to update a single console line in-place.
+
+    Percentage is truncated to an integer (no decimals) to match UX
+    expectations (e.g. 0.658 -> 65%). The output is ANSI-dimmed and the
+    ANSI reset code is appended so subsequent console output is unaffected.
+    """
+    try:
+        pct = int(max(0, min(100, int(progress * 100))))
+    except Exception:
+        try:
+            pct = int(max(0, min(100, int(float(progress) * 100))))
+        except Exception:
+            pct = 0
+    # Truncate rather than round (floor) to match example behaviour.
+    pct = int(max(0, min(100, int(progress * 100)))) if isinstance(progress, (int, float)) else pct
+    dim = "\x1b[2m"
+    reset = "\x1b[0m"
+    body = f"Processing {n_tokens}/{total_tokens} tokens ({pct}%)"
+    return f"\r{dim}{body}{reset}"
+
 # Request counting
 request_counts: dict = {}
 counts_lock = asyncio.Lock()
