@@ -2,6 +2,7 @@ import io
 import logging
 import json
 import pytest
+import re
 
 from pathlib import Path
 
@@ -35,6 +36,11 @@ def _configure_logger_for_test(tmp_path: Path):
     return logger, console_handler, strio
 
 
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from text."""
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+
 @pytest.mark.parametrize("chunk,expected", [
     (b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n', "hello"),
     (b'data: {"choices":[{"delta":{"content":"first\\n"}}]}\n\n', "first\n"),
@@ -45,7 +51,8 @@ def test_console_prints_delta_content(tmp_path, chunk, expected):
     server.log_response_chunk(chunk)
 
     out = strio.getvalue()
-    assert out == expected
+    # Content is wrapped in bold ANSI codes, so strip them for comparison
+    assert _strip_ansi(out) == expected
 
 
 def test_console_suppresses_non_json_chunks(tmp_path):
@@ -58,3 +65,29 @@ def test_console_suppresses_non_json_chunks(tmp_path):
     out = strio.getvalue()
     # Raw content should NOT appear in console - only extracted delta.content
     assert out == ""
+
+
+def test_console_formats_reasoning_content_as_dim(tmp_path):
+    """reasoning_content should be displayed with dim/grey formatting."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    # Should contain DIM ANSI code (\x1b[2m) for reasoning_content
+    assert '\x1b[2m' in out
+    assert 'thinking' in _strip_ansi(out)
+
+
+def test_console_formats_content_as_bold(tmp_path):
+    """content should be displayed with bold formatting."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    # Should contain BOLD ANSI code (\x1b[1m) for content
+    assert '\x1b[1m' in out
+    assert 'hello' in _strip_ansi(out)

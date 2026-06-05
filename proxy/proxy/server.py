@@ -1027,25 +1027,69 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
     values from any JSON payloads inside the chunk and write only the
     concatenated content to the console stream (without adding extra
     newlines). Raw JSON is never displayed in the console - only extracted
-    text content is shown. For other records, normal formatting is used.
+    text content is shown.
+
+    - reasoning_content is displayed in dim/grey
+    - content is displayed in bold
+
+    For other records, normal formatting is used.
     """
 
     PREFIX = "STREAM CHUNK | "
+    # ANSI escape codes
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    def _extract_and_format_content(self, chunk_str: str) -> Optional[str]:
+        """Extract content from chunk and apply formatting based on type.
+        
+        Returns formatted string with ANSI codes, or None if no content found.
+        """
+        if not chunk_str:
+            return None
+        
+        parts: list[str] = []
+        for line in chunk_str.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                j = json.loads(payload)
+            except Exception:
+                continue
+            for choice in j.get("choices", []):
+                delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    continue
+                # Check reasoning_content first (dim)
+                reasoning = delta.get("reasoning_content")
+                if reasoning is not None:
+                    parts.append(f"{self.DIM}{reasoning}{self.RESET}")
+                # Check content (bold)
+                content = delta.get("content")
+                if content is not None:
+                    parts.append(f"{self.BOLD}{content}{self.RESET}")
+        
+        return "".join(parts) if parts else None
 
     def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - exercised by integration
         try:
             msg = record.getMessage()
             if isinstance(msg, str) and msg.startswith(self.PREFIX):
                 chunk_str = msg[len(self.PREFIX):]
-                content = extract_streamed_content_from_chunk(chunk_str)
-                if content is not None and content:
+                formatted = self._extract_and_format_content(chunk_str)
+                if formatted:
                     # Ensure stream exists
                     if getattr(self, 'stream', None) is None:
                         self.stream = sys.stderr
                     try:
-                        # Write content as-is. Do not append an extra newline;
+                        # Write formatted content. Do not append extra newline;
                         # the content may include its own newline characters.
-                        self.stream.write(content)
+                        self.stream.write(formatted)
                         try:
                             self.flush()
                         except Exception:
