@@ -135,6 +135,8 @@ async def test_proxy_to_local_concurrency_reject_increments_signal(monkeypatch):
         },
     )
     monkeypatch.setattr(server, "active_queries", 1)
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "llama_process", type("P", (), {"poll": lambda s: None, "pid": 1})())
 
     with pytest.raises(HTTPException) as excinfo:
         await server.proxy_to_local(DummyRequest(), "v1/chat/completions")
@@ -292,6 +294,8 @@ async def test_proxy_preserves_backend_error_when_not_self_healing(monkeypatch):
         },
     )
     monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "llama_process", type("P", (), {"poll": lambda s: None, "pid": 1})())
     monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
 
     response = await server.proxy_to_local(DummyRequest(), "v1/completions")
@@ -474,6 +478,8 @@ async def test_proxy_handles_history_mismatch_and_backend_failure(monkeypatch):
         },
     )
     monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(server, "llama_process", type("P", (), {"poll": lambda s: None, "pid": 1})())
     monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
 
     response = await server.proxy_to_local(DummyRequest(), "v1/chat/completions")
@@ -484,3 +490,162 @@ async def test_proxy_handles_history_mismatch_and_backend_failure(monkeypatch):
     # Ensure session headers are present and show the session was re-created
     assert response.headers.get("X-Session-Id") == sid
     assert response.headers.get("X-Session-Created") == "true"
+
+
+# ---------------------------------------------------------------------------
+# LP-0MQ4GQ2LO005PZPY: Eliminate 500s during backend recovery window
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_proxy_returns_503_when_backend_ready_is_false(monkeypatch):
+    """proxy_to_local returns 503 immediately when backend_ready is False
+    without attempting any backend connection."""
+    connect_attempted = []
+
+    class DummyRequest:
+        headers = {}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/chat/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","messages":[{"role":"user","content":"hi"}]}'
+
+    async def should_not_be_called(*_args, **_kwargs):
+        connect_attempted.append(True)
+        raise RuntimeError("should not connect to backend")
+
+    monkeypatch.setattr(server, "backend_ready", False)
+    monkeypatch.setattr(server, "llama_process", None)
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "_call_with_backend_retries", should_not_be_called)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "llama_request_timeout": 1,
+            }
+        },
+    )
+
+    response = await server.proxy_to_local(DummyRequest(), "v1/chat/completions")
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 503
+    assert payload["status"] == 503
+    assert "backend" in payload["error"]["type"].lower() or "unavailable" in payload["error"]["message"].lower()
+    assert connect_attempted == [], "backend should not have been contacted"
+
+
+@pytest.mark.asyncio
+async def test_proxy_returns_503_when_llama_process_is_none(monkeypatch):
+    """proxy_to_local returns 503 immediately when llama_process is None
+    even if backend_ready hasn't been set to False yet."""
+    connect_attempted = []
+
+    class DummyRequest:
+        headers = {}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/chat/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","messages":[{"role":"user","content":"hi"}]}'
+
+    async def should_not_be_called(*_args, **_kwargs):
+        connect_attempted.append(True)
+        raise RuntimeError("should not connect to backend")
+
+    monkeypatch.setattr(server, "backend_ready", True)  # not yet updated by watchdog
+    monkeypatch.setattr(server, "llama_process", None)
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "_call_with_backend_retries", should_not_be_called)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "llama_request_timeout": 1,
+            }
+        },
+    )
+
+    response = await server.proxy_to_local(DummyRequest(), "v1/chat/completions")
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 503
+    assert payload["status"] == 503
+    assert connect_attempted == [], "backend should not have been contacted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_watchdog_retries_restart_when_process_is_none(monkeypatch):
+    """Watchdog attempts restart even when llama_process is None
+    (i.e. after a failed self-heal or initial crash)."""
+    restart_calls = []
+
+    def fake_start(model=None):
+        restart_calls.append(model)
+        fake_proc = type("P", (), {"poll": lambda self: None, "pid": 999})()
+        return fake_proc
+
+    async def fake_wait(timeout):
+        return True
+
+    monkeypatch.setattr(server, "start_llama_server", fake_start)
+    monkeypatch.setattr(server, "wait_for_llama_server", fake_wait)
+    monkeypatch.setattr(server, "llama_process", None)
+    monkeypatch.setattr(server, "current_model", None)
+    monkeypatch.setattr(server, "backend_ready", False)
+    monkeypatch.setattr(
+        server,
+        "backend_recovery_state",
+        {
+            "in_progress": False,
+            "attempt_timestamps": [],
+            "max_attempts": 3,
+            "window_seconds": 300,
+            "retry_after_seconds": 30,
+            "last_failure": None,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": True,
+                "llama_watchdog_interval_seconds": 0.01,
+                "llama_self_heal_max_attempts": 2,
+                "llama_self_heal_window_seconds": 300,
+                "llama_self_heal_backoff_base_seconds": 0,
+                "llama_startup_timeout": 5,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "logger", type("L", (), {
+        "error": lambda *a, **kw: None,
+        "warning": lambda *a, **kw: None,
+        "info": lambda *a, **kw: None,
+        "exception": lambda *a, **kw: None,
+    })())
+    monkeypatch.setattr(server, "_record_backend_signal", lambda *a: None)
+
+    # Run watchdog for a short time
+    task = asyncio.create_task(server._backend_watchdog_loop())
+    await asyncio.sleep(0.15)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Watchdog should have attempted restart even though process was None
+    assert len(restart_calls) >= 1, f"Expected at least 1 restart attempt, got {len(restart_calls)}"

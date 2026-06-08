@@ -2688,7 +2688,25 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     if _is_self_healing_active():
         return _self_healing_response(path)
-    
+
+    # LP-0MQ4GQ2LO005PZPY: Return 503 immediately when backend is unavailable.
+    # This covers the gap between a backend crash and watchdog detection/recovery,
+    # preventing clients from seeing raw 500s from the dead backend.
+    if not backend_ready or llama_process is None:
+        retry_after = _self_heal_retry_after_seconds()
+        headers_err = {"Retry-After": str(retry_after), "Cache-Control": "no-store"}
+        payload = {
+            "error": {
+                "type": "backend_unavailable",
+                "code": "backend_unavailable",
+                "message": "Backend is not available, please retry later",
+            },
+            "status": 503,
+            "path": f"/{path.lstrip('/')}",
+            "retry_after": retry_after,
+        }
+        return JSONResponse(status_code=503, content=payload, headers=headers_err)
+
     # Get request body
     body = await request.body()
 
@@ -3892,7 +3910,15 @@ async def _backend_watchdog_loop() -> None:
             await asyncio.sleep(max(0.0, interval))
 
             proc = llama_process
+
+            # LP-0MQ4GQ2LO005PZPY: If process is None (crashed or never started),
+            # attempt restart in router mode instead of skipping.
             if proc is None:
+                router_mode = bool(config.get("server", {}).get("llama_router_mode", False))
+                if router_mode and not backend_ready:
+                    logger.warning("watchdog: llama_process is None, attempting restart")
+                    recovered = await _attempt_router_self_heal()
+                    logger.info("watchdog restart-from-none recovered=%s", recovered)
                 continue
 
             code = None
