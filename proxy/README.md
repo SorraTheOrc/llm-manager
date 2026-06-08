@@ -696,6 +696,32 @@ The proxy now adds bounded backend retries for transient local transport failure
 - `server.backend_retry_max_delay_seconds`
 - `server.backend_retry_jitter_ratio`
 
+#### Adaptive Timeouts
+
+The proxy supports adaptive timeouts that scale based on prompt size. This
+prevents unnecessary timeouts for large prompts while keeping reasonable
+limits for small requests.
+
+Enable with:
+
+- `server.llama_adaptive_timeout_enabled` (default `false`)
+- `server.llama_adaptive_timeout_base_seconds` (default `60`)
+- `server.llama_adaptive_timeout_per_token_seconds` (default `0.01`)
+- `server.llama_request_timeout` (default `300`) — used as max timeout cap
+
+The adaptive timeout formula is:
+```
+timeout = min(base + per_token * estimated_tokens, max_timeout)
+```
+
+For example, with default settings:
+- Small prompt (100 tokens): `60 + 0.01 * 100 = 61s`
+- Medium prompt (1000 tokens): `60 + 0.01 * 1000 = 70s`
+- Large prompt (10000 tokens): `60 + 0.01 * 10000 = 160s`
+- Very large prompt (25000 tokens): capped at `300s`
+
+Token estimation uses a heuristic of ~4 bytes per token for UTF-8 text.
+
 Concurrency pressure is controlled by `server.max_concurrent_queries` (default 4).
 When the guard rejects a request, the proxy returns a 503 and increments
 `backend_signals.concurrency_rejects`.

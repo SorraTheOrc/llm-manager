@@ -628,6 +628,51 @@ def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitt
     return delay
 
 
+def _estimate_prompt_tokens(body_json: dict) -> int:
+    """Estimate prompt token count from request body.
+    
+    Returns estimated token count based on message content length.
+    Uses a heuristic of ~4 bytes per token for UTF-8 text.
+    """
+    if not isinstance(body_json, dict):
+        return 0
+    messages = body_json.get("messages", [])
+    if not messages:
+        return 0
+    # Concatenate all message content
+    total_chars = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                # Handle array content (e.g., multimodal)
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        total_chars += len(str(item["text"]))
+    # Heuristic: ~4 bytes per token
+    return max(1, total_chars // 4)
+
+
+def _compute_adaptive_timeout(
+    body_json: dict,
+    base_timeout: float,
+    per_token_timeout: float,
+    max_timeout: float,
+) -> float:
+    """Compute adaptive timeout based on prompt size.
+    
+    Timeout = min(base_timeout + per_token_timeout * estimated_tokens, max_timeout)
+    
+    This allows larger prompts to have longer timeouts while keeping
+    a reasonable upper bound.
+    """
+    estimated_tokens = _estimate_prompt_tokens(body_json)
+    adaptive = base_timeout + (per_token_timeout * estimated_tokens)
+    return min(adaptive, max_timeout)
+
+
 async def _call_with_backend_retries(call_factory, path: str, stream: bool = False):
     """Execute backend call with bounded retries on connect/read failures."""
     server_cfg = config.get("server", {})
@@ -2951,7 +2996,21 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Check if streaming is requested
     is_streaming = body_json.get("stream", False)
     
-    request_timeout = httpx.Timeout(server_config.get("llama_request_timeout", 300))
+    # Compute request timeout - use adaptive timeout if enabled
+    adaptive_enabled = server_config.get("llama_adaptive_timeout_enabled", False)
+    if adaptive_enabled and body_json:
+        base_timeout = float(server_config.get("llama_adaptive_timeout_base_seconds", 60))
+        per_token_timeout = float(server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01))
+        max_timeout = float(server_config.get("llama_request_timeout", 300))
+        timeout_seconds = _compute_adaptive_timeout(body_json, base_timeout, per_token_timeout, max_timeout)
+        logger.debug(
+            "Adaptive timeout: tokens=%d timeout=%.1fs",
+            _estimate_prompt_tokens(body_json),
+            timeout_seconds,
+        )
+    else:
+        timeout_seconds = server_config.get("llama_request_timeout", 300)
+    request_timeout = httpx.Timeout(timeout_seconds)
     
     if is_streaming:
         session_guard = session_single_flight_coordinator.acquire(
