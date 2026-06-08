@@ -714,6 +714,14 @@ Self-healing uses exponential backoff and is capped by:
 
 While self-healing is active, proxy requests return HTTP `503` with
 `Retry-After: 30` and a machine-readable `backend_recovery_in_progress` payload.
+
+If the backend is unavailable (either `backend_ready` is `false` or the backend
+process has not been started), requests to `/v1/chat/completions` and other
+completions endpoints immediately return HTTP `503` with a `backend_unavailable`
+payload and `Retry-After` header, **without** attempting to connect to the
+backend. This eliminates the window between a backend crash and watchdog
+detection where clients would previously receive raw 500 errors.
+
 When self-healing is not active, existing backend failure behavior is unchanged.
 
 #### Fault-injection validation (reproducible)
