@@ -7,6 +7,9 @@ This module exposes a small set of metrics required by LP-0MNA7G5JB004P5O6:
 - llm_model_load_events_total{model="...",event="load|unload"} (counter)
 - llm_models_loaded (gauge)
 
+Extended by LP-0MQ1HDY1N00502S7:
+- proxy_http_errors_total{endpoint="...",status="...",reason="..."} (counter)
+
 The implementation is best-effort: when router-mode exposes multiple models in a
 single process we estimate per-model RSS by dividing the process RSS equally
 across loaded models (documented). If prometheus_client is not installed the
@@ -31,6 +34,7 @@ llama_process_rss_bytes = None
 llama_model_rss_bytes = None
 llama_model_load_events_total = None
 llama_models_loaded = None
+proxy_http_errors_total = None
 
 if _enabled:
     try:
@@ -45,6 +49,11 @@ if _enabled:
         )
         llama_models_loaded = Gauge(
             'llama_models_loaded', 'Number of models currently loaded in the llama-server'
+        )
+        proxy_http_errors_total = Counter(
+            'proxy_http_errors_total',
+            'Total HTTP errors by endpoint, status class, and reason',
+            ['endpoint', 'status', 'reason']
         )
     except Exception:  # pragma: no cover - defensive
         _enabled = False
@@ -113,6 +122,25 @@ def record_model_unloaded(model: str):
         return
     try:
         llama_model_load_events_total.labels(model=model, event='unload').inc()
+    except Exception:
+        pass
+
+
+def record_http_error(endpoint: str, status: str, reason: str):
+    """Increment proxy_http_errors_total with the given label values.
+
+    Args:
+        endpoint: The API endpoint path, e.g. "v1/chat/completions".
+        status: The HTTP status class, e.g. "5xx".
+        reason: A short identifier for the error cause, e.g. "backend_error".
+
+    This is a best-effort no-op when prometheus_client is not installed
+    or the counter is unavailable.
+    """
+    if not _enabled or proxy_http_errors_total is None:
+        return
+    try:
+        proxy_http_errors_total.labels(endpoint=endpoint, status=status, reason=reason).inc()
     except Exception:
         pass
 

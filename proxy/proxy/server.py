@@ -35,6 +35,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from proxy.session_manager import SessionManager, DEFAULT_SESSION_TTL_SECONDS
 import proxy.metrics as metrics
+from proxy.metrics import record_http_error
 
 # Global state
 llama_process: Optional[subprocess.Popen] = None
@@ -2869,6 +2870,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     target_url = f"http://localhost:{llama_port}/{path}"
 
     if _is_self_healing_active():
+        record_http_error("v1/chat/completions", "5xx", "self_healing")
         return _self_healing_response(path)
 
     # LP-0MQ4GQ2LO005PZPY: Return 503 immediately when backend is unavailable.
@@ -2887,6 +2889,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             "path": f"/{path.lstrip('/')}",
             "retry_after": retry_after,
         }
+        record_http_error("v1/chat/completions", "5xx", "backend_unavailable")
         return JSONResponse(status_code=503, content=payload, headers=headers_err)
 
     # Get request body
@@ -3061,6 +3064,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 if available_slots == 0 and total_slots > 0:
                     logger.warning(f"No available slots ({total_slots} total), rejecting request")
                     retry_after = int(server_config.get("slot_unavailable_retry_after", 5) or 5)
+                    record_http_error("v1/chat/completions", "5xx", "slot_exhaustion")
                     return JSONResponse(
                         status_code=503,
                         content={
@@ -3212,8 +3216,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     except Exception:
                         pass
                     if _is_self_healing_active():
+                        record_http_error("v1/chat/completions", "5xx", "self_healing")
                         return _self_healing_response(path)
                     # Return a 503 response indicating backend error instead of raising
+                    record_http_error("v1/chat/completions", "5xx", "backend_error")
                     retry_after = _self_heal_retry_after_seconds()
                     headers_err = {"Retry-After": str(retry_after), "Cache-Control": "no-store"}
                     if session_id:
@@ -3543,8 +3549,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             except Exception:
                                 backend_ready = False
                                 if _is_self_healing_active():
+                                    record_http_error("v1/chat/completions", "5xx", "self_healing")
                                     return _self_healing_response(path)
                                 # Return a 503 response indicating backend error instead of raising
+                                record_http_error("v1/chat/completions", "5xx", "backend_error")
                                 retry_after = _self_heal_retry_after_seconds()
                                 headers_err = {"Retry-After": str(retry_after), "Cache-Control": "no-store"}
                                 if session_id:

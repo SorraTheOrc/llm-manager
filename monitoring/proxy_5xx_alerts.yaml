@@ -1,0 +1,11 @@
+groups:
+  - name: proxy-5xx.rules
+    rules:
+      - alert: ProxyHttpErrorsHigh
+        expr: rate(proxy_http_errors_total{endpoint="/v1/chat/completions",status="5xx"}[5m]) > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Proxy 5xx rate exceeded threshold on /v1/chat/completions"
+          description: "The proxy returned 5xx errors at a rate of {{ $value }} per second over the last 5 minutes on {{ $labels.instance }}. Expected rate is <= 5 per 5 minutes. Investigate proxy logs, session_manager.py history_mismatch patterns, and llama-server health."

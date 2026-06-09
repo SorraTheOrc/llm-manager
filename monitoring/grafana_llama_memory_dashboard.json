@@ -28,6 +28,19 @@
       ],
       "datasource": "Prometheus",
       "gridPos": {"h": 4, "w": 24, "x": 0, "y": 8}
+    },
+    {
+      "type": "graph",
+      "title": "Proxy 5xx Errors (/v1/chat/completions)",
+      "id": 3,
+      "targets": [
+        {
+          "expr": "rate(proxy_http_errors_total{endpoint=\"/v1/chat/completions\",status=\"5xx\"}[5m])",
+          "legendFormat": "5xx_rate"
+        }
+      ],
+      "datasource": "Prometheus",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 12}
     }
   ],
   "schemaVersion": 16,

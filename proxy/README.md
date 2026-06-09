@@ -652,6 +652,7 @@ Available metrics (best-effort):
 - `llama_model_rss_bytes{model="..."}` (gauge) — estimated per-model RSS (when multiple models are loaded the proxy divides process RSS evenly across models as an approximation).
 - `llama_model_load_events_total{model="...",event="load|unload"}` (counter) — model lifecycle events.
 - `llama_models_loaded` (gauge) — number of loaded models reported by router-mode.
+- `proxy_http_errors_total{endpoint="...",status="...",reason="..."}` (counter) — HTTP errors by endpoint, status class, and reason. Incremented at each 5xx response from `proxy_to_local`. Reasons include: `backend_error`, `backend_unavailable`, `self_healing`, and `slot_exhaustion`. See [5xx Error Runbook](docs/runbook-5xx.md) for investigation guidance.
 
 Example Prometheus scrape config:
 
@@ -662,8 +663,16 @@ scrape_configs:
       - targets: ['localhost:8000']
 ```
 
-Alerting rules (warning at 75% of 90GB; critical at 90GB) are provided in `monitoring/llama_memory_alerts.yaml`.
-A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json`.
+### Alerting Rules
+
+- **Llama memory**: Warning at 75% of 90GB; critical at 90GB — `monitoring/llama_memory_alerts.yaml`.
+- **Proxy 5xx errors**: Critical alert when `rate(proxy_http_errors_total{endpoint="/v1/chat/completions",status="5xx"}[5m]) > 5` for 5 minutes — `monitoring/proxy_5xx_alerts.yaml`.
+
+A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json` with panels for llama-server RSS, models loaded, and proxy 5xx error rate.
+
+### Runbook
+
+See [5xx Error Runbook](docs/runbook-5xx.md) for on-call investigation, remediation, and escalation steps when the `ProxyHttpErrorsHigh` alert fires.
 
 ## Model Switching Behavior
 
