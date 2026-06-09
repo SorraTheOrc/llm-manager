@@ -1046,3 +1046,124 @@ class TestToolCallFromReasoning:
         from proxy.server import _is_empty_response
 
         assert _is_empty_response("   ") is True
+
+
+class TestEmptyRetry:
+    """Tests for _call_with_empty_retry retry-on-empty behavior."""
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_succeeds(self):
+        """First call returns non-empty response, no retry needed."""
+        from proxy.server import _call_with_empty_retry, _call_with_backend_retries
+
+        resp = MagicMock()
+        resp.content = b'{"choices":[{"message":{"content":"Hello"}}]}'
+
+        async def send_fn():
+            return resp
+
+        # _call_with_empty_retry uses _call_with_backend_retries internally;
+        # we patch it so the send_fn is called directly via the real wrapper.
+        # Use a side_effect that returns the response on first call.
+        with patch(
+            "proxy.server._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.return_value = resp
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions")
+
+            assert result is resp
+            mock_backend_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_first_empty_then_succeeds(self):
+        """First call returns empty, retry returns non-empty."""
+        from proxy.server import _call_with_empty_retry, _call_with_backend_retries
+
+        empty_resp = MagicMock()
+        empty_resp.content = b'{"choices":[{"message":{"content":null}}]}'
+        good_resp = MagicMock()
+        good_resp.content = b'{"choices":[{"message":{"content":"Hello"}}]}'
+
+        async def send_fn():
+            return empty_resp
+
+        with patch(
+            "proxy.server._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.side_effect = [empty_resp, good_resp]
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions", retry_delay=0.01)
+
+            assert result is good_resp
+            assert mock_backend_retry.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_empty_exhausts_retries(self):
+        """All calls return empty, retry exhausts and returns last response."""
+        from proxy.server import _call_with_empty_retry, _call_with_backend_retries
+
+        empty_resp = MagicMock()
+        empty_resp.content = b'{"choices":[{"message":{"content":null}}]}'
+
+        async def send_fn():
+            return empty_resp
+
+        with patch(
+            "proxy.server._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.side_effect = [empty_resp, empty_resp, empty_resp]
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions", retry_delay=0.01)
+
+            assert result is empty_resp
+            # 1 initial + 2 retries = 3 total
+            assert mock_backend_retry.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_non_json_content_passthrough(self):
+        """Non-JSON response content passes through without retry."""
+        from proxy.server import _call_with_empty_retry, _call_with_backend_retries
+
+        resp = MagicMock()
+        resp.content = b"Just plain text, not JSON"
+
+        async def send_fn():
+            return resp
+
+        with patch(
+            "proxy.server._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.return_value = resp
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions")
+
+            assert result is resp
+            mock_backend_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_call_in_reasoning_no_retry(self):
+        """Empty content but tool call in reasoning_content does not trigger retry."""
+        from proxy.server import _call_with_empty_retry, _call_with_backend_retries
+
+        resp = MagicMock()
+        resp.content = b'{"choices":[{"message":{"content":null,"reasoning_content":"<function=bash>\\n<parameter=command>\\nls -la\\n</parameter>\\n</function>"}}]}'
+
+        async def send_fn():
+            return resp
+
+        with patch(
+            "proxy.server._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.return_value = resp
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions")
+
+            assert result is resp
+            # No retry because tool call is present in reasoning_content
+            mock_backend_retry.assert_awaited_once()

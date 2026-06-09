@@ -21,7 +21,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from fnmatch import fnmatch
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 import shutil
@@ -838,10 +838,15 @@ def _is_empty_response(response_text: str, resp_json: Optional[dict] = None) -> 
     Used to detect cases where the model generates thinking content but
     produces no actual output. Returns True if the response has no usable
     content.
+
+    When resp_json is provided (OpenAI-style response), emptiness is determined
+    by the presence of assistant content (text or tool calls) in the JSON
+    structure, not by the raw text length.
+    When resp_json is not provided, falls back to checking if response_text
+    is blank or whitespace-only.
     """
-    if response_text and response_text.strip():
-        return False
     if resp_json:
+        # For JSON API responses, check the structured content
         content = _extract_assistant_content(resp_json)
         if content:
             return False
@@ -855,7 +860,60 @@ def _is_empty_response(response_text: str, resp_json: Optional[dict] = None) -> 
                     return False
         except Exception:
             pass
+        return True
+    # Fallback: check if the raw response text is blank or whitespace-only
+    if response_text and response_text.strip():
+        return False
     return True
+
+
+async def _call_with_empty_retry(
+    send_fn: Callable[[], Awaitable[httpx.Response]],
+    path: str,
+    max_retries: int = 2,
+    retry_delay: float = 0.5,
+) -> httpx.Response:
+    """Call send_fn, retrying on empty responses up to max_retries times.
+
+    A response is considered "empty" when it has no text content and no tool
+    call embedded in reasoning_content (e.g. the model returned only thinking
+    output without actual content). Retries use retry_delay seconds between
+    attempts. Session context is preserved across retries because send_fn
+    captures the same headers/body.
+
+    Returns the first non-empty response, or the last response if all retries
+    are exhausted.
+    """
+    for attempt in range(max_retries + 1):
+        response = await _call_with_backend_retries(send_fn, path=path, stream=False)
+        try:
+            content = response.content.decode('utf-8', errors='replace')
+            resp_json = json.loads(content) if content else {}
+        except Exception:
+            return response  # not valid JSON or content not readable, use as-is
+
+        if _is_empty_response(content or "", resp_json):
+            if attempt < max_retries:
+                logger.info(
+                    "Empty response detected on attempt %s/%s, retrying...",
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.warning(
+                    "Empty response persisted after %s retries, returning empty response",
+                    max_retries,
+                )
+        else:
+            if attempt > 0:
+                logger.info(
+                    "Retry attempt %s produced non-empty response",
+                    attempt + 1,
+                )
+            return response
+
+    return response
 
 
 def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
@@ -3506,6 +3564,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     "retry_after": retry_after,
                                 }
                                 return JSONResponse(status_code=503, content=payload, headers=headers_err)
+
+                            # Retry on empty response (no content and no tool call in reasoning_content)
+                            response = await _call_with_empty_retry(_send_once, path=path)
 
                             recv_tokens = 0
                             # Non-streaming: count tokens in response body
