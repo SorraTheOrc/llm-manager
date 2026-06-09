@@ -782,11 +782,34 @@ def normalize_provider_name(name: Optional[str]) -> Optional[str]:
 
 
 
+def _extract_tool_call_from_reasoning(reasoning_content: Optional[str]) -> Optional[str]:
+    """Extract a tool call XML pattern from reasoning_content.
+
+    When a model with thinking mode enabled (like Qwen3) generates tool calls
+    during its thinking phase, they appear in reasoning_content rather than
+    content. This function extracts well-formed <function=...>...</function>
+    patterns from reasoning content.
+
+    Returns the matched tool call XML string, or None if no tool call found.
+    """
+    if not reasoning_content:
+        return None
+    # Match <function=...>...</function> block
+    match = re.search(r'<function=[^>]*>.*?</function>', reasoning_content, re.DOTALL)
+    if match:
+        return match.group(0)
+    return None
+
+
+
 def _extract_assistant_content(resp_json: dict) -> Optional[str]:
     """Extract assistant content from a non-streaming OpenAI API response.
 
     Looks for choices[0].message.content and returns it.
-    Returns None if unable to extract content.
+    If content is null but reasoning_content contains a tool call
+    pattern (<function=...>...</function>), the tool call is extracted
+    and returned instead.
+    Returns None if unable to extract content or tool call.
     """
     try:
         choices = resp_json.get("choices", [])
@@ -795,18 +818,56 @@ def _extract_assistant_content(resp_json: dict) -> Optional[str]:
             content = message.get("content")
             if content is not None:
                 return str(content)
+            # Fall back to extracting tool call from reasoning_content
+            reasoning_content = message.get("reasoning_content")
+            tool_call = _extract_tool_call_from_reasoning(reasoning_content)
+            if tool_call:
+                logger.info(
+                    "Extracted tool call from reasoning_content (non-streaming): %.80s",
+                    tool_call,
+                )
+                return tool_call
     except Exception:
         pass
     return None
+
+
+def _is_empty_response(response_text: str, resp_json: Optional[dict] = None) -> bool:
+    """Check if a response is effectively empty (no content, no tool calls).
+
+    Used to detect cases where the model generates thinking content but
+    produces no actual output. Returns True if the response has no usable
+    content.
+    """
+    if response_text and response_text.strip():
+        return False
+    if resp_json:
+        content = _extract_assistant_content(resp_json)
+        if content:
+            return False
+        # Check reasoning_content for tool calls
+        try:
+            choices = resp_json.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                rc = message.get("reasoning_content")
+                if rc and _extract_tool_call_from_reasoning(rc):
+                    return False
+        except Exception:
+            pass
+    return True
 
 
 def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
     """Extract concatenated assistant content from SSE stream text.
 
     Parses 'data: {json}' lines, extracting delta.content from each chunk.
-    Returns concatenated content string, or None if nothing found.
+    If no content is found, falls back to checking delta.reasoning_content
+    for embedded tool call XML patterns (<function=...>...</function>).
+    Returns concatenated content string, tool call string, or None.
     """
     parts: list[str] = []
+    reasoning_parts: list[str] = []
     for line in sse_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -818,13 +879,31 @@ def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
             j = json.loads(payload)
             for choice in j.get("choices", []):
                 delta = choice.get("delta", {})
-                if isinstance(delta, dict) and "content" in delta:
-                    c = delta["content"]
-                    if c is not None:
-                        parts.append(str(c))
+                if isinstance(delta, dict):
+                    if "content" in delta and delta["content"] is not None:
+                        parts.append(str(delta["content"]))
+                    # Collect reasoning_content regardless for fallback
+                    if "reasoning_content" in delta and delta["reasoning_content"] is not None:
+                        reasoning_parts.append(str(delta["reasoning_content"]))
         except Exception:
             continue
-    return "".join(parts) if parts else None
+
+    # If we have regular content, return it (preferred)
+    if parts:
+        return "".join(parts)
+
+    # Fall back to extracting tool call from accumulated reasoning_content
+    if reasoning_parts:
+        full_reasoning = "".join(reasoning_parts)
+        tool_call = _extract_tool_call_from_reasoning(full_reasoning)
+        if tool_call:
+            logger.info(
+                "Extracted tool call from reasoning_content (streaming): %.80s",
+                tool_call,
+            )
+            return tool_call
+
+    return None
 
 
 def _extract_delta_text_from_sse_chunk(chunk_text: str) -> str:

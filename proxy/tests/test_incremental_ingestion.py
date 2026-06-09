@@ -834,3 +834,215 @@ class TestSlotPersistenceHelpers:
         server.config = server.load_config()
         resolved = server._resolve_slot_model_name(None, "Qwen3", {"llama_router_mode": True})
         assert resolved == "Qwen3"
+
+
+# ---------------------------------------------------------------------------
+# Tool call extraction from reasoning_content
+# ---------------------------------------------------------------------------
+
+class TestToolCallFromReasoning:
+    """Tests for extracting tool calls from reasoning_content when content is null."""
+
+    def test_extract_tool_call_from_reasoning_with_function_call(self):
+        """Extract a well-formed <function=...>...</function> pattern."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = '\nI need to find files\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is not None
+        assert '<function=bash>' in result
+        assert '<parameter=command>' in result
+        assert 'ls -la' in result
+        assert '</function>' in result
+
+    def test_extract_tool_call_from_reasoning_with_function_no_tool_wrapper(self):
+        """Extract <function=...>...</function> without </tool_call> wrapper."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = 'Let me think... <function=bash>\n<parameter=command>\necho hello\n</parameter>\n</function>'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is not None
+        assert 'echo hello' in result
+
+    def test_extract_tool_call_from_reasoning_no_tool_call(self):
+        """Return None when no tool call pattern is present."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = 'I am thinking about the answer. The answer is 42.'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is None
+
+    def test_extract_tool_call_from_reasoning_empty(self):
+        """Return None for empty string."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        assert _extract_tool_call_from_reasoning("") is None
+        assert _extract_tool_call_from_reasoning(None) is None
+
+    def test_extract_tool_call_from_reasoning_with_incomplete_tag(self):
+        """Return None for incomplete/partial <function=...> without </function>."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = 'Here is some code: <function=test>'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is None
+
+    def test_extract_assistant_content_from_sse_with_reasoning_content_no_content(self):
+        """When delta.content is null but reasoning_content has a tool call, extract the tool call."""
+        from proxy.server import _extract_assistant_content_from_sse
+
+        # Use JSON escape sequences (\\n) for newlines inside JSON strings,
+        # matching how the actual SSE stream delivers reasoning_content.
+        sse_text = (
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"\\n<function=bash>\\n"}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"<parameter=command>\\nls -la\\n</parameter>\\n"}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"</function>\\n</tool_call>"}}]}\n'
+            'data: [DONE]\n'
+        )
+        result = _extract_assistant_content_from_sse(sse_text)
+        assert result is not None
+        assert '<function=bash>' in result
+        assert 'ls -la' in result
+
+    def test_extract_assistant_content_from_sse_reasoning_no_tool_call(self):
+        """When reasoning_content has no tool call, return None."""
+        from proxy.server import _extract_assistant_content_from_sse
+
+        sse_text = (
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"Just thinking about it..."}}]}\n'
+            'data: [DONE]\n'
+        )
+        result = _extract_assistant_content_from_sse(sse_text)
+        assert result is None
+
+    def test_extract_assistant_content_from_sse_prefers_content_over_reasoning(self):
+        """When both content and reasoning_content are present, prefer content."""
+        from proxy.server import _extract_assistant_content_from_sse
+
+        sse_text = (
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"Thinking..."}}]}\n'
+            'data: {"choices":[{"delta":{"content":"Hello there"}}]}\n'
+            'data: [DONE]\n'
+        )
+        result = _extract_assistant_content_from_sse(sse_text)
+        assert result == "Hello there"
+
+    def test_extract_assistant_content_non_streaming_with_reasoning_content(self):
+        """Non-streaming: extract tool call from message.reasoning_content when content is null."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>"
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        assert result is not None
+        assert '<function=bash>' in result
+        assert 'echo hi' in result
+
+    def test_extract_assistant_content_non_streaming_reasoning_no_tool_call(self):
+        """Non-streaming: return None when reasoning_content has no tool call."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "Just thinking quietly..."
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        assert result is None
+
+    def test_extract_assistant_content_non_streaming_prefers_content(self):
+        """Non-streaming: when content is present, ignore reasoning_content."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!",
+                        "reasoning_content": ";thinking..."
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        assert result == "Hello!"
+
+    def test_is_empty_response_with_content(self):
+        """Response with content is not empty."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello there"
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response("Hello there", resp) is False
+
+    def test_is_empty_response_with_reasoning_tool_call(self):
+        """Response with tool call in reasoning_content is not empty."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>"
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response(None, resp) is False
+
+    def test_is_empty_response_truly_empty(self):
+        """Response with no content and no tool call is empty."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response(None, resp) is True
+
+    def test_is_empty_response_with_text(self):
+        """Response with non-empty text is not empty."""
+        from proxy.server import _is_empty_response
+
+        assert _is_empty_response("Hello world") is False
+
+    def test_is_empty_response_with_blank_text(self):
+        """Response with only whitespace text is empty."""
+        from proxy.server import _is_empty_response
+
+        assert _is_empty_response("   ") is True
