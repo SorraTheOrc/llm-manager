@@ -1181,10 +1181,18 @@ def evaluate_stream_guardrail(
     repetition_min_pattern_chars: int,
     repetition_min_repeats: int,
 ) -> Optional[str]:
+    """Evaluate whether the stream should be stopped due to guardrail violations.
+
+    Priority order:
+    1. Runtime cutoff - indicates a true runaway loop
+    2. Repetition detection - indicates the model is stuck in a loop
+
+    Note: The hard completion_tokens cutoff has been removed. Legitimate long
+    responses should not be cut off. Loop detection via repetition check is
+    used instead to catch runaway generation.
+    """
     if max_runtime_seconds and runtime_seconds >= max_runtime_seconds:
         return "runtime"
-    if max_completion_tokens and completion_tokens >= max_completion_tokens:
-        return "completion_tokens"
     if _should_cutoff_for_repetition(response_text, repetition_min_pattern_chars, repetition_min_repeats):
         return "repetition"
     return None
@@ -1195,10 +1203,21 @@ def _should_invalidate_on_guardrail(
     invalidate_on_cutoff: bool,
     invalidate_on_repetition: bool,
 ) -> bool:
+    """Determine whether a session should be invalidated due to a guardrail.
+
+    By default:
+    - "runtime" guardrail invalidates the session (indicates true runaway loop)
+    - "repetition" guardrail does NOT invalidate by default (let client retry)
+    - "completion_tokens" guardrail never invalidates (removed in favor of loop detection)
+    """
     if not guardrail_reason:
         return False
     if guardrail_reason == "repetition":
         return bool(invalidate_on_repetition)
+    # completion_tokens reason should never cause invalidation
+    # (it's no longer a guardrail reason, but handle defensively)
+    if guardrail_reason == "completion_tokens":
+        return False
     return bool(invalidate_on_cutoff)
 
 
@@ -3589,30 +3608,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             except Exception:
                                 pass
 
-                            max_completion_tokens = int(
-                                server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
-                            )
-                            invalidate_on_guardrail = bool(
-                                server_config.get("session_guardrail_invalidate_on_cutoff", True)
-                            )
-                            invalidate_on_repetition = server_config.get(
-                                "session_guardrail_invalidate_on_repetition",
-                                False,
-                            )
-                            if max_completion_tokens and recv_tokens >= max_completion_tokens:
-                                _record_guardrail_cutoff("completion_tokens")
-                                should_invalidate = _should_invalidate_on_guardrail(
-                                    "completion_tokens",
-                                    invalidate_on_guardrail,
-                                    bool(invalidate_on_repetition),
-                                )
-                                if session_id and should_invalidate:
-                                    await _invalidate_session_and_slot(
-                                        session_id,
-                                        "guardrail_completion_tokens",
-                                        slot_filename,
-                                    )
-                                    slot_save_allowed = False
+                            # Note: Hard completion_tokens cutoff has been removed.
+                            # Loop detection via repetition check is used instead.
+                            # The max_completion_tokens config is now ignored.
 
                             # Update session history for non-streaming responses
                             if session_id and isinstance(body_json, dict) and 'messages' in body_json:

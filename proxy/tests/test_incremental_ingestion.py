@@ -614,9 +614,15 @@ class TestStreamGuardrails:
         )
         assert _extract_delta_text_from_sse_chunk(mixed) == "ThinkHello"
 
-    def test_guardrail_evaluation_prioritizes_runtime_then_length_then_repetition(self):
+    def test_guardrail_evaluation_prioritizes_runtime_then_repetition(self):
+        """Test guardrail priority: runtime first, then repetition (loop detection).
+
+        Note: Hard completion_tokens cutoff has been removed in favor of
+        loop detection. The max_completion_tokens parameter is now ignored.
+        """
         from proxy.server import evaluate_stream_guardrail
 
+        # Runtime guardrail still triggers first
         assert (
             evaluate_stream_guardrail(
                 runtime_seconds=11.0,
@@ -630,6 +636,7 @@ class TestStreamGuardrails:
             == "runtime"
         )
 
+        # High completion_tokens alone should NOT trigger guardrail anymore
         assert (
             evaluate_stream_guardrail(
                 runtime_seconds=5.0,
@@ -640,9 +647,10 @@ class TestStreamGuardrails:
                 repetition_min_pattern_chars=8,
                 repetition_min_repeats=4,
             )
-            == "completion_tokens"
+            is None  # No guardrail triggered - this is the new behavior
         )
 
+        # Repetition (loop detection) still triggers
         assert (
             evaluate_stream_guardrail(
                 runtime_seconds=5.0,
@@ -688,6 +696,89 @@ class TestStreamGuardrails:
             invalidate_on_cutoff=True,
             invalidate_on_repetition=True,
         ) is False
+
+    def test_no_hard_completion_tokens_cutoff(self):
+        """Test that hard completion_tokens cutoff is removed.
+
+        The guardrail should NOT trigger on completion_tokens alone.
+        Loop detection should be used instead (repetition check).
+        """
+        from proxy.server import evaluate_stream_guardrail
+
+        # Even with many completion_tokens, no cutoff should occur
+        # if there's no repetition detected
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=5000,  # Exceeds old 2048 limit
+                response_text="This is a legitimate long response with varied content.",
+                max_runtime_seconds=120.0,
+                max_completion_tokens=2048,  # Old limit, should be ignored
+                repetition_min_pattern_chars=64,
+                repetition_min_repeats=10,
+            )
+            is None
+        )
+
+    def test_loop_detection_via_repetition_still_works(self):
+        """Test that loop detection via repetition check still works.
+
+        When a response contains repeating patterns, the guardrail
+        should trigger with 'repetition' reason.
+        """
+        from proxy.server import evaluate_stream_guardrail
+
+        # Create a repeating pattern (64 chars repeated 10 times)
+        pattern = "a" * 64
+        repeating_text = pattern * 10
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=1000,
+                response_text=repeating_text,
+                max_runtime_seconds=120.0,
+                max_completion_tokens=2048,
+                repetition_min_pattern_chars=64,
+                repetition_min_repeats=10,
+            )
+            == "repetition"
+        )
+
+    def test_session_not_invalidated_on_repetition_by_default(self):
+        """Test that session is NOT invalidated when repetition is detected.
+
+        By default, session_guardrail_invalidate_on_repetition is False,
+        so the session should NOT be invalidated when a loop is detected.
+        """
+        from proxy.server import _should_invalidate_on_guardrail
+
+        # Default config: invalidate_on_cutoff=True, invalidate_on_repetition=False
+        assert (
+            _should_invalidate_on_guardrail(
+                "repetition",
+                invalidate_on_cutoff=True,
+                invalidate_on_repetition=False,
+            )
+            is False
+        )
+
+    def test_runtime_guardrail_still_invalidates_session(self):
+        """Test that runtime guardrail still invalidates session.
+
+        Runtime cutoff indicates a true runaway loop, so session
+        should be invalidated.
+        """
+        from proxy.server import _should_invalidate_on_guardrail
+
+        assert (
+            _should_invalidate_on_guardrail(
+                "runtime",
+                invalidate_on_cutoff=True,
+                invalidate_on_repetition=False,
+            )
+            is True
+        )
 
 
 class TestSessionHistoryIntegrityHelpers:
