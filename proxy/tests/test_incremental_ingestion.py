@@ -1258,3 +1258,407 @@ class TestEmptyRetry:
             assert result is resp
             # No retry because tool call is present in reasoning_content
             mock_backend_retry.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive restore signal detection tests
+# ---------------------------------------------------------------------------
+
+
+class TestHasExplicitRestoreSignalComprehensive:
+    """Comprehensive tests for _has_explicit_restore_signal covering all
+    header candidates, JSON fields, case insensitivity, and truthy values."""
+
+    # ---- All header candidates ----
+
+    def test_x_llama_session_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Llama-Session-Restored": "true"}) is True
+
+    def test_x_session_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Session-Restored": "true"}) is True
+
+    def test_x_llama_cache_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Llama-Cache-Restored": "true"}) is True
+
+    def test_x_kv_cache_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-KV-Cache-Restored": "true"}) is True
+
+    def test_x_cache_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Cache-Restored": "true"}) is True
+
+    # ---- Case insensitivity ----
+
+    def test_header_case_insensitivity(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "True"}) is True
+        assert _has_explicit_restore_signal({"X-LLAMA-SESSION-RESTORED": "TRUE"}) is True
+        assert _has_explicit_restore_signal({"x-Llama-Session-Restored": "tRuE"}) is True
+
+    # ---- All truthy values ----
+
+    def test_truthy_value_1(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "1"}) is True
+
+    def test_truthy_value_yes(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "yes"}) is True
+
+    def test_truthy_value_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "restored"}) is True
+
+    def test_truthy_value_hit(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "hit"}) is True
+
+    def test_falsy_values(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "false"}) is False
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "0"}) is False
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "no"}) is False
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "miss"}) is False
+
+    # ---- All JSON field candidates ----
+
+    def test_json_session_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"session_restored": True}) is True
+
+    def test_json_cache_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"cache_restored": True}) is True
+
+    def test_json_restore_success(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"restore_success": True}) is True
+
+    def test_json_kv_cache_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"kv_cache_restored": True}) is True
+
+    def test_json_field_without_header(self):
+        from proxy.server import _has_explicit_restore_signal
+        # JSON carries the signal even when headers are empty
+        assert _has_explicit_restore_signal({}, {"session_restored": True}) is True
+
+    def test_json_field_false(self):
+        from proxy.server import _has_explicit_restore_signal
+        # JSON field explicitly False should not trigger
+        assert _has_explicit_restore_signal({}, {"session_restored": False}) is False
+
+    # ---- No signal at all ----
+
+    def test_no_signal_at_all(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"content-type": "application/json"}) is False
+
+    def test_empty_headers_and_json(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {}) is False
+        assert _has_explicit_restore_signal({}, None) is False
+
+    # ---- Both header and JSON with different values ----
+
+    def test_header_true_json_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal(
+            {"x-llama-session-restored": "true"},
+            {"session_restored": True},
+        ) is True
+
+    def test_header_true_json_false(self):
+        from proxy.server import _has_explicit_restore_signal
+        # Header wins despite JSON being false
+        assert _has_explicit_restore_signal(
+            {"x-llama-session-restored": "true"},
+            {"session_restored": False},
+        ) is True
+
+    def test_header_false_json_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        # Header is false but JSON carries the signal
+        assert _has_explicit_restore_signal(
+            {"x-llama-session-restored": "false"},
+            {"session_restored": True},
+        ) is True
+
+
+class TestDetectRestoreSignalFromLogSliceComprehensive:
+    """Comprehensive edge-case tests for _detect_restore_signal_from_log_slice."""
+
+    def test_nonexistent_log_file(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        nonexistent = tmp_path / "does_not_exist.log"
+        assert _detect_restore_signal_from_log_slice(nonexistent, 0) is False
+
+    def test_empty_log_file(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "empty.log"
+        log_file.write_text("")
+        assert _detect_restore_signal_from_log_slice(log_file, 0) is False
+
+    def test_restore_signal_restored_context_checkpoint(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "restore_checkpoint.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot update_slots restored context checkpoint\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_load_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "load_session.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot load_session: loading KV cache for session abc-123\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_session_restore(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "session_restore.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("INFO session restore completed for slot 0\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_restore_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "restore_session.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("restore session for abc-123\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_loading_kv_cache(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "loading_kv.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("loading KV cache from disk for slot 0\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_kv_cache_restored(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "kv_restored.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("kv cache restored for session abc-123\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_read_error_encoding(self, tmp_path):
+        """Binary/garbled data at the start offset should not crash."""
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "binary.log"
+        log_file.write_bytes(b"\x00\x01\x02before\n\xff\xfe restored context checkpoint\n")
+        # The function uses errors="replace" so it should not raise
+        assert _detect_restore_signal_from_log_slice(log_file, 0) is True
+
+
+class TestDetectRestoreSignalFromLlamaLogComprehensive:
+    """Comprehensive tests for _detect_restore_signal_from_llama_log."""
+
+    def test_none_session_id(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO load_session: abc-123\n")
+        assert _detect_restore_signal_from_llama_log(None, log_path=log_file) is False
+
+    def test_empty_session_id(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO load_session: abc-123\n")
+        assert _detect_restore_signal_from_llama_log("", log_path=log_file) is False
+
+    def test_nonexistent_log_file(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        nonexistent = tmp_path / "nonexistent.log"
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=nonexistent) is False
+
+    def test_session_id_in_log_without_restore_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("abc-123 slot update processing\n")
+        # Session ID appears but no restore phrase — should not match
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+    def test_session_id_with_load_session_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "slot load_session: loading KV cache for session_id=abc-123\n"
+        )
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_session_restore_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO session restore for abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_restore_session_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("restore session abc-123 completed\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_loading_kv_cache_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("loading KV cache for session abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_kv_cache_restored_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("kv cache restored for abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_restored_context_checkpoint_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("restored context checkpoint for abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_different_session_id_in_log(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "INFO slot update: processing tokens, no restore phrases present\n"
+        )
+        # Log has no restore phrase at all, so should return False
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+    def test_multiple_sessions_only_one_matches(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "load_session: session_id=other-session\n"
+            "load_session: session_id=abc-123\n"
+            "load_session: session_id=another-one\n"
+        )
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_log_path_override(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        custom_log = tmp_path / "custom-llama.log"
+        custom_log.write_text("load_session: session_id=custom-session\n")
+        assert _detect_restore_signal_from_llama_log("custom-session", log_path=custom_log) is True
+
+    def test_lookback_lines_truncation(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        # Write enough lines to exceed lookback_lines
+        lines = [f"line {i}\n" for i in range(500)]
+        lines.append("load_session: session_id=abc-123\n")
+        log_file.write_text("".join(lines))
+        # With lookback_lines=400, the signal line should still be within range
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file, lookback_lines=400) is True
+
+    def test_lookback_lines_excludes_signal(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        # Write many lines so the signal is outside the lookback window
+        lines = [f"line {i}\n" for i in range(500)]
+        lines.append("load_session: session_id=abc-123\n")
+        log_file.write_text("".join(lines))
+        # With lookback_lines=10, the signal (last line) should be included
+        # Actually the function takes the LAST lookback_lines lines, so last 10 should include it
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file, lookback_lines=10) is True
+
+    def test_session_id_case_insensitivity(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "slot load_session: loading KV cache for session_id=ABC-123\n"
+        )
+        # Both session_id and log text are lowercased before matching
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_restore_phrase_without_session_id(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("slot processing tokens without any restore phrases\n")
+        # No restore phrase at all, so should return False
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+
+# ---------------------------------------------------------------------------
+# Additional delta routing classification tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyDeltaRoutingComprehensive:
+    """Additional edge cases for _classify_delta_routing."""
+
+    def test_no_new_messages_fallback(self):
+        """When delta_message_count <= 0, routing should fall back with reason."""
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=0,
+            restore_confirmed=True,
+        )
+        assert use_delta is False
+        assert reason == "no_new_messages"
+
+    def test_negative_delta_message_count(self):
+        """Negative delta_message_count should also be treated as no_new_messages."""
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=-1,
+            restore_confirmed=True,
+        )
+        assert use_delta is False
+        assert reason == "no_new_messages"
+
+    def test_all_fallbacks_in_priority_order(self):
+        """Verify that fallback reasons are applied in expected priority order."""
+        from proxy.server import _classify_delta_routing
+
+        # Priority 1: history_mismatch (takes precedence)
+        use_delta, reason = _classify_delta_routing(
+            history_matches=False,
+            delta_message_count=2,
+            restore_confirmed=True,
+        )
+        assert reason == "history_mismatch"
+
+        # Priority 2: no_new_messages (history matches, but no delta)
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=0,
+            restore_confirmed=True,
+        )
+        assert reason == "no_new_messages"
+
+        # Priority 3: delta_disabled (force_full_prompt takes precedence over missing signal)
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+            force_full_prompt=True,
+        )
+        assert reason == "delta_disabled"
+
+        # Priority 4: missing_restore_signal
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+        )
+        assert reason == "missing_restore_signal"
