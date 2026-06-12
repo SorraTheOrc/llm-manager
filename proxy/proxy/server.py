@@ -165,14 +165,6 @@ active_queries: int = 0
 active_queries_lock = asyncio.Lock()
 
 # Backend resilience/observability signals
-backend_signal_counts: dict = {
-    "connect_failures": 0,
-    "read_failures": 0,
-    "timeout_failures": 0,
-    "other_failures": 0,
-    "concurrency_rejects": 0,
-}
-
 # Session restore observability
 
 
@@ -349,24 +341,7 @@ def _model_loading_response(requested_model: Optional[str], target_model: str, s
     )
 
 
-def _record_backend_signal(signal_name: str) -> None:
-    """Increment a backend signal counter for observability."""
-    try:
-        if signal_name in backend_signal_counts:
-            backend_signal_counts[signal_name] = int(backend_signal_counts.get(signal_name, 0)) + 1
-    except Exception:
-        pass
 
-
-def _classify_backend_exception(exc: Exception) -> str:
-    """Map backend transport exceptions to signal buckets."""
-    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
-        return "connect_failures"
-    if isinstance(exc, (httpx.ReadError,)):
-        return "read_failures"
-    if isinstance(exc, (httpx.ReadTimeout, httpx.TimeoutException)):
-        return "timeout_failures"
-    return "other_failures"
 
 
 def _is_retryable_backend_exception(exc: Exception) -> bool:
@@ -1055,9 +1030,7 @@ logger: logging.Logger = logging.getLogger("llama-proxy")
 
 
 # SSE clients for real-time status updates
-sse_clients: set[asyncio.Queue] = set()
-# SSE clients for log tail updates (counts + other notifications)
-log_tail_clients: set[asyncio.Queue] = set()
+
 
 
 def load_config(config_path: Optional[str] = None) -> dict:
@@ -5980,6 +5953,13 @@ from .session import (  # noqa: E402, F401
     _detect_restore_signal_from_llama_log,
     extract_streamed_content_from_chunk,
     ContentOnlyConsoleHandler,
+)
+from .observability import (  # noqa: E402, F401
+    backend_signal_counts,
+    _record_backend_signal,
+    _classify_backend_exception,
+    sse_clients,
+    log_tail_clients,
 )
 
 
