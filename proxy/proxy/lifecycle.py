@@ -369,42 +369,43 @@ def _dec_model_switch_refcount() -> None:
 
 
 def schedule_background_load(model_name: str) -> bool:
+    srv = _srv()
     """Schedule model load in background if not already running.
 
     Returns True if a background load was started, False if one is already in progress.
     """
     if not model_name:
        return False
-    if background_loads.get(model_name):
+    if srv.background_loads.get(model_name):
        return False
 
-    background_loads[model_name] = True
+    srv.background_loads[model_name] = True
 
     # Increment the global refcount so status checks observe switching even
     # when the background worker runs in another thread/event loop.
     try:
-       _inc_model_switch_refcount()
+       srv._inc_model_switch_refcount()
     except Exception:
        pass
 
     async def _bg():
-       global background_loads
+
        try:
-           logger.info(f"Background model load started: {model_name}")
-           ok = await ensure_model_loaded(model_name)
+           srv.logger.info(f"Background model load started: {model_name}")
+           ok = await srv.ensure_model_loaded(model_name)
            if ok:
-               logger.info(f"Background model load succeeded: {model_name}")
+               srv.logger.info(f"Background model load succeeded: {model_name}")
            else:
-               logger.error(f"Background model load failed: {model_name}")
+               srv.logger.error(f"Background model load failed: {model_name}")
        except Exception:
-           logger.exception(f"Exception during background model load for {model_name}")
+           srv.logger.exception(f"Exception during background model load for {model_name}")
        finally:
            # Decrement the refcount when done so status reflects completion.
            try:
-               _dec_model_switch_refcount()
+               srv._dec_model_switch_refcount()
            except Exception:
                pass
-           background_loads.pop(model_name, None)
+           srv.background_loads.pop(model_name, None)
 
     try:
        loop = asyncio.get_running_loop()
@@ -463,7 +464,7 @@ def _model_loading_response(requested_model: Optional[str], target_model: str, s
        "target_model": target_model,
        "scheduled": bool(scheduled),
        "srv.current_model": srv.current_model,
-       "llama_server_running": srv.llama_process is not None and llama_process.poll() is None,
+       "llama_server_running": srv.llama_process is not None and srv.llama_process.poll() is None,
        "retry_after": retry_after,
        "endpoint": endpoint,
     }
@@ -499,6 +500,7 @@ def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitt
 
 
 def _estimate_prompt_tokens(body_json: dict) -> int:
+    srv = _srv()
     """Estimate prompt token count from request body.
     
     Returns estimated token count based on message content length.
@@ -532,6 +534,7 @@ def _compute_adaptive_timeout(
     per_token_timeout: float,
     max_timeout: float,
 ) -> float:
+    srv = _srv()
     """Compute adaptive timeout based on prompt size.
     
     Timeout = min(base_timeout + per_token_timeout * estimated_tokens, max_timeout)
@@ -571,7 +574,7 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
            signal_name = srv._classify_backend_exception(exc)
            srv._record_backend_signal(signal_name)
            delay = srv._compute_retry_delay(attempt, base_delay, max_delay, jitter_ratio)
-           logger.warning(
+           srv.logger.warning(
                "backend_retry path=%s stream=%s attempt=%s/%s delay=%.3fs signal=%s error=%s",
                path,
                stream,
@@ -629,6 +632,7 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
 
 
 def get_model_config(model_name: Optional[str]) -> Optional[dict]:
+    srv = _srv()
     """
     Get model configuration by name or alias.
     
@@ -736,25 +740,25 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
     try:
        while time.time() - start_time < timeout:
            # Check if llama process died
-           if srv.llama_process is not None and llama_process.poll() is not None:
-               exit_code = llama_process.returncode
-               logger.error(f"llama-server process exited with code {exit_code}")
+           if srv.llama_process is not None and srv.llama_process.poll() is not None:
+               exit_code = srv.llama_process.returncode
+               srv.logger.error(f"llama-server process exited with code {exit_code}")
                return False
            
            try:
                response = await client.get(health_url, timeout=5)
                if response.status_code == 200:
-                   logger.info("llama-server is ready")
+                   srv.logger.info("llama-server is ready")
                    return True
            except asyncio.CancelledError:
-               logger.info("Wait for llama-server cancelled")
+               srv.logger.info("Wait for llama-server cancelled")
                raise
            except Exception:
                pass
            try:
                await asyncio.sleep(2)
            except asyncio.CancelledError:
-               logger.info("Wait for llama-server cancelled")
+               srv.logger.info("Wait for llama-server cancelled")
                raise
     finally:
        if not srv._http_client:
@@ -763,7 +767,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
            except Exception:
                pass
     
-    logger.error(f"llama-server failed to start within {timeout} seconds")
+    srv.logger.error(f"llama-server failed to start within {timeout} seconds")
     return False
 
 
@@ -784,14 +788,14 @@ async def router_load_model(model_name: str) -> bool:
                body = response.text
                body_l = (body or "").lower()
                if response.status_code == 400 and ("already loaded" in body_l or "already running" in body_l):
-                   logger.info(f"Router model already loaded: {model_name}")
+                   srv.logger.info(f"Router model already loaded: {model_name}")
                    # update last-used timestamp when model already loaded/running
                    try:
                        srv.model_last_used[model_name] = datetime.utcnow().isoformat()
                    except Exception:
                        pass
                    return True
-               logger.error(f"Router load failed for {model_name}: {response.status_code} {body}")
+               srv.logger.error(f"Router load failed for {model_name}: {response.status_code} {body}")
                return False
            # Update last-used timestamp on successful load
            try:
@@ -804,7 +808,7 @@ async def router_load_model(model_name: str) -> bool:
                pass
            return True
        except Exception as e:
-           logger.error(f"Router load failed for {model_name}: {e}")
+           srv.logger.error(f"Router load failed for {model_name}: {e}")
            return False
     finally:
        if not srv._http_client:
@@ -826,11 +830,11 @@ async def router_list_models() -> Optional[dict]:
     try:
        response = await client.get(url, timeout=5.0)
        if response.status_code != 200:
-           logger.warning(f"Router list models failed: {response.status_code} {response.text}")
+           srv.logger.warning(f"Router list models failed: {response.status_code} {response.text}")
            return None
        return response.json()
     except Exception as e:
-       logger.warning(f"Router list models failed: {e}")
+       srv.logger.warning(f"Router list models failed: {e}")
        return None
     finally:
        if not srv._http_client:
@@ -961,7 +965,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
        router_mode = True
 
     mode_label = "router" if router_mode else f"model: {model}"
-    logger.info(f"Starting llama-server with {mode_label} in distrobox '{distrobox_name}'")
+    srv.logger.info(f"Starting llama-server with {mode_label} in distrobox '{distrobox_name}'")
 
     # Rotate llama-server logs (keep last 15)
     if srv.log_dir:
@@ -987,7 +991,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     else:
        if model is None:
            msg = "Model name is required when not running in router mode"
-           logger.error(msg)
+           srv.logger.error(msg)
            srv.last_start_failure = msg
            srv.broadcast_status_sync("error", {"message": msg, "srv.current_model": None, "llama_server_running": False})
            return None
@@ -1006,11 +1010,11 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
                text=True
            )
        except FileNotFoundError as e:
-           logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
+           srv.logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
            return None, f"Command not found: {cmd[0]}: {e}"
        except Exception as e:
            tb = traceback.format_exc()
-           logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
+           srv.logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
            return None, f"Spawn failed: {e}\n{tb}"
 
        # Give the child a short window to produce output and check if it exits
@@ -1097,7 +1101,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # models outside a controlled container environment.
     if not shutil.which("distrobox"):
        msg = "distrobox not found in PATH; llama-server must be started inside distrobox"
-       logger.error(msg)
+       srv.logger.error(msg)
        srv.last_start_failure = msg
        srv.broadcast_status_sync("error", {"message": msg, "srv.current_model": None, "llama_server_running": False})
        return None
@@ -1115,7 +1119,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
            # requested model prematurely (while still switching).
            return proc
        # If out is present, the command exited quickly with output; log and retry
-       logger.warning(f"distrobox attempt {attempt+1} failed quickly: {out}")
+       srv.logger.warning(f"distrobox attempt {attempt+1} failed quickly: {out}")
        time.sleep(backoff * (2 ** attempt))
 
     # All distrobox attempts failed — assemble a helpful diagnostic message
@@ -1131,7 +1135,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     msg_lines.append(" - Ensure distrobox/podman rootless runtime is available (enable user linger: sudo loginctl enable-linger <user>)")
     msg_lines.append(" - Ensure /etc/subuid and /etc/subgid contain mappings for the user and that /usr/bin/newuidmap and newgidmap are setuid root")
     msg = "\n".join(msg_lines)
-    logger.error(msg)
+    srv.logger.error(msg)
     # record last failure for diagnostics and broadcast
     srv.last_start_failure = msg
     srv.broadcast_status_sync("error", {"message": msg, "srv.current_model": None, "llama_server_running": False})
@@ -1152,7 +1156,7 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
     
     # Get all existing rotated logs sorted by number (descending)
     rotated_logs = []
-    for f in log_dir.glob(f"{base_name}.*{suffix}"):
+    for f in srv.log_dir.glob(f"{base_name}.*{suffix}"):
        try:
            num = int(f.stem.split(".")[-1])
            rotated_logs.append((num, f))
@@ -1165,7 +1169,7 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
     for num, f in rotated_logs:
        if num >= keep:
            f.unlink()
-           logger.debug(f"Deleted old llama-server log: {f}")
+           srv.logger.debug(f"Deleted old llama-server log: {f}")
     
     # Rotate existing logs (N -> N+1)
     for num, f in rotated_logs:
@@ -1193,28 +1197,28 @@ def stop_llama_server():
            timeout=10,
            capture_output=True
        )
-       logger.info("Sent kill signal to llama-server inside distrobox")
+       srv.logger.info("Sent kill signal to llama-server inside distrobox")
     except Exception as e:
-       logger.warning(f"Failed to kill llama-server inside distrobox: {e}")
+       srv.logger.warning(f"Failed to kill llama-server inside distrobox: {e}")
     
     if srv.llama_process is not None:
        pid = getattr(srv.llama_process, 'pid', 'N/A')
-       logger.info(f"Stopping llama-server wrapper (PID: {pid})")
+       srv.logger.info(f"Stopping llama-server wrapper (PID: {pid})")
        # Only clean up process and model state if srv.llama_process looks like
        # a real subprocess (has terminate/kill/wait methods). If it's a
        # test mock or invalid object, skip process cleanup.
        is_real_process = hasattr(srv.llama_process, 'terminate') or hasattr(srv.llama_process, 'kill')
        if is_real_process:
            previous_model = srv.current_model
-           llama_process.terminate()
+           srv.llama_process.terminate()
            try:
-               llama_process.wait(timeout=30)
+               srv.llama_process.wait(timeout=30)
            except subprocess.TimeoutExpired:
-               logger.warning("llama-server wrapper did not terminate gracefully, killing...")
+               srv.logger.warning("llama-server wrapper did not terminate gracefully, killing...")
                if hasattr(srv.llama_process, 'kill'):
-                   llama_process.kill()
+                   srv.llama_process.kill()
                if hasattr(srv.llama_process, 'wait'):
-                   llama_process.wait()
+                   srv.llama_process.wait()
            srv.llama_process = None
            try:
                if previous_model:
@@ -1223,16 +1227,16 @@ def stop_llama_server():
                pass
            srv.current_model = None
            srv.backend_ready = False
-           logger.info("llama-server stopped")
+           srv.logger.info("llama-server stopped")
        else:
            srv.llama_process = None
            srv.backend_ready = False
-           logger.info("llama-server stop skipped (no valid process)")
+           srv.logger.info("llama-server stop skipped (no valid process)")
     
     # Close log file if open
     if srv.llama_log_file is not None and srv.llama_log_file != subprocess.DEVNULL:
        try:
-           llama_log_file.close()
+           srv.llama_log_file.close()
        except Exception:
            pass
        srv.llama_log_file = None
@@ -1240,15 +1244,16 @@ def stop_llama_server():
 
 
 async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
+    srv = _srv()
     """
     Ensure the requested model is loaded in llama-server.
     Returns True if the model is ready, False if there was an error.
     """
-    global llama_process, current_model, backend_ready
 
-    llama_model = get_local_model_name(requested_model)
+
+    llama_model = srv.get_local_model_name(requested_model)
     if llama_model is None:
-       backend_ready = False
+       srv.backend_ready = False
        return False
 
     server_config = srv.config.get("server", {})
@@ -1258,21 +1263,21 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
     # decrement the global refcount if this invocation incremented it.
     incremented_here = False
     try:
-       async with model_switch_lock:
-           if current_model == llama_model and llama_process is not None:
+       async with srv.model_switch_lock:
+           if srv.current_model == llama_model and srv.llama_process is not None:
                # Check if process is still running
-               if llama_process.poll() is None:
-                   backend_ready = True
+               if srv.llama_process.poll() is None:
+                   srv.backend_ready = True
                    return True
                else:
-                   logger.warning("llama-server process died, restarting...")
+                   srv.logger.warning("llama-server process died, restarting...")
 
            # If no background load marker exists for this model then this
            # synchronous path should increment the refcount so status
            # endpoints observe switching across threads/loops.
            try:
-               if not background_loads.get(llama_model):
-                   _inc_model_switch_refcount()
+               if not srv.background_loads.get(llama_model):
+                   srv._inc_model_switch_refcount()
                    incremented_here = True
            except Exception:
                # Best-effort: do not fail switching due to refcount errors
@@ -1281,59 +1286,59 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            # Broadcast that we're switching models
            await srv.broadcast_status("switching", {
                "target_model": llama_model,
-               "previous_model": current_model
+               "previous_model": srv.current_model
            })
 
            timeout = server_config.get("llama_startup_timeout", 300)
 
            if router_mode:
-               if llama_process is None or llama_process.poll() is not None:
-                   llama_process = start_llama_server(None)
+               if srv.llama_process is None or srv.llama_process.poll() is not None:
+                   srv.llama_process = srv.start_llama_server(None)
 
-                   if llama_process is None:
-                       logger.error("start_llama_server failed to spawn router process")
-                       backend_ready = False
+                   if srv.llama_process is None:
+                       srv.logger.error("start_llama_server failed to spawn router process")
+                       srv.backend_ready = False
                        return False
 
-                   if not await wait_for_llama_server(timeout):
+                   if not await srv.wait_for_llama_server(timeout):
                        await srv.broadcast_status("error", {
                            "message": "Failed to start router-mode llama-server",
                            "current_model": None,
                            "llama_server_running": False
                        })
-                       stop_llama_server()
-                       backend_ready = False
+                       srv.stop_llama_server()
+                       srv.backend_ready = False
                        return False
 
-               if not await router_load_model(llama_model):
+               if not await srv.router_load_model(llama_model):
                    await srv.broadcast_status("error", {
                        "message": f"Failed to load model {llama_model} via router",
                        "current_model": None,
                        "llama_server_running": True
                    })
-                   backend_ready = False
+                   srv.backend_ready = False
                    return False
 
                # Enforce embeddings pinned: ensure embeddings preset remains loaded
                embeddings_preset = server_config.get("embeddings_model")
                if embeddings_preset:
                    try:
-                       await router_load_model(embeddings_preset)
-                       await router_wait_for_model(embeddings_preset, timeout=server_config.get("llama_embed_load_timeout", 30))
+                       await srv.router_load_model(embeddings_preset)
+                       await srv.router_wait_for_model(embeddings_preset, timeout=server_config.get("llama_embed_load_timeout", 30))
                    except Exception:
-                       logger.warning("Failed to ensure embeddings preset is loaded/pinned")
+                       srv.logger.warning("Failed to ensure embeddings preset is loaded/pinned")
 
                load_timeout = server_config.get("llama_model_load_timeout", timeout)
-               if not await router_wait_for_model(llama_model, timeout=load_timeout):
+               if not await srv.router_wait_for_model(llama_model, timeout=load_timeout):
                    await srv.broadcast_status("error", {
                        "message": f"Timed out waiting for model {llama_model} to load",
                        "current_model": None,
                        "llama_server_running": True
                    })
-                   backend_ready = False
+                   srv.backend_ready = False
                    return False
 
-               current_model = llama_model
+               srv.current_model = llama_model
                try:
                    metrics.record_model_loaded(llama_model)
                except Exception:
@@ -1342,24 +1347,24 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    "current_model": llama_model,
                    "llama_server_running": True
                })
-               backend_ready = True
+               srv.backend_ready = True
                return True
 
            # Need to switch models or restart
-           stop_llama_server()
+           srv.stop_llama_server()
 
-           llama_process = start_llama_server(llama_model)
+           srv.llama_process = srv.start_llama_server(llama_model)
 
            # If starting the process failed immediately (start_llama_server returns None),
            # fail fast instead of waiting the full timeout. start_llama_server already
            # broadcasts a detailed error message.
-           if llama_process is None:
-               logger.error(f"start_llama_server failed to spawn process for model {llama_model}")
-               backend_ready = False
+           if srv.llama_process is None:
+               srv.logger.error(f"start_llama_server failed to spawn process for model {llama_model}")
+               srv.backend_ready = False
                return False
 
-           if await wait_for_llama_server(timeout):
-               current_model = llama_model
+           if await srv.wait_for_llama_server(timeout):
+               srv.current_model = llama_model
                try:
                    metrics.record_model_loaded(llama_model)
                except Exception:
@@ -1369,7 +1374,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    "current_model": llama_model,
                    "llama_server_running": True
                })
-               backend_ready = True
+               srv.backend_ready = True
                return True
            else:
                # Broadcast failure
@@ -1378,14 +1383,14 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    "current_model": None,
                    "llama_server_running": False
                })
-               stop_llama_server()
-               backend_ready = False
+               srv.stop_llama_server()
+               srv.backend_ready = False
                return False
     finally:
        # Ensure we decrement the refcount if we incremented it above.
        if incremented_here:
            try:
-               _dec_model_switch_refcount()
+               srv._dec_model_switch_refcount()
            except Exception:
                pass
 
