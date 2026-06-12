@@ -141,165 +141,15 @@ def schedule_background_load(model_name: str) -> bool:
     return True
 
     
-def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
-    """Extract `n_tokens` and `progress` from llama-server stdout progress lines.
-
-    Returns a tuple (n_tokens: int, progress: float) or None if the line does
-    not contain valid progress data.
-
-    Examples of supported lines:
-        "slot 1 : prompt processing progress, n_tokens = 26988, progress = 0.658083"
-    The parser is conservative: it requires both `n_tokens` and `progress`
-    fields and at least one comma to avoid false positives from unrelated
-    text that mentions the word 'progress'.
-    """
-    if not isinstance(line, str):
-        return None
-    text = line.strip()
-    if not text:
-        return None
-    # Require explicit field markers to avoid false positives
-    if 'n_tokens' not in text or 'progress' not in text:
-        return None
-    # Require at least one comma present to resemble expected formats
-    if ',' not in text:
-        return None
-    try:
-        m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
-        m_progress = re.search(r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b', text, flags=re.IGNORECASE)
-        if not m_tokens or not m_progress:
-            return None
-        n_tokens = int(m_tokens.group(1))
-        progress = float(m_progress.group(1))
-        return (n_tokens, progress)
-    except Exception:
-        return None
+# Functions extracted to handlers.py:
+#   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
+# The module-level state they reference remains here.
+from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: F401
 
 # Polling state for /slots API (model -> latest data)
 slot_polling_state: dict = {}
 # Internal record of active polling tasks (model -> asyncio.Task)
 _slot_polling_tasks: dict = {}
-
-async def poll_slots_for_model(model: str, llama_port: int = 0, interval: float = 0.5, max_polls: Optional[int] = None) -> None:
-    """Poll the llama-server `/slots` endpoint for a given model and update
-    `slot_polling_state[model]` with a dict containing `is_processing` and
-    `n_decoded` (or None).
-
-    This function is intentionally conservative: it tolerates a variety of
-    response formats (list-of-slots or single-slot dict) and never raises
-    on parse errors — instead it records `None` values for missing data.
-
-    The optional ``max_polls`` parameter is useful for tests to limit the
-    number of iterations.
-    """
-    polls = 0
-    if not model:
-        return None
-    slots_url = f"http://localhost:{llama_port}/slots?model={model}"
-    while True:
-        try:
-            client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
-            # Support either an injected async client instance or creating a
-            # temporary AsyncClient context when none is provided.
-            if getattr(client, '__aenter__', None):
-                # client supports async context manager
-                async with client as c:
-                    resp = await c.get(slots_url, timeout=5.0)
-            else:
-                resp = await client.get(slots_url, timeout=5.0)
-
-            if resp is not None and getattr(resp, 'status_code', None) == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = None
-
-                n_decoded = None
-                is_processing = False
-                if isinstance(data, list):
-                    if data:
-                        slot = data[0]
-                        is_processing = bool(slot.get('is_processing', False))
-                        next_token = slot.get('next_token') if isinstance(slot.get('next_token'), dict) else None
-                        if next_token is not None and 'n_decoded' in next_token:
-                            n_decoded = next_token.get('n_decoded')
-                        else:
-                            # Fallback to top-level field if present
-                            n_decoded = slot.get('n_decoded')
-                elif isinstance(data, dict):
-                    is_processing = bool(data.get('is_processing', False))
-                    next_token = data.get('next_token')
-                    if isinstance(next_token, dict) and 'n_decoded' in next_token:
-                        n_decoded = next_token.get('n_decoded')
-                    else:
-                        n_decoded = data.get('n_decoded')
-
-                slot_polling_state[model] = {'is_processing': is_processing, 'n_decoded': n_decoded}
-            else:
-                # Non-200 or missing response — mark as not processing
-                slot_polling_state[model] = {'is_processing': False, 'n_decoded': None}
-        except Exception:
-            # On any error, record a safe fallback and continue
-            slot_polling_state[model] = {'is_processing': False, 'n_decoded': None}
-
-        polls += 1
-        if max_polls is not None and polls >= max_polls:
-            break
-
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            break
-
-
-def start_slot_polling(model: str, llama_port: int, interval: float = 0.5) -> None:
-    """Start an asyncio task to poll the slots endpoint for `model`.
-
-    If an active poller already exists for the model it will not start a
-    duplicate. If called from a non-async context (no running loop) a
-    background thread will be created that runs its own asyncio loop.
-    """
-    if not model:
-        return None
-    if model in _slot_polling_tasks and not _slot_polling_tasks[model].done():
-        return None
-    try:
-        loop = asyncio.get_running_loop()
-        task = loop.create_task(poll_slots_for_model(model, llama_port, interval, None))
-        _slot_polling_tasks[model] = task
-    except RuntimeError:
-        # No running event loop in this thread — spawn a thread to run one
-        def _run():
-            try:
-                asyncio.run(poll_slots_for_model(model, llama_port, interval, None))
-            except Exception:
-                pass
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-
-def format_progress(n_tokens: int, total_tokens: int, progress: float) -> str:
-    """Return a formatted, ANSI-dimmed, in-place-updating progress string.
-
-    The returned string begins with a carriage return ("\r") so it can be
-    written to stderr repeatedly to update a single console line in-place.
-
-    Percentage is truncated to an integer (no decimals) to match UX
-    expectations (e.g. 0.658 -> 65%). The output is ANSI-dimmed and the
-    ANSI reset code is appended so subsequent console output is unaffected.
-    """
-    try:
-        pct = int(max(0, min(100, int(progress * 100))))
-    except Exception:
-        try:
-            pct = int(max(0, min(100, int(float(progress) * 100))))
-        except Exception:
-            pct = 0
-    # Truncate rather than round (floor) to match example behaviour.
-    pct = int(max(0, min(100, int(progress * 100)))) if isinstance(progress, (int, float)) else pct
-    dim = "\x1b[2m"
-    reset = "\x1b[0m"
-    body = f"Processing {n_tokens}/{total_tokens} tokens ({pct}%)"
-    return f"\r{dim}{body}{reset}"
 
 # Request counting
 request_counts: dict = {}
@@ -760,6 +610,40 @@ def _backend_recovery_snapshot() -> dict:
     attempts = state.get("attempt_timestamps")
     state["attempt_count"] = len(attempts) if isinstance(attempts, list) else 0
     return state
+
+
+async def _probe_backend_reachable(llama_port: int) -> bool:
+    """Actively probe backend reachability so /health reflects real connectivity."""
+    if llama_port <= 0:
+        return False
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    router_mode = bool(server_cfg.get("llama_router_mode", False))
+    timeout_seconds = float(server_cfg.get("llama_backend_probe_timeout_seconds", 2.0) or 2.0)
+    probe_paths: list[str] = []
+    if router_mode and current_model:
+        probe_paths.append(f"/slots?model={current_model}")
+    if router_mode:
+        probe_paths.extend(["/models", "/health"])
+    else:
+        probe_paths.append("/health")
+    client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+    try:
+        for probe_path in probe_paths:
+            try:
+                url = f"http://localhost:{llama_port}{probe_path}"
+                response = await client.get(url, timeout=timeout_seconds)
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if 200 <= status_code < 500:
+                    return True
+            except Exception:
+                continue
+        return False
+    finally:
+        if not _http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 config: dict = {}
@@ -4349,6 +4233,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Include handlers from the extracted handlers module
+from . import handlers  # noqa: E402
+app.include_router(handlers.router)
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -5691,134 +5579,10 @@ API Endpoints
     return HTMLResponse(content=html_content)
 
 
-@app.get("/llama/local/status")
-async def get_llama_local_status():
-    """Return a small JSON object describing local llama-server status.
-
-    Fields:
-      - active_query: bool
-      - model_switch_in_progress: bool
-      - current_model: str | None
-      - llama_server_running: bool
-    """
-    # Query llama-server for runtime info (n_ctx etc. not included here)
-    try:
-        status = await query_llama_status()
-    except Exception:
-        # If querying fails, assume server not running
-        status = {"llama_server_running": False, "n_ctx": None, "kv_cache_tokens": None, "router_mode": False}
-
-    llama_running = bool(status.get("llama_server_running", False))
-
-    # Determine if a model switch/load is in progress.
-    # Consider multiple indicators:
-    #  - explicit refcount for background/synchronous loads (`model_switch_refcount`)
-    #  - the model_switch_lock (held during ensure_model_loaded)
-    #  - any scheduled background loads in `background_loads`.
-    try:
-        switch_in_progress = (model_switch_refcount > 0) if 'model_switch_refcount' in globals() else False
-    except Exception:
-        switch_in_progress = False
-
-    # Fall back to lock visibility
-    if not switch_in_progress:
-        try:
-            switch_in_progress = model_switch_lock.locked() if model_switch_lock is not None else False
-        except Exception:
-            switch_in_progress = switch_in_progress
-
-    # Also consider any scheduled background loads
-    if not switch_in_progress:
-        try:
-            switch_in_progress = bool(background_loads)
-        except Exception:
-            switch_in_progress = switch_in_progress
-
-    # current_model should be null when server not running
-    cm = current_model if llama_running else None
-
-    # active_query is true when we have at least one in-flight local request
-    active = False
-    try:
-        async with active_queries_lock:
-            active = (active_queries > 0)
-    except Exception:
-        active = False
-
-    result = {
-        "active_query": bool(active),
-        "model_switch_in_progress": bool(switch_in_progress),
-        "current_model": cm,
-        "llama_server_running": bool(llama_running),
-    }
-
-    return result
 
 
-async def _probe_backend_reachable(llama_port: int) -> bool:
-    """Actively probe backend reachability so /health reflects real connectivity."""
-    if llama_port <= 0:
-        return False
-
-    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
-    router_mode = bool(server_cfg.get("llama_router_mode", False))
-    timeout_seconds = float(server_cfg.get("llama_backend_probe_timeout_seconds", 2.0) or 2.0)
-
-    probe_paths: list[str] = []
-    if router_mode and current_model:
-        probe_paths.append(f"/slots?model={current_model}")
-    if router_mode:
-        probe_paths.extend(["/models", "/health"])
-    else:
-        probe_paths.append("/health")
-
-    client = _http_client if _http_client else httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
-    try:
-        for probe_path in probe_paths:
-            try:
-                url = f"http://localhost:{llama_port}{probe_path}"
-                response = await client.get(url, timeout=timeout_seconds)
-                status_code = int(getattr(response, "status_code", 0) or 0)
-                if 200 <= status_code < 500:
-                    return True
-            except Exception:
-                continue
-        return False
-    finally:
-        if not _http_client:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint with readiness gating."""
-    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
-    router_mode = bool(server_cfg.get("llama_router_mode", False))
-    loaded_models = None
-    if router_mode:
-        router_models = await router_list_models()
-        loaded_models = _extract_router_model_ids(router_models)
-
-    llama_running = llama_process is not None and llama_process.poll() is None
-    llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-    backend_reachable = bool(llama_running and await _probe_backend_reachable(llama_port))
-    self_healing = _is_self_healing_active()
-    ready = bool(llama_running and backend_ready and backend_reachable and not self_healing)
-
-    return {
-        "status": "healthy" if ready else "degraded",
-        "ready": ready,
-        "current_model": current_model,
-        "loaded_models": loaded_models,
-        "llama_server_running": llama_running,
-        "backend_reachable": backend_reachable,
-        "self_healing_in_progress": self_healing,
-        "backend_recovery": _backend_recovery_snapshot(),
-        "backend_signals": dict(backend_signal_counts),
-    }
 
 
 @app.get("/events")
@@ -5871,25 +5635,7 @@ async def status_events():
     )
 
 
-@app.get("/v1/models")
-async def list_models():
-    """List available models from proxy configuration."""
-    models_list = []
-    
-    for name, cfg in config.get("models", {}).items():
-        models_list.append({
-            "id": name,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "local" if cfg.get("type") == "local" else "remote",
-            "type": cfg.get("type"),
-            "aliases": cfg.get("aliases", [])
-        })
-    
-    return {
-        "object": "list",
-        "data": models_list
-    }
+
 
 
 def _resolve_log_path(source: str = "proxy") -> Path:
@@ -6683,17 +6429,7 @@ async def proxy_openai_api(request: Request, path: str):
     )
 
 
-@app.post("/admin/reload-config")
-async def reload_config():
-    """Reload configuration file."""
-    global config
-    try:
-        config = load_config()
-        logger.info("Configuration reloaded")
-        return {"status": "success", "message": "Configuration reloaded"}
-    except Exception as e:
-        logger.error(f"Failed to reload config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/admin/switch-model/{model_name}")
@@ -6732,152 +6468,7 @@ async def switch_model(model_name: str):
         )
 
 
-@app.post("/admin/stop-server")
-async def admin_stop_server():
-    """Stop the llama-server."""
-    stop_llama_server()
-    return {"status": "success", "message": "llama-server stopped"}
 
-
-@app.get("/admin/dump-counts")
-async def admin_dump_counts():
-    """Return in-memory request and token counts for debugging."""
-    # Snapshot under locks to avoid races
-    snap_c = {}
-    snap_t = {}
-    async with counts_lock:
-        snap_c = dict(request_counts)
-    async with token_lock:
-        snap_t = dict(token_counts)
-    return {"counts": snap_c, "tokens": snap_t}
-
-
-@app.get("/admin/metrics")
-async def admin_metrics():
-    """Return router/memory/metrics for observability."""
-    server_config = config.get("server", {})
-    models_max = server_config.get("llama_models_max")
-    router_mode = server_config.get("llama_router_mode", False)
-    loaded_models = None
-    if router_mode:
-        router_models = await router_list_models()
-        loaded_models = _extract_router_model_ids(router_models)
-
-    per_model = {}
-    for m in loaded_models or []:
-        per_model[m] = {"last_used": model_last_used.get(m), "rss_bytes": None}
-
-    process_rss = None
-    try:
-        if 'psutil' in globals() and psutil and llama_process is not None:
-            pid = getattr(llama_process, 'pid', None)
-            if pid:
-                p = psutil.Process(pid)
-                mem = p.memory_info()
-                process_rss = getattr(mem, 'rss', None)
-    except Exception:
-        process_rss = None
-
-    # Estimate per-model RSS bytes when possible (approximation for router-mode)
-    if process_rss is not None and loaded_models:
-        try:
-            per = int(process_rss // len(loaded_models))
-            for m in loaded_models:
-                per_model[m]['rss_bytes'] = per
-        except Exception:
-            for m in loaded_models:
-                per_model[m]['rss_bytes'] = None
-
-    # Update Prometheus metrics (best-effort)
-    try:
-        metrics.update_metrics(process_rss, loaded_models)
-    except Exception:
-        pass
-
-    return {
-        "models_max": models_max,
-        "loaded_models": loaded_models,
-        "per_model": per_model,
-        "process_rss_bytes": process_rss,
-        "session_metrics": session_manager.get_metrics(),
-        "restore_success_total": int(session_restore_observability.get("restore_success_total", 0)),
-        "restore_fallback_total": dict(session_restore_observability.get("restore_fallback_total", {})),
-        "delta_payload_bytes_total": int(session_restore_observability.get("delta_payload_bytes_total", 0)),
-        "single_flight_metrics": dict(session_single_flight_observability),
-        "guardrail_metrics": {
-            "guardrail_cutoff_total": int(session_guardrail_observability.get("guardrail_cutoff_total", 0)),
-            "guardrail_cutoff_reasons": dict(session_guardrail_observability.get("guardrail_cutoff_reasons", {})),
-            "session_invalidation_total": int(session_guardrail_observability.get("session_invalidation_total", 0)),
-            "session_invalidation_reasons": dict(session_guardrail_observability.get("session_invalidation_reasons", {})),
-        },
-        "backend_ready": bool(backend_ready),
-        "backend_recovery": _backend_recovery_snapshot(),
-        "backend_signals": dict(backend_signal_counts),
-    }
-
-
-@app.get("/metrics")
-async def prometheus_metrics():
-    """Prometheus scrape endpoint (text/plain, exposition format)."""
-    try:
-        payload, content_type = metrics.generate_metrics_payload()
-        return Response(content=payload, media_type=content_type)
-    except Exception:
-        raise HTTPException(status_code=503, detail="Prometheus metrics unavailable")
-
-
-@app.post("/admin/reset-counts")
-async def admin_reset_counts():
-    """Reset in-memory and persisted request/token counts to empty.
-
-    This clears the in-memory dictionaries and triggers an immediate persist.
-    """
-    global request_counts, token_counts, counts_dirty, tokens_dirty
-    async with counts_lock:
-        request_counts = {}
-        counts_dirty = True
-    async with token_lock:
-        token_counts = {}
-        tokens_dirty = True
-
-    # Trigger async saves (background)
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(save_counts())
-        loop.create_task(save_token_counts())
-    except RuntimeError:
-        # fallback
-        await save_counts()
-        await save_token_counts()
-
-    # Broadcast an empty snapshot to log tail clients
-    for q in list(log_tail_clients):
-        try:
-            q.put_nowait({"counts": {}, "tokens": {}})
-        except Exception:
-            continue
-
-    return {"status": "success", "message": "Counts reset"}
-
-
-@app.get("/admin/sessions")
-async def admin_list_sessions():
-    """List all active sessions with their metadata."""
-    sessions = []
-    for session_id in list(session_manager._sessions.keys()):
-        info = session_manager.get_session_info(session_id)
-        if info is not None:
-            sessions.append(info)
-    return {"sessions": sessions, "total": len(sessions)}
-
-
-@app.delete("/admin/sessions/{session_id}")
-async def admin_delete_session(session_id: str):
-    """Delete a specific session by ID."""
-    removed = await session_manager.remove(session_id)
-    if removed:
-        return {"status": "success", "message": f"Session {session_id} deleted"}
-    raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
 
 def main():
@@ -6898,6 +6489,24 @@ def main():
         reload=False,
         log_level="info"
     )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility re-exports for tests that import these from server
+# ---------------------------------------------------------------------------
+from .handlers import (  # noqa: E402, F401
+    get_llama_local_status,
+    health_check,
+    list_models,
+    prometheus_metrics,
+    admin_metrics,
+    admin_dump_counts,
+    admin_stop_server,
+    admin_reset_counts,
+    admin_list_sessions,
+    admin_delete_session,
+    reload_config,
+)
 
 
 if __name__ == "__main__":
