@@ -174,101 +174,7 @@ backend_signal_counts: dict = {
 }
 
 # Session restore observability
-session_restore_observability: dict = {
-    "restore_success_total": 0,
-    "restore_fallback_total": {},
-    "delta_payload_bytes_total": 0,
-}
 
-# Session single-flight observability
-session_single_flight_observability: dict = {
-    "queue_events_total": 0,
-    "reject_events_total": 0,
-    "active_sessions_current": 0,
-    "queue_depth_current": 0,
-}
-
-# Guardrail & invalidation observability
-session_guardrail_observability: dict = {
-    "guardrail_cutoff_total": 0,
-    "guardrail_cutoff_reasons": {},
-    "session_invalidation_total": 0,
-    "session_invalidation_reasons": {},
-}
-
-
-def _record_restore_success() -> None:
-    try:
-        session_restore_observability["restore_success_total"] = int(
-            session_restore_observability.get("restore_success_total", 0)
-        ) + 1
-    except Exception:
-        pass
-
-
-def _record_restore_fallback(reason: str) -> None:
-    if not reason:
-        return
-    try:
-        bucket = session_restore_observability.setdefault("restore_fallback_total", {})
-        bucket[reason] = int(bucket.get(reason, 0)) + 1
-    except Exception:
-        pass
-
-
-def _record_delta_payload_bytes(value: int) -> None:
-    if value <= 0:
-        return
-    try:
-        session_restore_observability["delta_payload_bytes_total"] = int(
-            session_restore_observability.get("delta_payload_bytes_total", 0)
-        ) + int(value)
-    except Exception:
-        pass
-
-
-def _record_single_flight_queue() -> None:
-    try:
-        session_single_flight_observability["queue_events_total"] = int(
-            session_single_flight_observability.get("queue_events_total", 0)
-        ) + 1
-    except Exception:
-        pass
-
-
-def _record_single_flight_reject() -> None:
-    try:
-        session_single_flight_observability["reject_events_total"] = int(
-            session_single_flight_observability.get("reject_events_total", 0)
-        ) + 1
-    except Exception:
-        pass
-
-
-def _record_guardrail_cutoff(reason: str) -> None:
-    if not reason:
-        return
-    try:
-        session_guardrail_observability["guardrail_cutoff_total"] = int(
-            session_guardrail_observability.get("guardrail_cutoff_total", 0)
-        ) + 1
-        bucket = session_guardrail_observability.setdefault("guardrail_cutoff_reasons", {})
-        bucket[reason] = int(bucket.get(reason, 0)) + 1
-    except Exception:
-        pass
-
-
-def _record_session_invalidation(reason: str) -> None:
-    if not reason:
-        return
-    try:
-        session_guardrail_observability["session_invalidation_total"] = int(
-            session_guardrail_observability.get("session_invalidation_total", 0)
-        ) + 1
-        bucket = session_guardrail_observability.setdefault("session_invalidation_reasons", {})
-        bucket[reason] = int(bucket.get(reason, 0)) + 1
-    except Exception:
-        pass
 
 
 def _ensure_slot_dir(slot_path: Optional[str]) -> Optional[Path]:
@@ -1139,233 +1045,14 @@ def _has_explicit_restore_signal(
     return False
 
 
-def _detect_restore_signal_from_log_slice(
-    log_path: Path,
-    start_offset: int,
-) -> bool:
-    """Return True when restore evidence exists in newly appended log bytes."""
-    if not log_path.exists():
-        return False
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(max(0, int(start_offset)))
-            data = f.read()
-    except Exception:
-        return False
 
-    if not data:
-        return False
-
-    text = data.lower()
-    phrases = (
-        "restored context checkpoint",
-        "load_session",
-        "session restore",
-        "restore session",
-        "loading kv cache",
-        "kv cache restored",
-    )
-    return any(p in text for p in phrases)
-
-
-def _detect_restore_signal_from_llama_log(
-    session_id: Optional[str],
-    log_path: Optional[Path] = None,
-    lookback_lines: int = 400,
-) -> bool:
-    """Best-effort compatibility signal from llama-server logs.
-
-    Prefer session-id-specific lines when available.
-    """
-    if not session_id:
-        return False
-
-    target_path = log_path or _resolve_log_path("llama")
-    if not target_path.exists():
-        return False
-
-    try:
-        with open(target_path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()[-max(1, int(lookback_lines)):]
-    except Exception:
-        return False
-
-    sid = str(session_id).strip()
-    sid_lower = sid.lower()
-    phrases = (
-        "load_session",
-        "session restore",
-        "restore session",
-        "loading kv cache",
-        "kv cache restored",
-        "restored context checkpoint",
-    )
-
-    for line in reversed(lines):
-        text = line.strip().lower()
-        if sid_lower in text and any(p in text for p in phrases):
-            return True
-
-    # Fallback: if no session id appears in log format, accept recent restore phrases.
-    return any(any(p in line.strip().lower() for p in phrases) for line in lines)
 
 
 log_dir: Optional[Path] = None
 logger: logging.Logger = logging.getLogger("llama-proxy")
 
 
-def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
-    """Extract concatenated delta.content and delta.reasoning_content strings from an SSE chunk.
 
-    Returns the concatenated content (may include newlines as provided by the delta values)
-    or None if no parseable content is found. Handles both 'content' and 'reasoning_content'
-    fields used by models like Qwen3 during their thinking/reasoning phase.
-    """
-    if not chunk_str:
-        return None
-    try:
-        contents: list[str] = []
-        # First attempt: parse lines prefixed with 'data:' (SSE style)
-        for line in chunk_str.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("data:"):
-                payload = line[len("data:"):].strip()
-                try:
-                    j = json.loads(payload)
-                except Exception:
-                    # ignore non-json data: lines
-                    continue
-                if isinstance(j, dict):
-                    choices = j.get("choices") or []
-                    for choice in choices:
-                        if not isinstance(choice, dict):
-                            continue
-                        delta = choice.get("delta") or {}
-                        if isinstance(delta, dict):
-                            # Extract both content and reasoning_content
-                            for key in ("reasoning_content", "content"):
-                                content_piece = delta.get(key)
-                                if content_piece is not None:
-                                    contents.append(str(content_piece))
-        if contents:
-            return "".join(contents)
-
-        # Second attempt: try to parse the whole chunk as JSON
-        s = chunk_str.strip()
-        if s:
-            try:
-                j = json.loads(s)
-                if isinstance(j, dict):
-                    choices = j.get("choices") or []
-                    for choice in choices:
-                        if not isinstance(choice, dict):
-                            continue
-                        delta = choice.get("delta") or {}
-                        if isinstance(delta, dict):
-                            # Extract both content and reasoning_content
-                            for key in ("reasoning_content", "content"):
-                                content_piece = delta.get(key)
-                                if content_piece is not None:
-                                    contents.append(str(content_piece))
-                if contents:
-                    return "".join(contents)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return None
-
-
-class ContentOnlyConsoleHandler(logging.StreamHandler):
-    """Console handler that prints only streamed content for STREAM CHUNK records.
-
-    For log records whose formatted message begins with the prefix
-    "STREAM CHUNK | ", this handler will attempt to extract delta.content
-    values from any JSON payloads inside the chunk and write only the
-    concatenated content to the console stream (without adding extra
-    newlines). Raw JSON is never displayed in the console - only extracted
-    text content is shown.
-
-    - reasoning_content is displayed in dim/grey
-    - content is displayed in bold
-
-    For other records, normal formatting is used.
-    """
-
-    PREFIX = "STREAM CHUNK | "
-    # ANSI escape codes
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
-    def _extract_and_format_content(self, chunk_str: str) -> Optional[str]:
-        """Extract content from chunk and apply formatting based on type.
-        
-        Returns formatted string with ANSI codes, or None if no content found.
-        """
-        if not chunk_str:
-            return None
-        
-        parts: list[str] = []
-        for line in chunk_str.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("data:"):
-                continue
-            payload = line[len("data:"):].strip()
-            if payload == "[DONE]":
-                continue
-            try:
-                j = json.loads(payload)
-            except Exception:
-                continue
-            for choice in j.get("choices", []):
-                delta = choice.get("delta", {})
-                if not isinstance(delta, dict):
-                    continue
-                # Check reasoning_content first (dim)
-                reasoning = delta.get("reasoning_content")
-                if reasoning is not None:
-                    parts.append(f"{self.DIM}{reasoning}{self.RESET}")
-                # Check content (bold)
-                content = delta.get("content")
-                if content is not None:
-                    parts.append(f"{self.BOLD}{content}{self.RESET}")
-        
-        return "".join(parts) if parts else None
-
-    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - exercised by integration
-        try:
-            msg = record.getMessage()
-            if isinstance(msg, str) and msg.startswith(self.PREFIX):
-                chunk_str = msg[len(self.PREFIX):]
-                formatted = self._extract_and_format_content(chunk_str)
-                if formatted:
-                    # Ensure stream exists
-                    if getattr(self, 'stream', None) is None:
-                        self.stream = sys.stderr
-                    try:
-                        # Write formatted content. Do not append extra newline;
-                        # the content may include its own newline characters.
-                        self.stream.write(formatted)
-                        try:
-                            self.flush()
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                # Always return for STREAM CHUNK - never show raw JSON in console
-                # Raw JSON is written to the log file by the file handler
-                return
-            # Not a stream chunk — use default formatting
-            super().emit(record)
-        except Exception:
-            # Best-effort: do not allow logging errors to crash application
-            try:
-                super().emit(record)
-            except Exception:
-                pass
 
 # SSE clients for real-time status updates
 sse_clients: set[asyncio.Queue] = set()
@@ -6277,6 +5964,22 @@ from .lifecycle import (  # noqa: E402, F401
     _prune_recovery_attempts,
     _attempt_router_self_heal,
     _backend_watchdog_loop,
+)
+from .session import (  # noqa: E402, F401
+    session_restore_observability,
+    session_single_flight_observability,
+    session_guardrail_observability,
+    _record_restore_success,
+    _record_restore_fallback,
+    _record_delta_payload_bytes,
+    _record_single_flight_queue,
+    _record_single_flight_reject,
+    _record_guardrail_cutoff,
+    _record_session_invalidation,
+    _detect_restore_signal_from_log_slice,
+    _detect_restore_signal_from_llama_log,
+    extract_streamed_content_from_chunk,
+    ContentOnlyConsoleHandler,
 )
 
 
