@@ -77,14 +77,16 @@ def resolve_var(vars_map, val):
 
 
 def extract_css_vars_from_server() -> dict:
-    p = Path(__file__).resolve().parents[1] / 'proxy' / 'server.py'
-    txt = p.read_text(encoding='utf-8')
-    # find all --var: value; occurrences
     vars_map = {}
-    for m in re.finditer(r'--([a-z0-9\-]+):\s*([^;]+);', txt, flags=re.IGNORECASE):
-        name = m.group(1)
-        val = m.group(2).strip()
-        vars_map[name] = val
+    for pyfile in ['server.py', 'ui.py']:
+        p = Path(__file__).resolve().parents[1] / 'proxy' / pyfile
+        if not p.exists():
+            continue
+        txt = p.read_text(encoding='utf-8')
+        for m in re.finditer(r'--([a-z0-9\-]+):\s*([^;]+);', txt, flags=re.IGNORECASE):
+            name = m.group(1)
+            val = m.group(2).strip()
+            vars_map[name] = val
     return vars_map
 
 
