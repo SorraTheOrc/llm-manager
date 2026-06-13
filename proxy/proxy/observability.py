@@ -137,7 +137,7 @@ def save_counts_sync():
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(request_counts, f, indent=2)
+            json.dump(srv.request_counts, f, indent=2)
         tmp.replace(path)
     except Exception as e:
         srv.logger.error(f"Failed to persist request counts: {e}")
@@ -173,7 +173,7 @@ def save_token_counts_sync():
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(token_counts, f, indent=2)
+            json.dump(srv.token_counts, f, indent=2)
         tmp.replace(path)
     except Exception as e:
         srv.logger.error(f"Failed to persist token counts: {e}")
@@ -266,7 +266,7 @@ async def query_llama_status() -> dict:
             """
             # If discovery was already done for this pid, skip.
             try:
-                current_pid = getattr(llama_process, 'pid', None)
+                current_pid = getattr(srv.llama_process, 'pid', None)
             except Exception:
                 current_pid = None
             if srv._llama_status_discovered and srv._llama_status_discovered_pid == current_pid:
@@ -316,7 +316,7 @@ async def query_llama_status() -> dict:
             # Mark discovery done for this pid even if none found
             srv._llama_status_discovered = True
             try:
-                srv._llama_status_discovered_pid = getattr(llama_process, 'pid', None)
+                srv._llama_status_discovered_pid = getattr(srv.llama_process, 'pid', None)
             except Exception:
                 srv._llama_status_discovered_pid = None
 
@@ -360,7 +360,7 @@ async def query_llama_status() -> dict:
                             )
                 else:
                     # cache no longer valid; clear and allow future rediscovery
-                    srv._llama_status_endpoint_failures[_llama_status_endpoint_cache] = time.time()
+                    srv._llama_status_endpoint_failures[srv._llama_status_endpoint_cache] = time.time()
                     srv._llama_status_endpoint_cache = None
                     srv._llama_status_discovered = False
                     srv._llama_status_discovered_pid = None
@@ -440,7 +440,7 @@ async def _periodic_broadcast_loop():
                 if sse_clients:
                     status_data = {
                         "type": "status",
-                        "current_model": current_model,
+                        "current_model": srv.current_model,
                         "llama_server_running": llama_status["llama_server_running"],
                         "n_ctx": llama_status["n_ctx"],
                         "kv_cache_tokens": llama_status["kv_cache_tokens"],

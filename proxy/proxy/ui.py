@@ -2210,9 +2210,9 @@ async def switch_model(model_name: str):
             detail=f"Model {model_name} is not a local model"
         )
     
-    srv.logger.info(f"Admin switch-model requested: {model_name}; current_model before: {current_model}; llama_running: {llama_process is not None and llama_process.poll() is None}")
+    srv.logger.info(f"Admin switch-model requested: {model_name}; current_model before: {srv.current_model}; llama_running: {srv.llama_process is not None and srv.llama_process.poll() is None}")
     if await srv.ensure_model_loaded(model_name):
-        srv.logger.info(f"Admin switch-model succeeded: requested={model_name} current_model after: {current_model}")
+        srv.logger.info(f"Admin switch-model succeeded: requested={model_name} current_model after: {srv.current_model}")
         return {
             "status": "success",
             "message": f"Switched to model: {model_name}",

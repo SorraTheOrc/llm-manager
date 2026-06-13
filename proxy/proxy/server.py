@@ -216,55 +216,6 @@ except Exception:
 config: dict = {}
 
 
-async def _call_with_empty_retry(
-    send_fn: Callable[[], Awaitable[httpx.Response]],
-    path: str,
-    max_retries: int = 2,
-    retry_delay: float = 0.5,
-) -> httpx.Response:
-    """Call send_fn, retrying on empty responses up to max_retries times.
-
-    A response is considered "empty" when it has no text content and no tool
-    call embedded in reasoning_content (e.g. the model returned only thinking
-    output without actual content). Retries use retry_delay seconds between
-    attempts. Session context is preserved across retries because send_fn
-    captures the same headers/body.
-
-    Returns the first non-empty response, or the last response if all retries
-    are exhausted.
-    """
-    for attempt in range(max_retries + 1):
-        response = await _call_with_backend_retries(send_fn, path=path, stream=False)
-        try:
-            content = response.content.decode('utf-8', errors='replace')
-            resp_json = json.loads(content) if content else {}
-        except Exception:
-            return response  # not valid JSON or content not readable, use as-is
-
-        if _is_empty_response(content or "", resp_json):
-            if attempt < max_retries:
-                logger.info(
-                    "Empty response detected on attempt %s/%s, retrying...",
-                    attempt + 1,
-                    max_retries,
-                )
-                await asyncio.sleep(retry_delay)
-            else:
-                logger.warning(
-                    "Empty response persisted after %s retries, returning empty response",
-                    max_retries,
-                )
-        else:
-            if attempt > 0:
-                logger.info(
-                    "Retry attempt %s produced non-empty response",
-                    attempt + 1,
-                )
-            return response
-
-    return response
-
-
 def _sanitize_session_id(session_id: str) -> str:
     if not session_id:
         return ""
@@ -580,6 +531,26 @@ logger: logging.Logger = logging.getLogger("llama-proxy")
 
 
 
+
+
+def _resolve_session_id_header(
+    headers: dict,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a session identifier from request headers.
+
+    Priority order:
+    1. ``X-Session-Id``
+    2. ``session_id``
+    3. ``X-Client-Request-Id``
+    4. ``X-Session-Affinity``
+
+    Returns ``(session_id, source_header_name)``.
+    """
+    for header_name in ("x-session-id", "session_id", "x-client-request-id", "x-session-affinity"):
+        value = headers.get(header_name)
+        if value:
+            return value, header_name
+    return None, None
 
 
 def _log_session_header_resolution(
@@ -2057,6 +2028,7 @@ from .utils import (  # noqa: E402, F401
     count_text_tokens,
     _extract_tool_call_from_reasoning,
     _extract_assistant_content,
+    _call_with_empty_retry,
     _is_empty_response,
     _extract_assistant_content_from_sse,
     _extract_delta_text_from_sse_chunk,

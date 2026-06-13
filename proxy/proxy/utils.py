@@ -6,13 +6,14 @@ monolithic server.py. Functions in this module do NOT depend on server
 module-level state unless accessed via the lazy _srv() import pattern.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 import yaml
@@ -25,6 +26,11 @@ from proxy.session import ContentOnlyConsoleHandler
 # ---------------------------------------------------------------------------
 def _srv():
     import proxy.server as _m
+    return _m
+
+
+def _lifecycle():
+    import proxy.lifecycle as _m
     return _m
 
 
@@ -250,6 +256,61 @@ def _extract_delta_text_from_sse_chunk(chunk_text: str) -> str:
                 if value is not None:
                     parts.append(str(value))
     return "".join(parts)
+
+
+# ===================================================================
+# Empty response retry helper
+# ===================================================================
+
+async def _call_with_empty_retry(
+    send_fn: Callable[[], Awaitable[httpx.Response]],
+    path: str,
+    max_retries: int = 2,
+    retry_delay: float = 0.5,
+) -> httpx.Response:
+    """Call send_fn, retrying on empty responses up to max_retries times.
+
+    A response is considered "empty" when it has no text content and no tool
+    call embedded in reasoning_content (e.g. the model returned only thinking
+    output without actual content). Retries use retry_delay seconds between
+    attempts. Session context is preserved across retries because send_fn
+    captures the same headers/body.
+
+    Returns the first non-empty response, or the last response if all retries
+    are exhausted.
+    """
+    lifecycle = _lifecycle()
+    srv = _srv()
+    for attempt in range(max_retries + 1):
+        response = await lifecycle._call_with_backend_retries(send_fn, path=path, stream=False)
+        try:
+            content = response.content.decode('utf-8', errors='replace')
+            resp_json = json.loads(content) if content else {}
+        except Exception:
+            return response  # not valid JSON or content not readable, use as-is
+
+        if _is_empty_response(content or "", resp_json):
+            if attempt < max_retries:
+                srv.logger.info(
+                    "Empty response detected on attempt %s/%s, retrying...",
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                srv.logger.warning(
+                    "Empty response persisted after %s retries, returning empty response",
+                    max_retries,
+                )
+        else:
+            if attempt > 0:
+                srv.logger.info(
+                    "Retry attempt %s produced non-empty response",
+                    attempt + 1,
+                )
+            return response
+
+    return response
 
 
 # ===================================================================

@@ -21,6 +21,7 @@ from typing import Any, Callable, Awaitable, Dict, List, Optional, Tuple
 
 import httpx
 import subprocess
+from fnmatch import fnmatch
 from fastapi.responses import JSONResponse
 
 
@@ -463,7 +464,7 @@ def _model_loading_response(requested_model: Optional[str], target_model: str, s
        "requested_model": requested_model,
        "target_model": target_model,
        "scheduled": bool(scheduled),
-       "srv.current_model": srv.current_model,
+       "current_model": srv.current_model,
        "llama_server_running": srv.llama_process is not None and srv.llama_process.poll() is None,
        "retry_after": retry_after,
        "endpoint": endpoint,
@@ -716,7 +717,7 @@ def _resolve_slot_model_name(
 ) -> Optional[str]:
     """Resolve the llama model name used for slot endpoints in router mode."""
     srv = _srv()
-    candidate = requested_model or srv.current_model
+    candidate = requested_model or current_model
     if not candidate:
        return None
     if server_config.get("llama_router_mode", False):
@@ -993,7 +994,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
            msg = "Model name is required when not running in router mode"
            srv.logger.error(msg)
            srv.last_start_failure = msg
-           srv.broadcast_status_sync("error", {"message": msg, "srv.current_model": None, "llama_server_running": False})
+           srv.broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
            return None
        distrobox_cmd = ["distrobox", "enter", distrobox_name, "--", script_path, model]
 
@@ -1056,30 +1057,12 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
                                                except Exception:
                                                    total_tokens = n_tokens
                                                try:
-                                                   progress_str = format_progress(n_tokens, total_tokens, prog_frac)
-                                                   # Write the progress string in-place (no newline)
-                                                   sys.stderr.write(progress_str)
-                                                   sys.stderr.flush()
+                                                   pct = int(prog_frac * 100)
+                                                   srv.logger.info(f"Prompt processing: {n_tokens}/{total_tokens} ({pct}%)")
                                                except Exception:
-                                                   # Formatting failed — fall back to raw line
-                                                   progress_line = line_str.strip()
-                                                   if progress_line:
-                                                       sys.stderr.write(f"\r{progress_line}\n")
-                                                       sys.stderr.flush()
-                                           else:
-                                               # No structured progress found — print raw line
-                                               progress_line = line_str.strip()
-                                               if progress_line:
-                                                   sys.stderr.write(f"\r{progress_line}\n")
-                                                   sys.stderr.flush()
+                                                   pass
                                        except Exception:
-                                           try:
-                                               progress_line = line_str.strip()
-                                               if progress_line:
-                                                   sys.stderr.write(f"\r{progress_line}\n")
-                                                   sys.stderr.flush()
-                                           except Exception:
-                                               pass
+                                           pass
                                except Exception:
                                    pass
                        except Exception:
@@ -1103,7 +1086,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
        msg = "distrobox not found in PATH; llama-server must be started inside distrobox"
        srv.logger.error(msg)
        srv.last_start_failure = msg
-       srv.broadcast_status_sync("error", {"message": msg, "srv.current_model": None, "llama_server_running": False})
+       srv.broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
        return None
 
     # Try distrobox only
@@ -1138,7 +1121,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     srv.logger.error(msg)
     # record last failure for diagnostics and broadcast
     srv.last_start_failure = msg
-    srv.broadcast_status_sync("error", {"message": msg, "srv.current_model": None, "llama_server_running": False})
+    srv.broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
     return None
 
 
