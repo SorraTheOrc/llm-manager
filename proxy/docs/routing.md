@@ -1,6 +1,12 @@
 # Proxy Request Routing
 
 This document describes how the proxy decides how to route incoming requests.
+The core routing functions `proxy_to_local` and `proxy_to_remote` (along with request/response
+logging helpers `log_request`, `log_response`, and `log_response_chunk`) live in
+`proxy/proxy/router.py`.
+
+For backward compatibility, these five functions are re-exported from `proxy/proxy/server.py`
+so that `from proxy.server import proxy_to_local` continues to work.
 
 ## Request Routing Flow
 
