@@ -936,7 +936,8 @@ into a modular composition:
 | `server.py` | Bootstrap, composition wiring, session manager, model loading, web UI |
 | `router.py` | Core proxy routing (`proxy_to_local`, `proxy_to_remote`) and request/response logging (`log_request`, `log_response`, `log_response_chunk`) |
 | `handlers.py` | HTTP route handlers (FastAPI APIRouter) — `/health`, `/v1/models`, `/metrics`, `/admin/*` |
-| `lifecycle.py` | Model lifecycle, self-healing, backend watchdog, recovery state |
+| `lifecycle.py` | Model lifecycle orchestration, model loading, refcounting, background loads |
+| `backend_health.py` | Backend recovery, self-healing, watchdog monitoring, worker-health checks |
 | `session.py` | Session coordination, delta/fallback/single-flight, restore signal detection, `ContentOnlyConsoleHandler` |
 | `observability.py` | Backend signal counters, SSE client sets (`sse_clients`, `log_tail_clients`) |
 | `metrics.py` | Prometheus metrics helpers (gauges, counters, exposition format) |
