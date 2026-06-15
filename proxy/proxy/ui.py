@@ -91,7 +91,7 @@ async def index(request: Request):
     base = provider_host.rstrip('/') if provider_host else str(request.base_url).rstrip('/')
 
     # Load template from external file
-    _templates_dir = Path(__file__).parent / "templates"
+    _templates_dir = Path(__file__).parent.parent / "templates"
     html_content = (_templates_dir / "index.html").read_text(encoding="utf-8")
 
     # Substitute placeholders
@@ -351,7 +351,7 @@ async def view_logs(request: Request):
     tokens_html = await get_tokens_html()
 
     # Load template from external file
-    _templates_dir = Path(__file__).parent / "templates"
+    _templates_dir = Path(__file__).parent.parent / "templates"
     html = (_templates_dir / "view_logs.html").read_text(encoding="utf-8")
 
     # Prepare JSON snapshot for client-side rendering
