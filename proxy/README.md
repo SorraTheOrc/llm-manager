@@ -933,7 +933,7 @@ into a modular composition:
 
 | Module | Responsibility |
 |--------|---------------|
-| `server.py` | Bootstrap, composition wiring, session manager, model loading, web UI |
+| `server.py` | Bootstrap, composition wiring, session manager, model loading |
 | `router.py` | Core proxy routing (`proxy_to_local`, `proxy_to_remote`) and request/response logging (`log_request`, `log_response`, `log_response_chunk`) |
 | `handlers.py` | HTTP route handlers (FastAPI APIRouter) — `/health`, `/v1/models`, `/metrics`, `/admin/*` |
 | `lifecycle.py` | Model lifecycle orchestration, model loading, refcounting, background loads |
@@ -941,6 +941,8 @@ into a modular composition:
 | `session.py` | Session coordination, delta/fallback/single-flight, restore signal detection, `ContentOnlyConsoleHandler` |
 | `observability.py` | Backend signal counters, SSE client sets (`sse_clients`, `log_tail_clients`) |
 | `metrics.py` | Prometheus metrics helpers (gauges, counters, exposition format) |
+| `ui.py` | Web UI endpoints (dashboard at `/`, log viewer at `/logs`, SSE streaming) |
+| `templates/` | HTML template files for Web UI (`index.html`, `view_logs.html`) |
 | `session_manager.py` | Core session manager class (session create/lookup/expiry) |
 
 Each module uses a lazy `_srv()` import pattern to access `server.py` module-level
