@@ -1378,4 +1378,195 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                pass
 
 
+# ===================================================================
+# Router model health monitoring
+# Probes loaded model instance ports to detect crashed children that the
+# llama.cpp router still reports as "loaded" (a known bug where the child
+# monitoring thread doesn't update status on crash).
+# ===================================================================
+
+
+def _extract_model_port_from_args(args: list) -> Optional[int]:
+    """Extract the model instance port from its argument list.
+
+    The args list comes from the router's /models endpoint status.args
+    field and contains things like ``--port 41649``.
+    """
+    if not isinstance(args, list):
+        return None
+    try:
+        for i, arg in enumerate(args):
+            if arg == "--port" and i + 1 < len(args):
+                return int(args[i + 1])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+async def _router_model_health_loop() -> None:
+    """Periodically check all loaded models' reachability in router mode.
+
+    Queries the router's ``/models`` endpoint, then probes each model that
+    reports ``status.value == "loaded"`` by connecting to its port.  If a
+    model claims to be loaded but its port is unreachable, triggers an
+    unload+reload cycle to recover the dead instance.
+
+    This addresses the case where llama.cpp's child-monitoring thread fails
+    to promptly detect a child crash and update the model status, leaving
+    the router permanently proxying requests to a dead port.
+    """
+    srv = _srv()
+
+    while True:
+        try:
+            interval = float(
+                srv.config.get("server", {}).get(
+                    "llama_model_health_interval_seconds", 30.0
+                )
+                or 30.0
+            )
+            await asyncio.sleep(max(5.0, interval))
+
+            router_mode = bool(
+                srv.config.get("server", {}).get("llama_router_mode", False)
+            )
+            if not router_mode:
+                continue
+
+            # Don't interfere while the watchdog is actively recovering
+            if srv._is_self_healing_active():
+                continue
+
+            # Get the list of models from the router
+            models_data = await srv.router_list_models()
+            if not isinstance(models_data, dict):
+                continue
+
+            models_payload = models_data.get("data") or models_data.get("models") or []
+            if not isinstance(models_payload, list):
+                continue
+
+            router_port = int(
+                srv.config.get("server", {}).get("llama_server_port", 8080)
+            )
+            router_host = "127.0.0.1"
+
+            for model_entry in models_payload:
+                if not isinstance(model_entry, dict):
+                    continue
+
+                model_id = model_entry.get("id")
+                raw_status = model_entry.get("status", {})
+
+                # Extract the status value string
+                if isinstance(raw_status, str):
+                    status_value = raw_status.lower()
+                    args = []
+                elif isinstance(raw_status, dict):
+                    status_value = str(raw_status.get("value", "")).lower()
+                    args = raw_status.get("args", [])
+                else:
+                    continue
+
+                if status_value != "loaded":
+                    continue
+                if not model_id:
+                    continue
+
+                # Extract port from the instance args (--port N)
+                port = srv._extract_model_port_from_args(args)
+                if port is None or port <= 0:
+                    srv.logger.debug(
+                        "model_health: cannot determine port for "
+                        "loaded model %s, skipping",
+                        model_id,
+                    )
+                    continue
+
+                # Probe the model's port with a simple health check
+                reachable = await srv._probe_model_instance(
+                    router_host, port
+                )
+                if reachable:
+                    continue
+
+                # Model reports "loaded" but its port is unreachable
+                srv.logger.error(
+                    "model_health: model %s (port %d) is reported as "
+                    "loaded but unreachable, triggering recovery",
+                    model_id,
+                    port,
+                )
+
+                # Unload first (may 400 if already unloaded, that's fine)
+                srv.logger.info(
+                    "model_health: unloading dead model %s",
+                    model_id,
+                )
+                try:
+                    client = (
+                        srv._http_client
+                        if srv._http_client
+                        else httpx.AsyncClient(timeout=10.0)
+                    )
+                    try:
+                        await client.post(
+                            f"http://{router_host}:{router_port}/models/unload",
+                            json={"model": model_id},
+                            timeout=10.0,
+                        )
+                    finally:
+                        if not srv._http_client:
+                            await client.aclose()
+                except Exception as exc:
+                    srv.logger.warning(
+                        "model_health: unload request for %s failed: %s",
+                        model_id,
+                        exc,
+                    )
+
+                # Reload the model
+                srv.logger.info(
+                    "model_health: reloading model %s",
+                    model_id,
+                )
+                loaded = await srv.router_load_model(model_id)
+                if loaded:
+                    srv.logger.info(
+                        "model_health: successfully reloaded model %s",
+                        model_id,
+                    )
+                else:
+                    srv.logger.error(
+                        "model_health: failed to reload model %s",
+                        model_id,
+                    )
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            srv.logger.exception("model health loop error")
+
+
+async def _probe_model_instance(
+    host: str, port: int, timeout: float = 5.0
+) -> bool:
+    """Probe whether a model instance is reachable on its port.
+
+    Performs a simple GET to ``/health`` on the given host:port.
+    Returns True if the endpoint responds with HTTP 200.
+    """
+    if port <= 0:
+        return False
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        try:
+            url = f"http://{host}:{port}/health"
+            response = await client.get(url, timeout=timeout)
+            return response.status_code == 200
+        finally:
+            await client.aclose()
+    except Exception:
+        return False
+
 

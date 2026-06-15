@@ -110,6 +110,9 @@ backend_recovery_state: dict = {
 # Background watchdog task (started in lifespan)
 backend_watchdog_task: Optional[asyncio.Task] = None
 
+# Background model health monitoring task (started in lifespan)
+model_health_task: Optional[asyncio.Task] = None
+
 # Token counting
 token_counts: dict = {}
 token_lock = asyncio.Lock()
@@ -1237,7 +1240,7 @@ def log_response_chunk(chunk: bytes):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global config, logger, llama_process, _http_client, backend_watchdog_task, backend_ready, backend_recovery_state
+    global config, logger, llama_process, _http_client, backend_watchdog_task, model_health_task, backend_ready, backend_recovery_state
     
     # Startup
     config = load_config()
@@ -1361,6 +1364,9 @@ async def lifespan(app: FastAPI):
 
     if backend_watchdog_task is None:
         backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
+
+    if model_health_task is None:
+        model_health_task = loop.create_task(_router_model_health_loop())
 
     # Load persisted request counts and token counts
     load_counts()
@@ -1521,6 +1527,9 @@ from .lifecycle import (  # noqa: E402, F401
     _prune_recovery_attempts,
     _attempt_router_self_heal,
     _backend_watchdog_loop,
+    _router_model_health_loop,
+    _extract_model_port_from_args,
+    _probe_model_instance,
     _inc_model_switch_refcount,
     _dec_model_switch_refcount,
     schedule_background_load,
