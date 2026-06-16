@@ -620,6 +620,59 @@ async def test_local_fallback_all_exhausted(mixed_model_config):
     assert "retry_after" in body
 
 
+@pytest.mark.asyncio
+async def test_fallback_preserves_request_semantics(mixed_model_config):
+    """When local fallback occurs, the forwarded request to the remote provider
+    must preserve method, headers, body, and the path argument passed to the
+    proxy. This verifies request semantics are preserved during fallback.
+    """
+    request = _DummyRequest(body=b'{"prompt":"hello"}')
+    # Add some headers to ensure they are forwarded
+    request.headers = {
+        "Authorization": "Bearer test-token",
+        "X-Custom-Header": "custom",
+    }
+
+    cfg = {"provider_cooldown_seconds": 60}
+    observed = {}
+
+    async def _mock_proxy_to_local(_req, _path):
+        # Simulate local failure to force fallback
+        raise httpx.ConnectError("Local llama-server unreachable")
+
+    async def _mock_proxy_to_remote(req, path, provider_cfg):
+        # Capture the forwarded request semantics
+        observed["method"] = req.method
+        # Make a shallow copy of headers to avoid framework-specific types
+        observed["headers"] = dict(req.headers)
+        observed["body"] = await req.body()
+        observed["path"] = path
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # Verify the remote proxy received the same method
+    assert observed.get("method") == request.method
+    # Verify headers were forwarded
+    assert observed.get("headers", {}).get("Authorization") == "Bearer test-token"
+    assert observed.get("headers", {}).get("X-Custom-Header") == "custom"
+    # Verify body preserved
+    assert observed.get("body") == b'{"prompt":"hello"}'
+    # Verify path argument forwarded matches the requested path
+    assert observed.get("path") == "v1/chat/completions"
+
+
 # ===================================================================
 # Observability tests (X-Provider header, fallback logging)
 # ===================================================================
