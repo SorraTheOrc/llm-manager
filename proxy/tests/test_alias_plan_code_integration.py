@@ -46,6 +46,32 @@ def alias_config():
                 "force_full_prompt": True,
                 "llama_model": "Qwen3-Next",
             },
+            "plan": {
+                "type": "local",
+                "providers": [
+                    {
+                        "name": "local-qwen3-next",
+                        "type": "local",
+                        "llama_model": "Qwen3-Next",
+                    },
+                ],
+                "aliases": ["plan"],
+                "force_full_prompt": True,
+                "llama_model": "Qwen3-Next",
+            },
+            "code": {
+                "type": "local",
+                "providers": [
+                    {
+                        "name": "local-qwen3-next",
+                        "type": "local",
+                        "llama_model": "Qwen3-Next",
+                    },
+                ],
+                "aliases": ["code"],
+                "force_full_prompt": True,
+                "llama_model": "Qwen3-Next",
+            },
             "embed": {
                 "type": "local",
                 "providers": [
@@ -179,6 +205,14 @@ def test_models_endpoint_contains_plan_and_code(monkeypatch, alias_config):
     assert "plan" in aliases, f"'plan' not in aliases: {aliases}"
     assert "code" in aliases, f"'code' not in aliases: {aliases}"
     assert "embeddings" not in aliases, "'embeddings' should not be in qwen3-next aliases"
+
+    # Also verify plan and code appear as standalone model entries
+    plan_entry = next((m for m in models if m.get("id") == "plan"), None)
+    code_entry = next((m for m in models if m.get("id") == "code"), None)
+    assert plan_entry is not None, "'plan' should appear as a standalone model entry"
+    assert code_entry is not None, "'code' should appear as a standalone model entry"
+    assert plan_entry.get("aliases") == ["plan"], f"plan entry aliases: {plan_entry.get('aliases')}"
+    assert code_entry.get("aliases") == ["code"], f"code entry aliases: {code_entry.get('aliases')}"
 
 
 # ===================================================================

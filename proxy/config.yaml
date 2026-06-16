@@ -164,6 +164,24 @@ models:
     - code
     force_full_prompt: true
     llama_model: Qwen3-Next
+  plan:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3-Next
+    aliases:
+    - plan
+    force_full_prompt: true
+    llama_model: Qwen3-Next
+  code:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3-Next
+    aliases:
+    - code
+    force_full_prompt: true
+    llama_model: Qwen3-Next
 server:
   distrobox_name: llama
   embeddings_model: mxbai-embed
