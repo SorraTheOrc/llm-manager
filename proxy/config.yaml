@@ -76,44 +76,59 @@ logging:
   rotation_hours: 6
 models:
   anthropic:
+    providers:
+      - name: anthropic-primary
+        type: remote
+        endpoint: https://api.anthropic.com/v1
+        api_key_env: ANTHROPIC_API_KEY
+        headers:
+          anthropic-version: '2023-06-01'
     aliases:
     - claude-3-opus
     - claude-3-sonnet
     - claude-3-haiku
     - claude-*
-    api_key_env: ANTHROPIC_API_KEY
-    endpoint: https://api.anthropic.com/v1
-    headers:
-      anthropic-version: '2023-06-01'
-    type: remote
   embed:
+    providers:
+      - name: local-embed
+        type: local
+        llama_model: mxbai-embed
     aliases:
     - embeddings
     - embed
-    llama_model: mxbai-embed
-    type: local
   gemma4:
+    providers:
+      - name: local-gemma4
+        type: local
+        llama_model: gemma4
     aliases:
     - gemma4
     - Gemma4
-    llama_model: gemma4
-    type: local
   github:
+    providers:
+      - name: github-primary
+        type: remote
+        endpoint: https://models.inference.ai.azure.com
+        api_key_env: GITHUB_TOKEN
     aliases:
     - github-*
-    api_key_env: GITHUB_TOKEN
-    endpoint: https://models.inference.ai.azure.com
-    type: remote
   gpt120:
+    providers:
+      - name: local-gpt120
+        type: local
+        llama_model: gpt120
     aliases:
     - gpt-oss-120b
     - gpt-oss*
     - GPT-OSS*
     - Casey
     - casey
-    llama_model: gpt120
-    type: local
   openai:
+    providers:
+      - name: openai-primary
+        type: remote
+        endpoint: https://api.openai.com/v1
+        api_key_env: OPENAI_API_KEY
     aliases:
     - gpt-4
     - gpt-4-turbo
@@ -123,24 +138,25 @@ models:
     - gpt-*
     - o1-*
     - chatgpt-*
-    api_key_env: OPENAI_API_KEY
-    endpoint: https://api.openai.com/v1
-    type: remote
   qwen3:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
     aliases:
     - qwen3*
     - Qwen3*
-    llama_model: Qwen3
     force_full_prompt: true
-    type: local
   qwen3-next:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3-Next
     aliases:
     - qwen3-next
     - qwen3-coder-next
     - qwen3-next*
-    llama_model: Qwen3-Next
     force_full_prompt: true
-    type: local
 server:
   distrobox_name: llama
   embeddings_model: mxbai-embed
