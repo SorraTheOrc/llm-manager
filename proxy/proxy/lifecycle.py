@@ -401,21 +401,38 @@ def _should_force_full_prompt(model_cfg: Optional[dict]) -> bool:
 
 
 def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
-    """Get the llama model name for a given model."""
+    """Get the llama model name for a given model.
+
+    Supports both the legacy top-level `type: local` + `llama_model` and the
+    new `providers` list schema where a local provider contains `type: local`
+    and `llama_model`.
+    """
     srv = _srv()
     model_cfg = srv.get_model_config(model_name)
-    if model_cfg and model_cfg.get("type") == "local":
+    if not model_cfg:
+       return None
+
+    # First, prefer an explicit top-level llama_model (backwards compat)
+    llama_model = model_cfg.get("llama_model")
+
+    # If not present, inspect providers list for a local provider
+    if not llama_model:
+       providers = model_cfg.get("providers") or []
+       if isinstance(providers, list):
+           for p in providers:
+               if isinstance(p, dict) and p.get("type") == "local" and p.get("llama_model"):
+                   llama_model = p.get("llama_model")
+                   break
+
+    # If still not found, fall back to legacy type field where appropriate
+    if not llama_model and model_cfg.get("type") == "local":
        llama_model = model_cfg.get("llama_model")
-       if not isinstance(llama_model, str) or not llama_model:
-           raise HTTPException(
-               status_code=500,
-               detail=f"Local model configuration missing llama_model for: {model_name}"
-           )
-       llama_model_str: str = llama_model
-       if llama_model:
-           return llama_model
-       return model_name
-    return None
+
+    if not isinstance(llama_model, str) or not llama_model:
+       # Not a local model or missing config
+       return None
+
+    return llama_model
 
 
 
