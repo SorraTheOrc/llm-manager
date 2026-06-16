@@ -160,6 +160,8 @@ models:
     - qwen3-next
     - qwen3-coder-next
     - qwen3-next*
+    - plan
+    - code
     force_full_prompt: true
     llama_model: Qwen3-Next
 server:
