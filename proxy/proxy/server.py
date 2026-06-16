@@ -558,6 +558,19 @@ from .router import (  # noqa: E402, F401
     log_response,
     log_response_chunk,
 )
+from .provider import (  # noqa: E402, F401
+    resolve_provider,
+    mark_provider_unavailable,
+    proxy_with_remote_fallback,
+    proxy_with_fallback,
+    _provider_unavailable_until,
+    _is_provider_unavailable,
+    _is_connection_error,
+    _is_http_error_status,
+    _is_slot_exhaustion_response,
+    _parse_retry_after,
+    _compute_cooldown,
+)
 
 
 if __name__ == "__main__":

@@ -84,19 +84,97 @@ Notes:
 
 ## Model configuration
 
- - Add an entry under the `models:` section of `proxy/config.yaml`. Required/typical fields (follow existing config style):
-   - `type`: `local` or `remote` (matches current `proxy/config.yaml` schema)
-   - `llama_model`: for `type: local` entries, the model name used by the llama start script (e.g. `mxbai-embed-large-v1`)
-   - `endpoint` / `api_key_env`: for `type: remote` entries, the remote endpoint and API key env var
-  - `aliases`: optional list of aliases (e.g. `embeddings`)
+## Provider fallback configuration
 
-Example (add under `models:` in `proxy/config.yaml`, matching the existing schema in `proxy/config.yaml`):
+Models can define an ordered list of `providers` for automatic failover. The `providers` list replaces the old top-level `endpoint`/`api_key_env`/`headers` fields. This is a **breaking change** from the old flat format.
+
+### Provider entry fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique identifier for this provider entry |
+| `type` | string | yes | `"local"` or `"remote"` |
+| `endpoint` | string | remote | Base URL of the remote API |
+| `api_key_env` | string | remote | Environment variable containing the API key |
+| `headers` | dict | remote (optional) | Additional headers to include |
+| `llama_model` | string | local | Name of the local model |
+
+### Example: Local model without fallback
 
 ```yaml
 models:
   mxbai-embed-large-v1:
-    type: "local"
-    llama_model: "mxbai-embed-large-v1"
+    providers:
+      - name: local-embed
+        type: local
+        llama_model: mxbai-embed-large-v1
+    aliases:
+      - embeddings
+```
+
+### Example: Remote model with fallback
+
+```yaml
+models:
+  my-remote-model:
+    providers:
+      - name: primary
+        type: remote
+        endpoint: https://api.openai.com/v1
+        api_key_env: OPENAI_API_KEY
+      - name: fallback
+        type: remote
+        endpoint: https://api.anthropic.com/v1
+        api_key_env: ANTHROPIC_API_KEY
+    aliases:
+      - my-model*
+```
+
+### Migration guide from old format
+
+**Before (old flat format — deprecated):**
+```yaml
+models:
+  my-model:
+    type: remote
+    endpoint: https://api.example.com/v1
+    api_key_env: EXAMPLE_API_KEY
+    aliases:
+      - my-*
+```
+
+**After (new providers list — required):**
+```yaml
+models:
+  my-model:
+    providers:
+      - name: my-provider
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: EXAMPLE_API_KEY
+    aliases:
+      - my-*
+```
+
+**Note:** The `type` field is now specified inside each provider entry, not at the model level. The old top-level `endpoint`/`api_key_env`/`headers` format is deprecated and will be removed in a future release.
+
+### Adding a new model
+
+ - Add an entry under the `models:` section of `proxy/config.yaml`. Required/typical fields (follow existing config style):
+   - `providers`: a list of provider configs (see above)
+   - For local providers: `type: local`, `llama_model`
+   - For remote providers: `type: remote`, `endpoint`, `api_key_env` (and optional `headers`)
+   - `aliases`: optional list of aliases (e.g. `embeddings`)
+
+Example (add under `models:` in `proxy/config.yaml`):
+
+```yaml
+models:
+  mxbai-embed-large-v1:
+    providers:
+      - name: local-embed
+        type: local
+        llama_model: mxbai-embed-large-v1
     aliases:
       - "embeddings"
     # Note: do not include a `supports` field here — the proxy will forward requests and the backend

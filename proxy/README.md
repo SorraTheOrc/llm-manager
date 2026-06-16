@@ -9,6 +9,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Local Model Management**: Automatically starts/stops llama-server with the correct model
 - **Remote API Routing**: Forward requests to OpenAI, Anthropic, or other OpenAI-compatible APIs
 - **Hot Model Switching**: Automatically switches local models when a different model is requested
+- **Provider Fallback**: Automatic failover between providers per model with configurable cooldown and circuit breaker
 - **Streaming Support**: Full support for streaming responses (SSE)
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
@@ -211,6 +212,129 @@ openai:
 - `endpoint`: Base URL of the API
 - `api_key_env`: Environment variable containing the API key
 - `headers`: Additional headers to include (optional)
+
+### Provider Fallback
+
+Each model can define an ordered list of `providers` for automatic failover. The `providers` list replaces the old top-level `endpoint`, `api_key_env`, and `headers` fields on each model entry. This is a **breaking change** — existing flat-format model entries must be migrated to the provider list format.
+
+When a request arrives for a model with a `providers` list, the proxy tries each provider in order. If a provider fails (connection error, timeout, HTTP 4xx/5xx, or slot exhaustion for local models), the proxy immediately tries the next provider in the list. This continues until a provider succeeds or all providers are exhausted.
+
+#### Provider Entry Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique identifier for this provider entry |
+| `type` | string | yes | `"local"` or `"remote"` |
+| `endpoint` | string | remote | Base URL of the remote API |
+| `api_key_env` | string | remote | Environment variable containing the API key |
+| `headers` | dict | remote (optional) | Additional headers to include |
+| `llama_model` | string | local | Name of the local model |
+
+#### Example: Remote Fallback
+
+```yaml
+models:
+  mimo-v2.5:
+    providers:
+      - name: openai-primary
+        type: remote
+        endpoint: https://api.openai.com/v1
+        api_key_env: OPENAI_API_KEY
+      - name: anthropic-fallback
+        type: remote
+        endpoint: https://api.anthropic.com/v1
+        api_key_env: ANTHROPIC_API_KEY
+    aliases:
+      - mimo*
+```
+
+In this example, requests for `mimo-v2.5` first try OpenAI. If that fails, they fall back to Anthropic.
+
+#### Example: Local-to-Remote Fallback
+
+```yaml
+models:
+  hybrid-model:
+    providers:
+      - name: local-llama
+        type: local
+        llama_model: Qwen3
+      - name: openai-fallback
+        type: remote
+        endpoint: https://api.openai.com/v1
+        api_key_env: OPENAI_API_KEY
+    aliases:
+      - hybrid*
+```
+
+In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to OpenAI.
+
+#### Unavailability Detection
+
+A provider is considered unavailable when:
+- **Connection error**: DNS failure, connection refused, timeout
+- **HTTP error**: Response with status >= 400 (4xx or 5xx)
+- **Slot exhaustion** (local models): `available_slots == 0` and `total_slots > 0`
+
+#### Cooldown / Circuit Breaker
+
+After a provider fails, it is marked as unavailable for a cooldown period. During cooldown, subsequent requests skip that provider and try the next available one. This prevents wasting time on known-bad endpoints.
+
+- **Default cooldown**: 60 seconds
+- **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
+- **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
+- **State**: Cooldown state is in-memory only and resets when the proxy restarts
+
+#### All Providers Exhausted
+
+When all providers are exhausted:
+- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 (Too Many Requests) with `Content-Type: text/plain` and body `"Model server busy: 0/<total_slots> slots available. Retry later."` (no `Retry-After` header).
+- **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
+
+#### Observability
+
+When a fallback occurs:
+- **Response header**: `X-Provider: <provider-name>` is added to the response, indicating which provider handled the request.
+- **Logging**: An INFO-level log is emitted:
+  ```
+  Fallback triggered for model=v1/chat/completions, from=openai-primary, to=anthropic-fallback, reason=HTTP 502
+  ```
+
+#### Migration Guide
+
+To migrate from the old flat format to the new `providers` list format:
+
+1. Replace the top-level `endpoint`, `api_key_env`, and `headers` fields with a `providers` list.
+2. Each entry in the `providers` list must have a `name`, `type`, and type-specific fields.
+3. For single-provider models, simply wrap the existing config in a `providers` list.
+
+**Before (old format):**
+```yaml
+models:
+  openai:
+    type: remote
+    endpoint: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    aliases:
+      - gpt-4
+      - gpt-*
+```
+
+**After (new format):**
+```yaml
+models:
+  openai:
+    providers:
+      - name: openai
+        type: remote
+        endpoint: https://api.openai.com/v1
+        api_key_env: OPENAI_API_KEY
+    aliases:
+      - gpt-4
+      - gpt-*
+```
+
+**Important:** The old top-level `endpoint`/`api_key_env` format is **deprecated** and will be removed in a future release. All models must use the `providers` list format.
 
 ### Environment Variables
 
