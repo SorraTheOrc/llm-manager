@@ -132,7 +132,7 @@ models:
 
 ### Migration guide from old format
 
-**Before (old flat format — deprecated):**
+**Before (old flat format - deprecated):**
 ```yaml
 models:
   my-model:
@@ -143,7 +143,7 @@ models:
       - my-*
 ```
 
-**After (new providers list — required):**
+**After (new providers list - required):**
 ```yaml
 models:
   my-model:
@@ -166,6 +166,12 @@ models:
    - For remote providers: `type: remote`, `endpoint`, `api_key_env` (and optional `headers`)
    - `aliases`: optional list of aliases (e.g. `embeddings`)
 
+**Friendly model aliases:** You can use short, human-friendly names like `plan`
+or `code` as aliases. These are listed in the `aliases` array alongside regular
+model IDs. Callers can then pass `model: "plan"` or `model: "code"` in API
+requests without needing to know the internal preset ID. See `README.md` for
+full alias resolution rules (case-insensitive matching, wildcard precedence).
+
 Example (add under `models:` in `proxy/config.yaml`):
 
 ```yaml
@@ -177,7 +183,7 @@ models:
         llama_model: mxbai-embed-large-v1
     aliases:
       - "embeddings"
-    # Note: do not include a `supports` field here — the proxy will forward requests and the backend
+    # Note: do not include a `supports` field here - the proxy will forward requests and the backend
     # (llama-server or remote provider) will surface errors if a model does not support a capability.
 
   # Remote example
@@ -223,8 +229,8 @@ If `system_prompt` is present but `mode` is missing or invalid, config validatio
 ### `file` field (required)
 
 Path to the prompt text file. This can be:
-- A **relative path** — resolved against the repository root (e.g. `proxy/prompts/assistant.txt`)
-- An **absolute path** — used as-is
+- A **relative path** - resolved against the repository root (e.g. `proxy/prompts/assistant.txt`)
+- An **absolute path** - used as-is
 
 ### Prompt resolution precedence
 
@@ -264,8 +270,14 @@ comments and follow best practices.
 
 ## Alias resolution
 
-- The proxy should resolve aliases before model lookup. Add alias handling where model names are resolved (e.g. in `get_model_config()`):
-  - If `model` matches an alias, replace with the canonical `name`.
+- The proxy resolves aliases using `get_model_config()` in `proxy/lifecycle.py`.
+  See that function for exact precedence rules (exact match > case-insensitive exact
+  alias > wildcard pattern).
+- **Friendly aliases** like `plan`, `code`, or `embeddings` can be added to any
+  model's `aliases` list. They behave identically to regular aliases and follow
+  the same case-insensitive matching and precedence rules.
+- The `/v1/models` endpoint automatically lists all configured aliases in the
+  `aliases` field of each model entry, making friendly names discoverable.
 
 ## Routing to local backends
 
@@ -345,4 +357,4 @@ docker run --rm -p 8080:8080 --name llama-embed -v /models/mxbai:/models mxbai/l
 - Add the integration test `proxy/tests/test_embeddings_integration.py`.
 
 ## References
-- Parent work item: LP-0MN557XBD0H8B8PC — Add an embeddings specific model
+- Parent work item: LP-0MN557XBD0H8B8PC - Add an embeddings specific model

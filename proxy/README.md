@@ -200,6 +200,36 @@ openai:
 - Request for `o1-preview` → Routes to OpenAI
 - Request for `qwen3-coder` → Routes to local qwen3
 
+### Friendly Model Aliases
+
+In addition to model IDs and wildcard patterns, the proxy supports short,
+human-friendly aliases that map directly to configured model presets.
+These are useful when callers should not need to know internal preset IDs.
+
+**Example configuration:**
+```yaml
+qwen3-next:
+  providers:
+    - name: local-qwen3-next
+      type: local
+      llama_model: Qwen3-Next
+  aliases:
+    - qwen3-next
+    - qwen3-coder-next
+    - plan       # Route requests for model="plan" to Qwen3-Next
+    - code       # Route requests for model="code" to Qwen3-Next
+```
+
+Requests with `model: "plan"` or `model: "code"` are routed to the `qwen3-next`
+preset. The same case-insensitive and wildcard precedence rules apply:
+
+- `"plan"`, `"Plan"`, `"PLAN"` → all resolve to `qwen3-next`
+- `"code"`, `"Code"`, `"CODE"` → all resolve to `qwen3-next`
+- Exact aliases (`plan`, `code`) take precedence over wildcard patterns
+
+Friendly aliases are listed in the `/v1/models` response and can be discovered
+programmatically by inspecting the `aliases` field of each model entry.
+
 ### Model Types
 
 **Local Models** (`type: local`)
