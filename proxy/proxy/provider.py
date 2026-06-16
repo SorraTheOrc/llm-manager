@@ -157,17 +157,20 @@ def _add_provider_header(response: Response, provider_name: str) -> Response:
     return response
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
         all_local_slot_exhaustion: If ``True``, all providers exhausted due to
                                    slot exhaustion (returns HTTP 429).
                                    Otherwise, returns HTTP 503 with JSON body.
+        total_slots: Total number of slots across local providers (used only
+                     for the slot-exhaustion 429 text body).
     """
     if all_local_slot_exhaustion:
+        # total_slots may be 0 if unknown; still format per acceptance criteria
         return Response(
-            content=b"Model server busy: 0/0 slots available. Retry later.",
+            content=(f"Model server busy: 0/{int(total_slots)} slots available. Retry later.").encode("utf-8"),
             status_code=429,
             media_type="text/plain",
         )
@@ -213,23 +216,30 @@ def _get_proxy_to_local():
     return proxy_to_local
 
 
-def _is_slot_exhaustion_response(response) -> bool:
-    """Check if a response indicates slot exhaustion.
+def _parse_slot_exhaustion(response):
+    """Parse a slot-exhaustion response and return slot info.
 
-    Slot exhaustion responses from proxy_to_local have status 503 and
-    error.code == "no_slots_available".
+    Returns a dict with keys 'total_slots' and 'available_slots' when the
+    response indicates slot exhaustion, otherwise returns None.
     """
-    if response.status_code != 503:
-        return False
     try:
+        if response.status_code != 503:
+            return None
         import json
         body = json.loads(response.body)
         error = body.get("error", {})
         if isinstance(error, dict) and error.get("code") == "no_slots_available":
-            return True
+            total = int(body.get("total_slots", 0) or 0)
+            avail = int(body.get("available_slots", 0) or 0)
+            return {"total_slots": total, "available_slots": avail}
     except Exception:
         pass
-    return False
+    return None
+
+
+def _is_slot_exhaustion_response(response) -> bool:
+    """Backward-compatible boolean check for slot exhaustion."""
+    return _parse_slot_exhaustion(response) is not None
 
 
 async def proxy_with_remote_fallback(
@@ -344,6 +354,10 @@ async def proxy_with_fallback(
     prev_provider: Optional[str] = None
     fallback_reason: Optional[str] = None
 
+    # Accumulate slot counts when local providers report slot exhaustion
+    total_slots_sum = 0
+    available_slots_sum = 0
+
     ptr_remote = _get_proxy_to_remote()
     ptr_local = _get_proxy_to_local()
 
@@ -364,10 +378,13 @@ async def proxy_with_fallback(
             any_provider_tried = True
 
             # Check for slot exhaustion (local model)
-            if _is_slot_exhaustion_response(response):
+            slot_info = _parse_slot_exhaustion(response)
+            if slot_info:
                 mark_provider_unavailable(provider_name, cooldown_seconds)
                 fallback_reason = "slot_exhaustion"
                 prev_provider = provider_name
+                total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
+                available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
                 continue
 
             # Check for HTTP error status (remote provider)
@@ -406,4 +423,7 @@ async def proxy_with_fallback(
     # All providers exhausted
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False)
-    return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion)
+    # If all failures were slot exhaustion, include total slots in message
+    if all_slot_exhaustion:
+        return _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum)
+    return _build_exhausted_response(all_local_slot_exhaustion=False)
