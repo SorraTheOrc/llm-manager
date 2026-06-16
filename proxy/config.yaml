@@ -96,6 +96,7 @@ models:
     aliases:
     - embeddings
     - embed
+    llama_model: mxbai-embed
   gemma4:
     providers:
       - name: local-gemma4
@@ -104,6 +105,7 @@ models:
     aliases:
     - gemma4
     - Gemma4
+    llama_model: gemma4
   github:
     providers:
       - name: github-primary
@@ -123,6 +125,7 @@ models:
     - GPT-OSS*
     - Casey
     - casey
+    llama_model: gpt120
   openai:
     providers:
       - name: openai-primary
@@ -147,6 +150,7 @@ models:
     - qwen3*
     - Qwen3*
     force_full_prompt: true
+    llama_model: Qwen3
   qwen3-next:
     providers:
       - name: local-qwen3-next
@@ -157,6 +161,7 @@ models:
     - qwen3-coder-next
     - qwen3-next*
     force_full_prompt: true
+    llama_model: Qwen3-Next
 server:
   distrobox_name: llama
   embeddings_model: mxbai-embed
