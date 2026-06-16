@@ -35,6 +35,26 @@
 #     endpoint: https://...
 #     api_key_env: SOME_KEY
 #     aliases: [...]
+#
+# Custom system prompts per model/alias:
+# Each model entry may include a `system_prompt` object to configure
+# a default system prompt that is injected into requests targeting
+# the model or any of its aliases.
+#
+#   assistant-model:
+#     type: local
+#     aliases: ["assistant", "asst"]
+#     llama_model: gemma4
+#     system_prompt:
+#       mode: "prepend"   # "override" or "prepend" (required)
+#       file: "proxy/prompts/assistant.txt"  # path relative to repo root
+#
+# Prompt resolution precedence (first match wins):
+#   1) Local override:   .sorraAgents/prompts/<alias>.txt
+#   2) Repo default:     <system_prompt.file> resolved against repo root
+#   3) No prompt if none present
+#
+# See proxy/MODEL_ADD.md for the full guide.
 # ---------------------------------------------------------------------------
 
 default_model: Qwen3

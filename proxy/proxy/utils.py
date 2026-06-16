@@ -357,7 +357,34 @@ def load_config(config_path: Optional[str] = None) -> dict:
         )
 
     with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+
+    # Validate system_prompt configurations
+    _validate_prompt_configs(cfg)
+
+    return cfg
+
+
+def _validate_prompt_configs(cfg: dict) -> None:
+    """Validate system_prompt configurations for all model entries.
+
+    Raises ValueError on first invalid config.
+    """
+    from proxy.prompt_resolver import validate_prompt_config as _vpc
+
+    models = cfg.get("models", {})
+    if not isinstance(models, dict):
+        return
+
+    for model_name, model_cfg in models.items():
+        if not isinstance(model_cfg, dict):
+            continue
+        try:
+            _vpc(model_cfg)
+        except ValueError as e:
+            raise ValueError(
+                f"Model '{model_name}': {e}"
+            ) from e
 
 
 def setup_logging(config: dict) -> logging.Logger:

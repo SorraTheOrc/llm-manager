@@ -8,10 +8,13 @@ Uses lazy server import (_srv()) to avoid circular imports.
 import asyncio
 import json
 from pathlib import Path
+from typing import Optional
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi import HTTPException
+
+from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +533,20 @@ async def proxy_openai_api(request: Request, path: str):
     
     # Get model configuration
     model_cfg = srv.get_model_config(model_name) if model_name else None
+    
+    # Apply system prompt if configured
+    if model_cfg is not None and "messages" in body_json and isinstance(body_json.get("messages"), list):
+        prompt_result = resolve_system_prompt(model_name, model_cfg) if model_name else None
+        if prompt_result is not None and body_json["messages"]:
+            original_count = len(body_json["messages"])
+            body_json["messages"] = compose_messages(body_json["messages"], prompt_result)
+            new_body = json.dumps(body_json).encode("utf-8")
+            request._body = new_body
+            body = new_body
+            srv.logger.info(
+                "Applied system_prompt mode=%s to %s messages (was %d, now %d)",
+                prompt_result["mode"], model_name, original_count, len(body_json["messages"]),
+            )
     
     if model_cfg is None:
         # Check if default remote is enabled

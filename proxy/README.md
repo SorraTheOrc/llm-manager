@@ -336,6 +336,101 @@ models:
 
 **Important:** The old top-level `endpoint`/`api_key_env` format is **deprecated** and will be removed in a future release. All models must use the `providers` list format.
 
+### Custom System Prompts
+
+Each model entry may include a `system_prompt` configuration to inject a default
+system prompt into all requests targeting that model or any of its aliases.
+
+#### Configuration
+
+```yaml
+models:
+  assistant-model:
+    type: local
+    llama_model: gemma4
+    aliases:
+      - "assistant"
+      - "asst"
+    system_prompt:
+      mode: "prepend"       # "override" or "prepend" (required)
+      file: "proxy/prompts/assistant.txt"
+```
+
+#### Modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `override` | Replaces **all** client-supplied system messages with the prompt file content. |
+| `prepend`  | Inserts the prompt file content as the first system message **before** any client-supplied system messages. |
+
+If `system_prompt` is present but `mode` is missing or invalid, config validation
+fails at startup with a clear error message.
+
+#### Prompt file resolution precedence
+
+When a request arrives, the proxy looks for the prompt file in this order:
+
+1. **Local override**: `.sorraAgents/prompts/<alias>.txt` (project-local, not committed)
+2. **Repo default**: The path specified in `system_prompt.file`, resolved against the repo root
+3. **No prompt** if neither exists
+
+This allows operators to deploy per-instance prompt overrides without modifying
+the repository. Override files are looked up by alias name (e.g.,
+`.sorraAgents/prompts/assistant.txt` for the `assistant` alias).
+
+#### File format and limits
+
+- Files must be **plain text UTF-8**.
+- Maximum file size: **64 KB**. Files larger than this are ignored and logged.
+- Non-UTF-8 files are ignored and logged.
+- **No caching**: prompt files are read on every request.
+
+#### Security considerations
+
+- **Do not store secrets or credentials in prompt files.** Prompts are plaintext
+  and may appear in logs, upstream request payloads, or the debug endpoint.
+- Local override files (`.sorraAgents/prompts/`) are outside the repository
+  and should be managed via deployment tooling, not committed.
+- Enable the debug endpoint (see below) only for development or QA.
+
+#### Example prompt file
+
+Create `proxy/prompts/assistant.txt`:
+
+```
+You are a helpful and knowledgeable assistant. Your responses should be
+concise, accurate, and well-structured. When asked to write code, include
+comments and follow best practices.
+```
+
+#### Debug endpoint
+
+When enabled, the debug endpoint at `GET /debug/prompt?alias=<alias>` returns
+sanitized information about the resolved prompt:
+
+```json
+{
+  "alias": "assistant",
+  "resolved": true,
+  "mode": "prepend",
+  "source_path": "/path/to/prompt.txt",
+  "content_preview": "You are a helpful...",
+  "size_bytes": 182
+}
+```
+
+To enable, set `server.debug: true` in `config.yaml`:
+
+```yaml
+server:
+  debug: true
+```
+
+By default, the endpoint returns only the first 200 characters of content
+(`content_preview`). Pass `&full=true` to get the full content when debug
+mode is enabled. Without debug mode, the endpoint is accessible only from
+localhost (127.0.0.1).
+
 ### Environment Variables
 
 | Variable | Description |

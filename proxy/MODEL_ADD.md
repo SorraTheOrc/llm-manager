@@ -189,6 +189,79 @@ models:
       - "example-*"
 ```
 
+## Custom system prompts per model / alias
+
+Each model entry may optionally include a `system_prompt` configuration to inject a default
+system prompt into all requests targeting that model or any of its aliases. This is useful
+for setting consistent agent personalities (e.g. "You are a helpful coding assistant")
+without requiring clients to send the prompt.
+
+### Configuration
+
+```yaml
+models:
+  assistant-model:
+    type: local
+    llama_model: gemma4
+    aliases:
+      - "assistant"
+      - "asst"
+    system_prompt:
+      mode: "prepend"       # "override" or "prepend" (required)
+      file: "proxy/prompts/assistant.txt"  # path relative to repo root
+```
+
+### `mode` field (required)
+
+| Mode | Behaviour |
+|------|-----------|
+| `override` | Replaces **all** client-supplied system messages with the prompt file content. |
+| `prepend`  | Inserts the prompt file content as the first system message **before** any client-supplied system messages. |
+
+If `system_prompt` is present but `mode` is missing or invalid, config validation fails at startup.
+
+### `file` field (required)
+
+Path to the prompt text file. This can be:
+- A **relative path** — resolved against the repository root (e.g. `proxy/prompts/assistant.txt`)
+- An **absolute path** — used as-is
+
+### Prompt resolution precedence
+
+When a request arrives, the proxy resolves the prompt file in this order:
+
+1. **Local override**: `.sorraAgents/prompts/<alias>.txt` (project-local, not committed)
+2. **Repo default**: the path specified in `system_prompt.file`
+3. **No prompt** if none of the above exist
+
+This allows operators to deploy per-instance prompt overrides without modifying the repository.
+
+### File format and limits
+
+- Files must be **plain text UTF-8**.
+- Maximum file size: **64 KB**. Files larger than this are ignored and logged.
+- Files with non-UTF-8 content are ignored and logged.
+- No caching: files are read on every request (safe for rapid iteration).
+
+### Security considerations
+
+- **Do not store secrets or credentials in prompt files.** Prompts are plaintext and may
+  appear in logs, debug endpoints, or upstream request payloads.
+- Local override files (`.sorraAgents/prompts/`) are outside the repository and should
+  be managed via deployment tooling, not committed.
+- The debug endpoint (see admin endpoints) returns prompt previews; enable it only
+  for development or QA.
+
+### Example prompt file
+
+Create `proxy/prompts/assistant.txt`:
+
+```
+You are a helpful and knowledgeable assistant. Your responses should be
+concise, accurate, and well-structured. When asked to write code, include
+comments and follow best practices.
+```
+
 ## Alias resolution
 
 - The proxy should resolve aliases before model lookup. Add alias handling where model names are resolved (e.g. in `get_model_config()`):

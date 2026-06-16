@@ -387,6 +387,72 @@ async def proxy_openai_api(request: Request, path: str):
 async def switch_model(model_name: str):
     return await _ui_switch_model(model_name)
 
+
+@app.get("/debug/prompt")
+async def debug_prompt(request: Request, alias: str = "", full: bool = False):
+    """Debug endpoint to inspect resolved prompt for a given alias.
+
+    Gated by server.debug config flag or localhost access.
+    Returns {
+        alias, resolved: bool, mode, source_path, content_preview, size_bytes
+    }
+    """
+    from proxy.prompt_resolver import resolve_system_prompt
+
+    debug_mode = config.get("server", {}).get("debug", False)
+    client_host = request.client.host if request.client else ""
+    is_local = client_host in ("127.0.0.1", "::1", "localhost")
+
+    if not debug_mode and not is_local:
+        raise HTTPException(status_code=403, detail="Debug endpoint is not enabled")
+
+    if not alias:
+        raise HTTPException(status_code=400, detail="Query parameter 'alias' is required")
+
+    model_cfg = get_model_config(alias)
+    if model_cfg is None:
+        return JSONResponse({
+            "alias": alias,
+            "resolved": False,
+            "mode": None,
+            "source_path": None,
+            "content_preview": None,
+            "size_bytes": None,
+            "reason": "Model config not found",
+        })
+
+    prompt_result = resolve_system_prompt(alias, model_cfg)
+
+    if prompt_result is None:
+        return JSONResponse({
+            "alias": alias,
+            "resolved": False,
+            "mode": model_cfg.get("system_prompt", {}).get("mode") if isinstance(model_cfg.get("system_prompt"), dict) else None,
+            "source_path": None,
+            "content_preview": None,
+            "size_bytes": None,
+            "reason": "No prompt file found or configured",
+        })
+
+    content = prompt_result["content"]
+    content_bytes = content.encode("utf-8")
+    size_bytes = len(content_bytes)
+
+    if full and debug_mode:
+        content_preview = content
+    else:
+        content_preview = content[:200] + ("..." if len(content) > 200 else "")
+
+    return JSONResponse({
+        "alias": alias,
+        "resolved": True,
+        "mode": prompt_result["mode"],
+        "source_path": prompt_result["source"],
+        "content_preview": content_preview,
+        "size_bytes": size_bytes,
+    })
+
+
 def main():
     """Main entry point."""
     import uvicorn
