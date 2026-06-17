@@ -151,6 +151,20 @@ def _compute_cooldown(
     return cooldown_seconds
 
 
+def _get_cooldown_seconds(config: dict) -> float:
+    """Read ``provider_cooldown_seconds`` from config, supporting both flat and nested formats.
+
+    Checks ``config["provider_cooldown_seconds"]`` (flat) first for backward
+    compatibility with unit tests, then falls back to
+    ``config["server"]["provider_cooldown_seconds"]`` (nested) for production
+    configs loaded from ``config.yaml``.  Defaults to 60.
+    """
+    val = config.get("provider_cooldown_seconds")
+    if val is None:
+        val = config.get("server", {}).get("provider_cooldown_seconds", 60)
+    return float(val)
+
+
 def _add_provider_header(response: Response, provider_name: str) -> Response:
     """Add X-Provider header to a response."""
     response.headers.append("X-Provider", provider_name)
@@ -265,7 +279,7 @@ async def proxy_with_remote_fallback(
         A ``Response`` from a successful provider, or a 503/429 error
         response if all providers are exhausted.
     """
-    cooldown_seconds = float(config.get("provider_cooldown_seconds", 60))
+    cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
     prev_provider: Optional[str] = None
@@ -348,7 +362,7 @@ async def proxy_with_fallback(
         A ``Response`` from a successful provider, or a 503/429 error
         response if all providers are exhausted.
     """
-    cooldown_seconds = float(config.get("provider_cooldown_seconds", 60))
+    cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
     prev_provider: Optional[str] = None
