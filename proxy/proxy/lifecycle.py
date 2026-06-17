@@ -403,9 +403,9 @@ def _should_force_full_prompt(model_cfg: Optional[dict]) -> bool:
 def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
     """Get the llama model name for a given model.
 
-    Supports both the legacy top-level `type: local` + `llama_model` and the
-    new `providers` list schema where a local provider contains `type: local`
-    and `llama_model`.
+    Supports both the legacy top-level ``type: local`` + ``llama_model`` and the
+    new ``providers`` list schema where a local provider contains ``type: local``
+    and ``llama_model``.
     """
     srv = _srv()
     model_cfg = srv.get_model_config(model_name)

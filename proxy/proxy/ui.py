@@ -15,6 +15,7 @@ from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi import HTTPException
 
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
+from proxy.provider import get_model_type, get_local_model_name_from_providers, get_remote_endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -33,10 +34,10 @@ async def index(request: Request):
     model_buttons = ""
     model_options = ""
     for name, cfg in srv.config.get("models", {}).items():
-        model_type = cfg.get("type", "unknown")
+        model_type = get_model_type(cfg) or "unknown"
         aliases = ", ".join(cfg.get("aliases", [])) or "—"
-        endpoint = cfg.get("endpoint", "localhost:8080") if model_type == "remote" else "Local llama-server"
-        type_badge = f'<span class="badge badge-local">Local</span>' if model_type == "local" else f'<span class="badge badge-remote">Remote</span>'
+        endpoint = get_remote_endpoint(cfg) if model_type == "remote" else "Local llama-server"
+        type_badge = f'<span class="badge badge-local">Local</span>' if model_type == "local" else (f'<span class="badge badge-remote">Remote</span>' if model_type == "remote" else '<span class="badge badge-unknown">Unknown</span>')
         
         # Build model dropdown options
         # Consider both the config key (name) and the underlying llama_model when
@@ -44,7 +45,9 @@ async def index(request: Request):
         # resolved llama-server id still show the correct active model.
         selected = ""
         try:
-            lm = cfg.get("llama_model", name)
+            lm = get_local_model_name_from_providers(cfg)
+            if not lm:
+                lm = name
             if name == srv.current_model or lm == srv.current_model:
                 selected = "selected"
         except Exception:
@@ -55,7 +58,9 @@ async def index(request: Request):
         # Add switch button for local models that aren't currently loaded
         action_cell = ""
         if model_type == "local":
-            llama_model = cfg.get("llama_model", name)
+            llama_model = get_local_model_name_from_providers(cfg)
+            if not llama_model:
+                llama_model = name
             # Consider model active when either the user-visible name or the
             # resolved llama_model matches the current_model state.
             if llama_model != srv.current_model and name != srv.current_model:
@@ -75,7 +80,7 @@ async def index(request: Request):
 
     # Build list of local model names for JavaScript
     import json
-    local_model_names = [name for name, cfg in srv.config.get("models", {}).items() if cfg.get("type") == "local"]
+    local_model_names = [name for name, cfg in srv.config.get("models", {}).items() if get_model_type(cfg) == "local"]
     local_model_names_json = json.dumps(local_model_names)
 
     router_mode = srv.config.get("server", {}).get("llama_router_mode", False)
@@ -461,11 +466,11 @@ async def create_embeddings(request: Request):
             detail=f"Unknown model: {model_name}. No default remote configured."
         )
     
-    if model_cfg.get("type") == "local":
+    if get_model_type(model_cfg) == "local":
         server_config = srv.config.get("server", {})
         router_mode = server_config.get("llama_router_mode", False)
         # Check if we need to switch models
-        llama_model = model_cfg.get("llama_model")
+        llama_model = get_local_model_name_from_providers(model_cfg)
         if not isinstance(llama_model, str) or not llama_model:
             raise HTTPException(
                 status_code=500,
@@ -507,7 +512,7 @@ async def create_embeddings(request: Request):
             endpoint="/v1/embeddings",
         )
     
-    elif model_cfg.get("type") == "remote":
+    elif get_model_type(model_cfg) == "remote":
         providers = model_cfg.get("providers")
         if providers:
             from proxy.provider import proxy_with_remote_fallback
@@ -575,11 +580,11 @@ async def proxy_openai_api(request: Request, path: str):
             detail=f"Unknown model: {model_name}. No default remote configured."
         )
     
-    if model_cfg.get("type") == "local":
+    if get_model_type(model_cfg) == "local":
         server_config = srv.config.get("server", {})
         router_mode = server_config.get("llama_router_mode", False)
         # Check if we need to switch models
-        llama_model = model_cfg.get("llama_model")
+        llama_model = get_local_model_name_from_providers(model_cfg)
         if not isinstance(llama_model, str) or not llama_model:
             raise HTTPException(
                 status_code=500,
@@ -620,7 +625,7 @@ async def proxy_openai_api(request: Request, path: str):
             endpoint=f"/v1/{path}",
         )
     
-    elif model_cfg.get("type") == "remote":
+    elif get_model_type(model_cfg) == "remote":
         providers = model_cfg.get("providers")
         if providers:
             from proxy.provider import proxy_with_remote_fallback
@@ -645,7 +650,7 @@ async def switch_model(model_name: str):
     if model_cfg is None:
         raise HTTPException(status_code=404, detail=f"Unknown model: {model_name}")
     
-    if model_cfg.get("type") != "local":
+    if get_model_type(model_cfg) != "local":
         raise HTTPException(
             status_code=400, 
             detail=f"Model {model_name} is not a local model"

@@ -76,7 +76,6 @@ logging:
   rotation_hours: 6
 models:
   anthropic:
-    type: remote
     providers:
       - name: anthropic-primary
         type: remote
@@ -90,7 +89,6 @@ models:
     - claude-3-haiku
     - claude-*
   embed:
-    type: local
     providers:
       - name: local-embed
         type: local
@@ -98,9 +96,7 @@ models:
     aliases:
     - embeddings
     - embed
-    llama_model: mxbai-embed
   gemma4:
-    type: local
     providers:
       - name: local-gemma4
         type: local
@@ -108,9 +104,7 @@ models:
     aliases:
     - gemma4
     - Gemma4
-    llama_model: gemma4
   github:
-    type: remote
     providers:
       - name: github-primary
         type: remote
@@ -119,7 +113,6 @@ models:
     aliases:
     - github-*
   gpt120:
-    type: local
     providers:
       - name: local-gpt120
         type: local
@@ -130,9 +123,7 @@ models:
     - GPT-OSS*
     - Casey
     - casey
-    llama_model: gpt120
   openai:
-    type: remote
     providers:
       - name: openai-primary
         type: remote
@@ -148,7 +139,6 @@ models:
     - o1-*
     - chatgpt-*
   qwen3:
-    type: local
     providers:
       - name: local-qwen3
         type: local
@@ -157,9 +147,7 @@ models:
     - qwen3*
     - Qwen3*
     force_full_prompt: true
-    llama_model: Qwen3
   qwen3-next:
-    type: local
     providers:
       - name: local-qwen3-next
         type: local
@@ -171,9 +159,7 @@ models:
     - plan
     - code
     force_full_prompt: true
-    llama_model: Qwen3-Next
   plan:
-    type: local
     providers:
       - name: local-qwen3-next
         type: local
@@ -181,9 +167,7 @@ models:
     aliases:
     - plan
     force_full_prompt: true
-    llama_model: Qwen3-Next
   code:
-    type: local
     providers:
       - name: local-qwen3-next
         type: local
@@ -191,7 +175,6 @@ models:
     aliases:
     - code
     force_full_prompt: true
-    llama_model: Qwen3-Next
 server:
   distrobox_name: llama
   embeddings_model: mxbai-embed

@@ -45,13 +45,15 @@ def mock_config():
         "models": {
             "embed": {
                 "aliases": ["embeddings", "embed"],
-                "llama_model": "mxbai-embed",
-                "type": "local",
+                "providers": [
+                    {"name": "local-embed", "type": "local", "llama_model": "mxbai-embed"}
+                ],
             },
             "gemma4": {
                 "aliases": ["gemma4"],
-                "llama_model": "gemma4",
-                "type": "local",
+                "providers": [
+                    {"name": "local-gemma4", "type": "local", "llama_model": "gemma4"}
+                ],
             },
         },
         "server": {

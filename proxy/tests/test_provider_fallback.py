@@ -311,7 +311,7 @@ async def test_remote_fallback_on_connection_error(sample_model_config):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -339,7 +339,7 @@ async def test_remote_fallback_on_http_4xx(sample_model_config):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -367,7 +367,7 @@ async def test_remote_fallback_on_http_5xx(sample_model_config):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -388,7 +388,7 @@ async def test_remote_fallback_tries_providers_in_order(sample_model_config):
         attempted.append(provider_cfg.get("name"))
         return Response(status_code=502, content=b"Bad gateway")
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -405,7 +405,7 @@ async def test_remote_fallback_all_exhausted_returns_503(sample_model_config):
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         return Response(status_code=502, content=b"Bad gateway")
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -438,7 +438,7 @@ async def test_remote_fallback_cooldown_skips_failed_providers(sample_model_conf
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         # First request: both fail
         result1 = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
@@ -471,7 +471,7 @@ async def test_remote_fallback_respects_retry_after(sample_model_config):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -502,7 +502,7 @@ async def test_remote_fallback_single_provider_fails(single_provider_config):
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         return Response(status_code=502, content=b"Bad gateway")
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", single_provider_config, cfg
         )
@@ -536,7 +536,7 @@ async def test_local_fallback_to_remote_on_connection_error(mixed_model_config):
         raise httpx.ConnectError("Connection refused to llama-server")
 
     with (
-        patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
     ):
         result = await provider.proxy_with_fallback(
@@ -585,7 +585,7 @@ async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
         )
 
     with (
-        patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
     ):
         result = await provider.proxy_with_fallback(
@@ -615,7 +615,7 @@ async def test_local_fallback_all_exhausted(mixed_model_config):
         raise httpx.ConnectError("Connection refused")
 
     with (
-        patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
     ):
         result = await provider.proxy_with_fallback(
@@ -665,7 +665,7 @@ async def test_fallback_preserves_request_semantics(mixed_model_config):
         )
 
     with (
-        patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
     ):
         result = await provider.proxy_with_fallback(
@@ -701,7 +701,7 @@ async def test_x_provider_header_on_success(sample_model_config):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -729,7 +729,7 @@ async def test_x_provider_header_on_fallback(sample_model_config):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -761,7 +761,7 @@ async def test_fallback_logging(sample_model_config, caplog):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -796,7 +796,7 @@ async def test_no_fallback_log_on_success(sample_model_config, caplog):
             media_type="application/json",
         )
 
-    with patch("proxy.proxy_remote.proxy_to_remote", _mock_proxy_to_remote):
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
         result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
@@ -876,10 +876,11 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_remote_model_without_providers_uses_legacy_path(monkeypatch):
-    """proxy_openai_api should NOT call proxy_with_remote_fallback for remote models without providers."""
+async def test_remote_model_without_providers_returns_error(monkeypatch):
+    """Remote models WITHOUT a providers list should return an error (breaking change)."""
     import proxy.server as server_module
-    from unittest.mock import MagicMock, AsyncMock
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
 
     # Set up config with a remote model that has NO providers (legacy format)
     server_module.config = {
@@ -896,52 +897,29 @@ async def test_remote_model_without_providers_uses_legacy_path(monkeypatch):
     server_module.llama_process = None
     server_module.backend_ready = True
 
-    fallback_called = False
+    from proxy.ui import proxy_openai_api
+    from fastapi import Request as FastAPIRequest
 
-    async def mock_fallback(request, path, model_config, config):
-        nonlocal fallback_called
-        fallback_called = True
-        return Response(status_code=200)
+    body = json.dumps({
+        "model": "test-remote",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }).encode("utf-8")
 
-    proxy_to_remote_called = False
+    mock_request = MagicMock(spec=FastAPIRequest)
+    mock_request.method = "POST"
+    mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+    mock_request.headers = {}
+    mock_request._body = body
+    async def mock_body():
+        return mock_request._body
+    mock_request.body = mock_body
 
-    async def mock_proxy_to_remote(request, path, model_config):
-        nonlocal proxy_to_remote_called
-        proxy_to_remote_called = True
-        return Response(
-            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
-            status_code=200,
-            media_type="application/json",
-        )
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_openai_api(mock_request, "chat/completions")
 
-    with patch("proxy.provider.proxy_with_remote_fallback", mock_fallback), \
-         patch("proxy.proxy_remote.proxy_to_remote", mock_proxy_to_remote), \
-         patch("proxy.server.proxy_to_remote", mock_proxy_to_remote):
-        from proxy.ui import proxy_openai_api
-        from fastapi import Request as FastAPIRequest
-
-        body = json.dumps({
-            "model": "test-remote",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": False,
-        }).encode("utf-8")
-
-        mock_request = MagicMock(spec=FastAPIRequest)
-        mock_request.method = "POST"
-        mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
-        mock_request.headers = {}
-        mock_request._body = body
-        async def mock_body():
-            return mock_request._body
-        mock_request.body = mock_body
-
-        resp = await proxy_openai_api(mock_request, "chat/completions")
-
-    assert not fallback_called, \
-        "proxy_with_remote_fallback should NOT be called for legacy remote model"
-    assert proxy_to_remote_called, \
-        "proxy_to_remote should be called for legacy remote model"
-    assert resp.status_code == 200
+    assert exc_info.value.status_code == 500, "Legacy remote model without providers should return error"
+    assert "Invalid model configuration" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio

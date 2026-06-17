@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
 
@@ -270,12 +271,13 @@ async def list_models():
     srv = _srv()
     models_list = []
     for name, cfg in srv.config.get("models", {}).items():
+        mtype = get_model_type(cfg)
         models_list.append({
             "id": name,
             "object": "model",
             "created": int(time.time()),
-            "owned_by": "local" if cfg.get("type") == "local" else "remote",
-            "type": cfg.get("type"),
+            "owned_by": "local" if mtype == "local" else ("remote" if mtype == "remote" else "unknown"),
+            "type": mtype or "unknown",
             "aliases": cfg.get("aliases", []),
         })
     return {"object": "list", "data": models_list}

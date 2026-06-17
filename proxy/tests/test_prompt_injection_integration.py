@@ -36,8 +36,9 @@ async def test_override_mode_injects_system_prompt(monkeypatch, tmp_path):
         "models": {
             "assistant-model": {
                 "aliases": ["assistant", "asst"],
-                "llama_model": "test-llama",
-                "type": "local",
+                "providers": [
+                    {"name": "local", "type": "local", "llama_model": "test-llama"}
+                ],
                 "system_prompt": {
                     "mode": "override",
                     "file": "proxy/prompts/assistant.txt",
@@ -115,7 +116,22 @@ async def test_override_mode_injects_system_prompt(monkeypatch, tmp_path):
         )
         return resp
 
-    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+    # Mock proxy_with_fallback to delegate to the backend mock
+    from proxy import provider as provider_module
+
+    async def fake_proxy_with_fallback(request, path, model_cfg, config):
+        body_bytes = await request.body()
+        body_json = json.loads(body_bytes) if body_bytes else {}
+        new_body = json.dumps(body_json).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        resp = await client.post(
+            f"http://localhost:9999/{path}",
+            content=new_body,
+            headers=headers,
+        )
+        return resp
+
+    monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
 
     resp = await proxy_openai_api(mock_request, "chat/completions")
 
@@ -159,8 +175,9 @@ async def test_prepend_mode_injects_system_prompt(monkeypatch, tmp_path):
         "models": {
             "code-model": {
                 "aliases": ["code", "coder"],
-                "llama_model": "test-llama",
-                "type": "local",
+                "providers": [
+                    {"name": "local", "type": "local", "llama_model": "test-llama"}
+                ],
                 "system_prompt": {
                     "mode": "prepend",
                     "file": "proxy/prompts/code.txt",
@@ -236,7 +253,22 @@ async def test_prepend_mode_injects_system_prompt(monkeypatch, tmp_path):
         )
         return resp
 
-    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+    # Mock proxy_with_fallback to delegate to the backend mock
+    from proxy import provider as provider_module
+
+    async def fake_proxy_with_fallback(request, path, model_cfg, config):
+        body_bytes = await request.body()
+        body_json = json.loads(body_bytes) if body_bytes else {}
+        new_body = json.dumps(body_json).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        resp = await client.post(
+            f"http://localhost:9999/{path}",
+            content=new_body,
+            headers=headers,
+        )
+        return resp
+
+    monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
 
     resp = await proxy_openai_api(mock_request, "chat/completions")
     await client.aclose()
@@ -266,8 +298,9 @@ async def test_no_system_prompt_passes_through(monkeypatch):
         "models": {
             "basic-model": {
                 "aliases": ["basic"],
-                "llama_model": "test-llama",
-                "type": "local",
+                "providers": [
+                    {"name": "local", "type": "local", "llama_model": "test-llama"}
+                ],
             },
         },
         "server": {
@@ -339,7 +372,22 @@ async def test_no_system_prompt_passes_through(monkeypatch):
         )
         return resp
 
-    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+    # Mock proxy_with_fallback to delegate to the backend mock
+    from proxy import provider as provider_module
+
+    async def fake_proxy_with_fallback(request, path, model_cfg, config):
+        body_bytes = await request.body()
+        body_json = json.loads(body_bytes) if body_bytes else {}
+        new_body = json.dumps(body_json).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        resp = await client.post(
+            f"http://localhost:9999/{path}",
+            content=new_body,
+            headers=headers,
+        )
+        return resp
+
+    monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
 
     resp = await proxy_openai_api(mock_request, "chat/completions")
     await client.aclose()

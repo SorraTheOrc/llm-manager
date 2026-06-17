@@ -69,6 +69,62 @@ def resolve_provider(
     return None
 
 
+def get_model_type(model_config: dict) -> Optional[str]:
+    """Determine the model type from the providers list.
+
+    Returns ``"local"`` if the first provider is a local provider,
+    ``"remote"`` if it is remote, or ``None`` if no providers are defined.
+
+    This replaces the legacy ``model_config["type"]`` field.
+    """
+    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    if not providers:
+        return None
+    first = providers[0]
+    ptype = first.get("type")
+    if ptype in ("local", "remote"):
+        return ptype
+    return None
+
+
+def get_local_model_name_from_providers(model_config: dict) -> Optional[str]:
+    """Extract the llama_model name from the providers list.
+
+    Searches the ordered ``providers`` list for a local provider and
+    returns its ``llama_model`` value.
+
+    This replaces the legacy ``model_config["llama_model"]`` field.
+
+    Returns ``None`` if no local provider is found.
+    """
+    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    if not providers:
+        return None
+    for p in providers:
+        if isinstance(p, dict) and p.get("type") == "local":
+            return p.get("llama_model")
+    return None
+
+
+def get_remote_endpoint(model_config: dict) -> Optional[str]:
+    """Extract the endpoint URL from the providers list.
+
+    Searches the ordered ``providers`` list for a remote provider and
+    returns its ``endpoint`` value.
+
+    This replaces the legacy ``model_config["endpoint"]`` field.
+
+    Returns ``None`` if no remote provider is found.
+    """
+    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    if not providers:
+        return None
+    for p in providers:
+        if isinstance(p, dict) and p.get("type") == "remote":
+            return p.get("endpoint")
+    return None
+
+
 def mark_provider_unavailable(
     provider_name: str,
     cooldown_seconds: float,
@@ -219,8 +275,12 @@ def _is_http_error_status(status_code: int) -> bool:
 
 
 def _get_proxy_to_remote():
-    """Lazily import proxy_to_remote."""
-    from proxy.proxy_remote import proxy_to_remote
+    """Lazily import proxy_to_remote.
+
+    Uses ``proxy.server`` as the source so that any monkeypatches
+    applied to the server module (e.g. in tests) are picked up.
+    """
+    from proxy.server import proxy_to_remote
     return proxy_to_remote
 
 
