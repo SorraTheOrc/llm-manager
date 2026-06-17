@@ -18,6 +18,10 @@ import proxy.metrics as metrics
 class TestHttpErrorsCounter:
     """Tests for the proxy_http_errors_total counter and record_http_error()."""
 
+    @pytest.mark.skipif(
+        not metrics._enabled,
+        reason="prometheus_client not available",
+    )
     def test_http_errors_counter_exists(self):
         """The proxy_http_errors_total counter is defined when prometheus_client is available."""
         assert metrics._enabled, (
@@ -28,6 +32,10 @@ class TestHttpErrorsCounter:
         from prometheus_client import Counter
         assert isinstance(metrics.proxy_http_errors_total, Counter)
 
+    @pytest.mark.skipif(
+        not metrics._enabled,
+        reason="prometheus_client not available",
+    )
     def test_http_errors_counter_labels(self):
         """The counter has the expected labels: endpoint, status, reason."""
         # The label names are accessible via the ._labelnames attribute on Counter objects
@@ -36,6 +44,10 @@ class TestHttpErrorsCounter:
         assert "status" in label_names
         assert "reason" in label_names
 
+    @pytest.mark.skipif(
+        not metrics._enabled,
+        reason="prometheus_client not available",
+    )
     def test_record_http_error_increments_counter(self):
         """Calling record_http_error() increments the counter with matching labels."""
         # Get value before
@@ -55,6 +67,10 @@ class TestHttpErrorsCounter:
 
         assert after == before + 1, "counter should increment by 1"
 
+    @pytest.mark.skipif(
+        not metrics._enabled,
+        reason="prometheus_client not available",
+    )
     def test_record_http_error_separate_reasons(self):
         """Different reason labels produce separate label combinations (no cross-talk)."""
         before_backend = metrics.proxy_http_errors_total.labels(
@@ -84,6 +100,10 @@ class TestHttpErrorsCounter:
         assert after_backend == before_backend + 1
         assert after_unavail == before_unavail, "unrelated reason should not be affected"
 
+    @pytest.mark.skipif(
+        not metrics._enabled,
+        reason="prometheus_client not available",
+    )
     def test_record_http_error_different_endpoint(self):
         """Different endpoint labels are tracked independently."""
         before_completions = metrics.proxy_http_errors_total.labels(
@@ -107,6 +127,10 @@ class TestHttpErrorsCounter:
 
         assert after_other == before_other, "other endpoint should not be affected"
 
+    @pytest.mark.skipif(
+        not metrics._enabled,
+        reason="prometheus_client not available",
+    )
     def test_record_http_error_different_status(self):
         """Different status labels are tracked independently."""
         before_5xx = metrics.proxy_http_errors_total.labels(
