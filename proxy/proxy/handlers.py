@@ -184,20 +184,46 @@ def format_progress(n_tokens: int, total_tokens: int, progress: float) -> str:
 
 @router.get("/llama/local/status")
 async def get_llama_local_status():
-    """Return a small JSON object describing local llama-server status."""
+    """Return a small JSON object describing local llama-server status.
+
+    The endpoint is designed to be non-blocking even when the underlying
+    llama-server is busy. ``query_llama_status()`` is wrapped with a short
+    timeout so the endpoint itself remains responsive under load (target
+    response time < 5 s).
+
+    Fields returned::
+
+        {"active_query": bool,
+         "model_switch_in_progress": bool,
+         "current_model": str | None,
+         "llama_server_running": bool}
+
+    Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
+    (seconds, default 1.0).
+    """
+    import os  # noqa: local import for config access
+
+    # -- query_llama_status with timeout (non-blocking guarantee) ---------
     srv = _srv()
+    timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
     try:
-        status = await srv.query_llama_status()
-    except Exception:
+        status = await asyncio.wait_for(srv.query_llama_status(), timeout=timeout)
+    except (asyncio.TimeoutError, Exception):
         status = {"llama_server_running": False, "n_ctx": None, "kv_cache_tokens": None, "router_mode": False}
 
     llama_running = bool(status.get("llama_server_running", False))
 
+    # -- model_switch_in_progress (thread-safe read of refcount) ----------
+    switch_in_progress = False
     try:
-        switch_in_progress = (srv.model_switch_refcount > 0) if hasattr(srv, 'model_switch_refcount') else False
+        if hasattr(srv, "model_switch_refcount"):
+            with srv.model_switch_refcount_lock:  # type: ignore[arg-type]
+                refcount = srv.model_switch_refcount
+            switch_in_progress = refcount > 0
     except Exception:
         switch_in_progress = False
 
+    # -- secondary indicators ---------------------------------------------
     if not switch_in_progress:
         try:
             switch_in_progress = srv.model_switch_lock.locked() if srv.model_switch_lock is not None else False
@@ -212,10 +238,11 @@ async def get_llama_local_status():
 
     cm = srv.current_model if llama_running else None
 
+    # -- active queries (non-blocking snapshot) ---------------------------
     active = False
     try:
         async with srv.active_queries_lock:
-            active = (srv.active_queries > 0)
+            active = srv.active_queries > 0
     except Exception:
         active = False
 

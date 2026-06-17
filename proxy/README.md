@@ -718,6 +718,44 @@ Response:
 }
 ```
 
+#### LLama Local Status
+
+Internal endpoint that returns a small JSON object describing the current status
+of the local llama.cpp (llama-server) process.
+
+```bash
+curl http://localhost:8000/llama/local/status
+```
+
+Response:
+```json
+{
+  "active_query": false,
+  "model_switch_in_progress": false,
+  "current_model": "qwen3",
+  "llama_server_running": true
+}
+```
+
+**Fields:**
+
+| Field                     | Type          | Description                                                                 |
+|---------------------------|---------------|-----------------------------------------------------------------------------|
+| `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
+| `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
+| `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
+| `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
+
+**Performance:**
+
+The endpoint is designed to remain responsive even under load. The underlying
+`query_llama_status()` call is wrapped with a configurable timeout
+(default: 1 second, overridable via the `STATUS_QUERY_TIMEOUT` environment
+variable). If the query times out, safe defaults (mostly `false`/`null`) are
+returned and `llama_server_running` is set to `false`.
+
+This endpoint requires no authentication (internal) and is rate-unlimited.
+
 #### List Models
 ```bash
 curl http://localhost:8000/v1/models
