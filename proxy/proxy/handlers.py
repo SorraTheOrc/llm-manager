@@ -200,8 +200,13 @@ async def get_llama_local_status():
 
     Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
     (seconds, default 1.0).
+
+    Each call is logged with a ``status_request`` structured message that
+    includes the response fields and request latency (ms).
     """
     import os  # noqa: local import for config access
+
+    _start = time.monotonic()
 
     # -- query_llama_status with timeout (non-blocking guarantee) ---------
     srv = _srv()
@@ -245,6 +250,19 @@ async def get_llama_local_status():
             active = srv.active_queries > 0
     except Exception:
         active = False
+
+    # -- structured log entry with latency --------------------------------
+    _latency_ms = int((time.monotonic() - _start) * 1000)
+    logger.info(
+        "status_request",
+        extra={
+            "latency_ms": _latency_ms,
+            "llama_server_running": llama_running,
+            "active_query": active,
+            "model_switch_in_progress": switch_in_progress,
+            "current_model": cm,
+        },
+    )
 
     return {
         "active_query": bool(active),

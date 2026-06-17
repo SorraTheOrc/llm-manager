@@ -4,6 +4,7 @@ These tests exercise the actual handler (via ASGI transport) with real
 server state, simulating model-switch and active-query scenarios.
 """
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 import httpx
 import pytest
@@ -286,3 +287,31 @@ async def test_status_response_under_query_load(transport):
                 assert elapsed < 5.0, (
                     f"Response took {elapsed:.2f}s, expected < 5.0s"
                 )
+
+
+@pytest.mark.asyncio
+async def test_status_request_logged(caplog, transport):
+    """Each call to /llama/local/status emits a structured log entry with latency."""
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get("/llama/local/status")
+
+        assert resp.status_code == 200
+
+    # Verify a structured log entry was emitted
+    assert any("status_request" in record.getMessage() for record in caplog.records), (
+        "Expected 'status_request' in log output"
+    )
+    # Verify at least one record has the latency_ms extra field
+    assert any(
+        hasattr(record, "latency_ms") for record in caplog.records
+    ), "Expected log record with latency_ms attribute"
