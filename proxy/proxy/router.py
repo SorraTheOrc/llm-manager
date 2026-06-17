@@ -391,9 +391,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     stream_start = time.monotonic()
                     max_runtime_seconds = float(
                         server_config.get(
-                            "session_guardrail_max_runtime_seconds", 120
+                            "session_guardrail_max_runtime_seconds", 1800
                         )
-                        or 120
+                        or 1800
                     )
                     max_completion_tokens = int(
                         server_config.get(

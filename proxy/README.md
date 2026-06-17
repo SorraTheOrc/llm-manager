@@ -132,9 +132,35 @@ server:
   session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
   session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
-  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_runtime_seconds: 1800
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 64
+  session_guardrail_repetition_min_repeats: 10
+  session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
+  session_require_restore_signal: false
+
+# Default model to load on startup
+# Set the default to `gemma4` in examples and docs; other models (e.g., `gpt120`) remain available.
+default_model: "gemma4"
+
+# Logging configuration
+logging:
+  directory: "/var/log/llama-proxy"
+  rotation_hours: 6
+  retention_days: 90
+  level: "INFO"
+
+# Audit model configuration
+# The audit skill uses these settings to determine which model to call
+# for audit operations. See proxy/provider_resolver.py for details.
+audit_model: "deepseek-v4-flash-free"
+audit_model_fallbacks:
+  - "openrouter/free"
+  - "deepseek-v4-flash"
+
+# Model routing
+models:
   session_guardrail_repetition_min_repeats: 10
   session_guardrail_invalidate_on_cutoff: true
   session_guardrail_invalidate_on_repetition: false
@@ -242,6 +268,78 @@ programmatically by inspecting the `aliases` field of each model entry.
 - `endpoint`: Base URL of the API
 - `api_key_env`: Environment variable containing the API key
 - `headers`: Additional headers to include (optional)
+
+### Audit Model Configuration
+
+The audit skill (`skill/audit/`) uses the `audit_model` and `audit_model_fallbacks`
+settings to determine which model to call for audit operations. The resolver
+maps short model names to provider-prefixed model identifiers.
+
+#### Configuration
+
+```yaml
+audit_model: "deepseek-v4-flash-free"
+audit_model_fallbacks:
+  - "openrouter/free"
+  - "deepseek-v4-flash"
+```
+
+#### Resolution
+
+The resolver maintains a static mapping table (in `proxy/provider_resolver.py`) that
+maps well-known short names to provider-prefixed model IDs:
+
+| Short name | Resolved IDs |
+|------------|-------------|
+| `deepseek-v4-flash-free` | `opencode/deepseek-v4-flash-free`, `openrouter/openrouter/free`, `opencode-go/deepseek-v4-flash` |
+| `deepseek-v4-flash` | `opencode/deepseek-v4-flash`, `opencode-go/deepseek-v4-flash`, `openrouter/deepseek/deepseek-v4-flash` |
+| `openrouter/free` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
+| `free-model` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
+
+Canonical model IDs were discovered via `pi --list-models`:
+- `opencode/deepseek-v4-flash-free`
+- `opencode-go/deepseek-v4-flash`
+- `openrouter/openrouter/free`
+- `openrouter/deepseek/deepseek-v4-flash`
+- `opencode/deepseek-v4-flash`
+
+#### Fallback Behaviour
+
+When the primary `audit_model` fails to resolve, the resolver attempts each
+fallback in order. If all names fail, startup validation logs a warning (lenient
+mode, default) or errors (strict mode). The default strictness is lenient to
+avoid blocking startup when models are temporarily unavailable.
+
+#### Startup Validation
+
+At server startup the resolver validates that at least one valid model can be
+resolved. Configuration:
+
+```yaml
+# Not yet exposed in config.yaml — resolved programmatically from the resolver
+# Default: strict=false (lenient — logs warnings but does not fail startup)
+```
+
+#### Observability
+
+The resolver produces structured logs and a lightweight metric:
+
+- **Log**: `INFO` on successful resolution, `WARNING` on unresolvable names
+- **Metric**: `provider_resolver_unresolved_total` — count of unresolvable
+  lookups keyed by short name
+
+#### Migration Note
+
+The SorrasAgents integration will consume this resolver in a separate work item
+(LP-0MQGO0PWJ001R5QI covers the resolver implementation; SorrasAgents update
+follows). Until then, the resolver is available for standalone testing via the
+CLI:
+
+```bash
+cd proxy && source .venv/bin/activate
+python -m proxy.provider_resolver deepseek-v4-flash-free openrouter/free
+# Output: Resolved to: opencode/deepseek-v4-flash-free, openrouter/openrouter/free, opencode-go/deepseek-v4-flash
+```
 
 ### Provider Fallback
 
