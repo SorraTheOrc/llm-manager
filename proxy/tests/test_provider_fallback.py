@@ -480,6 +480,17 @@ async def test_remote_fallback_respects_retry_after(sample_model_config):
     # openai-primary should be in cooldown with the larger of
     # provider_cooldown_seconds (60) and Retry-After (120)
     assert provider._is_provider_unavailable("openai-primary")
+    # Verify the cooldown expiry is approximately now + 120s (max of 60 and 120)
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("openai-primary")
+    assert expiry is not None, "openai-primary should have a cooldown expiry"
+    # Allow 2s tolerance for test execution time
+    assert expiry >= now + 118, (
+        f"Expected expiry ~now+120s, got {expiry - now:.1f}s from now"
+    )
+    assert expiry <= now + 125, (
+        f"Expiry too far in the future: {expiry - now:.1f}s"
+    )
 
 
 @pytest.mark.asyncio
