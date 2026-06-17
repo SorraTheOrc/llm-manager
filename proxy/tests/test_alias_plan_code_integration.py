@@ -258,9 +258,17 @@ async def test_plan_alias_routes_to_qwen3_next(monkeypatch, alias_config):
             content=new_body,
             headers=headers,
         )
-        return resp
+        # Convert httpx.Response to Starlette Response (needed by _add_provider_header)
+        from starlette.responses import Response as StarletteResponse
+        return StarletteResponse(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
 
     monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+    import proxy.router as proxy_router
+    monkeypatch.setattr(proxy_router, 'proxy_to_local', fake_proxy_to_local)
 
     from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
@@ -324,9 +332,17 @@ async def test_code_alias_routes_to_qwen3_next(monkeypatch, alias_config):
             content=new_body,
             headers=headers,
         )
-        return resp
+        # Convert httpx.Response to Starlette Response (needed by _add_provider_header)
+        from starlette.responses import Response as StarletteResponse
+        return StarletteResponse(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
 
     monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+    import proxy.router as proxy_router
+    monkeypatch.setattr(proxy_router, 'proxy_to_local', fake_proxy_to_local)
 
     from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
@@ -391,9 +407,17 @@ async def test_plan_alias_resolves_model_name(monkeypatch, alias_config):
             content=new_body,
             headers=headers,
         )
-        return resp
+        # Convert httpx.Response to Starlette Response (needed by _add_provider_header)
+        from starlette.responses import Response as StarletteResponse
+        return StarletteResponse(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
 
     monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+    import proxy.router as proxy_router
+    monkeypatch.setattr(proxy_router, 'proxy_to_local', fake_proxy_to_local)
 
     from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest

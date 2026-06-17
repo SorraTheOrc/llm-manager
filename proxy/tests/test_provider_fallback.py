@@ -793,3 +793,206 @@ async def test_no_fallback_log_on_success(sample_model_config, caplog):
     assert result.status_code == 200
     for record in caplog.records:
         assert "Fallback triggered" not in record.getMessage()
+
+
+# ===================================================================
+# Integration tests: ui.py request path uses fallback functions
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_remote_model_with_providers_calls_fallback(monkeypatch):
+    """proxy_openai_api should call proxy_with_remote_fallback for remote models with providers."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock, AsyncMock
+
+    # Set up config with a remote model that has providers
+    server_module.config = {
+        "models": {
+            "test-remote": {
+                "type": "remote",
+                "providers": [
+                    {"name": "primary", "type": "remote",
+                     "endpoint": "https://primary.test/v1", "api_key_env": "KEY1"},
+                    {"name": "backup", "type": "remote",
+                     "endpoint": "https://backup.test/v1", "api_key_env": "KEY2"},
+                ],
+            },
+        },
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+    server_module.llama_process = None
+    server_module.backend_ready = True
+
+    # Track that proxy_with_remote_fallback was called
+    fallback_called = False
+    orig_fallback = provider.proxy_with_remote_fallback
+
+    async def mock_fallback(request, path, model_config, config):
+        nonlocal fallback_called
+        fallback_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_remote_fallback", mock_fallback):
+        from proxy.ui import proxy_openai_api
+        from fastapi import Request as FastAPIRequest
+
+        body = json.dumps({
+            "model": "test-remote",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        }).encode("utf-8")
+
+        mock_request = MagicMock(spec=FastAPIRequest)
+        mock_request.method = "POST"
+        mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+        mock_request.headers = {}
+        mock_request._body = body
+        async def mock_body():
+            return mock_request._body
+        mock_request.body = mock_body
+
+        resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert fallback_called, \
+        "proxy_with_remote_fallback should be called for remote model with providers"
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_remote_model_without_providers_uses_legacy_path(monkeypatch):
+    """proxy_openai_api should NOT call proxy_with_remote_fallback for remote models without providers."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock, AsyncMock
+
+    # Set up config with a remote model that has NO providers (legacy format)
+    server_module.config = {
+        "models": {
+            "test-remote": {
+                "type": "remote",
+                "endpoint": "https://test.api.com/v1",
+                "api_key_env": "TEST_KEY",
+            },
+        },
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+    server_module.llama_process = None
+    server_module.backend_ready = True
+
+    fallback_called = False
+
+    async def mock_fallback(request, path, model_config, config):
+        nonlocal fallback_called
+        fallback_called = True
+        return Response(status_code=200)
+
+    proxy_to_remote_called = False
+
+    async def mock_proxy_to_remote(request, path, model_config):
+        nonlocal proxy_to_remote_called
+        proxy_to_remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_remote_fallback", mock_fallback), \
+         patch("proxy.proxy_remote.proxy_to_remote", mock_proxy_to_remote), \
+         patch("proxy.server.proxy_to_remote", mock_proxy_to_remote):
+        from proxy.ui import proxy_openai_api
+        from fastapi import Request as FastAPIRequest
+
+        body = json.dumps({
+            "model": "test-remote",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        }).encode("utf-8")
+
+        mock_request = MagicMock(spec=FastAPIRequest)
+        mock_request.method = "POST"
+        mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+        mock_request.headers = {}
+        mock_request._body = body
+        async def mock_body():
+            return mock_request._body
+        mock_request.body = mock_body
+
+        resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert not fallback_called, \
+        "proxy_with_remote_fallback should NOT be called for legacy remote model"
+    assert proxy_to_remote_called, \
+        "proxy_to_remote should be called for legacy remote model"
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_local_model_with_providers_calls_fallback(monkeypatch):
+    """proxy_openai_api should call proxy_with_fallback for loaded local models with providers."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock
+
+    # Set up config with a local model that has providers (local + remote)
+    server_module.config = {
+        "models": {
+            "test-local": {
+                "type": "local",
+                "llama_model": "test-llama",
+                "providers": [
+                    {"name": "local-instance", "type": "local", "llama_model": "test-llama"},
+                    {"name": "remote-backup", "type": "remote",
+                     "endpoint": "https://backup.test/v1", "api_key_env": "KEY"},
+                ],
+            },
+        },
+        "server": {"llama_request_timeout": 300},
+    }
+    # Simulate model is already loaded
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    server_module.llama_process = fake_proc
+    server_module.backend_ready = True
+    server_module.current_model = "test-llama"
+
+    fallback_called = False
+
+    async def mock_fallback(request, path, model_config, config):
+        nonlocal fallback_called
+        fallback_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_fallback", mock_fallback):
+        from proxy.ui import proxy_openai_api
+        from fastapi import Request as FastAPIRequest
+
+        body = json.dumps({
+            "model": "test-local",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        }).encode("utf-8")
+
+        mock_request = MagicMock(spec=FastAPIRequest)
+        mock_request.method = "POST"
+        mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+        mock_request.headers = {}
+        mock_request._body = body
+        async def mock_body():
+            return mock_request._body
+        mock_request.body = mock_body
+
+        resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert fallback_called, \
+        "proxy_with_fallback should be called for local model with providers"
+    assert resp.status_code == 200

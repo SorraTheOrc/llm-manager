@@ -475,6 +475,10 @@ async def create_embeddings(request: Request):
 
         # If model already active and process running, proceed immediately
         if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
+            providers = model_cfg.get("providers")
+            if providers:
+                from proxy.provider import proxy_with_fallback
+                return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
             return await srv.proxy_to_local(request, "v1/embeddings")
 
         # Try a fast router-mode check: model may already be loaded in router
@@ -483,6 +487,10 @@ async def create_embeddings(request: Request):
                 if await srv.router_is_model_loaded(llama_model_str):
                     srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
                     srv.current_model = llama_model_str
+                    providers = model_cfg.get("providers")
+                    if providers:
+                        from proxy.provider import proxy_with_fallback
+                        return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
                     return await srv.proxy_to_local(request, "v1/embeddings")
             except Exception:
                 # Non-fatal: fall through to scheduling background load
@@ -500,6 +508,10 @@ async def create_embeddings(request: Request):
         )
     
     elif model_cfg.get("type") == "remote":
+        providers = model_cfg.get("providers")
+        if providers:
+            from proxy.provider import proxy_with_remote_fallback
+            return await proxy_with_remote_fallback(request, "v1/embeddings", model_cfg, srv.config)
         return await srv.proxy_to_remote(request, "v1/embeddings", model_cfg)
     
     raise HTTPException(
@@ -577,6 +589,10 @@ async def proxy_openai_api(request: Request, path: str):
 
         # If model already active and process running, proceed immediately
         if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
+            providers = model_cfg.get("providers")
+            if providers:
+                from proxy.provider import proxy_with_fallback
+                return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
             return await srv.proxy_to_local(request, f"v1/{path}")
 
         # Try a fast router-mode check: model may already be loaded in router
@@ -585,6 +601,10 @@ async def proxy_openai_api(request: Request, path: str):
                 if await srv.router_is_model_loaded(llama_model_str):
                     srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
                     srv.current_model = llama_model_str
+                    providers = model_cfg.get("providers")
+                    if providers:
+                        from proxy.provider import proxy_with_fallback
+                        return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
                     return await srv.proxy_to_local(request, f"v1/{path}")
             except Exception:
                 srv.logger.debug("Fast router check failed; scheduling background load")
@@ -601,6 +621,10 @@ async def proxy_openai_api(request: Request, path: str):
         )
     
     elif model_cfg.get("type") == "remote":
+        providers = model_cfg.get("providers")
+        if providers:
+            from proxy.provider import proxy_with_remote_fallback
+            return await proxy_with_remote_fallback(request, f"v1/{path}", model_cfg, srv.config)
         return await srv.proxy_to_remote(request, f"v1/{path}", model_cfg)
     
     raise HTTPException(
