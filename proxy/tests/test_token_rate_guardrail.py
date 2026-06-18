@@ -2,21 +2,14 @@
 
 Tests the _evaluate_token_rate_guardrail helper function that determines
 whether the token generation rate has exceeded the configured threshold
-over a configurable rolling window.
-
-These tests are written test-first: they define the expected contract for
-the token-rate guardrail. The implementation will be added in Feature 4
-(Token-rate rolling window algorithm, LP-0MQJGWIUI0007WJO).
+over a configurable rolling window, and its integration into
+evaluate_stream_guardrail.
 
 Acceptance criteria (from LP-0MQJGVH9Q003MTAQ):
 1. Guardrail returns None when tokens/sec is below the configured threshold
 2. Guardrail returns "token_rate" when sustained violation detected over full window
 3. Brief bursts (< window duration) do not trigger the guardrail
 4. Disabled mode (threshold=0) never triggers, even at extreme token rates (>500 t/s)
-
-Mock strategy:
-- count_text_tokens is mocked to return controlled token counts per chunk
-- time.time (or monotonic) is mocked to control chunk arrival timestamps
 """
 
 from typing import List, Optional, Tuple
@@ -25,55 +18,185 @@ from unittest.mock import patch
 import pytest
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _make_chunks(
+    *,
+    start_time: float = 1000.0,
+    interval_seconds: float = 0.1,
+    text_length: int = 200,  # ~50 tokens at 4 bytes/token
+    count: int = 10,
+) -> List[Tuple[float, str]]:
+    """Build a list of (timestamp, chunk_text) pairs with controlled spacing."""
+    chunks = []
+    for i in range(count):
+        t = start_time + i * interval_seconds
+        text = "x" * text_length  # ~text_len/4 tokens via heuristic
+        chunks.append((t, text))
+    return chunks
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tests for _evaluate_token_rate_guardrail (pure function)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# These tests call the helper that will be added to proxy/session.py.
-# The function signature is:
-#
-#   def _evaluate_token_rate_guardrail(
-#       chunk_history: List[Tuple[float, int]],   # [(timestamp, token_count), ...]
-#       max_token_rate: int = 0,                   # tokens/sec, 0 = disabled
-#       window_seconds: int = 5,                   # rolling window duration
-#   ) -> bool:
-#
-# Returns True when sustained violation is detected, False otherwise.
+# Tests for _evaluate_token_rate_guardrail (direct helper testing)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestTokenRateGuardrailHelper:
     """Unit tests for _evaluate_token_rate_guardrail.
 
-    These tests verify the core rolling-window algorithm independently
-    of the full evaluate_stream_guardrail pipeline.
+    Tests the core rolling-window algorithm by calling evaluate_stream_guardrail
+    with chunk_history to exercise the helper.
     """
-
-    # ── Helper to build chunk histories ──────────────────────────────────
-
-    @staticmethod
-    def _make_chunks(
-        *,
-        start_time: float = 1000.0,
-        interval_seconds: float = 0.1,
-        tokens_per_chunk: int = 50,
-        count: int = 10,
-    ) -> List[Tuple[float, int]]:
-        """Build a list of (timestamp, token_count) pairs."""
-        chunks = []
-        for i in range(count):
-            t = start_time + i * interval_seconds
-            chunks.append((t, tokens_per_chunk))
-        return chunks
 
     # ── Test: below threshold ────────────────────────────────────────────
 
-    def test_below_threshold_without_token_rate_params(self):
-        """Guardrail returns None when token-rate params not passed (backward compat).
+    def test_below_threshold_does_not_trigger(self):
+        """Guardrail returns None when tokens/sec is below configured threshold.
 
-        Calling evaluate_stream_guardrail without token-rate parameters
-        should continue to work and not break existing behavior.
+        50 chars per chunk at 4 bytes/token heuristic → ~12 tokens each.
+        0.1s apart → ~125 tokens/sec total. Threshold=1000 → below → no trigger.
         """
+        from proxy.server import evaluate_stream_guardrail
+
+        chunks = _make_chunks(
+            start_time=1000.0,
+            interval_seconds=0.1,
+            text_length=50,  # ~12 tokens via heuristic
+            count=60,  # 6 seconds of data (fills a 5s window)
+        )
+
+        result = evaluate_stream_guardrail(
+            runtime_seconds=5.0,
+            completion_tokens=100,
+            response_text="normal varied text that does not repeat at all",
+            max_runtime_seconds=120.0,
+            max_completion_tokens=2048,
+            repetition_min_pattern_chars=64,
+            repetition_min_repeats=10,
+            chunk_history=chunks,
+            max_token_rate=1000,
+            token_rate_window_seconds=5,
+        )
+
+        assert result is None, f"Expected None (below threshold), got {result}"
+
+    # ── Test: disabled mode (threshold=0) ────────────────────────────────
+
+    def test_disabled_threshold_zero_never_triggers(self):
+        """Disabled mode (max_token_rate=0) never triggers regardless of rate."""
+        from proxy.server import evaluate_stream_guardrail
+
+        # Very fast chunks with lots of text → high token rate
+        chunks = _make_chunks(
+            start_time=1000.0,
+            interval_seconds=0.01,
+            text_length=500,  # ~125 tokens each
+            count=100,  # 1 second of data
+        )
+
+        result = evaluate_stream_guardrail(
+            runtime_seconds=5.0,
+            completion_tokens=2000,
+            response_text="normal varied text that does not repeat",
+            max_runtime_seconds=120.0,
+            max_completion_tokens=2048,
+            repetition_min_pattern_chars=64,
+            repetition_min_repeats=10,
+            chunk_history=chunks,
+            max_token_rate=0,  # Disabled
+            token_rate_window_seconds=5,
+        )
+
+        assert result is None, (
+            f"Expected None (disabled), got {result}"
+        )
+
+    # ── Test: sustained violation over full window ───────────────────────
+
+    @patch("proxy.utils.count_text_tokens")
+    def test_sustained_violation_over_window_triggers(
+        self, mock_count_tokens
+    ):
+        """Guardrail returns 'token_rate' when sustained violation over window.
+
+        With mocked count_text_tokens returning 200 tokens per chunk,
+        0.05s apart → 4000 tokens/sec. Window=5s, threshold=1000 → trigger.
+        """
+        from proxy.server import evaluate_stream_guardrail
+
+        mock_count_tokens.return_value = 200
+
+        # 6 seconds of data at 0.05s intervals → 120 chunks
+        chunks = _make_chunks(
+            start_time=1000.0,
+            interval_seconds=0.05,
+            text_length=800,  # content won't matter since count_text_tokens is mocked
+            count=120,
+        )
+
+        result = evaluate_stream_guardrail(
+            runtime_seconds=10.0,
+            completion_tokens=500,
+            response_text="normal varied text that does not repeat",
+            max_runtime_seconds=120.0,
+            max_completion_tokens=2048,
+            repetition_min_pattern_chars=64,
+            repetition_min_repeats=10,
+            chunk_history=chunks,
+            max_token_rate=1000,
+            token_rate_window_seconds=5,
+        )
+
+        assert result == "token_rate", (
+            f"Expected 'token_rate' (sustained violation), got {result}"
+        )
+
+    # ── Test: brief burst does not trigger ───────────────────────────────
+
+    @patch("proxy.utils.count_text_tokens")
+    def test_burst_under_window_does_not_trigger(
+        self, mock_count_tokens
+    ):
+        """Brief bursts (< window duration) do not trigger the guardrail.
+
+        1 second of data with 500 tokens/sec, but window is 5s.
+        The window is not fully populated so the guardrail should not trigger.
+        """
+        from proxy.server import evaluate_stream_guardrail
+
+        mock_count_tokens.return_value = 50
+
+        # Only 1 second of data — not enough to fill the 5s window
+        chunks = _make_chunks(
+            start_time=1000.0,
+            interval_seconds=0.1,
+            text_length=200,  # content won't matter with mock
+            count=10,  # 1 second of data
+        )
+
+        result = evaluate_stream_guardrail(
+            runtime_seconds=5.0,
+            completion_tokens=200,
+            response_text="normal varied text that does not repeat",
+            max_runtime_seconds=120.0,
+            max_completion_tokens=2048,
+            repetition_min_pattern_chars=64,
+            repetition_min_repeats=10,
+            chunk_history=chunks,
+            max_token_rate=100,  # Low threshold
+            token_rate_window_seconds=5,
+        )
+
+        # Burst too short to fill the window → no trigger
+        assert result is None, (
+            f"Expected None (burst too short), got {result}"
+        )
+
+    # ── Test: disabled mode via backward compat ──────────────────────────
+
+    def test_no_chunk_history_is_noop(self):
+        """Calling without chunk_history or max_token_rate is backward compat."""
         from proxy.server import evaluate_stream_guardrail
 
         result = evaluate_stream_guardrail(
@@ -88,140 +211,106 @@ class TestTokenRateGuardrailHelper:
 
         assert result is None
 
-    # ── Test: sustained violation over full window ───────────────────────
 
-    def test_sustained_violation_over_window_triggers(self):
-        """Guardrail returns 'token_rate' when sustained violation over window."""
-        from proxy.server import evaluate_stream_guardrail
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests for _evaluate_token_rate_guardrail algorithm details
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        # 200 tokens each, 0.05s apart → 4000 tokens/sec, threshold=1000
-        # Sustained violation → should trigger
-        chunks = self._make_chunks(
+
+class TestTokenRateAlgorithmDetail:
+    """Detailed unit tests for the rolling window algorithm."""
+
+    @patch("proxy.utils.count_text_tokens")
+    def test_rate_computed_from_chunk_content(self, mock_count_tokens):
+        """Token rate is correctly computed from chunk text content.
+
+        count_text_tokens returns 100 per chunk, 0.2s apart → 500 tokens/sec.
+        """
+        from proxy.session import _evaluate_token_rate_guardrail
+
+        mock_count_tokens.return_value = 100
+
+        chunks = _make_chunks(
             start_time=1000.0,
-            interval_seconds=0.05,
-            tokens_per_chunk=200,
-            count=50,  # 2.5 seconds of data
+            interval_seconds=0.2,
+            text_length=400,
+            count=30,  # 6 seconds of data
         )
 
-        # When token-rate guardrail is implemented, this test will
-        # call evaluate_stream_guardrail with token-rate parameters
-        result = evaluate_stream_guardrail(
-            runtime_seconds=5.0,
-            completion_tokens=100,
-            response_text="some text",
-            max_runtime_seconds=120.0,
-            max_completion_tokens=2048,
-            repetition_min_pattern_chars=64,
-            repetition_min_repeats=10,
+        # Window set to 5s, with fully populated window and rate > 200
+        result = _evaluate_token_rate_guardrail(
+            chunks, max_token_rate=200, window_seconds=5
         )
 
-        # This assertion will need to be updated once the token-rate
-        # parameters are wired into evaluate_stream_guardrail
-        assert result is None  # TODO: change to "token_rate" once implemented
+        assert result is True, (
+            "Rate should exceed threshold over full window"
+        )
 
-    # ── Test: brief burst does not trigger ───────────────────────────────
+    @patch("proxy.utils.count_text_tokens")
+    def test_window_slides_with_new_chunks(self, mock_count_tokens):
+        """Rolling window correctly slides: old chunks fall out of window.
 
-    def test_burst_under_window_does_not_trigger(self):
-        """Brief bursts (< window duration) do not trigger the guardrail.
-
-        A high-rate burst that lasts less than the full rolling window
-        should not trigger cutoff, allowing legitimate high-speed emissions
-        like cached reasoning content.
+        With a 5s window, chunks older than 5s should not affect the rate.
         """
-        from proxy.server import evaluate_stream_guardrail
+        from proxy.session import _evaluate_token_rate_guardrail
 
-        # Simulate: 1 second of very high rate (500 t/s), then normal rate
-        # Window default is 5s, so 1s burst should not trigger
+        mock_count_tokens.return_value = 100
 
-        result = evaluate_stream_guardrail(
-            runtime_seconds=5.0,
-            completion_tokens=100,
-            response_text="some text",
-            max_runtime_seconds=120.0,
-            max_completion_tokens=2048,
-            repetition_min_pattern_chars=64,
-            repetition_min_repeats=10,
+        # Simulate:
+        # - Old burst at t=1000 to t=1002 (very high rate, 500 t/s)
+        # - Normal rate at t=1002 to t=1008 (low rate, 50 t/s)
+        # With window=5s at t=1008, old burst (t=1000-1002) should be out of window
+        chunks: List[Tuple[float, str]] = []
+        # Old burst (t=1000 to t=1002): high rate
+        for i in range(20):
+            t = 1000.0 + i * 0.1
+            chunks.append((t, "x" * 800))
+        # Normal rate (t=1002 to t=1008): low rate
+        mock_count_tokens.return_value = 10  # switch to low return value
+        for i in range(60):
+            t = 1002.0 + i * 0.1
+            chunks.append((t, "x" * 40))
+
+        # At the end (t≈1008), the rolling window should only include
+        # data from ~t=1003 onward, which has 10 tokens/chunk at 0.1s = 100 t/s
+        # Threshold = 1000 should not trigger
+        result = _evaluate_token_rate_guardrail(
+            chunks, max_token_rate=1000, window_seconds=5
         )
 
-        assert result is None  # No trigger for burst-only patterns
-
-    # ── Test: disabled mode ──────────────────────────────────────────────
-
-    def test_disabled_mode_never_triggers(self):
-        """Disabled mode (threshold=0) never triggers, even at extreme rate.
-
-        With max_token_rate=0, the guardrail should be completely disabled
-        and never cut off the stream regardless of token rate.
-        """
-        from proxy.server import evaluate_stream_guardrail
-
-        # Even with extremely high rates, disabled mode should not trigger
-        result = evaluate_stream_guardrail(
-            runtime_seconds=5.0,
-            completion_tokens=100,
-            response_text="some text",
-            max_runtime_seconds=120.0,
-            max_completion_tokens=2048,
-            repetition_min_pattern_chars=64,
-            repetition_min_repeats=10,
+        assert result is False, (
+            "Old burst should have fallen out of 5s window"
         )
-
-        assert result is None  # Disabled → no trigger
-
-    # ── Test: very high rate, disabled ───────────────────────────────────
-
-    def test_extreme_rate_with_disabled_does_not_trigger(self):
-        """Extreme token rates (>500 t/s) do not trigger when disabled.
-
-        With max_token_rate=0 (default), the guardrail should never trigger
-        regardless of token rate. Uses diverse text to avoid repetition trigger.
-        """
-        from proxy.server import evaluate_stream_guardrail
-
-        # Generate varied text to avoid repetition detection
-        varied_text = " ".join(f"word{i}_{'x'*100}" for i in range(100))
-        result = evaluate_stream_guardrail(
-            runtime_seconds=5.0,
-            completion_tokens=100,
-            response_text=varied_text,
-            max_runtime_seconds=120.0,
-            max_completion_tokens=2048,
-            repetition_min_pattern_chars=64,
-            repetition_min_repeats=10,
-        )
-
-        assert result is None  # Disabled → no trigger
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Tests for token-rate evaluation with mocked count_text_tokens
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestTokenRateWithMockedTokenCounting:
-    """Tests the token-rate helper with mocked count_text_tokens.
-
-    Verifies that the rolling window algorithm correctly computes token
-    rates from chunk text content using the existing counting utility.
-    """
-
-    # ── Test: rate computation correctness ───────────────────────────────
-
-    def test_rate_computed_from_chunk_content(self):
-        """Token rate is correctly computed from chunk text content."""
-        # Placeholder: once _evaluate_token_rate_guardrail is implemented,
-        # this test will mock count_text_tokens and verify the computed rate
-        pass
-
-    def test_window_slides_with_new_chunks(self):
-        """Rolling window correctly slides to include only recent chunks."""
-        # Placeholder: verify that old chunks fall out of the window
-        pass
 
     def test_window_seconds_configurable(self):
         """The token_rate_window_seconds parameter is respected."""
-        # Placeholder: verify different window durations work
-        pass
+        from proxy.server import evaluate_stream_guardrail
+
+        # 1 second of data, window=5s → not enough to trigger
+        chunks = _make_chunks(
+            start_time=1000.0,
+            interval_seconds=0.1,
+            text_length=800,  # ~200 tokens each
+            count=10,  # 1 second
+        )
+
+        # With window=1s and threshold=100, should trigger (200/0.9s ≈ 222 t/s)
+        # But with window=5s, the window is not fully populated yet
+        result_5s = evaluate_stream_guardrail(
+            runtime_seconds=2.0,
+            completion_tokens=500,
+            response_text="normal varied text that does not repeat",
+            max_runtime_seconds=120.0,
+            max_completion_tokens=2048,
+            repetition_min_pattern_chars=64,
+            repetition_min_repeats=10,
+            chunk_history=chunks,
+            max_token_rate=100,
+            token_rate_window_seconds=5,
+        )
+        assert result_5s is None, (
+            "5s window not filled by 1s of data"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -289,3 +378,38 @@ class TestTokenRateGuardrailIntegrationWithEvaluate:
             repetition_min_repeats=10,
         )
         assert result is None
+
+    @patch("proxy.utils.count_text_tokens")
+    def test_token_rate_can_trigger_with_high_rate(
+        self, mock_count_tokens
+    ):
+        """Token-rate triggers when rate exceeds threshold over full window,
+        even when runtime and repetition checks pass."""
+        from proxy.server import evaluate_stream_guardrail
+
+        mock_count_tokens.return_value = 100
+
+        chunks = _make_chunks(
+            start_time=1000.0,
+            interval_seconds=0.1,
+            text_length=400,
+            count=60,  # 6 seconds
+        )
+
+        result = evaluate_stream_guardrail(
+            runtime_seconds=5.0,
+            completion_tokens=100,
+            response_text="normal varied text that does not repeat",
+            max_runtime_seconds=120.0,
+            max_completion_tokens=2048,
+            repetition_min_pattern_chars=64,
+            repetition_min_repeats=10,
+            chunk_history=chunks,
+            max_token_rate=500,
+            token_rate_window_seconds=5,
+        )
+
+        # 100 tokens/chunk ÷ 0.1s = 1000 t/s, threshold=500 → trigger
+        assert result == "token_rate", (
+            f"Expected 'token_rate' (rate exceeds threshold), got {result}"
+        )

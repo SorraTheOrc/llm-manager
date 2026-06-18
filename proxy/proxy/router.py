@@ -398,6 +398,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     guardrail_response_text = ""
                     completion_tokens_total = 0
                     stream_start = time.monotonic()
+                    chunk_history: list[tuple[float, str]] = []
                     max_runtime_seconds = float(
                         server_config.get(
                             "session_guardrail_max_runtime_seconds", 1800
@@ -436,9 +437,22 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             False,
                         )
                     )
+                    max_token_rate = int(
+                        server_config.get(
+                            "session_guardrail_max_token_rate", 0
+                        )
+                        or 0
+                    )
+                    token_rate_window_seconds = int(
+                        server_config.get(
+                            "session_guardrail_token_rate_window_seconds",
+                            5,
+                        )
+                        or 5
+                    )
 
                     async def stream_generator():
-                        nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed
+                        nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed, chunk_history
                         # Track assistant response for session history update
                         collected_content: list[str] = []
                         saw_done = False
@@ -489,6 +503,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     chunk_text = ""
                                     delta_text = ""
 
+                                # Track chunk for token-rate guardrail (rolling window)
+                                chunk_history.append(
+                                    (time.monotonic(), chunk_text)
+                                )
+
                                 # Inspect SSE-style 'data:' lines for finish indicators
                                 try:
                                     txt = chunk.decode(
@@ -532,6 +551,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         max_completion_tokens=max_completion_tokens,
                                         repetition_min_pattern_chars=repetition_min_pattern_chars,
                                         repetition_min_repeats=repetition_min_repeats,
+                                        chunk_history=chunk_history,
+                                        max_token_rate=max_token_rate,
+                                        token_rate_window_seconds=token_rate_window_seconds,
                                     )
                                     if guardrail_reason:
                                         _record_guardrail_cutoff(

@@ -228,6 +228,13 @@ server:
   session_guardrail_repetition_min_repeats: 10
   session_guardrail_invalidate_on_cutoff: false
   session_guardrail_invalidate_on_repetition: false
+  # Token-rate guardrail settings (disabled by default)
+  # Maximum tokens/second threshold. Set to 0 to disable token-rate guardrail.
+  session_guardrail_max_token_rate: 0
+  # Rolling window duration in seconds for token-rate calculation.
+  # The guardrail only triggers if the rate exceeds max_token_rate for the
+  # entire window duration (sustained violation, not a spike).
+  session_guardrail_token_rate_window_seconds: 5
   session_require_restore_signal: false
   backend_retry_attempts: 8
   backend_retry_base_delay_seconds: 0.25

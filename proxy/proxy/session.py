@@ -713,6 +713,62 @@ def _should_cutoff_for_repetition(
     return tail == pattern * repeats
 
 
+def _evaluate_token_rate_guardrail(
+    chunk_history: List[Tuple[float, str]],
+    max_token_rate: int,
+    window_seconds: int,
+    model_name: Optional[str] = None,
+) -> bool:
+    """Evaluate whether token generation rate exceeds threshold over a rolling window.
+
+    Computes tokens/second from the chunk history using ``count_text_tokens``
+    and triggers only when the rate has been sustained over the *full* window
+    duration (i.e. the window is fully populated with data).
+
+    Args:
+        chunk_history: List of ``(timestamp, chunk_text)`` tuples in chronological
+            order. Timestamps are from ``time.monotonic()``.
+        max_token_rate: Maximum allowed tokens per second. 0 or negative = disabled.
+        window_seconds: Duration of the rolling window in seconds.
+        model_name: Optional model name passed to ``count_text_tokens``.
+
+    Returns:
+        True if the sustained token rate exceeds ``max_token_rate`` over the
+        full window; False otherwise.
+    """
+    if max_token_rate <= 0 or not chunk_history or len(chunk_history) < 2:
+        return False
+
+    from proxy.utils import count_text_tokens
+
+    now = chunk_history[-1][0]
+    window_start = now - window_seconds
+
+    # Only consider chunks within the rolling window
+    window_chunks = [(t, text) for t, text in chunk_history if t >= window_start]
+
+    if len(window_chunks) < 2:
+        return False
+
+    # Compute total tokens and elapsed time over the window
+    total_tokens = sum(
+        count_text_tokens(text, model_name) for _, text in window_chunks
+    )
+    elapsed = window_chunks[-1][0] - window_chunks[0][0]
+
+    if elapsed <= 0:
+        return False
+
+    tokens_per_second = total_tokens / elapsed
+
+    # Only trigger once the window is fully populated (elapsed >= window_seconds)
+    # to avoid false positives on short bursts.
+    if elapsed >= window_seconds and tokens_per_second > max_token_rate:
+        return True
+
+    return False
+
+
 def evaluate_stream_guardrail(
     runtime_seconds: float,
     completion_tokens: int,
@@ -721,12 +777,18 @@ def evaluate_stream_guardrail(
     max_completion_tokens: Optional[int],
     repetition_min_pattern_chars: int,
     repetition_min_repeats: int,
+    # Token-rate guardrail parameters (new in token-rate feature)
+    chunk_history: Optional[List[Tuple[float, str]]] = None,
+    max_token_rate: int = 0,
+    token_rate_window_seconds: int = 5,
 ) -> Optional[str]:
     """Evaluate whether the stream should be stopped due to guardrail violations.
 
     Priority order:
     1. Runtime cutoff - indicates a true runaway loop
     2. Repetition detection - indicates the model is stuck in a loop
+    3. Token-rate guardrail - monitors tokens/second over a rolling window
+       (only evaluated when enabled, i.e. ``max_token_rate > 0``)
 
     Note: The hard completion_tokens cutoff has been removed. Legitimate long
     responses should not be cut off. Loop detection via repetition check is
@@ -736,6 +798,12 @@ def evaluate_stream_guardrail(
         return "runtime"
     if _should_cutoff_for_repetition(response_text, repetition_min_pattern_chars, repetition_min_repeats):
         return "repetition"
+    if max_token_rate > 0 and _evaluate_token_rate_guardrail(
+        chunk_history or [],
+        max_token_rate,
+        token_rate_window_seconds,
+    ):
+        return "token_rate"
     return None
 
 
@@ -749,12 +817,16 @@ def _should_invalidate_on_guardrail(
     By default:
     - "runtime" guardrail invalidates the session (indicates true runaway loop)
     - "repetition" guardrail does NOT invalidate by default (let client retry)
+    - "token_rate" guardrail does NOT invalidate (consistent with repetition)
     - "completion_tokens" guardrail never invalidates (removed in favor of loop detection)
     """
     if not guardrail_reason:
         return False
     if guardrail_reason == "repetition":
         return bool(invalidate_on_repetition)
+    # token_rate guardrail does not invalidate by default (consistent with repetition)
+    if guardrail_reason == "token_rate":
+        return False
     # completion_tokens reason should never cause invalidation
     # (it's no longer a guardrail reason, but handle defensively)
     if guardrail_reason == "completion_tokens":
