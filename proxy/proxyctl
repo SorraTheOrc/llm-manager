@@ -316,35 +316,8 @@ cmd_restart() {
 
 cmd_logs() {
   local dev_mode="$1"
-  shift || true
-
-  local file_override=""
-  local follow=0
-  local lines=0
-
-  # simple arg parse for --file, --follow, --lines
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --file)
-        file_override="$2"
-        shift 2
-        ;;
-      --follow)
-        follow=1
-        shift
-        ;;
-      --lines)
-        lines="$2"
-        shift 2
-        ;;
-      *)
-        # unknown/positional - ignore
-        shift
-        ;;
-    esac
-  done
-
   local log_file="$LOG_FILE"
+
   if [[ "$dev_mode" -eq 1 ]]; then
     ensure_dev_dirs
     log_file="$DEV_LOG_FILE"
@@ -352,34 +325,11 @@ cmd_logs() {
     ensure_dirs
   fi
 
-  if [[ -n "$file_override" ]]; then
-    log_file="$file_override"
-  fi
-
   if [[ ! -f "$log_file" ]]; then
     echo "Logfile does not exist yet: $log_file"
     exit 1
   fi
-
-  # Permission check
-  if [[ ! -r "$log_file" ]]; then
-    echo "Logfile is not readable: $log_file" >&2
-    exit 2
-  fi
-
-  if [[ "$follow" -eq 1 ]]; then
-    if [[ "$lines" -gt 0 ]]; then
-      tail -n "$lines" -f "$log_file"
-    else
-      tail -n +1 -f "$log_file"
-    fi
-  else
-    if [[ "$lines" -gt 0 ]]; then
-      tail -n "$lines" "$log_file"
-    else
-      tail -n +1 "$log_file"
-    fi
-  fi
+  tail -n +1 -f "$log_file"
 }
 
 usage() {
@@ -445,8 +395,7 @@ main() {
     stop) cmd_stop "$DEV_MODE" ;;
     restart) cmd_restart "$DEV_MODE" ;;
     status) cmd_status "$DEV_MODE" ;;
-    logs) cmd_logs "$DEV_MODE" "$@" ;;
-    debug-resolve) cmd_debug_resolve ;;
+    logs) cmd_logs "$DEV_MODE" ;;
     debug-resolve) cmd_debug_resolve ;;
     help|-h|--help) usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
