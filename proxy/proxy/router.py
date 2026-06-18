@@ -183,6 +183,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     max_queries,
                     path,
                 )
+                record_http_error(
+                    "v1/chat/completions", "5xx", "concurrency_rejected"
+                )
                 raise HTTPException(
                     status_code=503,
                     detail=f"Server overloaded: {srv.active_queries} queries active. Retry later.",
@@ -322,6 +325,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             await client.aclose()
                         except Exception:
                             pass
+
+                        # Instrument 5xx upstream errors
+                        if upstream_status >= 500:
+                            record_http_error(
+                                "v1/chat/completions", "5xx", "upstream_error"
+                            )
 
                         err_headers = _normalize_outgoing_headers(
                             dict(response.headers), buffered=True
