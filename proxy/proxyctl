@@ -153,6 +153,44 @@ cmd_start() {
       local pid=$!
       echo "$pid" > "$PID_FILE"
       echo "Started (PID $pid). Logs: $LOG_FILE"
+
+      # Health polling: wait for /health to return 200 within startup timeout
+      # Read timeout from config if available, otherwise default to 30s
+      local startup_timeout=30
+      if [[ -f "$CONFIG_FILE" ]]; then
+        local cfg_val
+        cfg_val=$(awk -F ':' '/llama_startup_timeout/ { $1=""; sub(/^[: \t]+/, "", $0); print $0; exit }' "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//' ) || true
+        if [[ -n "$cfg_val" ]]; then
+          startup_timeout="$cfg_val"
+        fi
+      fi
+
+      local probe_port="${LLAMA_SERVER_PORT:-8080}"
+      local t=0
+      while true; do
+        # Use python stdlib to probe /health
+        if python - <<PY > /dev/null 2>&1
+import urllib.request, sys
+try:
+    resp=urllib.request.urlopen(f'http://localhost:{probe_port}/health', timeout=2)
+    if resp.getcode()==200:
+        sys.exit(0)
+    else:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+        then
+          echo "Health check passed on port $probe_port"
+          break
+        fi
+        sleep 1
+        t=$((t+1))
+        if [[ $t -ge $startup_timeout ]]; then
+          echo "Health check did not succeed within $startup_timeout seconds"
+          exit 4
+        fi
+      done
     fi
   fi
 }
