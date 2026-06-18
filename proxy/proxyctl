@@ -45,8 +45,22 @@ read_config_start_script() {
 
   # Fallback to scripts/start-proxy.sh
   local proxy_dir
-  proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
+  proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
   echo "$proxy_dir/scripts/start-proxy.sh"
+}
+
+cmd_debug_resolve() {
+  # Print all resolved paths in key=value format for test assertions
+  local start_script
+  start_script=$(read_config_start_script)
+  echo "start_script=$start_script"
+  echo "pid_file=$PID_FILE"
+  echo "log_file=$LOG_FILE"
+  echo "config_file=$CONFIG_FILE"
+  echo "pid_dir=$PID_DIR"
+  echo "log_dir=$LOG_DIR"
+  echo "dev_pid_file=$DEV_PID_FILE"
+  echo "dev_log_file=$DEV_LOG_FILE"
 }
 
 is_running() {
@@ -224,6 +238,7 @@ Commands:
   restart [--dev]      Stop then start
   status [--dev]       Show running status, PID and start time
   logs [--dev]         Tail the proxy log produced by $SCRIPT_NAME
+  debug-resolve        Print resolved paths for tests (start_script, pid_file, log_file, config_file, pid_dir, log_dir)
   help                 Show this message
 
 Environment:
@@ -271,6 +286,7 @@ main() {
     restart) cmd_restart "$DEV_MODE" ;;
     status) cmd_status "$DEV_MODE" ;;
     logs) cmd_logs "$DEV_MODE" ;;
+    debug-resolve) cmd_debug_resolve ;;
     help|-h|--help) usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
   esac
