@@ -103,6 +103,7 @@ def test_start_foreground_runs_and_exits(tmp_path):
     script_dst.chmod(0o755)
 
     env = os.environ.copy()
+    env['XDG_RUNTIME_DIR'] = str(tmp_path / 'runtime')
     env['XDG_STATE_HOME'] = str(tmp_path / 'state')
 
     res = subprocess.run([str(script_dst), 'start', '--foreground'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, timeout=10)
@@ -121,6 +122,7 @@ def test_start_missing_start_script_returns_error(tmp_path):
     script_dst.chmod(0o755)
 
     env = os.environ.copy()
+    env['XDG_RUNTIME_DIR'] = str(tmp_path / 'runtime')
     env['XDG_STATE_HOME'] = str(tmp_path / 'state')
 
     res = subprocess.run([str(script_dst), 'start'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
