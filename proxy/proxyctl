@@ -6,12 +6,12 @@ SCRIPT_NAME="proxyctl"
 # Global flags
 DEV_MODE=0
 
-PID_DIR="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}}/llama-proxy"
+PID_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy"
 PID_FILE="$PID_DIR/proxy.pid"
 DEV_PID_FILE="$PID_DIR/proxy.dev.pid"
-LOG_DIR="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}}/llama-proxy/logs"
+LOG_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy/logs"
 LOG_FILE="$LOG_DIR/proxy.log"
-DEV_LOG_DIR="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}}/llama-proxy-dev/logs"
+DEV_LOG_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy-dev/logs"
 DEV_LOG_FILE="$DEV_LOG_DIR/proxy-dev.log"
 CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.yaml"
 
