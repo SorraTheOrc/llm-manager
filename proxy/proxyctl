@@ -169,7 +169,7 @@ cmd_start() {
       local t=0
       while true; do
         # Use python stdlib to probe /health
-        if python - <<PY > /dev/null 2>&1
+        if python3 - <<PY > /dev/null 2>&1
 import urllib.request, sys
 try:
     resp=urllib.request.urlopen(f'http://127.0.0.1:{probe_port}/health', timeout=2)
