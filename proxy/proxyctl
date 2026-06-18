@@ -43,10 +43,8 @@ read_config_start_script() {
     fi
   fi
 
-  # Fallback to scripts/start-proxy.sh
-  local proxy_dir
-  proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
-  echo "$proxy_dir/scripts/start-proxy.sh"
+  # Fallback to top-level start script
+  echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)/start-llama.sh"
 }
 
 is_running() {
