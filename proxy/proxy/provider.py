@@ -308,29 +308,13 @@ def _get_proxy_to_local():
         except Exception:
             fn_server = None
 
-        # Detect common test monkeypatch patterns and prefer the patched
-        # implementation when possible. If the router-level function was
-        # patched (its __module__ will typically not be 'proxy.router'),
-        # prefer that. Otherwise, if the server-level function was patched,
-        # prefer that. As a final fallback, use the router implementation if
-        # present (this matches historical behavior).
+        # Prefer a server-level patch (monkeypatching proxy.server.proxy_to_local)
+        # if present; otherwise prefer a router-level patch. This order makes
+        # tests that patch server.proxy_to_local succeed while still honoring
+        # tests that patch router.proxy_to_local.
         chosen = None
-        try:
-            router_module = getattr(fn_router, "__module__", None)
-        except Exception:
-            router_module = None
-        try:
-            server_module = getattr(fn_server, "__module__", None)
-        except Exception:
-            server_module = None
-
-        # Router patched in tests (common pattern)
-        if fn_router is not None and router_module != "proxy.router":
-            chosen = fn_router
-        # Server patched in tests
-        elif fn_server is not None and server_module != "proxy.server":
+        if fn_server is not None and fn_server is not fn_router:
             chosen = fn_server
-        # No obvious patch detected — prefer router (original behavior)
         elif fn_router is not None:
             chosen = fn_router
         elif fn_server is not None:
