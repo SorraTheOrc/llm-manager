@@ -23,7 +23,7 @@ def test_start_background_writes_pid_and_health(tmp_path):
 
     start_sh = scripts / 'start-proxy.sh'
     start_sh.write_text(textwrap.dedent(f"""#!/usr/bin/env bash
-python3 - <<PY
+python - <<PY
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
