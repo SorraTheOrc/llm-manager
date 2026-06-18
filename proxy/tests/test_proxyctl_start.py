@@ -54,7 +54,8 @@ PY
     script_dst.chmod(0o755)
 
     env = os.environ.copy()
-    # Use XDG_STATE_HOME so pid/logs are written under tmp_path
+    # Use XDG_RUNTIME_DIR so pid/logs are written under tmp_path (preferred)
+    env['XDG_RUNTIME_DIR'] = str(tmp_path / 'runtime')
     env['XDG_STATE_HOME'] = str(tmp_path / 'state')
     env['LLAMA_SERVER_PORT'] = str(port)
 
