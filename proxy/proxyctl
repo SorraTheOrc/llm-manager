@@ -170,7 +170,7 @@ cmd_start() {
       # Run in background, redirecting output to log file.
       # Start the process in a new session to avoid it being killed when
       # this script exits; capture the background shell PID as the service PID.
-      nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+      setsid bash -c "$start_script" > "$LOG_FILE" 2>&1 < /dev/null &
       local pid=$!
       echo "$pid" > "$PID_FILE"
       echo "Started (PID $pid). Logs: $LOG_FILE"
