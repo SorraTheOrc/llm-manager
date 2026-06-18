@@ -47,7 +47,7 @@ Important: your existing setup uses a container image where `llama-server` is pr
    llama-server --help || true
 
    # Try starting the server with your normal start script to confirm the proxy fallback will work
-   /home/rgardler/projects/llm/start-llama.sh qwen3
+   proxy/scripts/start-proxy.sh qwen3
 
 4) Restart the proxy service and verify (if you use a system service unit you created)
 
@@ -63,7 +63,7 @@ Important: your existing setup uses a container image where `llama-server` is pr
    - Use the container-based fixes (make systemd allow writing to /run/user/$UID/libpod, run service as user, or fix podman/distrobox rootless setup). Those are safer long-term but require more changes.
 
 Notes and troubleshooting
- - If the build step produces a differently-named binary, update `start-llama.sh` or symlink the built binary to `/usr/local/bin/llama-server`.
+ - If the build step produces a differently-named binary, update `proxy/scripts/start-proxy.sh` or symlink the built binary to `/usr/local/bin/llama-server`.
  - GPU builds or ROCm builds require additional dependencies (ROCm libs, drivers). Ensure you have the proper hardware drivers before attempting those builds.
 
 If you want, I can produce a small scripted installer tailored to your OS (Debian/Ubuntu or Fedora) that will build and install the binary automatically. Reply with the target OS and I will add it as a commit and a work item.
