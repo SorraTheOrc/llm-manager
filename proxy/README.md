@@ -733,7 +733,9 @@ Response:
   "active_query": false,
   "model_switch_in_progress": false,
   "current_model": "qwen3",
-  "llama_server_running": true
+  "llama_server_running": true,
+  "available_slots": 2,
+  "total_slots": 4
 }
 ```
 
@@ -745,6 +747,8 @@ Response:
 | `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
 | `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
+| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing).     |
+| `total_slots`             | `int`         | Total number of model-serving slots configured on the llama-server.         |
 
 **Performance:**
 

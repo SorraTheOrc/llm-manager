@@ -315,3 +315,26 @@ async def test_status_request_logged(caplog, transport):
     assert any(
         hasattr(record, "latency_ms") for record in caplog.records
     ), "Expected log record with latency_ms attribute"
+
+
+@pytest.mark.asyncio
+async def test_status_returns_slot_fields(transport):
+    """Response includes available_slots and total_slots (integers)."""
+    from proxy import server as srv_module
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            # When server is running the slots query is attempted (may fail in test)
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get("/llama/local/status")
+
+        assert resp.status_code == 200
+        j = resp.json()
+        assert isinstance(j.get("available_slots"), int)
+        assert isinstance(j.get("total_slots"), int)
+        assert j["available_slots"] >= 0
+        assert j["total_slots"] >= 0

@@ -13,10 +13,14 @@ test.describe('LLama Local Status Endpoint', () => {
     expect(body).toHaveProperty('model_switch_in_progress');
     expect(body).toHaveProperty('current_model');
     expect(body).toHaveProperty('llama_server_running');
+    expect(body).toHaveProperty('available_slots');
+    expect(body).toHaveProperty('total_slots');
 
     expect(typeof body.active_query).toBe('boolean');
     expect(typeof body.model_switch_in_progress).toBe('boolean');
     expect(typeof body.llama_server_running).toBe('boolean');
+    expect(typeof body.available_slots).toBe('number');
+    expect(typeof body.total_slots).toBe('number');
     // current_model can be string or null
     expect(body.current_model === null || typeof body.current_model === 'string').toBe(true);
   });
@@ -65,6 +69,8 @@ test.describe('LLama Local Status Endpoint', () => {
       expect(body).toHaveProperty('active_query');
       expect(body).toHaveProperty('model_switch_in_progress');
       expect(body).toHaveProperty('current_model');
+      expect(body).toHaveProperty('available_slots');
+      expect(body).toHaveProperty('total_slots');
     }
   });
 

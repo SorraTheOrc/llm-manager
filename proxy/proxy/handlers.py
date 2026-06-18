@@ -196,7 +196,13 @@ async def get_llama_local_status():
         {"active_query": bool,
          "model_switch_in_progress": bool,
          "current_model": str | None,
-         "llama_server_running": bool}
+         "llama_server_running": bool,
+         "available_slots": int,
+         "total_slots": int}
+
+    ``available_slots`` and ``total_slots`` reflect the model-serving slot
+    state reported by llama-server's ``/slots`` endpoint. When the server is
+    not running or the query fails both default to 0.
 
     Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
     (seconds, default 1.0).
@@ -251,6 +257,27 @@ async def get_llama_local_status():
     except Exception:
         active = False
 
+    # -- slots query (lightweight, short timeout) -------------------------
+    available_slots = 0
+    total_slots = 0
+    if llama_running:
+        try:
+            server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+            llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+            client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+            slots_url = f"http://localhost:{llama_port}/slots"
+            slots_resp = await asyncio.wait_for(client.get(slots_url), timeout=2.0)
+            if slots_resp.status_code == 200:
+                slots_data = slots_resp.json()
+                if isinstance(slots_data, list):
+                    total_slots = len(slots_data)
+                    available_slots = sum(
+                        1 for s in slots_data if not s.get("is_processing", True)
+                    )
+        except Exception:
+            # slots query is best-effort; default to 0 on failure
+            pass
+
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
     logger.info(
@@ -261,6 +288,8 @@ async def get_llama_local_status():
             "active_query": active,
             "model_switch_in_progress": switch_in_progress,
             "current_model": cm,
+            "available_slots": available_slots,
+            "total_slots": total_slots,
         },
     )
 
@@ -269,6 +298,8 @@ async def get_llama_local_status():
         "model_switch_in_progress": bool(switch_in_progress),
         "current_model": cm,
         "llama_server_running": bool(llama_running),
+        "available_slots": available_slots,
+        "total_slots": total_slots,
     }
 
 
