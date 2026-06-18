@@ -64,31 +64,12 @@ cmd_debug_resolve() {
   echo "dev_log_file=$DEV_LOG_FILE"
 }
 
-pid_is_alive() {
-  # Return 0 if PID is alive and not a zombie, 1 otherwise
-  local _p="$1"
-  if [[ -z "$_p" ]]; then
-    return 1
-  fi
-  if kill -0 "$_p" 2>/dev/null; then
-    # Check for zombie status
-    local _st
-    _st=$(ps -p "$_p" -o stat= 2>/dev/null || true)
-    if [[ -n "$_st" && "$_st" == *Z* ]]; then
-      # Process is zombie – treat as not alive
-      return 1
-    fi
-    return 0
-  fi
-  return 1
-}
-
 is_running() {
   local check_pid_file="${1:-$PID_FILE}"
   if [[ -f "$check_pid_file" ]]; then
     local pid
     pid=$(cat "$check_pid_file" 2>/dev/null || true)
-    if [[ -n "$pid" ]] && pid_is_alive "$pid"; then
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       printf '%s' "$pid"
       return 0
     fi
@@ -230,7 +211,7 @@ cmd_stop() {
   kill -TERM "$pid" 2>/dev/null || true
   # wait up to 10s
   local t=0
-  while pid_is_alive "$pid"; do
+  while kill -0 "$pid" 2>/dev/null; do
     sleep 1
     t=$((t+1))
     if [[ $t -ge 10 ]]; then
@@ -238,11 +219,11 @@ cmd_stop() {
       kill -KILL "$pid" 2>/dev/null || true
       # give a short grace for SIGKILL
       local t2=0
-      while pid_is_alive "$pid" && [[ $t2 -lt 2 ]]; do
+      while kill -0 "$pid" 2>/dev/null && [[ $t2 -lt 2 ]]; do
         sleep 1
         t2=$((t2+1))
       done
-      if pid_is_alive "$pid"; then
+      if kill -0 "$pid" 2>/dev/null; then
         echo "Failed to kill process" >&2
         rm -f "$pid_file"
         exit 3
