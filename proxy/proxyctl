@@ -5,7 +5,6 @@ SCRIPT_NAME="proxyctl"
 
 # Global flags
 DEV_MODE=0
-FOREGROUND=0
 
 PID_DIR="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}}/llama-proxy"
 PID_FILE="$PID_DIR/proxy.pid"
@@ -79,7 +78,6 @@ is_running() {
 
 cmd_start() {
   local dev_mode="$1"
-  local foreground="${2:-0}"
   local start_script
 
   if [[ "$dev_mode" -eq 1 ]]; then
@@ -142,18 +140,11 @@ cmd_start() {
     fi
 
     echo "Starting proxy using: $start_script"
-    if [[ "$foreground" -eq 1 ]]; then
-      echo "Running start script in foreground: $start_script"
-      bash "$start_script"
-      local rc=$?
-      exit $rc
-    else
-      # Run in background, redirecting output to log file.
-      nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
-      local pid=$!
-      echo "$pid" > "$PID_FILE"
-      echo "Started (PID $pid). Logs: $LOG_FILE"
-    fi
+    # Run in background, redirecting output to log file.
+    nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    echo "Started (PID $pid). Logs: $LOG_FILE"
   fi
 }
 
@@ -241,9 +232,8 @@ $SCRIPT_NAME - manage local llama proxy
 Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
-  start [--dev] [--foreground]  Start the proxy (uses config or start-llama.sh)
+  start [--dev]        Start the proxy (uses config or start-llama.sh)
                        --dev  Run in development mode (port 8001, debug logging, auto-reload)
-                       --foreground  Run the start script in the foreground (stream output)
   stop [--dev]         Stop the running proxy (SIGTERM then SIGKILL)
   restart [--dev]      Stop then start
   status [--dev]       Show running status, PID and start time
@@ -279,13 +269,11 @@ main() {
   cmd="$1"
   shift || true
 
-  # Check for --dev and --foreground flags in remaining arguments
+  # Check for --dev flag in remaining arguments
   local dev_args=()
   for arg in "$@"; do
     if [[ "$arg" == "--dev" ]]; then
       DEV_MODE=1
-    elif [[ "$arg" == "--foreground" ]]; then
-      FOREGROUND=1
     else
       dev_args+=("$arg")
     fi
@@ -293,7 +281,7 @@ main() {
   set -- "${dev_args[@]+${dev_args[@]}}"
 
   case "$cmd" in
-    start) cmd_start "$DEV_MODE" "$FOREGROUND" ;;
+    start) cmd_start "$DEV_MODE" ;;
     stop) cmd_stop "$DEV_MODE" ;;
     restart) cmd_restart "$DEV_MODE" ;;
     status) cmd_status "$DEV_MODE" ;;
