@@ -285,8 +285,12 @@ def _get_proxy_to_remote():
 
 
 def _get_proxy_to_local():
-    """Lazily import proxy_to_local."""
-    from proxy.router import proxy_to_local
+    """Lazily import proxy_to_local.
+
+    Prefer importing via proxy.server so that any monkeypatches applied to
+    ``proxy.server.proxy_to_local`` (as done in unit tests) are respected.
+    """
+    from proxy.server import proxy_to_local
     return proxy_to_local
 
 
