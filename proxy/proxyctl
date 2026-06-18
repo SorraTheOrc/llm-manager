@@ -172,7 +172,7 @@ cmd_start() {
         if python - <<PY > /dev/null 2>&1
 import urllib.request, sys
 try:
-    resp=urllib.request.urlopen(f'http://localhost:{probe_port}/health', timeout=2)
+    resp=urllib.request.urlopen(f'http://127.0.0.1:{probe_port}/health', timeout=2)
     if resp.getcode()==200:
         sys.exit(0)
     else:
