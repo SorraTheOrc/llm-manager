@@ -244,6 +244,6 @@ server:
   - Qwen3
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
-  llama_start_script: /home/rgardler/projects/llm/start-llama.sh
+  llama_start_script: proxy/scripts/start-proxy.sh
   llama_startup_timeout: 300
   port: 8000
