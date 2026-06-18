@@ -285,43 +285,13 @@ def _get_proxy_to_remote():
 
 
 def _get_proxy_to_local():
-    """Return an async callable that dispatches to the current proxy_to_local.
+    """Lazily import proxy_to_local.
 
-    We resolve the implementation at call time (dynamic import) so that
-    unit tests that monkeypatch either ``proxy.router.proxy_to_local`` or
-    ``proxy.server.proxy_to_local`` are both honored. This avoids fragile
-    import-time binding and makes the provider fallback logic more robust
-    in test environments.
+    Prefer importing via proxy.server so that any monkeypatches applied to
+    ``proxy.server.proxy_to_local`` (as done in unit tests) are respected.
     """
-    async def _call(request, path):
-        # Dynamic import to pick up runtime monkeypatches
-        try:
-            import importlib
-            router_mod = importlib.import_module("proxy.router")
-            fn_router = getattr(router_mod, "proxy_to_local", None)
-        except Exception:
-            fn_router = None
-        try:
-            import importlib as _importlib2
-            server_mod = _importlib2.import_module("proxy.server")
-            fn_server = getattr(server_mod, "proxy_to_local", None)
-        except Exception:
-            fn_server = None
-
-        # Prefer a router-level patch (common test pattern); otherwise use server-level
-        chosen = None
-        if fn_router is not None and fn_router is not fn_server:
-            chosen = fn_router
-        elif fn_server is not None:
-            chosen = fn_server
-        elif fn_router is not None:
-            chosen = fn_router
-        else:
-            raise RuntimeError("proxy_to_local function is not available")
-
-        return await chosen(request, path)
-
-    return _call
+    from proxy.server import proxy_to_local
+    return proxy_to_local
 
 
 def _parse_slot_exhaustion(response):
