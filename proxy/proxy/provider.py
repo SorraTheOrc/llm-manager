@@ -308,14 +308,17 @@ def _get_proxy_to_local():
         except Exception:
             fn_server = None
 
-        # Prefer a router-level patch (common test pattern); otherwise use server-level
+        # Prefer a server-level patch (monkeypatching proxy.server.proxy_to_local)
+        # if present; otherwise prefer a router-level patch. This order makes
+        # tests that patch server.proxy_to_local succeed while still honoring
+        # tests that patch router.proxy_to_local.
         chosen = None
-        if fn_router is not None and fn_router is not fn_server:
-            chosen = fn_router
-        elif fn_server is not None:
+        if fn_server is not None and fn_server is not fn_router:
             chosen = fn_server
         elif fn_router is not None:
             chosen = fn_router
+        elif fn_server is not None:
+            chosen = fn_server
         else:
             raise RuntimeError("proxy_to_local function is not available")
 
