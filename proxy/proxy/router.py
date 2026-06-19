@@ -51,7 +51,10 @@ from proxy.session import (  # noqa: E402
 from proxy.observability import (  # noqa: E402
     _record_backend_signal,
 )
-from proxy.metrics import record_http_error  # noqa: E402
+import proxy.metrics as metrics  # noqa: E402
+# legacy alias for convenience
+record_http_error = metrics.record_http_error
+
 from proxy.utils import (  # noqa: E402
     _extract_assistant_content_from_sse,
     _extract_delta_text_from_sse_chunk,
@@ -504,9 +507,32 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     delta_text = ""
 
                                 # Track chunk for token-rate guardrail (rolling window)
-                                chunk_history.append(
-                                    (time.monotonic(), chunk_text)
-                                )
+                                now_ts = time.monotonic()
+                                chunk_history.append((now_ts, chunk_text))
+
+                                # Emit token-rate metrics (best-effort) — gauge + histogram per-session
+                                try:
+                                    # Only emit if prometheus metrics enabled and we have a session_id
+                                    if getattr(metrics, '_enabled', False) and session_id:
+                                        # Compute instantaneous rate from last two chunks
+                                        if len(chunk_history) >= 2:
+                                            t_prev, _ = chunk_history[-2]
+                                            t_curr, _ = chunk_history[-1]
+                                            elapsed = t_curr - t_prev
+                                            if elapsed > 0:
+                                                # chunk_tokens computed earlier represents tokens in this raw chunk
+                                                try:
+                                                    token_rate = float(chunk_tokens) / float(elapsed)
+                                                except Exception:
+                                                    token_rate = 0.0
+                                                try:
+                                                    # Use session_id label to scope metrics
+                                                    metrics.llama_token_rate_gauge.labels(session_id=session_id).set(token_rate)
+                                                    metrics.llama_token_rate_histogram.labels(session_id=session_id).observe(token_rate)
+                                                except Exception:
+                                                    pass
+                                except Exception:
+                                    pass
 
                                 # Inspect SSE-style 'data:' lines for finish indicators
                                 try:

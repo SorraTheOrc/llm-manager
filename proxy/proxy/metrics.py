@@ -20,12 +20,13 @@ from typing import Iterable, Optional
 
 _enabled = True
 try:
-    from prometheus_client import Gauge, Counter, generate_latest, CONTENT_TYPE_LATEST
+    from prometheus_client import Gauge, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
     # Use the default registry — simple and compatible with Prometheus exposition
 except Exception:  # pragma: no cover - fallback path when dependency missing
     _enabled = False
     Gauge = None
     Counter = None
+    Histogram = None
     generate_latest = None
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
 
@@ -35,6 +36,9 @@ llama_model_rss_bytes = None
 llama_model_load_events_total = None
 llama_models_loaded = None
 proxy_http_errors_total = None
+# Token-rate observation metrics
+llama_token_rate_gauge = None
+llama_token_rate_histogram = None
 
 if _enabled:
     try:
@@ -54,6 +58,13 @@ if _enabled:
             'proxy_http_errors_total',
             'Total HTTP errors by endpoint, status class, and reason',
             ['endpoint', 'status', 'reason']
+        )
+        # Token-rate metrics: gauge for current tokens/sec, histogram for distribution
+        llama_token_rate_gauge = Gauge(
+            'llama_token_rate_gauge', 'Observed token generation rate (tokens/sec) per session', ['session_id']
+        )
+        llama_token_rate_histogram = Histogram(
+            'llama_token_rate_histogram', 'Histogram of token generation rates (tokens/sec) per session', ['session_id']
         )
     except Exception:  # pragma: no cover - defensive
         _enabled = False
