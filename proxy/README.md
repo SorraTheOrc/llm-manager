@@ -993,9 +993,25 @@ Guardrails stop runaway responses and invalidate sessions when configured:
 - `server.session_guardrail_repetition_min_repeats` — repetition count to trigger cutoff
 - `server.session_guardrail_invalidate_on_cutoff` — invalidate session after runtime/token cutoff
 - `server.session_guardrail_invalidate_on_repetition` — invalidate session after repetition cutoff
+- `server.session_guardrail_max_token_rate` — token-rate guardrail threshold (tokens/second). Default `0` = disabled.
+- `server.session_guardrail_token_rate_window_seconds` — rolling window (seconds) used to compute sustained tokens/sec.
 
 When a guardrail triggers, `/admin/metrics` exposes `guardrail_metrics` with the
 cutoff reason and invalidation counters for observability.
+
+Token-rate guardrail calibration and notes:
+- Disabled by default. Operators must explicitly enable it by setting `server.session_guardrail_max_token_rate`.
+- Measurement is best-effort: token counting uses the existing `count_text_tokens` utility and SSE chunk boundaries, so rates are approximate.
+- The guardrail requires a sustained violation over the full rolling window (`session_guardrail_token_rate_window_seconds`) to avoid cutting short legitimate short bursts.
+- To calibrate a threshold:
+  1. Enable the Prometheus token-rate metrics (see below) in a non-enforcing, observability-only run — start with a very high threshold or deploy in a canary environment.
+  2. Observe `llama_token_rate_gauge{session_id="..."}` (instantaneous gauge) or compute a percentile from `llama_token_rate_histogram` over representative traffic, for example:
+     ```promql
+     histogram_quantile(0.95, sum(rate(llama_token_rate_histogram_bucket[5m])) by (le))
+     ```
+  3. Choose a threshold comfortably above your normal operating percentile (e.g., above 99th percentile of normal traffic), and test in canary before broad rollout.
+
+Note: token-rate measurement is approximate and intended as a pragmatic guardrail; prefer conservative thresholds and monitor metrics closely after enabling.
 
 ### Slot persistence (KV save/restore)
 
@@ -1042,6 +1058,23 @@ Available metrics (best-effort):
 - `llama_model_load_events_total{model="...",event="load|unload"}` (counter) — model lifecycle events.
 - `llama_models_loaded` (gauge) — number of loaded models reported by router-mode.
 - `proxy_http_errors_total{endpoint="...",status="...",reason="..."}` (counter) — HTTP errors by endpoint, status class, and reason. Incremented at each 5xx response from `proxy_to_local`. Reasons include: `backend_error`, `backend_unavailable`, `self_healing`, and `slot_exhaustion`. See [5xx Error Runbook](docs/runbook-5xx.md) for investigation guidance.
+
+Token-rate observability metrics (exposed on `/metrics`):
+
+- `llama_token_rate_gauge{session_id="..."}` (gauge) — Best-effort instantaneous tokens/second observed for an active session. Useful for short-term spikes and live dashboards.
+- `llama_token_rate_histogram{session_id="..."}` (histogram) — Bucketed distribution of observed token rates per session. Use Prometheus `histogram_quantile()` over a reasonable window (e.g., 5m) to compute operational percentiles for calibration.
+
+Example queries:
+- 95th percentile token-rate across all sessions:
+```promql
+histogram_quantile(0.95, sum(rate(llama_token_rate_histogram_bucket[5m])) by (le))
+```
+- Current token-rate gauge for a specific session:
+```promql
+llama_token_rate_gauge{session_id="<session-id>"}
+```
+
+These metrics are best-effort and will no-op when the `prometheus_client` library is not available. They are scoped per-session to help identify high-rate sessions that might indicate a runaway generator.
 
 Example Prometheus scrape config:
 
