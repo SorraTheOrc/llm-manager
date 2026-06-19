@@ -1,4 +1,4 @@
-FROM docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7rc-rocwmma
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4
 
 WORKDIR /opt
 
