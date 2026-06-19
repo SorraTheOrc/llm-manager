@@ -3,9 +3,10 @@ FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4
 WORKDIR /opt
 
 # Install build dependencies (package manager varies by base image)
-RUN (command -v dnf && dnf -y install git cmake make gcc gcc-c++ ninja-build && dnf clean all) || \
+RUN (command -v apt-get && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential cmake ninja-build ca-certificates && apt-get clean) || \
+    (command -v dnf && dnf -y install git cmake make gcc gcc-c++ ninja-build && dnf clean all) || \
     (command -v microdnf && microdnf -y install git cmake make gcc gcc-c++ ninja-build && microdnf clean all) || \
-    (echo "No dnf/microdnf found in base image; check base OS" && exit 1)
+    (echo "No supported package manager found in base image; check base OS" && exit 1)
 
 RUN git clone https://github.com/ggml-org/llama.cpp.git
 
