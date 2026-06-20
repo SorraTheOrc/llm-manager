@@ -15,7 +15,79 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
--- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo.
+- **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
+-- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
+
+## Host-first deployment
+
+The repository has transitioned from container-based (distrobox) llama-server hosting to a host-first startup model. Systemd unit files are no longer distributed from the repository, but example units are provided in `docs/systemd/` to help operators deploy and supervise the services.
+
+### Host-fallback mechanism
+
+The proxy implements a host-fallback mechanism controlled by the `llama_allow_host_fallback` configuration option in `config.yaml`. When enabled, the proxy attempts to start llama-server directly on the host via `start-llama.sh` before falling back to distrobox.
+
+**Configuration:**
+```yaml
+server:
+  llama_allow_host_fallback: true  # Enable host-first startup
+  # llama_allow_host_fallback: false  # Use distrobox only (default fallback)
+```
+
+**Startup behavior (from `proxy/proxy/lifecycle.py`):**
+1. If `llama_allow_host_fallback` is `true`, the proxy first probes for an existing llama-server process on the expected port
+2. If no existing process is found, it attempts to start llama-server via `start-llama.sh` on the host
+3. If host start fails, it falls back to starting via distrobox (if available)
+4. If both fail, the proxy reports an error
+
+To completely disable host-fallback and use distrobox only:
+```yaml
+server:
+  llama_allow_host_fallback: false
+```
+
+### Systemd service units
+
+Example systemd unit files are provided in `docs/systemd/`:
+- `docs/systemd/llama-server.service` — llama-server service unit
+- `docs/systemd/llama-proxy.service` — proxy server service unit
+
+Both units document two deployment approaches:
+- **User service** (recommended) — runs under the operator's login session, uses `~/.config/systemd/user/`
+- **System service** — runs independently of user sessions, uses `/etc/systemd/system/`
+
+See the individual unit files for setup commands, configuration, and verification steps.
+
+### Log paths
+
+The proxy distinguishes between development and production log paths:
+
+| Mode | Proxy logs | llama-server logs |
+|------|------------|-------------------|
+| Development | `./logs/proxy.log` | `./logs/llama-server.log` |
+| Production (user service) | `$XDG_STATE_HOME/llama-proxy/logs/proxy.log` | `$XDG_STATE_HOME/llama-server/logs/llama-server.log` |
+| Production (system service) | `/var/log/llama-proxy/proxy.log` | `/var/log/llama-server/llama-server.log` |
+
+### Verification
+
+Verify services are running after deployment:
+
+```bash
+# Check llama-server health
+curl http://localhost:8080/health
+
+# Check proxy health
+curl http://localhost:8000/health
+
+# View systemd logs (user service)
+journalctl --user -u llama-server.service -f
+journalctl --user -u llama-proxy.service -f
+
+# View systemd logs (system service)
+sudo journalctl -u llama-server.service -f
+sudo journalctl -u llama-proxy.service -f
+```
+
+## Requirements
 
 ## Requirements
 

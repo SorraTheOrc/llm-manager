@@ -57,8 +57,12 @@ Run: scripts/build-llama-test.sh --dry-run --json
 
 - Run scripts/verify-upgrade.sh --dry-run --json to review the planned verification steps
 - Run scripts/verify-upgrade.sh --json to perform health and test completion requests against the running llama-server
+- Verify llama-server health: `curl http://localhost:8080/health`
+- Verify proxy health: `curl http://localhost:8000/health`
+- If using systemd services, check status: `systemctl --user status llama-server.service llama-proxy.service` or `sudo systemctl status llama-server.service llama-proxy.service`
 - Rollback: scripts/rollback-rocm.sh --dry-run --json
   - If a backup of /etc/apt/sources.list.d/rocm.list exists (.bak) run scripts/rollback-rocm.sh (as root) to restore it
+- **Note**: The host-first deployment model (via `start-llama.sh`) is documented in `docs/systemd/` and `proxy/README.md` → "Host-first deployment" section. Ensure systemd units are updated after ROCm upgrades if llama-server binaries change location.
 
 8) Monitoring notes
 
@@ -68,4 +72,7 @@ Run: scripts/build-llama-test.sh --dry-run --json
 
 - Containerfile — suggested FROM update to rocm/dev-ubuntu-24.04:7.2.4
 - start-llama.sh, install_proxy.sh — reboot/restart considerations
+- docs/systemd/ — systemd unit files for llama-server and proxy
+- proxy/README.md — "Host-first deployment" section with host-fallback configuration
+- HOST_INSTALL.md — host installation instructions for llama-server
 

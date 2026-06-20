@@ -1,0 +1,154 @@
+# llama-proxy.service — Host-first deployment systemd unit
+
+## Overview
+
+This systemd unit file runs the LLM proxy server (uvicorn-based) for the LLM
+proxy stack. It is designed to be deployed as a **user service** (recommended),
+though a system-service variant is documented below.
+
+## User Service (Recommended)
+
+This is the recommended deployment approach for single-operator setups. It
+keeps the proxy process under the operator's login session, using the proxy's
+built-in virtual environment.
+
+**File location**: `~/.config/systemd/user/llama-proxy.service`
+
+```ini
+[Unit]
+Description=LLM proxy server (OpenAI-compatible API)
+After=network.target llama-server.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rgardler/projects/llm/proxy
+ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
+Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml
+Environment=LLAMA_START_SCRIPT=/home/rgardler/projects/llm/start-llama.sh
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/home/rgardler/.local/state/llama-proxy/logs/proxy.log
+StandardError=append:/home/rgardler/.local/state/llama-proxy/logs/proxy.log
+
+# Resource limits
+MemoryMax=4G
+CPUQuota=100%
+
+[Install]
+WantedBy=default.target
+```
+
+### Setup commands (user service)
+
+```bash
+# Create log directory
+mkdir -p ~/.local/state/llama-proxy/logs
+
+# Enable and start the service
+systemctl --user daemon-reload
+systemctl --user enable llama-proxy.service
+systemctl --user start llama-proxy.service
+
+# Check status
+systemctl --user status llama-proxy.service
+
+# View logs
+journalctl --user -u llama-proxy.service -f
+```
+
+## System Service (Alternative)
+
+Use this approach only if the proxy must survive logout or run independently
+of any user session. This requires root or sudo access.
+
+**File location**: `/etc/systemd/system/llama-proxy.service`
+
+```ini
+[Unit]
+Description=LLM proxy server (OpenAI-compatible API)
+After=network.target llama-server.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=rgardler
+Group=rgardler
+WorkingDirectory=/home/rgardler/projects/llm/proxy
+ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
+Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml
+Environment=LLAMA_START_SCRIPT=/home/rgardler/projects/llm/start-llama.sh
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/var/log/llama-proxy/proxy.log
+StandardError=append:/var/log/llama-proxy/proxy.log
+
+MemoryMax=4G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Setup commands (system service)
+
+```bash
+# Create log directory
+sudo mkdir -p /var/log/llama-proxy
+sudo chown rgardler:rgardler /var/log/llama-proxy
+
+# Install the unit
+sudo cp llama-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable llama-proxy.service
+sudo systemctl start llama-proxy.service
+
+# Check status
+sudo systemctl status llama-proxy.service
+
+# View logs
+sudo journalctl -u llama-proxy.service -f
+```
+
+## Verification
+
+Regardless of deployment approach, verify the proxy is running:
+
+```bash
+# Check health endpoint
+curl http://localhost:8000/health
+
+# Expected response:
+# {
+#   "status": "healthy",
+#   "ready": true,
+#   "current_model": "gemma4",
+#   "llama_server_running": true,
+#   "backend_signals": { ... }
+# }
+
+# Check loaded models
+curl http://localhost:8000/v1/models
+
+# Check proxy logs
+tail -f /home/rgardler/.local/state/llama-proxy/logs/proxy.log
+# or for system service:
+# sudo tail -f /var/log/llama-proxy/proxy.log
+```
+
+## Log paths
+
+- **User service**: `$XDG_STATE_HOME/llama-proxy/logs/proxy.log` (typically `~/.local/state/llama-proxy/logs/proxy.log`)
+- **System service**: `/var/log/llama-proxy/proxy.log`
+
+## Cross-references
+
+- See also: `docs/systemd/llama-server.service` for the llama-server systemd unit.
+- See also: `proxy/README.md` → "Host-first deployment" section.
+- See also: `HOST_INSTALL.md` for llama-server host installation instructions.
