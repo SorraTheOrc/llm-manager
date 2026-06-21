@@ -970,7 +970,11 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            # Router mode: ensure server process is running and models loaded
            if router_mode:
                if srv.llama_process is None or srv.llama_process.poll() is not None:
-                   srv.llama_process = srv.start_llama_server(None)
+                   try:
+                       srv.llama_process = srv.start_llama_server(None, prefer_distrobox=True)
+                   except TypeError:
+                       # Backwards-compatible call for older test monkeypatches
+                       srv.llama_process = srv.start_llama_server(None)
 
                    if srv.llama_process is None:
                        srv.logger.error("start_llama_server failed to spawn router process")
@@ -1056,7 +1060,10 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
            # Attempt host-first start when configured; start_llama_server will
            # try host first and fall back to distrobox if host spawn fails.
-           srv.llama_process = srv.start_llama_server(llama_model)
+           try:
+               srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=True)
+           except TypeError:
+               srv.llama_process = srv.start_llama_server(llama_model)
 
            # If starting the process failed immediately (start_llama_server returns None),
            # fail fast instead of waiting the full timeout. start_llama_server already
