@@ -1,0 +1,136 @@
+{
+  "gaps": [
+    {
+      "topic": "[sources/SRC-2026-06-20-001",
+      "mentionedBy": [
+        "concepts/accelerator-performance-tuning",
+        "concepts/containerized-ai-workflows",
+        "concepts/gpu-layer-offloading",
+        "concepts/graphics-translation-table-gtt",
+        "concepts/memory-mapping-bypass",
+        "concepts/unified-memory-architecture-uma",
+        "entities/amd-ryzen-ai-max-395",
+        "entities/distrobox",
+        "entities/gmktec-evo-x2",
+        "entities/hipblaslt",
+        "entities/kyuz0",
+        "entities/llamacpp",
+        "entities/mainline-ppa",
+        "entities/podman",
+        "entities/rocm-7-rc",
+        "entities/rocwmma",
+        "entities/thebloke",
+        "entities/tuned"
+      ]
+    },
+    {
+      "topic": "gmktec-evo-x2",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "amd-ryzen-ai-max-395",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "rocm-7-rc",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "rocwmma",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "hipblaslt",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "podman",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "distrobox",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "llamacpp",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "kyuz0",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "thebloke",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "mainline-ppa",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "tuned",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "unified-memory-architecture-uma",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "graphics-translation-table-gtt",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "containerized-ai-workflows",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "gpu-layer-offloading",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "memory-mapping-bypass",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    },
+    {
+      "topic": "accelerator-performance-tuning",
+      "mentionedBy": [
+        "sources/SRC-2026-06-20-001"
+      ]
+    }
+  ],
+  "generated": "2026-06-20T12:37:37.924Z"
+}

@@ -1,0 +1,8 @@
+{"timestamp":"2026-06-20T12:21:43.372Z","kind":"bootstrap","topic":"LLM Self Hosting","mode":"personal"}
+{"timestamp":"2026-06-20T12:26:06.058Z","kind":"capture","source_id":"SRC-2026-06-20-001","url":"https://github.com/pablo-ross/strix-halo-gmktec-evo-x2/blob/main/ROADMAP.md","format":"web"}
+{"timestamp":"2026-06-20T12:27:38.536Z","kind":"ingest","source_id":"SRC-2026-06-20-001","entities_created":12,"concepts_created":6,"contradictions":0,"background":true}
+{"timestamp":"2026-06-20T12:37:37.924Z","kind":"lint","orphans":18,"missing_pages":36,"contradictions":0,"auto_fix":false}
+{"timestamp":"2026-06-20T13:22:07.730Z","kind":"observe","slug":"obs-2026-06-20-host-first-systemd-documentation-implemented","title":"Host-first systemd documentation implemented","relevance":"high"}
+{"timestamp":"2026-06-21T12:28:26.574Z","kind":"observe","slug":"obs-2026-06-21-effort-estimate-applied-to-lp-0mqnqur7k005gdp6","title":"Effort estimate applied to LP-0MQNQUR7K005GDP6","relevance":"medium"}
+{"timestamp":"2026-06-21T13:44:34.724Z","kind":"observe","slug":"obs-2026-06-21-plan-remove-anthropic-openai-providers-lp-0mqnqur7k005gdp6","title":"Plan: remove anthropic & openai providers (LP-0MQNQUR7K005GDP6)","relevance":"high"}
+{"timestamp":"2026-06-21T17:36:41.478Z","kind":"observe","slug":"obs-2026-06-21-intake-host-first-llama-server-startup-work-item-created","title":"Intake: Host-first llama-server startup work item created","relevance":"high"}
