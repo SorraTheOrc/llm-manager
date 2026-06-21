@@ -720,6 +720,14 @@ python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
 # Development (with auto-reload and DEBUG logging)
 LLAMA_PROXY_DEV=1 python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
 ```
+
+Note on start-proxy.sh hardening
+
+The bundled `proxy/scripts/start-proxy.sh` script now prefers the virtualenv Python interpreter (`.venv/bin/python3`) when available, falls back to the system `python3`, and will set `PYTHONPATH` to the repository root if it is not already set to avoid import errors when running from the repository checkout.
+
+Before launching the server the script also checks whether the selected port (default `8000`, or overridden with `--port`) is already in use on the local host. If the port is occupied the script exits with a helpful message indicating the port and suggesting `proxyctl start --dev` or running with a different `--port` value.
+
+This makes manual invocations of the proxy more robust across developer environments and reduces confusing import or bind errors when starting the server directly.
 ```
 
 **Production:** Run the proxy under your platform's service manager or keep it as a manually started process:
