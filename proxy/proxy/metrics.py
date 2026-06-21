@@ -18,17 +18,24 @@ functions are no-ops and generate_metrics() returns an explanatory payload.
 
 from typing import Iterable, Optional
 
-_enabled = True
+_enabled = False
+Gauge = None
+Counter = None
+Histogram = None
+generate_latest = None
+CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
 try:
-    from prometheus_client import Gauge, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-    # Use the default registry — simple and compatible with Prometheus exposition
-except Exception:  # pragma: no cover - fallback path when dependency missing
+    import prometheus_client as _pc
+    Gauge = getattr(_pc, 'Gauge', None)
+    Counter = getattr(_pc, 'Counter', None)
+    Histogram = getattr(_pc, 'Histogram', None)
+    generate_latest = getattr(_pc, 'generate_latest', None)
+    CONTENT_TYPE_LATEST = getattr(_pc, 'CONTENT_TYPE_LATEST', CONTENT_TYPE_LATEST)
+    # Consider metrics enabled when we can create basic metrics
+    if Gauge is not None and Counter is not None and generate_latest is not None:
+        _enabled = True
+except Exception:
     _enabled = False
-    Gauge = None
-    Counter = None
-    Histogram = None
-    generate_latest = None
-    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
 
 # Metric objects (initialized only if prometheus_client is available)
 llama_process_rss_bytes = None
@@ -63,9 +70,16 @@ if _enabled:
         llama_token_rate_gauge = Gauge(
             'llama_token_rate_gauge', 'Observed token generation rate (tokens/sec) per session', ['session_id']
         )
-        llama_token_rate_histogram = Histogram(
-            'llama_token_rate_histogram', 'Histogram of token generation rates (tokens/sec) per session', ['session_id']
-        )
+        if Histogram is not None:
+            try:
+                llama_token_rate_histogram = Histogram(
+                    'llama_token_rate_histogram', 'Histogram of token generation rates (tokens/sec) per session', ['session_id']
+                )
+            except Exception:
+                # If histogram creation fails, leave it as None but keep metrics enabled
+                llama_token_rate_histogram = None
+        else:
+            llama_token_rate_histogram = None
     except Exception:  # pragma: no cover - defensive
         _enabled = False
 

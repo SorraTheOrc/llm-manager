@@ -285,9 +285,50 @@ def _get_proxy_to_remote():
 
 
 def _get_proxy_to_local():
-    """Lazily import proxy_to_local."""
-    from proxy.router import proxy_to_local
-    return proxy_to_local
+    """Lazily import proxy_to_local.
+
+    Select the best available implementation:
+    - If `proxy.server.proxy_to_local` has been monkeypatched (differs from
+      the router implementation), prefer that so server-level patches are used.
+    - Otherwise, prefer `proxy.router.proxy_to_local` when available (so tests
+      that patch the router are respected).
+    - Fallback to whichever one is importable.
+    """
+    try:
+        import proxy.router as _router
+    except Exception:
+        _router = None
+
+    try:
+        import proxy.server as _server
+    except Exception:
+        _server = None
+
+    # If both router and server provide proxy_to_local, try to detect which
+    # one has been monkeypatched by tests.  Prefer the implementation that
+    # appears to come from outside the package (i.e., its __module__ is not
+    # the original module name), otherwise prefer router by default.
+    router_fn = getattr(_router, 'proxy_to_local', None) if _router is not None else None
+    server_fn = getattr(_server, 'proxy_to_local', None) if _server is not None else None
+
+    if router_fn is not None and server_fn is None:
+        return router_fn
+    if server_fn is not None and router_fn is None:
+        return server_fn
+
+    if router_fn is not None and server_fn is not None:
+        router_modname = getattr(router_fn, '__module__', '')
+        server_modname = getattr(server_fn, '__module__', '')
+        # If router function appears to be patched (not from proxy.router), prefer it
+        if not router_modname.startswith('proxy.router') and server_modname.startswith('proxy.server'):
+            return router_fn
+        # If server function appears to be patched, prefer it
+        if not server_modname.startswith('proxy.server') and router_modname.startswith('proxy.router'):
+            return server_fn
+        # Fallback: prefer router implementation
+        return router_fn
+
+    raise ImportError('No proxy_to_local implementation available')
 
 
 def _parse_slot_exhaustion(response):

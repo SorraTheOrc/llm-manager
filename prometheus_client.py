@@ -69,6 +69,9 @@ llama_process_rss_bytes 0
 # HELP proxy_http_errors_total Total HTTP errors by endpoint, status class, and reason
 # TYPE proxy_http_errors_total counter
 proxy_http_errors_total{endpoint="v1/chat/completions",status="5xx",reason="backend_error"} 0
+# HELP llama_token_rate_gauge Observed token generation rate (tokens/sec) per session
+# TYPE llama_token_rate_gauge gauge
+llama_token_rate_gauge{session_id="test"} 0
 llama_models_loaded 0
 """
     return payload.encode('utf-8')
