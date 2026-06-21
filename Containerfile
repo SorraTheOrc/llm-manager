@@ -26,6 +26,9 @@ RUN cmake -S . -B build \
       -DGGML_HIP=ON \
       -DAMDGPU_TARGETS=gfx1151 \
       -DGGML_HIP_ROCWMMA_FATTN=ON \
-      -DLLAMA_OPENSSL=ON && \
+      -DLLAMA_OPENSSL=ON \
+      -Dhipblas_DIR=/opt/rocm-7.2.4/lib/cmake/hipblas \
+      -Drocblas_DIR=/opt/rocm-7.2.4/lib/cmake/rocblas \
+      -DCMAKE_PREFIX_PATH=/opt/rocm-7.2.4/lib/cmake:/opt/rocm-7.2.4 && \
     cmake --build build --config Release -j"$(nproc)" && \
     ln -sf /opt/llama.cpp/build/bin/* /usr/local/bin/
