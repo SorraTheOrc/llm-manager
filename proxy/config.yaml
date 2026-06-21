@@ -202,7 +202,9 @@ server:
   # Fallback to host start is not permitted in production. This flag is
   # reserved for temporary developer troubleshooting only and must not be
   # committed in infra-managed production deployments.
-  llama_allow_host_fallback: false
+  # For this environment we allow host-start so the proxy can spawn the
+  # podman-backed container via the host start script wrapper.
+  llama_allow_host_fallback: true
   llama_embed_load_timeout: 30
   llama_health_check_interval: 10
   llama_model_load_timeout: 600
@@ -251,6 +253,6 @@ server:
   - Qwen3
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
-  llama_start_script: /home/rgardler/projects/llm/start-llama.sh
+  llama_start_script: /home/rgardler/projects/llm/scripts/podman_start_llama.sh
   llama_startup_timeout: 300
   port: 8000
