@@ -971,7 +971,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            if router_mode:
                if srv.llama_process is None or srv.llama_process.poll() is not None:
                    try:
-                       srv.llama_process = srv.start_llama_server(None, prefer_distrobox=True)
+                       srv.llama_process = srv.start_llama_server(None, prefer_distrobox=False)
                    except TypeError:
                        # Backwards-compatible call for older test monkeypatches
                        srv.llama_process = srv.start_llama_server(None)
@@ -987,7 +987,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                        if bool(server_config.get("llama_allow_host_fallback", False)):
                            srv.logger.warning("Router host-start failed to become reachable; attempting distrobox fallback")
                            srv.stop_llama_server()
-                           srv.llama_process = srv.start_llama_server(None, prefer_distrobox=True)
+                           srv.llama_process = srv.start_llama_server(None, prefer_distrobox=False)
                            if srv.llama_process is None:
                                await srv.broadcast_status("error", {
                                    "message": "Failed to start router-mode llama-server (host and distrobox attempts failed)",
@@ -1061,7 +1061,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            # Attempt host-first start when configured; start_llama_server will
            # try host first and fall back to distrobox if host spawn fails.
            try:
-               srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=True)
+               srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=False)
            except TypeError:
                srv.llama_process = srv.start_llama_server(llama_model)
 
@@ -1092,7 +1092,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                if bool(server_config.get("llama_allow_host_fallback", False)):
                    srv.logger.warning(f"Host-start for model {llama_model} did not become reachable within timeout; attempting distrobox fallback")
                    srv.stop_llama_server()
-                   srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=True)
+                   srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=False)
                    if srv.llama_process is None:
                        await srv.broadcast_status("error", {
                            "message": f"Failed to start model {llama_model} (host and distrobox attempts failed)",
