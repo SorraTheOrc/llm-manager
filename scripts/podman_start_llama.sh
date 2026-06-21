@@ -49,6 +49,14 @@ for v in "${env_vars[@]}"; do
   fi
 done
 
+# If a server is already listening inside the container on :8080,
+# avoid starting another and instead attach to the server log so the
+# parent process remains alive for the proxy's process supervision.
+if podman exec "$container" sh -c "ss -ltnp 2>/dev/null | rg ':8080' >/dev/null 2>&1"; then
+  echo "Detected backend listening inside container; attaching to logs"
+  exec podman exec "${env_args[@]}" "$container" tail -F /work/llama-server.log
+fi
+
 # Decide command inside container
 if [ -z "$model" ] || [ "$model" = "router" ]; then
   echo "Executing router inside container $container"
