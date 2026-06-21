@@ -50,13 +50,13 @@ def sample_model_config():
     return {
         "providers": [
             {
-                "name": "openai-primary",
+                "name": "remote-primary",
                 "type": "remote",
                 "endpoint": "https://api.openai.com/v1",
                 "api_key_env": "OPENAI_API_KEY",
             },
             {
-                "name": "anthropic-fallback",
+                "name": "remote-fallback",
                 "type": "remote",
                 "endpoint": "https://api.anthropic.com/v1",
                 "api_key_env": "ANTHROPIC_API_KEY",
@@ -77,7 +77,7 @@ def mixed_model_config():
                 "llama_model": "Qwen3",
             },
             {
-                "name": "openai-fallback",
+                "name": "remote-fallback",
                 "type": "remote",
                 "endpoint": "https://api.openai.com/v1",
                 "api_key_env": "OPENAI_API_KEY",
@@ -143,7 +143,7 @@ def test_resolve_provider_returns_first_available(sample_model_config):
     """resolve_provider should return the first provider when no cooldown."""
     result = provider.resolve_provider(sample_model_config)
     assert result is not None
-    assert result["name"] == "openai-primary"
+    assert result["name"] == "remote-primary"
     assert result["type"] == "remote"
     assert result["endpoint"] == "https://api.openai.com/v1"
 
@@ -151,10 +151,10 @@ def test_resolve_provider_returns_first_available(sample_model_config):
 def test_resolve_provider_skips_failed_provider(sample_model_config):
     """resolve_provider should skip the failed_provider and return the next."""
     result = provider.resolve_provider(
-        sample_model_config, failed_provider="openai-primary"
+        sample_model_config, failed_provider="remote-primary"
     )
     assert result is not None
-    assert result["name"] == "anthropic-fallback"
+    assert result["name"] == "remote-fallback"
     assert result["type"] == "remote"
 
 
@@ -165,11 +165,11 @@ def test_resolve_provider_returns_none_when_all_exhausted(sample_model_config):
     skipped via failed_provider, so none are available.
     """
     # Mark one provider in cooldown and fail the other
-    provider.mark_provider_unavailable("openai-primary", 60.0)
+    provider.mark_provider_unavailable("remote-primary", 60.0)
     result = provider.resolve_provider(
-        sample_model_config, failed_provider="anthropic-fallback"
+        sample_model_config, failed_provider="remote-fallback"
     )
-    # openai-primary is in cooldown, anthropic-fallback is the failed_provider
+    # remote-primary is in cooldown, remote-fallback is the failed_provider
     assert result is None
 
 
@@ -194,17 +194,17 @@ def test_resolve_provider_returns_none_for_missing_providers_key():
 def test_resolve_provider_skips_provider_in_cooldown(sample_model_config):
     """resolve_provider should skip providers that are in cooldown."""
     # Mark the first provider as unavailable (in cooldown)
-    provider.mark_provider_unavailable("openai-primary", 60.0)
+    provider.mark_provider_unavailable("remote-primary", 60.0)
 
     result = provider.resolve_provider(sample_model_config)
     assert result is not None
-    assert result["name"] == "anthropic-fallback"
+    assert result["name"] == "remote-fallback"
 
 
 def test_resolve_provider_skips_all_in_cooldown(sample_model_config):
     """resolve_provider should return None when all providers are in cooldown."""
-    provider.mark_provider_unavailable("openai-primary", 60.0)
-    provider.mark_provider_unavailable("anthropic-fallback", 60.0)
+    provider.mark_provider_unavailable("remote-primary", 60.0)
+    provider.mark_provider_unavailable("remote-fallback", 60.0)
 
     result = provider.resolve_provider(sample_model_config)
     assert result is None
@@ -212,10 +212,10 @@ def test_resolve_provider_skips_all_in_cooldown(sample_model_config):
 
 def test_cooldown_expiry(sample_model_config):
     """resolve_provider should return a provider after its cooldown expires."""
-    provider.mark_provider_unavailable("openai-primary", 0.01)  # very short cooldown
+    provider.mark_provider_unavailable("remote-primary", 0.01)  # very short cooldown
     # First call should skip it
     result = provider.resolve_provider(sample_model_config)
-    assert result["name"] == "anthropic-fallback"
+    assert result["name"] == "remote-fallback"
 
     # Wait for cooldown to expire
     time.sleep(0.02)
@@ -223,7 +223,7 @@ def test_cooldown_expiry(sample_model_config):
     # Now the first provider should be available again
     result = provider.resolve_provider(sample_model_config)
     assert result is not None
-    assert result["name"] == "openai-primary"
+    assert result["name"] == "remote-primary"
 
 
 def test_mark_provider_unavailable_stores_timestamp():
@@ -273,14 +273,14 @@ def test_resolve_provider_failed_single_exhausts(single_provider_config):
 
 def test_failed_and_cooldown_both_skip(sample_model_config):
     """A provider is skipped if it's the failed_provider OR in cooldown."""
-    # Mark anthropic-fallback in cooldown
-    provider.mark_provider_unavailable("anthropic-fallback", 60.0)
+    # Mark remote-fallback in cooldown
+    provider.mark_provider_unavailable("remote-fallback", 60.0)
 
-    # Call with openai-primary as the failed_provider.
-    # openai-primary is skipped (failed_provider)
-    # anthropic-fallback is skipped (in cooldown)
+    # Call with remote-primary as the failed_provider.
+    # remote-primary is skipped (failed_provider)
+    # remote-fallback is skipped (in cooldown)
     result = provider.resolve_provider(
-        sample_model_config, failed_provider="openai-primary"
+        sample_model_config, failed_provider="remote-primary"
     )
     assert result is None
 
@@ -393,7 +393,7 @@ async def test_remote_fallback_tries_providers_in_order(sample_model_config):
             request, "v1/chat/completions", sample_model_config, cfg
         )
 
-    assert attempted == ["openai-primary", "anthropic-fallback"]
+    assert attempted == ["remote-primary", "remote-fallback"]
 
 
 @pytest.mark.asyncio
@@ -430,8 +430,8 @@ async def test_remote_fallback_cooldown_skips_failed_providers(sample_model_conf
         if call_count <= 2:
             # First two calls fail (both providers fail)
             return Response(status_code=502, content=b"Bad gateway")
-        # Third call: anthropic-fallback is in cooldown, so this
-        # should only get called for openai-primary (cooldown expired?)
+        # Third call: remote-fallback is in cooldown, so this
+        # should only get called for remote-primary (cooldown expired?)
         return Response(
             content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
             status_code=200,
@@ -459,7 +459,7 @@ async def test_remote_fallback_respects_retry_after(sample_model_config):
     cfg = {"provider_cooldown_seconds": 60}
 
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
-        if provider_cfg.get("name") == "openai-primary":
+        if provider_cfg.get("name") == "remote-primary":
             return Response(
                 status_code=429,
                 content=b"Rate limited",
@@ -477,13 +477,13 @@ async def test_remote_fallback_respects_retry_after(sample_model_config):
         )
 
     assert result.status_code == 200
-    # openai-primary should be in cooldown with the larger of
+    # remote-primary should be in cooldown with the larger of
     # provider_cooldown_seconds (60) and Retry-After (120)
-    assert provider._is_provider_unavailable("openai-primary")
+    assert provider._is_provider_unavailable("remote-primary")
     # Verify the cooldown expiry is approximately now + 120s (max of 60 and 120)
     now = time.time()
-    expiry = provider._provider_unavailable_until.get("openai-primary")
-    assert expiry is not None, "openai-primary should have a cooldown expiry"
+    expiry = provider._provider_unavailable_until.get("remote-primary")
+    assert expiry is not None, "remote-primary should have a cooldown expiry"
     # Allow 2s tolerance for test execution time
     assert expiry >= now + 118, (
         f"Expected expiry ~now+120s, got {expiry - now:.1f}s from now"
@@ -546,7 +546,7 @@ async def test_local_fallback_to_remote_on_connection_error(mixed_model_config):
     assert result.status_code == 200
     assert call_log == [
         ("local", "local-llama"),
-        ("remote", "openai-fallback"),
+        ("remote", "remote-fallback"),
     ]
 
 
@@ -595,7 +595,7 @@ async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
     assert result.status_code == 200
     assert call_log == [
         ("local", "local-llama"),
-        ("remote", "openai-fallback"),
+        ("remote", "remote-fallback"),
     ]
 
 
@@ -625,7 +625,7 @@ async def test_local_fallback_all_exhausted(mixed_model_config):
     assert result.status_code == 503
     assert call_log == [
         ("local", "local-llama"),
-        ("remote", "openai-fallback"),
+        ("remote", "remote-fallback"),
     ]
     body = json.loads(result.body)
     assert "retry_after" in body
@@ -707,7 +707,7 @@ async def test_x_provider_header_on_success(sample_model_config):
         )
 
     assert result.status_code == 200
-    assert result.headers.get("X-Provider") == "openai-primary"
+    assert result.headers.get("X-Provider") == "remote-primary"
 
 
 @pytest.mark.asyncio
@@ -735,8 +735,8 @@ async def test_x_provider_header_on_fallback(sample_model_config):
         )
 
     assert result.status_code == 200
-    # After fallback from openai-primary, anthropic-fallback should be in header
-    assert result.headers.get("X-Provider") == "anthropic-fallback"
+    # After fallback from remote-primary, remote-fallback should be in header
+    assert result.headers.get("X-Provider") == "remote-fallback"
 
 
 @pytest.mark.asyncio
@@ -773,8 +773,8 @@ async def test_fallback_logging(sample_model_config, caplog):
         if "Fallback triggered" in record.getMessage():
             found = True
             assert record.levelname == "INFO"
-            assert "openai-primary" in record.getMessage()
-            assert "anthropic-fallback" in record.getMessage()
+            assert "remote-primary" in record.getMessage()
+            assert "remote-fallback" in record.getMessage()
             assert "HTTP 502" in record.getMessage()
             break
     assert found, "Expected 'Fallback triggered' log message not found"
