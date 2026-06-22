@@ -139,6 +139,20 @@ def _extract_assistant_content(resp_json: dict) -> Optional[str]:
                     tool_call,
                 )
                 return tool_call
+            # Promote plain reasoning text (non-tool) as a fallback so clients
+            # receive a usable assistant message when the model emitted its
+            # reply into the thinking channel instead of content.
+            try:
+                if reasoning_content and isinstance(reasoning_content, str):
+                    rc_trim = reasoning_content.strip()
+                    if rc_trim:
+                        srv.logger.info(
+                            "Promoting reasoning_content to assistant.content (non-tool fallback): %.120s",
+                            rc_trim[:120],
+                        )
+                        return rc_trim
+            except Exception:
+                pass
     except Exception:
         pass
     return None
@@ -224,6 +238,17 @@ def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
                 tool_call,
             )
             return tool_call
+        # Promote non-tool reasoning text as a fallback (streaming case)
+        try:
+            rc_trim = full_reasoning.strip()
+            if rc_trim:
+                srv.logger.info(
+                    "Promoting streaming reasoning_content to assistant content (non-tool fallback): %.120s",
+                    rc_trim[:120],
+                )
+                return rc_trim
+        except Exception:
+            pass
 
     return None
 
