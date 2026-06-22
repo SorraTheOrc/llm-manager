@@ -206,7 +206,17 @@ server:
   # podman-backed container via the host start script wrapper.
   llama_allow_host_fallback: true
   llama_embed_load_timeout: 30
+  # Router model-health monitoring cadence (seconds).
+  # Preferred key (used by backend health loop):
+  llama_model_health_interval_seconds: 10
+  # Legacy alias retained for compatibility with older configs.
   llama_health_check_interval: 10
+  # Reduce false-positive unload/reload churn under transient probe failures.
+  llama_model_health_failures_before_recovery: 2
+  llama_model_health_probe_attempts: 2
+  llama_model_health_probe_timeout_seconds: 5
+  llama_model_health_probe_backoff_seconds: 0.5
+  llama_model_health_grace_period_seconds: 15
   llama_model_load_timeout: 600
   llama_models_max: 2
   llama_request_timeout: 300

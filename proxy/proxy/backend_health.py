@@ -138,6 +138,24 @@ def _prune_recovery_attempts(
     return [float(ts) for ts in attempts if now_ts - float(ts) <= window]
 
 
+def _coerce_float(value, default: float) -> float:
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _coerce_int(value, default: int) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
 # ===================================================================
 # Router self-healing
 # ===================================================================
@@ -357,32 +375,74 @@ def _extract_model_port_from_args(args: list) -> Optional[int]:
 
 
 async def _router_model_health_loop() -> None:
-    """Periodically check all loaded models' reachability in router mode.
+    """Periodically check loaded models' reachability in router mode.
 
-    Queries the router's ``/models`` endpoint, then probes each model that
-    reports ``status.value == "loaded"`` by connecting to its port.  If a
-    model claims to be loaded but its port is unreachable, triggers an
-    unload+reload cycle to recover the dead instance.
-
-    This addresses the case where llama.cpp's child-monitoring thread fails
-    to promptly detect a child crash and update the model status, leaving
-    the router permanently proxying requests to a dead port.
+    Guardrails to reduce false positives:
+    - legacy interval-key fallback (llama_health_check_interval)
+    - initial grace window after model (re)load or port change
+    - multi-attempt probing before counting a failure
+    - consecutive failure threshold before unload/reload
     """
     srv = _srv()
 
+    # Stateful counters across loop iterations
+    consecutive_failures: dict[str, int] = {}
+    observed_ports: dict[str, int] = {}
+    port_first_seen_at: dict[str, float] = {}
+
     while True:
         try:
-            interval = float(
-                srv.config.get("server", {}).get(
-                    "llama_model_health_interval_seconds", 30.0
-                )
-                or 30.0
+            server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+
+            interval_config = server_cfg.get(
+                "llama_model_health_interval_seconds",
+                server_cfg.get("llama_health_check_interval", 30.0),
             )
+            interval = _coerce_float(interval_config, 30.0)
+
+            failures_before_recovery = max(
+                1,
+                _coerce_int(
+                    server_cfg.get("llama_model_health_failures_before_recovery", 2),
+                    2,
+                ),
+            )
+
+            probe_timeout = max(
+                0.5,
+                _coerce_float(
+                    server_cfg.get("llama_model_health_probe_timeout_seconds", 5.0),
+                    5.0,
+                ),
+            )
+
+            probe_attempts = max(
+                1,
+                _coerce_int(
+                    server_cfg.get("llama_model_health_probe_attempts", 2),
+                    2,
+                ),
+            )
+
+            probe_backoff = max(
+                0.0,
+                _coerce_float(
+                    server_cfg.get("llama_model_health_probe_backoff_seconds", 0.5),
+                    0.5,
+                ),
+            )
+
+            grace_period_seconds = max(
+                0.0,
+                _coerce_float(
+                    server_cfg.get("llama_model_health_grace_period_seconds", 15.0),
+                    15.0,
+                ),
+            )
+
             await asyncio.sleep(max(5.0, interval))
 
-            router_mode = bool(
-                srv.config.get("server", {}).get("llama_router_mode", False)
-            )
+            router_mode = bool(server_cfg.get("llama_router_mode", False))
             if not router_mode:
                 continue
 
@@ -390,7 +450,6 @@ async def _router_model_health_loop() -> None:
             if _is_self_healing_active():
                 continue
 
-            # Get the list of models from the router
             models_data = await srv.router_list_models()
             if not isinstance(models_data, dict):
                 continue
@@ -399,10 +458,14 @@ async def _router_model_health_loop() -> None:
             if not isinstance(models_payload, list):
                 continue
 
-            router_port = int(
-                srv.config.get("server", {}).get("llama_server_port", 8080)
-            )
             router_host = "127.0.0.1"
+            try:
+                router_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+            except Exception:
+                router_port = 8080
+
+            now_ts = time.time()
+            loaded_model_ids: set[str] = set()
 
             for model_entry in models_payload:
                 if not isinstance(model_entry, dict):
@@ -411,7 +474,6 @@ async def _router_model_health_loop() -> None:
                 model_id = model_entry.get("id")
                 raw_status = model_entry.get("status", {})
 
-                # Extract the status value string
                 if isinstance(raw_status, str):
                     status_value = raw_status.lower()
                     args = []
@@ -421,41 +483,76 @@ async def _router_model_health_loop() -> None:
                 else:
                     continue
 
-                if status_value != "loaded":
-                    continue
-                if not model_id:
+                if status_value != "loaded" or not model_id:
                     continue
 
-                # Extract port from the instance args (--port N)
+                loaded_model_ids.add(model_id)
+
                 port = _extract_model_port_from_args(args)
                 if port is None or port <= 0:
                     srv.logger.debug(
-                        "model_health: cannot determine port for "
-                        "loaded model %s, skipping",
+                        "model_health: cannot determine port for loaded model %s, skipping",
                         model_id,
                     )
                     continue
 
-                # Probe the model's port with a simple health check
-                reachable = await _probe_model_instance(
-                    router_host, port
-                )
-                if reachable:
+                # Reset tracking when the loaded instance port changes.
+                prior_port = observed_ports.get(model_id)
+                if prior_port != port:
+                    observed_ports[model_id] = port
+                    port_first_seen_at[model_id] = now_ts
+                    consecutive_failures[model_id] = 0
+
+                first_seen = port_first_seen_at.get(model_id, now_ts)
+                age_seconds = max(0.0, now_ts - first_seen)
+                if grace_period_seconds > 0 and age_seconds < grace_period_seconds:
+                    srv.logger.debug(
+                        "model_health: skipping probe for %s (port %d) during grace window %.1fs/%.1fs",
+                        model_id,
+                        port,
+                        age_seconds,
+                        grace_period_seconds,
+                    )
                     continue
 
-                # Model reports "loaded" but its port is unreachable
+                reachable = await _probe_model_instance_with_retries(
+                    router_host,
+                    port,
+                    timeout=probe_timeout,
+                    attempts=probe_attempts,
+                    backoff_seconds=probe_backoff,
+                )
+                if reachable:
+                    if consecutive_failures.get(model_id, 0) > 0:
+                        srv.logger.info(
+                            "model_health: model %s recovered after %d failed probe(s)",
+                            model_id,
+                            consecutive_failures.get(model_id, 0),
+                        )
+                    consecutive_failures[model_id] = 0
+                    continue
+
+                failure_count = consecutive_failures.get(model_id, 0) + 1
+                consecutive_failures[model_id] = failure_count
+
+                if failure_count < failures_before_recovery:
+                    srv.logger.warning(
+                        "model_health: model %s (port %d) probe failed (%d/%d); delaying recovery",
+                        model_id,
+                        port,
+                        failure_count,
+                        failures_before_recovery,
+                    )
+                    continue
+
                 srv.logger.error(
-                    "model_health: model %s (port %d) is reported as "
-                    "loaded but unreachable, triggering recovery",
+                    "model_health: model %s (port %d) is loaded but unreachable for %d consecutive probe cycle(s), triggering recovery",
                     model_id,
                     port,
+                    failure_count,
                 )
 
-                # Unload first (may 400 if already unloaded, that's fine)
-                srv.logger.info(
-                    "model_health: unloading dead model %s",
-                    model_id,
-                )
+                srv.logger.info("model_health: unloading dead model %s", model_id)
                 try:
                     client = (
                         srv._http_client
@@ -478,11 +575,7 @@ async def _router_model_health_loop() -> None:
                         exc,
                     )
 
-                # Reload the model
-                srv.logger.info(
-                    "model_health: reloading model %s",
-                    model_id,
-                )
+                srv.logger.info("model_health: reloading model %s", model_id)
                 loaded = await srv.router_load_model(model_id)
                 if loaded:
                     srv.logger.info(
@@ -495,10 +588,41 @@ async def _router_model_health_loop() -> None:
                         model_id,
                     )
 
+                # Reset counters and re-apply grace period after recovery attempt
+                consecutive_failures[model_id] = 0
+                port_first_seen_at[model_id] = time.time()
+
+            # Prune state for models no longer loaded
+            stale_ids = [model_id for model_id in list(consecutive_failures.keys()) if model_id not in loaded_model_ids]
+            for stale_id in stale_ids:
+                consecutive_failures.pop(stale_id, None)
+                observed_ports.pop(stale_id, None)
+                port_first_seen_at.pop(stale_id, None)
+
         except asyncio.CancelledError:
             return
         except Exception:
             srv.logger.exception("model health loop error")
+
+
+async def _probe_model_instance_with_retries(
+    host: str,
+    port: int,
+    timeout: float = 5.0,
+    attempts: int = 2,
+    backoff_seconds: float = 0.5,
+) -> bool:
+    """Probe a model instance with retries to reduce transient false negatives."""
+    tries = max(1, int(attempts or 1))
+    pause = max(0.0, float(backoff_seconds or 0.0))
+
+    for attempt_idx in range(tries):
+        reachable = await _probe_model_instance(host, port, timeout=timeout)
+        if reachable:
+            return True
+        if attempt_idx < tries - 1 and pause > 0:
+            await asyncio.sleep(pause)
+    return False
 
 
 async def _probe_model_instance(

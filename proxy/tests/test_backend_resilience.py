@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 import proxy.server as server
+import proxy.backend_health as backend_health
 
 pytestmark = pytest.mark.refactor_parity
 
@@ -649,3 +650,159 @@ async def test_watchdog_retries_restart_when_process_is_none(monkeypatch):
 
     # Watchdog should have attempted restart even though process was None
     assert len(restart_calls) >= 1, f"Expected at least 1 restart attempt, got {len(restart_calls)}"
+
+
+@pytest.mark.asyncio
+async def test_router_model_health_loop_uses_legacy_interval_key(monkeypatch):
+    """Model health loop should honor legacy llama_health_check_interval when
+    llama_model_health_interval_seconds is not set."""
+
+    sleep_calls = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {"server": {"llama_router_mode": True, "llama_health_check_interval": 12}},
+    )
+
+    await server._router_model_health_loop()
+
+    assert sleep_calls, "expected at least one sleep call"
+    assert sleep_calls[0] == 12.0
+
+
+@pytest.mark.asyncio
+async def test_router_model_health_requires_consecutive_failures_before_recovery(monkeypatch):
+    """Single failed probe should not immediately unload/reload a model."""
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_delay):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": True,
+                "llama_model_health_interval_seconds": 0,
+                "llama_model_health_failures_before_recovery": 2,
+                "llama_model_health_grace_period_seconds": 0,
+                "llama_model_health_probe_attempts": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "backend_recovery_state", {"in_progress": False})
+
+    async def fake_router_list_models():
+        return {
+            "data": [
+                {
+                    "id": "Qwen3",
+                    "status": {"value": "loaded", "args": ["--port", "7777"]},
+                }
+            ]
+        }
+
+    probe_calls = {"n": 0}
+
+    async def fake_probe_with_retries(*_args, **_kwargs):
+        probe_calls["n"] += 1
+        return False
+
+    unload_calls = {"n": 0}
+
+    class FakeClient:
+        async def post(self, *args, **kwargs):
+            unload_calls["n"] += 1
+            return type("Resp", (), {"status_code": 200})()
+
+    load_calls = {"n": 0}
+
+    async def fake_router_load_model(_model):
+        load_calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(server, "router_list_models", fake_router_list_models)
+    monkeypatch.setattr(backend_health, "_probe_model_instance_with_retries", fake_probe_with_retries)
+    monkeypatch.setattr(server, "_http_client", FakeClient())
+    monkeypatch.setattr(server, "router_load_model", fake_router_load_model)
+
+    await server._router_model_health_loop()
+
+    assert probe_calls["n"] == 1
+    assert unload_calls["n"] == 0
+    assert load_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_router_model_health_recovers_after_failure_threshold(monkeypatch):
+    """Recovery should trigger once the consecutive failure threshold is met."""
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_delay):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 3:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": True,
+                "llama_model_health_interval_seconds": 0,
+                "llama_model_health_failures_before_recovery": 2,
+                "llama_model_health_grace_period_seconds": 0,
+                "llama_model_health_probe_attempts": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "backend_recovery_state", {"in_progress": False})
+
+    async def fake_router_list_models():
+        return {
+            "data": [
+                {
+                    "id": "Qwen3",
+                    "status": {"value": "loaded", "args": ["--port", "8888"]},
+                }
+            ]
+        }
+
+    async def fake_probe_with_retries(*_args, **_kwargs):
+        return False
+
+    unload_calls = {"n": 0}
+
+    class FakeClient:
+        async def post(self, *args, **kwargs):
+            unload_calls["n"] += 1
+            return type("Resp", (), {"status_code": 200})()
+
+    load_calls = {"n": 0}
+
+    async def fake_router_load_model(_model):
+        load_calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(server, "router_list_models", fake_router_list_models)
+    monkeypatch.setattr(backend_health, "_probe_model_instance_with_retries", fake_probe_with_retries)
+    monkeypatch.setattr(server, "_http_client", FakeClient())
+    monkeypatch.setattr(server, "router_load_model", fake_router_load_model)
+
+    await server._router_model_health_loop()
+
+    assert unload_calls["n"] == 1
+    assert load_calls["n"] == 1
