@@ -23,10 +23,25 @@ fi
 # Create the container if it does not exist (non-interactive)
 if ! podman container exists "$container" >/dev/null 2>&1; then
   echo "Creating container '$container' from image $image"
+
+  # Host HuggingFace cache path; can be overridden with LLAMA_HOST_HF_CACHE
+  host_hf_cache="${LLAMA_HOST_HF_CACHE:-${HOME}/.cache/huggingface/hub}"
+  hf_mount_args=()
+  if [ -n "$host_hf_cache" ]; then
+    if [ -d "$host_hf_cache" ]; then
+      hf_mount_args+=( -v "$host_hf_cache":/root/.cache/huggingface/hub:rw )
+    else
+      echo "Host HF cache not found at $host_hf_cache; creating"
+      mkdir -p "$host_hf_cache" || true
+      hf_mount_args+=( -v "$host_hf_cache":/root/.cache/huggingface/hub:rw )
+    fi
+  fi
+
   podman create --name "$container" \
     --device /dev/kfd --device /dev/dri --security-opt label=disable \
     -p 127.0.0.1:8080:8080 \
     -v "$host_repo":/work:rw \
+    "${hf_mount_args[@]}" \
     "$image" sleep infinity
 fi
 
