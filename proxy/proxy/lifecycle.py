@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -737,6 +738,21 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
                            for line in src:
                                dst.write(line)
                                dst.flush()
+                               # Display prompt processing progress to console
+                               try:
+                                   line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
+                                   if 'prompt processing' in line_str.lower():
+                                       parsed = extract_progress_data(line_str)
+                                       if parsed:
+                                           n_tokens, progress = parsed
+                                           total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
+                                           progress_str = format_progress(n_tokens, total_tokens, progress)
+                                           sys.stderr.write(progress_str)
+                                           if progress >= 0.999:
+                                               sys.stderr.write('\n')
+                                           sys.stderr.flush()
+                               except Exception:
+                                   pass
                        except Exception:
                            pass
 
