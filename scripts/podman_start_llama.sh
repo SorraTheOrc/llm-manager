@@ -39,7 +39,7 @@ if ! podman container exists "$container" >/dev/null 2>&1; then
 
   podman create --name "$container" \
     --device /dev/kfd --device /dev/dri --security-opt label=disable \
-    -p 127.0.0.1:8080:8080 \
+    --network host \
     -v "$host_repo":/work:rw \
     "${hf_mount_args[@]}" \
     "$image" sleep infinity

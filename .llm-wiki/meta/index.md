@@ -32,7 +32,11 @@
 - [[sources/obs-2026-06-21-effort-estimate-applied-to-lp-0mqnqur7k005gdp6]] — "Observation: Effort estimate applied to LP-0MQNQUR7K005GDP6" *(created: 2026-06-21)*
 - [[sources/obs-2026-06-21-intake-host-first-llama-server-startup-work-item-created]] — "Observation: Intake: Host-first llama-server startup work item created" *(created: 2026-06-21)*
 - [[sources/obs-2026-06-21-plan-remove-anthropic-openai-providers-lp-0mqnqur7k005gdp6]] — "Observation: Plan: remove anthropic & openai providers (LP-0MQNQUR7K005GDP6)" *(created: 2026-06-21)*
-- [[sources/SRC-2026-06-20-001]] — SRC-2026-06-20-001 *(created: 2026-06-21)*
+- [[sources/obs-2026-06-22-added-regression-tests-for-model-health-loop-behavior]] — "Observation: Added regression tests for model-health loop behavior" *(created: 2026-06-22)*
+- [[sources/obs-2026-06-22-implemented-guarded-router-model-health-recovery]] — "Observation: Implemented guarded router model-health recovery" *(created: 2026-06-22)*
+- [[sources/obs-2026-06-23-audit-lp-0mqnrdpjl005no0i-tests-ready-for-provider-removal]] — "Observation: Audit: LP-0MQNRDPJL005NO0I tests ready for provider removal" *(created: 2026-06-23)*
+- [[sources/obs-2026-06-23-plan-auto-complete-for-lp-0mqpucofj000qirf]] — "Observation: Plan auto-complete for LP-0MQPUCOFJ000QIRF" *(created: 2026-06-23)*
+- [[sources/SRC-2026-06-20-001]] — SRC-2026-06-20-001 *(created: 2026-06-23)*
 
 ---
-*Last updated: 2026-06-21T17:36:41.479Z* | *Total pages: 23*
+*Last updated: 2026-06-23T00:25:37.107Z* | *Total pages: 27*

@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-06-21T17:36:41.479Z",
+  "last_updated": "2026-06-23T00:25:37.107Z",
   "pages": {
     "concepts/accelerator-performance-tuning": {
       "type": "concept",
@@ -167,7 +167,7 @@
     "sources/SRC-2026-06-20-001": {
       "type": "source",
       "title": "SRC-2026-06-20-001",
-      "created": "2026-06-21",
+      "created": "2026-06-23",
       "updated": "2026-06-20",
       "format": "web",
       "source_id": "SRC-2026-06-20-001",
@@ -244,6 +244,72 @@
         "plan"
       ],
       "source_context": "\"LP-0MQNQUR7K005GDP6 planning session\""
+    },
+    "sources/obs-2026-06-22-added-regression-tests-for-model-health-loop-behavior": {
+      "type": "source",
+      "title": "\"Observation: Added regression tests for model-health loop behavior\"",
+      "created": "2026-06-22",
+      "updated": "2026-06-22",
+      "slug": "obs-2026-06-22-added-regression-tests-for-model-health-loop-behavior",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-22T19:26:21.069Z",
+      "tags": [
+        "tests",
+        "backend-health",
+        "regression"
+      ],
+      "source_context": "\"LP-0MQP3Q8DN0047J1H verification\""
+    },
+    "sources/obs-2026-06-22-implemented-guarded-router-model-health-recovery": {
+      "type": "source",
+      "title": "\"Observation: Implemented guarded router model-health recovery\"",
+      "created": "2026-06-22",
+      "updated": "2026-06-22",
+      "slug": "obs-2026-06-22-implemented-guarded-router-model-health-recovery",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-22T19:26:17.148Z",
+      "tags": [
+        "proxy",
+        "health-check",
+        "recovery",
+        "qwen3",
+        "config"
+      ],
+      "source_context": "\"LP-0MQP3Q8DN0047J1H implementation\""
+    },
+    "sources/obs-2026-06-23-audit-lp-0mqnrdpjl005no0i-tests-ready-for-provider-removal": {
+      "type": "source",
+      "title": "\"Observation: Audit: LP-0MQNRDPJL005NO0I tests ready for provider removal\"",
+      "created": "2026-06-23",
+      "updated": "2026-06-23",
+      "slug": "obs-2026-06-23-audit-lp-0mqnrdpjl005no0i-tests-ready-for-provider-removal",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-23T00:20:27.598Z",
+      "tags": [
+        "audit",
+        "provider-removal",
+        "tests"
+      ],
+      "source_context": "\"Auditing LP-0MQNRDPJL005NO0I\""
+    },
+    "sources/obs-2026-06-23-plan-auto-complete-for-lp-0mqpucofj000qirf": {
+      "type": "source",
+      "title": "\"Observation: Plan auto-complete for LP-0MQPUCOFJ000QIRF\"",
+      "created": "2026-06-23",
+      "updated": "2026-06-23",
+      "slug": "obs-2026-06-23-plan-auto-complete-for-lp-0mqpucofj000qirf",
+      "status": "observation",
+      "relevance": "medium",
+      "observed_at": "2026-06-23T00:25:37.105Z",
+      "tags": [
+        "planning",
+        "bug",
+        "proxy"
+      ],
+      "source_context": "\"Planning work item LP-0MQPUCOFJ000QIRF\""
     }
   }
 }
