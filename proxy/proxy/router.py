@@ -358,6 +358,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 err_headers[
                                     "X-Session-Fallback-Reason"
                                 ] = session_fallback_reason
+                        await _decrement_active_queries(srv)
                         return Response(
                             content=body_bytes,
                             status_code=upstream_status,

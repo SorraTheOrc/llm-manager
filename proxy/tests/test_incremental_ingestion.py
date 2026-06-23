@@ -997,7 +997,8 @@ class TestToolCallFromReasoning:
         assert 'ls -la' in result
 
     def test_extract_assistant_content_from_sse_reasoning_no_tool_call(self):
-        """When reasoning_content has no tool call, return None."""
+        """When reasoning_content has no tool call, promote reasoning text
+        as fallback so clients receive a usable assistant message."""
         from proxy.server import _extract_assistant_content_from_sse
 
         sse_text = (
@@ -1006,7 +1007,8 @@ class TestToolCallFromReasoning:
             'data: [DONE]\n'
         )
         result = _extract_assistant_content_from_sse(sse_text)
-        assert result is None
+        # Reasoning content is promoted as a fallback so clients see the response
+        assert result == "Just thinking about it..."
 
     def test_extract_assistant_content_from_sse_prefers_content_over_reasoning(self):
         """When both content and reasoning_content are present, prefer content."""
@@ -1042,7 +1044,8 @@ class TestToolCallFromReasoning:
         assert 'echo hi' in result
 
     def test_extract_assistant_content_non_streaming_reasoning_no_tool_call(self):
-        """Non-streaming: return None when reasoning_content has no tool call."""
+        """Non-streaming: when reasoning_content has no tool call,
+        promote reasoning text as fallback so clients see it."""
         from proxy.server import _extract_assistant_content
 
         resp = {
@@ -1057,7 +1060,8 @@ class TestToolCallFromReasoning:
             ]
         }
         result = _extract_assistant_content(resp)
-        assert result is None
+        # Reasoning content is promoted as a fallback so clients see the response
+        assert result == "Just thinking quietly..."
 
     def test_extract_assistant_content_non_streaming_prefers_content(self):
         """Non-streaming: when content is present, ignore reasoning_content."""
