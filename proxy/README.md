@@ -260,15 +260,13 @@ models:
       - "qwen3-coder"
       - "qwen3*"          # Wildcard: matches qwen3-32b, qwen3-coder-instruct, etc.
 
-  openai:
+  provider-a:
     type: "remote"
-    endpoint: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"
+    endpoint: "https://api.provider-a.com/v1"
+    api_key_env: "PROVIDER_A_KEY"
     aliases:
-      - "gpt-4"
-      - "gpt-4-turbo"
-      - "gpt-*"           # Wildcard: matches any model starting with gpt-
-      - "o1-*"            # Wildcard: matches o1-preview, o1-mini, etc.
+      - "my-model-*"      # Wildcard: matches my-model-anything
+      - "my-model"
 ```
 
 ### Wildcard Patterns in Aliases
@@ -289,13 +287,12 @@ Aliases support wildcard patterns using fnmatch syntax:
 qwen3:
   aliases: ["qwen3", "qwen3-coder"]   # Exact matches
 
-openai:
-  aliases: ["gpt-*", "o1-*"]          # Wildcards route ALL gpt- and o1- models to OpenAI
+provider-a:
+  aliases: ["my-model-*"]            # Wildcards route ALL my-model-* to provider-a
 ```
 
-- Request for `gpt-4` → Routes to OpenAI
-- Request for `gpt-4o-mini` → Routes to OpenAI
-- Request for `o1-preview` → Routes to OpenAI
+- Request for `my-model` → Routes to provider-a
+- Request for `my-model-extra` → Routes to provider-a
 - Request for `qwen3-coder` → Routes to local qwen3
 
 ### Friendly Model Aliases
@@ -436,19 +433,19 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 models:
   mimo-v2.5:
     providers:
-      - name: openai-primary
+      - name: remote-primary
         type: remote
-        endpoint: https://api.openai.com/v1
-        api_key_env: OPENAI_API_KEY
-      - name: anthropic-fallback
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+      - name: remote-fallback
         type: remote
-        endpoint: https://api.anthropic.com/v1
-        api_key_env: ANTHROPIC_API_KEY
+        endpoint: https://api.provider-b.com/v1
+        api_key_env: PROVIDER_B_KEY
     aliases:
       - mimo*
 ```
 
-In this example, requests for `mimo-v2.5` first try OpenAI. If that fails, they fall back to Anthropic.
+In this example, requests for `mimo-v2.5` first try the primary remote provider. If that fails, they fall back to the secondary provider.
 
 #### Example: Local-to-Remote Fallback
 
@@ -459,15 +456,15 @@ models:
       - name: local-llama
         type: local
         llama_model: Qwen3
-      - name: openai-fallback
+      - name: remote-fallback
         type: remote
-        endpoint: https://api.openai.com/v1
-        api_key_env: OPENAI_API_KEY
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
     aliases:
       - hybrid*
 ```
 
-In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to OpenAI.
+In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to the remote provider.
 
 #### Unavailability Detection
 
@@ -497,7 +494,7 @@ When a fallback occurs:
 - **Response header**: `X-Provider: <provider-name>` is added to the response, indicating which provider handled the request.
 - **Logging**: An INFO-level log is emitted:
   ```
-  Fallback triggered for model=v1/chat/completions, from=openai-primary, to=anthropic-fallback, reason=HTTP 502
+  Fallback triggered for model=v1/chat/completions, from=remote-primary, to=remote-fallback, reason=HTTP 502
   ```
 
 #### Migration Guide
@@ -511,27 +508,27 @@ To migrate from the old flat format to the new `providers` list format:
 **Before (old format):**
 ```yaml
 models:
-  openai:
+  my-model:
     type: remote
-    endpoint: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
+    endpoint: https://api.provider-a.com/v1
+    api_key_env: PROVIDER_A_KEY
     aliases:
-      - gpt-4
-      - gpt-*
+      - my-model
+      - my-model-*
 ```
 
 **After (new format):**
 ```yaml
 models:
-  openai:
+  my-model:
     providers:
-      - name: openai
+      - name: my-provider
         type: remote
-        endpoint: https://api.openai.com/v1
-        api_key_env: OPENAI_API_KEY
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
     aliases:
-      - gpt-4
-      - gpt-*
+      - my-model
+      - my-model-*
 ```
 
 **Important:** The old top-level `endpoint`/`api_key_env` format is **deprecated** and will be removed in a future release. All models must use the `providers` list format.

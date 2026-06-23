@@ -120,12 +120,12 @@ models:
     providers:
       - name: primary
         type: remote
-        endpoint: https://api.openai.com/v1
-        api_key_env: OPENAI_API_KEY
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
       - name: fallback
         type: remote
-        endpoint: https://api.anthropic.com/v1
-        api_key_env: ANTHROPIC_API_KEY
+        endpoint: https://api.provider-b.com/v1
+        api_key_env: PROVIDER_B_KEY
     aliases:
       - my-model*
 ```

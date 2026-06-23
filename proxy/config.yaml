@@ -18,14 +18,14 @@
 # Example with providers list:
 #   mimo-v2.5:
 #     providers:
-#       - name: openai-primary
+#       - name: remote-primary
 #         type: remote
-#         endpoint: https://api.openai.com/v1
-#         api_key_env: OPENAI_API_KEY
-#       - name: anthropic-fallback
+#         endpoint: https://api.provider-a.com/v1
+#         api_key_env: PROVIDER_A_KEY
+#       - name: remote-fallback
 #         type: remote
-#         endpoint: https://api.anthropic.com/v1
-#         api_key_env: ANTHROPIC_API_KEY
+#         endpoint: https://api.provider-b.com/v1
+#         api_key_env: PROVIDER_B_KEY
 #     aliases:
 #       - mimo*
 #
@@ -58,10 +58,11 @@
 # ---------------------------------------------------------------------------
 
 default_model: Qwen3
-default_remote:
-  api_key_env: OPENAI_API_KEY
-  enabled: false
-  endpoint: https://api.openai.com/v1
+# default_remote is commented out: the openai provider was removed (LP-0MQNQUR7K005GDP6).
+# default_remote:
+#   api_key_env: OPENAI_API_KEY
+#   enabled: false
+#   endpoint: https://api.openai.com/v1
 
 # Optional named provider endpoints (e.g., Tailscale based host mapping)
 providers:
@@ -95,19 +96,6 @@ audit_model_fallbacks:
   - "deepseek-v4-flash"
 
 models:
-  anthropic:
-    providers:
-      - name: anthropic-primary
-        type: remote
-        endpoint: https://api.anthropic.com/v1
-        api_key_env: ANTHROPIC_API_KEY
-        headers:
-          anthropic-version: '2023-06-01'
-    aliases:
-    - claude-3-opus
-    - claude-3-sonnet
-    - claude-3-haiku
-    - claude-*
   embed:
     providers:
       - name: local-embed
@@ -143,21 +131,6 @@ models:
     - GPT-OSS*
     - Casey
     - casey
-  openai:
-    providers:
-      - name: openai-primary
-        type: remote
-        endpoint: https://api.openai.com/v1
-        api_key_env: OPENAI_API_KEY
-    aliases:
-    - gpt-4
-    - gpt-4-turbo
-    - gpt-4o
-    - gpt-4o-mini
-    - gpt-3.5-turbo
-    - gpt-*
-    - o1-*
-    - chatgpt-*
   qwen3:
     providers:
       - name: local-qwen3
