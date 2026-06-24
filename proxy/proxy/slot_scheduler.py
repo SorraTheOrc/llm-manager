@@ -1,0 +1,249 @@
+"""
+Job Scheduler — Job-Level Slot Ownership
+
+Manages job-to-slot assignment with ownership semantics for multi-turn
+conversations. Each session (job) is assigned to a slot for the entire
+lifetime of the conversation, preventing inter-session slot stealing.
+
+Usage:
+    scheduler = JobScheduler(pool_size=4, max_queue_depth=16, job_timeout=300.0)
+    await scheduler.start()
+
+    # New job
+    result = await scheduler.admit_job("session-id")
+    if result.kind == "ASSIGNED":
+        slot_id = result.slot_id
+    elif result.kind == "QUEUED":
+        # Wait for slot
+    else:
+        # REJECTED_503 - queue full
+
+    # Subsequent requests from active job
+    slot_id = await scheduler.reenter_job("session-id")
+    if slot_id is not None:
+        # Fast path - job owns a slot
+
+    # On session end
+    await scheduler.release_slot(slot_id)
+    await scheduler.stop()
+"""
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Optional, Tuple, Union
+
+
+# ===================================================================
+# Data types
+# ===================================================================
+
+
+@dataclass
+class SlotState:
+    """Per-slot state tracking."""
+
+    slot_id: int
+    state: Literal["Idle", "Owned"] = "Idle"
+    job_id: Optional[str] = None
+    job_assigned_at: Optional[float] = None
+    job_last_request_at: Optional[float] = None
+
+
+@dataclass
+class QueuedJob:
+    """A job waiting in the queue."""
+
+    tenant_id: str
+    job_id: str
+    enqueue_time: float = field(default_factory=time.monotonic)
+    request_count: int = 0
+
+
+@dataclass
+class AdmitResult:
+    """Result of admitting a job to the scheduler."""
+
+    kind: str  # "ASSIGNED", "QUEUED", "REJECTED_503"
+    slot_id: Optional[int] = None
+    position: Optional[int] = None
+    retry_after: Optional[float] = None
+
+
+# ===================================================================
+# JobScheduler
+# ===================================================================
+
+
+class JobScheduler:
+    """
+    Manages job-to-slot assignment with ownership semantics.
+
+    State:
+        slots: dict[slot_id, SlotState]       -- per-slot state
+        queue: asyncio.Queue[QueuedJob]        -- waiting jobs
+        active_jobs: dict[session_id, int]     -- session → slot_id mapping
+        slot_to_job: dict[int, str]            -- slot_id → session_id mapping
+    """
+
+    def __init__(
+        self,
+        pool_size: int,
+        max_queue_depth: int,
+        job_timeout: float,
+        queue_overflow_retry_after: float = 900.0,
+    ):
+        if pool_size < 1:
+            raise ValueError("pool_size must be >= 1")
+        if max_queue_depth < 1:
+            raise ValueError("max_queue_depth must be >= 1")
+
+        self.slots: Dict[int, SlotState] = {
+            i: SlotState(slot_id=i) for i in range(pool_size)
+        }
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_depth)
+        self.active_jobs: Dict[str, int] = {}  # session_id → slot_id
+        self.slot_to_job: Dict[int, str] = {}  # slot_id → session_id
+        self.job_timeout = job_timeout
+        self.queue_overflow_retry_after = queue_overflow_retry_after
+        self._timeout_check_task: Optional[asyncio.Task] = None
+
+    async def start(self) -> None:
+        """Start the scheduler (including background timeout checks)."""
+        self._timeout_check_task = asyncio.create_task(
+            self._periodic_timeout_check()
+        )
+
+    async def stop(self) -> None:
+        """Stop the scheduler and cancel the background timeout task."""
+        if self._timeout_check_task and not self._timeout_check_task.done():
+            self._timeout_check_task.cancel()
+            try:
+                await self._timeout_check_task
+            except asyncio.CancelledError:
+                pass
+
+    async def admit_job(self, session_id: str) -> AdmitResult:
+        """
+        Admit a new job.
+
+        Returns one of:
+          - ASSIGNED(slot_id): Job assigned to an idle slot
+          - QUEUED: Job added to queue, waiting for a slot
+          - REJECTED_503: Queue full, job rejected with Retry-After
+        """
+        # Case 1: Job already owns a slot — return the slot
+        if session_id in self.active_jobs:
+            return AdmitResult(kind="ASSIGNED", slot_id=self.active_jobs[session_id])
+
+        # Case 2: Find an idle slot
+        for slot_id, slot_state in self.slots.items():
+            if slot_state.state == "Idle":
+                now = time.monotonic()
+                slot_state.state = "Owned"
+                slot_state.job_id = session_id
+                slot_state.job_assigned_at = now
+                slot_state.job_last_request_at = now
+                self.active_jobs[session_id] = slot_id
+                self.slot_to_job[slot_id] = session_id
+                return AdmitResult(kind="ASSIGNED", slot_id=slot_id)
+
+        # Case 3: All slots busy — try to enqueue
+        if self.queue.full():
+            return AdmitResult(
+                kind="REJECTED_503",
+                retry_after=self.queue_overflow_retry_after,
+            )
+
+        # Determine queue position before enqueueing
+        position = self.queue.qsize()
+
+        await self.queue.put(QueuedJob(
+            tenant_id=session_id,
+            job_id=session_id,
+            enqueue_time=time.monotonic(),
+            request_count=0,
+        ))
+        return AdmitResult(kind="QUEUED", position=position)
+
+    async def reenter_job(self, session_id: str) -> Optional[int]:
+        """
+        Called for subsequent requests from an active job.
+
+        Returns the slot_id if the job is still active, None otherwise.
+        Caller must call admit_job() when None is returned.
+        """
+        if session_id in self.active_jobs:
+            slot_id = self.active_jobs[session_id]
+            # Update last request time
+            if slot_id in self.slots:
+                self.slots[slot_id].job_last_request_at = time.monotonic()
+            return slot_id
+        return None
+
+    async def release_slot(self, slot_id: int) -> None:
+        """
+        Release a slot from its owning job.
+
+        Transitions slot to Idle and assigns the next job from the queue
+        (if any) to this slot.
+        """
+        if slot_id not in self.slots:
+            return
+
+        slot_state = self.slots[slot_id]
+
+        # If already idle, nothing to do
+        if slot_state.state == "Idle":
+            return
+
+        # Clear ownership
+        job_id = slot_state.job_id
+        slot_state.state = "Idle"
+        slot_state.job_id = None
+        slot_state.job_assigned_at = None
+        slot_state.job_last_request_at = None
+
+        if job_id and job_id in self.active_jobs:
+            del self.active_jobs[job_id]
+        if slot_id in self.slot_to_job:
+            del self.slot_to_job[slot_id]
+
+        # Assign next job from queue
+        if not self.queue.empty():
+            try:
+                queued_job = self.queue.get_nowait()
+                now = time.monotonic()
+                slot_state.state = "Owned"
+                slot_state.job_id = queued_job.tenant_id
+                slot_state.job_assigned_at = now
+                slot_state.job_last_request_at = now
+                self.active_jobs[queued_job.tenant_id] = slot_id
+                self.slot_to_job[slot_id] = queued_job.tenant_id
+            except asyncio.QueueEmpty:
+                pass  # No more jobs; slot stays Idle
+
+    async def _check_timeouts_now(self) -> None:
+        """
+        Single-pass timeout check. Releases all jobs that have been idle
+        for longer than self.job_timeout.
+        """
+        now = time.monotonic()
+        for slot_id, slot_state in self.slots.items():
+            if (
+                slot_state.state == "Owned"
+                and slot_state.job_last_request_at is not None
+            ):
+                idle_time = now - slot_state.job_last_request_at
+                if idle_time > self.job_timeout:
+                    await self.release_slot(slot_id)
+
+    async def _periodic_timeout_check(self) -> None:
+        """
+        Background task: run every 10s to release idle jobs that have
+        timed out. A job is considered idle if no requests have been
+        received for longer than self.job_timeout.
+        """
+        while True:
+            await asyncio.sleep(10)
+            await self._check_timeouts_now()
