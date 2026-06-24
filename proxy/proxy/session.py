@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
@@ -878,14 +880,32 @@ def _classify_delta_routing(
 
     When ``require_restore_signal`` is True, delta routing requires explicit
     restore confirmation from backend signals/logs.
+
+    Returns (use_delta, reason) where reason is None when delta can be used,
+    or a string explaining why a full re-process is required.
     """
     if not history_matches:
+        logger.warning(
+            "cache_invalidation: full re-process required - history_mismatch"
+        )
         return False, "history_mismatch"
     if delta_message_count <= 0:
+        logger.warning(
+            "cache_invalidation: full re-process required - no_new_messages "
+            "(delta_message_count=%s)", delta_message_count
+        )
         return False, "no_new_messages"
     if force_full_prompt:
+        logger.info(
+            "cache_invalidation: full re-process required - "
+            "delta_disabled (force_full_prompt=True)"
+        )
         return False, "delta_disabled"
     if require_restore_signal and not restore_confirmed:
+        logger.warning(
+            "cache_invalidation: full re-process required - "
+            "missing_restore_signal"
+        )
         return False, "missing_restore_signal"
     return True, None
 
