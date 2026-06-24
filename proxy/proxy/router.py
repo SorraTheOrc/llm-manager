@@ -61,6 +61,8 @@ from proxy.utils import (  # noqa: E402
     count_text_tokens,
 )
 
+from proxy.slot_scheduler import JobScheduler, AdmitResult  # noqa: E402
+
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402
     _build_backend_error_response,
@@ -80,6 +82,45 @@ from .router_helpers import (  # noqa: E402
     log_response,
     log_response_chunk,
 )
+
+
+# ===================================================================
+# Job-level slot scheduler (global, lazy-initialized from config)
+# ===================================================================
+
+_job_scheduler: Optional[JobScheduler] = None
+_job_scheduler_initialized: bool = False
+
+
+def _get_job_scheduler() -> Optional[JobScheduler]:
+    """
+    Return the global JobScheduler, initialising it from config on first call.
+    Returns None if slot management is not configured.
+    """
+    global _job_scheduler, _job_scheduler_initialized
+    if _job_scheduler_initialized:
+        return _job_scheduler
+
+    _job_scheduler_initialized = True
+    srv = _srv()
+    slot_config = srv.config.get("slot_management", {})
+    if not slot_config:
+        return None
+
+    pool_size = int(slot_config.get("slot_pool_size", 0) or 0)
+    if pool_size < 1:
+        return None
+
+    _job_scheduler = JobScheduler(
+        pool_size=pool_size,
+        max_queue_depth=int(slot_config.get("slot_queue_max_depth", 16) or 16),
+        job_timeout=float(slot_config.get("slot_job_timeout_seconds", 300.0) or 300.0),
+        queue_overflow_retry_after=float(
+            slot_config.get("slot_queue_overflow_retry_after", 900) or 900
+        ),
+    )
+    return _job_scheduler
+
 
 # Core proxy routing: Local llama-server dispatch
 
@@ -134,10 +175,54 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         body = session_result["body_override"]
         body_json = session_result["body_json"]
 
-    slot_id, slot_filename, slot_timeout = _build_slot_context(
-        server_config, session_id
-    )
-    slot_enabled = slot_id is not None and slot_filename is not None
+    slot_id = None
+    slot_filename = None
+    slot_timeout = 3.0
+    slot_enabled = False
+
+    # Try job-level scheduler (slot management) first
+    scheduler = _get_job_scheduler()
+    if scheduler is not None and session_id:
+        admit_result = await scheduler.reenter_job(session_id)
+        if admit_result is None:
+            admit_result = await scheduler.admit_job(session_id)
+        if isinstance(admit_result, AdmitResult):
+            if admit_result.kind == "ASSIGNED":
+                slot_id = admit_result.slot_id
+                # Job owns the slot — no save/restore needed
+                slot_enabled = False
+                srv.logger.debug(
+                    "scheduler assigned slot %s to session %s",
+                    slot_id, session_id[:8] if session_id else "unknown",
+                )
+            elif admit_result.kind == "QUEUED":
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Slot unavailable: session {session_id[:8]} queued "
+                        f"at position {admit_result.position}"
+                    ),
+                    headers={"Retry-After": "30"},
+                )
+            elif admit_result.kind == "REJECTED_503":
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Queue full. Try again later.",
+                    headers={
+                        "Retry-After": str(
+                            int(admit_result.retry_after)
+                            if admit_result.retry_after
+                            else 900
+                        )
+                    },
+                )
+
+    # Fall back to hash-based slot context if no scheduler assigned a slot
+    if slot_id is None:
+        slot_id, slot_filename, slot_timeout = _build_slot_context(
+            server_config, session_id
+        )
+        slot_enabled = slot_id is not None and slot_filename is not None
 
     method = request.method.upper()
     key = f"{method} {request.url.path} -> local"
