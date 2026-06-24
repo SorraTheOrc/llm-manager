@@ -580,6 +580,11 @@ class SlotLockCoordinator:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._locks: dict[int, asyncio.Lock] = {}
+        self._scheduler: Optional[Any] = None
+
+    def set_scheduler(self, scheduler: Any) -> None:
+        """Inject a JobScheduler instance (called at startup)."""
+        self._scheduler = scheduler
 
     def acquire(self, slot_id: Optional[int]):
         @asynccontextmanager

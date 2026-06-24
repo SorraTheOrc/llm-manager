@@ -119,6 +119,8 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
             slot_config.get("slot_queue_overflow_retry_after", 900) or 900
         ),
     )
+    # Wire scheduler into SlotLockCoordinator
+    slot_lock_coordinator.set_scheduler(_job_scheduler)
     return _job_scheduler
 
 
@@ -688,6 +690,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                             )
                                         )
                                         if session_id and should_invalidate:
+                                            # Release scheduler slot if active
+                                            scheduler = _get_job_scheduler()
+                                            if (
+                                                scheduler is not None
+                                                and slot_id is not None
+                                            ):
+                                                await scheduler.release_slot(slot_id)
                                             await _invalidate_session_and_slot(
                                                 session_id,
                                                 f"guardrail_{guardrail_reason}",
