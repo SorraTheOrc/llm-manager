@@ -526,3 +526,162 @@ With `pool_size=4` and 4 sessions:
 | **LP-0MQMC4MNU002QJK4** (Slot-cache retention & cleanup) | Slot persistence reliability affects save/restore cost | Ensure cleanup script doesn't delete active reservation snapshot files |
 | **LP-0MQ0PYH8P008DLPJ** (Web based logging per slot) | Instrumentation touch points in F1 findings overlap | Reservation events (grant, release, preempt) are natural logging events for per-slot UI |
 | **LP-0MPU11WBN004MFQ8** (Session Routing Regression Suite) | Regression coverage for slot coordination must be updated | Add tests for reservation timeout and queue behavior |
+
+---
+
+## 12. Implementation Roadmap
+
+This section breaks the recommended **Approach D (Hybrid Reservation + Queue)**
+into implementable sub-tasks with effort estimates. Implementation is **deferred**
+to follow-up work items; these sub-tasks are **proposals**, not created items.
+
+### Phase 1: Core Reservation (MVP)
+
+Minimal viable implementation — only the reservation state machine without queue
+fallback or preemption.
+
+| # | Sub-task | Effort | Dependencies | Description |
+|---|----------|--------|-------------|-------------|
+| 1.1 | Add `SessionSlotReservation` data structure to `SlotLockCoordinator` | **S** (2–3h) | None | Simple dataclass with `session_id`, `expiry` fields; store in dict keyed by slot_id |
+| 1.2 | Modify `acquire()` to check reservation before granting | **M** (3–5h) | 1.1 | If slot reserved for requesting session_id AND expiry not passed: grant immediately. If reserved for different session: block. If free: grant + set reservation. |
+| 1.3 | Add reservation timeout config key `slot_reservation_timeout_seconds` | **XS** (0.5–1h) | 1.1 | New config in `proxy/config.yaml` and `server_config` dict. Default: 3.0. |
+| 1.4 | Modify `release()` to set reservation instead of releasing immediately | **M** (4–6h) | 1.2, 1.3 | After lock-release body completes, set reservation timer. Hold asyncio.Lock until timeout or preemption. |
+| 1.5 | Unit tests for reservation state machine | **M** (4–6h) | 1.2 | Test: within-timeout reclaim, after-timeout release, concurrent sessions, edge cases |
+| 1.6 | Integration tests with mock slot save/restore | **M** (3–5h) | 1.5 | Verify save/restore is skipped for within-timeout reclaim; verify save+restore happens on cross-session switch |
+| | **Phase 1 Total** | **~17–26h** | | |
+
+### Phase 2: Fair Queue
+
+Add FIFO waiting queue so that when reservation expires, the next waiting
+session gets the slot deterministically.
+
+| # | Sub-task | Effort | Dependencies | Description |
+|---|----------|--------|-------------|-------------|
+| 2.1 | Add `waiting_queue: asyncio.Queue` per slot | **S** (2–3h) | Phase 1 | Standard FIFO queue of `(session_id, asyncio.Future)` tuples |
+| 2.2 | Enqueue callers when slot is reserved for another session | **M** (3–4h) | 2.1, 1.2 | On acquire: if slot reserved for other session AND within expiry, enqueue waiter. Return future that resolves when slot free. |
+| 2.3 | Dequeue and grant on reservation expiry | **M** (3–4h) | 2.2 | Background task: when reservation timer fires, dequeue next waiter, resolve their future, grant slot |
+| 2.4 | Config: `slot_queue_max_depth` with overflow → 503 | **S** (1–2h) | 2.2 | If queue exceeds max_depth, return 503 immediately (existing mechanism) |
+| 2.5 | Unit tests for queue behavior | **M** (4–6h) | 2.3 | Test: FIFO ordering, max_depth overflow, concurrent enqueue/dequeue |
+| 2.6 | Integration tests for queue + reservation interaction | **M** (3–5h) | 2.5 | Test: reservation expiry → next waiter gets slot, multiple waiters, timeout |
+| | **Phase 2 Total** | **~16–24h** | | |
+
+### Phase 3: Preemption (Optional)
+
+Allow queue pressure to preempt an active reservation, preventing head-of-line
+blocking under severe load.
+
+| # | Sub-task | Effort | Dependencies | Description |
+|---|----------|--------|-------------|-------------|
+| 3.1 | Add preemption trigger when queue exceeds max_depth | **M** (3–5h) | 2.4 | When enqueuing and queue depth > max_depth, preempt the active reservation: release lock, log warning, grant to oldest waiter |
+| 3.2 | Config: `slot_preemption_enabled` (bool) and `slot_preemption_warn_only` | **S** (1–2h) | 3.1 | Toggle preemption behavior; warn-only logs instead of preempting |
+| 3.3 | Preemption metrics and logging | **S** (1–2h) | 3.1 | Counter for preemption events, gauge for queue depth, logging at INFO level |
+| 3.4 | Unit tests for preemption logic | **M** (3–5h) | 3.1 | Test: preemption triggers correctly, warn-only mode, edge cases |
+| 3.5 | Integration tests: preemption under load | **M** (3–5h) | 3.4 | Simulate 8 sessions hammering the proxy; verify preemption prevents queue overflow |
+| | **Phase 3 Total** | **~11–19h** | | |
+
+### Phase 4: Observability & Polish
+
+Metrics, logging, and documentation for operators.
+
+| # | Sub-task | Effort | Dependencies | Description |
+|---|----------|--------|-------------|-------------|
+| 4.1 | Add Prometheus metrics for reservation state | **S** (2–3h) | Phase 1 | Gauge: reserved slots count, queue depth. Counter: preemptions, reservation grants, timeouts |
+| 4.2 | Add per-slot reservation logging (INFO/DEBUG) | **XS** (1–2h) | Phase 1 | Log grant/release/timeout/preemption events with session_id and slot_id |
+| 4.3 | Update `proxy/config.yaml` with new config keys | **XS** (0.5h) | Phases 1–3 | Document all new slot config keys with defaults and descriptions |
+| 4.4 | Update `proxy/README.md` with new slot management behavior | **S** (1–2h) | 4.3 | Document reservation timeout, queue behavior, and tuning guidance |
+| 4.5 | Update `docs/dev/slot-management-design.md` with post-implementation lessons | **XS** (0.5–1h) | After testing | Reflect any design changes discovered during implementation |
+| | **Phase 4 Total** | **~5–8.5h** | | |
+
+### Total Implementation Effort
+
+| Phase | Effort (hours) | Scope |
+|-------|---------------|-------|
+| Phase 1: Core Reservation | 17–26 | MVP — solves the primary thrashing problem |
+| Phase 2: Fair Queue | 16–24 | Adds fairness under load |
+| Phase 3: Preemption | 11–19 | Optional escape valve for severe load |
+| Phase 4: Observability | 5–9 | Production readiness |
+| **Total** | **49–78h** | Full recommended approach |
+
+**Phase 1 alone** (17–26h) delivers the core value — reducing thrashing from
+95–98% to near-zero for session with <3s inter-turn gaps — and can be shipped
+independently. Phases 2–4 add robustness and production readiness.
+
+---
+
+## 13. Open Questions & Assumptions
+
+### Open Questions
+
+1. **What is the actual distribution of agent 'thinking time' between turns?**
+   This directly affects the optimal `slot_reservation_timeout_seconds` value.
+   Without production telemetry, the default of 3.0s is a reasonable starting
+   point but should be validated.
+
+2. **Should the reservation timeout be static or adaptive?**
+   A static timeout (3s default) is simple but may not suit all workloads.
+   An adaptive timeout that tracks per-session inter-request timing could
+   auto-tune — but adds complexity that may not be justified.
+
+3. **Is preemption always safe?**
+   When preempting a reservation, the evicted session's slot save may not have
+   completed. Should preemption wait for save to finish, or force-cancel?
+   Recommendation: preemption should wait for the current save to complete
+   (up to `session_slot_timeout_seconds`) before granting the slot.
+
+4. **What happens to slot save/restore during reservation?**
+   The current design assumes save happens *before* lock release (already the
+   case). With reservation, the save still happens before the reservation is
+   set. Restore happens on next acquire. No change to save/restore timing.
+
+### Assumptions
+
+1. The asyncio cooperative scheduling model is sufficient — no OS-level lock
+   or semaphore is needed.
+2. `pool_size=1` remains the default — the hybrid approach works correctly
+   regardless of pool_size.
+3. Existing 503/Retry-After clients will retry naturally — no client changes
+   needed.
+4. Save/restore latency is acceptable (~10ms each in the repro simulation).
+5. Reservation state lives in-memory only (no persistence across proxy
+   restarts).
+
+### Risks
+
+1. **Reservation state machine correctness**: The combination of reservation +
+   queue + preemption has complex interleavings. Mitigation: Phase 1 (pure
+   reservation) is simpler and can be validated before adding queue/preemption.
+2. **Timeout sensitivity**: If the default 3s timeout is wrong, thrashing may
+   not be meaningfully reduced. Mitigation: configurable timeout; operators can
+   tune.
+3. **Queue memory pressure**: With 8 concurrent agents, the queue holds at
+   most `max_depth` (default 4) request objects in memory. Each object is
+   ~1–10KB (headers + body). Mitigation: trivial memory cost (~40KB max).
+
+---
+
+## 14. Follow-Up Work Item Proposals
+
+The following work items are **proposed** (NOT created) for implementating the
+recommended approach. These are one-liners suitable for creating as child work
+items of the parent epic.
+
+| ID | Title | Phase | Estimated Effort |
+|----|-------|-------|-----------------|
+| P1 | Add SessionSlotReservation data structure to SlotLockCoordinator | 1 | S (2–3h) |
+| P2 | Implement reservation-aware lock acquire/release in SlotLockCoordinator | 1 | M (7–11h) |
+| P3 | Add slot_reservation_timeout_seconds config key | 1 | XS (0.5–1h) |
+| P4 | Add FIFO waiting queue to SlotLockCoordinator | 2 | S (2–3h) |
+| P5 | Implement enqueue/dequeue with reservation expiry handoff | 2 | M (6–8h) |
+| P6 | Add slot_queue_max_depth config and 503 overflow | 2 | S (1–2h) |
+| P7 | Implement preemption trigger when queue exceeds max_depth | 3 | M (3–5h) |
+| P8 | Add preemption config toggles | 3 | S (1–2h) |
+| P9 | Add Prometheus metrics for reservation/queue state | 4 | S (2–3h) |
+| P10 | Update config.yaml and README with new slot config | 4 | S (1–2h) |
+
+### Interleaving with Related Open Items
+
+| Related Item | Recommended Sequence |
+|-------------|--------------------|
+| **LP-0MQMC4MKY006J08E** (Prompt-cache / session reuse tests) | Execute after Phase 1 (P1–P3) — tests should verify cache preservation under reservation |
+| **LP-0MQMC4MNU002QJK4** (Slot-cache retention & cleanup) | Can be done in parallel with any phase — orthogonal to reservation |
+| **LP-0MQ0PYH8P008DLPJ** (Web based logging per slot) | Coordinate with Phase 4 (P9) — both touch metrics/logging infrastructure |
