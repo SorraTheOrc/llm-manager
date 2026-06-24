@@ -45,6 +45,31 @@ Notes
 - The repository was pushed to `git@github.com:SorraTheOrc/llm-manager.git` and `origin` is configured to point to it.
 - Before running integration or Playwright tests ensure the local llama-server (or a compatible mock) is available and any long model loading has completed — requests may return 503 while the model loads.
 
+Configuration
+-------------
+
+Key server configuration in `proxy/config.yaml` under `server:`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `slot_management.slot_pool_size` | `4` | Number of slots (GPU contexts) for job-level slot ownership. |
+| `slot_management.slot_queue_max_depth` | `16` | Maximum jobs waiting in queue when all slots busy. |
+| `slot_management.slot_job_timeout_seconds` | `300.0` | Seconds of inactivity before releasing a job's slot. |
+| `slot_management.slot_queue_overflow_retry_after` | `900` | Seconds in Retry-After header on queue overflow. |
+
+When `slot_management` is present in config, the JobScheduler assigns each
+multi-turn conversation (session) to a slot for its entire lifetime,
+eliminating save/restore overhead between turns. When absent, the previous
+hash-based slot assignment with save/restore is used.
+
+Existing session slot settings (used when `slot_management` is absent):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `session_slot_pool_size` | `1` | Number of slots for hash-based assignment. |
+| `session_slot_save_path` | `./slot-cache` | Directory for KV cache snapshots. |
+| `session_slot_timeout_seconds` | `3.0` | Slot save/restore timeout in seconds. |
+
 Contributing
 - Open issues and PRs in the `SorraTheOrc/llm-manager` repo. If you want changes merged upstream to `rgardler/llm`, open a PR from this repo to the upstream repository.
 
