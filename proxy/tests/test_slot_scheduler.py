@@ -390,3 +390,154 @@ class TestEdgeCases:
             assert result is None
         finally:
             await cleanup_scheduler(s)
+
+
+# ===================================================================
+# Active request tracking
+# ===================================================================
+
+
+class TestActiveRequestTracking:
+    """Tests for mark_request_start / mark_request_end."""
+
+    @pytest.mark.asyncio
+    async def test_mark_request_start_increments_counter(self):
+        """mark_request_start increments the active_requests counter."""
+        s = await make_scheduler()
+        try:
+            await s.admit_job("session-a")
+            slot_id = s.active_jobs["session-a"]
+
+            assert s.slots[slot_id].active_requests == 0
+
+            await s.mark_request_start(slot_id)
+            assert s.slots[slot_id].active_requests == 1
+
+            await s.mark_request_start(slot_id)
+            assert s.slots[slot_id].active_requests == 2
+        finally:
+            await cleanup_scheduler(s)
+
+    @pytest.mark.asyncio
+    async def test_mark_request_end_decrements_counter(self):
+        """mark_request_end decrements the active_requests counter."""
+        s = await make_scheduler()
+        try:
+            await s.admit_job("session-a")
+            slot_id = s.active_jobs["session-a"]
+
+            await s.mark_request_start(slot_id)
+            await s.mark_request_start(slot_id)
+            assert s.slots[slot_id].active_requests == 2
+
+            await s.mark_request_end(slot_id)
+            assert s.slots[slot_id].active_requests == 1
+
+            await s.mark_request_end(slot_id)
+            assert s.slots[slot_id].active_requests == 0
+        finally:
+            await cleanup_scheduler(s)
+
+    @pytest.mark.asyncio
+    async def test_mark_request_end_does_not_go_below_zero(self):
+        """mark_request_end does not decrement below zero."""
+        s = await make_scheduler()
+        try:
+            await s.admit_job("session-a")
+            slot_id = s.active_jobs["session-a"]
+
+            assert s.slots[slot_id].active_requests == 0
+            await s.mark_request_end(slot_id)
+            assert s.slots[slot_id].active_requests == 0
+        finally:
+            await cleanup_scheduler(s)
+
+    @pytest.mark.asyncio
+    async def test_mark_request_start_unknown_slot_no_error(self):
+        """mark_request_start on unknown slot is a no-op."""
+        s = await make_scheduler()
+        try:
+            # Should not raise
+            await s.mark_request_start(999)
+        finally:
+            await cleanup_scheduler(s)
+
+    @pytest.mark.asyncio
+    async def test_mark_request_end_unknown_slot_no_error(self):
+        """mark_request_end on unknown slot is a no-op."""
+        s = await make_scheduler()
+        try:
+            await s.mark_request_end(999)
+        finally:
+            await cleanup_scheduler(s)
+
+
+# ===================================================================
+# Timeout check with active requests
+# ===================================================================
+
+
+class TestTimeoutWithActiveRequests:
+    """Tests that _check_timeouts_now skips slots with active requests."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_skips_slot_with_active_request(self):
+        """A slot with an active request is NOT released by timeout."""
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.01)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            # Mark request as active
+            await sched.mark_request_start(slot_id)
+
+            # Wait for timeout period
+            await asyncio.sleep(0.02)
+            await sched._check_timeouts_now()
+
+            # Slot should still be owned (not released)
+            assert "session-a" in sched.active_jobs
+            assert sched.slots[slot_id].state == "Owned"
+            assert sched.slots[slot_id].active_requests == 1
+        finally:
+            await sched.stop()
+
+    @pytest.mark.asyncio
+    async def test_timeout_releases_after_request_ends(self):
+        """After request ends, idle timeout releases the slot normally."""
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.01)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            # Mark request active then end it
+            await sched.mark_request_start(slot_id)
+            await sched.mark_request_end(slot_id)
+
+            # Wait for timeout period
+            await asyncio.sleep(0.02)
+            await sched._check_timeouts_now()
+
+            # Slot should be released now
+            assert "session-a" not in sched.active_jobs
+            assert sched.slots[slot_id].state == "Idle"
+        finally:
+            await sched.stop()
+
+    @pytest.mark.asyncio
+    async def test_release_slot_resets_active_requests(self):
+        """release_slot resets the active_requests counter to zero."""
+        s = await make_scheduler()
+        try:
+            await s.admit_job("session-a")
+            slot_id = s.active_jobs["session-a"]
+
+            await s.mark_request_start(slot_id)
+            assert s.slots[slot_id].active_requests == 1
+
+            await s.release_slot(slot_id)
+            assert s.slots[slot_id].active_requests == 0
+        finally:
+            await cleanup_scheduler(s)

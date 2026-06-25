@@ -29,9 +29,13 @@ Usage:
 """
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Union
+
+
+logger = logging.getLogger(__name__)
 
 
 # ===================================================================
@@ -48,6 +52,7 @@ class SlotState:
     job_id: Optional[str] = None
     job_assigned_at: Optional[float] = None
     job_last_request_at: Optional[float] = None
+    active_requests: int = 0
 
 
 @dataclass
@@ -134,7 +139,12 @@ class JobScheduler:
         """
         # Case 1: Job already owns a slot — return the slot
         if session_id in self.active_jobs:
-            return AdmitResult(kind="ASSIGNED", slot_id=self.active_jobs[session_id])
+            slot_id = self.active_jobs[session_id]
+            logger.info(
+                "scheduler admit_job re-entry session=%s slot=%s",
+                session_id[:8], slot_id,
+            )
+            return AdmitResult(kind="ASSIGNED", slot_id=slot_id)
 
         # Case 2: Find an idle slot
         for slot_id, slot_state in self.slots.items():
@@ -146,10 +156,18 @@ class JobScheduler:
                 slot_state.job_last_request_at = now
                 self.active_jobs[session_id] = slot_id
                 self.slot_to_job[slot_id] = session_id
+                logger.info(
+                    "scheduler admit_job assign session=%s slot=%s",
+                    session_id[:8], slot_id,
+                )
                 return AdmitResult(kind="ASSIGNED", slot_id=slot_id)
 
         # Case 3: All slots busy — try to enqueue
         if self.queue.full():
+            logger.info(
+                "scheduler queue full session=%s",
+                session_id[:8],
+            )
             return AdmitResult(
                 kind="REJECTED_503",
                 retry_after=self.queue_overflow_retry_after,
@@ -164,6 +182,10 @@ class JobScheduler:
             enqueue_time=time.monotonic(),
             request_count=0,
         ))
+        logger.info(
+            "scheduler queue session=%s position=%s",
+            session_id[:8], position,
+        )
         return AdmitResult(kind="QUEUED", position=position)
 
     async def reenter_job(self, session_id: str) -> Optional[int]:
@@ -178,8 +200,33 @@ class JobScheduler:
             # Update last request time
             if slot_id in self.slots:
                 self.slots[slot_id].job_last_request_at = time.monotonic()
+            logger.info(
+                "scheduler reenter_job session=%s slot=%s",
+                session_id[:8], slot_id,
+            )
             return slot_id
         return None
+
+    async def mark_request_start(self, slot_id: int) -> None:
+        """
+        Mark that a request has started on the given slot.
+
+        This increments the active-request counter, preventing the
+        background timeout check from releasing the slot while a
+        request is actively being served.
+        """
+        if slot_id in self.slots:
+            self.slots[slot_id].active_requests += 1
+
+    async def mark_request_end(self, slot_id: int) -> None:
+        """
+        Mark that a request has ended on the given slot.
+
+        Decrements the active-request counter. Must be called in a
+        finally block paired with mark_request_start.
+        """
+        if slot_id in self.slots and self.slots[slot_id].active_requests > 0:
+            self.slots[slot_id].active_requests -= 1
 
     async def release_slot(self, slot_id: int) -> None:
         """
@@ -197,12 +244,21 @@ class JobScheduler:
         if slot_state.state == "Idle":
             return
 
-        # Clear ownership
         job_id = slot_state.job_id
+
+        # Log the release reason (caller should pass context, but we log generically)
+        logger.info(
+            "scheduler release_slot slot=%s job=%s",
+            slot_id,
+            (job_id[:8] if job_id else "none"),
+        )
+
+        # Clear ownership
         slot_state.state = "Idle"
         slot_state.job_id = None
         slot_state.job_assigned_at = None
         slot_state.job_last_request_at = None
+        slot_state.active_requests = 0
 
         if job_id and job_id in self.active_jobs:
             del self.active_jobs[job_id]
@@ -220,6 +276,11 @@ class JobScheduler:
                 slot_state.job_last_request_at = now
                 self.active_jobs[queued_job.tenant_id] = slot_id
                 self.slot_to_job[slot_id] = queued_job.tenant_id
+                logger.info(
+                    "scheduler queue_assign slot=%s session=%s",
+                    slot_id,
+                    (queued_job.tenant_id[:8] if queued_job.tenant_id else "none"),
+                )
             except asyncio.QueueEmpty:
                 pass  # No more jobs; slot stays Idle
 
@@ -227,15 +288,25 @@ class JobScheduler:
         """
         Single-pass timeout check. Releases all jobs that have been idle
         for longer than self.job_timeout.
+
+        Skips slots that have active requests in flight to prevent
+        premature release during a streaming response.
         """
         now = time.monotonic()
         for slot_id, slot_state in self.slots.items():
             if (
                 slot_state.state == "Owned"
                 and slot_state.job_last_request_at is not None
+                and slot_state.active_requests == 0
             ):
                 idle_time = now - slot_state.job_last_request_at
                 if idle_time > self.job_timeout:
+                    logger.warning(
+                        "scheduler timeout slot=%s job=%s idle=%.1fs",
+                        slot_id,
+                        (slot_state.job_id[:8] if slot_state.job_id else "none"),
+                        idle_time,
+                    )
                     await self.release_slot(slot_id)
 
     async def _periodic_timeout_check(self) -> None:

@@ -557,7 +557,30 @@ async def _invalidate_session_and_slot(
     session_id: Optional[str],
     reason: str,
     slot_filename: Optional[str],
+    scheduler: Optional[Any] = None,
+    scheduler_slot_id: Optional[int] = None,
 ) -> None:
+    """
+    Invalidate a session, clean up its slot file, and optionally release
+    the JobScheduler-owned slot.
+
+    Args:
+        session_id: The session to invalidate.
+        reason: Invalidation reason string.
+        slot_filename: Path to the slot persistence file to remove.
+        scheduler: Optional JobScheduler instance. If provided together
+            with scheduler_slot_id, the scheduler slot is released before
+            session invalidation.
+        scheduler_slot_id: Slot ID to release via the JobScheduler.
+    """
+    # Release scheduler-owned slot first (before session invalidation
+    # so queued jobs can be assigned promptly).
+    if scheduler is not None and scheduler_slot_id is not None:
+        try:
+            await scheduler.release_slot(scheduler_slot_id)
+        except Exception:
+            pass
+
     if session_id:
         try:
             srv = _srv()

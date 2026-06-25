@@ -54,7 +54,7 @@ Key server configuration in `proxy/config.yaml` under `server:`:
 |-----|---------|-------------|
 | `slot_management.slot_pool_size` | `4` | Number of slots (GPU contexts) for job-level slot ownership. |
 | `slot_management.slot_queue_max_depth` | `16` | Maximum jobs waiting in queue when all slots busy. |
-| `slot_management.slot_job_timeout_seconds` | `300.0` | Seconds of inactivity before releasing a job's slot. |
+| `slot_management.slot_job_timeout_seconds` | `300.0` | Seconds of inactivity before releasing a job's slot. The timeout check skips slots with an active request in flight to prevent premature slot release during long streaming responses. |
 | `slot_management.slot_queue_overflow_retry_after` | `900` | Seconds in Retry-After header on queue overflow. |
 
 When `slot_management` is present in config, the JobScheduler assigns each

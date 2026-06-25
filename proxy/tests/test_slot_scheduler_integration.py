@@ -298,3 +298,142 @@ class TestRouterIntegration:
             assert r2.kind == "ASSIGNED"
         finally:
             await sched.stop()
+
+
+# ===================================================================
+# Active-request tracking (streaming protection)
+# ===================================================================
+
+
+class TestActiveRequestStreaming:
+    """Integration tests for active-request tracking during streaming."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_longer_than_timeout_no_release(self):
+        """
+        Simulates a streaming response longer than slot_job_timeout_seconds.
+
+        Verifies the slot is NOT released mid-stream when active_requests > 0.
+        """
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.02)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            # Mark request as active (simulating start of streaming)
+            await sched.mark_request_start(slot_id)
+
+            # Wait significantly longer than timeout
+            await asyncio.sleep(0.05)
+
+            # Run timeout check
+            await sched._check_timeouts_now()
+
+            # Slot should NOT have been released (active request in flight)
+            assert "session-a" in sched.active_jobs, (
+                "Session should still own slot during active request"
+            )
+            assert sched.slots[slot_id].state == "Owned"
+            assert sched.slots[slot_id].active_requests == 1
+
+            # Now end the request
+            await sched.mark_request_end(slot_id)
+
+            # Wait for timeout
+            await asyncio.sleep(0.03)
+            await sched._check_timeouts_now()
+
+            # Slot should be released now (no active request)
+            assert "session-a" not in sched.active_jobs, (
+                "Session should be released after request ends and timeout expires"
+            )
+            assert sched.slots[slot_id].state == "Idle"
+        finally:
+            await sched.stop()
+
+    @pytest.mark.asyncio
+    async def test_queue_drain_during_active_stream(self):
+        """Queued jobs should not preempt a slot with an active request."""
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.02)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            # Queue another job
+            await sched.admit_job("session-b")
+            assert sched.queue.qsize() == 1
+
+            # Mark request active
+            await sched.mark_request_start(slot_id)
+
+            # Wait past timeout
+            await asyncio.sleep(0.05)
+            await sched._check_timeouts_now()
+
+            # Session-a should still own the slot
+            assert "session-a" in sched.active_jobs
+            assert sched.queue.qsize() == 1  # session-b still queued
+
+            # End request and re-check
+            await sched.mark_request_end(slot_id)
+            await asyncio.sleep(0.03)
+            await sched._check_timeouts_now()
+
+            # Session-b should now get the slot
+            assert "session-a" not in sched.active_jobs
+            assert sched.active_jobs.get("session-b") == slot_id
+            assert sched.queue.empty()
+        finally:
+            await sched.stop()
+
+
+# ===================================================================
+# Session invalidation releases scheduler slot
+# ===================================================================
+
+
+class TestInvalidationReleasesSchedulerSlot:
+    """Tests that _invalidate_session_and_slot releases the scheduler slot."""
+
+    @pytest.mark.asyncio
+    async def test_invalidation_releases_scheduler_slot(self):
+        """
+        When _invalidate_session_and_slot is called with a scheduler
+        reference, the scheduler slot is released.
+        """
+        from proxy.session import _invalidate_session_and_slot
+
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=300.0)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            # Invalidate with scheduler reference
+            await _invalidate_session_and_slot(
+                "session-a",
+                reason="test_invalidation",
+                slot_filename=None,
+                scheduler=sched,
+                scheduler_slot_id=slot_id,
+            )
+
+            # Scheduler slot should be released
+            assert "session-a" not in sched.active_jobs
+            assert sched.slots[slot_id].state == "Idle"
+        finally:
+            await sched.stop()
+
+    @pytest.mark.asyncio
+    async def test_invalidation_without_scheduler_no_error(self):
+        """Calling _invalidate_session_and_slot without a scheduler works."""
+        from proxy.session import _invalidate_session_and_slot
+
+        # Should not raise
+        await _invalidate_session_and_slot(
+            "test-session",
+            reason="test_no_scheduler",
+            slot_filename=None,
+        )

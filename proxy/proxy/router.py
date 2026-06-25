@@ -197,6 +197,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     "scheduler assigned slot %s to session %s",
                     slot_id, session_id[:8] if session_id else "unknown",
                 )
+                await scheduler.mark_request_start(slot_id)
             elif admit_result.kind == "QUEUED":
                 raise HTTPException(
                     status_code=503,
@@ -690,17 +691,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                             )
                                         )
                                         if session_id and should_invalidate:
-                                            # Release scheduler slot if active
-                                            scheduler = _get_job_scheduler()
-                                            if (
-                                                scheduler is not None
-                                                and slot_id is not None
-                                            ):
-                                                await scheduler.release_slot(slot_id)
                                             await _invalidate_session_and_slot(
                                                 session_id,
                                                 f"guardrail_{guardrail_reason}",
                                                 slot_filename,
+                                                scheduler=scheduler,
+                                                scheduler_slot_id=slot_id,
                                             )
                                             slot_save_allowed = False
                                         break
@@ -874,6 +870,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             except Exception:
                                 pass
                             # decrement active queries when streaming finishes
+                            if scheduler is not None and slot_id is not None:
+                                await scheduler.mark_request_end(slot_id)
                             await _decrement_active_queries(srv)
 
                     return StreamingResponse(
@@ -1126,6 +1124,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                     finally:
                         await _decrement_active_queries(srv)
+                        if scheduler is not None and slot_id is not None:
+                            await scheduler.mark_request_end(slot_id)
         except SessionSingleFlightRejected as exc:
             await _decrement_active_queries(srv)
             payload = {
