@@ -115,6 +115,8 @@ async def index(request: Request):
     html_content = html_content.replace('__CURRENT_MODEL_JS__', srv.current_model or 'None')
     html_content = html_content.replace('__LOCAL_MODEL_NAMES_JSON__', local_model_names_json)
     html_content = html_content.replace('__BASE__', base)
+    html_content = html_content.replace('__LLAMA_SERVER_VERSION__', srv.llama_server_version)
+    html_content = html_content.replace('__ROCM_VERSION__', srv.rocm_version)
 
     # Inject router script
     router_script = f'<script>window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'
@@ -380,6 +382,10 @@ async def view_logs(request: Request):
     # Replace placeholders with empty containers; client will render using INITIAL_STATS
     html = html.replace('{counts_html}', '')
     html = html.replace('{tokens_html}', '')
+
+    # Inject version info placeholders
+    html = html.replace('__LLAMA_SERVER_VERSION__', srv.llama_server_version)
+    html = html.replace('__ROCM_VERSION__', srv.rocm_version)
 
     # Inject initial stats and model list script before </body>
     log_viewer_script = f'<script>window.__INITIAL_STATS = {initial_stats_json}; window.__MODEL_LIST = {model_list_json}; window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'

@@ -57,6 +57,10 @@ model_switch_refcount: int = 0
 # Lock to protect model_switch_refcount updates across threads
 model_switch_refcount_lock = threading.Lock()
 
+# Version information captured at startup (llama-server and ROCm)
+llama_server_version: str = "unknown"
+rocm_version: str = "unknown"
+
 # Session manager for incremental prompt ingestion
 session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
 
@@ -139,7 +143,85 @@ logger: logging.Logger = logging.getLogger("llama-proxy")
 # SSE clients for real-time status updates
 
 
+async def _capture_llama_server_version() -> str:
+    """Capture the llama-server version by running `llama-server --version`.
 
+    Runs once at startup. Returns the version string or "unknown" on failure.
+    """
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["llama-server", "--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            logger.warning("llama-server --version returned %d", result.returncode)
+            return "unknown"
+        stdout = result.stdout.strip()
+        if not stdout:
+            return "unknown"
+        # Return the first non-empty line as the version string
+        # Typical outputs: "build: 4321 (abc12345)" or "version: X.Y.Z (deadbeef)"
+        lines = stdout.split("\n")
+        for line in lines:
+            line = line.strip()
+            if line:
+                return line
+        return "unknown"
+    except FileNotFoundError:
+        logger.warning("llama-server not found in PATH")
+        return "unknown"
+    except subprocess.TimeoutExpired:
+        logger.warning("llama-server --version timed out")
+        return "unknown"
+    except Exception as e:
+        logger.warning("Failed to capture llama-server version: %s", e)
+        return "unknown"
+
+
+async def _capture_rocm_version() -> str:
+    """Capture the ROCm version by running `rocm-smi --showtag`.
+
+    Falls back to `rocm-smi --version` if --showtag is unavailable.
+    Returns the version string or "unknown" on failure.
+    """
+    # Try primary command: rocm-smi --showtag
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["rocm-smi", "--showtag"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            stdout = result.stdout.strip()
+            if stdout:
+                return stdout
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as e:
+        logger.warning("rocm-smi --showtag failed: %s", e)
+
+    # Fallback: rocm-smi --version
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["rocm-smi", "--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            stdout = result.stdout.strip()
+            if stdout:
+                return stdout
+    except FileNotFoundError:
+        logger.warning("rocm-smi not found in PATH")
+    except subprocess.TimeoutExpired:
+        logger.warning("rocm-smi --version timed out")
+    except Exception as e:
+        logger.warning("rocm-smi --version failed: %s", e)
+
+    return "unknown"
 
 
 @asynccontextmanager
@@ -165,6 +247,22 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(5.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
     )
+
+    # Capture llama-server and ROCm versions asynchronously at startup.
+    # These are best-effort, non-blocking captures. If either command fails
+    # or is unavailable, the version remains "unknown" and the server continues.
+    loop = asyncio.get_running_loop()
+
+    async def _capture_versions():
+        global llama_server_version, rocm_version
+        llama_server_version = await _capture_llama_server_version()
+        rocm_version = await _capture_rocm_version()
+        logger.info(
+            "Version info: llama-server=%s, ROCm=%s",
+            llama_server_version, rocm_version
+        )
+
+    loop.create_task(_capture_versions())
 
     # One-time podman rootless state reset. After a reboot, crash-loop, or
     # when the service was previously run under incompatible systemd sandbox
