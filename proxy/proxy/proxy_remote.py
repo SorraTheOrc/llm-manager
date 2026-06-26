@@ -144,6 +144,9 @@ async def _handle_remote_streaming(
     async def stream_generator():
         saw_done = False
         saw_finish = False
+        # Client disconnect detection (LP-0MQTHP828000JYM6)
+        disconnected = False
+        _disconnect_check_count = 0
         try:
             async for chunk in response.aiter_bytes():
                 try:
@@ -174,10 +177,23 @@ async def _handle_remote_streaming(
                         await _schedule_recv_token_increment(key, chunk_tokens)
                 except Exception:
                     pass
+
+                # Check for client disconnect periodically (LP-0MQTHP828000JYM6)
+                _disconnect_check_count += 1
+                if _disconnect_check_count % 10 == 0:
+                    try:
+                        _dc = await request.is_disconnected()
+                        if isinstance(_dc, bool) and _dc:
+                            disconnected = True
+                            break
+                    except Exception:
+                        pass
+
                 yield chunk
                 log_response_chunk(chunk)
             # Synthesize final SSE event if upstream closed without finish marker.
-            if not saw_done and not saw_finish:
+            # Skip if client disconnected (LP-0MQTHP828000JYM6)
+            if not disconnected and not saw_done and not saw_finish:
                 final_obj = {
                     "choices": [
                         {"delta": {}, "finish_reason": "stop", "index": 0}

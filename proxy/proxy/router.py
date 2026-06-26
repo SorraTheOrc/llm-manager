@@ -549,6 +549,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         collected_content: list[str] = []
                         saw_done = False
                         saw_finish = False
+                        # Client disconnect detection (LP-0MQTHP828000JYM6)
+                        disconnected = False
+                        _disconnect_check_count = 0
                         try:
                             async for chunk in response.aiter_bytes():
                                 # count tokens in this chunk (best-effort)
@@ -712,10 +715,27 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     except Exception:
                                         pass
 
+                                # Check for client disconnect periodically (LP-0MQTHP828000JYM6)
+                                _disconnect_check_count += 1
+                                if _disconnect_check_count % 10 == 0:
+                                    try:
+                                        _dc = await request.is_disconnected()
+                                        if isinstance(_dc, bool) and _dc:
+                                            disconnected = True
+                                            srv.logger.info(
+                                                "client_disconnect session=%s slot=%s",
+                                                session_id[:8] if session_id else "unknown",
+                                                slot_id,
+                                            )
+                                            break
+                                    except Exception:
+                                        pass
+
                                 yield chunk
                                 log_response_chunk(chunk)
                             # Synthesize final SSE event if upstream closed without finish marker.
-                            if not saw_done and not saw_finish:
+                            # Skip if client disconnected (LP-0MQTHP828000JYM6)
+                            if not disconnected and not saw_done and not saw_finish:
                                 finish_reason = (
                                     "stop"
                                     if not guardrail_reason
@@ -866,9 +886,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 await client.aclose()
                             except Exception:
                                 pass
-                            # decrement active queries when streaming finishes
-                            if scheduler is not None and slot_id is not None:
-                                await scheduler.mark_request_end(slot_id)
+                            # If client disconnected, release scheduler slot entirely (LP-0MQTHP828000JYM6)
+                            if scheduler is not None:
+                                if disconnected and session_id:
+                                    await scheduler.remove_job(session_id)
+                                elif slot_id is not None:
+                                    await scheduler.mark_request_end(slot_id)
                             await _decrement_active_queries(srv)
 
                     return StreamingResponse(

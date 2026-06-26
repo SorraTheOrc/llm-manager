@@ -26,6 +26,9 @@ Usage:
     # On session end
     await scheduler.release_slot(slot_id)
     await scheduler.stop()
+
+    # On client disconnect (release slot or remove from queue)
+    await scheduler.remove_job(session_id)
 """
 
 import asyncio
@@ -112,6 +115,9 @@ class JobScheduler:
         self.job_timeout = job_timeout
         self.queue_overflow_retry_after = queue_overflow_retry_after
         self._timeout_check_task: Optional[asyncio.Task] = None
+        # Tracking for queued job removal (LP-0MQTHP828000JYM6)
+        self._queued_jobs: Dict[str, QueuedJob] = {}  # session_id -> QueuedJob
+        self._cancelled_jobs: set[str] = set()  # session_ids marked for removal
 
     async def start(self) -> None:
         """Start the scheduler (including background timeout checks)."""
@@ -176,12 +182,14 @@ class JobScheduler:
         # Determine queue position before enqueueing
         position = self.queue.qsize()
 
-        await self.queue.put(QueuedJob(
+        queued_job = QueuedJob(
             tenant_id=session_id,
             job_id=session_id,
             enqueue_time=time.monotonic(),
             request_count=0,
-        ))
+        )
+        self._queued_jobs[session_id] = queued_job
+        await self.queue.put(queued_job)
         logger.info(
             "scheduler queue session=%s position=%s",
             session_id[:8], position,
@@ -228,6 +236,38 @@ class JobScheduler:
         if slot_id in self.slots and self.slots[slot_id].active_requests > 0:
             self.slots[slot_id].active_requests -= 1
 
+    async def remove_job(self, session_id: str) -> bool:
+        """
+        Remove a job by session_id.
+
+        Handles two cases:
+        - If the session owns a slot: releases the slot (AC4)
+        - If the session is queued: marks the job as cancelled (AC3)
+
+        Returns True if any action was taken, False if the session was unknown.
+        """
+        # Case 1: Session owns a slot — release it
+        if session_id in self.active_jobs:
+            slot_id = self.active_jobs[session_id]
+            await self.release_slot(slot_id)
+            logger.info(
+                "scheduler remove_job slot session=%s slot=%s",
+                session_id[:8], slot_id,
+            )
+            return True
+
+        # Case 2: Session is queued — mark as cancelled
+        if session_id in self._queued_jobs:
+            self._cancelled_jobs.add(session_id)
+            del self._queued_jobs[session_id]
+            logger.info(
+                "scheduler remove_job queued session=%s",
+                session_id[:8],
+            )
+            return True
+
+        return False
+
     async def release_slot(self, slot_id: int) -> None:
         """
         Release a slot from its owning job.
@@ -265,24 +305,36 @@ class JobScheduler:
         if slot_id in self.slot_to_job:
             del self.slot_to_job[slot_id]
 
-        # Assign next job from queue
-        if not self.queue.empty():
+        # Assign next job from queue (skipping cancelled jobs)
+        while not self.queue.empty():
             try:
                 queued_job = self.queue.get_nowait()
-                now = time.monotonic()
-                slot_state.state = "Owned"
-                slot_state.job_id = queued_job.tenant_id
-                slot_state.job_assigned_at = now
-                slot_state.job_last_request_at = now
-                self.active_jobs[queued_job.tenant_id] = slot_id
-                self.slot_to_job[slot_id] = queued_job.tenant_id
-                logger.info(
-                    "scheduler queue_assign slot=%s session=%s",
-                    slot_id,
-                    (queued_job.tenant_id[:8] if queued_job.tenant_id else "none"),
-                )
             except asyncio.QueueEmpty:
-                pass  # No more jobs; slot stays Idle
+                break
+
+            # Skip cancelled jobs
+            if queued_job.tenant_id in self._cancelled_jobs:
+                self._cancelled_jobs.discard(queued_job.tenant_id)
+                if queued_job.tenant_id in self._queued_jobs:
+                    del self._queued_jobs[queued_job.tenant_id]
+                continue
+
+            now = time.monotonic()
+            slot_state.state = "Owned"
+            slot_state.job_id = queued_job.tenant_id
+            slot_state.job_assigned_at = now
+            slot_state.job_last_request_at = now
+            self.active_jobs[queued_job.tenant_id] = slot_id
+            self.slot_to_job[slot_id] = queued_job.tenant_id
+            if queued_job.tenant_id in self._queued_jobs:
+                del self._queued_jobs[queued_job.tenant_id]
+            logger.info(
+                "scheduler queue_assign slot=%s session=%s",
+                slot_id,
+                (queued_job.tenant_id[:8] if queued_job.tenant_id else "none"),
+            )
+            return  # Job assigned; slot no longer idle
+        # No more valid jobs; slot stays Idle
 
     async def _check_timeouts_now(self) -> None:
         """
