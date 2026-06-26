@@ -714,37 +714,34 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                                 yield chunk
                                 log_response_chunk(chunk)
-                        finally:
                             # Synthesize final SSE event if upstream closed without finish marker.
-                            try:
-                                if not saw_done and not saw_finish:
-                                    try:
-                                        finish_reason = (
-                                            "stop"
-                                            if not guardrail_reason
-                                            else "stop"
-                                        )
-                                        final_obj = {
-                                            "choices": [
-                                                {
-                                                    "delta": {},
-                                                    "finish_reason": finish_reason,
-                                                    "index": 0,
-                                                }
-                                            ]
+                            if not saw_done and not saw_finish:
+                                finish_reason = (
+                                    "stop"
+                                    if not guardrail_reason
+                                    else "stop"
+                                )
+                                final_obj = {
+                                    "choices": [
+                                        {
+                                            "delta": {},
+                                            "finish_reason": finish_reason,
+                                            "index": 0,
                                         }
-                                        final_bytes = (
-                                            f"data: {json.dumps(final_obj)}\n\n"
-                                        ).encode("utf-8")
-                                        yield final_bytes
-                                        log_response_chunk(
-                                            final_bytes
-                                        )
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-
+                                    ]
+                                }
+                                final_bytes = (
+                                    f"data: {json.dumps(final_obj)}\n\n"
+                                ).encode("utf-8")
+                                yield final_bytes
+                                log_response_chunk(
+                                    final_bytes
+                                )
+                        except GeneratorExit:
+                            # Client disconnected or generator is being closed.
+                            # Skip the final event yield and proceed directly to cleanup.
+                            pass
+                        finally:
                             # Strict restore confirmation state comes from explicit backend signal.
                             if session_id:
                                 try:

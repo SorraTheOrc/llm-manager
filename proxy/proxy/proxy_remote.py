@@ -176,22 +176,24 @@ async def _handle_remote_streaming(
                     pass
                 yield chunk
                 log_response_chunk(chunk)
+            # Synthesize final SSE event if upstream closed without finish marker.
+            if not saw_done and not saw_finish:
+                final_obj = {
+                    "choices": [
+                        {"delta": {}, "finish_reason": "stop", "index": 0}
+                    ]
+                }
+                final_bytes = (
+                    f"data: {json.dumps(final_obj)}\n\n"
+                ).encode("utf-8")
+                yield final_bytes
+                log_response_chunk(final_bytes)
+        except GeneratorExit:
+            # Client disconnected or generator is being closed.
+            # Skip the final event yield and proceed directly to cleanup.
+            pass
         finally:
             try:
-                if not saw_done and not saw_finish:
-                    try:
-                        final_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "stop", "index": 0}
-                            ]
-                        }
-                        final_bytes = (
-                            f"data: {json.dumps(final_obj)}\n\n"
-                        ).encode("utf-8")
-                        yield final_bytes
-                        log_response_chunk(final_bytes)
-                    except Exception:
-                        pass
                 await cm.__aexit__(None, None, None)
             except Exception:
                 try:
