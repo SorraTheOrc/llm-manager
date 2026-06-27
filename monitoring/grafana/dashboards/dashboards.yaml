@@ -1,0 +1,21 @@
+# Grafana dashboard provisioning
+#
+# Place this file in Grafana's provisioning/dashboards directory so that
+# dashboards in the configured path are loaded automatically on startup:
+#
+#   <grafana_home>/conf/provisioning/dashboards/dashboards.yaml
+#
+# See monitoring/README.md for full deployment instructions.
+
+apiVersion: 1
+
+providers:
+  - name: "default"
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: ${grafana_home}/conf/provisioning/dashboards
+      foldersFromFilesStructure: false
