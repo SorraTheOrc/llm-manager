@@ -3,7 +3,7 @@ Container image for llama-server
 
 Overview
 --------
-This directory contains a Containerfile and build script to produce an image that runs `start-llama.sh` inside a container. The goal is to create a self-contained image that can be run under a system-level container runtime (podman) for production use, avoiding reliance on distrobox and per-user namespaces.
+This directory contains a Containerfile and build script to produce an image that runs `start-llama.sh` inside a container. The goal is to create a self-contained image that can be run under a system-level container runtime (podman) for production use.
 
 How it works
 ------------

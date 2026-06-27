@@ -48,58 +48,36 @@ class FakeProc:
         return
 
 
-def test_host_start_success(monkeypatch, tmp_path):
-    # Host-start allowed and host command spawns a long-running process
-    dummy = DummySrv({"server": {"llama_allow_host_fallback": True}})
+def test_start_script_success(monkeypatch):
+    """Start script spawns a long-running process successfully."""
+    dummy = DummySrv({"server": {}})
     monkeypatch.setattr(lifecycle, "_srv", lambda: dummy)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)  # No-op sleep
 
     def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
-        # Simulate a long-running host process when start-llama.sh is invoked
-        if isinstance(cmd, list) and cmd[0].endswith("start-llama.sh"):
+        if isinstance(cmd, list) and len(cmd) > 0 and cmd[0].endswith("start-llama.sh"):
             return FakeProc()
         raise FileNotFoundError(cmd[0])
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
-    # Ensure distrobox exists to avoid early failure
-    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/distrobox" if name == "distrobox" else None)
 
     proc = lifecycle.start_llama_server("mymodel")
     assert proc is not None
     assert hasattr(proc, "communicate")
 
 
-def test_host_start_fails_fallback_to_distrobox(monkeypatch):
-    # Host-start attempted but FileNotFoundError; distrobox path succeeds
-    dummy = DummySrv({"server": {"llama_allow_host_fallback": True}})
+def test_start_script_fails_after_retries(monkeypatch):
+    """When the start script fails repeatedly, start_llama_server returns None and sets last_start_failure."""
+    dummy = DummySrv({"server": {}})
     monkeypatch.setattr(lifecycle, "_srv", lambda: dummy)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)  # No-op sleep
 
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
-        # If distrobox is invoked, return a running process, otherwise raise
-        if isinstance(cmd, list) and cmd[0] == "distrobox":
-            return FakeProc()
-        raise FileNotFoundError(cmd[0])
+    def failing_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        raise FileNotFoundError(f"{cmd[0]} not found")
 
-    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/distrobox" if name == "distrobox" else None)
-
-    proc = lifecycle.start_llama_server("mymodel")
-    assert proc is not None
-    assert hasattr(proc, "communicate")
-
-
-def test_distrobox_missing_and_no_host_fallback(monkeypatch):
-    # No distrobox installed and host-fallback disabled -> start fails
-    dummy = DummySrv({"server": {"llama_allow_host_fallback": False}})
-    monkeypatch.setattr(lifecycle, "_srv", lambda: dummy)
-
-    # Ensure distrobox which() returns None
-    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: None)
-
-    # Popen should not be called; but if it is, raise to fail loudly
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
-        raise RuntimeError("unexpected popen")
-
-    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", failing_popen)
 
     proc = lifecycle.start_llama_server("mymodel")
     assert proc is None
+    assert dummy.last_start_failure is not None
+    assert "Failed to start llama-server" in dummy.last_start_failure

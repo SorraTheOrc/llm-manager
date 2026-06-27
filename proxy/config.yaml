@@ -169,7 +169,6 @@ models:
     - code
     force_full_prompt: true
 server:
-  distrobox_name: llama
   embeddings_model: mxbai-embed
   host: 0.0.0.0
   # Fallback to host start is not permitted in production. This flag is

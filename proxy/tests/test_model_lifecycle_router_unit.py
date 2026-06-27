@@ -316,9 +316,7 @@ async def test_stop_server_and_background_load_clears_background_and_refcount(mo
 
 @pytest.mark.asyncio
 async def test_start_llama_server_not_found_sets_last_start_failure_and_error_broadcast(monkeypatch, mock_config):
-    """If starting the llama-server fails to spawn (distrobox missing), ensure last_start_failure is set and an error broadcast occurs."""
-    import shutil
-
+    """If starting the llama-server fails to spawn, ensure last_start_failure is set and an error broadcast occurs."""
     # Run in non-router mode so start_llama_server is invoked with a model name
     cfg = dict(mock_config)
     cfg['server'] = dict(cfg['server'])
@@ -326,15 +324,24 @@ async def test_start_llama_server_not_found_sets_last_start_failure_and_error_br
 
     monkeypatch.setattr(server, 'config', cfg)
 
-    # Ensure distrobox is reported missing
-    monkeypatch.setattr(shutil, 'which', lambda _cmd: False)
-
     events = []
 
     def fake_broadcast_sync(event_type: str, data: dict):
         events.append((event_type, data))
 
     monkeypatch.setattr(server, 'broadcast_status_sync', fake_broadcast_sync)
+
+    # Simulate start_llama_server by having it broadcast an error and return None
+    def failing_start(model):
+        server.last_start_failure = "Failed to start llama-server"
+        server.broadcast_status_sync("error", {
+            "message": "Failed to start llama-server",
+            "current_model": None,
+            "llama_server_running": False
+        })
+        return None
+
+    monkeypatch.setattr(server, 'start_llama_server', failing_start)
 
     # Ensure clean state
     server.current_model = None

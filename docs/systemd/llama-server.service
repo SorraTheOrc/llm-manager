@@ -10,8 +10,7 @@ variant is documented below.
 ## User Service (Recommended)
 
 This is the recommended deployment approach for single-operator setups. It
-keeps the llama-server process under the operator's login session, aligning
-with the existing distrobox-based workflow while supporting host-first startup.
+keeps the llama-server process under the operator's login session.
 
 **File location**: `~/.config/systemd/user/llama-server.service`
 

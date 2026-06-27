@@ -67,7 +67,7 @@ if [[ "$router_mode" -eq 1 ]]; then
   echo
 
   # Prefer an explicit LLAMA_SERVER_BIN when provided (proxy exports this env var
-  # to force the distrobox start script to use a host-built binary). Fall back
+  # to use a host-built binary). Fall back
   # to the system `llama-server` on PATH or the literal name.
   if [[ -n "${LLAMA_SERVER_BIN:-}" ]]; then
     LLAMA_BIN="${LLAMA_SERVER_BIN}"

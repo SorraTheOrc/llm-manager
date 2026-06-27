@@ -20,29 +20,22 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 
 ## Host-first deployment
 
-The repository has transitioned from container-based (distrobox) llama-server hosting to a host-first startup model. Systemd unit files are no longer distributed from the repository, but example units are provided in `docs/systemd/` to help operators deploy and supervise the services.
+The repository uses a host-first startup model for llama-server. Systemd unit files are no longer distributed from the repository, but example units are provided in `docs/systemd/` to help operators deploy and supervise the services.
 
-### Host-fallback mechanism
+### Startup mechanism
 
-The proxy implements a host-fallback mechanism controlled by the `llama_allow_host_fallback` configuration option in `config.yaml`. When enabled, the proxy attempts to start llama-server directly on the host via `start-llama.sh` before falling back to distrobox.
-
-**Configuration:**
-```yaml
-server:
-  llama_allow_host_fallback: true  # Enable host-first startup
-  # llama_allow_host_fallback: false  # Use distrobox only (default fallback)
-```
+The proxy starts llama-server via the configured `llama_start_script` (default: `scripts/podman_start_llama.sh`). The start script uses podman to create and run a containerized llama-server.
 
 **Startup behavior (from `proxy/proxy/lifecycle.py`):**
-1. If `llama_allow_host_fallback` is `true`, the proxy first probes for an existing llama-server process on the expected port
-2. If no existing process is found, it attempts to start llama-server via `start-llama.sh` on the host
-3. If host start fails, it falls back to starting via distrobox (if available)
-4. If both fail, the proxy reports an error
+1. The proxy invokes the configured `llama_start_script` with the target model
+2. If the start script fails, the proxy retries up to 4 times with exponential backoff
+3. If all attempts fail, the proxy reports a clear error message
 
-To completely disable host-fallback and use distrobox only:
+### Configuration
+
 ```yaml
 server:
-  llama_allow_host_fallback: false
+  llama_start_script: /path/to/start-llama.sh  # Script to start llama-server
 ```
 
 ### Systemd service units
@@ -92,10 +85,10 @@ sudo journalctl -u llama-proxy.service -f
 ## Requirements
 
 - Python 3.10+
-- Distrobox with a container named `llama` containing llama-server (llama.cpp)
--- `/home/rgardler/projects/llm/start-llama.sh` script for starting llama-server
+- Podman with a container image containing llama-server (llama.cpp)
+- `/home/rgardler/projects/llm/start-llama.sh` script for starting llama-server
 
-See `../LLAMA_README.md` for distrobox setup instructions.
+See `../LLAMA_README.md` for build and setup instructions.
 
 ## Installation
 
@@ -196,7 +189,6 @@ server:
     - "embeddings"
     - "gemma4"    # preload the configured default model (gemma4)
   llama_models_max: 1
-  distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
   llama_startup_timeout: 300
   session_single_flight_mode: "queue"

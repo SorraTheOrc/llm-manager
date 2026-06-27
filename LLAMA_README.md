@@ -4,22 +4,14 @@
 # Install Podman
 sudo apt install podman -y
 
-# Install Distrobox (toolbox is not available in Ubuntu repos)
-curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sudo sh
-
 # Ensure you can run containers
 sudo loginctl enable-linger $USER
 ```
 
-# Build the contianer image
+# Build the container image
 
 ```bash
 podman build -t localhost/llama-rocm:gfx1151 -f Containerfile .
-
-distrobox create \
-  --name llama \
-  --image localhost/llama-rocm:gfx1151 \
-  --additional-flags "--device=/dev/kfd --device=/dev/dri --group-add=video --group-add=render --security-opt=seccomp=unconfined"
 ```
 
 # Building llama.cpp with SSL support
@@ -28,9 +20,6 @@ The `-hf` flag for downloading models from Hugging Face requires SSL support.
 Build llama.cpp with one of the following SSL options:
 
 ```bash
-# Enter the container
-distrobox enter llama
-
 # Navigate to llama.cpp source directory
 cd ~/llama.cpp  # or wherever your llama.cpp source is located
 
@@ -87,11 +76,9 @@ git -C ~/llama.cpp rev-parse HEAD
 # e97492369888f5311e4d1f3beb325a36bbed70e9
 ```
 
-To reproduce the build inside the llama distrobox container:
+To reproduce the build:
 
 ```bash
-# Enter the container
-distrobox enter llama
 cd ~/llama.cpp
 
 git fetch --all --tags
@@ -151,9 +138,7 @@ This significantly reduces CPU usage and latency for multi-turn conversations. S
 To run llama-server directly without the proxy:
 
 ```bash
-~/project/llmstart-llama.sh [model]
+~/project/llm/start-llama.sh [model]
 ```
 
-
 See Llama on Evo X1 - [pablo-ross/strix-halo-gmktec-evo-x2 ](https://github.com/pablo-ross/strix-halo-gmktec-evo-x2)
-

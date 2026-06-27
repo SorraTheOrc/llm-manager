@@ -302,7 +302,7 @@ async def lifespan(app: FastAPI):
     # startup and begin accepting connections immediately. This avoids
     # blocking systemd (which waits for the lifespan to complete) for the
     # full model-load time (potentially 5+ minutes) and also handles the
-    # boot-order race where distrobox/podman isn't ready yet.
+    # boot-order race where podman isn't ready yet.
     # Read default_model from config; default to gemma4 if not present
     default_model = config.get("default_model", "gemma4")
     router_mode = config.get("server", {}).get("llama_router_mode", False)

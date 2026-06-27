@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import sys
 import threading
 import time
@@ -650,16 +649,13 @@ async def router_preload_models(model_names: list[str]) -> bool:
 
 
 
-def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> Optional[subprocess.Popen]:
+def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     """Start the llama-server with the specified model.
 
-    Behavior:
-    - If prefer_distrobox=True the function will only attempt to start via distrobox.
-    - Otherwise, when `server.llama_allow_host_fallback` is true the function
-      will attempt to start on the host (via `start-llama.sh`) first and fall
-      back to distrobox if the host attempt fails to spawn quickly.
-    - Returns a subprocess.Popen object when a long-running process is started,
-      or None when startup failed immediately.
+    Starts llama-server via the configured `llama_start_script`
+    (default: `scripts/podman_start_llama.sh`).
+    Returns a subprocess.Popen object when a long-running process is started,
+    or None when startup failed after retries.
     """
     srv = _srv()
 
@@ -669,7 +665,6 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
        "llama_start_script",
        str(Path(__file__).parent.parent / "start-llama.sh")
     )
-    distrobox_name = server_config.get("distrobox_name", "llama")
     llama_port = server_config.get("llama_server_port", 8080)
 
     # Set environment variables
@@ -696,7 +691,7 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
        router_mode = True
 
     mode_label = "router" if router_mode else f"model: {model}"
-    srv.logger.info(f"Starting llama-server with {mode_label} (host-first={not prefer_distrobox})")
+    srv.logger.info(f"Starting llama-server with {mode_label}")
 
     # Rotate llama-server logs (keep last 15)
     if srv.log_dir:
@@ -762,7 +757,7 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
                pass
            return proc, None
 
-    # Build commands for host and distrobox
+    # Build the command for the configured start script
     if router_mode:
        llama_models_max = server_config.get("llama_models_max")
        if llama_models_max:
@@ -771,8 +766,7 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
        if llama_models_preset:
            env["LLAMA_MODELS_PRESET"] = str(llama_models_preset)
 
-       distrobox_cmd = ["distrobox", "enter", distrobox_name, "--", script_path, "router"]
-       host_cmd = [script_path, "router"]
+       cmd = [script_path, "router"]
     else:
        if model is None:
            msg = "Model name is required when not running in router mode"
@@ -780,39 +774,20 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
            srv.last_start_failure = msg
            srv.broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
            return None
-       distrobox_cmd = ["distrobox", "enter", distrobox_name, "--", script_path, model]
-       host_cmd = [script_path, model]
+       cmd = [script_path, model]
 
     # Retry loop configuration
     retries = 4
     backoff = 3  # seconds base
     tried_cmds = []
 
-    host_fallback = bool(server_config.get("llama_allow_host_fallback", False))
-
-    # Attempt host start first when allowed and not explicitly preferring distrobox
-    if not prefer_distrobox and host_fallback:
-       proc, out = _spawn_and_capture(host_cmd)
-       tried_cmds.append((host_cmd, out))
-       if proc is not None:
-           srv.logger.info(f"Started llama-server on host with command: {' '.join(host_cmd)}")
-           return proc
-       srv.logger.warning(f"Host start failed quickly: {out}")
-
-    # Now attempt distrobox
-    if not shutil.which("distrobox"):
-       msg = "distrobox not found in PATH; llama-server must be started inside distrobox"
-       srv.logger.error(msg)
-       srv.last_start_failure = msg
-       srv.broadcast_status_sync("error", {"message": msg, "current_model": None, "llama_server_running": False})
-       return None
-
     for attempt in range(retries):
-       proc, out = _spawn_and_capture(distrobox_cmd)
-       tried_cmds.append((distrobox_cmd, out))
+       proc, out = _spawn_and_capture(cmd)
+       tried_cmds.append((cmd, out))
        if proc is not None:
+           srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
            return proc
-       srv.logger.warning(f"distrobox attempt {attempt+1} failed quickly: {out}")
+       srv.logger.warning(f"Attempt {attempt+1} failed quickly: {out}")
        time.sleep(backoff * (2 ** attempt))
 
     # All attempts failed — assemble diagnostic
@@ -825,8 +800,8 @@ def start_llama_server(model: Optional[str], prefer_distrobox: bool = False) -> 
        msg_lines.append(f"- {cmd_str}: {snippet}")
     msg_lines.append("")
     msg_lines.append("Hints:")
-    msg_lines.append(" - Ensure distrobox/podman rootless runtime is available (enable user linger: sudo loginctl enable-linger <user>)")
-    msg_lines.append(" - Ensure /etc/subuid and /etc/subgid contain mappings for the user and that /usr/bin/newuidmap and newgidmap are setuid root")
+    msg_lines.append(" - Ensure podman/container runtime is available and the start script is executable")
+    msg_lines.append(" - Check the llama-server binary is installed and configured correctly")
     msg = "\n".join(msg_lines)
     srv.logger.error(msg)
     srv.last_start_failure = msg
@@ -878,20 +853,6 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
 def stop_llama_server():
     """Stop the currently running llama-server."""
     srv = _srv()
-    
-    server_config = srv.config.get("server", {})
-    distrobox_name = server_config.get("distrobox_name", "llama")
-    
-    # First, try to kill llama-server inside the distrobox
-    try:
-       subprocess.run(
-           ["distrobox", "enter", distrobox_name, "--", "pkill", "-f", "llama-server"],
-           timeout=10,
-           capture_output=True
-       )
-       srv.logger.info("Sent kill signal to llama-server inside distrobox")
-    except Exception as e:
-       srv.logger.warning(f"Failed to kill llama-server inside distrobox: {e}")
     
     if srv.llama_process is not None:
        pid = getattr(srv.llama_process, 'pid', 'N/A')
@@ -987,7 +948,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            if router_mode:
                if srv.llama_process is None or srv.llama_process.poll() is not None:
                    try:
-                       srv.llama_process = srv.start_llama_server(None, prefer_distrobox=False)
+                       srv.llama_process = srv.start_llama_server(None)
                    except TypeError:
                        # Backwards-compatible call for older test monkeypatches
                        srv.llama_process = srv.start_llama_server(None)
@@ -999,37 +960,14 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
                    # Wait for the backend to become reachable
                    if not await srv.wait_for_llama_server(timeout):
-                       # If host-fallback is enabled, attempt a distrobox fallback
-                       if bool(server_config.get("llama_allow_host_fallback", False)):
-                           srv.logger.warning("Router host-start failed to become reachable; attempting distrobox fallback")
-                           srv.stop_llama_server()
-                           srv.llama_process = srv.start_llama_server(None, prefer_distrobox=False)
-                           if srv.llama_process is None:
-                               await srv.broadcast_status("error", {
-                                   "message": "Failed to start router-mode llama-server (host and distrobox attempts failed)",
-                                   "current_model": None,
-                                   "llama_server_running": False
-                               })
-                               srv.backend_ready = False
-                               return False
-                           if not await srv.wait_for_llama_server(timeout):
-                               await srv.broadcast_status("error", {
-                                   "message": "Failed to start router-mode llama-server",
-                                   "current_model": None,
-                                   "llama_server_running": False
-                               })
-                               srv.stop_llama_server()
-                               srv.backend_ready = False
-                               return False
-                       else:
-                           await srv.broadcast_status("error", {
-                               "message": "Failed to start router-mode llama-server",
-                               "current_model": None,
-                               "llama_server_running": False
-                           })
-                           srv.stop_llama_server()
-                           srv.backend_ready = False
-                           return False
+                       await srv.broadcast_status("error", {
+                           "message": "Failed to start router-mode llama-server",
+                           "current_model": None,
+                           "llama_server_running": False
+                       })
+                       srv.stop_llama_server()
+                       srv.backend_ready = False
+                       return False
 
                if not await srv.router_load_model(llama_model):
                    await srv.broadcast_status("error", {
@@ -1074,10 +1012,9 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            # Need to switch models or restart (single-model path)
            srv.stop_llama_server()
 
-           # Attempt host-first start when configured; start_llama_server will
-           # try host first and fall back to distrobox if host spawn fails.
+           # Start llama-server via the configured start script
            try:
-               srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=False)
+               srv.llama_process = srv.start_llama_server(llama_model)
            except TypeError:
                srv.llama_process = srv.start_llama_server(llama_model)
 
@@ -1104,43 +1041,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                srv.backend_ready = True
                return True
            else:
-               # If host-fallback was configured, attempt a distrobox-only fallback
-               if bool(server_config.get("llama_allow_host_fallback", False)):
-                   srv.logger.warning(f"Host-start for model {llama_model} did not become reachable within timeout; attempting distrobox fallback")
-                   srv.stop_llama_server()
-                   srv.llama_process = srv.start_llama_server(llama_model, prefer_distrobox=False)
-                   if srv.llama_process is None:
-                       await srv.broadcast_status("error", {
-                           "message": f"Failed to start model {llama_model} (host and distrobox attempts failed)",
-                           "current_model": None,
-                           "llama_server_running": False
-                       })
-                       srv.backend_ready = False
-                       return False
-
-                   if await srv.wait_for_llama_server(timeout):
-                       srv.current_model = llama_model
-                       try:
-                           metrics.record_model_loaded(llama_model)
-                       except Exception:
-                           pass
-                       await srv.broadcast_status("ready", {
-                           "current_model": llama_model,
-                           "llama_server_running": True
-                       })
-                       srv.backend_ready = True
-                       return True
-                   else:
-                       await srv.broadcast_status("error", {
-                           "message": f"Failed to load model {llama_model}",
-                           "current_model": None,
-                           "llama_server_running": False
-                       })
-                       srv.stop_llama_server()
-                       srv.backend_ready = False
-                       return False
-
-               # Broadcast failure for non-host-fallback case
+               # Broadcast failure
                await srv.broadcast_status("error", {
                    "message": f"Failed to load model {llama_model}",
                    "current_model": None,

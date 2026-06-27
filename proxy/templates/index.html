@@ -695,7 +695,7 @@
                 The proxy automatically routes requests based on the <code>model</code> parameter in your API request:
             </p>
             <ul style="margin: 1rem 0 0 1.5rem; color: var(--text-secondary);">
-                <li><strong>Local models</strong> are served by llama-server running in a distrobox container</li>
+                <li><strong>Local models</strong> are served by llama-server running in a podman container</li>
                 <li><strong>Remote models</strong> are proxied to external APIs (OpenAI, Anthropic, etc.)</li>
                 <li><strong>Wildcard aliases</strong> like <code>gpt-*</code> match any model starting with that prefix</li>
                 <li>If a model switch is needed, the server will automatically load the new model</li>
