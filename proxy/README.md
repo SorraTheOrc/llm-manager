@@ -11,6 +11,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Hot Model Switching**: Automatically switches local models when a different model is requested
 - **Provider Fallback**: Automatic failover between providers per model with configurable cooldown and circuit breaker
 - **Streaming Support**: Full support for streaming responses (SSE)
+- **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
@@ -899,6 +900,49 @@ curl -X POST http://localhost:8000/admin/reset-counts
 ```
 
 Resets in-memory request/token counters and triggers immediate persistence.
+
+## Client Disconnect Detection
+
+The proxy automatically detects when a client disconnects during a streaming response and performs cleanup to prevent resource leaks and false overload signals.
+
+### How It Works
+
+1. The proxy periodically calls `request.is_disconnected()` (every 10 SSE chunks) during streaming in both local and remote proxy handlers.
+2. When a disconnect is detected:
+   - The streaming loop is broken immediately
+   - The httpx connection to the backend is closed
+   - The JobScheduler slot is released (if one was allocated) via `scheduler.remove_job()`
+   - The `active_queries` counter is correctly decremented
+   - Any queued jobs for the disconnected session are removed from the queue
+3. Cleanup code runs in a `finally` block, ensuring resources are released even on generator closure.
+
+### Configuration
+
+Client disconnect cleanup timeout can be configured in `config.yaml`:
+
+```yaml
+server:
+  disconnect_cleanup_timeout: 5.0  # seconds, default: 5.0
+```
+
+This timeout controls how long the proxy waits for cleanup operations (e.g., closing the httpx connection) to complete. If a cleanup operation exceeds this timeout, it is cancelled and the proxy continues with remaining cleanup steps.
+
+### Behavior on Non-Streaming Requests
+
+For non-streaming requests, the proxy reads the full backend response before returning. Client disconnect during non-streaming processing is detected by Starlette's built-in mechanisms, and resources are cleaned up in the request handler's error paths.
+
+### Queue and Slot Cleanup
+
+When a client disconnects:
+- **While queued**: The job is removed from the JobScheduler queue and marked as cancelled. When a slot becomes available, cancelled jobs are skipped.
+- **While a slot is allocated**: The slot is released immediately for use by another session. The `active_queries` counter is decremented.
+
+### Observability
+
+The proxy logs client disconnect events at INFO level with the session ID and slot ID:
+```
+client_disconnect session=<session_id> slot=<slot_id>
+```
 
 ## Session-Based Incremental Ingestion
 

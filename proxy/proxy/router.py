@@ -887,8 +887,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             except Exception:
                                 pass
                             try:
-                                await client.aclose()
-                            except Exception:
+                                disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
+                                await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
+                            except (asyncio.TimeoutError, Exception):
                                 pass
                             # If client disconnected, release scheduler slot entirely (LP-0MQTHP828000JYM6)
                             if scheduler is not None:

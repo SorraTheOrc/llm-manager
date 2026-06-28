@@ -227,8 +227,9 @@ async def _handle_remote_streaming(
                 except Exception:
                     pass
             try:
-                await client.aclose()
-            except Exception:
+                disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
+                await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
+            except (asyncio.TimeoutError, Exception):
                 pass
 
     return StreamingResponse(
