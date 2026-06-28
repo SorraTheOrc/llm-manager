@@ -1,11 +1,15 @@
 
 ## How to add a new model to the proxy
 
-This document describes the checklist and a worked example for adding a new model to the proxy. It is intended for engineers who need to add small local or remote models (including embeddings models) to the proxy.
+This document describes how to add models, aliases, fallback chains and custom system prompts to the proxy and the proxy managed llama-server 
+for locally hosted models.
+
+Note that once you have added models/aliases to the Proxy you will need to instruct your agent framework to use them. How to do this
+is outside the scope of this document.
 
 ## Adding the model to the local start script
 
-- When running a local fallback the proxy expects models to be startable by the repository `start-llama.sh` script (`/home/rgardler/projects/llm/start-llama.sh`). To make a new local model available via that script you must add a case block for the model name to the script.
+- When running a local model via the proxy managed llama-server instance the proxy expects models to be startable by the repository `start-llama.sh` script (`/home/rgardler/projects/llm/start-llama.sh`). To make a new local model available via that script you must add a case block for the model name to the script.
  - Steps to add your model to `start-llama.sh`:
 
  ### 1) Register the model preset for router-mode (models.ini)
@@ -56,7 +60,7 @@ This document describes the checklist and a worked example for adding a new mode
   4. If you maintain a container image that packages `start-llama.sh` (see `proxy/container/Containerfile` and `proxy/CONTAINERS.md`), update any documentation or container build steps if the model requires additional artifacts or mount points.
   5. Test locally by running the script directly from repo root, e.g. `/home/rgardler/projects/llm/start-llama.sh mymodel` and ensure the llama-server process starts and exposes embeddings (if required) on the configured port.
 
-### Making gemma4 downloadable from Hugging Face
+### Making the model downloadable from Hugging Face
 
 Intro
 
@@ -71,12 +75,12 @@ Regardless of whether the proxy is running in router mode or single-model mode, 
 
   The start script will construct the `-hf` argument for `llama-server` and the server will fetch the model from Hugging Face, storing it in the configured models location. When the download completes you can stop the server and run the proxy normally; the proxy will use the downloaded model whether it runs in router or non-router mode.
 
-What you must change to make `gemma4` download from Hugging Face:
+What you must change to make `your_model` download from Hugging Face:
 
 - If you run the start script (non-router fallback):
-  1. Add a `gemma4)` case block in `start-llama.sh` matching the lowercase model name (the script lowercases the arg).
+  1. Add a `your_model)` case block in `start-llama.sh` matching the lowercase model name (the script lowercases the arg).
   2. Set `REPOID`, `MODEL`, `QUANTIZATION`, etc., inside that block so the script builds the correct `-hf` value for `llama-server`.
-  3. Example: create a block that sets `REPOID=owner`, `MODEL=gemma4-gguf`, `QUANTIZATION=Q8_0`, then llama-server gets `-hf "owner/gemma4-gguf:Q8_0"`.
+  3. Example: create a block that sets `REPOID=owner`, `MODEL=your_model-gguf`, `QUANTIZATION=Q8_0`, then llama-server gets `-hf "owner/gemma4-gguf:Q8_0"`.
 
 Notes:
 - The proxy passes the configured `llama_model` value through to the local start script. Keep the name consistent between `proxy/config.yaml` `llama_model:` and the `case` pattern in `start-llama.sh`.
@@ -99,100 +103,26 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
 
-### Example: Local model without fallback
+### Example: Local model with remote fallback
 
 ```yaml
 models:
-  mxbai-embed-large-v1:
+  plan:
     providers:
-      - name: local-embed
+      - name: local-qwen3
         type: local
-        llama_model: mxbai-embed-large-v1
-    aliases:
-      - embeddings
-```
-
-### Example: Remote model with fallback
-
-```yaml
-models:
-  my-remote-model:
-    providers:
-      - name: primary
+        llama_model: qwen3
+      - name: primary_remote
         type: remote
         endpoint: https://api.provider-a.com/v1
         api_key_env: PROVIDER_A_KEY
-      - name: fallback
+      - name: secondary_remote
         type: remote
         endpoint: https://api.provider-b.com/v1
         api_key_env: PROVIDER_B_KEY
     aliases:
-      - my-model*
-```
-
-### Migration guide from old format
-
-**Before (old flat format - deprecated):**
-```yaml
-models:
-  my-model:
-    type: remote
-    endpoint: https://api.example.com/v1
-    api_key_env: EXAMPLE_API_KEY
-    aliases:
-      - my-*
-```
-
-**After (new providers list - required):**
-```yaml
-models:
-  my-model:
-    providers:
-      - name: my-provider
-        type: remote
-        endpoint: https://api.example.com/v1
-        api_key_env: EXAMPLE_API_KEY
-    aliases:
-      - my-*
-```
-
-**Note:** The `type` field is now specified inside each provider entry, not at the model level. The old top-level `endpoint`/`api_key_env`/`headers` format is deprecated and will be removed in a future release.
-
-### Adding a new model
-
- - Add an entry under the `models:` section of `proxy/config.yaml`. Required/typical fields (follow existing config style):
-   - `providers`: a list of provider configs (see above)
-   - For local providers: `type: local`, `llama_model`
-   - For remote providers: `type: remote`, `endpoint`, `api_key_env` (and optional `headers`)
-   - `aliases`: optional list of aliases (e.g. `embeddings`)
-
-**Friendly model aliases:** You can use short, human-friendly names like `plan`
-or `code` as aliases. These are listed in the `aliases` array alongside regular
-model IDs. Callers can then pass `model: "plan"` or `model: "code"` in API
-requests without needing to know the internal preset ID. See `README.md` for
-full alias resolution rules (case-insensitive matching, wildcard precedence).
-
-Example (add under `models:` in `proxy/config.yaml`):
-
-```yaml
-models:
-  mxbai-embed-large-v1:
-    providers:
-      - name: local-embed
-        type: local
-        llama_model: mxbai-embed-large-v1
-    aliases:
-      - "embeddings"
-    # Note: do not include a `supports` field here - the proxy will forward requests and the backend
-    # (llama-server or remote provider) will surface errors if a model does not support a capability.
-
-  # Remote example
-  example-remote:
-    type: "remote"
-    endpoint: "https://models.example.com"
-    api_key_env: "EXAMPLE_API_KEY"
-    aliases:
-      - "example-*"
+      - plan*
+      - map
 ```
 
 ## Custom system prompts per model / alias
@@ -295,55 +225,6 @@ comments and follow best practices.
   - Spins up the proxy (or uses a test harness) and a test llama-server hosting `mxbai-embed-large-v1`.
   - POSTs to `/v1/embeddings` with `model: "embeddings"` and `input: "test string"`.
 - Validates the response follows the OpenAI embeddings format and that the returned vector length equals the documented dimension.
-
-## Adding the model to the local start script
-
-- When running a local fallback the proxy expects models to be startable by the repository `start-llama.sh` script (`/home/rgardler/projects/llm/start-llama.sh`). To make a new local model available via that script you must add a case block for the model name to the script.
-- Steps to add your model to `start-llama.sh`:
-  1. Pick the canonical model name that will be used in `proxy/config.yaml` `llama_model:` and in requests to the proxy. The `start-llama.sh` script lowercases the first CLI argument, so use a lowercase name in the case pattern.
-  2. In `start-llama.sh` add a `case "$model" in` entry (follow the existing examples `qwen3`, `qwen2.5`, `gpt120`). At minimum set these variables inside the block: `REPOID`, `MODEL`, `QUANTIZATION`, `CONTEXT`, `BATCH_SIZE`, and any of `CHAT_TEMPLATE_KWARGS`, `REASONING_FORMAT`, `TEMP`, `TOP_P`, `TOP_K`, `MIN_P`, `EXTRA_CMD_SWITCHES` as needed for the model.
-     - Example block (copy and adapt fields as necessary):
-
-```bash
-  mymodel)
-    REPOID=Vendor
-    MODEL=MyModel-Name-GGUF
-    QUANTIZATION=Q5_K_M
-    CONTEXT=131072
-    BATCH_SIZE=512
-
-    CHAT_TEMPLATE_KWARGS='{"reasoning_effort": "medium"}'
-    REASONING_FORMAT=none
-
-    TEMP=0.7
-    TOP_P=1.0
-    TOP_K=40
-    MIN_P=0
-
-    EXTRA_CMD_SWITCHES="--jinja"
-    ;;
-```
-
-  3. Update the final `*)` default section of the script (if appropriate) to include the new model name in the recognised list shown to users (the script prints the supported models when an unrecognised name is provided).
-  4. If you maintain a container image that packages `start-llama.sh` (see `proxy/container/Containerfile` and `proxy/CONTAINERS.md`), update any documentation or container build steps if the model requires additional artifacts or mount points.
-  5. Test locally by running the script directly from repo root, e.g. `/home/rgardler/projects/llm/start-llama.sh mymodel` and ensure the llama-server process starts and exposes embeddings (if required) on the configured port.
-
-Notes:
-- The proxy passes the configured `llama_model` value through to the local start script. Keep the name consistent between `proxy/config.yaml` `llama_model:` and the `case` pattern in `start-llama.sh`.
-- The script lowercases the first argument before matching; use lowercase in your `case` pattern to avoid mismatches.
-
-## Runtime & deployment notes
-
-- Document how to run the local llama-server with the model (example docker run or launch command), expected memory footprint, and any packaging notes.
-  - Example using system podman and a self-contained image is documented in `proxy/CONTAINERS.md`.
-
-Example (local launch):
-
-```bash
-# Example: run llama-server with the mxbai-embed-large-v1 model on port 8080
-docker run --rm -p 8080:8080 --name llama-embed -v /models/mxbai:/models mxbai/llama-server:latest \
-  --model /models/mxbai-embed-large-v1
-```
 
 ## Troubleshooting
 

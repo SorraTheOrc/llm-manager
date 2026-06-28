@@ -69,6 +69,16 @@ async def proxy_to_remote(
     headers.update(custom_headers)
 
     body_json = json.loads(body) if body else {}
+
+    # Override model name in body if provider config specifies an upstream model ID.
+    # This allows the proxy to present a different model name to the remote API
+    # than what the client originally sent (e.g. "deepseek-v4-flash-free" for a
+    # model alias like "qwen3-fallback").
+    upstream_model = model_config.get("model")
+    if upstream_model and body_json.get("model"):
+        body_json["model"] = upstream_model
+        body = json.dumps(body_json).encode("utf-8")
+
     # Determine model name for attribution (may be provided in body)
     model_name = None
     try:

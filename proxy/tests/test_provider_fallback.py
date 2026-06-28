@@ -985,3 +985,98 @@ async def test_local_model_with_providers_calls_fallback(monkeypatch):
     assert fallback_called, \
         "proxy_with_fallback should be called for local model with providers"
     assert resp.status_code == 200
+
+
+# ===================================================================
+# Model name override tests
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_overrides_model_name_with_model_field():
+    """When a remote provider config has a `model` field, proxy_to_remote
+    should override the model name in the forwarded request body."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import MagicMock, patch as mock_patch
+
+    # Minimal server config needed for timeout
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"qwen3-fallback","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "opencode-deepseek-free",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash-free",
+    }
+
+    captured_body = None
+
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+        nonlocal captured_body
+        captured_body = body
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_body is not None, "_handle_remote_non_streaming should have been called"
+    captured_json = json.loads(captured_body.decode("utf-8"))
+    assert captured_json["model"] == "deepseek-v4-flash-free", \
+        f"Expected model override to 'deepseek-v4-flash-free', got '{captured_json.get('model')}'"
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
+    """When a remote provider config has NO `model` field, proxy_to_remote
+    should pass the original model name through unchanged."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import MagicMock, patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"my-original-model","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "plain-remote",
+        "type": "remote",
+        "endpoint": "https://example.com/v1",
+        "api_key_env": "SOME_KEY",
+    }
+
+    captured_body = None
+
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+        nonlocal captured_body
+        captured_body = body
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_body is not None
+    captured_json = json.loads(captured_body.decode("utf-8"))
+    assert captured_json["model"] == "my-original-model", \
+        f"Expected original model 'my-original-model', got '{captured_json.get('model')}'"

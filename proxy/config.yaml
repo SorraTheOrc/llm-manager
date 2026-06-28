@@ -5,10 +5,6 @@
 # failover. The `providers` list replaces the old top-level `endpoint`,
 # `api_key_env`, and `headers` fields on each model entry.
 #
-# BREAKING CHANGE: The old flat format (endpoint/api_key_env at model
-# level) is deprecated and will be removed. Migrate to the `providers`
-# list format.
-#
 # Provider entry fields:
 #   name        - Unique identifier for this provider entry
 #   type        - "local" or "remote"
@@ -28,13 +24,6 @@
 #         api_key_env: PROVIDER_B_KEY
 #     aliases:
 #       - mimo*
-#
-# Legacy format (single endpoint/api_key_env per model):
-#   model-name:
-#     type: remote
-#     endpoint: https://...
-#     api_key_env: SOME_KEY
-#     aliases: [...]
 #
 # Custom system prompts per model/alias:
 # Each model entry may include a `system_prompt` object to configure
@@ -140,6 +129,32 @@ models:
     - qwen3*
     - Qwen3*
     force_full_prompt: true
+
+  # Cascading fallback: local Qwen3 first, then OpenCode free, then OpenCode Go.
+  # Slot exhaustion on the local model falls through to the free remote tier.
+  # Rate limiting (429) on the free tier falls through to the paid Go tier.
+  # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
+  qwen3-fallback:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+      - name: opencode-go-deepseek
+        type: remote
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+    aliases:
+    - qwen3-fallback*
+    - fallback-router
+    - auto
+    force_full_prompt: true
+
   qwen3-next:
     providers:
       - name: local-qwen3-next
@@ -149,8 +164,6 @@ models:
     - qwen3-next
     - qwen3-coder-next
     - qwen3-next*
-    - plan
-    - code
     force_full_prompt: true
   plan:
     providers:
