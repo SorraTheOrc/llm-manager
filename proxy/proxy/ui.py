@@ -16,6 +16,7 @@ from fastapi import HTTPException
 
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_model_type, get_local_model_name_from_providers, get_remote_endpoint
+from proxy.lifecycle import _extract_router_model_ids
 
 
 # ---------------------------------------------------------------------------
