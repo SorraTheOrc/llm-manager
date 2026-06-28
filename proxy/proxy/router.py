@@ -138,6 +138,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     llama_port = server_config.get("llama_server_port", 8080)
     target_url = f"http://localhost:{llama_port}/{path}"
 
+    # Self-healing is active — record 5xx with reason "self_healing"
     if _is_self_healing_active():
         record_http_error("v1/chat/completions", "5xx", "self_healing")
         return _self_healing_response(path)
@@ -274,6 +275,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     max_queries,
                     path,
                 )
+                # Concurrency limit reached — record 5xx with reason "concurrency_rejected"
                 record_http_error(
                     "v1/chat/completions", "5xx", "concurrency_rejected"
                 )
@@ -385,11 +387,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             await client.aclose()
                         except Exception:
                             pass
+                        # Self-healing became active during streaming — record 5xx with reason "self_healing"
                         if _is_self_healing_active():
                             record_http_error(
                                 "v1/chat/completions", "5xx", "self_healing"
                             )
                             return _self_healing_response(path)
+                        # Backend connection/read error — record 5xx with reason "backend_error"
                         record_http_error(
                             "v1/chat/completions", "5xx", "backend_error"
                         )
@@ -417,7 +421,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         except Exception:
                             pass
 
-                        # Instrument 5xx upstream errors
+                        # Upstream returned 5xx — record 5xx with reason "upstream_error"
                         if upstream_status >= 500:
                             record_http_error(
                                 "v1/chat/completions", "5xx", "upstream_error"
@@ -964,6 +968,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 srv.backend_ready = True
                             except Exception:
                                 srv.backend_ready = False
+                                # Self-healing became active during retry — record 5xx with reason "self_healing"
                                 if _is_self_healing_active():
                                     record_http_error(
                                         "v1/chat/completions",
@@ -971,6 +976,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         "self_healing",
                                     )
                                     return _self_healing_response(path)
+                                # Backend error during retry — record 5xx with reason "backend_error"
                                 record_http_error(
                                     "v1/chat/completions",
                                     "5xx",

@@ -1126,7 +1126,7 @@ Available metrics (best-effort):
 - `llama_model_rss_bytes{model="..."}` (gauge) — estimated per-model RSS (when multiple models are loaded the proxy divides process RSS evenly across models as an approximation).
 - `llama_model_load_events_total{model="...",event="load|unload"}` (counter) — model lifecycle events.
 - `llama_models_loaded` (gauge) — number of loaded models reported by router-mode.
-- `proxy_http_errors_total{endpoint="...",status="...",reason="..."}` (counter) — HTTP errors by endpoint, status class, and reason. Incremented at each 5xx response from `proxy_to_local`. Reasons include: `backend_error`, `backend_unavailable`, `self_healing`, and `slot_exhaustion`. See [5xx Error Runbook](docs/runbook-5xx.md) for investigation guidance.
+- `proxy_http_errors_total{endpoint="...",status="...",reason="..."}` (counter) — HTTP errors by endpoint, status class, and reason. Incremented via `record_http_error(endpoint, status, reason)` at each 5xx response. Reasons include: `backend_error`, `backend_unavailable`, `self_healing`, and `slot_exhaustion`. See [5xx Error Runbook](docs/runbook-5xx.md) for investigation guidance.
 
 Token-rate observability metrics (exposed on `/metrics`):
 

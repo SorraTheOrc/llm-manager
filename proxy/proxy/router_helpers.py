@@ -177,6 +177,7 @@ def _build_backend_unavailable_response(
     from proxy.metrics import record_http_error
     
     retry_after = _self_heal_retry_after_seconds()
+    # Backend not ready or process missing — record 5xx with reason "backend_unavailable"
     record_http_error("v1/chat/completions", "5xx", "backend_unavailable")
     
     return JSONResponse(
@@ -204,6 +205,7 @@ def _build_slot_exhaustion_response(
     retry_after = int(
         server_config.get("slot_unavailable_retry_after", 5) or 5
     )
+    # All llama-server slots busy — record 5xx with reason "slot_exhaustion"
     record_http_error("v1/chat/completions", "5xx", "slot_exhaustion")
     return JSONResponse(
         status_code=503,
