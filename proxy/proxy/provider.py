@@ -466,6 +466,28 @@ async def proxy_with_remote_fallback(
                 except Exception:
                     resp_json = None
                 if _is_empty_response(body_text or '', resp_json):
+                    # If the upstream included reasoning_content in the payload,
+                    # promote it and return success instead of marking provider down.
+                    body_l = (body_text or "").lower()
+                    if "reasoning_content" in body_l:
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "promoted_reasoning",
+                            "status_code": int(getattr(response, 'status_code', 0) or 0),
+                            "body_snippet": (body_text[:512] if body_text else None),
+                        })
+                        result = _add_provider_header(response, provider_name)
+                        if prev_provider:
+                            logger.info(
+                                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                                path,
+                                prev_provider,
+                                provider_name,
+                                fallback_reason or "promoted_reasoning",
+                            )
+                        return result
+
                     effective_cooldown = _compute_cooldown(cooldown_seconds, response)
                     mark_provider_unavailable(provider_name, effective_cooldown)
                     fallback_reason = "empty_response"
@@ -653,6 +675,28 @@ async def proxy_with_fallback(
                 except Exception:
                     resp_json = None
                 if _is_empty_response(body_text or '', resp_json):
+                    # If the upstream included reasoning_content in the payload,
+                    # promote it and return success instead of marking provider down.
+                    body_l = (body_text or "").lower()
+                    if "reasoning_content" in body_l:
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "promoted_reasoning",
+                            "status_code": int(getattr(response, 'status_code', 0) or 0),
+                            "body_snippet": (body_text[:512] if body_text else None),
+                        })
+                        result = _add_provider_header(response, provider_name)
+                        if prev_provider:
+                            logger.info(
+                                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                                path,
+                                prev_provider,
+                                provider_name,
+                                fallback_reason or "promoted_reasoning",
+                            )
+                        return result
+
                     effective_cooldown = _compute_cooldown(cooldown_seconds, response)
                     mark_provider_unavailable(provider_name, effective_cooldown)
                     fallback_reason = "empty_response"
