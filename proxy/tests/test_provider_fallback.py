@@ -1,0 +1,1082 @@
+"""
+Unit tests for provider fallback: config schema & provider resolution.
+
+Tests for:
+- Config parsing with providers list
+- resolve_provider() function behaviour
+"""
+
+import json
+import pytest
+import time
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from fastapi import Request, Response
+
+import proxy.provider as provider
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class _DummyRequest:
+    """Minimal request stub for use in fallback tests."""
+    def __init__(self, body: bytes = b'{"model":"test"}'):
+        self._body = body
+        self.headers = {}
+        self.method = "POST"
+        self.url = type("U", (), {"path": "/v1/chat/completions"})()
+
+    async def body(self):
+        return self._body
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def reset_cooldown_state():
+    """Reset cooldown state between tests to avoid cross-test leakage."""
+    provider._provider_unavailable_until.clear()
+    yield
+
+
+@pytest.fixture
+def sample_model_config():
+    """A model config with an ordered providers list (remote only)."""
+    return {
+        "providers": [
+            {
+                "name": "remote-primary",
+                "type": "remote",
+                "endpoint": "https://api.openai.com/v1",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+            {
+                "name": "remote-fallback",
+                "type": "remote",
+                "endpoint": "https://api.anthropic.com/v1",
+                "api_key_env": "ANTHROPIC_API_KEY",
+            },
+        ],
+        "aliases": ["mimo*"],
+    }
+
+
+@pytest.fixture
+def mixed_model_config():
+    """A model config with both local and remote providers."""
+    return {
+        "providers": [
+            {
+                "name": "local-llama",
+                "type": "local",
+                "llama_model": "Qwen3",
+            },
+            {
+                "name": "remote-fallback",
+                "type": "remote",
+                "endpoint": "https://api.openai.com/v1",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+@pytest.fixture
+def single_provider_config():
+    """A model config with a single provider."""
+    return {
+        "providers": [
+            {
+                "name": "sole-provider",
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+                "api_key_env": "EXAMPLE_API_KEY",
+            },
+        ],
+        "aliases": ["sole*"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Config parsing tests
+# ---------------------------------------------------------------------------
+
+def test_config_has_providers_list(sample_model_config):
+    """Config should contain an ordered providers list."""
+    providers_list = sample_model_config.get("providers")
+    assert isinstance(providers_list, list)
+    assert len(providers_list) == 2
+
+
+def test_provider_entry_has_required_fields(sample_model_config):
+    """Each provider entry must have name, type, and type-specific fields."""
+    for entry in sample_model_config["providers"]:
+        assert "name" in entry
+        assert "type" in entry
+        assert entry["type"] in ("local", "remote")
+
+    # Remote provider fields
+    remote = sample_model_config["providers"][0]
+    assert remote["type"] == "remote"
+    assert "endpoint" in remote
+    assert "api_key_env" in remote
+
+
+def test_provider_entry_local_fields(mixed_model_config):
+    """Local provider must have llama_model."""
+    local = mixed_model_config["providers"][0]
+    assert local["type"] == "local"
+    assert "llama_model" in local
+
+
+# ---------------------------------------------------------------------------
+# resolve_provider tests
+# ---------------------------------------------------------------------------
+
+def test_resolve_provider_returns_first_available(sample_model_config):
+    """resolve_provider should return the first provider when no cooldown."""
+    result = provider.resolve_provider(sample_model_config)
+    assert result is not None
+    assert result["name"] == "remote-primary"
+    assert result["type"] == "remote"
+    assert result["endpoint"] == "https://api.openai.com/v1"
+
+
+def test_resolve_provider_skips_failed_provider(sample_model_config):
+    """resolve_provider should skip the failed_provider and return the next."""
+    result = provider.resolve_provider(
+        sample_model_config, failed_provider="remote-primary"
+    )
+    assert result is not None
+    assert result["name"] == "remote-fallback"
+    assert result["type"] == "remote"
+
+
+def test_resolve_provider_returns_none_when_all_exhausted(sample_model_config):
+    """resolve_provider should return None when all providers are exhausted.
+
+    Exhausted means ALL providers are either in cooldown or have been
+    skipped via failed_provider, so none are available.
+    """
+    # Mark one provider in cooldown and fail the other
+    provider.mark_provider_unavailable("remote-primary", 60.0)
+    result = provider.resolve_provider(
+        sample_model_config, failed_provider="remote-fallback"
+    )
+    # remote-primary is in cooldown, remote-fallback is the failed_provider
+    assert result is None
+
+
+def test_resolve_provider_returns_none_for_empty_providers_list():
+    """resolve_provider should return None for an empty providers list."""
+    config = {"providers": [], "aliases": ["empty*"]}
+    result = provider.resolve_provider(config)
+    assert result is None
+
+
+def test_resolve_provider_returns_none_for_missing_providers_key():
+    """resolve_provider should return None when providers key is missing."""
+    config = {"aliases": ["noprov*"]}
+    result = provider.resolve_provider(config)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Cooldown / unavailability tests
+# ---------------------------------------------------------------------------
+
+def test_resolve_provider_skips_provider_in_cooldown(sample_model_config):
+    """resolve_provider should skip providers that are in cooldown."""
+    # Mark the first provider as unavailable (in cooldown)
+    provider.mark_provider_unavailable("remote-primary", 60.0)
+
+    result = provider.resolve_provider(sample_model_config)
+    assert result is not None
+    assert result["name"] == "remote-fallback"
+
+
+def test_resolve_provider_skips_all_in_cooldown(sample_model_config):
+    """resolve_provider should return None when all providers are in cooldown."""
+    provider.mark_provider_unavailable("remote-primary", 60.0)
+    provider.mark_provider_unavailable("remote-fallback", 60.0)
+
+    result = provider.resolve_provider(sample_model_config)
+    assert result is None
+
+
+def test_cooldown_expiry(sample_model_config):
+    """resolve_provider should return a provider after its cooldown expires."""
+    provider.mark_provider_unavailable("remote-primary", 0.01)  # very short cooldown
+    # First call should skip it
+    result = provider.resolve_provider(sample_model_config)
+    assert result["name"] == "remote-fallback"
+
+    # Wait for cooldown to expire
+    time.sleep(0.02)
+
+    # Now the first provider should be available again
+    result = provider.resolve_provider(sample_model_config)
+    assert result is not None
+    assert result["name"] == "remote-primary"
+
+
+def test_mark_provider_unavailable_stores_timestamp():
+    """mark_provider_unavailable should store an expiry timestamp."""
+    provider.mark_provider_unavailable("test-provider", 30.0)
+    assert "test-provider" in provider._provider_unavailable_until
+    expiry = provider._provider_unavailable_until["test-provider"]
+    assert expiry > time.time()
+    assert expiry <= time.time() + 31.0  # Allow small timing delta
+
+
+def test_provider_not_in_cooldown_is_available():
+    """A provider that was never marked should be available."""
+    assert provider._is_provider_unavailable("fresh-provider") is False
+
+
+def test_provider_in_cooldown_is_unavailable():
+    """A provider in cooldown should be reported as unavailable."""
+    provider.mark_provider_unavailable("down-provider", 60.0)
+    assert provider._is_provider_unavailable("down-provider") is True
+
+
+def test_expired_cooldown_is_available():
+    """A provider whose cooldown expired should be available again."""
+    provider.mark_provider_unavailable("recovered-provider", 0.001)
+    time.sleep(0.01)
+    assert provider._is_provider_unavailable("recovered-provider") is False
+    assert "recovered-provider" not in provider._provider_unavailable_until
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+def test_resolve_provider_no_failed_provider_single(single_provider_config):
+    """resolve_provider should return the sole provider when available."""
+    result = provider.resolve_provider(single_provider_config)
+    assert result is not None
+    assert result["name"] == "sole-provider"
+
+
+def test_resolve_provider_failed_single_exhausts(single_provider_config):
+    """resolve_provider should return None when the sole provider fails."""
+    result = provider.resolve_provider(single_provider_config, failed_provider="sole-provider")
+    assert result is None
+
+
+def test_failed_and_cooldown_both_skip(sample_model_config):
+    """A provider is skipped if it's the failed_provider OR in cooldown."""
+    # Mark remote-fallback in cooldown
+    provider.mark_provider_unavailable("remote-fallback", 60.0)
+
+    # Call with remote-primary as the failed_provider.
+    # remote-primary is skipped (failed_provider)
+    # remote-fallback is skipped (in cooldown)
+    result = provider.resolve_provider(
+        sample_model_config, failed_provider="remote-primary"
+    )
+    assert result is None
+
+
+# ===================================================================
+# Remote provider fallback tests
+# ===================================================================
+
+@pytest.mark.asyncio
+async def test_remote_fallback_on_connection_error(sample_model_config):
+    """Fallback should trigger on connection error and try next provider."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    # Mock proxy_to_remote to raise connection error on first call,
+    # then succeed on second call.
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx.ConnectError("Connection refused")
+        # Second call succeeds
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2  # First failed, second succeeded
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_on_http_4xx(sample_model_config):
+    """Fallback should trigger on HTTP 4xx and try next provider."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(status_code=429, content=b"Rate limited")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_on_http_5xx(sample_model_config):
+    """Fallback should trigger on HTTP 5xx and try next provider."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(status_code=502, content=b"Bad gateway")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_tries_providers_in_order(sample_model_config):
+    """Fallback should try providers in the order they appear in config."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    attempted = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        attempted.append(provider_cfg.get("name"))
+        return Response(status_code=502, content=b"Bad gateway")
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert attempted == ["remote-primary", "remote-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_all_exhausted_returns_503(sample_model_config):
+    """When all providers are exhausted, return 503 with JSON body and retry_after."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return Response(status_code=502, content=b"Bad gateway")
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert "retry_after" in body
+    assert isinstance(body["retry_after"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_cooldown_skips_failed_providers(sample_model_config):
+    """After a provider fails, subsequent requests should skip it via cooldown."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            # First two calls fail (both providers fail)
+            return Response(status_code=502, content=b"Bad gateway")
+        # Third call: remote-fallback is in cooldown, so this
+        # should only get called for remote-primary (cooldown expired?)
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        # First request: both fail
+        result1 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+        assert result1.status_code == 503
+
+        # Second request: both providers should be in cooldown
+        result2 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+        assert result2.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_respects_retry_after(sample_model_config):
+    """Retry-After header from upstream response should extend cooldown."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        if provider_cfg.get("name") == "remote-primary":
+            return Response(
+                status_code=429,
+                content=b"Rate limited",
+                headers={"Retry-After": "120"},
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # remote-primary should be in cooldown with the larger of
+    # provider_cooldown_seconds (60) and Retry-After (120)
+    assert provider._is_provider_unavailable("remote-primary")
+    # Verify the cooldown expiry is approximately now + 120s (max of 60 and 120)
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("remote-primary")
+    assert expiry is not None, "remote-primary should have a cooldown expiry"
+    # Allow 2s tolerance for test execution time
+    assert expiry >= now + 118, (
+        f"Expected expiry ~now+120s, got {expiry - now:.1f}s from now"
+    )
+    assert expiry <= now + 125, (
+        f"Expiry too far in the future: {expiry - now:.1f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_single_provider_fails(single_provider_config):
+    """Single provider that fails should return 503."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return Response(status_code=502, content=b"Bad gateway")
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", single_provider_config, cfg
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert "retry_after" in body
+
+
+# ===================================================================
+# Local-to-remote fallback tests
+# ===================================================================
+
+@pytest.mark.asyncio
+async def test_local_fallback_to_remote_on_connection_error(mixed_model_config):
+    """Local model connection error should trigger fallback to remote."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        raise httpx.ConnectError("Connection refused to llama-server")
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [
+        ("local", "local-llama"),
+        ("remote", "remote-fallback"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
+    """Slot exhaustion (all slots busy) should trigger fallback to remote."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        # Simulate slot exhaustion response
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": "Model server busy: 0/1 slots available. Please retry later.",
+                },
+                "status": 503,
+                "retry_after": 5,
+                "total_slots": 1,
+                "available_slots": 0,
+            },
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [
+        ("local", "local-llama"),
+        ("remote", "remote-fallback"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_fallback_all_exhausted(mixed_model_config):
+    """When all providers (local + remote) fail, return 503."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(status_code=502, content=b"Bad gateway")
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        raise httpx.ConnectError("Connection refused")
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 503
+    assert call_log == [
+        ("local", "local-llama"),
+        ("remote", "remote-fallback"),
+    ]
+    body = json.loads(result.body)
+    assert "retry_after" in body
+
+
+@pytest.mark.asyncio
+async def test_fallback_preserves_request_semantics(mixed_model_config):
+    """When local fallback occurs, the forwarded request to the remote provider
+    must preserve method, headers, body, and the path argument passed to the
+    proxy. This verifies request semantics are preserved during fallback.
+    """
+    request = _DummyRequest(body=b'{"prompt":"hello"}')
+    # Add some headers to ensure they are forwarded
+    request.headers = {
+        "Authorization": "Bearer test-token",
+        "X-Custom-Header": "custom",
+    }
+
+    cfg = {"provider_cooldown_seconds": 60}
+    observed = {}
+
+    async def _mock_proxy_to_local(_req, _path):
+        # Simulate local failure to force fallback
+        raise httpx.ConnectError("Local llama-server unreachable")
+
+    async def _mock_proxy_to_remote(req, path, provider_cfg):
+        # Capture the forwarded request semantics
+        observed["method"] = req.method
+        # Make a shallow copy of headers to avoid framework-specific types
+        observed["headers"] = dict(req.headers)
+        observed["body"] = await req.body()
+        observed["path"] = path
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # Verify the remote proxy received the same method
+    assert observed.get("method") == request.method
+    # Verify headers were forwarded
+    assert observed.get("headers", {}).get("Authorization") == "Bearer test-token"
+    assert observed.get("headers", {}).get("X-Custom-Header") == "custom"
+    # Verify body preserved
+    assert observed.get("body") == b'{"prompt":"hello"}'
+    # Verify path argument forwarded matches the requested path
+    assert observed.get("path") == "v1/chat/completions"
+
+
+# ===================================================================
+# Observability tests (X-Provider header, fallback logging)
+# ===================================================================
+
+@pytest.mark.asyncio
+async def test_x_provider_header_on_success(sample_model_config):
+    """Successful response should include X-Provider header."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "remote-primary"
+
+
+@pytest.mark.asyncio
+async def test_x_provider_header_on_fallback(sample_model_config):
+    """On fallback, X-Provider should reflect the successful provider."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(status_code=502, content=b"Bad gateway")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # After fallback from remote-primary, remote-fallback should be in header
+    assert result.headers.get("X-Provider") == "remote-fallback"
+
+
+@pytest.mark.asyncio
+async def test_fallback_logging(sample_model_config, caplog):
+    """Fallback events should be logged at INFO level."""
+    import logging
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(status_code=502, content=b"Bad gateway")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # Check that a fallback log was emitted
+    found = False
+    for record in caplog.records:
+        if "Fallback triggered" in record.getMessage():
+            found = True
+            assert record.levelname == "INFO"
+            assert "remote-primary" in record.getMessage()
+            assert "remote-fallback" in record.getMessage()
+            assert "HTTP 502" in record.getMessage()
+            break
+    assert found, "Expected 'Fallback triggered' log message not found"
+
+
+@pytest.mark.asyncio
+async def test_no_fallback_log_on_success(sample_model_config, caplog):
+    """No fallback log should be emitted when first provider succeeds."""
+    import logging
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    for record in caplog.records:
+        assert "Fallback triggered" not in record.getMessage()
+
+
+# ===================================================================
+# Integration tests: ui.py request path uses fallback functions
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_remote_model_with_providers_calls_fallback(monkeypatch):
+    """proxy_openai_api should call proxy_with_remote_fallback for remote models with providers."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock, AsyncMock
+
+    # Set up config with a remote model that has providers
+    server_module.config = {
+        "models": {
+            "test-remote": {
+                "type": "remote",
+                "providers": [
+                    {"name": "primary", "type": "remote",
+                     "endpoint": "https://primary.test/v1", "api_key_env": "KEY1"},
+                    {"name": "backup", "type": "remote",
+                     "endpoint": "https://backup.test/v1", "api_key_env": "KEY2"},
+                ],
+            },
+        },
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+    server_module.llama_process = None
+    server_module.backend_ready = True
+
+    # Track that proxy_with_remote_fallback was called
+    fallback_called = False
+    orig_fallback = provider.proxy_with_remote_fallback
+
+    async def mock_fallback(request, path, model_config, config):
+        nonlocal fallback_called
+        fallback_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_remote_fallback", mock_fallback):
+        from proxy.ui import proxy_openai_api
+        from fastapi import Request as FastAPIRequest
+
+        body = json.dumps({
+            "model": "test-remote",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        }).encode("utf-8")
+
+        mock_request = MagicMock(spec=FastAPIRequest)
+        mock_request.method = "POST"
+        mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+        mock_request.headers = {}
+        mock_request._body = body
+        async def mock_body():
+            return mock_request._body
+        mock_request.body = mock_body
+
+        resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert fallback_called, \
+        "proxy_with_remote_fallback should be called for remote model with providers"
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_remote_model_without_providers_returns_error(monkeypatch):
+    """Remote models WITHOUT a providers list should return an error (breaking change)."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+
+    # Set up config with a remote model that has NO providers (legacy format)
+    server_module.config = {
+        "models": {
+            "test-remote": {
+                "type": "remote",
+                "endpoint": "https://test.api.com/v1",
+                "api_key_env": "TEST_KEY",
+            },
+        },
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+    server_module.llama_process = None
+    server_module.backend_ready = True
+
+    from proxy.ui import proxy_openai_api
+    from fastapi import Request as FastAPIRequest
+
+    body = json.dumps({
+        "model": "test-remote",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }).encode("utf-8")
+
+    mock_request = MagicMock(spec=FastAPIRequest)
+    mock_request.method = "POST"
+    mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+    mock_request.headers = {}
+    mock_request._body = body
+    async def mock_body():
+        return mock_request._body
+    mock_request.body = mock_body
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_openai_api(mock_request, "chat/completions")
+
+    assert exc_info.value.status_code == 500, "Legacy remote model without providers should return error"
+    assert "Invalid model configuration" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_local_model_with_providers_calls_fallback(monkeypatch):
+    """proxy_openai_api should call proxy_with_fallback for loaded local models with providers."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock
+
+    # Set up config with a local model that has providers (local + remote)
+    server_module.config = {
+        "models": {
+            "test-local": {
+                "type": "local",
+                "llama_model": "test-llama",
+                "providers": [
+                    {"name": "local-instance", "type": "local", "llama_model": "test-llama"},
+                    {"name": "remote-backup", "type": "remote",
+                     "endpoint": "https://backup.test/v1", "api_key_env": "KEY"},
+                ],
+            },
+        },
+        "server": {"llama_request_timeout": 300},
+    }
+    # Simulate model is already loaded
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    server_module.llama_process = fake_proc
+    server_module.backend_ready = True
+    server_module.current_model = "test-llama"
+
+    fallback_called = False
+
+    async def mock_fallback(request, path, model_config, config):
+        nonlocal fallback_called
+        fallback_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_fallback", mock_fallback):
+        from proxy.ui import proxy_openai_api
+        from fastapi import Request as FastAPIRequest
+
+        body = json.dumps({
+            "model": "test-local",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        }).encode("utf-8")
+
+        mock_request = MagicMock(spec=FastAPIRequest)
+        mock_request.method = "POST"
+        mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+        mock_request.headers = {}
+        mock_request._body = body
+        async def mock_body():
+            return mock_request._body
+        mock_request.body = mock_body
+
+        resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert fallback_called, \
+        "proxy_with_fallback should be called for local model with providers"
+    assert resp.status_code == 200
+
+
+# ===================================================================
+# Model name override tests
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_overrides_model_name_with_model_field():
+    """When a remote provider config has a `model` field, proxy_to_remote
+    should override the model name in the forwarded request body."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import MagicMock, patch as mock_patch
+
+    # Minimal server config needed for timeout
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"qwen3-fallback","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "opencode-deepseek-free",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash-free",
+    }
+
+    captured_body = None
+
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+        nonlocal captured_body
+        captured_body = body
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_body is not None, "_handle_remote_non_streaming should have been called"
+    captured_json = json.loads(captured_body.decode("utf-8"))
+    assert captured_json["model"] == "deepseek-v4-flash-free", \
+        f"Expected model override to 'deepseek-v4-flash-free', got '{captured_json.get('model')}'"
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
+    """When a remote provider config has NO `model` field, proxy_to_remote
+    should pass the original model name through unchanged."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import MagicMock, patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"my-original-model","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "plain-remote",
+        "type": "remote",
+        "endpoint": "https://example.com/v1",
+        "api_key_env": "SOME_KEY",
+    }
+
+    captured_body = None
+
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+        nonlocal captured_body
+        captured_body = body
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_body is not None
+    captured_json = json.loads(captured_body.decode("utf-8"))
+    assert captured_json["model"] == "my-original-model", \
+        f"Expected original model 'my-original-model', got '{captured_json.get('model')}'"

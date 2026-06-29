@@ -45,13 +45,15 @@ def mock_config():
         "models": {
             "embed": {
                 "aliases": ["embeddings", "embed"],
-                "llama_model": "mxbai-embed",
-                "type": "local",
+                "providers": [
+                    {"name": "local-embed", "type": "local", "llama_model": "mxbai-embed"}
+                ],
             },
             "gemma4": {
                 "aliases": ["gemma4"],
-                "llama_model": "gemma4",
-                "type": "local",
+                "providers": [
+                    {"name": "local-gemma4", "type": "local", "llama_model": "gemma4"}
+                ],
             },
         },
         "server": {
@@ -310,3 +312,137 @@ async def test_stop_server_and_background_load_clears_background_and_refcount(mo
     # Refcount should be back to zero and current_model set
     assert getattr(server, 'model_switch_refcount', 0) == 0
     assert server.current_model == 'mxbai-embed'
+
+
+@pytest.mark.asyncio
+async def test_start_llama_server_not_found_sets_last_start_failure_and_error_broadcast(monkeypatch, mock_config):
+    """If starting the llama-server fails to spawn, ensure last_start_failure is set and an error broadcast occurs."""
+    # Run in non-router mode so start_llama_server is invoked with a model name
+    cfg = dict(mock_config)
+    cfg['server'] = dict(cfg['server'])
+    cfg['server']['llama_router_mode'] = False
+
+    monkeypatch.setattr(server, 'config', cfg)
+
+    events = []
+
+    def fake_broadcast_sync(event_type: str, data: dict):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(server, 'broadcast_status_sync', fake_broadcast_sync)
+
+    # Simulate start_llama_server by having it broadcast an error and return None
+    def failing_start(model):
+        server.last_start_failure = "Failed to start llama-server"
+        server.broadcast_status_sync("error", {
+            "message": "Failed to start llama-server",
+            "current_model": None,
+            "llama_server_running": False
+        })
+        return None
+
+    monkeypatch.setattr(server, 'start_llama_server', failing_start)
+
+    # Ensure clean state
+    server.current_model = None
+    server.last_start_failure = None
+
+    res = await server.ensure_model_loaded('embed')
+
+    assert res is False
+    # last_start_failure should contain diagnostic text
+    assert isinstance(server.last_start_failure, str) and server.last_start_failure
+    # broadcast_status_sync should have been called with an error
+    assert any(e[0] == 'error' for e in events)
+
+
+@pytest.mark.asyncio
+async def test_background_load_failure_clears_background_and_decrements_refcount(monkeypatch, mock_config):
+    """When a background load fails (router_load_model returns False), background_loads must be cleared and refcount decremented."""
+    monkeypatch.setattr(server, 'config', mock_config)
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
+    # Simulate router load failure
+    monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=False))
+
+    events = []
+
+    async def fake_broadcast(event_type: str, data: dict):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(server, 'broadcast_status', fake_broadcast)
+
+    # Ensure clean counters
+    server.background_loads = {}
+    server.model_switch_refcount = 0
+
+    scheduled = server.schedule_background_load('embed')
+    assert scheduled is True
+    # background_loads marker should be present immediately
+    assert server.background_loads.get('embed') is True
+
+    # Wait for background task to finish and clear marker
+    async def _wait_for_no_background_load(timeout=2.0):
+        start = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start < timeout:
+            if not server.background_loads.get('embed'):
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    assert await _wait_for_no_background_load(), "background_loads marker was not cleared after failure"
+
+    # Refcount should be back to zero
+    assert getattr(server, 'model_switch_refcount', 0) == 0
+    # An error broadcast should have been emitted for the failed load
+    assert any(e[0] == 'error' for e in events)
+
+
+@pytest.mark.asyncio
+async def test_background_load_failure_retains_previous_model_and_clears_markers(monkeypatch, mock_config):
+    """When a background load fails, the previous current_model should be retained, and background markers/refcount cleared with an error broadcast."""
+    monkeypatch.setattr(server, 'config', mock_config)
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
+    # Simulate router load failure
+    monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=False))
+
+    events = []
+
+    async def fake_broadcast(event_type: str, data: dict):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(server, 'broadcast_status', fake_broadcast)
+
+    # Set a previous model that should be preserved on background failure
+    server.current_model = 'gemma4'
+    server.background_loads = {}
+    server.model_switch_refcount = 0
+
+    scheduled = server.schedule_background_load('embed')
+    assert scheduled is True
+    assert server.background_loads.get('embed') is True
+
+    # Wait for background task to finish and clear marker
+    async def _wait_for_no_background_load(timeout=2.0):
+        start = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start < timeout:
+            if not server.background_loads.get('embed'):
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    assert await _wait_for_no_background_load(), "background_loads marker was not cleared after failure"
+
+    # Previous model should be retained
+    assert server.current_model == 'gemma4'
+    # Refcount should be back to zero
+    assert getattr(server, 'model_switch_refcount', 0) == 0
+    # An error broadcast should have been emitted
+    assert any(e[0] == 'error' for e in events)

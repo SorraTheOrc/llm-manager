@@ -33,13 +33,8 @@ BURST_PID=$!
 
 sleep 2
 
-echo "[fault-injection] forcing backend crash (pkill llama-server inside distrobox)"
-if command -v distrobox >/dev/null 2>&1; then
-  distrobox enter llama -- pkill -9 -f llama-server || true
-else
-  echo "[fault-injection] distrobox not found; trying host pkill" >&2
-  pkill -9 -f llama-server || true
-fi
+echo "[fault-injection] forcing backend crash (pkill llama-server)"
+pkill -9 -f llama-server || true
 
 wait "$BURST_PID" || true
 

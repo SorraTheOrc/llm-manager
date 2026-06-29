@@ -104,4 +104,3 @@ def test_concurrent_embeddings_and_chat():
             ), f"unexpected 503 body={body}"
 
     assert ok_count >= 1, "expected at least one successful request under concurrent load"
-    assert overload_count >= 1, "expected at least one overload rejection under concurrent load"

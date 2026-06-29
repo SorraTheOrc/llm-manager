@@ -1,0 +1,81 @@
+# prometheus.service — Host-first deployment systemd unit
+
+## Overview
+
+This systemd unit file runs Prometheus for the LLM proxy stack monitoring
+infrastructure. It uses the host-first model (binary installation, no
+containers) and is designed to be deployed as a **user service**.
+
+## User Service (Recommended)
+
+**File location**: `~/.config/systemd/user/prometheus.service`
+
+```ini
+[Unit]
+Description=Prometheus metrics server for LLM proxy stack
+After=network.target llama-proxy.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/rgardler/bin/prometheus/prometheus \
+  --config.file=/home/rgardler/projects/llm/monitoring/prometheus.yml \
+  --storage.tsdb.path=/home/rgardler/.local/share/prometheus/data \
+  --storage.tsdb.retention.time=15d \
+  --web.listen-address=:9090
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/home/rgardler/.local/state/prometheus/logs/prometheus.log
+StandardError=append:/home/rgardler/.local/state/prometheus/logs/prometheus.log
+
+# Resource limits
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target
+```
+
+### Setup commands (user service)
+
+```bash
+# Create directories
+mkdir -p ~/.local/share/prometheus/data
+mkdir -p ~/.local/state/prometheus/logs
+
+# Enable and start the service
+systemctl --user daemon-reload
+systemctl --user enable prometheus.service
+systemctl --user start prometheus.service
+
+# Check status
+systemctl --user status prometheus.service
+
+# View logs
+journalctl --user -u prometheus.service -f
+```
+
+## Verification
+
+```bash
+# Check Prometheus targets page
+curl http://localhost:9090/api/v1/targets
+
+# Check metrics endpoint
+curl http://localhost:9090/api/v1/query?query=up
+
+# View Prometheus expression browser
+# Open http://localhost:9090 in a browser
+
+# Query a specific metric
+curl 'http://localhost:9090/api/v1/query?query=llama_process_rss_bytes'
+```
+
+## Cross-references
+
+- See also: `docs/systemd/grafana-server.service` for the Grafana systemd unit.
+- See also: `monitoring/README.md` for full monitoring deployment documentation.
+- See also: `monitoring/prometheus.yml` for the Prometheus scrape configuration.

@@ -9,20 +9,87 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Local Model Management**: Automatically starts/stops llama-server with the correct model
 - **Remote API Routing**: Forward requests to OpenAI, Anthropic, or other OpenAI-compatible APIs
 - **Hot Model Switching**: Automatically switches local models when a different model is requested
+- **Provider Fallback**: Automatic failover between providers per model with configurable cooldown and circuit breaker
 - **Streaming Support**: Full support for streaming responses (SSE)
+- **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
--- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo.
+- **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
+-- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
+
+## Host-first deployment
+
+The repository uses a host-first startup model for llama-server. Systemd unit files are no longer distributed from the repository, but example units are provided in `docs/systemd/` to help operators deploy and supervise the services.
+
+### Startup mechanism
+
+The proxy starts llama-server via the configured `llama_start_script` (default: `scripts/podman_start_llama.sh`). The start script uses podman to create and run a containerized llama-server.
+
+**Startup behavior (from `proxy/proxy/lifecycle.py`):**
+1. The proxy invokes the configured `llama_start_script` with the target model
+2. If the start script fails, the proxy retries up to 4 times with exponential backoff
+3. If all attempts fail, the proxy reports a clear error message
+
+### Configuration
+
+```yaml
+server:
+  llama_start_script: /path/to/start-llama.sh  # Script to start llama-server
+```
+
+### Systemd service units
+
+Example systemd unit files are provided in `docs/systemd/`:
+- `docs/systemd/llama-server.service` — llama-server service unit
+- `docs/systemd/llama-proxy.service` — proxy server service unit
+
+Both units document two deployment approaches:
+- **User service** (recommended) — runs under the operator's login session, uses `~/.config/systemd/user/`
+- **System service** — runs independently of user sessions, uses `/etc/systemd/system/`
+
+See the individual unit files for setup commands, configuration, and verification steps.
+
+### Log paths
+
+The proxy distinguishes between development and production log paths:
+
+| Mode | Proxy logs | llama-server logs |
+|------|------------|-------------------|
+| Development | `./logs/proxy.log` | `./logs/llama-server.log` |
+| Production (user service) | `$XDG_STATE_HOME/llama-proxy/logs/proxy.log` | `$XDG_STATE_HOME/llama-server/logs/llama-server.log` |
+| Production (system service) | `/var/log/llama-proxy/proxy.log` | `/var/log/llama-server/llama-server.log` |
+
+### Verification
+
+Verify services are running after deployment:
+
+```bash
+# Check llama-server health
+curl http://localhost:8080/health
+
+# Check proxy health
+curl http://localhost:8000/health
+
+# View systemd logs (user service)
+journalctl --user -u llama-server.service -f
+journalctl --user -u llama-proxy.service -f
+
+# View systemd logs (system service)
+sudo journalctl -u llama-server.service -f
+sudo journalctl -u llama-proxy.service -f
+```
+
+## Requirements
 
 ## Requirements
 
 - Python 3.10+
-- Distrobox with a container named `llama` containing llama-server (llama.cpp)
--- `/home/rgardler/projects/llm/start-llama.sh` script for starting llama-server
+- Podman with a container image containing llama-server (llama.cpp)
+- `/home/rgardler/projects/llm/start-llama.sh` script for starting llama-server
 
-See `../LLAMA_README.md` for distrobox setup instructions.
+See `../LLAMA_README.md` for build and setup instructions.
 
 ## Installation
 
@@ -96,13 +163,17 @@ sudo install -m 0755 proxy/proxyctl /usr/local/bin/proxyctl
 Usage examples:
 
 ```sh
-proxyctl start    # start using proxy/config.yaml llama_start_script or start-llama.sh
-proxyctl status   # show running status and PID
-proxyctl logs     # tail the proxy logs
-proxyctl stop     # stop the running proxy
+proxyctl start              # start using proxy/config.yaml llama_start_script or start-llama.sh
+proxyctl start --dev        # start dev instance (port 8001, DEBUG logging, auto-reload)
+proxyctl status             # show running status and PID
+proxyctl status --dev       # show dev instance status
+proxyctl logs               # tail the proxy logs
+proxyctl logs --dev         # tail dev instance logs
+proxyctl stop               # stop the running proxy
+proxyctl stop --dev         # stop the dev instance
 ```
 
-The script respects `LLAMA_START_SCRIPT` environment variable and `proxy/config.yaml` `server.llama_start_script` entry when determining what to run.
+The script respects `LLAMA_START_SCRIPT` environment variable and `proxy/config.yaml` `server.llama_start_script` entry when determining what to run. Use the `--dev` flag to run in development mode, or set `LLAMA_PROXY_DEV=1` to force dev mode via environment variable.
 
 ## Configuration
 
@@ -119,7 +190,6 @@ server:
     - "embeddings"
     - "gemma4"    # preload the configured default model (gemma4)
   llama_models_max: 1
-  distrobox_name: "llama"  # Distrobox container where llama-server runs
   llama_server_port: 8080
   llama_startup_timeout: 300
   session_single_flight_mode: "queue"
@@ -127,9 +197,35 @@ server:
   session_slot_save_path: "/home/rgardler/projects/llm/slot-cache"
   session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
-  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_runtime_seconds: 1800
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 64
+  session_guardrail_repetition_min_repeats: 10
+  session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
+  session_require_restore_signal: false
+
+# Default model to load on startup
+# Set the default to `gemma4` in examples and docs; other models (e.g., `gpt120`) remain available.
+default_model: "gemma4"
+
+# Logging configuration
+logging:
+  directory: "/var/log/llama-proxy"
+  rotation_hours: 6
+  retention_days: 90
+  level: "INFO"
+
+# Audit model configuration
+# The audit skill uses these settings to determine which model to call
+# for audit operations. See proxy/provider_resolver.py for details.
+audit_model: "deepseek-v4-flash-free"
+audit_model_fallbacks:
+  - "openrouter/free"
+  - "deepseek-v4-flash"
+
+# Model routing
+models:
   session_guardrail_repetition_min_repeats: 10
   session_guardrail_invalidate_on_cutoff: true
   session_guardrail_invalidate_on_repetition: false
@@ -157,15 +253,13 @@ models:
       - "qwen3-coder"
       - "qwen3*"          # Wildcard: matches qwen3-32b, qwen3-coder-instruct, etc.
 
-  openai:
+  provider-a:
     type: "remote"
-    endpoint: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"
+    endpoint: "https://api.provider-a.com/v1"
+    api_key_env: "PROVIDER_A_KEY"
     aliases:
-      - "gpt-4"
-      - "gpt-4-turbo"
-      - "gpt-*"           # Wildcard: matches any model starting with gpt-
-      - "o1-*"            # Wildcard: matches o1-preview, o1-mini, etc.
+      - "my-model-*"      # Wildcard: matches my-model-anything
+      - "my-model"
 ```
 
 ### Wildcard Patterns in Aliases
@@ -186,14 +280,43 @@ Aliases support wildcard patterns using fnmatch syntax:
 qwen3:
   aliases: ["qwen3", "qwen3-coder"]   # Exact matches
 
-openai:
-  aliases: ["gpt-*", "o1-*"]          # Wildcards route ALL gpt- and o1- models to OpenAI
+provider-a:
+  aliases: ["my-model-*"]            # Wildcards route ALL my-model-* to provider-a
 ```
 
-- Request for `gpt-4` → Routes to OpenAI
-- Request for `gpt-4o-mini` → Routes to OpenAI
-- Request for `o1-preview` → Routes to OpenAI
+- Request for `my-model` → Routes to provider-a
+- Request for `my-model-extra` → Routes to provider-a
 - Request for `qwen3-coder` → Routes to local qwen3
+
+### Friendly Model Aliases
+
+In addition to model IDs and wildcard patterns, the proxy supports short,
+human-friendly aliases that map directly to configured model presets.
+These are useful when callers should not need to know internal preset IDs.
+
+**Example configuration:**
+```yaml
+qwen3-next:
+  providers:
+    - name: local-qwen3-next
+      type: local
+      llama_model: Qwen3-Next
+  aliases:
+    - qwen3-next
+    - qwen3-coder-next
+    - plan       # Route requests for model="plan" to Qwen3-Next
+    - code       # Route requests for model="code" to Qwen3-Next
+```
+
+Requests with `model: "plan"` or `model: "code"` are routed to the `qwen3-next`
+preset. The same case-insensitive and wildcard precedence rules apply:
+
+- `"plan"`, `"Plan"`, `"PLAN"` → all resolve to `qwen3-next`
+- `"code"`, `"Code"`, `"CODE"` → all resolve to `qwen3-next`
+- Exact aliases (`plan`, `code`) take precedence over wildcard patterns
+
+Friendly aliases are listed in the `/v1/models` response and can be discovered
+programmatically by inspecting the `aliases` field of each model entry.
 
 ### Model Types
 
@@ -208,13 +331,360 @@ openai:
 - `api_key_env`: Environment variable containing the API key
 - `headers`: Additional headers to include (optional)
 
+### Audit Model Configuration
+
+The audit skill (`skill/audit/`) uses the `audit_model` and `audit_model_fallbacks`
+settings to determine which model to call for audit operations. The resolver
+maps short model names to provider-prefixed model identifiers.
+
+#### Configuration
+
+```yaml
+audit_model: "deepseek-v4-flash-free"
+audit_model_fallbacks:
+  - "openrouter/free"
+  - "deepseek-v4-flash"
+```
+
+#### Resolution
+
+The resolver maintains a static mapping table (in `proxy/provider_resolver.py`) that
+maps well-known short names to provider-prefixed model IDs:
+
+| Short name | Resolved IDs |
+|------------|-------------|
+| `deepseek-v4-flash-free` | `opencode/deepseek-v4-flash-free`, `openrouter/openrouter/free`, `opencode-go/deepseek-v4-flash` |
+| `deepseek-v4-flash` | `opencode/deepseek-v4-flash`, `opencode-go/deepseek-v4-flash`, `openrouter/deepseek/deepseek-v4-flash` |
+| `openrouter/free` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
+| `free-model` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
+
+Canonical model IDs were discovered via `pi --list-models`:
+- `opencode/deepseek-v4-flash-free`
+- `opencode-go/deepseek-v4-flash`
+- `openrouter/openrouter/free`
+- `openrouter/deepseek/deepseek-v4-flash`
+- `opencode/deepseek-v4-flash`
+
+#### Fallback Behaviour
+
+When the primary `audit_model` fails to resolve, the resolver attempts each
+fallback in order. If all names fail, startup validation logs a warning (lenient
+mode, default) or errors (strict mode). The default strictness is lenient to
+avoid blocking startup when models are temporarily unavailable.
+
+#### Startup Validation
+
+At server startup the resolver validates that at least one valid model can be
+resolved. Configuration:
+
+```yaml
+# Not yet exposed in config.yaml — resolved programmatically from the resolver
+# Default: strict=false (lenient — logs warnings but does not fail startup)
+```
+
+#### Observability
+
+The resolver produces structured logs and a lightweight metric:
+
+- **Log**: `INFO` on successful resolution, `WARNING` on unresolvable names
+- **Metric**: `provider_resolver_unresolved_total` — count of unresolvable
+  lookups keyed by short name
+
+#### Migration Note
+
+The SorrasAgents integration will consume this resolver in a separate work item
+(LP-0MQGO0PWJ001R5QI covers the resolver implementation; SorrasAgents update
+follows). Until then, the resolver is available for standalone testing via the
+CLI:
+
+```bash
+cd proxy && source .venv/bin/activate
+python -m proxy.provider_resolver deepseek-v4-flash-free openrouter/free
+# Output: Resolved to: opencode/deepseek-v4-flash-free, openrouter/openrouter/free, opencode-go/deepseek-v4-flash
+```
+
+### Provider Fallback
+
+Each model can define an ordered list of `providers` for automatic failover. The `providers` list replaces the old top-level `endpoint`, `api_key_env`, and `headers` fields on each model entry. This is a **breaking change** — existing flat-format model entries must be migrated to the provider list format.
+
+When a request arrives for a model with a `providers` list, the proxy tries each provider in order. If a provider fails (connection error, timeout, HTTP 4xx/5xx, or slot exhaustion for local models), the proxy immediately tries the next provider in the list. This continues until a provider succeeds or all providers are exhausted.
+
+#### Provider Entry Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique identifier for this provider entry |
+| `type` | string | yes | `"local"` or `"remote"` |
+| `endpoint` | string | remote | Base URL of the remote API |
+| `api_key_env` | string | remote | Environment variable containing the API key |
+| `headers` | dict | remote (optional) | Additional headers to include |
+| `llama_model` | string | local | Name of the local model |
+
+#### Example: Remote Fallback
+
+```yaml
+models:
+  mimo-v2.5:
+    providers:
+      - name: remote-primary
+        type: remote
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+      - name: remote-fallback
+        type: remote
+        endpoint: https://api.provider-b.com/v1
+        api_key_env: PROVIDER_B_KEY
+    aliases:
+      - mimo*
+```
+
+In this example, requests for `mimo-v2.5` first try the primary remote provider. If that fails, they fall back to the secondary provider.
+
+#### Example: Local-to-Remote Fallback
+
+```yaml
+models:
+  hybrid-model:
+    providers:
+      - name: local-llama
+        type: local
+        llama_model: Qwen3
+      - name: remote-fallback
+        type: remote
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+    aliases:
+      - hybrid*
+```
+
+In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to the remote provider.
+
+#### Unavailability Detection
+
+A provider is considered unavailable when:
+- **Connection error**: DNS failure, connection refused, timeout
+- **HTTP error**: Response with status >= 400 (4xx or 5xx)
+- **Slot exhaustion** (local models): `available_slots == 0` and `total_slots > 0`
+
+#### Cooldown / Circuit Breaker
+
+After a provider fails, it is marked as unavailable for a cooldown period. During cooldown, subsequent requests skip that provider and try the next available one. This prevents wasting time on known-bad endpoints.
+
+- **Default cooldown**: 60 seconds
+- **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
+- **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
+- **State**: Cooldown state is in-memory only and resets when the proxy restarts
+
+#### All Providers Exhausted
+
+When all providers are exhausted:
+- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 (Too Many Requests) with `Content-Type: text/plain` and body `"Model server busy: 0/<total_slots> slots available. Retry later."` (no `Retry-After` header).
+- **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
+
+#### Observability
+
+When a fallback occurs:
+- **Response header**: `X-Provider: <provider-name>` is added to the response, indicating which provider handled the request.
+- **Logging**: An INFO-level log is emitted:
+  ```
+  Fallback triggered for model=v1/chat/completions, from=remote-primary, to=remote-fallback, reason=HTTP 502
+  ```
+
+#### Migration Guide
+
+To migrate from the old flat format to the new `providers` list format:
+
+1. Replace the top-level `endpoint`, `api_key_env`, and `headers` fields with a `providers` list.
+2. Each entry in the `providers` list must have a `name`, `type`, and type-specific fields.
+3. For single-provider models, simply wrap the existing config in a `providers` list.
+
+**Before (old format):**
+```yaml
+models:
+  my-model:
+    type: remote
+    endpoint: https://api.provider-a.com/v1
+    api_key_env: PROVIDER_A_KEY
+    aliases:
+      - my-model
+      - my-model-*
+```
+
+**After (new format):**
+```yaml
+models:
+  my-model:
+    providers:
+      - name: my-provider
+        type: remote
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+    aliases:
+      - my-model
+      - my-model-*
+```
+
+**Important:** The old top-level `endpoint`/`api_key_env` format is **deprecated** and will be removed in a future release. All models must use the `providers` list format.
+
+### Custom System Prompts
+
+Each model entry may include a `system_prompt` configuration to inject a default
+system prompt into all requests targeting that model or any of its aliases.
+
+#### Configuration
+
+```yaml
+models:
+  assistant-model:
+    type: local
+    llama_model: gemma4
+    aliases:
+      - "assistant"
+      - "asst"
+    system_prompt:
+      mode: "prepend"       # "override" or "prepend" (required)
+      file: "proxy/prompts/assistant.txt"
+```
+
+#### Modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `override` | Replaces **all** client-supplied system messages with the prompt file content. |
+| `prepend`  | Inserts the prompt file content as the first system message **before** any client-supplied system messages. |
+
+If `system_prompt` is present but `mode` is missing or invalid, config validation
+fails at startup with a clear error message.
+
+#### Prompt file resolution precedence
+
+When a request arrives, the proxy looks for the prompt file in this order:
+
+1. **Local override**: `.sorraAgents/prompts/<alias>.txt` (project-local, not committed)
+2. **Repo default**: The path specified in `system_prompt.file`, resolved against the repo root
+3. **No prompt** if neither exists
+
+This allows operators to deploy per-instance prompt overrides without modifying
+the repository. Override files are looked up by alias name (e.g.,
+`.sorraAgents/prompts/assistant.txt` for the `assistant` alias).
+
+#### File format and limits
+
+- Files must be **plain text UTF-8**.
+- Maximum file size: **64 KB**. Files larger than this are ignored and logged.
+- Non-UTF-8 files are ignored and logged.
+- **No caching**: prompt files are read on every request.
+
+#### Security considerations
+
+- **Do not store secrets or credentials in prompt files.** Prompts are plaintext
+  and may appear in logs, upstream request payloads, or the debug endpoint.
+- Local override files (`.sorraAgents/prompts/`) are outside the repository
+  and should be managed via deployment tooling, not committed.
+- Enable the debug endpoint (see below) only for development or QA.
+
+#### Example prompt file
+
+Create `proxy/prompts/assistant.txt`:
+
+```
+You are a helpful and knowledgeable assistant. Your responses should be
+concise, accurate, and well-structured. When asked to write code, include
+comments and follow best practices.
+```
+
+#### Debug endpoint
+
+When enabled, the debug endpoint at `GET /debug/prompt?alias=<alias>` returns
+sanitized information about the resolved prompt:
+
+```json
+{
+  "alias": "assistant",
+  "resolved": true,
+  "mode": "prepend",
+  "source_path": "/path/to/prompt.txt",
+  "content_preview": "You are a helpful...",
+  "size_bytes": 182
+}
+```
+
+To enable, set `server.debug: true` in `config.yaml`:
+
+```yaml
+server:
+  debug: true
+```
+
+By default, the endpoint returns only the first 200 characters of content
+(`content_preview`). Pass `&full=true` to get the full content when debug
+mode is enabled. Without debug mode, the endpoint is accessible only from
+localhost (127.0.0.1).
+
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `LLAMA_PROXY_CONFIG` | Path to config file (default: `./config.yaml`) |
+| `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
+| `LLAMA_START_SCRIPT` | Override the start script path (used by proxyctl) |
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
+| `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
+| `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
+| `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
+| `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
+
+### Development Mode
+
+The proxy supports a development mode that allows running a dev instance side-by-side with the production proxy. Dev mode uses alternate ports, DEBUG logging, and auto-reload for rapid iteration.
+
+#### Dev Mode Ports
+
+| Component | Default (prod) | Default (dev) | Overridable via |
+|-----------|---------------|---------------|----------------|
+| Proxy web server | 8000 | 8001 | `PROXY_PORT` env var |
+| llama-server backend | 8080 | 8081 | `LLAMA_SERVER_PORT` or `PORT` env var |
+
+#### Using Dev Mode with proxyctl
+
+```bash
+# Start dev instance (auto-reload + DEBUG logging)
+proxyctl start --dev
+
+# Check dev instance status
+proxyctl status --dev
+
+# View dev logs
+proxyctl logs --dev
+
+# Restart dev instance
+proxyctl restart --dev
+
+# Stop dev instance
+proxyctl stop --dev
+```
+
+#### Direct uvicorn invocation
+
+You can also run the proxy directly with uvicorn for development:
+
+```bash
+source .venv/bin/activate
+export LLAMA_PROXY_DEV=1
+python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
+```
+
+#### Dev Mode Details
+
+- **Opt-in only**: Dev mode must be explicitly enabled via `--dev` flag or `LLAMA_PROXY_DEV=1` environment variable
+- **Separate PID file**: Dev instances use `proxy.dev.pid` to avoid conflicts with production
+- **Separate log directory**: Dev logs go to `$XDG_STATE_HOME/llama-proxy-dev/logs/` (or `~/.local/state/llama-proxy-dev/logs/`)
+- **Auto-reload**: Code changes trigger automatic server restarts during development
+- **DEBUG logging**: All log levels are emitted for maximum visibility during development
+- **No production impact**: Dev mode does not modify production config or defaults
+
+> **Warning**: Ensure no other service is listening on port 8001 or 8081 before starting the dev instance.
 
 Systemd-specific instructions removed. If you run systemd units outside this repository, add environment variables via `systemctl edit <unit>` or your system's preferred method.
 
@@ -222,10 +692,32 @@ Systemd-specific instructions removed. If you run systemd units outside this rep
 
 ### Starting the Server
 
-**Development:**
+**With proxyctl (recommended):**
+```bash
+# Production (default port 8000)
+proxyctl start
+
+# Development (port 8001, DEBUG logging, auto-reload)
+proxyctl start --dev
+```
+
+**Direct uvicorn:**
 ```bash
 source .venv/bin/activate
-python -m uvicorn server:app --host 0.0.0.0 --port 8000
+# Production
+python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
+
+# Development (with auto-reload and DEBUG logging)
+LLAMA_PROXY_DEV=1 python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
+```
+
+Note on start-proxy.sh hardening
+
+The bundled `proxy/scripts/start-proxy.sh` script now prefers the virtualenv Python interpreter (`.venv/bin/python3`) when available, falls back to the system `python3`, and will set `PYTHONPATH` to the repository root if it is not already set to avoid import errors when running from the repository checkout.
+
+Before launching the server the script also checks whether the selected port (default `8000`, or overridden with `--port`) is already in use on the local host. If the port is occupied the script exits with a helpful message indicating the port and suggesting `proxyctl start --dev` or running with a different `--port` value.
+
+This makes manual invocations of the proxy more robust across developer environments and reduces confusing import or bind errors when starting the server directly.
 ```
 
 **Production:** Run the proxy under your platform's service manager or keep it as a manually started process:
@@ -295,6 +787,48 @@ Response:
   }
 }
 ```
+
+#### LLama Local Status
+
+Internal endpoint that returns a small JSON object describing the current status
+of the local llama.cpp (llama-server) process.
+
+```bash
+curl http://localhost:8000/llama/local/status
+```
+
+Response:
+```json
+{
+  "active_query": false,
+  "model_switch_in_progress": false,
+  "current_model": "qwen3",
+  "llama_server_running": true,
+  "available_slots": 2,
+  "total_slots": 4
+}
+```
+
+**Fields:**
+
+| Field                     | Type          | Description                                                                 |
+|---------------------------|---------------|-----------------------------------------------------------------------------|
+| `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
+| `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
+| `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
+| `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
+| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing).     |
+| `total_slots`             | `int`         | Total number of model-serving slots configured on the llama-server.         |
+
+**Performance:**
+
+The endpoint is designed to remain responsive even under load. The underlying
+`query_llama_status()` call is wrapped with a configurable timeout
+(default: 1 second, overridable via the `STATUS_QUERY_TIMEOUT` environment
+variable). If the query times out, safe defaults (mostly `false`/`null`) are
+returned and `llama_server_running` is set to `false`.
+
+This endpoint requires no authentication (internal) and is rate-unlimited.
 
 #### List Models
 ```bash
@@ -366,6 +900,49 @@ curl -X POST http://localhost:8000/admin/reset-counts
 ```
 
 Resets in-memory request/token counters and triggers immediate persistence.
+
+## Client Disconnect Detection
+
+The proxy automatically detects when a client disconnects during a streaming response and performs cleanup to prevent resource leaks and false overload signals.
+
+### How It Works
+
+1. The proxy periodically calls `request.is_disconnected()` (every 10 SSE chunks) during streaming in both local and remote proxy handlers.
+2. When a disconnect is detected:
+   - The streaming loop is broken immediately
+   - The httpx connection to the backend is closed
+   - The JobScheduler slot is released (if one was allocated) via `scheduler.remove_job()`
+   - The `active_queries` counter is correctly decremented
+   - Any queued jobs for the disconnected session are removed from the queue
+3. Cleanup code runs in a `finally` block, ensuring resources are released even on generator closure.
+
+### Configuration
+
+Client disconnect cleanup timeout can be configured in `config.yaml`:
+
+```yaml
+server:
+  disconnect_cleanup_timeout: 5.0  # seconds, default: 5.0
+```
+
+This timeout controls how long the proxy waits for cleanup operations (e.g., closing the httpx connection) to complete. If a cleanup operation exceeds this timeout, it is cancelled and the proxy continues with remaining cleanup steps.
+
+### Behavior on Non-Streaming Requests
+
+For non-streaming requests, the proxy reads the full backend response before returning. Client disconnect during non-streaming processing is detected by Starlette's built-in mechanisms, and resources are cleaned up in the request handler's error paths.
+
+### Queue and Slot Cleanup
+
+When a client disconnects:
+- **While queued**: The job is removed from the JobScheduler queue and marked as cancelled. When a slot becomes available, cancelled jobs are skipped.
+- **While a slot is allocated**: The slot is released immediately for use by another session. The `active_queries` counter is decremented.
+
+### Observability
+
+The proxy logs client disconnect events at INFO level with the session ID and slot ID:
+```
+client_disconnect session=<session_id> slot=<slot_id>
+```
 
 ## Session-Based Incremental Ingestion
 
@@ -529,9 +1106,25 @@ Guardrails stop runaway responses and invalidate sessions when configured:
 - `server.session_guardrail_repetition_min_repeats` — repetition count to trigger cutoff
 - `server.session_guardrail_invalidate_on_cutoff` — invalidate session after runtime/token cutoff
 - `server.session_guardrail_invalidate_on_repetition` — invalidate session after repetition cutoff
+- `server.session_guardrail_max_token_rate` — token-rate guardrail threshold (tokens/second). Default `0` = disabled.
+- `server.session_guardrail_token_rate_window_seconds` — rolling window (seconds) used to compute sustained tokens/sec.
 
 When a guardrail triggers, `/admin/metrics` exposes `guardrail_metrics` with the
 cutoff reason and invalidation counters for observability.
+
+Token-rate guardrail calibration and notes:
+- Disabled by default. Operators must explicitly enable it by setting `server.session_guardrail_max_token_rate`.
+- Measurement is best-effort: token counting uses the existing `count_text_tokens` utility and SSE chunk boundaries, so rates are approximate.
+- The guardrail requires a sustained violation over the full rolling window (`session_guardrail_token_rate_window_seconds`) to avoid cutting short legitimate short bursts.
+- To calibrate a threshold:
+  1. Enable the Prometheus token-rate metrics (see below) in a non-enforcing, observability-only run — start with a very high threshold or deploy in a canary environment.
+  2. Observe `llama_token_rate_gauge{session_id="..."}` (instantaneous gauge) or compute a percentile from `llama_token_rate_histogram` over representative traffic, for example:
+     ```promql
+     histogram_quantile(0.95, sum(rate(llama_token_rate_histogram_bucket[5m])) by (le))
+     ```
+  3. Choose a threshold comfortably above your normal operating percentile (e.g., above 99th percentile of normal traffic), and test in canary before broad rollout.
+
+Note: token-rate measurement is approximate and intended as a pragmatic guardrail; prefer conservative thresholds and monitor metrics closely after enabling.
 
 ### Slot persistence (KV save/restore)
 
@@ -577,6 +1170,24 @@ Available metrics (best-effort):
 - `llama_model_rss_bytes{model="..."}` (gauge) — estimated per-model RSS (when multiple models are loaded the proxy divides process RSS evenly across models as an approximation).
 - `llama_model_load_events_total{model="...",event="load|unload"}` (counter) — model lifecycle events.
 - `llama_models_loaded` (gauge) — number of loaded models reported by router-mode.
+- `proxy_http_errors_total{endpoint="...",status="...",reason="..."}` (counter) — HTTP errors by endpoint, status class, and reason. Incremented via `record_http_error(endpoint, status, reason)` at each 5xx response. Reasons include: `backend_error`, `backend_unavailable`, `self_healing`, and `slot_exhaustion`. See [5xx Error Runbook](docs/runbook-5xx.md) for investigation guidance.
+
+Token-rate observability metrics (exposed on `/metrics`):
+
+- `llama_token_rate_gauge{session_id="..."}` (gauge) — Best-effort instantaneous tokens/second observed for an active session. Useful for short-term spikes and live dashboards.
+- `llama_token_rate_histogram{session_id="..."}` (histogram) — Bucketed distribution of observed token rates per session. Use Prometheus `histogram_quantile()` over a reasonable window (e.g., 5m) to compute operational percentiles for calibration.
+
+Example queries:
+- 95th percentile token-rate across all sessions:
+```promql
+histogram_quantile(0.95, sum(rate(llama_token_rate_histogram_bucket[5m])) by (le))
+```
+- Current token-rate gauge for a specific session:
+```promql
+llama_token_rate_gauge{session_id="<session-id>"}
+```
+
+These metrics are best-effort and will no-op when the `prometheus_client` library is not available. They are scoped per-session to help identify high-rate sessions that might indicate a runaway generator.
 
 Example Prometheus scrape config:
 
@@ -587,8 +1198,26 @@ scrape_configs:
       - targets: ['localhost:8000']
 ```
 
-Alerting rules (warning at 75% of 90GB; critical at 90GB) are provided in `monitoring/llama_memory_alerts.yaml`.
-A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json`.
+A fully configured Prometheus instance with alert rules, data retention,
+and systemd service setup is documented in [monitoring/README.md](../monitoring/README.md).
+
+### Alerting Rules
+
+- **Llama memory**: Warning at 75% of 90GB; critical at 90GB — `monitoring/llama_memory_alerts.yaml`.
+- **Proxy 5xx errors**: Critical alert when `rate(proxy_http_errors_total{endpoint="/v1/chat/completions",status="5xx"}[5m]) > 5` for 5 minutes — `monitoring/proxy_5xx_alerts.yaml`.
+
+A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json` with panels for llama-server RSS, models loaded, and proxy 5xx error rate.
+
+### Deploying Prometheus and Grafana
+
+See [monitoring/README.md](../monitoring/README.md) for step-by-step deployment
+instructions covering Prometheus and Grafana binary installation, systemd user
+service setup, Grafana datasource and dashboard provisioning, and
+verification steps.
+
+### Runbook
+
+See [5xx Error Runbook](docs/runbook-5xx.md) for on-call investigation, remediation, and escalation steps when the `ProxyHttpErrorsHigh` alert fires.
 
 ## Model Switching Behavior
 
@@ -621,6 +1250,32 @@ The proxy now adds bounded backend retries for transient local transport failure
 - `server.backend_retry_max_delay_seconds`
 - `server.backend_retry_jitter_ratio`
 
+#### Adaptive Timeouts
+
+The proxy supports adaptive timeouts that scale based on prompt size. This
+prevents unnecessary timeouts for large prompts while keeping reasonable
+limits for small requests.
+
+Enable with:
+
+- `server.llama_adaptive_timeout_enabled` (default `false`)
+- `server.llama_adaptive_timeout_base_seconds` (default `60`)
+- `server.llama_adaptive_timeout_per_token_seconds` (default `0.01`)
+- `server.llama_request_timeout` (default `300`) — used as max timeout cap
+
+The adaptive timeout formula is:
+```
+timeout = min(base + per_token * estimated_tokens, max_timeout)
+```
+
+For example, with default settings:
+- Small prompt (100 tokens): `60 + 0.01 * 100 = 61s`
+- Medium prompt (1000 tokens): `60 + 0.01 * 1000 = 70s`
+- Large prompt (10000 tokens): `60 + 0.01 * 10000 = 160s`
+- Very large prompt (25000 tokens): capped at `300s`
+
+Token estimation uses a heuristic of ~4 bytes per token for UTF-8 text.
+
 Concurrency pressure is controlled by `server.max_concurrent_queries` (default 4).
 When the guard rejects a request, the proxy returns a 503 and increments
 `backend_signals.concurrency_rejects`.
@@ -639,6 +1294,14 @@ Self-healing uses exponential backoff and is capped by:
 
 While self-healing is active, proxy requests return HTTP `503` with
 `Retry-After: 30` and a machine-readable `backend_recovery_in_progress` payload.
+
+If the backend is unavailable (either `backend_ready` is `false` or the backend
+process has not been started), requests to `/v1/chat/completions` and other
+completions endpoints immediately return HTTP `503` with a `backend_unavailable`
+payload and `Retry-After` header, **without** attempting to connect to the
+backend. This eliminates the window between a backend crash and watchdog
+detection where clients would previously receive raw 500 errors.
+
 When self-healing is not active, existing backend failure behavior is unchanged.
 
 #### Fault-injection validation (reproducible)
@@ -807,6 +1470,29 @@ The test suite covers:
                                             │  Anthropic API  │
                                             └─────────────────┘
 ```
+
+### Internal Module Structure
+
+The proxy server (`proxy/proxy/`) has been refactored from a monolithic `server.py`
+into a modular composition:
+
+| Module | Responsibility |
+|--------|---------------|
+| `server.py` | Bootstrap, composition wiring, module-level globals, lifespan, `main()` |
+| `router.py` | Core proxy routing (`proxy_to_local`, `proxy_to_remote`) and request/response logging (`log_request`, `log_response`, `log_response_chunk`) |
+| `handlers.py` | HTTP route handlers (FastAPI APIRouter) — `/health`, `/v1/models`, `/metrics`, `/admin/*` |
+| `lifecycle.py` | Model lifecycle orchestration, model loading, refcounting, background loads, router-model loading |
+| `backend_health.py` | Backend recovery, self-healing, watchdog monitoring, worker-health checks, router model health monitoring |
+| `session.py` | Session coordination, delta/fallback/single-flight, restore signal detection, `ContentOnlyConsoleHandler` |
+| `observability.py` | Backend signal counters, SSE client sets (`sse_clients`, `log_tail_clients`), persistence loops |
+| `metrics.py` | Prometheus metrics helpers (gauges, counters, exposition format) |
+| `ui.py` | Web UI endpoints (dashboard at `/`, log viewer at `/logs`, SSE streaming) |
+| `templates/` | HTML template files for Web UI (`index.html`, `view_logs.html`) |
+| `session_manager.py` | Core session manager class (session create/lookup/expiry) |
+
+Each module uses a lazy `_srv()` import pattern to access `server.py` module-level
+state without circular imports. Backward-compatibility re-exports in `server.py`
+preserve existing test imports.
 
 ## License
 

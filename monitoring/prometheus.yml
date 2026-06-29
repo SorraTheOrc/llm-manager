@@ -1,0 +1,25 @@
+# Prometheus configuration for LLM proxy stack
+#
+# Drop this file into the Prometheus config directory and reference it
+# when starting Prometheus:
+#
+#   prometheus --config.file=prometheus.yml
+#
+# See monitoring/README.md for full deployment instructions.
+
+global:
+  scrape_interval:     15s      # How frequently to scrape targets by default
+  evaluation_interval: 15s      # How frequently to evaluate alerting rules
+
+# Alerting rules
+rule_files:
+  - "monitoring/llama_memory_alerts.yaml"
+  - "monitoring/proxy_5xx_alerts.yaml"
+
+# Scrape configurations
+scrape_configs:
+  # Scrape the LLM proxy's /metrics endpoint
+  - job_name: "llama-proxy"
+    static_configs:
+      - targets: ["localhost:8000"]
+    metrics_path: /metrics

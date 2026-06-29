@@ -3,15 +3,26 @@ set -euo pipefail
 
 SCRIPT_NAME="proxyctl"
 
+# Global flags
+DEV_MODE=0
+
 PID_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy"
 PID_FILE="$PID_DIR/proxy.pid"
+DEV_PID_FILE="$PID_DIR/proxy.dev.pid"
 LOG_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy/logs"
 LOG_FILE="$LOG_DIR/proxy.log"
+DEV_LOG_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy-dev/logs"
+DEV_LOG_FILE="$DEV_LOG_DIR/proxy-dev.log"
 CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.yaml"
 
 ensure_dirs() {
   mkdir -p "$PID_DIR"
   mkdir -p "$LOG_DIR"
+}
+
+ensure_dev_dirs() {
+  mkdir -p "$PID_DIR"
+  mkdir -p "$DEV_LOG_DIR"
 }
 
 read_config_start_script() {
@@ -37,9 +48,10 @@ read_config_start_script() {
 }
 
 is_running() {
-  if [[ -f "$PID_FILE" ]]; then
+  local check_pid_file="${1:-$PID_FILE}"
+  if [[ -f "$check_pid_file" ]]; then
     local pid
-    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    pid=$(cat "$check_pid_file" 2>/dev/null || true)
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       printf '%s' "$pid"
       return 0
@@ -49,28 +61,86 @@ is_running() {
 }
 
 cmd_start() {
-  ensure_dirs
-  if pid=$(is_running); then
-    echo "proxy already running (PID $pid)"
-    exit 0
-  fi
+  local dev_mode="$1"
+  local start_script
 
-  start_script=$(read_config_start_script)
-  if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
-    echo "Start script not found: $start_script" >&2
-    exit 2
-  fi
+  if [[ "$dev_mode" -eq 1 ]]; then
+    ensure_dev_dirs
+    if pid=$(is_running "$DEV_PID_FILE"); then
+      echo "proxy dev already running (PID $pid)"
+      exit 0
+    fi
 
-  echo "Starting proxy using: $start_script"
-  # Run in background, redirecting output to log file.
-  nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
-  local pid=$!
-  echo "$pid" > "$PID_FILE"
-  echo "Started (PID $pid). Logs: $LOG_FILE"
+    # Dev mode: set dev defaults (overridable via env vars)
+    export LLAMA_PROXY_DEV=1
+    export PROXY_PORT="${PROXY_PORT:-8001}"
+    export LLAMA_SERVER_PORT="${LLAMA_SERVER_PORT:-8081}"
+    export PORT="$LLAMA_SERVER_PORT"
+
+    start_script=$(read_config_start_script)
+    if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+      echo "Start script not found: $start_script" >&2
+      exit 2
+    fi
+
+    echo "Starting proxy in dev mode (web: http://localhost:${PROXY_PORT}, backend: http://localhost:${LLAMA_SERVER_PORT})"
+    echo "Dev log directory: $DEV_LOG_DIR"
+
+    # In dev mode, launch via proxy server directly with uvicorn for auto-reload
+    # First start llama-server backend in the background
+    nohup bash "$start_script" > "$DEV_LOG_DIR/llama-server-dev.log" 2>&1 &
+    local llama_pid=$!
+    echo "Started llama-server backend (PID $llama_pid)"
+
+    # Wait briefly for llama-server to initialize
+    sleep 2
+
+    # Then start the proxy server with uvicorn, --reload, and debug logging
+    local proxy_dir
+    proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local venv_activate="$proxy_dir/.venv/bin/activate"
+
+    if [[ -f "$venv_activate" ]]; then
+      (source "$venv_activate" && exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug) > "$DEV_LOG_FILE" 2>&1 &
+    else
+      echo "Warning: virtualenv not found at $venv_activate, running without it" >&2
+      exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug > "$DEV_LOG_FILE" 2>&1 &
+    fi
+    local pid=$!
+    echo "$pid" > "$DEV_PID_FILE"
+    echo "Started dev proxy (PID $pid). Logs: $DEV_LOG_FILE"
+  else
+    # Production mode (unchanged)
+    ensure_dirs
+    if pid=$(is_running); then
+      echo "proxy already running (PID $pid)"
+      exit 0
+    fi
+
+    start_script=$(read_config_start_script)
+    if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+      echo "Start script not found: $start_script" >&2
+      exit 2
+    fi
+
+    echo "Starting proxy using: $start_script"
+    # Run in background, redirecting output to log file.
+    nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    echo "Started (PID $pid). Logs: $LOG_FILE"
+  fi
 }
 
 cmd_stop() {
-  if ! pid=$(is_running); then
+  local dev_mode="$1"
+  local pid_file="$PID_FILE"
+
+  if [[ "$dev_mode" -eq 1 ]]; then
+    pid_file="$DEV_PID_FILE"
+  fi
+
+  if ! pid=$(is_running "$pid_file"); then
     echo "proxy not running"
     exit 0
   fi
@@ -87,12 +157,19 @@ cmd_stop() {
       break
     fi
   done
-  rm -f "$PID_FILE"
+  rm -f "$pid_file"
   echo "Stopped"
 }
 
 cmd_status() {
-  if pid=$(is_running); then
+  local dev_mode="$1"
+  local pid_file="$PID_FILE"
+
+  if [[ "$dev_mode" -eq 1 ]]; then
+    pid_file="$DEV_PID_FILE"
+  fi
+
+  if pid=$(is_running "$pid_file"); then
     echo "proxy running (PID $pid)"
     if ps -p "$pid" >/dev/null 2>&1; then
       start_time=$(ps -p "$pid" -o lstart= 2>/dev/null || true)
@@ -108,37 +185,57 @@ cmd_status() {
 }
 
 cmd_restart() {
-  cmd_stop || true
+  local dev_mode="$1"
+  cmd_stop "$dev_mode" || true
   sleep 1
-  cmd_start
+  cmd_start "$dev_mode"
 }
 
 cmd_logs() {
-  ensure_dirs
-  if [[ ! -f "$LOG_FILE" ]]; then
-    echo "Logfile does not exist yet: $LOG_FILE"
+  local dev_mode="$1"
+  local log_file="$LOG_FILE"
+
+  if [[ "$dev_mode" -eq 1 ]]; then
+    ensure_dev_dirs
+    log_file="$DEV_LOG_FILE"
+  else
+    ensure_dirs
+  fi
+
+  if [[ ! -f "$log_file" ]]; then
+    echo "Logfile does not exist yet: $log_file"
     exit 1
   fi
-  tail -n +1 -f "$LOG_FILE"
+  tail -n +1 -f "$log_file"
 }
 
 usage() {
   cat <<EOF
 $SCRIPT_NAME - manage local llama proxy
 
-Usage: $SCRIPT_NAME <command>
+Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
-  start     Start the proxy (uses config or start-llama.sh)
-  stop      Stop the running proxy (SIGTERM then SIGKILL)
-  restart   Stop then start
-  status    Show running status, PID and start time
-  logs      Tail the proxy log produced by $SCRIPT_NAME
-  help      Show this message
+  start [--dev]        Start the proxy (uses config or start-llama.sh)
+                       --dev  Run in development mode (port 8001, debug logging, auto-reload)
+  stop [--dev]         Stop the running proxy (SIGTERM then SIGKILL)
+  restart [--dev]      Stop then start
+  status [--dev]       Show running status, PID and start time
+  logs [--dev]         Tail the proxy log produced by $SCRIPT_NAME
+  help                 Show this message
 
 Environment:
-  LLAMA_START_SCRIPT  Override the start script path
-  XDG_STATE_HOME      Base dir for state (defaults to ~/.local/state)
+  LLAMA_START_SCRIPT   Override the start script path
+  XDG_STATE_HOME       Base dir for state (defaults to ~/.local/state)
+  LLAMA_PROXY_DEV      Set to 1 to force dev mode (alternative to --dev flag)
+  PROXY_PORT           Override proxy web server port (default: 8000 prod, 8001 dev)
+  LLAMA_SERVER_PORT    Override llama-server backend port (default: 8080 prod, 8081 dev)
+  PORT                 Override backend port (alias for LLAMA_SERVER_PORT)
+
+Dev Mode:
+  When --dev is used, the proxy starts on port 8001 with DEBUG logging and
+  auto-reload enabled. A separate PID file (proxy.dev.pid) and log directory
+  are used to avoid conflicts with production instances.
 
 Install:
   Copy this file to a location on PATH and make it executable, e.g.
@@ -154,13 +251,25 @@ main() {
   fi
   cmd="$1"
   shift || true
+
+  # Check for --dev flag in remaining arguments
+  local dev_args=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--dev" ]]; then
+      DEV_MODE=1
+    else
+      dev_args+=("$arg")
+    fi
+  done
+  set -- "${dev_args[@]+${dev_args[@]}}"
+
   case "$cmd" in
-    start) cmd_start ;; 
-    stop) cmd_stop ;; 
-    restart) cmd_restart ;; 
-    status) cmd_status ;; 
-    logs) cmd_logs ;; 
-    help|-h|--help) usage ;; 
+    start) cmd_start "$DEV_MODE" ;;
+    stop) cmd_stop "$DEV_MODE" ;;
+    restart) cmd_restart "$DEV_MODE" ;;
+    status) cmd_status "$DEV_MODE" ;;
+    logs) cmd_logs "$DEV_MODE" ;;
+    help|-h|--help) usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
   esac
 }

@@ -22,6 +22,10 @@ async def test_llama_local_status_not_running():
             assert isinstance(j.get("model_switch_in_progress"), bool)
             assert j.get("current_model") is None
             assert j.get("llama_server_running") is False
+            assert isinstance(j.get("available_slots"), int)
+            assert isinstance(j.get("total_slots"), int)
+            assert j["available_slots"] == 0
+            assert j["total_slots"] == 0
 
 
 @pytest.mark.asyncio
@@ -52,3 +56,5 @@ async def test_llama_local_status_running_and_switch():
                         assert j.get("model_switch_in_progress") is True
                         assert j.get("current_model") == "test-model"
                         assert j.get("llama_server_running") is True
+                        assert isinstance(j.get("available_slots"), int)
+                        assert isinstance(j.get("total_slots"), int)
