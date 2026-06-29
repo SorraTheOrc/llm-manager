@@ -7,6 +7,9 @@ This module exposes a small set of metrics required by LP-0MNA7G5JB004P5O6:
 - llm_model_load_events_total{model="...",event="load|unload"} (counter)
 - llm_models_loaded (gauge)
 
+Extended by LP-0MQ1HDY1N00502S7:
+- proxy_http_errors_total{endpoint="...",status="...",reason="..."} (counter)
+
 The implementation is best-effort: when router-mode exposes multiple models in a
 single process we estimate per-model RSS by dividing the process RSS equally
 across loaded models (documented). If prometheus_client is not installed the
@@ -15,22 +18,34 @@ functions are no-ops and generate_metrics() returns an explanatory payload.
 
 from typing import Iterable, Optional
 
-_enabled = True
+_enabled = False
+Gauge = None
+Counter = None
+Histogram = None
+generate_latest = None
+CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
 try:
-    from prometheus_client import Gauge, Counter, generate_latest, CONTENT_TYPE_LATEST
-    # Use the default registry — simple and compatible with Prometheus exposition
-except Exception:  # pragma: no cover - fallback path when dependency missing
+    import prometheus_client as _pc
+    Gauge = getattr(_pc, 'Gauge', None)
+    Counter = getattr(_pc, 'Counter', None)
+    Histogram = getattr(_pc, 'Histogram', None)
+    generate_latest = getattr(_pc, 'generate_latest', None)
+    CONTENT_TYPE_LATEST = getattr(_pc, 'CONTENT_TYPE_LATEST', CONTENT_TYPE_LATEST)
+    # Consider metrics enabled when we can create basic metrics
+    if Gauge is not None and Counter is not None and generate_latest is not None:
+        _enabled = True
+except Exception:
     _enabled = False
-    Gauge = None
-    Counter = None
-    generate_latest = None
-    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
 
 # Metric objects (initialized only if prometheus_client is available)
 llama_process_rss_bytes = None
 llama_model_rss_bytes = None
 llama_model_load_events_total = None
 llama_models_loaded = None
+proxy_http_errors_total = None
+# Token-rate observation metrics
+llama_token_rate_gauge = None
+llama_token_rate_histogram = None
 
 if _enabled:
     try:
@@ -46,6 +61,25 @@ if _enabled:
         llama_models_loaded = Gauge(
             'llama_models_loaded', 'Number of models currently loaded in the llama-server'
         )
+        proxy_http_errors_total = Counter(
+            'proxy_http_errors_total',
+            'Total HTTP errors by endpoint, status class, and reason',
+            ['endpoint', 'status', 'reason']
+        )
+        # Token-rate metrics: gauge for current tokens/sec, histogram for distribution
+        llama_token_rate_gauge = Gauge(
+            'llama_token_rate_gauge', 'Observed token generation rate (tokens/sec) per session', ['session_id']
+        )
+        if Histogram is not None:
+            try:
+                llama_token_rate_histogram = Histogram(
+                    'llama_token_rate_histogram', 'Histogram of token generation rates (tokens/sec) per session', ['session_id']
+                )
+            except Exception:
+                # If histogram creation fails, leave it as None but keep metrics enabled
+                llama_token_rate_histogram = None
+        else:
+            llama_token_rate_histogram = None
     except Exception:  # pragma: no cover - defensive
         _enabled = False
 
@@ -113,6 +147,25 @@ def record_model_unloaded(model: str):
         return
     try:
         llama_model_load_events_total.labels(model=model, event='unload').inc()
+    except Exception:
+        pass
+
+
+def record_http_error(endpoint: str, status: str, reason: str):
+    """Increment proxy_http_errors_total with the given label values.
+
+    Args:
+        endpoint: The API endpoint path, e.g. "v1/chat/completions".
+        status: The HTTP status class, e.g. "5xx".
+        reason: A short identifier for the error cause, e.g. "backend_error".
+
+    This is a best-effort no-op when prometheus_client is not installed
+    or the counter is unavailable.
+    """
+    if not _enabled or proxy_http_errors_total is None:
+        return
+    try:
+        proxy_http_errors_total.labels(endpoint=endpoint, status=status, reason=reason).inc()
     except Exception:
         pass
 

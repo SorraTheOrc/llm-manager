@@ -614,9 +614,15 @@ class TestStreamGuardrails:
         )
         assert _extract_delta_text_from_sse_chunk(mixed) == "ThinkHello"
 
-    def test_guardrail_evaluation_prioritizes_runtime_then_length_then_repetition(self):
+    def test_guardrail_evaluation_prioritizes_runtime_then_repetition(self):
+        """Test guardrail priority: runtime first, then repetition (loop detection).
+
+        Note: Hard completion_tokens cutoff has been removed in favor of
+        loop detection. The max_completion_tokens parameter is now ignored.
+        """
         from proxy.server import evaluate_stream_guardrail
 
+        # Runtime guardrail still triggers first
         assert (
             evaluate_stream_guardrail(
                 runtime_seconds=11.0,
@@ -630,6 +636,7 @@ class TestStreamGuardrails:
             == "runtime"
         )
 
+        # High completion_tokens alone should NOT trigger guardrail anymore
         assert (
             evaluate_stream_guardrail(
                 runtime_seconds=5.0,
@@ -640,9 +647,10 @@ class TestStreamGuardrails:
                 repetition_min_pattern_chars=8,
                 repetition_min_repeats=4,
             )
-            == "completion_tokens"
+            is None  # No guardrail triggered - this is the new behavior
         )
 
+        # Repetition (loop detection) still triggers
         assert (
             evaluate_stream_guardrail(
                 runtime_seconds=5.0,
@@ -688,6 +696,89 @@ class TestStreamGuardrails:
             invalidate_on_cutoff=True,
             invalidate_on_repetition=True,
         ) is False
+
+    def test_no_hard_completion_tokens_cutoff(self):
+        """Test that hard completion_tokens cutoff is removed.
+
+        The guardrail should NOT trigger on completion_tokens alone.
+        Loop detection should be used instead (repetition check).
+        """
+        from proxy.server import evaluate_stream_guardrail
+
+        # Even with many completion_tokens, no cutoff should occur
+        # if there's no repetition detected
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=5000,  # Exceeds old 2048 limit
+                response_text="This is a legitimate long response with varied content.",
+                max_runtime_seconds=120.0,
+                max_completion_tokens=2048,  # Old limit, should be ignored
+                repetition_min_pattern_chars=64,
+                repetition_min_repeats=10,
+            )
+            is None
+        )
+
+    def test_loop_detection_via_repetition_still_works(self):
+        """Test that loop detection via repetition check still works.
+
+        When a response contains repeating patterns, the guardrail
+        should trigger with 'repetition' reason.
+        """
+        from proxy.server import evaluate_stream_guardrail
+
+        # Create a repeating pattern (64 chars repeated 10 times)
+        pattern = "a" * 64
+        repeating_text = pattern * 10
+
+        assert (
+            evaluate_stream_guardrail(
+                runtime_seconds=5.0,
+                completion_tokens=1000,
+                response_text=repeating_text,
+                max_runtime_seconds=120.0,
+                max_completion_tokens=2048,
+                repetition_min_pattern_chars=64,
+                repetition_min_repeats=10,
+            )
+            == "repetition"
+        )
+
+    def test_session_not_invalidated_on_repetition_by_default(self):
+        """Test that session is NOT invalidated when repetition is detected.
+
+        By default, session_guardrail_invalidate_on_repetition is False,
+        so the session should NOT be invalidated when a loop is detected.
+        """
+        from proxy.server import _should_invalidate_on_guardrail
+
+        # Default config: invalidate_on_cutoff=True, invalidate_on_repetition=False
+        assert (
+            _should_invalidate_on_guardrail(
+                "repetition",
+                invalidate_on_cutoff=True,
+                invalidate_on_repetition=False,
+            )
+            is False
+        )
+
+    def test_runtime_guardrail_still_invalidates_session(self):
+        """Test that runtime guardrail still invalidates session.
+
+        Runtime cutoff indicates a true runaway loop, so session
+        should be invalidated.
+        """
+        from proxy.server import _should_invalidate_on_guardrail
+
+        assert (
+            _should_invalidate_on_guardrail(
+                "runtime",
+                invalidate_on_cutoff=True,
+                invalidate_on_repetition=False,
+            )
+            is True
+        )
 
 
 class TestSessionHistoryIntegrityHelpers:
@@ -834,3 +925,743 @@ class TestSlotPersistenceHelpers:
         server.config = server.load_config()
         resolved = server._resolve_slot_model_name(None, "Qwen3", {"llama_router_mode": True})
         assert resolved == "Qwen3"
+
+
+# ---------------------------------------------------------------------------
+# Tool call extraction from reasoning_content
+# ---------------------------------------------------------------------------
+
+class TestToolCallFromReasoning:
+    """Tests for extracting tool calls from reasoning_content when content is null."""
+
+    def test_extract_tool_call_from_reasoning_with_function_call(self):
+        """Extract a well-formed <function=...>...</function> pattern."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = '\nI need to find files\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is not None
+        assert '<function=bash>' in result
+        assert '<parameter=command>' in result
+        assert 'ls -la' in result
+        assert '</function>' in result
+
+    def test_extract_tool_call_from_reasoning_with_function_no_tool_wrapper(self):
+        """Extract <function=...>...</function> without </tool_call> wrapper."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = 'Let me think... <function=bash>\n<parameter=command>\necho hello\n</parameter>\n</function>'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is not None
+        assert 'echo hello' in result
+
+    def test_extract_tool_call_from_reasoning_no_tool_call(self):
+        """Return None when no tool call pattern is present."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = 'I am thinking about the answer. The answer is 42.'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is None
+
+    def test_extract_tool_call_from_reasoning_empty(self):
+        """Return None for empty string."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        assert _extract_tool_call_from_reasoning("") is None
+        assert _extract_tool_call_from_reasoning(None) is None
+
+    def test_extract_tool_call_from_reasoning_with_incomplete_tag(self):
+        """Return None for incomplete/partial <function=...> without </function>."""
+        from proxy.server import _extract_tool_call_from_reasoning
+
+        reasoning = 'Here is some code: <function=test>'
+        result = _extract_tool_call_from_reasoning(reasoning)
+        assert result is None
+
+    def test_extract_assistant_content_from_sse_with_reasoning_content_no_content(self):
+        """When delta.content is null but reasoning_content has a tool call, extract the tool call."""
+        from proxy.server import _extract_assistant_content_from_sse
+
+        # Use JSON escape sequences (\\n) for newlines inside JSON strings,
+        # matching how the actual SSE stream delivers reasoning_content.
+        sse_text = (
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"\\n<function=bash>\\n"}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"<parameter=command>\\nls -la\\n</parameter>\\n"}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"</function>\\n</tool_call>"}}]}\n'
+            'data: [DONE]\n'
+        )
+        result = _extract_assistant_content_from_sse(sse_text)
+        assert result is not None
+        assert '<function=bash>' in result
+        assert 'ls -la' in result
+
+    def test_extract_assistant_content_from_sse_reasoning_no_tool_call(self):
+        """When reasoning_content has no tool call, promote reasoning text
+        as fallback so clients receive a usable assistant message."""
+        from proxy.server import _extract_assistant_content_from_sse
+
+        sse_text = (
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"Just thinking about it..."}}]}\n'
+            'data: [DONE]\n'
+        )
+        result = _extract_assistant_content_from_sse(sse_text)
+        # Reasoning content is promoted as a fallback so clients see the response
+        assert result == "Just thinking about it..."
+
+    def test_extract_assistant_content_from_sse_prefers_content_over_reasoning(self):
+        """When both content and reasoning_content are present, prefer content."""
+        from proxy.server import _extract_assistant_content_from_sse
+
+        sse_text = (
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"Thinking..."}}]}\n'
+            'data: {"choices":[{"delta":{"content":"Hello there"}}]}\n'
+            'data: [DONE]\n'
+        )
+        result = _extract_assistant_content_from_sse(sse_text)
+        assert result == "Hello there"
+
+    def test_extract_assistant_content_non_streaming_with_reasoning_content(self):
+        """Non-streaming: extract tool call from message.reasoning_content when content is null."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>"
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        assert result is not None
+        assert '<function=bash>' in result
+        assert 'echo hi' in result
+
+    def test_extract_assistant_content_non_streaming_reasoning_no_tool_call(self):
+        """Non-streaming: when reasoning_content has no tool call,
+        promote reasoning text as fallback so clients see it."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "Just thinking quietly..."
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        # Reasoning content is promoted as a fallback so clients see the response
+        assert result == "Just thinking quietly..."
+
+    def test_extract_assistant_content_non_streaming_prefers_content(self):
+        """Non-streaming: when content is present, ignore reasoning_content."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!",
+                        "reasoning_content": ";thinking..."
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        assert result == "Hello!"
+
+    def test_is_empty_response_with_content(self):
+        """Response with content is not empty."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello there"
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response("Hello there", resp) is False
+
+    def test_is_empty_response_with_reasoning_tool_call(self):
+        """Response with tool call in reasoning_content is not empty."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>"
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response(None, resp) is False
+
+    def test_is_empty_response_truly_empty(self):
+        """Response with no content and no tool call is empty."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response(None, resp) is True
+
+    def test_is_empty_response_with_text(self):
+        """Response with non-empty text is not empty."""
+        from proxy.server import _is_empty_response
+
+        assert _is_empty_response("Hello world") is False
+
+    def test_is_empty_response_with_blank_text(self):
+        """Response with only whitespace text is empty."""
+        from proxy.server import _is_empty_response
+
+        assert _is_empty_response("   ") is True
+
+
+class TestEmptyRetry:
+    """Tests for _call_with_empty_retry retry-on-empty behavior."""
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_succeeds(self):
+        """First call returns non-empty response, no retry needed."""
+        from proxy.server import _call_with_empty_retry
+
+        resp = MagicMock()
+        resp.content = b'{"choices":[{"message":{"content":"Hello"}}]}'
+
+        async def send_fn():
+            return resp
+
+        # _call_with_empty_retry now lives in proxy.utils and accesses
+        # _call_with_backend_retries via a lazy import from proxy.lifecycle.
+        with patch(
+            "proxy.lifecycle._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.return_value = resp
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions")
+
+            assert result is resp
+            mock_backend_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_first_empty_then_succeeds(self):
+        """First call returns empty, retry returns non-empty."""
+        from proxy.server import _call_with_empty_retry
+
+        empty_resp = MagicMock()
+        empty_resp.content = b'{"choices":[{"message":{"content":null}}]}'
+        good_resp = MagicMock()
+        good_resp.content = b'{"choices":[{"message":{"content":"Hello"}}]}'
+
+        async def send_fn():
+            return empty_resp
+
+        with patch(
+            "proxy.lifecycle._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.side_effect = [empty_resp, good_resp]
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions", retry_delay=0.01)
+
+            assert result is good_resp
+            assert mock_backend_retry.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_empty_exhausts_retries(self):
+        """All calls return empty, retry exhausts and returns last response."""
+        from proxy.server import _call_with_empty_retry
+
+        empty_resp = MagicMock()
+        empty_resp.content = b'{"choices":[{"message":{"content":null}}]}'
+
+        async def send_fn():
+            return empty_resp
+
+        with patch(
+            "proxy.lifecycle._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.side_effect = [empty_resp, empty_resp, empty_resp]
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions", retry_delay=0.01)
+
+            assert result is empty_resp
+            # 1 initial + 2 retries = 3 total
+            assert mock_backend_retry.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_non_json_content_passthrough(self):
+        """Non-JSON response content passes through without retry."""
+        from proxy.server import _call_with_empty_retry
+
+        resp = MagicMock()
+        resp.content = b"Just plain text, not JSON"
+
+        async def send_fn():
+            return resp
+
+        with patch(
+            "proxy.lifecycle._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.return_value = resp
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions")
+
+            assert result is resp
+            mock_backend_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_call_in_reasoning_no_retry(self):
+        """Empty content but tool call in reasoning_content does not trigger retry."""
+        from proxy.server import _call_with_empty_retry
+
+        resp = MagicMock()
+        resp.content = b'{"choices":[{"message":{"content":null,"reasoning_content":"<function=bash>\\n<parameter=command>\\nls -la\\n</parameter>\\n</function>"}}]}'
+
+        async def send_fn():
+            return resp
+
+        with patch(
+            "proxy.lifecycle._call_with_backend_retries",
+            new_callable=AsyncMock,
+        ) as mock_backend_retry:
+            mock_backend_retry.return_value = resp
+
+            result = await _call_with_empty_retry(send_fn, path="/v1/chat/completions")
+
+            assert result is resp
+            # No retry because tool call is present in reasoning_content
+            mock_backend_retry.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive restore signal detection tests
+# ---------------------------------------------------------------------------
+
+
+class TestHasExplicitRestoreSignalComprehensive:
+    """Comprehensive tests for _has_explicit_restore_signal covering all
+    header candidates, JSON fields, case insensitivity, and truthy values."""
+
+    # ---- All header candidates ----
+
+    def test_x_llama_session_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Llama-Session-Restored": "true"}) is True
+
+    def test_x_session_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Session-Restored": "true"}) is True
+
+    def test_x_llama_cache_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Llama-Cache-Restored": "true"}) is True
+
+    def test_x_kv_cache_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-KV-Cache-Restored": "true"}) is True
+
+    def test_x_cache_restored_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"X-Cache-Restored": "true"}) is True
+
+    # ---- Case insensitivity ----
+
+    def test_header_case_insensitivity(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "True"}) is True
+        assert _has_explicit_restore_signal({"X-LLAMA-SESSION-RESTORED": "TRUE"}) is True
+        assert _has_explicit_restore_signal({"x-Llama-Session-Restored": "tRuE"}) is True
+
+    # ---- All truthy values ----
+
+    def test_truthy_value_1(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "1"}) is True
+
+    def test_truthy_value_yes(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "yes"}) is True
+
+    def test_truthy_value_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "restored"}) is True
+
+    def test_truthy_value_hit(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "hit"}) is True
+
+    def test_falsy_values(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "false"}) is False
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "0"}) is False
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "no"}) is False
+        assert _has_explicit_restore_signal({"x-llama-session-restored": "miss"}) is False
+
+    # ---- All JSON field candidates ----
+
+    def test_json_session_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"session_restored": True}) is True
+
+    def test_json_cache_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"cache_restored": True}) is True
+
+    def test_json_restore_success(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"restore_success": True}) is True
+
+    def test_json_kv_cache_restored(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {"kv_cache_restored": True}) is True
+
+    def test_json_field_without_header(self):
+        from proxy.server import _has_explicit_restore_signal
+        # JSON carries the signal even when headers are empty
+        assert _has_explicit_restore_signal({}, {"session_restored": True}) is True
+
+    def test_json_field_false(self):
+        from proxy.server import _has_explicit_restore_signal
+        # JSON field explicitly False should not trigger
+        assert _has_explicit_restore_signal({}, {"session_restored": False}) is False
+
+    # ---- No signal at all ----
+
+    def test_no_signal_at_all(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({"content-type": "application/json"}) is False
+
+    def test_empty_headers_and_json(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal({}, {}) is False
+        assert _has_explicit_restore_signal({}, None) is False
+
+    # ---- Both header and JSON with different values ----
+
+    def test_header_true_json_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        assert _has_explicit_restore_signal(
+            {"x-llama-session-restored": "true"},
+            {"session_restored": True},
+        ) is True
+
+    def test_header_true_json_false(self):
+        from proxy.server import _has_explicit_restore_signal
+        # Header wins despite JSON being false
+        assert _has_explicit_restore_signal(
+            {"x-llama-session-restored": "true"},
+            {"session_restored": False},
+        ) is True
+
+    def test_header_false_json_true(self):
+        from proxy.server import _has_explicit_restore_signal
+        # Header is false but JSON carries the signal
+        assert _has_explicit_restore_signal(
+            {"x-llama-session-restored": "false"},
+            {"session_restored": True},
+        ) is True
+
+
+class TestDetectRestoreSignalFromLogSliceComprehensive:
+    """Comprehensive edge-case tests for _detect_restore_signal_from_log_slice."""
+
+    def test_nonexistent_log_file(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        nonexistent = tmp_path / "does_not_exist.log"
+        assert _detect_restore_signal_from_log_slice(nonexistent, 0) is False
+
+    def test_empty_log_file(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "empty.log"
+        log_file.write_text("")
+        assert _detect_restore_signal_from_log_slice(log_file, 0) is False
+
+    def test_restore_signal_restored_context_checkpoint(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "restore_checkpoint.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot update_slots restored context checkpoint\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_load_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "load_session.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("slot load_session: loading KV cache for session abc-123\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_session_restore(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "session_restore.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("INFO session restore completed for slot 0\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_restore_session(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "restore_session.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("restore session for abc-123\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_loading_kv_cache(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "loading_kv.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("loading KV cache from disk for slot 0\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_restore_signal_kv_cache_restored(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "kv_restored.log"
+        log_file.write_text("before\n")
+        offset = log_file.stat().st_size
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write("kv cache restored for session abc-123\n")
+        assert _detect_restore_signal_from_log_slice(log_file, offset) is True
+
+    def test_read_error_encoding(self, tmp_path):
+        """Binary/garbled data at the start offset should not crash."""
+        from proxy.server import _detect_restore_signal_from_log_slice
+        log_file = tmp_path / "binary.log"
+        log_file.write_bytes(b"\x00\x01\x02before\n\xff\xfe restored context checkpoint\n")
+        # The function uses errors="replace" so it should not raise
+        assert _detect_restore_signal_from_log_slice(log_file, 0) is True
+
+
+class TestDetectRestoreSignalFromLlamaLogComprehensive:
+    """Comprehensive tests for _detect_restore_signal_from_llama_log."""
+
+    def test_none_session_id(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO load_session: abc-123\n")
+        assert _detect_restore_signal_from_llama_log(None, log_path=log_file) is False
+
+    def test_empty_session_id(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO load_session: abc-123\n")
+        assert _detect_restore_signal_from_llama_log("", log_path=log_file) is False
+
+    def test_nonexistent_log_file(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        nonexistent = tmp_path / "nonexistent.log"
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=nonexistent) is False
+
+    def test_session_id_in_log_without_restore_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("abc-123 slot update processing\n")
+        # Session ID appears but no restore phrase — should not match
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+    def test_session_id_with_load_session_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "slot load_session: loading KV cache for session_id=abc-123\n"
+        )
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_session_restore_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("INFO session restore for abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_restore_session_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("restore session abc-123 completed\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_loading_kv_cache_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("loading KV cache for session abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_kv_cache_restored_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("kv cache restored for abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_session_id_with_restored_context_checkpoint_phrase(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("restored context checkpoint for abc-123\n")
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_different_session_id_in_log(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "INFO slot update: processing tokens, no restore phrases present\n"
+        )
+        # Log has no restore phrase at all, so should return False
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+    def test_multiple_sessions_only_one_matches(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "load_session: session_id=other-session\n"
+            "load_session: session_id=abc-123\n"
+            "load_session: session_id=another-one\n"
+        )
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_log_path_override(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        custom_log = tmp_path / "custom-llama.log"
+        custom_log.write_text("load_session: session_id=custom-session\n")
+        assert _detect_restore_signal_from_llama_log("custom-session", log_path=custom_log) is True
+
+    def test_lookback_lines_truncation(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        # Write enough lines to exceed lookback_lines
+        lines = [f"line {i}\n" for i in range(500)]
+        lines.append("load_session: session_id=abc-123\n")
+        log_file.write_text("".join(lines))
+        # With lookback_lines=400, the signal line should still be within range
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file, lookback_lines=400) is True
+
+    def test_lookback_lines_excludes_signal(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        # Write many lines so the signal is outside the lookback window
+        lines = [f"line {i}\n" for i in range(500)]
+        lines.append("load_session: session_id=abc-123\n")
+        log_file.write_text("".join(lines))
+        # With lookback_lines=10, the signal (last line) should be included
+        # Actually the function takes the LAST lookback_lines lines, so last 10 should include it
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file, lookback_lines=10) is True
+
+    def test_session_id_case_insensitivity(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text(
+            "slot load_session: loading KV cache for session_id=ABC-123\n"
+        )
+        # Both session_id and log text are lowercased before matching
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is True
+
+    def test_restore_phrase_without_session_id(self, tmp_path):
+        from proxy.server import _detect_restore_signal_from_llama_log
+        log_file = tmp_path / "llama-server.log"
+        log_file.write_text("slot processing tokens without any restore phrases\n")
+        # No restore phrase at all, so should return False
+        assert _detect_restore_signal_from_llama_log("abc-123", log_path=log_file) is False
+
+
+# ---------------------------------------------------------------------------
+# Additional delta routing classification tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyDeltaRoutingComprehensive:
+    """Additional edge cases for _classify_delta_routing."""
+
+    def test_no_new_messages_fallback(self):
+        """When delta_message_count <= 0, routing should fall back with reason."""
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=0,
+            restore_confirmed=True,
+        )
+        assert use_delta is False
+        assert reason == "no_new_messages"
+
+    def test_negative_delta_message_count(self):
+        """Negative delta_message_count should also be treated as no_new_messages."""
+        from proxy.server import _classify_delta_routing
+
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=-1,
+            restore_confirmed=True,
+        )
+        assert use_delta is False
+        assert reason == "no_new_messages"
+
+    def test_all_fallbacks_in_priority_order(self):
+        """Verify that fallback reasons are applied in expected priority order."""
+        from proxy.server import _classify_delta_routing
+
+        # Priority 1: history_mismatch (takes precedence)
+        use_delta, reason = _classify_delta_routing(
+            history_matches=False,
+            delta_message_count=2,
+            restore_confirmed=True,
+        )
+        assert reason == "history_mismatch"
+
+        # Priority 2: no_new_messages (history matches, but no delta)
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=0,
+            restore_confirmed=True,
+        )
+        assert reason == "no_new_messages"
+
+        # Priority 3: delta_disabled (force_full_prompt takes precedence over missing signal)
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+            force_full_prompt=True,
+        )
+        assert reason == "delta_disabled"
+
+        # Priority 4: missing_restore_signal
+        use_delta, reason = _classify_delta_routing(
+            history_matches=True,
+            delta_message_count=2,
+            restore_confirmed=False,
+        )
+        assert reason == "missing_restore_signal"

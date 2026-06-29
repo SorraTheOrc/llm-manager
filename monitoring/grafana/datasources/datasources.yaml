@@ -1,0 +1,18 @@
+# Grafana datasource provisioning
+#
+# Place this file in Grafana's provisioning/datasources directory so it is
+# loaded automatically on startup:
+#
+#   <grafana_home>/conf/provisioning/datasources/datasources.yaml
+#
+# See monitoring/README.md for full deployment instructions.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    editable: true

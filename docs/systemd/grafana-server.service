@@ -1,0 +1,86 @@
+# grafana-server.service — Host-first deployment systemd unit
+
+## Overview
+
+This systemd unit file runs Grafana for the LLM proxy stack monitoring
+infrastructure. It uses the host-first model (binary installation, no
+containers) and is designed to be deployed as a **user service**.
+
+## User Service (Recommended)
+
+**File location**: `~/.config/systemd/user/grafana-server.service`
+
+```ini
+[Unit]
+Description=Grafana dashboard server for LLM proxy stack
+After=network.target prometheus.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/rgardler/bin/grafana/bin/grafana-server \
+  --homepath=/home/rgardler/bin/grafana \
+  --config=/home/rgardler/bin/grafana/conf/defaults.ini \
+  --packaging=unknown
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/home/rgardler/.local/state/grafana/logs/grafana.log
+StandardError=append:/home/rgardler/.local/state/grafana/logs/grafana.log
+
+# Resource limits
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
+```
+
+### Setup commands (user service)
+
+```bash
+# Create directories
+mkdir -p ~/.local/share/grafana/data
+mkdir -p ~/.local/state/grafana/logs
+
+# Copy provisioning files
+cp monitoring/grafana/datasources/datasources.yaml ~/bin/grafana/conf/provisioning/datasources/
+cp monitoring/grafana/dashboards/dashboards.yaml ~/bin/grafana/conf/provisioning/dashboards/
+cp monitoring/grafana_llama_memory_dashboard.json ~/bin/grafana/conf/provisioning/dashboards/
+
+# Enable and start the service
+systemctl --user daemon-reload
+systemctl --user enable grafana-server.service
+systemctl --user start grafana-server.service
+
+# Check status
+systemctl --user status grafana-server.service
+
+# View logs
+journalctl --user -u grafana-server.service -f
+```
+
+## Verification
+
+```bash
+# Check Grafana health
+curl http://localhost:3000/api/health
+
+# Open Grafana in browser
+# http://localhost:3000
+# Default credentials: admin / admin
+
+# Verify Prometheus datasource is configured
+curl -u admin:admin http://localhost:3000/api/datasources
+
+# Verify dashboards are loaded
+curl -u admin:admin http://localhost:3000/api/search?type=dash-db
+```
+
+## Cross-references
+
+- See also: `docs/systemd/prometheus.service` for the Prometheus systemd unit.
+- See also: `monitoring/README.md` for full monitoring deployment documentation.
+- See also: `monitoring/grafana/datasources/datasources.yaml` and `monitoring/grafana/dashboards/dashboards.yaml` for provisioning configuration.

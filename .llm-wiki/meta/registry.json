@@ -1,0 +1,315 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-06-23T00:25:37.107Z",
+  "pages": {
+    "concepts/accelerator-performance-tuning": {
+      "type": "concept",
+      "title": "accelerator-performance-tuning",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "concepts/containerized-ai-workflows": {
+      "type": "concept",
+      "title": "containerized-ai-workflows",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "concepts/gpu-layer-offloading": {
+      "type": "concept",
+      "title": "gpu-layer-offloading",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "concepts/graphics-translation-table-gtt": {
+      "type": "concept",
+      "title": "graphics-translation-table-gtt",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "concepts/memory-mapping-bypass": {
+      "type": "concept",
+      "title": "memory-mapping-bypass",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "concepts/unified-memory-architecture-uma": {
+      "type": "concept",
+      "title": "unified-memory-architecture-uma",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/amd-ryzen-ai-max-395": {
+      "type": "entity",
+      "title": "amd-ryzen-ai-max-395",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/distrobox": {
+      "type": "entity",
+      "title": "distrobox",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/gmktec-evo-x2": {
+      "type": "entity",
+      "title": "gmktec-evo-x2",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/hipblaslt": {
+      "type": "entity",
+      "title": "hipblaslt",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/kyuz0": {
+      "type": "entity",
+      "title": "kyuz0",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/llamacpp": {
+      "type": "entity",
+      "title": "llamacpp",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/mainline-ppa": {
+      "type": "entity",
+      "title": "mainline-ppa",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/podman": {
+      "type": "entity",
+      "title": "podman",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/rocm-7-rc": {
+      "type": "entity",
+      "title": "rocm-7-rc",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/rocwmma": {
+      "type": "entity",
+      "title": "rocwmma",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/thebloke": {
+      "type": "entity",
+      "title": "thebloke",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "entities/tuned": {
+      "type": "entity",
+      "title": "tuned",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "sources": [
+        "[[sources/SRC-2026-06-20-001]]"
+      ]
+    },
+    "sources/SRC-2026-06-20-001": {
+      "type": "source",
+      "title": "SRC-2026-06-20-001",
+      "created": "2026-06-23",
+      "updated": "2026-06-20",
+      "format": "web",
+      "source_id": "SRC-2026-06-20-001",
+      "raw_path": "raw/sources/SRC-2026-06-20-001/extracted.md",
+      "captured": "2026-06-20",
+      "status": "ingested"
+    },
+    "sources/obs-2026-06-20-host-first-systemd-documentation-implemented": {
+      "type": "source",
+      "title": "\"Observation: Host-first systemd documentation implemented\"",
+      "created": "2026-06-20",
+      "updated": "2026-06-20",
+      "slug": "obs-2026-06-20-host-first-systemd-documentation-implemented",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-20T13:22:07.730Z",
+      "tags": [
+        "documentation",
+        "systemd",
+        "host-first",
+        "llama-server",
+        "proxy"
+      ],
+      "source_context": "\"Implementing work item LP-0MQMC3S0D000GP2E to document host-first operation and systemd units\""
+    },
+    "sources/obs-2026-06-21-effort-estimate-applied-to-lp-0mqnqur7k005gdp6": {
+      "type": "source",
+      "title": "\"Observation: Effort estimate applied to LP-0MQNQUR7K005GDP6\"",
+      "created": "2026-06-21",
+      "updated": "2026-06-21",
+      "slug": "obs-2026-06-21-effort-estimate-applied-to-lp-0mqnqur7k005gdp6",
+      "status": "observation",
+      "relevance": "medium",
+      "observed_at": "2026-06-21T12:28:26.573Z",
+      "tags": [
+        "effort",
+        "risk",
+        "proxy"
+      ],
+      "source_context": "\"Running effort-and-risk skill (assistant manual run)\""
+    },
+    "sources/obs-2026-06-21-intake-host-first-llama-server-startup-work-item-created": {
+      "type": "source",
+      "title": "\"Observation: Intake: Host-first llama-server startup work item created\"",
+      "created": "2026-06-21",
+      "updated": "2026-06-21",
+      "slug": "obs-2026-06-21-intake-host-first-llama-server-startup-work-item-created",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-21T17:36:41.478Z",
+      "tags": [
+        "intake",
+        "host-first",
+        "lifecycle",
+        "proxy",
+        "llama-server"
+      ],
+      "source_context": "\"Intake brief for implementing llama_allow_host_fallback config-driven host-first startup in start_llama_server()\""
+    },
+    "sources/obs-2026-06-21-plan-remove-anthropic-openai-providers-lp-0mqnqur7k005gdp6": {
+      "type": "source",
+      "title": "\"Observation: Plan: remove anthropic & openai providers (LP-0MQNQUR7K005GDP6)\"",
+      "created": "2026-06-21",
+      "updated": "2026-06-21",
+      "slug": "obs-2026-06-21-plan-remove-anthropic-openai-providers-lp-0mqnqur7k005gdp6",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-21T13:44:34.724Z",
+      "tags": [
+        "proxy",
+        "config",
+        "providers",
+        "tests",
+        "plan"
+      ],
+      "source_context": "\"LP-0MQNQUR7K005GDP6 planning session\""
+    },
+    "sources/obs-2026-06-22-added-regression-tests-for-model-health-loop-behavior": {
+      "type": "source",
+      "title": "\"Observation: Added regression tests for model-health loop behavior\"",
+      "created": "2026-06-22",
+      "updated": "2026-06-22",
+      "slug": "obs-2026-06-22-added-regression-tests-for-model-health-loop-behavior",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-22T19:26:21.069Z",
+      "tags": [
+        "tests",
+        "backend-health",
+        "regression"
+      ],
+      "source_context": "\"LP-0MQP3Q8DN0047J1H verification\""
+    },
+    "sources/obs-2026-06-22-implemented-guarded-router-model-health-recovery": {
+      "type": "source",
+      "title": "\"Observation: Implemented guarded router model-health recovery\"",
+      "created": "2026-06-22",
+      "updated": "2026-06-22",
+      "slug": "obs-2026-06-22-implemented-guarded-router-model-health-recovery",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-22T19:26:17.148Z",
+      "tags": [
+        "proxy",
+        "health-check",
+        "recovery",
+        "qwen3",
+        "config"
+      ],
+      "source_context": "\"LP-0MQP3Q8DN0047J1H implementation\""
+    },
+    "sources/obs-2026-06-23-audit-lp-0mqnrdpjl005no0i-tests-ready-for-provider-removal": {
+      "type": "source",
+      "title": "\"Observation: Audit: LP-0MQNRDPJL005NO0I tests ready for provider removal\"",
+      "created": "2026-06-23",
+      "updated": "2026-06-23",
+      "slug": "obs-2026-06-23-audit-lp-0mqnrdpjl005no0i-tests-ready-for-provider-removal",
+      "status": "observation",
+      "relevance": "high",
+      "observed_at": "2026-06-23T00:20:27.598Z",
+      "tags": [
+        "audit",
+        "provider-removal",
+        "tests"
+      ],
+      "source_context": "\"Auditing LP-0MQNRDPJL005NO0I\""
+    },
+    "sources/obs-2026-06-23-plan-auto-complete-for-lp-0mqpucofj000qirf": {
+      "type": "source",
+      "title": "\"Observation: Plan auto-complete for LP-0MQPUCOFJ000QIRF\"",
+      "created": "2026-06-23",
+      "updated": "2026-06-23",
+      "slug": "obs-2026-06-23-plan-auto-complete-for-lp-0mqpucofj000qirf",
+      "status": "observation",
+      "relevance": "medium",
+      "observed_at": "2026-06-23T00:25:37.105Z",
+      "tags": [
+        "planning",
+        "bug",
+        "proxy"
+      ],
+      "source_context": "\"Planning work item LP-0MQPUCOFJ000QIRF\""
+    }
+  }
+}

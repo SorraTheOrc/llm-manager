@@ -1,0 +1,1286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLama Proxy Server</title>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-card: #1f2940;
+            --text-primary: #eee;
+            --text-secondary: #aaa;
+            --accent: #4f8cff;
+            --accent-hover: #6ba1ff;
+            --success: #4caf50;
+            --warning: #ff9800;
+            --border: #2a3a5a;
+            --log-error: #b00020;
+            --log-warning: #f59e0b;
+            --log-info: #60a5fa;
+            --log-debug: #9ca3af;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 2rem;
+            padding-bottom: 4rem;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--accent), #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .subtitle { color: var(--text-secondary); margin-bottom: 2rem; font-size: 1.1rem; }
+        .status-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+            background: var(--bg-card);
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            border: 1px solid var(--border);
+        }
+        .status-item { display: flex; align-items: center; gap: 0.5rem; }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .card {
+            background: var(--bg-card);
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            border: 1px solid var(--border);
+        }
+        .card h2 {
+            font-size: 1.3rem;
+            margin-bottom: 1rem;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+        .card-header h2 {
+            margin-bottom: 0;
+        }
+        .model-select-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .endpoint-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+        }
+        .endpoint {
+            background: var(--bg-secondary);
+            padding: 1rem;
+            border-radius: 6px;
+            border-left: 3px solid var(--accent);
+        }
+        .endpoint-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+        }
+        .method {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+        .method-get { background: #2e7d32; color: #fff; }
+        .method-post { background: #1565c0; color: #fff; }
+        .endpoint-path { font-family: monospace; font-size: 0.95rem; color: var(--text-primary); }
+        .endpoint-desc { font-size: 0.85rem; color: var(--text-secondary); }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+        th, td {
+            text-align: left;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+        th { color: var(--text-secondary); font-weight: 500; font-size: 0.85rem; text-transform: uppercase; }
+        .badge {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+        .badge-local { background: #2e7d32; color: #fff; }
+        .badge-remote { background: #7b1fa2; color: #fff; }
+        code {
+            background: var(--bg-primary);
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        pre {
+            background: var(--bg-primary);
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            margin-top: 1rem;
+        }
+        .nav-links {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 2rem;
+        }
+        .nav-links a {
+            color: var(--accent);
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            transition: all 0.2s;
+        }
+        .nav-links a:hover {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+        }
+        .btn-model {
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
+        }
+        .section-title {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        .btn-switch {
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            padding: 0.4rem 0.8rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-switch:hover {
+            background: var(--accent-hover);
+        }
+        .btn-switch:disabled {
+            background: var(--text-secondary);
+            cursor: not-allowed;
+        }
+        .badge-active {
+            background: var(--success);
+            color: #fff;
+            font-size: 0.75rem;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+        .status-message {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            padding: 1rem 1.5rem;
+            border-radius: 6px;
+            font-weight: 500;
+            z-index: 1000;
+            display: none;
+        }
+        .status-message.success {
+            background: var(--success);
+            color: #fff;
+        }
+        .status-message.error {
+            background: #d32f2f;
+            color: #fff;
+        }
+        .status-message.loading {
+            background: var(--warning);
+            color: #000;
+        }
+        .quick-test {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .test-input-area, .test-output-area {
+            display: flex;
+            flex-direction: column;
+        }
+        .test-input-area label, .test-output-area label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        .test-input {
+            width: 100%;
+            min-height: 120px;
+            padding: 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            resize: vertical;
+        }
+        .test-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .test-output {
+            width: 100%;
+            min-height: 120px;
+            max-height: 300px;
+            padding: 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: monospace;
+            font-size: 0.85rem;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .test-hint {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.5rem;
+        }
+        .test-status {
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+            color: var(--text-secondary);
+        }
+        .test-status.streaming {
+            color: var(--success);
+        }
+        .test-status.error {
+            color: #d32f2f;
+        }
+        .btn-test {
+            background: transparent;
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            font-weight: 500;
+            margin-left: auto;
+            transition: all 0.2s;
+        }
+        .btn-test:hover {
+            background: var(--accent);
+            color: #fff;
+        }
+        .api-test-section {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 1rem;
+            border: 1px solid var(--accent);
+        }
+        .api-test-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            color: var(--accent);
+        }
+        .model-select-label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+        .model-select {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.4rem 0.6rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        .model-select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .btn-close {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.5rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0 0.25rem;
+        }
+        .btn-close:hover {
+            color: var(--text-primary);
+        }
+        .api-test-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        .api-test-input-area, .api-test-output-area {
+            display: flex;
+            flex-direction: column;
+        }
+        .api-test-input-area label, .api-test-output-area label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        .api-test-pre {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.75rem;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: var(--text-primary);
+            overflow: auto;
+            max-height: 300px;
+            min-height: 100px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin: 0;
+        }
+        .stats-panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            overflow: hidden;
+        }
+        .stats-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            font-weight: 500;
+            color: var(--accent);
+        }
+        .btn-close-stats {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.2rem;
+            cursor: pointer;
+            padding: 0 0.25rem;
+            line-height: 1;
+        }
+        .btn-close-stats:hover {
+            color: var(--text-primary);
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1px;
+            background: var(--border);
+        }
+        .stats-item {
+            display: flex;
+            flex-direction: column;
+            padding: 0.75rem 1rem;
+            background: var(--bg-card);
+        }
+        .stats-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 0.25rem;
+        }
+        .stats-value {
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            font-family: monospace;
+        }
+        .stats-unknown {
+            color: var(--warning);
+            font-style: italic;
+            cursor: help;
+        }
+        .stats-toggle {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.25rem 0.5rem;
+            font-size: 0.75rem;
+            color: var(--accent);
+            cursor: pointer;
+            margin-left: 1rem;
+        }
+        .stats-toggle:hover {
+            background: var(--accent);
+            color: #fff;
+        }
+        .version-footer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border);
+            padding: 0.5rem 1.5rem;
+            display: flex;
+            gap: 2rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>LLama Proxy Server</h1>
+        <p class="subtitle">OpenAI-compatible API proxy for local and remote LLM models</p>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <div class="status-dot"></div>
+                <span>Proxy Running</span>
+            </div>
+            __PROVIDER_HOST_HTML__
+            <div class="status-item">
+                <strong>Current Model:</strong>
+                <code id="currentModelStatus">__CURRENT_MODEL_DISPLAY__</code>
+            </div>
+            <div class="status-item" id="routerModeStatus" data-router-mode="__ROUTER_MODE_STR__" style="display: __ROUTER_MODE_DISPLAY__;">
+                <strong>Router:</strong>
+                <span id="routerModeLabel">__ROUTER_MODE_LABEL__</span>
+            </div>
+            <div class="status-item">
+                <strong>llama-server:</strong>
+                <span id="llamaServerStatus">__LLAMA_STATUS_DISPLAY__</span>
+            </div>
+        </div>
+
+        <div id="statsPanel" class="stats-panel" style="display: none;">
+            <div class="stats-panel-header">
+                <span>Model Statistics</span>
+                <button class="btn-close-stats" onclick="toggleStatsPanel()">&times;</button>
+            </div>
+            <div class="stats-grid">
+                <div class="stats-item">
+                    <span class="stats-label">Model</span>
+                    <span class="stats-value" id="statsModel">-</span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Llama-server status</span>
+                    <span class="stats-value" id="statsLlamaStatus">-</span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Max context</span>
+                    <span class="stats-value" id="statsNCtx">
+                        <span class="stats-val">-</span>
+                        <span class="stats-unknown" title="Value not available from backend" style="display:none;">unknown</span>
+                    </span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">KV cache tokens</span>
+                    <span class="stats-value" id="statsKvCache">
+                        <span class="stats-val">-</span>
+                        <span class="stats-unknown" title="Value not available from backend" style="display:none;">unknown</span>
+                    </span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Total tokens sent</span>
+                    <span class="stats-value" id="statsTokensSent">0</span>
+                </div>
+                <div class="stats-item">
+                    <span class="stats-label">Total tokens received</span>
+                    <span class="stats-value" id="statsTokensRecv">0</span>
+                </div>
+            </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;">
+            <p class="section-title" style="margin-bottom: 0;">Quick Links</p>
+            <button class="stats-toggle" onclick="toggleStatsPanel()">Show Model Stats</button>
+        </div>
+        <div class="nav-links">
+            <a href="/health">Health Check</a>
+            <a href="/v1/models">List Models</a>
+            <a href="/docs">OpenAPI Docs</a>
+            <a href="/redoc">ReDoc</a>
+            <a href="/logs">View Logs</a>
+            __MODEL_BUTTONS__
+        </div>
+
+        <div class="card">
+            <h2>Quick Test</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 0.5rem;">
+                Send a message to test the current model. Press Enter to send (Shift+Enter for new line).
+            </p>
+            <div class="quick-test">
+                <div class="test-input-area">
+                    <label>Input</label>
+                    <textarea id="testInput" class="test-input" placeholder="Type your message here..."></textarea>
+                    <p class="test-hint">Press Enter to send, Shift+Enter for new line</p>
+                </div>
+                <div class="test-output-area">
+                    <label>Response</label>
+                    <div id="testOutput" class="test-output"></div>
+                    <p id="testStatus" class="test-status"></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Configured Models</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Model ID</th>
+                        <th>Type</th>
+                        <th>Aliases (supports wildcards)</th>
+                        <th>Endpoint</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    __MODELS_ROWS__
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h2>API Passthrough Endpoints</h2>
+                <div class="model-select-wrapper">
+                    <label for="modelSelect" class="model-select-label">Test with model:</label>
+                    <select id="modelSelect" class="model-select" onchange="updateTestRequest()">
+                        __MODEL_OPTIONS__
+                    </select>
+                </div>
+            </div>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                These endpoints are fully compatible with the OpenAI API. Requests are automatically routed to local llama-server or remote APIs based on the model specified. Click "Test" to try each endpoint.
+            </p>
+            <div class="endpoint-grid">
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-post">POST</span>
+                        <span class="endpoint-path">/v1/chat/completions</span>
+                        <button class="btn-test" onclick="testEndpoint('chat')">Test</button>
+                    </div>
+                    <p class="endpoint-desc">Chat completions - send messages and get AI responses</p>
+                </div>
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-post">POST</span>
+                        <span class="endpoint-path">/v1/completions</span>
+                        <button class="btn-test" onclick="testEndpoint('completions')">Test</button>
+                    </div>
+                    <p class="endpoint-desc">Text completions - complete a prompt</p>
+                </div>
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-get">GET</span>
+                        <span class="endpoint-path">/v1/models</span>
+                        <button class="btn-test" onclick="testEndpoint('models')">Test</button>
+                    </div>
+                    <p class="endpoint-desc">List all available models</p>
+                </div>
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-post">POST</span>
+                        <span class="endpoint-path">/v1/embeddings</span>
+                        <button class="btn-test" onclick="testEndpoint('embeddings')">Test</button>
+                    </div>
+                    <p class="endpoint-desc">Generate embeddings for text</p>
+                </div>
+            </div>
+            
+            <div id="apiTestSection" class="api-test-section" style="display: none; margin-top: 1.5rem;">
+                <div class="api-test-header">
+                    <strong id="apiTestTitle">Test Request</strong>
+                    <button class="btn-close" onclick="closeApiTest()">&times;</button>
+                </div>
+                <div class="api-test-grid">
+                    <div class="api-test-input-area">
+                        <label>Request</label>
+                        <pre id="apiTestRequest" class="api-test-pre"></pre>
+                    </div>
+                    <div class="api-test-output-area">
+                        <label>Response</label>
+                        <pre id="apiTestResponse" class="api-test-pre"></pre>
+                        <p id="apiTestStatus" class="test-status"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Admin Endpoints</h2>
+            <div class="endpoint-grid">
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-get">GET</span>
+                        <span class="endpoint-path">/health</span>
+                        <button class="btn-switch" style="margin-left:auto;" onclick="refreshStatus()">Refresh</button>
+                    </div>
+                    <p class="endpoint-desc">Health check - returns server and model status</p>
+                </div>
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-post">POST</span>
+                        <span class="endpoint-path">/admin/reload-srv.config</span>
+                        <button class="btn-switch" style="margin-left:auto;" onclick="reloadConfig()">Reload</button>
+                    </div>
+                    <p class="endpoint-desc">Reload configuration from srv.config.yaml</p>
+                </div>
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-post">POST</span>
+                        <span class="endpoint-path">/admin/switch-model/{model}</span>
+                        <button class="btn-switch" style="margin-left:auto;" onclick="adminSwitchModel()">Switch To Selected</button>
+                    </div>
+                    <p class="endpoint-desc">Switch the llama-server to the model selected in the dropdown above</p>
+                </div>
+                <div class="endpoint">
+                    <div class="endpoint-header">
+                        <span class="method method-post">POST</span>
+                        <span class="endpoint-path">/admin/stop-server</span>
+                        <button class="btn-switch" style="margin-left:auto; background:#d32f2f;" onclick="stopServer()">Stop</button>
+                    </div>
+                    <p class="endpoint-desc">Stop the llama-server process (requires confirmation)</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Model Routing</h2>
+            <p style="color: var(--text-secondary);">
+                The proxy automatically routes requests based on the <code>model</code> parameter in your API request:
+            </p>
+            <ul style="margin: 1rem 0 0 1.5rem; color: var(--text-secondary);">
+                <li><strong>Local models</strong> are served by llama-server running in a podman container</li>
+                <li><strong>Remote models</strong> are proxied to external APIs (OpenAI, Anthropic, etc.)</li>
+                <li><strong>Wildcard aliases</strong> like <code>gpt-*</code> match any model starting with that prefix</li>
+                <li>If a model switch is needed, the server will automatically load the new model</li>
+            </ul>
+        </div>
+        
+        <div class="card">
+            <h2>API Endpoints</h2>
+            <pre style="background:var(--bg-primary); padding:1rem; border-radius:6px; color:var(--text-secondary);">==========================================
+API Endpoints
+==========================================
+
+  Health check:     GET  __BASE__/health
+  List models:      GET  __BASE__/v1/models
+  Chat completions: POST __BASE__/v1/chat/completions
+  Completions:      POST __BASE__/v1/completions
+
+  Admin endpoints:
+    Reload srv.config:  POST __BASE__/admin/reload-srv.config
+    Switch model:   POST __BASE__/admin/switch-model/{model}
+    Stop server:    POST __BASE__/admin/stop-server
+</pre>
+        </div>
+    </div>
+
+    <footer class="version-footer">
+        <span>llama-server: __LLAMA_SERVER_VERSION__</span>
+        <span>ROCm: __ROCM_VERSION__</span>
+    </footer>
+
+    <div id="statusMessage" class="status-message"></div>
+
+    <script>
+        async function switchModel(modelName) {
+            const statusEl = document.getElementById('statusMessage');
+            const currentModelEl = document.getElementById('currentModelStatus');
+            const llamaStatusEl = document.getElementById('llamaServerStatus');
+            const btn = event.target;
+            
+            // Store original values for error recovery
+            const originalModel = currentModelEl.textContent;
+            const originalLlamaStatus = llamaStatusEl.textContent;
+            
+            // Show loading state - update status bar immediately
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            currentModelEl.textContent = `Switching to ${modelName}...`;
+            llamaStatusEl.textContent = 'Switching';
+            statusEl.className = 'status-message loading';
+            statusEl.textContent = `Switching model to ${modelName}... This may take a few minutes.`;
+            statusEl.style.display = 'block';
+            
+            try {
+                const response = await fetch(`/admin/switch-model/${modelName}`, {
+                    method: 'POST'
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    statusEl.className = 'status-message loading';
+                    statusEl.textContent = `Switch requested for ${modelName}. Waiting for readiness...`;
+                    statusEl.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Load Model';
+                } else {
+                    throw new Error(data.detail || 'Failed to switch model');
+                }
+            } catch (error) {
+                // Restore original values on error
+                currentModelEl.textContent = originalModel;
+                llamaStatusEl.textContent = originalLlamaStatus;
+                statusEl.className = 'status-message error';
+                statusEl.textContent = `Error: ${error.message}`;
+                btn.disabled = false;
+                btn.textContent = 'Load Model';
+                // Hide error after 5 seconds
+                setTimeout(() => statusEl.style.display = 'none', 5000);
+            }
+        }
+
+        // Status bar elements
+        const currentModelEl = document.getElementById('currentModelStatus');
+        const llamaStatusEl = document.getElementById('llamaServerStatus');
+        const statusEl = document.getElementById('statusMessage');
+        const routerModeEl = document.getElementById('routerModeStatus');
+        const routerModeLabel = document.getElementById('routerModeLabel');
+        
+        // Stats panel elements
+        const statsPanel = document.getElementById('statsPanel');
+        const statsModelEl = document.getElementById('statsModel');
+        const statsLlamaStatusEl = document.getElementById('statsLlamaStatus');
+        const statsNCtxEl = document.getElementById('statsNCtx');
+        const statsKvCacheEl = document.getElementById('statsKvCache');
+        const statsTokensSentEl = document.getElementById('statsTokensSent');
+        const statsTokensRecvEl = document.getElementById('statsTokensRecv');
+        
+        // Track the actual current model (updated after successful operations)
+        let actualCurrentModel = '__CURRENT_MODEL_JS__';
+        const routerModeEnabled = Boolean(window.__ROUTER_MODE);
+        const routerModels = window.__ROUTER_MODELS;
+
+        if (routerModeEl) {
+            const serverFlag = routerModeEl.dataset.routerMode === 'true';
+            const enabled = routerModeEnabled || serverFlag;
+            routerModeEl.style.display = enabled ? 'flex' : 'none';
+            if (routerModeLabel) routerModeLabel.textContent = enabled ? 'Enabled' : 'Disabled';
+        }
+        
+        // Toggle stats panel visibility
+        function toggleStatsPanel() {
+            if (statsPanel.style.display === 'none') {
+                statsPanel.style.display = 'block';
+                document.querySelector('.stats-toggle').textContent = 'Hide Model Stats';
+            } else {
+                statsPanel.style.display = 'none';
+                document.querySelector('.stats-toggle').textContent = 'Show Model Stats';
+            }
+        }
+        
+        // Update stats panel with new values (only if changed)
+        function updateStatsPanel(data) {
+            if (!data) return;
+            
+            if (data.current_model !== undefined) {
+                const val = data.current_model || '-';
+                if (statsModelEl.textContent !== val) {
+                    statsModelEl.textContent = val;
+                }
+            }
+
+            if (data.loaded_models !== undefined) {
+                const val = data.loaded_models.length ? data.loaded_models.join(', ') : '-';
+                if (statsModelEl.textContent !== val) {
+                    statsModelEl.textContent = val;
+                }
+            }
+            
+            if (data.llama_server_running !== undefined) {
+                const val = data.llama_server_running ? 'Running' : 'Stopped';
+                if (statsLlamaStatusEl.textContent !== val) {
+                    statsLlamaStatusEl.textContent = val;
+                }
+            }
+            
+            if (data.n_ctx !== undefined) {
+                const valSpan = statsNCtxEl.querySelector('.stats-val');
+                const unknownSpan = statsNCtxEl.querySelector('.stats-unknown');
+                if (data.n_ctx === null || data.n_ctx === undefined) {
+                    if (valSpan) valSpan.textContent = '-';
+                    if (unknownSpan) unknownSpan.style.display = 'inline';
+                } else {
+                    if (valSpan) valSpan.textContent = data.n_ctx;
+                    if (unknownSpan) unknownSpan.style.display = 'none';
+                }
+            }
+            
+            if (data.kv_cache_tokens !== undefined) {
+                const valSpan = statsKvCacheEl.querySelector('.stats-val');
+                const unknownSpan = statsKvCacheEl.querySelector('.stats-unknown');
+                if (data.kv_cache_tokens === null || data.kv_cache_tokens === undefined) {
+                    if (valSpan) valSpan.textContent = '-';
+                    if (unknownSpan) unknownSpan.style.display = 'inline';
+                } else {
+                    if (valSpan) valSpan.textContent = data.kv_cache_tokens;
+                    if (unknownSpan) unknownSpan.style.display = 'none';
+                }
+            }
+            
+            if (data.total_sent !== undefined) {
+                const val = String(data.total_sent);
+                if (statsTokensSentEl.textContent !== val) {
+                    statsTokensSentEl.textContent = val;
+                }
+            }
+            
+            if (data.total_recv !== undefined) {
+                const val = String(data.total_recv);
+                if (statsTokensRecvEl.textContent !== val) {
+                    statsTokensRecvEl.textContent = val;
+                }
+            }
+        }
+        
+        // Helper function to show model switching status
+        function showSwitchingStatus(targetModel) {
+            currentModelEl.textContent = `Switching to ${targetModel}...`;
+            llamaStatusEl.textContent = 'Switching';
+            statusEl.className = 'status-message loading';
+            statusEl.textContent = `Switching model to ${targetModel}... This may take a few minutes.`;
+            statusEl.style.display = 'block';
+        }
+        
+        // Helper function to update status after successful model load
+        function showModelReady(modelName) {
+            actualCurrentModel = modelName;
+            currentModelEl.textContent = modelName;
+            llamaStatusEl.textContent = 'Running';
+            statusEl.className = 'status-message success';
+            statusEl.textContent = `Model ${modelName} is ready`;
+            // Hide success message after 3 seconds
+            setTimeout(() => statusEl.style.display = 'none', 3000);
+        }
+        
+        // Helper function to check if model switch is needed and show status
+        function checkAndShowSwitchStatus(targetModel) {
+            // Check if this is a local model that might need switching
+            const localModels = __LOCAL_MODEL_NAMES_JSON__;
+            const isLocal = localModels.some(m => targetModel.toLowerCase().startsWith(m.toLowerCase()));
+            
+            if (isLocal && targetModel !== actualCurrentModel) {
+                showSwitchingStatus(targetModel);
+                return true;
+            }
+            return false;
+        }
+        
+        // Helper to refresh status from server
+        async function refreshStatus() {
+            try {
+                const response = await fetch('/health');
+                const data = await response.json();
+                if (data.current_model) {
+                    actualCurrentModel = data.current_model;
+                    currentModelEl.textContent = data.current_model;
+                    llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
+                }
+                if (data.loaded_models) {
+                    statsModelEl.textContent = data.loaded_models.join(', ');
+                }
+            } catch (e) {
+                // Ignore errors
+            }
+        }
+
+        // Subscribe to Server-Sent Events for real-time status updates
+        function connectSSE() {
+            const eventSource = new EventSource('/events');
+            
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch (data.type) {
+                        case 'status':
+                            if (data.current_model) {
+                                actualCurrentModel = data.current_model;
+                                currentModelEl.textContent = data.current_model;
+                            }
+                            if (data.loaded_models) {
+                                statsModelEl.textContent = data.loaded_models.join(', ');
+                            }
+                            llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
+                            updateStatsPanel(data);
+                            break;
+                            
+                        case 'switching':
+                            // Model switch started
+                            showSwitchingStatus(data.target_model);
+                            break;
+                            
+                        case 'ready':
+                            // Model switch completed successfully
+                            showModelReady(data.current_model);
+                            break;
+                            
+                        case 'error':
+                            // Model switch failed
+                            currentModelEl.textContent = data.current_model || 'None';
+                            llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
+                            statusEl.className = 'status-message error';
+                            statusEl.textContent = data.message || 'An error occurred';
+                            statusEl.style.display = 'block';
+                            setTimeout(() => statusEl.style.display = 'none', 5000);
+                            break;
+                    }
+                } catch (e) {
+                    console.error('Error parsing SSE message:', e);
+                }
+            };
+            
+            eventSource.onerror = () => {
+                // Reconnect after a delay
+                eventSource.close();
+                setTimeout(connectSSE, 5000);
+            };
+        }
+        
+        // Start SSE connection
+        connectSSE();
+
+        // Admin button handlers
+        async function reloadConfig() {
+            try {
+                const resp = await fetch('/admin/reload-config', { method: 'POST' });
+                const data = await resp.json();
+                statusEl.className = 'status-message success';
+                statusEl.textContent = data.message || 'Config reloaded';
+                statusEl.style.display = 'block';
+                setTimeout(() => statusEl.style.display = 'none', 3000);
+                await refreshStatus();
+            } catch (e) {
+                statusEl.className = 'status-message error';
+                statusEl.textContent = 'Failed to reload config';
+                statusEl.style.display = 'block';
+                setTimeout(() => statusEl.style.display = 'none', 5000);
+            }
+        }
+
+        async function adminSwitchModel() {
+            const selected = modelSelect ? modelSelect.value : null;
+            if (!selected) return;
+            try {
+                showSwitchingStatus(selected);
+                const resp = await fetch(`/admin/switch-model/${selected}`, { method: 'POST' });
+                const data = await resp.json();
+                if (resp.ok) {
+                    statusEl.className = 'status-message loading';
+                    statusEl.textContent = data.message || `Switch requested for ${selected}. Waiting for readiness...`;
+                    statusEl.style.display = 'block';
+                } else {
+                    throw new Error(data.detail || 'Switch failed');
+                }
+            } catch (e) {
+                statusEl.className = 'status-message error';
+                statusEl.textContent = `Error: ${e.message}`;
+                statusEl.style.display = 'block';
+                setTimeout(() => statusEl.style.display = 'none', 5000);
+                await refreshStatus();
+            }
+        }
+
+        async function stopServer() {
+            if (!confirm('Are you sure you want to stop the llama-server?')) return;
+            try {
+                const resp = await fetch('/admin/stop-server', { method: 'POST' });
+                const data = await resp.json();
+                statusEl.className = 'status-message success';
+                statusEl.textContent = data.message || 'llama-server stopped';
+                statusEl.style.display = 'block';
+                setTimeout(() => statusEl.style.display = 'none', 3000);
+                await refreshStatus();
+            } catch (e) {
+                statusEl.className = 'status-message error';
+                statusEl.textContent = 'Failed to stop server';
+                statusEl.style.display = 'block';
+                setTimeout(() => statusEl.style.display = 'none', 5000);
+            }
+        }
+
+        // Quick Test functionality
+        const testInput = document.getElementById('testInput');
+        const testOutput = document.getElementById('testOutput');
+        const testStatus = document.getElementById('testStatus');
+        let isStreaming = false;
+
+        testInput.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (isStreaming) return;
+                
+                const message = testInput.value.trim();
+                if (!message) return;
+                
+                await sendTestMessage(message);
+            }
+        });
+
+        async function sendTestMessage(message) {
+            isStreaming = true;
+            testOutput.textContent = '';
+            testStatus.textContent = 'Connecting...';
+            testStatus.className = 'test-status';
+            
+            try {
+                const response = await fetch('/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        model: actualCurrentModel,
+                        messages: [{ role: 'user', content: message }],
+                        stream: true
+                    })
+                });
+                
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || `HTTP ${response.status}`);
+                }
+                
+                testStatus.textContent = 'Streaming...';
+                testStatus.className = 'test-status streaming';
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') continue;
+                            
+                            try {
+                                const json = JSON.parse(data);
+                                const content = json.choices?.[0]?.delta?.content;
+                                if (content) {
+                                    testOutput.textContent += content;
+                                    testOutput.scrollTop = testOutput.scrollHeight;
+                                }
+                            } catch {
+                                // Skip invalid JSON
+                            }
+                        }
+                    }
+                }
+                
+                testStatus.textContent = 'Complete';
+                testStatus.className = 'test-status';
+            } catch (error) {
+                testStatus.textContent = `Error: ${error.message}`;
+                testStatus.className = 'test-status error';
+            } finally {
+                isStreaming = false;
+                // Refresh status bar in case model changed
+                await refreshStatus();
+            }
+        }
+
+        // API Endpoint Test functionality
+        const apiTestSection = document.getElementById('apiTestSection');
+        const apiTestTitle = document.getElementById('apiTestTitle');
+        const apiTestRequest = document.getElementById('apiTestRequest');
+        const apiTestResponse = document.getElementById('apiTestResponse');
+        const apiTestStatus = document.getElementById('apiTestStatus');
+        const modelSelect = document.getElementById('modelSelect');
+        
+        let currentEndpointType = null;
+
+        function getTestExample(endpointType) {
+            const selectedModel = modelSelect ? modelSelect.value : '__CURRENT_MODEL_JS__';
+            
+            const examples = {
+                chat: {
+                    title: 'POST /v1/chat/completions',
+                    method: 'POST',
+                    url: '/v1/chat/completions',
+                    body: {
+                        model: selectedModel,
+                        messages: [{ role: 'user', content: 'Say hello in exactly 3 words.' }],
+                        max_tokens: 50
+                    }
+                },
+                completions: {
+                    title: 'POST /v1/completions',
+                    method: 'POST',
+                    url: '/v1/completions',
+                    body: {
+                        model: selectedModel,
+                        prompt: 'The quick brown fox',
+                        max_tokens: 30
+                    }
+                },
+                models: {
+                    title: 'GET /v1/models',
+                    method: 'GET',
+                    url: '/v1/models',
+                    body: null
+                },
+                embeddings: {
+                    title: 'POST /v1/embeddings',
+                    method: 'POST',
+                    url: '/v1/embeddings',
+                    body: {
+                        model: selectedModel,
+                        input: 'Hello, world!'
+                    }
+                }
+            };
+            
+            return examples[endpointType];
+        }
+        
+        function updateTestRequest() {
+            if (!currentEndpointType) return;
+            
+            const example = getTestExample(currentEndpointType);
+            if (example && example.body) {
+                apiTestRequest.textContent = JSON.stringify(example.body, null, 2);
+            }
+        }
+
+        async function testEndpoint(endpointType) {
+            currentEndpointType = endpointType;
+            const example = getTestExample(endpointType);
+            if (!example) return;
+
+            // Check if we need to show model switching status
+            const selectedModel = modelSelect ? modelSelect.value : actualCurrentModel;
+            const willSwitch = checkAndShowSwitchStatus(selectedModel);
+
+            // Show the test section
+            apiTestSection.style.display = 'block';
+            apiTestTitle.textContent = example.title;
+            
+            // Format and display the request
+            if (example.body) {
+                apiTestRequest.textContent = JSON.stringify(example.body, null, 2);
+            } else {
+                apiTestRequest.textContent = '(No request body - GET request)';
+            }
+            
+            apiTestResponse.textContent = '';
+            apiTestStatus.textContent = willSwitch ? 'Switching model...' : 'Sending request...';
+            apiTestStatus.className = 'test-status';
+
+            // Scroll to the test section
+            apiTestSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+            try {
+                const fetchOptions = {
+                    method: example.method,
+                    headers: {}
+                };
+
+                if (example.body) {
+                    fetchOptions.headers['Content-Type'] = 'application/json';
+                    fetchOptions.body = JSON.stringify(example.body);
+                }
+
+                const response = await fetch(example.url, fetchOptions);
+                // Prefer JSON parsing, but gracefully handle non-JSON responses (HTML/text)
+                let data;
+                const contentType = response.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {
+                    try {
+                        data = await response.json();
+                    } catch (e) {
+                        // Malformed JSON despite content-type; fall back to text
+                        data = await response.text();
+                    }
+                } else {
+                    // Not JSON - try to parse as JSON, otherwise keep as plain text
+                    const txt = await response.text();
+                    try {
+                        data = JSON.parse(txt);
+                    } catch (e) {
+                        data = txt;
+                    }
+                }
+
+                // Update status bar after request completes (model may have switched)
+                await refreshStatus();
+
+                const formatted = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+
+                if (response.ok) {
+                    apiTestResponse.textContent = formatted;
+                    apiTestStatus.textContent = `Success (HTTP ${response.status})`;
+                    apiTestStatus.className = 'test-status streaming';
+                } else {
+                    apiTestResponse.textContent = formatted;
+                    apiTestStatus.textContent = `Error (HTTP ${response.status})`;
+                    apiTestStatus.className = 'test-status error';
+                }
+            } catch (error) {
+                apiTestResponse.textContent = error.message;
+                apiTestStatus.textContent = 'Request failed';
+                apiTestStatus.className = 'test-status error';
+                // Still try to refresh status on error
+                await refreshStatus();
+            }
+        }
+
+        function closeApiTest() {
+            apiTestSection.style.display = 'none';
+            currentEndpointType = null;
+        }
+    </script>
+__ROUTER_SCRIPT__</body>
+</html>

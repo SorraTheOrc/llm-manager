@@ -8,12 +8,12 @@ TS=$(date --rfc-3339=seconds 2>/dev/null || date)
 echo "== diagnose-llama-proxy-startup.sh - $TS =="
 
 echo
-echo "[1] Processes matching known patterns (uvicorn, llama-proxy, start-llama, distrobox, llama-server)"
-ps -eo pid,ppid,user,uid,cmd --no-headers | egrep -i 'uvicorn|llama-proxy|start-llama|distrobox|llama-server' || true
+echo "[1] Processes matching known patterns (uvicorn, llama-proxy, start-llama, llama-server)"
+ps -eo pid,ppid,user,uid,cmd --no-headers | egrep -i 'uvicorn|llama-proxy|start-llama|llama-server' || true
 
 echo
 echo "[2] For each candidate PID show cgroup, exe and process line"
-PIDS=$(ps -eo pid,cmd --no-headers | egrep -i 'uvicorn|llama-proxy|start-llama|distrobox|llama-server' | awk '{print $1}' | tr '\n' ' ')
+PIDS=$(ps -eo pid,cmd --no-headers | egrep -i 'uvicorn|llama-proxy|start-llama|llama-server' | awk '{print $1}' | tr '\n' ' ')
 if [ -z "$PIDS" ]; then
   echo "No matching PIDs found."
 else
@@ -76,7 +76,7 @@ echo "  /usr/lib/systemd/system:"; ls -l /usr/lib/systemd/system/*llama* 2>/dev/
 
 echo
 echo "[6] Helpful next commands (not run by this script):"
-echo "  sudo ps -ef | egrep 'uvicorn|llama-proxy|start-llama|distrobox'"
+echo "  sudo ps -ef | egrep 'uvicorn|llama-proxy|start-llama'"
 echo "  sudo systemctl status <unit-name>"
 echo "  sudo systemctl disable --now <unit-name> && sudo systemctl mask <unit-name>"
 

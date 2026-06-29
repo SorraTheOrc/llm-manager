@@ -1,8 +1,57 @@
+# ---------------------------------------------------------------------------
+# Model Configuration
+# ---------------------------------------------------------------------------
+# Each model can define an ordered list of `providers` for automatic
+# failover. The `providers` list replaces the old top-level `endpoint`,
+# `api_key_env`, and `headers` fields on each model entry.
+#
+# Provider entry fields:
+#   name        - Unique identifier for this provider entry
+#   type        - "local" or "remote"
+#   For remote: endpoint, api_key_env, headers (optional)
+#   For local:  llama_model
+#
+# Example with providers list:
+#   mimo-v2.5:
+#     providers:
+#       - name: remote-primary
+#         type: remote
+#         endpoint: https://api.provider-a.com/v1
+#         api_key_env: PROVIDER_A_KEY
+#       - name: remote-fallback
+#         type: remote
+#         endpoint: https://api.provider-b.com/v1
+#         api_key_env: PROVIDER_B_KEY
+#     aliases:
+#       - mimo*
+#
+# Custom system prompts per model/alias:
+# Each model entry may include a `system_prompt` object to configure
+# a default system prompt that is injected into requests targeting
+# the model or any of its aliases.
+#
+#   assistant-model:
+#     type: local
+#     aliases: ["assistant", "asst"]
+#     llama_model: gemma4
+#     system_prompt:
+#       mode: "prepend"   # "override" or "prepend" (required)
+#       file: "proxy/prompts/assistant.txt"  # path relative to repo root
+#
+# Prompt resolution precedence (first match wins):
+#   1) Local override:   .sorraAgents/prompts/<alias>.txt
+#   2) Repo default:     <system_prompt.file> resolved against repo root
+#   3) No prompt if none present
+#
+# See proxy/MODEL_ADD.md for the full guide.
+# ---------------------------------------------------------------------------
+
 default_model: Qwen3
-default_remote:
-  api_key_env: OPENAI_API_KEY
-  enabled: false
-  endpoint: https://api.openai.com/v1
+# default_remote is commented out: the openai provider was removed (LP-0MQNQUR7K005GDP6).
+# default_remote:
+#   api_key_env: OPENAI_API_KEY
+#   enabled: false
+#   endpoint: https://api.openai.com/v1
 
 # Optional named provider endpoints (e.g., Tailscale based host mapping)
 providers:
@@ -15,86 +64,153 @@ logging:
   level: INFO
   retention_days: 90
   rotation_hours: 6
+
+# ---------------------------------------------------------------------------
+# Audit model configuration
+# ---------------------------------------------------------------------------
+# The audit skill (skill/audit/) uses these settings to determine which
+# model to call for audit operations. The resolver maps short names to
+# provider-prefixed model IDs (e.g., ``deepseek-v4-flash-free`` →
+# ``opencode/deepseek-v4-flash-free``).
+#
+# Canonical model IDs (discovered via ``pi --list-models``):
+#   opencode/deepseek-v4-flash-free
+#   opencode-go/deepseek-v4-flash
+#   openrouter/openrouter/free
+#
+# See proxy/provider_resolver.py for the full mapping table.
+audit_model: "deepseek-v4-flash-free"
+audit_model_fallbacks:
+  - "openrouter/free"
+  - "deepseek-v4-flash"
+
 models:
-  anthropic:
-    aliases:
-    - claude-3-opus
-    - claude-3-sonnet
-    - claude-3-haiku
-    - claude-*
-    api_key_env: ANTHROPIC_API_KEY
-    endpoint: https://api.anthropic.com/v1
-    headers:
-      anthropic-version: '2023-06-01'
-    type: remote
   embed:
+    providers:
+      - name: local-embed
+        type: local
+        llama_model: mxbai-embed
     aliases:
     - embeddings
     - embed
-    llama_model: mxbai-embed
-    type: local
   gemma4:
+    providers:
+      - name: local-gemma4
+        type: local
+        llama_model: gemma4
     aliases:
     - gemma4
     - Gemma4
-    llama_model: gemma4
-    type: local
   github:
+    providers:
+      - name: github-primary
+        type: remote
+        endpoint: https://models.inference.ai.azure.com
+        api_key_env: GITHUB_TOKEN
     aliases:
     - github-*
-    api_key_env: GITHUB_TOKEN
-    endpoint: https://models.inference.ai.azure.com
-    type: remote
   gpt120:
+    providers:
+      - name: local-gpt120
+        type: local
+        llama_model: gpt120
     aliases:
     - gpt-oss-120b
     - gpt-oss*
     - GPT-OSS*
     - Casey
     - casey
-    llama_model: gpt120
-    type: local
-  openai:
-    aliases:
-    - gpt-4
-    - gpt-4-turbo
-    - gpt-4o
-    - gpt-4o-mini
-    - gpt-3.5-turbo
-    - gpt-*
-    - o1-*
-    - chatgpt-*
-    api_key_env: OPENAI_API_KEY
-    endpoint: https://api.openai.com/v1
-    type: remote
   qwen3:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
     aliases:
     - qwen3*
     - Qwen3*
-    llama_model: Qwen3
     force_full_prompt: true
-    type: local
+
+  # Cascading fallback: local Qwen3 first, then OpenCode free, then OpenCode Go.
+  # Slot exhaustion on the local model falls through to the free remote tier.
+  # Rate limiting (429) on the free tier falls through to the paid Go tier.
+  # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
+  qwen3-fallback:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+      - name: opencode-go-deepseek
+        type: remote
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+    aliases:
+    - qwen3-fallback*
+    - fallback-router
+    - auto
+    force_full_prompt: true
+
   qwen3-next:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3-Next
     aliases:
     - qwen3-next
     - qwen3-coder-next
     - qwen3-next*
-    llama_model: Qwen3-Next
     force_full_prompt: true
-    type: local
+  plan:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3-Next
+    aliases:
+    - plan
+    force_full_prompt: true
+  code:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3-Next
+    aliases:
+    - code
+    force_full_prompt: true
 server:
-  distrobox_name: llama
   embeddings_model: mxbai-embed
   host: 0.0.0.0
   # Fallback to host start is not permitted in production. This flag is
   # reserved for temporary developer troubleshooting only and must not be
   # committed in infra-managed production deployments.
-  llama_allow_host_fallback: false
+  # For this environment we allow host-start so the proxy can spawn the
+  # podman-backed container via the host start script wrapper.
+  llama_allow_host_fallback: true
   llama_embed_load_timeout: 30
+  # Router model-health monitoring cadence (seconds).
+  # Preferred key (used by backend health loop):
+  llama_model_health_interval_seconds: 10
+  # Legacy alias retained for compatibility with older configs.
   llama_health_check_interval: 10
+  # Reduce false-positive unload/reload churn under transient probe failures.
+  llama_model_health_failures_before_recovery: 2
+  llama_model_health_probe_attempts: 2
+  llama_model_health_probe_timeout_seconds: 5
+  llama_model_health_probe_backoff_seconds: 0.5
+  llama_model_health_grace_period_seconds: 15
   llama_model_load_timeout: 600
-  llama_models_max: 1
+  llama_models_max: 2
   llama_request_timeout: 300
+  # Provider fallback cooldown: seconds to wait before retrying a failed provider
+  provider_cooldown_seconds: 60
+  # Adaptive timeout: base + per_token * prompt_tokens
+  llama_adaptive_timeout_enabled: true
+  llama_adaptive_timeout_base_seconds: 60
+  llama_adaptive_timeout_per_token_seconds: 0.01
   llama_router_mode: true
   max_concurrent_queries: 16
   session_single_flight_mode: queue
@@ -103,14 +219,21 @@ server:
   session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
-  session_guardrail_max_runtime_seconds: 120
+  session_guardrail_max_runtime_seconds: 1800
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 64
   session_guardrail_repetition_min_repeats: 10
-  session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_cutoff: false
   session_guardrail_invalidate_on_repetition: false
+  # Token-rate guardrail settings (disabled by default)
+  # Maximum tokens/second threshold. Set to 0 to disable token-rate guardrail.
+  session_guardrail_max_token_rate: 0
+  # Rolling window duration in seconds for token-rate calculation.
+  # The guardrail only triggers if the rate exceeds max_token_rate for the
+  # entire window duration (sustained violation, not a spike).
+  session_guardrail_token_rate_window_seconds: 5
   session_require_restore_signal: false
-  backend_retry_attempts: 3
+  backend_retry_attempts: 8
   backend_retry_base_delay_seconds: 0.25
   backend_retry_max_delay_seconds: 2.0
   backend_retry_jitter_ratio: 0.25
@@ -125,6 +248,21 @@ server:
   - Qwen3
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
-  llama_start_script: /home/rgardler/projects/llm/start-llama.sh
+  llama_start_script: /home/rgardler/projects/llm/scripts/podman_start_llama.sh
   llama_startup_timeout: 300
   port: 8000
+
+  # Slot management — job-level slot ownership (see docs/dev/slot-management-design.md)
+  # Replaces per-request hash-based slot assignment with per-job ownership.
+  # When enabled, each multi-turn conversation (session) owns a slot for its
+  # entire lifetime, eliminating save/restore overhead between turns.
+  slot_management:
+    # Number of slots (GPU contexts) available for job assignment.
+    # Recommended: equal to max expected concurrent sessions.
+    slot_pool_size: 4
+    # Maximum number of jobs waiting in the queue when all slots are busy.
+    slot_queue_max_depth: 16
+    # Seconds of inactivity before a job's slot is released automatically.
+    slot_job_timeout_seconds: 300.0
+    # Seconds in the Retry-After header when the queue is full.
+    slot_queue_overflow_retry_after: 900

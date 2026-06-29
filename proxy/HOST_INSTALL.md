@@ -60,7 +60,7 @@ Important: your existing setup uses a container image where `llama-server` is pr
 
 5) If you prefer not to install on the host
 
-   - Use the container-based fixes (make systemd allow writing to /run/user/$UID/libpod, run service as user, or fix podman/distrobox rootless setup). Those are safer long-term but require more changes.
+   - Use the container-based fixes (make systemd allow writing to /run/user/$UID/libpod, run service as user, or fix podman rootless setup). Those are safer long-term but require more changes.
 
 Notes and troubleshooting
  - If the build step produces a differently-named binary, update `start-llama.sh` or symlink the built binary to `/usr/local/bin/llama-server`.

@@ -340,6 +340,43 @@ class TestDeltaMetrics:
         assert metrics["fallback_reason"] == "history_mismatch"
         assert metrics["reduction_percent"] == 0.0
 
+    def test_delta_metrics_no_new_messages(self):
+        """When existing and incoming are identical, fallback_reason should be no_new_messages."""
+        mgr = SessionManager()
+        existing = _make_messages(4)
+        incoming = list(existing)
+
+        metrics = mgr.compute_delta_metrics(existing, incoming)
+
+        assert metrics["history_matches"] is True
+        assert metrics["mode"] == "delta"
+        assert metrics["fallback_reason"] == "no_new_messages"
+        assert metrics["delta_message_count"] == 0
+
+    def test_delta_metrics_no_existing_history(self):
+        """When there is no existing history, fallback_reason should be no_existing_history."""
+        mgr = SessionManager()
+        incoming = _make_messages(4)
+
+        metrics = mgr.compute_delta_metrics([], incoming)
+
+        assert metrics["history_matches"] is True
+        assert metrics["mode"] == "full"
+        assert metrics["fallback_reason"] == "no_existing_history"
+        assert metrics["reduction_percent"] == 0.0
+
+    def test_delta_metrics_both_empty(self):
+        """When both existing and incoming are empty, no_existing_history takes priority."""
+        mgr = SessionManager()
+
+        metrics = mgr.compute_delta_metrics([], [])
+
+        assert metrics["history_matches"] is True
+        assert metrics["mode"] == "full"
+        assert metrics["fallback_reason"] == "no_existing_history"
+        assert metrics["delta_message_count"] == 0
+        assert metrics["full_payload_bytes"] == 2  # "[]"
+
 
 # ---------------------------------------------------------------------------
 # Session info and removal

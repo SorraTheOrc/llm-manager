@@ -67,7 +67,7 @@ if [[ "$router_mode" -eq 1 ]]; then
   echo
 
   # Prefer an explicit LLAMA_SERVER_BIN when provided (proxy exports this env var
-  # to force the distrobox start script to use a host-built binary). Fall back
+  # to use a host-built binary). Fall back
   # to the system `llama-server` on PATH or the literal name.
   if [[ -n "${LLAMA_SERVER_BIN:-}" ]]; then
     LLAMA_BIN="${LLAMA_SERVER_BIN}"
@@ -149,7 +149,7 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--preence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj"
+    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   mxbai-embed)
@@ -218,7 +218,7 @@ echo "QUANTIZATION=$QUANTIZATION"
 echo "CONTEXT=$CONTEXT"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo
-echo "TEAMP=$TEMP"
+echo "TEMP=$TEMP"
 echo "TOP_P=$TOP_P"
 echo "TOP_K=$TOP_K"
 echo "MIN_P=$MIN_P"

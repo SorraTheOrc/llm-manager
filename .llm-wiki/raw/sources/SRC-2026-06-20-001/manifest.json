@@ -1,0 +1,10 @@
+{
+  "id": "SRC-2026-06-20-001",
+  "captured": "2026-06-20",
+  "packet_version": "1.0",
+  "title": "ROADMAP.md",
+  "url": "https://github.com/pablo-ross/strix-halo-gmktec-evo-x2/blob/main/ROADMAP.md",
+  "format": "web",
+  "extractor": "htmlToMarkdown",
+  "extraction_status": "success"
+}

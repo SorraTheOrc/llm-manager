@@ -1,0 +1,167 @@
+# llama-server.service — Host-first deployment systemd unit
+
+## Overview
+
+This systemd unit file runs the llama-server process for the LLM proxy stack.
+It uses the host-first model via `start-llama.sh` (router mode) and is designed
+to be deployed as a **user service** (recommended), though a system-service
+variant is documented below.
+
+## User Service (Recommended)
+
+This is the recommended deployment approach for single-operator setups. It
+keeps the llama-server process under the operator's login session.
+
+**File location**: `~/.config/systemd/user/llama-server.service`
+
+```ini
+[Unit]
+Description=LLM llama-server (host-first, router mode)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/rgardler/projects/llm/start-llama.sh router
+Environment=LLAMA_MODELS_PRESET=/home/rgardler/projects/llm/models.ini
+Environment=LLAMA_MODELS_MAX=1
+Environment=LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+Environment=HSA_OVERRIDE_GFX_VERSION=11.5.1
+Environment=ROCM_LLVM_PRE_VEGA=1
+Environment=PORT=8080
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/home/rgardler/.local/state/llama-server/logs/llama-server.log
+StandardError=append:/home/rgardler/.local/state/llama-server/logs/llama-server.log
+
+# Resource limits
+MemoryMax=70G
+CPUQuota=200%
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+
+[Install]
+WantedBy=default.target
+```
+
+### Setup commands (user service)
+
+```bash
+# Create log directory
+mkdir -p ~/.local/state/llama-server/logs
+
+# Enable and start the service
+systemctl --user daemon-reload
+systemctl --user enable llama-server.service
+systemctl --user start llama-server.service
+
+# Check status
+systemctl --user status llama-server.service
+
+# View logs
+journalctl --user -u llama-server.service -f
+```
+
+## System Service (Alternative)
+
+Use this approach only if the llama-server must survive logout or run
+independently of any user session. This requires root or sudo access.
+
+**File location**: `/etc/systemd/system/llama-server.service`
+
+```ini
+[Unit]
+Description=LLM llama-server (host-first, router mode)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=rgardler
+Group=rgardler
+WorkingDirectory=/home/rgardler/projects/llm
+ExecStart=/home/rgardler/projects/llm/start-llama.sh router
+Environment=LLAMA_MODELS_PRESET=/home/rgardler/projects/llm/models.ini
+Environment=LLAMA_MODELS_MAX=1
+Environment=LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+Environment=HSA_OVERRIDE_GFX_VERSION=11.5.1
+Environment=ROCM_LLVM_PRE_VEGA=1
+Environment=PORT=8080
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/var/log/llama-server/llama-server.log
+StandardError=append:/var/log/llama-server/llama-server.log
+
+MemoryMax=70G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Setup commands (system service)
+
+```bash
+# Create log directory
+sudo mkdir -p /var/log/llama-server
+sudo chown rgardler:rgardler /var/log/llama-server
+
+# Install the unit
+sudo cp llama-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable llama-server.service
+sudo systemctl start llama-server.service
+
+# Check status
+sudo systemctl status llama-server.service
+
+# View logs
+sudo journalctl -u llama-server.service -f
+```
+
+## Verification
+
+Regardless of deployment approach, verify the service is running:
+
+```bash
+# Check health endpoint
+curl http://localhost:8080/health
+
+# Expected response:
+# {
+#   "status": "healthy",
+#   "ready": true,
+#   "current_model": null,
+#   "llama_server_running": true,
+#   "backend_signals": {
+#     "connect_failures": 0,
+#     "read_failures": 0,
+#     "timeout_failures": 0,
+#     "other_failures": 0,
+#     "concurrency_rejects": 0
+#   }
+# }
+
+# Check loaded models
+curl http://localhost:8080/models
+```
+
+## Log paths
+
+- **User service**: `$XDG_STATE_HOME/llama-server/logs/llama-server.log` (typically `~/.local/state/llama-server/logs/llama-server.log`)
+- **System service**: `/var/log/llama-server/llama-server.log`
+
+## Cross-references
+
+- See also: `docs/systemd/llama-proxy.service` for the proxy systemd unit.
+- See also: `proxy/README.md` → "Host-first deployment" section.
+- See also: `HOST_INSTALL.md` for llama-server host installation instructions.
