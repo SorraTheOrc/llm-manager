@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import HTTPException, Response
 
+from proxy.utils import _is_empty_response
 
 logger = logging.getLogger("llama-proxy.provider")
 
@@ -409,6 +410,24 @@ async def proxy_with_remote_fallback(
                     all_slot_exhaustion = False
                 continue
 
+            # Treat empty successful responses as failures to allow fallback
+            try:
+                content_text = response.content.decode('utf-8', errors='replace') if hasattr(response, 'content') else ''
+                resp_json = None
+                try:
+                    resp_json = json.loads(content_text) if content_text else None
+                except Exception:
+                    resp_json = None
+                if _is_empty_response(content_text or '', resp_json):
+                    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+                    mark_provider_unavailable(provider_name, effective_cooldown)
+                    fallback_reason = "empty_response"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+            except Exception:
+                pass
+
             # Success — add X-Provider header and log if fallback occurred
             result = _add_provider_header(response, provider_name)
             if prev_provider:
@@ -433,6 +452,18 @@ async def proxy_with_remote_fallback(
             raise
 
     # All providers exhausted
+    # Log diagnostic details about provider cooldowns to aid troubleshooting
+    try:
+        provider_names = [p.get('name') for p in model_config.get('providers', []) if isinstance(p, dict)]
+        unavailable = {}
+        for n in provider_names:
+            exp = _provider_unavailable_until.get(n)
+            if exp:
+                unavailable[n] = int(max(0, exp - time.time()))
+        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
+    except Exception:
+        pass
+
     if not any_provider_tried:
         # No providers were available at all (all in cooldown or none defined)
         return _build_exhausted_response(all_local_slot_exhaustion=False)
@@ -512,6 +543,24 @@ async def proxy_with_fallback(
                     all_slot_exhaustion = False
                 continue
 
+            # Treat empty successful responses as failures to allow fallback
+            try:
+                content_text = response.content.decode('utf-8', errors='replace') if hasattr(response, 'content') else ''
+                resp_json = None
+                try:
+                    resp_json = json.loads(content_text) if content_text else None
+                except Exception:
+                    resp_json = None
+                if _is_empty_response(content_text or '', resp_json):
+                    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+                    mark_provider_unavailable(provider_name, effective_cooldown)
+                    fallback_reason = "empty_response"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+            except Exception:
+                pass
+
             # Success — add X-Provider header and log if fallback occurred
             result = _add_provider_header(response, provider_name)
             if prev_provider:
@@ -547,6 +596,18 @@ async def proxy_with_fallback(
             raise
 
     # All providers exhausted
+    # Log diagnostic details about provider cooldowns to aid troubleshooting
+    try:
+        provider_names = [p.get('name') for p in model_config.get('providers', []) if isinstance(p, dict)]
+        unavailable = {}
+        for n in provider_names:
+            exp = _provider_unavailable_until.get(n)
+            if exp:
+                unavailable[n] = int(max(0, exp - time.time()))
+        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
+    except Exception:
+        pass
+
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False)
     # If all failures were slot exhaustion, include total slots in message
