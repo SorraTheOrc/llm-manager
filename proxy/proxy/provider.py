@@ -228,7 +228,7 @@ def _add_provider_header(response: Response, provider_name: str) -> Response:
     return response
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: Optional[dict] = None) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
@@ -237,6 +237,8 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
                                    Otherwise, returns HTTP 503 with JSON body.
         total_slots: Total number of slots across local providers (used only
                      for the slot-exhaustion 429 text body).
+        unavailable_providers: Optional mapping of provider -> remaining cooldown seconds
+                               to include in the 503 JSON payload for diagnostics.
     """
     if all_local_slot_exhaustion:
         # total_slots may be 0 if unknown; still format per acceptance criteria
@@ -245,8 +247,17 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             status_code=429,
             media_type="text/plain",
         )
+
+    payload = {"error": "All providers exhausted", "retry_after": 60}
+    if unavailable_providers:
+        # Attach diagnostic info about which providers are in cooldown
+        try:
+            payload["unavailable_providers"] = unavailable_providers
+        except Exception:
+            pass
+
     return Response(
-        content=json.dumps({"error": "All providers exhausted", "retry_after": 60}).encode("utf-8"),
+        content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
     )
@@ -466,8 +477,8 @@ async def proxy_with_remote_fallback(
 
     if not any_provider_tried:
         # No providers were available at all (all in cooldown or none defined)
-        return _build_exhausted_response(all_local_slot_exhaustion=False)
-    return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion)
+        return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable)
+    return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable)
 
 
 async def proxy_with_fallback(
@@ -609,8 +620,8 @@ async def proxy_with_fallback(
         pass
 
     if not any_provider_tried:
-        return _build_exhausted_response(all_local_slot_exhaustion=False)
+        return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable)
     # If all failures were slot exhaustion, include total slots in message
     if all_slot_exhaustion:
-        return _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum)
-    return _build_exhausted_response(all_local_slot_exhaustion=False)
+        return _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable)
+    return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable)
