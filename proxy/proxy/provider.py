@@ -16,7 +16,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import Response
+from fastapi import HTTPException, Response
 
 
 logger = logging.getLogger("llama-proxy.provider")
@@ -529,6 +529,17 @@ async def proxy_with_fallback(
                 any_provider_tried = True
                 mark_provider_unavailable(provider_name, cooldown_seconds)
                 fallback_reason = str(type(exc).__name__)
+                prev_provider = provider_name
+                all_slot_exhaustion = False
+                continue
+            # HTTPException from the local provider (e.g., backend busy, slot
+            # queue full, concurrency limit) should also trigger fallback.
+            # Only 5xx responses are retryable via fallback; 4xx errors are
+            # client errors that should propagate.
+            if isinstance(exc, HTTPException) and exc.status_code >= 500:
+                any_provider_tried = True
+                mark_provider_unavailable(provider_name, cooldown_seconds)
+                fallback_reason = f"HTTPException {exc.status_code}"
                 prev_provider = provider_name
                 all_slot_exhaustion = False
                 continue

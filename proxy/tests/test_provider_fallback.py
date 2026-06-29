@@ -12,7 +12,7 @@ import time
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import Request, Response
+from fastapi import HTTPException, Request, Response
 
 import proxy.provider as provider
 
@@ -1080,3 +1080,39 @@ async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
     captured_json = json.loads(captured_body.decode("utf-8"))
     assert captured_json["model"] == "my-original-model", \
         f"Expected original model 'my-original-model', got '{captured_json.get('model')}'"
+
+
+@pytest.mark.asyncio
+async def test_local_http_exception_triggers_fallback(mixed_model_config):
+    """HTTPException (e.g., 503 backend busy) from a local provider should
+    trigger fallback to the next provider."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        # Simulate a 503 backend-unavailable HTTPException (e.g., concurrency limit)
+        raise HTTPException(status_code=503, detail="Backend busy")
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [
+        ("local", "local-llama"),
+        ("remote", "remote-fallback"),
+    ], f"Expected fallback to remote, got call_log={call_log}"
