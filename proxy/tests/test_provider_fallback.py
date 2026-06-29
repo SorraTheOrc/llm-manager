@@ -1083,6 +1083,98 @@ async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_loading(monkeypatch):
+    """When a local model with remote providers is NOT loaded and the remote
+    fallback returns a 503 error, proxy_openai_api should return a model_loading
+    response, not the 503 from the exhausted remote providers."""
+    import proxy.server as server_module
+    from unittest.mock import MagicMock
+
+    # Set up config with a local model that has providers (local + remote)
+    server_module.config = {
+        "models": {
+            "test-local": {
+                "type": "local",
+                "llama_model": "test-llama",
+                "providers": [
+                    {"name": "local-instance", "type": "local", "llama_model": "test-llama"},
+                    {"name": "remote-backup", "type": "remote",
+                     "endpoint": "https://backup.test/v1", "api_key_env": "KEY"},
+                ],
+            },
+        },
+        "server": {
+            "llama_request_timeout": 300,
+            "llama_router_mode": False,
+        },
+    }
+    # Simulate model is NOT loaded (current_model is different)
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    server_module.llama_process = fake_proc
+    server_module.backend_ready = True
+    server_module.current_model = "some-other-model"
+    server_module.background_loads = {}
+    server_module.logger = MagicMock()
+    server_module.schedule_background_load = MagicMock(return_value=True)
+    server_module._model_loading_response = MagicMock(
+        return_value=Response(
+            content=json.dumps({
+                "error": {"code": "model_loading", "message": "Model test-llama is loading"},
+                "status": 503,
+            }),
+            status_code=503,
+            media_type="application/json",
+        )
+    )
+    server_module.get_local_model_name = lambda m: "test-llama" if m == "test-local" or m == "test-llama" else None
+
+    # Mock proxy_with_remote_fallback to return a 503 (exhausted providers)
+    mock_exhausted_resp = Response(
+        content=json.dumps({"error": "All providers exhausted", "retry_after": 60}),
+        status_code=503,
+        media_type="application/json",
+    )
+
+    async def mock_remote_fallback(_req, _path, _cfg, _config):
+        return mock_exhausted_resp
+
+    with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
+        # Also mock session/slot detection to skip (no session header)
+        with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
+            with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
+                from proxy.ui import proxy_openai_api
+                from fastapi import Request as FastAPIRequest
+
+                body = json.dumps({
+                    "model": "test-local",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": False,
+                }).encode("utf-8")
+
+                mock_request = MagicMock(spec=FastAPIRequest)
+                mock_request.method = "POST"
+                mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+                mock_request.headers = {}
+                mock_request._body = body
+                async def mock_body():
+                    return mock_request._body
+                mock_request.body = mock_body
+
+                resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    # Should NOT be the exhausted providers response
+    assert resp.status_code == 503
+    body_text = resp.body.decode("utf-8") if hasattr(resp, "body") else ""
+    # Should be a model_loading response, not "All providers exhausted"
+    assert "All providers exhausted" not in body_text, \
+        f"Should NOT propagate exhausted provider error: {body_text}"
+    assert "model_loading" in body_text or "loading" in body_text.lower(), \
+        f"Should return model_loading response: {body_text}"
+
+
+@pytest.mark.asyncio
 async def test_local_http_exception_triggers_fallback(mixed_model_config):
     """HTTPException (e.g., 503 backend busy) from a local provider should
     trigger fallback to the next provider."""

@@ -559,6 +559,21 @@ async def create_embeddings(request: Request):
                 from proxy.provider import proxy_with_remote_fallback
                 try:
                     resp = await proxy_with_remote_fallback(request, "v1/embeddings", remote_cfg, srv.config)
+                    # remote fallback may return an error response (503) when all
+                    # remote providers are exhausted — don't propagate this;
+                    # return model_loading so the client waits for the local model.
+                    if resp.status_code >= 400:
+                        srv.logger.warning(
+                            "Remote fallback returned error for model=%s status=%s; "
+                            "returning model_loading response",
+                            model_name, resp.status_code,
+                        )
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint="/v1/embeddings",
+                        )
                     return resp
                 except Exception:
                     srv.logger.exception("Remote embeddings fallback raised exception; returning model_loading response")
@@ -726,6 +741,21 @@ async def proxy_openai_api(request: Request, path: str):
                 from proxy.provider import proxy_with_remote_fallback
                 try:
                     resp = await proxy_with_remote_fallback(request, f"v1/{path}", remote_cfg, srv.config)
+                    # remote fallback may return an error response (503) when all
+                    # remote providers are exhausted — don't propagate this;
+                    # return model_loading so the client waits for the local model.
+                    if resp.status_code >= 400:
+                        srv.logger.warning(
+                            "Remote fallback returned error for model=%s status=%s; "
+                            "returning model_loading response",
+                            model_name, resp.status_code,
+                        )
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint=f"/v1/{path}",
+                        )
                     return resp
                 except Exception:
                     srv.logger.exception("Remote fallback attempt raised exception; returning model_loading response")
