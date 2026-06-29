@@ -267,26 +267,46 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     max_queries = server_config.get("max_concurrent_queries", 4)
     try:
         async with srv.active_queries_lock:
-            if srv.active_queries >= max_queries:
-                _record_backend_signal("concurrency_rejects")
-                srv.logger.warning(
-                    "concurrency_reject active=%s max=%s path=%s",
-                    srv.active_queries,
-                    max_queries,
-                    path,
-                )
-                # Concurrency limit reached — record 5xx with reason "concurrency_rejected"
-                record_http_error(
-                    "v1/chat/completions", "5xx", "concurrency_rejected"
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Server overloaded: {srv.active_queries} queries active. Retry later.",
-                )
-    except HTTPException:
-        raise
+            cur_active = srv.active_queries
     except Exception:
-        pass
+        cur_active = 0
+
+    if cur_active >= max_queries:
+        # Concurrency limit reached. Attempt to serve from remote providers
+        # for the requested model before rejecting, since remote calls do not
+        # consume local backend slots.
+        try:
+            model_cfg = srv.get_model_config(model_name)
+            if model_cfg:
+                providers = model_cfg.get("providers") or []
+                remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+                if remote_providers:
+                    from proxy.provider import proxy_with_remote_fallback
+                    remote_cfg = {"providers": remote_providers}
+                    try:
+                        resp = await proxy_with_remote_fallback(request, f"v1/{path}", remote_cfg, srv.config)
+                        return resp
+                    except Exception:
+                        srv.logger.exception("Remote fallback during concurrency limit failed; will return concurrency 503")
+        except Exception:
+            srv.logger.debug("Failed to attempt remote fallback under concurrency limit", exc_info=True)
+
+        # No remote providers or remote attempts failed — reject due to concurrency
+        _record_backend_signal("concurrency_rejects")
+        srv.logger.warning(
+            "concurrency_reject active=%s max=%s path=%s",
+            cur_active,
+            max_queries,
+            path,
+        )
+        # Concurrency limit reached — record 5xx with reason "concurrency_rejected"
+        record_http_error(
+            "v1/chat/completions", "5xx", "concurrency_rejected"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Server overloaded: {cur_active} queries active. Retry later.",
+        )
 
     # Check slot availability
     slot_response = await _check_slot_availability(
