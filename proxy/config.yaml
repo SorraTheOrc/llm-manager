@@ -134,7 +134,11 @@ models:
   # Slot exhaustion on the local model falls through to the free remote tier.
   # Rate limiting (429) on the free tier falls through to the paid Go tier.
   # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
-  qwen3-fallback:
+  # Cascading fallback: local Qwen3 first, then OpenCode free, then OpenCode Go.
+  # Slot exhaustion on the local model falls through to the free remote tier.
+  # Rate limiting (429) on the free tier falls through to the paid Go tier.
+  # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
+  plan:
     providers:
       - name: local-qwen3
         type: local
@@ -150,9 +154,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
     aliases:
-    - qwen3-fallback*
-    - fallback-router
-    - auto
+    - plan*
     force_full_prompt: true
 
   qwen3-next:
@@ -164,14 +166,6 @@ models:
     - qwen3-next
     - qwen3-coder-next
     - qwen3-next*
-    force_full_prompt: true
-  plan:
-    providers:
-      - name: local-qwen3-next
-        type: local
-        llama_model: Qwen3-Next
-    aliases:
-    - plan
     force_full_prompt: true
   code:
     providers:
