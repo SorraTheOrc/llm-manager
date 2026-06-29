@@ -508,10 +508,69 @@ async def create_embeddings(request: Request):
                 # Non-fatal: fall through to scheduling background load
                 srv.logger.debug("Fast router check failed; scheduling background load")
 
-        # Otherwise, schedule a background load and return 503 immediately
+        # Otherwise, schedule a background load. If this request is restoring
+        # a session slot we must return model_loading. Otherwise, attempt remote
+        # providers (if configured) before returning model_loading so clients
+        # can be served by remotes when appropriate.
         target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
         scheduled = srv.schedule_background_load(target_model)
         srv.logger.info(f"Scheduled background load for embeddings request: {target_model} scheduled={scheduled}")
+
+        # If the request is attempting a session restore (slot file exists),
+        # return the model_loading response so the local restore can proceed.
+        try:
+            from proxy.session import _resolve_session_id_header, _build_slot_context
+            session_id_header, _ = _resolve_session_id_header(request.headers)
+            # Prefer checking the scheduler for an existing slot assignment (reenter)
+            try:
+                from proxy.router import _get_job_scheduler
+                scheduler = _get_job_scheduler()
+                if scheduler is not None and session_id_header:
+                    slot_reenter = await scheduler.reenter_job(session_id_header)
+                    if slot_reenter is not None:
+                        # Job already owns a slot — must proceed with local restore/loading
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint="/v1/embeddings",
+                        )
+            except Exception:
+                # Best-effort scheduler check failed; fall back to slot file heuristic
+                srv.logger.debug("Scheduler reenter check failed for embeddings; falling back to slot-file check", exc_info=True)
+
+            slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
+            if slot_filename and slot_filename != "" and Path(slot_filename).exists():
+                return srv._model_loading_response(
+                    requested_model=model_name if isinstance(model_name, str) else None,
+                    target_model=target_model,
+                    scheduled=scheduled,
+                    endpoint="/v1/embeddings",
+                )
+        except Exception:
+            srv.logger.debug("Session/slot detection failed for embeddings; will attempt remote fallback", exc_info=True)
+
+        # Try remote providers first if any are configured for this model
+        try:
+            providers = model_cfg.get("providers") or []
+            remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+            if remote_providers:
+                remote_cfg = {"providers": remote_providers}
+                from proxy.provider import proxy_with_remote_fallback
+                try:
+                    resp = await proxy_with_remote_fallback(request, "v1/embeddings", remote_cfg, srv.config)
+                    return resp
+                except Exception:
+                    srv.logger.exception("Remote embeddings fallback raised exception; returning model_loading response")
+                    return srv._model_loading_response(
+                        requested_model=model_name if isinstance(model_name, str) else None,
+                        target_model=target_model,
+                        scheduled=scheduled,
+                        endpoint="/v1/embeddings",
+                    )
+        except Exception:
+            srv.logger.exception("Failed while attempting remote embeddings fallback; returning model_loading response")
+
         return srv._model_loading_response(
             requested_model=model_name if isinstance(model_name, str) else None,
             target_model=target_model,
@@ -621,10 +680,64 @@ async def proxy_openai_api(request: Request, path: str):
             except Exception:
                 srv.logger.debug("Fast router check failed; scheduling background load")
 
-        # Otherwise, schedule background load and return 503 so client doesn't hang
+        # Otherwise, schedule background load. If this request is restoring a session
+        # slot we must return model_loading. Otherwise, attempt remote providers
+        # before returning model_loading so clients can be served by remotes when possible.
         target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
         scheduled = srv.schedule_background_load(target_model)
         srv.logger.info(f"Scheduled background load for request: model={target_model} scheduled={scheduled}")
+
+        try:
+            from proxy.session import _resolve_session_id_header, _build_slot_context
+            session_id_header, _ = _resolve_session_id_header(request.headers)
+            # First try scheduler.reenter_job to detect existing slot ownership (non-invasive)
+            try:
+                from proxy.router import _get_job_scheduler
+                scheduler = _get_job_scheduler()
+                if scheduler is not None and session_id_header:
+                    slot_reenter = await scheduler.reenter_job(session_id_header)
+                    if slot_reenter is not None:
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint=f"/v1/{path}",
+                        )
+            except Exception:
+                srv.logger.debug("Scheduler reenter check failed; falling back to slot-file check", exc_info=True)
+
+            slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
+            if slot_filename and slot_filename != "" and Path(slot_filename).exists():
+                return srv._model_loading_response(
+                    requested_model=model_name if isinstance(model_name, str) else None,
+                    target_model=target_model,
+                    scheduled=scheduled,
+                    endpoint=f"/v1/{path}",
+                )
+        except Exception:
+            srv.logger.debug("Session/slot detection failed; will attempt remote fallback before returning model_loading", exc_info=True)
+
+        # Try configured remote providers first
+        try:
+            providers = model_cfg.get("providers") or []
+            remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+            if remote_providers:
+                remote_cfg = {"providers": remote_providers}
+                from proxy.provider import proxy_with_remote_fallback
+                try:
+                    resp = await proxy_with_remote_fallback(request, f"v1/{path}", remote_cfg, srv.config)
+                    return resp
+                except Exception:
+                    srv.logger.exception("Remote fallback attempt raised exception; returning model_loading response")
+                    return srv._model_loading_response(
+                        requested_model=model_name if isinstance(model_name, str) else None,
+                        target_model=target_model,
+                        scheduled=scheduled,
+                        endpoint=f"/v1/{path}",
+                    )
+        except Exception:
+            srv.logger.exception("Failed while attempting remote fallback; returning model_loading response")
+
         return srv._model_loading_response(
             requested_model=model_name if isinstance(model_name, str) else None,
             target_model=target_model,
