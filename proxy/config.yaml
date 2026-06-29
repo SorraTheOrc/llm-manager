@@ -106,7 +106,6 @@ models:
       - name: github-primary
         type: remote
         endpoint: https://models.inference.ai.azure.com
-        api_key_env: GITHUB_TOKEN
     aliases:
     - github-*
   gpt120:
