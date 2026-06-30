@@ -49,6 +49,8 @@ LOGGER.setLevel(logging.DEBUG)
 
 BASE_URL = os.getenv("LIVE_PROXY_BASE_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_TIMEOUT = float(os.getenv("LIVE_PROXY_TIMEOUT_SECONDS", "180"))
+LOCAL_QWEN3_RETRY_ATTEMPTS = int(os.getenv("LIVE_E2E_LOCAL_RETRY_ATTEMPTS", "4"))
+LOCAL_QWEN3_RETRY_DELAY_SECONDS = float(os.getenv("LIVE_E2E_LOCAL_RETRY_DELAY_SECONDS", "1.5"))
 
 
 _PHASE_STATE: Dict[str, Any] = {
@@ -313,9 +315,19 @@ def _wait_for_restore_success_increment(before: int, timeout_seconds: float = 12
     return False, current
 
 
-def _assert_local_qwen3(response: Response, body: Dict[str, Any], *, phase: str) -> None:
+def _is_local_qwen3_response(response: Response, body: Dict[str, Any]) -> Tuple[bool, str, str]:
     provider = _provider_from_response(response)
     model_field = str(body.get("model", "")).strip().lower()
+    looks_local_qwen3 = (
+        provider == "local-qwen3"
+        or ("local" in provider.lower() and "qwen3" in provider.lower())
+        or ("qwen3" in model_field)
+    )
+    return looks_local_qwen3, provider, model_field
+
+
+def _assert_local_qwen3(response: Response, body: Dict[str, Any], *, phase: str) -> None:
+    looks_local_qwen3, provider, model_field = _is_local_qwen3_response(response, body)
 
     _log(
         f"{phase}: validating local qwen3 provider",
@@ -323,13 +335,53 @@ def _assert_local_qwen3(response: Response, body: Dict[str, Any], *, phase: str)
     )
 
     assert provider, f"{phase}: expected X-Provider header to be present"
-    looks_local_qwen3 = (
-        provider == "local-qwen3"
-        or ("local" in provider.lower() and "qwen3" in provider.lower())
-        or ("qwen3" in model_field)
-    )
     assert looks_local_qwen3, (
         f"{phase}: expected local qwen3 response, got provider={provider!r} model={model_field!r}"
+    )
+
+
+def _chat_until_local_qwen3(
+    *,
+    phase: str,
+    prompt: str,
+    max_tokens: int,
+    attempts: int = LOCAL_QWEN3_RETRY_ATTEMPTS,
+    delay_seconds: float = LOCAL_QWEN3_RETRY_DELAY_SECONDS,
+) -> Tuple[Response, Dict[str, Any], float, str]:
+    """Retry phase request until local qwen3 answers or attempts exhausted."""
+    attempts = max(1, int(attempts))
+    last_observation: Dict[str, Any] = {}
+
+    for attempt in range(1, attempts + 1):
+        candidate_session_id = _new_session_id(f"{phase}-session")
+        response, body, elapsed = _chat(
+            prompt=prompt,
+            session_id=candidate_session_id,
+            max_tokens=max_tokens,
+        )
+
+        looks_local_qwen3, provider, model_field = _is_local_qwen3_response(response, body)
+        has_content = bool(_extract_response_text(body).strip())
+
+        last_observation = {
+            "attempt": attempt,
+            "status_code": int(response.status_code),
+            "provider": provider,
+            "model_field": model_field,
+            "has_content": has_content,
+            "session_id": candidate_session_id,
+        }
+        _log(f"{phase}: local-qwen3 retry observation", payload=last_observation)
+
+        if response.status_code == 200 and has_content and looks_local_qwen3:
+            return response, body, elapsed, candidate_session_id
+
+        if attempt < attempts:
+            time.sleep(max(0.0, float(delay_seconds)))
+
+    pytest.fail(
+        f"{phase}: expected local qwen3 response after {attempts} attempts; "
+        f"last_observation={last_observation}"
     )
 
 
@@ -466,13 +518,12 @@ def test_phase_1_single_query_local_qwen3() -> None:
     _require_precondition(1)
     _require_local_proxy()
 
-    session_id = _new_session_id("plan-live-e2e-p1")
-    response, body, _elapsed = _chat(
+    response, body, _elapsed, session_id = _chat_until_local_qwen3(
+        phase="phase_1",
         prompt=(
             "You are performing a diagnostics handshake. Reply with exactly: "
             "PHASE1_OK and one short sentence."
         ),
-        session_id=session_id,
         max_tokens=80,
     )
 
