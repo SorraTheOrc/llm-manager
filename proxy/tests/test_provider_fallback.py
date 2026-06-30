@@ -1045,8 +1045,94 @@ async def test_local_model_with_providers_calls_fallback(monkeypatch):
 
 
 # ===================================================================
-# Model name override tests
+# Request-header / model-override tests
 # ===================================================================
+
+
+def test_normalize_upstream_request_headers_strips_hop_by_hop_headers():
+    from proxy.router_helpers import normalize_upstream_request_headers
+
+    incoming = {
+        "Host": "localhost:8000",
+        "Content-Length": "123",
+        "Connection": "keep-alive, x-drop-me",
+        "Keep-Alive": "timeout=5",
+        "Transfer-Encoding": "chunked",
+        "TE": "trailers",
+        "Trailer": "x-trailer",
+        "Expect": "100-continue",
+        "Proxy-Connection": "keep-alive",
+        "X-Drop-Me": "1",
+        "Authorization": "Bearer abc",
+        "Content-Type": "application/json",
+    }
+
+    normalized = normalize_upstream_request_headers(incoming)
+
+    assert "Host" not in normalized
+    assert "Content-Length" not in normalized
+    assert "Connection" not in normalized
+    assert "Keep-Alive" not in normalized
+    assert "Transfer-Encoding" not in normalized
+    assert "TE" not in normalized
+    assert "Trailer" not in normalized
+    assert "Expect" not in normalized
+    assert "Proxy-Connection" not in normalized
+    assert "X-Drop-Me" not in normalized
+
+    assert normalized.get("Authorization") == "Bearer abc"
+    assert normalized.get("Content-Type") == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {
+        "Connection": "keep-alive, x-drop-me",
+        "Transfer-Encoding": "chunked",
+        "X-Drop-Me": "1",
+        "Content-Type": "application/json",
+        "X-Custom": "ok",
+    }
+
+    provider_cfg = {
+        "name": "opencode-deepseek-free",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash-free",
+    }
+
+    observed_headers = None
+
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+        nonlocal observed_headers
+        observed_headers = headers
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert observed_headers is not None
+    assert "Connection" not in observed_headers
+    assert "Transfer-Encoding" not in observed_headers
+    assert "X-Drop-Me" not in observed_headers
+    assert observed_headers.get("Content-Type") == "application/json"
+    assert observed_headers.get("X-Custom") == "ok"
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import httpx
 from fastapi import HTTPException, Request
@@ -95,6 +95,60 @@ def log_response_chunk(chunk: bytes) -> None:
         srv.logger.info(f"STREAM CHUNK | {chunk_str}")
     except Exception:
         pass
+
+
+# ===================================================================
+# Upstream request header normalization
+# ===================================================================
+
+_HOP_BY_HOP_REQUEST_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "expect",
+    "proxy-connection",
+}
+
+
+def normalize_upstream_request_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    """Normalize inbound headers before proxying to upstream/local backends.
+
+    Removes hop-by-hop transport headers that can produce malformed upstream
+    requests (especially when forwarding from one HTTP connection to another).
+    Also strips headers referenced by the Connection header token list.
+    """
+    if not headers:
+        return {}
+
+    connection_tokens: set[str] = set()
+    for k, v in headers.items():
+        if str(k).lower() == "connection":
+            try:
+                connection_tokens.update(
+                    token.strip().lower()
+                    for token in str(v).split(",")
+                    if token and token.strip()
+                )
+            except Exception:
+                pass
+
+    out: Dict[str, str] = {}
+    for k, v in headers.items():
+        lk = str(k).lower()
+        if lk in ("host", "content-length"):
+            continue
+        if lk in _HOP_BY_HOP_REQUEST_HEADERS:
+            continue
+        if lk in connection_tokens:
+            continue
+        out[str(k)] = str(v)
+
+    return out
 
 
 # ===================================================================

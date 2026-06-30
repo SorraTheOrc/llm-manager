@@ -25,6 +25,7 @@ from .router_helpers import (
     log_response_chunk,
     _schedule_recv_token_increment,
     _normalize_outgoing_headers,
+    normalize_upstream_request_headers,
 )
 
 # Import utils functions used by this module
@@ -54,11 +55,8 @@ async def proxy_to_remote(
     if not api_key:
         api_key = model_config.get("api_key")
 
-    # Forward headers
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
+    # Forward headers (strip hop-by-hop transport headers)
+    headers = normalize_upstream_request_headers(request.headers)
 
     # Add API key
     if api_key:

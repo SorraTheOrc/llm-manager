@@ -78,6 +78,7 @@ from .router_helpers import (  # noqa: E402
     _schedule_token_increment,
     _call_with_backend_retries,
     _call_with_empty_retry,
+    normalize_upstream_request_headers,
     log_request,
     log_response,
     log_response_chunk,
@@ -322,12 +323,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
     await _schedule_token_increment(key, tokens_sent)
 
-    # Forward headers
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
+    # Forward headers (strip hop-by-hop transport headers)
+    headers = normalize_upstream_request_headers(request.headers)
 
     from proxy.session import _resolve_log_path  # noqa: E402
     llama_log_path = _resolve_log_path("llama")
