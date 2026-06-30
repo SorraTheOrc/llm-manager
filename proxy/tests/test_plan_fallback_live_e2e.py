@@ -243,16 +243,47 @@ def _build_summary_payload() -> Dict[str, Any]:
     return summary_payload
 
 
+def _render_summary_text(payload: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append(f"Base URL: {payload.get('base_url', BASE_URL)}")
+    lines.append(f"Total requests: {payload.get('total_requests', 0)}")
+
+    sessions = payload.get("sessions", {}) if isinstance(payload, dict) else {}
+    if not sessions:
+        lines.append("No sessions recorded.")
+        return "\n".join(lines)
+
+    for session_id, entries in sessions.items():
+        entries_list = entries if isinstance(entries, list) else []
+        lines.append("")
+        lines.append(f"Session: {session_id} ({len(entries_list)} request(s))")
+        for item in entries_list:
+            seq = item.get("sequence", "?") if isinstance(item, dict) else "?"
+            status = item.get("status_code", "?") if isinstance(item, dict) else "?"
+            duration = item.get("duration_seconds", "?") if isinstance(item, dict) else "?"
+            provider = item.get("provider", "") if isinstance(item, dict) else ""
+            model = item.get("model_responding", "") if isinstance(item, dict) else ""
+            request_sent = item.get("request_sent", "") if isinstance(item, dict) else ""
+            response_received = item.get("response_received", "") if isinstance(item, dict) else ""
+
+            lines.append(
+                f"  [{seq}] status={status} duration={duration}s provider={provider or 'n/a'} model={model or 'n/a'}"
+            )
+            lines.append(f"      Request: {request_sent}")
+            lines.append(f"      Response: {response_received}")
+
+    return "\n".join(lines)
+
+
 def _print_end_summary() -> None:
     global _LATEST_SUMMARY_PAYLOAD
 
-    if not _REQUEST_TRACES:
-        _LATEST_SUMMARY_PAYLOAD = _build_summary_payload()
-        _log("END-OF-TEST SUMMARY: no captured request traces")
-        return
-
     _LATEST_SUMMARY_PAYLOAD = _build_summary_payload()
-    _log("END-OF-TEST SUMMARY (grouped by session)", payload=_LATEST_SUMMARY_PAYLOAD)
+    summary_text = _render_summary_text(_LATEST_SUMMARY_PAYLOAD)
+
+    LOGGER.info("END-OF-TEST SUMMARY (grouped by session)\n%s", summary_text)
+    print("[plan-live-e2e] END-OF-TEST SUMMARY (grouped by session)")
+    print(summary_text)
 
 
 @pytest.fixture(scope="module", autouse=True)
