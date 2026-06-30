@@ -1427,6 +1427,66 @@ async def test_router_loading_status_but_router_load_model_already_loaded_prefer
 
 
 @pytest.mark.asyncio
+async def test_local_400_falls_back_without_local_cooldown(mixed_model_config):
+    """A local 4xx should allow same-request fallback but must not put the
+    local provider in cooldown for future requests.
+    """
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    local_call_count = 0
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_call_count
+        local_call_count += 1
+        call_log.append(("local", local_call_count))
+        if local_call_count == 1:
+            return Response(
+                content=json.dumps({"error": {"message": "invalid_request"}}),
+                status_code=400,
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+    ):
+        first = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+        assert first.status_code == 200
+        assert first.headers.get("X-Provider") == "remote-fallback"
+        assert "local-llama" not in provider._provider_unavailable_until
+
+        second = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert second.status_code == 200
+    assert second.headers.get("X-Provider") == "local-llama"
+    assert call_log == [
+        ("local", 1),
+        ("remote", "remote-fallback"),
+        ("local", 2),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_local_http_exception_triggers_fallback(mixed_model_config):
     """HTTPException (e.g., 503 backend busy) from a local provider should
     trigger fallback to the next provider."""

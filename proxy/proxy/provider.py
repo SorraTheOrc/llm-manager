@@ -744,7 +744,7 @@ async def proxy_with_fallback(
                 })
                 continue
 
-            # Check for HTTP error status (remote provider)
+            # Check for HTTP error status
             if _is_http_error_status(response.status_code):
                 if _is_model_loading_response(response, body_text):
                     fallback_reason = "model_loading"
@@ -753,6 +753,23 @@ async def proxy_with_fallback(
                         "provider": provider_name,
                         "type": provider_type,
                         "status": "model_loading",
+                        "status_code": int(response.status_code),
+                        "body_snippet": (body_text[:512] if body_text else None),
+                    })
+                    all_slot_exhaustion = False
+                    continue
+
+                # Local 4xx responses are typically request-shape incompatibilities
+                # (e.g. optional OpenAI fields unsupported by llama-server), not
+                # provider health failures. Allow same-request fallback, but do not
+                # poison local provider cooldown across subsequent requests.
+                if provider_type == "local" and 400 <= int(response.status_code) < 500:
+                    fallback_reason = f"HTTP {response.status_code}"
+                    prev_provider = provider_name
+                    attempts.append({
+                        "provider": provider_name,
+                        "type": provider_type,
+                        "status": "http_error_no_cooldown",
                         "status_code": int(response.status_code),
                         "body_snippet": (body_text[:512] if body_text else None),
                     })
