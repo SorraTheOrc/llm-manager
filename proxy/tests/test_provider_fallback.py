@@ -606,6 +606,54 @@ async def test_local_fallback_to_remote_on_connection_error(mixed_model_config):
 
 
 @pytest.mark.asyncio
+async def test_local_streaming_response_returned_as_success_no_remote_fallback(mixed_model_config):
+    """A 2xx StreamingResponse from local must be returned as success, not
+    treated as an empty response that triggers remote fallback.
+
+    Regression for pi CLI requests with stream=true: proxy_with_fallback used
+    to read the (empty) body of the StreamingResponse and fall back to remote.
+    """
+    from starlette.responses import StreamingResponse as _StreamingResponse
+
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    local_called = 0
+    remote_called = False
+
+    async def _gen():
+        yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_called
+        local_called += 1
+        return _StreamingResponse(content=_gen(), status_code=200, media_type="text/event-stream")
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert local_called == 1
+    assert not remote_called, "StreamingResponse should not trigger remote fallback"
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+
+
+@pytest.mark.asyncio
 async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
     """Slot exhaustion (all slots busy) should trigger fallback to remote."""
     request = _DummyRequest()
@@ -652,6 +700,224 @@ async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
         ("local", "local-llama"),
         ("remote", "remote-fallback"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_slot_exhaustion_retry_prefers_local_before_remote(mixed_model_config):
+    """Mimic Pi startup race: first local call reports slot exhaustion,
+    then local succeeds shortly after. With local slot retry enabled,
+    fallback should stay local and avoid remote.
+    """
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        from fastapi.responses import JSONResponse
+        if local_calls == 1:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "server_busy",
+                        "code": "no_slots_available",
+                        "message": "Model server busy: 0/1 slots available. Please retry later.",
+                    },
+                    "status": 503,
+                    "retry_after": 5,
+                    "total_slots": 1,
+                    "available_slots": 0,
+                },
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_calls == 2
+    assert not remote_called
+    assert "local-llama" not in provider._provider_unavailable_until
+
+
+@pytest.mark.asyncio
+async def test_local_503_retry_prefers_local_before_remote(mixed_model_config):
+    """Transient local 503 should be retried locally before remote fallback."""
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        if local_calls == 1:
+            return Response(
+                content=json.dumps({"error": {"message": "backend busy"}}),
+                status_code=503,
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_calls == 2
+    assert not remote_called
+
+
+@pytest.mark.asyncio
+async def test_local_http_exception_503_retry_prefers_local_before_remote(mixed_model_config):
+    """Transient local HTTPException(503) should be retried locally before remote."""
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        if local_calls == 1:
+            raise HTTPException(status_code=503, detail="Backend busy")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_calls == 2
+    assert not remote_called
+
+
+@pytest.mark.asyncio
+async def test_local_empty_200_retry_prefers_local_before_remote(mixed_model_config):
+    """Transient local empty 200 should be retried locally before remote fallback."""
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        if local_calls == 1:
+            return Response(content=b"", status_code=200, media_type="application/json")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_calls == 2
+    assert not remote_called
 
 
 @pytest.mark.asyncio

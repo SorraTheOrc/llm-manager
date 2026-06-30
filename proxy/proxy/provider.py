@@ -9,6 +9,7 @@ Provides:
 - Cooldown tracking: Mark providers as temporarily unavailable after failures
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -17,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import HTTPException, Response
+from fastapi.responses import StreamingResponse
 
 from proxy.utils import _is_empty_response
 
@@ -220,6 +222,56 @@ def _get_cooldown_seconds(config: dict) -> float:
     if val is None:
         val = config.get("server", {}).get("provider_cooldown_seconds", 60)
     return float(val)
+
+
+def _get_local_slot_retry_attempts(config: dict) -> int:
+    """Read local slot-exhaustion retry attempts from config.
+
+    Supports flat key (tests) and nested server key (runtime).
+    """
+    val = config.get("local_slot_exhaustion_retry_attempts")
+    if val is None:
+        val = config.get("server", {}).get("local_slot_exhaustion_retry_attempts", 0)
+    try:
+        return max(0, int(val or 0))
+    except Exception:
+        return 0
+
+
+def _get_local_slot_retry_delay_seconds(config: dict) -> float:
+    """Read local slot-exhaustion retry delay (seconds) from config."""
+    val = config.get("local_slot_exhaustion_retry_delay_seconds")
+    if val is None:
+        val = config.get("server", {}).get("local_slot_exhaustion_retry_delay_seconds", 0.2)
+    try:
+        return max(0.0, float(val or 0.0))
+    except Exception:
+        return 0.2
+
+
+def _is_streaming_response(response: Response) -> bool:
+    """Return True when response is a StreamingResponse (body is a generator).
+
+    Such responses cannot be inspected for emptiness and should be treated as
+    success when their status is 2xx.
+    """
+    return isinstance(response, StreamingResponse)
+
+
+def _response_body_text(response: Response) -> str:
+    """Best-effort extraction of text body for diagnostics/classification."""
+    try:
+        if hasattr(response, 'content'):
+            b = response.content
+        elif hasattr(response, 'body'):
+            b = response.body
+        else:
+            b = None
+        if b:
+            return b.decode('utf-8', errors='replace') if isinstance(b, (bytes, bytearray)) else str(b)
+    except Exception:
+        return ""
+    return ""
 
 
 def _add_provider_header(response: Response, provider_name: str) -> Response:
@@ -483,19 +535,25 @@ async def proxy_with_remote_fallback(
             any_provider_tried = True
             response = await ptr(request, path, provider_cfg)
 
+            # A 2xx StreamingResponse cannot be inspected for emptiness (its
+            # body is an async generator). Treat it as success and return it.
+            if _is_streaming_response(response) and int(getattr(response, "status_code", 0) or 0) < 400:
+                attempts.append({
+                    "provider": provider_name,
+                    "type": provider_type,
+                    "status": "streaming_success",
+                    "status_code": int(getattr(response, "status_code", 0) or 0),
+                })
+                result = _add_provider_header(response, provider_name)
+                if prev_provider:
+                    logger.info(
+                        "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                        path, prev_provider, provider_name, fallback_reason or "streaming",
+                    )
+                return result
+
             # Safely extract a small body snippet for diagnostics
-            body_text = ""
-            try:
-                if hasattr(response, 'content'):
-                    b = response.content
-                elif hasattr(response, 'body'):
-                    b = response.body
-                else:
-                    b = None
-                if b:
-                    body_text = b.decode('utf-8', errors='replace') if isinstance(b, (bytes, bytearray)) else str(b)
-            except Exception:
-                body_text = ""
+            body_text = _response_body_text(response)
 
             # Check for HTTP error status
             if _is_http_error_status(response.status_code):
@@ -669,6 +727,8 @@ async def proxy_with_fallback(
         response if all providers are exhausted.
     """
     cooldown_seconds = _get_cooldown_seconds(config)
+    local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
+    local_slot_retry_delay_seconds = _get_local_slot_retry_delay_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
     prev_provider: Optional[str] = None
@@ -709,40 +769,95 @@ async def proxy_with_fallback(
             else:
                 response = await ptr_remote(request, path, provider_cfg)
 
+            # A 2xx StreamingResponse cannot be inspected for emptiness (its
+            # body is an async generator). Treat it as success and return it.
+            if _is_streaming_response(response) and int(getattr(response, "status_code", 0) or 0) < 400:
+                attempts.append({
+                    "provider": provider_name,
+                    "type": provider_type,
+                    "status": "streaming_success",
+                    "status_code": int(getattr(response, "status_code", 0) or 0),
+                })
+                result = _add_provider_header(response, provider_name)
+                if prev_provider:
+                    logger.info(
+                        "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                        path, prev_provider, provider_name, fallback_reason or "streaming",
+                    )
+                return result
+
             # Capture the first non-success response so we can return it when
             # all providers are exhausted (instead of the generic exhausted message).
             if _first_error_response is None and response.status_code >= 400:
                 _first_error_response = response
 
             # Extract small response snippet for diagnostics
-            body_text = ""
-            try:
-                if hasattr(response, 'content'):
-                    b = response.content
-                elif hasattr(response, 'body'):
-                    b = response.body
-                else:
-                    b = None
-                if b:
-                    body_text = b.decode('utf-8', errors='replace') if isinstance(b, (bytes, bytearray)) else str(b)
-            except Exception:
-                body_text = ""
+            body_text = _response_body_text(response)
 
             # Check for slot exhaustion (local model)
             slot_info = _parse_slot_exhaustion(response)
             if slot_info:
-                mark_provider_unavailable(provider_name, cooldown_seconds)
-                fallback_reason = "slot_exhaustion"
-                prev_provider = provider_name
-                total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
-                available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "slot_exhaustion",
-                    "slot_info": slot_info,
-                })
-                continue
+                # Optional local retry window for startup races where router/model
+                # is loaded but slot probes briefly report 0 available.
+                if provider_type == "local" and local_slot_retry_attempts > 0:
+                    resolved_after_retry = False
+                    for retry_idx in range(1, local_slot_retry_attempts + 1):
+                        if local_slot_retry_delay_seconds > 0:
+                            await asyncio.sleep(local_slot_retry_delay_seconds)
+
+                        retry_response = await ptr_local(request, path)
+                        retry_body_text = _response_body_text(retry_response)
+                        retry_slot_info = _parse_slot_exhaustion(retry_response)
+
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "slot_exhaustion_retry",
+                            "retry_attempt": retry_idx,
+                            "status_code": int(getattr(retry_response, "status_code", 0) or 0),
+                            "slot_info": retry_slot_info,
+                            "body_snippet": (retry_body_text[:512] if retry_body_text else None),
+                        })
+
+                        if retry_slot_info:
+                            slot_info = retry_slot_info
+                            continue
+
+                        response = retry_response
+                        body_text = retry_body_text
+                        slot_info = None
+                        resolved_after_retry = True
+                        break
+
+                    if resolved_after_retry and slot_info is None:
+                        # Continue evaluating updated response below.
+                        pass
+                    else:
+                        mark_provider_unavailable(provider_name, cooldown_seconds)
+                        fallback_reason = "slot_exhaustion"
+                        prev_provider = provider_name
+                        total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
+                        available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "slot_exhaustion",
+                            "slot_info": slot_info,
+                        })
+                        continue
+                else:
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    fallback_reason = "slot_exhaustion"
+                    prev_provider = provider_name
+                    total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
+                    available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
+                    attempts.append({
+                        "provider": provider_name,
+                        "type": provider_type,
+                        "status": "slot_exhaustion",
+                        "slot_info": slot_info,
+                    })
+                    continue
 
             # Check for HTTP error status
             if _is_http_error_status(response.status_code):
@@ -759,38 +874,76 @@ async def proxy_with_fallback(
                     all_slot_exhaustion = False
                     continue
 
-                # Local 4xx responses are typically request-shape incompatibilities
-                # (e.g. optional OpenAI fields unsupported by llama-server), not
-                # provider health failures. Allow same-request fallback, but do not
-                # poison local provider cooldown across subsequent requests.
-                if provider_type == "local" and 400 <= int(response.status_code) < 500:
+                # Local 5xx can be transient right after startup (slot routing,
+                # backend warm-up). Retry local a few times before falling back.
+                if provider_type == "local" and int(response.status_code) >= 500 and local_slot_retry_attempts > 0:
+                    for retry_idx in range(1, local_slot_retry_attempts + 1):
+                        if local_slot_retry_delay_seconds > 0:
+                            await asyncio.sleep(local_slot_retry_delay_seconds)
+
+                        retry_response = await ptr_local(request, path)
+                        retry_body_text = _response_body_text(retry_response)
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "local_http_retry",
+                            "retry_attempt": retry_idx,
+                            "status_code": int(getattr(retry_response, "status_code", 0) or 0),
+                            "body_snippet": (retry_body_text[:512] if retry_body_text else None),
+                        })
+
+                        response = retry_response
+                        body_text = retry_body_text
+                        if not _is_http_error_status(response.status_code):
+                            break
+
+                    if _is_model_loading_response(response, body_text):
+                        fallback_reason = "model_loading"
+                        prev_provider = provider_name
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "model_loading",
+                            "status_code": int(response.status_code),
+                            "body_snippet": (body_text[:512] if body_text else None),
+                        })
+                        all_slot_exhaustion = False
+                        continue
+
+                if _is_http_error_status(response.status_code):
+                    # Local 4xx responses are typically request-shape
+                    # incompatibilities (e.g. optional OpenAI fields unsupported
+                    # by llama-server), not provider health failures. Allow
+                    # same-request fallback, but do not poison local provider
+                    # cooldown across subsequent requests.
+                    if provider_type == "local" and 400 <= int(response.status_code) < 500:
+                        fallback_reason = f"HTTP {response.status_code}"
+                        prev_provider = provider_name
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "http_error_no_cooldown",
+                            "status_code": int(response.status_code),
+                            "body_snippet": (body_text[:512] if body_text else None),
+                        })
+                        all_slot_exhaustion = False
+                        continue
+
+                    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+                    mark_provider_unavailable(provider_name, effective_cooldown)
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
                     attempts.append({
                         "provider": provider_name,
                         "type": provider_type,
-                        "status": "http_error_no_cooldown",
+                        "status": "http_error",
                         "status_code": int(response.status_code),
                         "body_snippet": (body_text[:512] if body_text else None),
+                        "cooldown_seconds": effective_cooldown,
                     })
-                    all_slot_exhaustion = False
+                    if response.status_code != 429:
+                        all_slot_exhaustion = False
                     continue
-
-                effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                mark_provider_unavailable(provider_name, effective_cooldown)
-                fallback_reason = f"HTTP {response.status_code}"
-                prev_provider = provider_name
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "http_error",
-                    "status_code": int(response.status_code),
-                    "body_snippet": (body_text[:512] if body_text else None),
-                    "cooldown_seconds": effective_cooldown,
-                })
-                if response.status_code != 429:
-                    all_slot_exhaustion = False
-                continue
 
             # Treat empty successful responses as failures to allow fallback
             try:
@@ -822,20 +975,78 @@ async def proxy_with_fallback(
                             )
                         return result
 
-                    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                    mark_provider_unavailable(provider_name, effective_cooldown)
-                    fallback_reason = "empty_response"
-                    prev_provider = provider_name
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "empty_response",
-                        "status_code": int(getattr(response, 'status_code', 0) or 0),
-                        "body_snippet": (body_text[:512] if body_text else None),
-                        "cooldown_seconds": effective_cooldown,
-                    })
-                    all_slot_exhaustion = False
-                    continue
+                    # Local empty 200 can be transient (slot busy/cancelled
+                    # right after a previous request). Retry locally before
+                    # falling back to remote providers.
+                    if provider_type == "local" and local_slot_retry_attempts > 0:
+                        resolved_after_empty_retry = False
+                        for retry_idx in range(1, local_slot_retry_attempts + 1):
+                            if local_slot_retry_delay_seconds > 0:
+                                await asyncio.sleep(local_slot_retry_delay_seconds)
+                            retry_response = await ptr_local(request, path)
+                            retry_body_text = _response_body_text(retry_response)
+                            attempts.append({
+                                "provider": provider_name,
+                                "type": provider_type,
+                                "status": "local_empty_retry",
+                                "retry_attempt": retry_idx,
+                                "status_code": int(getattr(retry_response, "status_code", 0) or 0),
+                                "body_snippet": (retry_body_text[:512] if retry_body_text else None),
+                            })
+                            try:
+                                retry_resp_json = json.loads(retry_body_text) if retry_body_text else None
+                            except Exception:
+                                retry_resp_json = None
+                            if not _is_empty_response(retry_body_text or "", retry_resp_json):
+                                response = retry_response
+                                body_text = retry_body_text
+                                resolved_after_empty_retry = True
+                                break
+
+                        if resolved_after_empty_retry:
+                            body_l2 = (body_text or "").lower()
+                            if "reasoning_content" in body_l2:
+                                attempts.append({
+                                    "provider": provider_name,
+                                    "type": provider_type,
+                                    "status": "promoted_reasoning",
+                                    "status_code": int(getattr(response, 'status_code', 0) or 0),
+                                    "body_snippet": (body_text[:512] if body_text else None),
+                                })
+                                result = _add_provider_header(response, provider_name)
+                                return result
+                            # Fall through to success path below.
+                            pass
+                        else:
+                            effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+                            mark_provider_unavailable(provider_name, effective_cooldown)
+                            fallback_reason = "empty_response"
+                            prev_provider = provider_name
+                            attempts.append({
+                                "provider": provider_name,
+                                "type": provider_type,
+                                "status": "empty_response",
+                                "status_code": int(getattr(response, 'status_code', 0) or 0),
+                                "body_snippet": (body_text[:512] if body_text else None),
+                                "cooldown_seconds": effective_cooldown,
+                            })
+                            all_slot_exhaustion = False
+                            continue
+                    else:
+                        effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+                        mark_provider_unavailable(provider_name, effective_cooldown)
+                        fallback_reason = "empty_response"
+                        prev_provider = provider_name
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "empty_response",
+                            "status_code": int(getattr(response, 'status_code', 0) or 0),
+                            "body_snippet": (body_text[:512] if body_text else None),
+                            "cooldown_seconds": effective_cooldown,
+                        })
+                        all_slot_exhaustion = False
+                        continue
             except Exception:
                 pass
 
@@ -879,6 +1090,59 @@ async def proxy_with_fallback(
             # client errors that should propagate.
             if isinstance(exc, HTTPException) and exc.status_code >= 500:
                 any_provider_tried = True
+
+                # Local 5xx HTTPException can be transient (slot warm-up,
+                # brief concurrency spike right after restart). Retry local a
+                # few times before falling back to remote providers.
+                if provider_type == "local" and local_slot_retry_attempts > 0:
+                    retry_exc: Optional[Exception] = exc
+                    resolved_response: Optional[Response] = None
+                    for retry_idx in range(1, local_slot_retry_attempts + 1):
+                        if local_slot_retry_delay_seconds > 0:
+                            await asyncio.sleep(local_slot_retry_delay_seconds)
+                        try:
+                            retry_response = await ptr_local(request, path)
+                        except Exception as inner_exc:
+                            retry_exc = inner_exc
+                            attempts.append({
+                                "provider": provider_name,
+                                "type": provider_type,
+                                "status": "local_http_exception_retry",
+                                "retry_attempt": retry_idx,
+                                "error": str(type(inner_exc).__name__),
+                            })
+                            continue
+                        retry_exc = None
+                        resolved_response = retry_response
+                        attempts.append({
+                            "provider": provider_name,
+                            "type": provider_type,
+                            "status": "local_http_exception_retry",
+                            "retry_attempt": retry_idx,
+                            "status_code": int(getattr(retry_response, "status_code", 0) or 0),
+                        })
+                        break
+
+                    if retry_exc is None and resolved_response is not None:
+                        # Local retry succeeded; re-enter success-path checks by
+                        # re-processing the resolved response.
+                        response = resolved_response
+                        body_text = _response_body_text(response)
+                        slot_info = _parse_slot_exhaustion(response)
+                        if slot_info is None and not _is_http_error_status(response.status_code):
+                            # Success — record and return below via normal path.
+                            attempts.append({
+                                "provider": provider_name,
+                                "type": provider_type,
+                                "status": "success_after_http_exception_retry",
+                                "status_code": int(getattr(response, "status_code", 0) or 0),
+                            })
+                            result = _add_provider_header(response, provider_name)
+                            return result
+                        # Retry produced a response but still slot-exhaustion/error;
+                        # fall through to normal handling by continuing the loop.
+                        continue
+
                 if _first_error_response is None:
                     # Capture the first HTTPException as an error response so
                     # the actual error (e.g. concurrency limit, slot queue) is

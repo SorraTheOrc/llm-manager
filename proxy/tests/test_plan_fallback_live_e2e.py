@@ -17,6 +17,8 @@ import gzip
 import json
 import logging
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -437,9 +439,11 @@ def _chat(
     max_tokens: int = 160,
     temperature: float = 0.0,
     timeout: float = DEFAULT_TIMEOUT,
+    payload_override: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[Response, Dict[str, Any], float]:
     url = f"{BASE_URL}/v1/chat/completions"
-    payload = {
+    payload = payload_override or {
         "model": "plan",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
@@ -454,6 +458,8 @@ def _chat(
     }
     if session_id:
         headers["X-Session-Id"] = session_id
+    if extra_headers:
+        headers.update(extra_headers)
 
     _log(
         "Sending chat request",
@@ -771,3 +777,164 @@ def test_phase_4_new_session_plus_remote_followup_validate_both() -> None:
             "all_phases_passed": True,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5
+# ---------------------------------------------------------------------------
+
+def test_phase_5_pi_like_payload_no_session_succeeds() -> None:
+    """Phase 5: Mimic a Pi-style request shape (system + tools, no session)."""
+    _require_local_proxy()
+
+    pi_like_system_prompt = (
+        "You are an expert coding assistant operating inside pi, a coding agent harness. "
+        "You help users by reading files, executing commands, editing code, and writing new files."
+    )
+    prompt = "say hi 23 languages"
+
+    payload = {
+        "model": "plan",
+        "messages": [
+            {"role": "system", "content": pi_like_system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Execute shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+        ],
+        "stream": False,
+        "max_tokens": 220,
+        "temperature": 0.0,
+    }
+
+    response, body, _ = _chat(
+        prompt=prompt,
+        session_id=None,
+        payload_override=payload,
+        timeout=max(120.0, DEFAULT_TIMEOUT),
+    )
+
+    _assert_ok_with_content(response, body, phase="phase_5")
+
+    raw_body = ""
+    if isinstance(body, dict):
+        raw_body = str(body.get("_raw") or "")
+    assert "cloudflare" not in raw_body.lower(), (
+        f"phase_5: unexpected Cloudflare 400 body: {raw_body}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6
+# ---------------------------------------------------------------------------
+
+def test_phase_6_pi_cli_subprocess_request_succeeds() -> None:
+    """Phase 6: Use the real `pi` CLI subprocess with model=plan and verify success."""
+    _require_local_proxy()
+
+    pi_bin = shutil.which("pi")
+    if not pi_bin:
+        pytest.skip("pi CLI not found in PATH")
+
+    prompt = "say hi 23 languages"
+    cmd = [
+        pi_bin,
+        "--provider",
+        "Local Proxy",
+        "--model",
+        "plan",
+        "--thinking",
+        "off",
+        "--no-session",
+        # Disable extension/skill/theme/context loading to keep this test
+        # focused on the proxy request path itself.
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--offline",
+        "-p",
+        prompt,
+    ]
+
+    _log("Running pi CLI subprocess", payload={"cmd": cmd})
+
+    started = time.monotonic()
+    proc = subprocess.run(
+        cmd,
+        cwd="/home/rgardler/projects/llm",
+        capture_output=True,
+        text=True,
+        timeout=max(120.0, DEFAULT_TIMEOUT),
+    )
+    elapsed = time.monotonic() - started
+
+    combined_output = f"{proc.stdout}\n{proc.stderr}".strip()
+    _log(
+        "pi CLI subprocess completed",
+        payload={
+            "returncode": proc.returncode,
+            "elapsed_seconds": round(elapsed, 3),
+            "stdout": _clip_text(proc.stdout, 500),
+            "stderr": _clip_text(proc.stderr, 500),
+        },
+    )
+
+    _REQUEST_TRACES.append(
+        {
+            "session_id": "pi-cli-subprocess",
+            "requested_session_id": None,
+            "response_session_id": None,
+            "status_code": 200 if proc.returncode == 0 else 500,
+            "duration_seconds": round(float(elapsed), 3),
+            "provider": "Local Proxy",
+            "model": "plan",
+            "request_sent": _clip_text(prompt, 500),
+            "response_received": _clip_text(combined_output, 500),
+        }
+    )
+
+    assert proc.returncode == 0, (
+        "phase_6: pi CLI returned non-zero exit code\n"
+        f"stdout:\n{proc.stdout}\n\n"
+        f"stderr:\n{proc.stderr}"
+    )
+
+    lowered = combined_output.lower()
+    assert "400 bad request" not in lowered, (
+        "phase_6: pi CLI output contained 400 Bad Request\n"
+        f"output:\n{combined_output}"
+    )
+    assert "cloudflare" not in lowered, (
+        "phase_6: pi CLI output contained Cloudflare error\n"
+        f"output:\n{combined_output}"
+    )
+    assert proc.stdout.strip(), "phase_6: expected non-empty pi CLI stdout"
