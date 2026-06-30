@@ -377,6 +377,59 @@ def _is_slot_exhaustion_response(response) -> bool:
     return _parse_slot_exhaustion(response) is not None
 
 
+def _resolve_provider_with_exclusions(
+    model_config: dict,
+    excluded_provider_names: set[str],
+) -> Optional[dict]:
+    """Resolve next available provider while excluding names tried this request."""
+    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    if not providers:
+        return None
+
+    for provider_cfg in providers:
+        name = provider_cfg.get("name", "")
+        if name in excluded_provider_names:
+            continue
+        if _is_provider_unavailable(name):
+            continue
+        return provider_cfg
+    return None
+
+
+def _is_model_loading_response(response: Response, body_text: str) -> bool:
+    """Return True when a 503 response represents transient model loading."""
+    if int(getattr(response, "status_code", 0) or 0) != 503:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code", "")).strip().lower()
+            err_type = str(error.get("type", "")).strip().lower()
+            message = str(error.get("message", "")).strip().lower()
+            if code == "model_loading" or err_type == "model_loading":
+                return True
+            if "model" in message and "loading" in message:
+                return True
+        elif isinstance(error, str):
+            lowered = error.strip().lower()
+            if "model_loading" in lowered or ("model" in lowered and "loading" in lowered):
+                return True
+
+    lowered_body = (body_text or "").strip().lower()
+    if "model_loading" in lowered_body:
+        return True
+    if "model" in lowered_body and "loading" in lowered_body:
+        return True
+
+    return False
+
+
 async def proxy_with_remote_fallback(
     request,
     path: str,
@@ -411,13 +464,19 @@ async def proxy_with_remote_fallback(
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
     unavailable: Dict[str, int] = {}
+    attempted_provider_names: set[str] = set()
+
+    # Preserve first model-loading response so single-provider models
+    # do not collapse into generic "All providers exhausted".
+    first_model_loading_response: Optional[Response] = None
 
     while True:
-        provider_cfg = resolve_provider(model_config)
+        provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
         if provider_cfg is None:
             break
 
         provider_name = provider_cfg.get("name", "unknown")
+        attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
         try:
             # Mark that we attempted this provider
@@ -440,6 +499,21 @@ async def proxy_with_remote_fallback(
 
             # Check for HTTP error status
             if _is_http_error_status(response.status_code):
+                if _is_model_loading_response(response, body_text):
+                    fallback_reason = "model_loading"
+                    prev_provider = provider_name
+                    if first_model_loading_response is None:
+                        first_model_loading_response = response
+                    attempts.append({
+                        "provider": provider_name,
+                        "type": provider_type,
+                        "status": "model_loading",
+                        "status_code": int(response.status_code),
+                        "body_snippet": (body_text[:512] if body_text else None),
+                    })
+                    all_slot_exhaustion = False
+                    continue
+
                 effective_cooldown = _compute_cooldown(cooldown_seconds, response)
                 mark_provider_unavailable(provider_name, effective_cooldown)
                 fallback_reason = f"HTTP {response.status_code}"
@@ -559,6 +633,14 @@ async def proxy_with_remote_fallback(
     if not any_provider_tried:
         # No providers were available at all (all in cooldown or none defined)
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+
+    if first_model_loading_response is not None:
+        logger.info(
+            "Returning model_loading response instead of generic exhausted message for model=%s",
+            path,
+        )
+        return first_model_loading_response
+
     return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
 
 
@@ -608,13 +690,15 @@ async def proxy_with_fallback(
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
     unavailable: Dict[str, int] = {}
+    attempted_provider_names: set[str] = set()
 
     while True:
-        provider_cfg = resolve_provider(model_config)
+        provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
         if provider_cfg is None:
             break
 
         provider_name = provider_cfg.get("name", "unknown")
+        attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
 
         try:
@@ -662,6 +746,19 @@ async def proxy_with_fallback(
 
             # Check for HTTP error status (remote provider)
             if _is_http_error_status(response.status_code):
+                if _is_model_loading_response(response, body_text):
+                    fallback_reason = "model_loading"
+                    prev_provider = provider_name
+                    attempts.append({
+                        "provider": provider_name,
+                        "type": provider_type,
+                        "status": "model_loading",
+                        "status_code": int(response.status_code),
+                        "body_snippet": (body_text[:512] if body_text else None),
+                    })
+                    all_slot_exhaustion = False
+                    continue
+
                 effective_cooldown = _compute_cooldown(cooldown_seconds, response)
                 mark_provider_unavailable(provider_name, effective_cooldown)
                 fallback_reason = f"HTTP {response.status_code}"

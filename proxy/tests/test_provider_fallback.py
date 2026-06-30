@@ -512,6 +512,61 @@ async def test_remote_fallback_single_provider_fails(single_provider_config):
     assert "retry_after" in body
 
 
+@pytest.mark.asyncio
+async def test_remote_model_loading_503_does_not_poison_provider_cooldown(single_provider_config):
+    """A model_loading 503 should not keep a provider in cooldown across requests.
+
+    Regression: first request can return model_loading while backend spins up,
+    but retries after load should still attempt the same provider instead of
+    short-circuiting to "All providers exhausted".
+    """
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(
+                status_code=503,
+                content=json.dumps({
+                    "error": {
+                        "type": "model_loading",
+                        "code": "model_loading",
+                        "message": "Model Qwen3 is loading, retry shortly",
+                    },
+                    "status": 503,
+                    "retry_after": 30,
+                }).encode("utf-8"),
+                media_type="application/json",
+                headers={"Retry-After": "30"},
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        first = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", single_provider_config, cfg
+        )
+        assert first.status_code == 503
+        first_body = first.body.decode("utf-8")
+        assert "model_loading" in first_body or "loading" in first_body.lower()
+
+        # Crucial: transient model-loading should not poison provider health.
+        assert not provider._is_provider_unavailable("sole-provider")
+
+        second = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", single_provider_config, cfg
+        )
+
+    assert second.status_code == 200
+    assert call_count == 2
+
+
 # ===================================================================
 # Local-to-remote fallback tests
 # ===================================================================
