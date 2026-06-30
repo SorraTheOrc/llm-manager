@@ -1232,6 +1232,201 @@ async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_
 
 
 @pytest.mark.asyncio
+async def test_router_transient_not_loaded_then_loaded_prefers_local_before_remote(monkeypatch):
+    """When router briefly reports a local model as not loaded, a short grace
+    window should allow local fallback path to recover before remote fallback.
+    """
+    import proxy.server as server_module
+    from unittest.mock import MagicMock
+
+    server_module.config = {
+        "models": {
+            "test-local": {
+                "type": "local",
+                "llama_model": "test-llama",
+                "providers": [
+                    {"name": "local-instance", "type": "local", "llama_model": "test-llama"},
+                    {"name": "remote-backup", "type": "remote", "endpoint": "https://backup.test/v1", "api_key_env": "KEY"},
+                ],
+            },
+        },
+        "server": {
+            "llama_request_timeout": 300,
+            "llama_router_mode": True,
+            "model_loading_local_grace_seconds": 0.2,
+        },
+    }
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    server_module.llama_process = fake_proc
+    server_module.backend_ready = True
+    server_module.current_model = "some-other-model"
+    server_module.background_loads = {}
+    server_module.logger = MagicMock()
+    server_module.schedule_background_load = MagicMock(return_value=True)
+
+    # First fast-check says not loaded, grace-window check says loaded.
+    check_calls = {"count": 0}
+
+    async def mock_router_is_model_loaded(_model_name):
+        check_calls["count"] += 1
+        return check_calls["count"] >= 2
+
+    server_module.router_is_model_loaded = mock_router_is_model_loaded
+    server_module.get_local_model_name = lambda m: "test-llama" if m in ("test-local", "test-llama") else None
+
+    local_fallback_called = False
+    remote_fallback_called = False
+
+    async def mock_with_fallback(_req, _path, _cfg, _config):
+        nonlocal local_fallback_called
+        local_fallback_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def mock_remote_fallback(_req, _path, _cfg, _config):
+        nonlocal remote_fallback_called
+        remote_fallback_called = True
+        return Response(
+            content=json.dumps({"error": "should-not-be-used"}),
+            status_code=503,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_fallback", mock_with_fallback):
+        with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
+            with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
+                with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
+                    from proxy.ui import proxy_openai_api
+                    from fastapi import Request as FastAPIRequest
+
+                    body = json.dumps({
+                        "model": "test-local",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": False,
+                    }).encode("utf-8")
+
+                    mock_request = MagicMock(spec=FastAPIRequest)
+                    mock_request.method = "POST"
+                    mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+                    mock_request.headers = {}
+                    mock_request._body = body
+
+                    async def mock_body():
+                        return mock_request._body
+
+                    mock_request.body = mock_body
+
+                    resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert resp.status_code == 200
+    assert local_fallback_called, "Expected local fallback path to be used after grace-window recheck"
+    assert not remote_fallback_called, "Remote fallback should not be used when local model becomes available"
+
+
+@pytest.mark.asyncio
+async def test_router_loading_status_but_router_load_model_already_loaded_prefers_local(monkeypatch):
+    """If router status lags as 'loading' but router_load_model reports already
+    loaded, local path should be preferred before remote fallback.
+    """
+    import proxy.server as server_module
+    from unittest.mock import MagicMock
+
+    server_module.config = {
+        "models": {
+            "test-local": {
+                "type": "local",
+                "llama_model": "test-llama",
+                "providers": [
+                    {"name": "local-instance", "type": "local", "llama_model": "test-llama"},
+                    {"name": "remote-backup", "type": "remote", "endpoint": "https://backup.test/v1", "api_key_env": "KEY"},
+                ],
+            },
+        },
+        "server": {
+            "llama_request_timeout": 300,
+            "llama_router_mode": True,
+            "model_loading_local_grace_seconds": 0.2,
+        },
+    }
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    server_module.llama_process = fake_proc
+    server_module.backend_ready = True
+    server_module.current_model = "some-other-model"
+    server_module.background_loads = {}
+    server_module.logger = MagicMock()
+    server_module.schedule_background_load = MagicMock(return_value=True)
+
+    async def mock_router_is_model_loaded(_model_name):
+        return False
+
+    async def mock_router_load_model(_model_name):
+        # Simulate router API saying this model is already loaded.
+        return True
+
+    server_module.router_is_model_loaded = mock_router_is_model_loaded
+    server_module.router_load_model = mock_router_load_model
+    server_module.get_local_model_name = lambda m: "test-llama" if m in ("test-local", "test-llama") else None
+
+    local_fallback_called = False
+    remote_fallback_called = False
+
+    async def mock_with_fallback(_req, _path, _cfg, _config):
+        nonlocal local_fallback_called
+        local_fallback_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def mock_remote_fallback(_req, _path, _cfg, _config):
+        nonlocal remote_fallback_called
+        remote_fallback_called = True
+        return Response(
+            content=json.dumps({"error": "should-not-be-used"}),
+            status_code=503,
+            media_type="application/json",
+        )
+
+    with patch("proxy.provider.proxy_with_fallback", mock_with_fallback):
+        with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
+            with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
+                with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
+                    from proxy.ui import proxy_openai_api
+                    from fastapi import Request as FastAPIRequest
+
+                    body = json.dumps({
+                        "model": "test-local",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": False,
+                    }).encode("utf-8")
+
+                    mock_request = MagicMock(spec=FastAPIRequest)
+                    mock_request.method = "POST"
+                    mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+                    mock_request.headers = {}
+                    mock_request._body = body
+
+                    async def mock_body():
+                        return mock_request._body
+
+                    mock_request.body = mock_body
+
+                    resp = await proxy_openai_api(mock_request, "chat/completions")
+
+    assert resp.status_code == 200
+    assert local_fallback_called, "Expected local path after router_load_model confirms availability"
+    assert not remote_fallback_called, "Remote fallback should not run when local availability is confirmed"
+
+
+@pytest.mark.asyncio
 async def test_local_http_exception_triggers_fallback(mixed_model_config):
     """HTTPException (e.g., 503 backend busy) from a local provider should
     trigger fallback to the next provider."""

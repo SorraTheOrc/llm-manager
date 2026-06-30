@@ -717,6 +717,43 @@ async def proxy_openai_api(request: Request, path: str):
         scheduled = srv.schedule_background_load(target_model)
         srv.logger.info(f"Scheduled background load for request: model={target_model} scheduled={scheduled}")
 
+        # In router mode, allow a short grace window for transient model-state
+        # lag (e.g. /models briefly reports "loading" while requests are already
+        # serviceable). If the target model becomes visible during this window,
+        # serve locally before attempting remote fallback.
+        if router_mode:
+            grace_seconds = float(server_config.get("model_loading_local_grace_seconds", 0.75) or 0.75)
+            grace_seconds = max(0.0, grace_seconds)
+            if grace_seconds > 0:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + grace_seconds
+                while loop.time() < deadline:
+                    try:
+                        model_ready = await srv.router_is_model_loaded(llama_model_str)
+                        if not model_ready:
+                            # Some router builds may still report "loading" in
+                            # /models even when /models/load returns already-loaded.
+                            # Treat a successful router_load_model() call as an
+                            # availability hint for this grace-window check.
+                            try:
+                                model_ready = await srv.router_load_model(llama_model_str)
+                            except Exception:
+                                model_ready = False
+
+                        if model_ready:
+                            srv.logger.info(
+                                "Router model %s became available during grace window; serving locally",
+                                llama_model_str,
+                            )
+                            srv.current_model = llama_model_str
+                            if _has_fallback_providers(model_cfg):
+                                from proxy.provider import proxy_with_fallback
+                                return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
+                            return await srv.proxy_to_local(request, f"v1/{path}")
+                    except Exception:
+                        srv.logger.debug("Grace-window router check failed; retrying", exc_info=True)
+                    await asyncio.sleep(0.1)
+
         try:
             from proxy.session import _resolve_session_id_header, _build_slot_context
             session_id_header, _ = _resolve_session_id_header(request.headers)
