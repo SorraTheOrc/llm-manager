@@ -27,6 +27,25 @@ def _srv():
     return _m
 
 
+def _has_fallback_providers(model_cfg):
+    """Check if a model config has providers that need fallback routing.
+
+    Returns ``True`` when there are multiple providers or at least one
+    remote provider — scenarios where ``proxy_with_fallback`` is needed
+    to cascade through alternatives.  A single local provider does NOT
+    need fallback; direct ``proxy_to_local`` preserves the original
+    response (e.g., a transient 503) instead of converting it to the
+    generic "All providers exhausted" error.
+    """
+    providers = model_cfg.get("providers") or []
+    if not isinstance(providers, list):
+        return False
+    if len(providers) > 1:
+        return True
+    first = providers[0] if providers else {}
+    return isinstance(first, dict) and first.get("type") == "remote"
+
+
 async def index(request: Request):
     """Serve the index page with API documentation."""
     # Build models table rows and quick link buttons for local models
@@ -487,8 +506,7 @@ async def create_embeddings(request: Request):
 
         # If model already active and process running, proceed immediately
         if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
-            providers = model_cfg.get("providers")
-            if providers:
+            if _has_fallback_providers(model_cfg):
                 from proxy.provider import proxy_with_fallback
                 return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
             return await srv.proxy_to_local(request, "v1/embeddings")
@@ -499,8 +517,7 @@ async def create_embeddings(request: Request):
                 if await srv.router_is_model_loaded(llama_model_str):
                     srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
                     srv.current_model = llama_model_str
-                    providers = model_cfg.get("providers")
-                    if providers:
+                    if _has_fallback_providers(model_cfg):
                         from proxy.provider import proxy_with_fallback
                         return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
                     return await srv.proxy_to_local(request, "v1/embeddings")
@@ -675,8 +692,7 @@ async def proxy_openai_api(request: Request, path: str):
 
         # If model already active and process running, proceed immediately
         if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
-            providers = model_cfg.get("providers")
-            if providers:
+            if _has_fallback_providers(model_cfg):
                 from proxy.provider import proxy_with_fallback
                 return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
             return await srv.proxy_to_local(request, f"v1/{path}")
@@ -687,8 +703,7 @@ async def proxy_openai_api(request: Request, path: str):
                 if await srv.router_is_model_loaded(llama_model_str):
                     srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
                     srv.current_model = llama_model_str
-                    providers = model_cfg.get("providers")
-                    if providers:
+                    if _has_fallback_providers(model_cfg):
                         from proxy.provider import proxy_with_fallback
                         return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
                     return await srv.proxy_to_local(request, f"v1/{path}")
