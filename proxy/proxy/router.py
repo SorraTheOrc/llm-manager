@@ -785,6 +785,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Client disconnected or generator is being closed.
                             # Skip the final event yield and proceed directly to cleanup.
                             pass
+                        except Exception as exc:
+                            # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
+                            # Log and let the finally block handle cleanup so backend_ready
+                            # is not spuriously set to False (which would cooldown the
+                            # local provider and trigger fallback to remotes).
+                            srv.logger.warning(
+                                "Stream error during local response for model=%s: %s",
+                                model_name,
+                                type(exc).__name__,
+                            )
                         finally:
                             # Strict restore confirmation state comes from explicit backend signal.
                             if session_id:
