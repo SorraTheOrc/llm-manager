@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import requests
@@ -61,6 +61,9 @@ _PHASE_STATE: Dict[str, Any] = {
     "phase_3_remote_provider": None,
 }
 
+# End-of-run trace data used for final grouped summary output.
+_REQUEST_TRACES: List[Dict[str, Any]] = []
+
 
 def _log(message: str, *, payload: Optional[Dict[str, Any]] = None) -> None:
     if payload is None:
@@ -71,6 +74,12 @@ def _log(message: str, *, payload: Optional[Dict[str, Any]] = None) -> None:
     rendered = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     LOGGER.info("%s\n%s", message, rendered)
     print(f"[plan-live-e2e] {message}\n{rendered}")
+
+
+def _new_session_id(prefix: str) -> str:
+    """Create a unique session id containing a timestamp and UUID."""
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return f"{prefix}-{ts}-{uuid.uuid4()}"
 
 
 def _require_local_proxy() -> None:
@@ -144,6 +153,96 @@ def _extract_response_text(body: Dict[str, Any]) -> str:
 
 def _provider_from_response(response: Response) -> str:
     return (response.headers.get("X-Provider") or "").strip()
+
+
+def _clip_text(value: str, limit: int = 500) -> str:
+    if not isinstance(value, str):
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f" … [truncated {len(value) - limit} chars]"
+
+
+def _response_text_for_summary(body: Dict[str, Any]) -> str:
+    text = _extract_response_text(body)
+    if text.strip():
+        return text
+    try:
+        return json.dumps(body, ensure_ascii=False, default=str)
+    except Exception:
+        return str(body)
+
+
+def _record_request_trace(
+    *,
+    requested_session_id: Optional[str],
+    response: Response,
+    body: Dict[str, Any],
+    prompt: str,
+    elapsed: float,
+) -> None:
+    summary_session_id = _session_id_from_response(
+        response,
+        requested_session_id or "no-session",
+    )
+    model_name = str(body.get("model", "") or "")
+    provider_name = _provider_from_response(response)
+    response_text = _response_text_for_summary(body)
+
+    _REQUEST_TRACES.append(
+        {
+            "session_id": summary_session_id,
+            "requested_session_id": requested_session_id,
+            "response_session_id": response.headers.get("X-Session-Id"),
+            "status_code": int(response.status_code),
+            "duration_seconds": round(float(elapsed), 3),
+            "provider": provider_name,
+            "model": model_name,
+            "request_sent": _clip_text(prompt, 500),
+            "response_received": _clip_text(response_text, 500),
+        }
+    )
+
+
+def _print_end_summary() -> None:
+    if not _REQUEST_TRACES:
+        _log("END-OF-TEST SUMMARY: no captured request traces")
+        return
+
+    sessions: Dict[str, List[Dict[str, Any]]] = {}
+    for trace in _REQUEST_TRACES:
+        sid = str(trace.get("session_id") or "no-session")
+        sessions.setdefault(sid, []).append(trace)
+
+    summary_payload: Dict[str, Any] = {
+        "base_url": BASE_URL,
+        "total_requests": len(_REQUEST_TRACES),
+        "sessions": {},
+    }
+
+    for session_id, traces in sessions.items():
+        summary_payload["sessions"][session_id] = []
+        for index, trace in enumerate(traces, start=1):
+            summary_payload["sessions"][session_id].append(
+                {
+                    "sequence": index,
+                    "status_code": trace.get("status_code"),
+                    "duration_seconds": trace.get("duration_seconds"),
+                    "model_responding": trace.get("model"),
+                    "provider": trace.get("provider"),
+                    "request_sent": trace.get("request_sent"),
+                    "response_received": trace.get("response_received"),
+                }
+            )
+
+    _log("END-OF-TEST SUMMARY (grouped by session)", payload=summary_payload)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _emit_summary_after_module() -> None:
+    """Print grouped request/response summary when all phases finish."""
+    yield
+    _print_end_summary()
 
 
 def _session_id_from_response(response: Response, fallback: str) -> str:
@@ -313,6 +412,14 @@ def _chat(
             "response_body": body,
         },
     )
+
+    _record_request_trace(
+        requested_session_id=session_id,
+        response=response,
+        body=body,
+        prompt=prompt,
+        elapsed=elapsed,
+    )
     return response, body, elapsed
 
 
@@ -344,7 +451,7 @@ def test_phase_1_single_query_local_qwen3() -> None:
     _require_precondition(1)
     _require_local_proxy()
 
-    session_id = f"plan-live-e2e-p1-{uuid.uuid4()}"
+    session_id = _new_session_id("plan-live-e2e-p1")
     response, body, _elapsed = _chat(
         prompt=(
             "You are performing a diagnostics handshake. Reply with exactly: "
@@ -448,7 +555,7 @@ def test_phase_3_near_simultaneous_queries_first_local_second_remote() -> None:
     primary_session_id = _PHASE_STATE["phase_1_session_id"]
     assert isinstance(primary_session_id, str) and primary_session_id, "phase_3: missing primary session id"
 
-    remote_session_id = f"plan-live-e2e-remote-{uuid.uuid4()}"
+    remote_session_id = _new_session_id("plan-live-e2e-remote")
 
     def _primary_call():
         return _chat(
@@ -515,7 +622,7 @@ def test_phase_4_new_session_plus_remote_followup_validate_both() -> None:
     remote_session_id = _PHASE_STATE.get("phase_3_remote_session_id")
     assert isinstance(remote_session_id, str) and remote_session_id, "phase_4: missing remote session id from phase 3"
 
-    new_session_id = f"plan-live-e2e-new-{uuid.uuid4()}"
+    new_session_id = _new_session_id("plan-live-e2e-new")
 
     def _new_session_call():
         return _chat(
