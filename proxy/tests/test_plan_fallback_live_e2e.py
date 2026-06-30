@@ -63,6 +63,7 @@ _PHASE_STATE: Dict[str, Any] = {
 
 # End-of-run trace data used for final grouped summary output.
 _REQUEST_TRACES: List[Dict[str, Any]] = []
+_LATEST_SUMMARY_PAYLOAD: Optional[Dict[str, Any]] = None
 
 
 def _log(message: str, *, payload: Optional[Dict[str, Any]] = None) -> None:
@@ -204,10 +205,13 @@ def _record_request_trace(
     )
 
 
-def _print_end_summary() -> None:
+def _build_summary_payload() -> Dict[str, Any]:
     if not _REQUEST_TRACES:
-        _log("END-OF-TEST SUMMARY: no captured request traces")
-        return
+        return {
+            "base_url": BASE_URL,
+            "total_requests": 0,
+            "sessions": {},
+        }
 
     sessions: Dict[str, List[Dict[str, Any]]] = {}
     for trace in _REQUEST_TRACES:
@@ -234,8 +238,19 @@ def _print_end_summary() -> None:
                     "response_received": trace.get("response_received"),
                 }
             )
+    return summary_payload
 
-    _log("END-OF-TEST SUMMARY (grouped by session)", payload=summary_payload)
+
+def _print_end_summary() -> None:
+    global _LATEST_SUMMARY_PAYLOAD
+
+    if not _REQUEST_TRACES:
+        _LATEST_SUMMARY_PAYLOAD = _build_summary_payload()
+        _log("END-OF-TEST SUMMARY: no captured request traces")
+        return
+
+    _LATEST_SUMMARY_PAYLOAD = _build_summary_payload()
+    _log("END-OF-TEST SUMMARY (grouped by session)", payload=_LATEST_SUMMARY_PAYLOAD)
 
 
 @pytest.fixture(scope="module", autouse=True)
