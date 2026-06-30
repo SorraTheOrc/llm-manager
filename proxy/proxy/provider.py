@@ -249,6 +249,22 @@ def _get_local_slot_retry_delay_seconds(config: dict) -> float:
         return 0.2
 
 
+def _get_slot_unavailable_retry_after(config: dict) -> float:
+    """Read the short cooldown for slot-exhaustion (slot busy), default 5s.
+
+    Distinct from provider_cooldown_seconds: a busy slot frees quickly (when
+    the in-flight request finishes), so we use a short cooldown so the next
+    request can retry local soon instead of waiting the full provider cooldown.
+    """
+    val = config.get("slot_unavailable_retry_after")
+    if val is None:
+        val = config.get("server", {}).get("slot_unavailable_retry_after", 5)
+    try:
+        return max(1.0, float(val or 5))
+    except Exception:
+        return 5.0
+
+
 def _is_streaming_response(response: Response) -> bool:
     """Return True when response is a StreamingResponse (body is a generator).
 
@@ -729,6 +745,7 @@ async def proxy_with_fallback(
     cooldown_seconds = _get_cooldown_seconds(config)
     local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
     local_slot_retry_delay_seconds = _get_local_slot_retry_delay_seconds(config)
+    slot_unavailable_cooldown = _get_slot_unavailable_retry_after(config)
     all_slot_exhaustion = True
     any_provider_tried = False
     prev_provider: Optional[str] = None
@@ -833,7 +850,7 @@ async def proxy_with_fallback(
                         # Continue evaluating updated response below.
                         pass
                     else:
-                        mark_provider_unavailable(provider_name, cooldown_seconds)
+                        mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
                         fallback_reason = "slot_exhaustion"
                         prev_provider = provider_name
                         total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
@@ -846,7 +863,7 @@ async def proxy_with_fallback(
                         })
                         continue
                 else:
-                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
                     fallback_reason = "slot_exhaustion"
                     prev_provider = provider_name
                     total_slots_sum += int(slot_info.get("total_slots", 0) or 0)

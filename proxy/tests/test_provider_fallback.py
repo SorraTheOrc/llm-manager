@@ -654,6 +654,49 @@ async def test_local_streaming_response_returned_as_success_no_remote_fallback(m
 
 
 @pytest.mark.asyncio
+async def test_local_slot_exhaustion_uses_short_cooldown_not_provider_cooldown(mixed_model_config):
+    """Local slot-exhaustion should use the short slot cooldown (5s) so the
+    next request can retry local soon, instead of the full provider cooldown.
+    """
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {"slot_unavailable_retry_after": 5},
+        "slot_unavailable_retry_after": 5,
+    }
+
+    async def _mock_proxy_to_local(_req, _path):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {"type": "server_busy", "code": "no_slots_available",
+                          "message": "0/1 slots"},
+                "total_slots": 1, "available_slots": 0,
+            },
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200, media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+    ):
+        await provider.proxy_with_fallback(request, "v1/chat/completions", mixed_model_config, cfg)
+
+    expiry = provider._provider_unavailable_until.get("local-llama")
+    assert expiry is not None
+    remaining = expiry - time.time()
+    # Short cooldown (~5s) not the full provider cooldown (60s).
+    assert remaining <= 6.5, f"expected short slot cooldown, got {remaining}s"
+    assert remaining >= 3.0, f"expected ~5s cooldown, got {remaining}s"
+
+
+@pytest.mark.asyncio
 async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
     """Slot exhaustion (all slots busy) should trigger fallback to remote."""
     request = _DummyRequest()

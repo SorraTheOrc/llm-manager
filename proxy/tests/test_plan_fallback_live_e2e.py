@@ -938,3 +938,164 @@ def test_phase_6_pi_cli_subprocess_request_succeeds() -> None:
         f"output:\n{combined_output}"
     )
     assert proc.stdout.strip(), "phase_6: expected non-empty pi CLI stdout"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: simultaneous requests — first local, second falls back to remote
+# ---------------------------------------------------------------------------
+
+def test_phase_7_simultaneous_local_then_remote_fallback() -> None:
+    """Phase 7: Long local request occupies the slot; a near-simultaneous
+    second pi-shaped request must fall back to a remote provider and succeed.
+
+    Regression for the operator-reported "All providers exhausted" failure of
+    the second request while the first is still being served locally.
+    """
+    _require_local_proxy()
+
+    local_session = _new_session_id("phase7-local")
+    remote_session = _new_session_id("phase7-remote")
+
+    pi_like_system = (
+        "You are an expert coding assistant operating inside pi, a coding agent harness. "
+        "You help users by reading files, executing commands, editing code, and writing new files.\n\n"
+        "Available tools:\n- read: Read file contents\n- bash: Execute bash commands\n\n"
+        "In addition to the tools above, you may have access to other custom tools depending on the project."
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+
+    # Local-occupying request: long enough generation to keep the slot busy.
+    local_payload = {
+        "model": "plan",
+        "messages": [
+            {"role": "system", "content": pi_like_system},
+            {"role": "user", "content": "Write a detailed 400-word paragraph about the ocean. Be thorough."},
+        ],
+        "stream": False,
+        "max_tokens": 600,
+        "temperature": 0.0,
+    }
+
+    # Second (pi-shaped) request should fall back to a remote provider.
+    remote_payload = {
+        "model": "plan",
+        "messages": [
+            {"role": "system", "content": pi_like_system},
+            {"role": "user", "content": "Say hello in one short sentence."},
+        ],
+        "tools": tools,
+        "stream": False,
+        "max_tokens": 120,
+        "temperature": 0.0,
+    }
+
+    results: Dict[str, Any] = {}
+
+    def _local_call() -> None:
+        resp, body, elapsed = _chat(
+            prompt="Write a detailed 400-word paragraph about the ocean. Be thorough.",
+            session_id=local_session,
+            payload_override=local_payload,
+            timeout=max(150.0, DEFAULT_TIMEOUT),
+        )
+        results["local"] = (resp, body, elapsed)
+
+    def _remote_call() -> None:
+        resp, body, elapsed = _chat(
+            prompt="Say hello in one short sentence.",
+            session_id=remote_session,
+            payload_override=remote_payload,
+            timeout=max(120.0, DEFAULT_TIMEOUT),
+        )
+        results["remote"] = (resp, body, elapsed)
+
+    _log(
+        "Phase 7 launching simultaneous calls",
+        payload={"local_session": local_session, "remote_session": remote_session},
+    )
+
+    local_provider_seen: List[str] = []
+    remote_provider_seen: List[str] = []
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        local_future = executor.submit(_local_call)
+        # Give the local request a head start so it claims the slot.
+        time.sleep(0.5)
+        remote_future = executor.submit(_remote_call)
+
+        local_future.result()
+        remote_future.result()
+
+        local_resp, local_body, local_elapsed = results["local"]
+        remote_resp, remote_body, remote_elapsed = results["remote"]
+
+    local_provider_seen.append(_provider_from_response(local_resp))
+    remote_provider_seen.append(_provider_from_response(remote_resp))
+
+    _log(
+        "Phase 7 results",
+        payload={
+            "local": {
+                "status_code": local_resp.status_code,
+                "provider": local_provider_seen[0],
+                "elapsed_seconds": round(local_elapsed, 3),
+            },
+            "remote": {
+                "status_code": remote_resp.status_code,
+                "provider": remote_provider_seen[0],
+                "elapsed_seconds": round(remote_elapsed, 3),
+            },
+        },
+    )
+
+    # Local request should succeed (local-qwen3).
+    assert local_resp.status_code == 200, (
+        f"phase_7.local: expected 200, got {local_resp.status_code} body={local_body}"
+    )
+    assert _extract_response_text(local_body).strip(), "phase_7.local: empty content"
+    assert _is_local_qwen3_response(local_resp, local_body)[0], (
+        f"phase_7.local: expected local-qwen3, provider={local_provider_seen[0]}"
+    )
+
+    # Second (pi-shaped) request must satisfy ONE of:
+    #   (a) fall back to a REMOTE provider and succeed (200), OR
+    #   (b) if remote free tiers are rate-limited/errored, return a RETRIABLE
+    #       busy/rate-limit error (429 or 5xx) — but never the Cloudflare HTML
+    #       "All providers exhausted" collapse the operator originally saw.
+    remote_provider = remote_provider_seen[0]
+    lowered = json.dumps(remote_body, ensure_ascii=False, default=str).lower()
+    assert "400 bad request" not in lowered, (
+        "phase_7.remote: must not return Cloudflare 400\n" + lowered
+    )
+    assert "cloudflare" not in lowered, (
+        "phase_7.remote: must not return Cloudflare error\n" + lowered
+    )
+
+    if remote_resp.status_code == 200 and remote_provider and not remote_provider.lower().startswith("local-"):
+        # Remote fallback success — ideal path.
+        assert _extract_response_text(remote_body).strip(), "phase_7.remote: empty content"
+        assert "qwen3" not in remote_provider.lower(), (
+            f"phase_7.remote: expected non-qwen3 remote, got {remote_provider!r}"
+        )
+    else:
+        # Remotes were rate-limited/errored: the response must be a RETRIABLE
+        # server-busy / rate-limit error, not a hard collapse.
+        assert remote_resp.status_code in (429, 503), (
+            f"phase_7.remote: expected remote success or retriable 429/503, "
+            f"got {remote_resp.status_code} body={remote_body}"
+        )
+
+    _log("Phase 7 completed", payload={"local_provider": local_provider_seen[0], "remote_provider": remote_provider})
