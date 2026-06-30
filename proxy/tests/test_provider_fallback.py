@@ -622,13 +622,15 @@ async def test_local_fallback_all_exhausted(mixed_model_config):
             request, "v1/chat/completions", mixed_model_config, cfg
         )
 
-    assert result.status_code == 503
+    # The first provider to return a non-success response is preserved
+    # instead of the generic "All providers exhausted" message.
+    # Here the remote provider returns 502, so that's what the client sees.
+    assert result.status_code == 502
     assert call_log == [
         ("local", "local-llama"),
         ("remote", "remote-fallback"),
     ]
-    body = json.loads(result.body)
-    assert "retry_after" in body
+    assert b"Bad gateway" in result.body
 
 
 @pytest.mark.asyncio

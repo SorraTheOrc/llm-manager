@@ -596,6 +596,12 @@ async def proxy_with_fallback(
     total_slots_sum = 0
     available_slots_sum = 0
 
+    # Track the first error response so we can return it when all providers
+    # are exhausted, instead of the generic "All providers exhausted" message.
+    # This preserves the actual error (e.g. backend_unavailable, concurrency)
+    # that a single-provider model would have returned directly.
+    _first_error_response = None
+
     ptr_remote = _get_proxy_to_remote()
     ptr_local = _get_proxy_to_local()
 
@@ -618,6 +624,11 @@ async def proxy_with_fallback(
                 response = await ptr_local(request, path)
             else:
                 response = await ptr_remote(request, path, provider_cfg)
+
+            # Capture the first non-success response so we can return it when
+            # all providers are exhausted (instead of the generic exhausted message).
+            if _first_error_response is None and response.status_code >= 400:
+                _first_error_response = response
 
             # Extract small response snippet for diagnostics
             body_text = ""
@@ -754,6 +765,22 @@ async def proxy_with_fallback(
             # client errors that should propagate.
             if isinstance(exc, HTTPException) and exc.status_code >= 500:
                 any_provider_tried = True
+                if _first_error_response is None:
+                    # Capture the first HTTPException as an error response so
+                    # the actual error (e.g. concurrency limit, slot queue) is
+                    # preserved instead of replaced by the generic exhausted message.
+                    _first_error_response = Response(
+                        content=json.dumps({
+                            "error": {
+                                "type": "backend_error",
+                                "code": "backend_error",
+                                "message": str(exc.detail),
+                            },
+                            "status": exc.status_code,
+                        }).encode("utf-8"),
+                        status_code=exc.status_code,
+                        media_type="application/json",
+                    )
                 mark_provider_unavailable(provider_name, cooldown_seconds)
                 fallback_reason = f"HTTPException {exc.status_code}"
                 prev_provider = provider_name
@@ -784,7 +811,22 @@ async def proxy_with_fallback(
 
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+
     # If all failures were slot exhaustion, include total slots in message
     if all_slot_exhaustion:
         return _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts)
+
+    # When all providers are exhausted, return the first provider's actual
+    # error response instead of the generic "All providers exhausted"
+    # message.  This preserves the real error (e.g. backend_unavailable,
+    # concurrency limit, slot exhaustion, backend error) that the client
+    # would have received from a single-provider model or direct call.
+    if _first_error_response is not None:
+        logger.info(
+            "Returning first provider error response instead of generic exhausted "
+            "message for model=%s (status=%s)",
+            path, _first_error_response.status_code,
+        )
+        return _first_error_response
+
     return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
