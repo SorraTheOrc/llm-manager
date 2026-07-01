@@ -628,10 +628,37 @@ async def proxy_openai_api(request: Request, path: str):
     """
     Main proxy endpoint for OpenAI API requests.
     Routes to local llama-server or remote API based on model.
+
+    Duplicate in-flight requests are coalesced via ``RequestCoalescer``
+    to prevent retry cascades when the Pi client retries a request that
+    is still being processed.
     """
-    # Get the request body to determine the model
+    from proxy.request_coalescer import get_coalescer
+
+    # Read the body early so the coalescer has the hash key.
     srv = _srv()
     body = await request.body()
+
+    # Wrap the rest of the processing in an inner coroutine so we can
+    # pass it to the coalescer for deduplication.
+    async def _process_request():
+        return await _do_proxy_openai_api(request, path, body, srv)
+
+    return await get_coalescer().coalesce_or_execute(path, body, _process_request)
+
+
+async def _do_proxy_openai_api(
+    request: Request,
+    path: str,
+    body: bytes,
+    srv,
+):
+    """Inner implementation of proxy_openai_api.
+
+    Extracted so that request coalescing can wrap just the outer call
+    without interfering with the processing logic.
+    """
+    # Get the request body to determine the model
     body_json = {}
     model_name = None
     

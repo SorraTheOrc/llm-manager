@@ -202,8 +202,8 @@ server:
   provider_cooldown_seconds: 60
   # Local slot-exhaustion grace retries before remote fallback.
   # Helps right-after-restart races where slot probes briefly report 0 available.
-  local_slot_exhaustion_retry_attempts: 2
-  local_slot_exhaustion_retry_delay_seconds: 0.25
+  local_slot_exhaustion_retry_attempts: 1
+  local_slot_exhaustion_retry_delay_seconds: 0.1
   # Adaptive timeout: base + per_token * prompt_tokens
   llama_adaptive_timeout_enabled: true
   llama_adaptive_timeout_base_seconds: 60
