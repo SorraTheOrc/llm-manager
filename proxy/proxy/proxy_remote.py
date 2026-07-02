@@ -12,6 +12,7 @@ circular import issues.
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -30,6 +31,74 @@ from .router_helpers import (
 
 # Import utils functions used by this module
 from proxy.utils import count_text_tokens  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Auth.json fallback helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_auth_json_path() -> Path:
+    """Return the path to pi's auth.json."""
+    return Path.home() / ".pi" / "agent" / "auth.json"
+
+
+def _try_pi_auth_json(provider_name: str) -> Optional[str]:
+    """Attempt to resolve an API key from ~/.pi/agent/auth.json.
+
+    Performs a case-insensitive lookup matching *provider_name* against
+    keys in the auth JSON file.  Strip trailing ``_api_key`` suffix from
+    *provider_name* before lookup.
+
+    The resolution order follows the ``start-proxy.sh`` logic:
+      1. Exact match (case-insensitive) on the provider name
+      2. ``api_key_env``-style names (e.g. ``OPENCODE_API_KEY``) are matched
+         by stripping the ``_api_key`` suffix and looking up the stem
+         (e.g. ``OPENCODE`` -> ``opencode``)
+
+    Returns the API key string (from the ``key`` field of a matching
+    ``api_key``-type entry), or ``None`` if no match is found.
+    """
+    path = _get_auth_json_path()
+    if not path.exists():
+        return None
+
+    try:
+        auth_data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if not isinstance(auth_data, dict):
+        return None
+
+    lookup_key = provider_name.lower()
+
+    # For OPENCODE_API_KEY-style env vars, prefer opencode-go then opencode
+    if lookup_key == "opencode_api_key":
+        for preferred in ("opencode-go", "opencode"):
+            entry = auth_data.get(preferred)
+            if isinstance(entry, dict) and entry.get("type") == "api_key":
+                key = entry.get("key")
+                if key:
+                    return str(key)
+
+    # Exact lowercase match
+    entry = auth_data.get(lookup_key)
+    if isinstance(entry, dict) and entry.get("type") == "api_key":
+        key = entry.get("key")
+        if key:
+            return str(key)
+
+    # Strip _API_KEY suffix and retry (for env-var-style names)
+    if lookup_key.endswith("_api_key"):
+        stem = lookup_key[:-8]
+        entry = auth_data.get(stem)
+        if isinstance(entry, dict) and entry.get("type") == "api_key":
+            key = entry.get("key")
+            if key:
+                return str(key)
+
+    return None
 
 
 async def proxy_to_remote(
@@ -54,6 +123,9 @@ async def proxy_to_remote(
         api_key = os.environ.get(api_key_env)
     if not api_key:
         api_key = model_config.get("api_key")
+    if not api_key:
+        # Fall back to pi's auth.json
+        api_key = _try_pi_auth_json(api_key_env or "")
 
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)

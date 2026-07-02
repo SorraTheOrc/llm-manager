@@ -1915,3 +1915,455 @@ async def test_local_http_exception_triggers_fallback(mixed_model_config):
         ("local", "local-llama"),
         ("remote", "remote-fallback"),
     ], f"Expected fallback to remote, got call_log={call_log}"
+
+
+# ===================================================================
+# Go tier (opencode-go-deepseek) regression tests
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
+    """proxy_to_remote with the opencode-go-deepseek provider config must
+    override the model name from the incoming request to 'deepseek-v4-flash'."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "opencode-go-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash",
+    }
+
+    captured_body = None
+
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+        nonlocal captured_body
+        captured_body = body
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_body is not None, "_handle_remote_non_streaming should have been called"
+    captured_json = json.loads(captured_body.decode("utf-8"))
+    assert captured_json["model"] == "deepseek-v4-flash", (
+        f"Expected model override to 'deepseek-v4-flash', got '{captured_json.get('model')}'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
+    """proxy_to_remote with the opencode-go-deepseek provider config must
+    inject the Authorization header using the API key from the env var."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "opencode-go-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash",
+    }
+
+    captured_headers = None
+
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+        nonlocal captured_headers
+        captured_headers = headers
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    test_key = "sk-test-go-tier-key-12345"
+    with mock_patch.dict("os.environ", {"OPENCODE_API_KEY": test_key}, clear=False):
+        with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+            result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_headers is not None, "_handle_remote_non_streaming should have been called"
+    auth_header = captured_headers.get("Authorization")
+    assert auth_header is not None, "Authorization header must be present"
+    assert auth_header == f"Bearer {test_key}", (
+        f"Expected Authorization: Bearer {test_key}, got '{auth_header}'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_falls_back_to_auth_json_when_env_var_not_set():
+    """When api_key_env is set but the env var is NOT set, proxy_to_remote
+    must fall back to resolving the key from ~/.pi/agent/auth.json."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote, _try_pi_auth_json
+    from unittest.mock import patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "opencode-go-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash",
+    }
+
+    captured_headers = None
+
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+        nonlocal captured_headers
+        captured_headers = headers
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    # Patch _try_pi_auth_json to return a test key when called with OPENCODE_API_KEY
+    with mock_patch("proxy.proxy_remote._try_pi_auth_json", return_value="sk-auth-json-fallback-key"):
+        with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+            result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_headers is not None, "_handle_remote_non_streaming should have been called"
+    auth_header = captured_headers.get("Authorization")
+    assert auth_header is not None, "Authorization header must be present when auth.json fallback resolves"
+    assert "sk-auth-json-fallback-key" in auth_header, (
+        f"Expected auth.json fallback key in Authorization header, got '{auth_header}'"
+    )
+
+
+# ===================================================================
+# _try_pi_auth_json function tests
+# ===================================================================
+
+
+def test_try_pi_auth_json_resolves_opencode_api_key(tmp_path):
+    """_try_pi_auth_json must resolve OPENCODE_API_KEY to the opencode-go
+    key from auth.json."""
+    from unittest.mock import patch as mock_patch
+    from proxy.proxy_remote import _try_pi_auth_json, _get_auth_json_path
+
+    auth_data = {
+        "opencode-go": {
+            "type": "api_key",
+            "key": "sk-opencode-go-key",
+        },
+        "opencode": {
+            "type": "api_key",
+            "key": "sk-opencode-key",
+        },
+    }
+    auth_file = tmp_path / ".pi" / "agent" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text(json.dumps(auth_data), encoding="utf-8")
+
+    with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=auth_file):
+        result = _try_pi_auth_json("OPENCODE_API_KEY")
+
+    assert result == "sk-opencode-go-key", (
+        f"Expected opencode-go key, got '{result}'"
+    )
+
+
+def test_try_pi_auth_json_falls_back_to_opencode_when_opencode_go_missing(tmp_path):
+    """When opencode-go is not in auth.json, _try_pi_auth_json must fall
+    back to opencode entry for OPENCODE_API_KEY."""
+    from unittest.mock import patch as mock_patch
+    from proxy.proxy_remote import _try_pi_auth_json
+
+    auth_data = {
+        "opencode": {
+            "type": "api_key",
+            "key": "sk-opencode-only-key",
+        },
+    }
+    auth_file = tmp_path / ".pi" / "agent" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text(json.dumps(auth_data), encoding="utf-8")
+
+    with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=auth_file):
+        result = _try_pi_auth_json("OPENCODE_API_KEY")
+
+    assert result == "sk-opencode-only-key", (
+        f"Expected opencode fallback key, got '{result}'"
+    )
+
+
+def test_try_pi_auth_json_exact_match(tmp_path):
+    """_try_pi_auth_json must return the key for an exact lowercase match
+    when the auth.json key matches the lookup key directly."""
+    from unittest.mock import patch as mock_patch
+    from proxy.proxy_remote import _try_pi_auth_json
+
+    auth_data = {
+        "openrouter": {
+            "type": "api_key",
+            "key": "sk-or-test-key",
+        },
+    }
+    auth_file = tmp_path / ".pi" / "agent" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text(json.dumps(auth_data), encoding="utf-8")
+
+    with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=auth_file):
+        result = _try_pi_auth_json("OPENROUTER")
+
+    assert result == "sk-or-test-key", (
+        f"Expected exact-match key, got '{result}'"
+    )
+
+
+def test_try_pi_auth_json_returns_none_when_file_missing():
+    """_try_pi_auth_json must return None when auth.json does not exist."""
+    from pathlib import Path
+    from unittest.mock import patch as mock_patch
+    from proxy.proxy_remote import _try_pi_auth_json
+
+    with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=Path("/nonexistent/auth.json")):
+        result = _try_pi_auth_json("OPENCODE_API_KEY")
+
+    assert result is None, f"Expected None for missing file, got '{result}'"
+
+
+def test_try_pi_auth_json_returns_none_for_unknown_key(tmp_path):
+    """_try_pi_auth_json must return None when the key is not in auth.json
+    and no fallback matches."""
+    from unittest.mock import patch as mock_patch
+    from proxy.proxy_remote import _try_pi_auth_json
+
+    auth_data = {
+        "opencode": {
+            "type": "api_key",
+            "key": "sk-opencode",
+        },
+    }
+    auth_file = tmp_path / ".pi" / "agent" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text(json.dumps(auth_data), encoding="utf-8")
+
+    with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=auth_file):
+        result = _try_pi_auth_json("NONEXISTENT_KEY")
+
+    assert result is None, f"Expected None for unknown key, got '{result}'"
+
+
+def test_try_pi_auth_json_strips_api_key_suffix(tmp_path):
+    """_try_pi_auth_json must strip _api_key suffix and look up the stem."""
+    from unittest.mock import patch as mock_patch
+    from proxy.proxy_remote import _try_pi_auth_json
+
+    auth_data = {
+        "openrouter": {
+            "type": "api_key",
+            "key": "sk-or-test-key",
+        },
+    }
+    auth_file = tmp_path / ".pi" / "agent" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text(json.dumps(auth_data), encoding="utf-8")
+
+    with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=auth_file):
+        result = _try_pi_auth_json("OPENROUTER_API_KEY")
+
+    assert result == "sk-or-test-key", (
+        f"Expected key from _api_key stripping, got '{result}'"
+    )
+
+
+# ===================================================================
+# Go tier fallback chain end-to-end test
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_plan_fallback_reaches_go_tier_when_free_tier_rate_limited():
+    """When the local provider is exhausted and the free remote tier returns
+    429, the fallback chain must reach the Go tier (opencode-go-deepseek)
+    and return a successful response."""
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+
+    plan_model_config = {
+        "providers": [
+            {
+                "name": "local-qwen3",
+                "type": "local",
+                "llama_model": "Qwen3",
+            },
+            {
+                "name": "opencode-deepseek-free",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "deepseek-v4-flash-free",
+            },
+            {
+                "name": "opencode-go-deepseek",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ],
+        "aliases": ["plan*"],
+    }
+
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-qwen3")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": "Model server busy: 0/1 slots available.",
+                },
+                "status": 503,
+                "retry_after": 5,
+                "total_slots": 1,
+                "available_slots": 0,
+            },
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg.get("name")
+        call_log.append(name)
+        if name == "opencode-deepseek-free":
+            # Free tier rate-limited
+            return Response(status_code=429, content=b"Rate limited")
+        # Go tier succeeds
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-from-go-tier"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", plan_model_config, cfg
+        )
+
+    assert result.status_code == 200, f"Expected 200 from Go tier, got {result.status_code}"
+    body = json.loads(result.body) if hasattr(result, "body") else {}
+    assert "ok-from-go-tier" in str(body), (
+        f"Expected Go tier response content, got: {body}"
+    )
+    assert call_log == [
+        "local-qwen3",
+        "opencode-deepseek-free",
+        "opencode-go-deepseek",
+    ], f"Expected fallback chain through all providers, got: {call_log}"
+    assert result.headers.get("X-Provider") == "opencode-go-deepseek", (
+        f"Expected X-Provider=opencode-go-deepseek, got '{result.headers.get('X-Provider')}'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_fallback_all_exhausted_with_go_tier_error():
+    """When ALL providers (including Go tier) fail, the fallback must
+    return a 503 with appropriate error diagnostics."""
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+
+    plan_model_config = {
+        "providers": [
+            {
+                "name": "local-qwen3",
+                "type": "local",
+                "llama_model": "Qwen3",
+            },
+            {
+                "name": "opencode-deepseek-free",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "deepseek-v4-flash-free",
+            },
+            {
+                "name": "opencode-go-deepseek",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ],
+        "aliases": ["plan*"],
+    }
+
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-qwen3")
+        raise httpx.ConnectError("Connection refused to llama-server")
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg.get("name")
+        call_log.append(name)
+        if name == "opencode-go-deepseek":
+            # Go tier also fails
+            return Response(status_code=502, content=b"Bad gateway from Go")
+        # Free tier fails
+        return Response(status_code=502, content=b"Bad gateway from Free")
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", plan_model_config, cfg
+        )
+
+    # Should return the first error response (502 from free tier) since the
+    # fallback logic preserves the actual upstream error instead of returning
+    # a generic "All providers exhausted" 503.
+    assert result.status_code == 502, (
+        f"Expected 502 (first upstream error), got {result.status_code}"
+    )
+    assert b"Bad gateway from Free" in result.body, (
+        f"Expected free-tier error body, got: {result.body}"
+    )
+    assert call_log == [
+        "local-qwen3",
+        "opencode-deepseek-free",
+        "opencode-go-deepseek",
+    ], f"Expected all providers tried, got: {call_log}"
