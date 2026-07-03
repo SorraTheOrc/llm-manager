@@ -2058,6 +2058,57 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
 
 
 @pytest.mark.asyncio
+async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_authorization_header():
+    """Incoming client Authorization header must be replaced (not duplicated)
+    with the upstream OPENCODE API key header."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import patch as mock_patch
+
+    server_module.config = {
+        "server": {"llama_request_timeout": 300},
+    }
+    server_module.current_model = None
+
+    request = _DummyRequest(body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    # Simulate client auth header to proxy (lower-case variant).
+    request.headers = {"authorization": "Bearer LOCAL_PROXY_TOKEN"}
+
+    provider_cfg = {
+        "name": "opencode-go-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_API_KEY",
+        "model": "deepseek-v4-flash",
+    }
+
+    captured_headers = None
+
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+        nonlocal captured_headers
+        captured_headers = headers
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    test_key = "sk-test-go-tier-key-12345"
+    with mock_patch.dict("os.environ", {"OPENCODE_API_KEY": test_key}, clear=False):
+        with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+            result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_headers is not None, "_handle_remote_non_streaming should have been called"
+    # Must not preserve incoming lowercase auth header.
+    assert "authorization" not in captured_headers
+    auth_header = captured_headers.get("Authorization")
+    assert auth_header == f"Bearer {test_key}", (
+        f"Expected Authorization: Bearer {test_key}, got '{auth_header}'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
     """proxy_to_remote with the opencode-go-deepseek provider config must
     inject the Authorization header using the API key from the env var."""

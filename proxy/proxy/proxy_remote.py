@@ -180,6 +180,20 @@ async def proxy_to_remote(
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
 
+    # Remove local/proxy auth/session headers before forwarding.
+    # In particular, prevent duplicate Authorization variants
+    # (e.g. "authorization" + "Authorization") which can trigger
+    # Cloudflare 400 Bad Request on upstream.
+    for hk in list(headers.keys()):
+        hkl = str(hk).lower()
+        if hkl in {
+            "authorization",
+            "x-session-id",
+            "x-client-request-id",
+            "x-session-affinity",
+        }:
+            headers.pop(hk, None)
+
     # Add API key
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
