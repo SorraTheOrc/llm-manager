@@ -197,7 +197,7 @@ server:
   llama_model_health_grace_period_seconds: 15
   llama_model_load_timeout: 600
   llama_models_max: 2
-  llama_request_timeout: 300
+  llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
   # Local slot-exhaustion grace retries before remote fallback.
@@ -220,7 +220,7 @@ server:
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 64
   session_guardrail_repetition_min_repeats: 10
-  session_guardrail_invalidate_on_cutoff: false
+  session_guardrail_invalidate_on_cutoff: true
   session_guardrail_invalidate_on_repetition: false
   # Token-rate guardrail settings (disabled by default)
   # Maximum tokens/second threshold. Set to 0 to disable token-rate guardrail.
