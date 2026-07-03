@@ -13,7 +13,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import Request, Response
@@ -101,6 +101,56 @@ def _try_pi_auth_json(provider_name: str) -> Optional[str]:
     return None
 
 
+# A conservative OpenAI-compatible subset for remote chat completions.
+# Unknown/experimental client keys can trigger 4xx on some providers.
+_REMOTE_CHAT_FIELD_ALLOWLIST = {
+    "model",
+    "messages",
+    "stream",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "frequency_penalty",
+    "stop",
+    "n",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
+    "seed",
+    "logit_bias",
+    "user",
+    "reasoning_effort",
+}
+
+
+def _sanitize_remote_chat_payload(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize chat-completions payload for remote providers.
+
+    Keeps a conservative OpenAI-compatible field subset for
+    ``v1/chat/completions``. This improves cross-provider compatibility
+    when clients include local-only or experimental fields.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if not (path == "v1/chat/completions" or str(path).endswith("chat/completions")):
+        return payload
+
+    sanitized = {k: v for k, v in payload.items() if k in _REMOTE_CHAT_FIELD_ALLOWLIST}
+    dropped = sorted(k for k in payload.keys() if k not in sanitized)
+    if dropped:
+        try:
+            _srv().logger.info(
+                "[remote] stripped unsupported chat-completions fields: %s",
+                ",".join(dropped),
+            )
+        except Exception:
+            pass
+    return sanitized
+
+
 async def proxy_to_remote(
     request: Request,
     path: str,
@@ -139,6 +189,11 @@ async def proxy_to_remote(
     headers.update(custom_headers)
 
     body_json = json.loads(body) if body else {}
+    if not isinstance(body_json, dict):
+        body_json = {}
+
+    # Sanitize request-shape for remote compatibility before model override.
+    body_json = _sanitize_remote_chat_payload(path, body_json)
 
     # Override model name in body if provider config specifies an upstream model ID.
     # This allows the proxy to present a different model name to the remote API
@@ -147,7 +202,8 @@ async def proxy_to_remote(
     upstream_model = model_config.get("model")
     if upstream_model and body_json.get("model"):
         body_json["model"] = upstream_model
-        body = json.dumps(body_json).encode("utf-8")
+
+    body = json.dumps(body_json).encode("utf-8")
 
     # Determine model name for attribution (may be provided in body)
     model_name = None
@@ -200,6 +256,19 @@ async def _handle_remote_streaming(
             body_bytes = await response.aread()
         except Exception:
             body_bytes = b""
+        try:
+            # Keep error-path visibility parity with non-streaming calls.
+            log_response(upstream_status, body_bytes or b"")
+            if upstream_status >= 400:
+                err_preview = (body_bytes or b"").decode("utf-8", errors="replace")[:500]
+                _srv().logger.warning(
+                    "[remote] upstream error status=%s url=%s body=%s",
+                    upstream_status,
+                    target_url,
+                    err_preview,
+                )
+        except Exception:
+            pass
         try:
             await cm.__aexit__(None, None, None)
         except Exception:

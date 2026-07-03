@@ -697,6 +697,48 @@ async def test_local_slot_exhaustion_uses_short_cooldown_not_provider_cooldown(m
 
 
 @pytest.mark.asyncio
+async def test_local_flat_slot_exhaustion_format_uses_short_cooldown(mixed_model_config):
+    """Llama-server native flat 503 slot-busy format should be parsed as slot
+    exhaustion and use the short slot cooldown (not full provider cooldown)."""
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {"slot_unavailable_retry_after": 5},
+        "slot_unavailable_retry_after": 5,
+    }
+
+    async def _mock_proxy_to_local(_req, _path):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "type": "server_busy",
+                "code": "no_slots_available",
+                "message": "Model server busy: 0/1 slots available. Please retry later.",
+            },
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+    ):
+        await provider.proxy_with_fallback(request, "v1/chat/completions", mixed_model_config, cfg)
+
+    expiry = provider._provider_unavailable_until.get("local-llama")
+    assert expiry is not None
+    remaining = expiry - time.time()
+    assert remaining <= 6.5, f"expected short slot cooldown, got {remaining}s"
+    assert remaining >= 3.0, f"expected ~5s cooldown, got {remaining}s"
+
+
+@pytest.mark.asyncio
 async def test_local_fallback_on_slot_exhaustion(mixed_model_config):
     """Slot exhaustion (all slots busy) should trigger fallback to remote."""
     request = _DummyRequest()
@@ -1488,6 +1530,53 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
     captured_json = json.loads(captured_body.decode("utf-8"))
     assert captured_json["model"] == "deepseek-v4-flash-free", \
         f"Expected model override to 'deepseek-v4-flash-free', got '{captured_json.get('model')}'"
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibility():
+    """Unknown top-level chat fields should be removed before forwarding to
+    remote providers to avoid provider-specific 4xx request-shape failures."""
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
+    from unittest.mock import patch as mock_patch
+
+    server_module.config = {"server": {"llama_request_timeout": 300}}
+    server_module.current_model = None
+
+    request = _DummyRequest(
+        body=b'{"model":"plan","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":16,"bogus_field":123,"another_unknown":{"x":1}}'
+    )
+    request.headers = {}
+
+    provider_cfg = {
+        "name": "plain-remote",
+        "type": "remote",
+        "endpoint": "https://example.com/v1",
+        "api_key_env": "SOME_KEY",
+    }
+
+    captured_body = None
+
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+        nonlocal captured_body
+        captured_body = body
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with mock_patch("proxy.proxy_remote._handle_remote_non_streaming", mock_non_streaming):
+        result = await proxy_to_remote(request, "v1/chat/completions", provider_cfg)
+
+    assert result.status_code == 200
+    assert captured_body is not None
+    captured_json = json.loads(captured_body.decode("utf-8"))
+    assert captured_json["model"] == "plan"
+    assert captured_json["stream"] is False
+    assert captured_json["max_tokens"] == 16
+    assert "bogus_field" not in captured_json
+    assert "another_unknown" not in captured_json
 
 
 @pytest.mark.asyncio
