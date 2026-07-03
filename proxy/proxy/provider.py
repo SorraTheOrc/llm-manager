@@ -424,14 +424,32 @@ def _parse_slot_exhaustion(response):
 
     Returns a dict with keys 'total_slots' and 'available_slots' when the
     response indicates slot exhaustion, otherwise returns None.
+
+    Handles two response formats:
+
+    1. Proxy-generated (``_build_slot_exhaustion_response``):
+
+           {"error": {"code": "no_slots_available", ...}, "total_slots": 1}
+
+    2. Llama-server native (flat):
+
+           {"type": "server_busy", "code": "no_slots_available", ...}
     """
     try:
         if response.status_code != 503:
             return None
         import json
         body = json.loads(response.body)
+
+        # Format 1: nested error.code
         error = body.get("error", {})
         if isinstance(error, dict) and error.get("code") == "no_slots_available":
+            total = int(body.get("total_slots", 0) or 0)
+            avail = int(body.get("available_slots", 0) or 0)
+            return {"total_slots": total, "available_slots": avail}
+
+        # Format 2: flat top-level code (llama-server native)
+        if body.get("code") == "no_slots_available":
             total = int(body.get("total_slots", 0) or 0)
             avail = int(body.get("available_slots", 0) or 0)
             return {"total_slots": total, "available_slots": avail}

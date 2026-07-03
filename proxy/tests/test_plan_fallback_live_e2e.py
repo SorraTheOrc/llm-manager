@@ -1084,18 +1084,20 @@ def test_phase_7_simultaneous_local_then_remote_fallback() -> None:
         "phase_7.remote: must not return Cloudflare error\n" + lowered
     )
 
-    if remote_resp.status_code == 200 and remote_provider and not remote_provider.lower().startswith("local-"):
-        # Remote fallback success — ideal path.
-        assert _extract_response_text(remote_body).strip(), "phase_7.remote: empty content"
-        assert "qwen3" not in remote_provider.lower(), (
-            f"phase_7.remote: expected non-qwen3 remote, got {remote_provider!r}"
-        )
-    else:
-        # Remotes were rate-limited/errored: the response must be a RETRIABLE
-        # server-busy / rate-limit error, not a hard collapse.
-        assert remote_resp.status_code in (429, 503), (
-            f"phase_7.remote: expected remote success or retriable 429/503, "
-            f"got {remote_resp.status_code} body={remote_body}"
-        )
+    # Remote fallback MUST succeed (200) from a non-local provider.
+    # The previous lenient path (accepting 429/503) was removed because
+    # it masked provider failures — the entire purpose of this phase is to
+    # verify that remote fallback actually WORKS when the local slot is busy.
+    assert remote_resp.status_code == 200, (
+        f"phase_7.remote: expected 200, got {remote_resp.status_code} "
+        f"body={remote_body}"
+    )
+    assert remote_provider and not remote_provider.lower().startswith("local-"), (
+        f"phase_7.remote: expected non-local remote, got {remote_provider!r}"
+    )
+    assert _extract_response_text(remote_body).strip(), "phase_7.remote: empty content"
+    assert "qwen3" not in remote_provider.lower(), (
+        f"phase_7.remote: expected non-qwen3 remote, got {remote_provider!r}"
+    )
 
     _log("Phase 7 completed", payload={"local_provider": local_provider_seen[0], "remote_provider": remote_provider})
