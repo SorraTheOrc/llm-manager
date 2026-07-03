@@ -163,7 +163,7 @@ async def proxy_to_remote(
     # Get request body
     body = await request.body()
 
-    # Log request
+    # Log request (remote path has no slot concept; slot_id defaults to "none")
     log_request(request, body, "remote", endpoint)
 
     # Get API key

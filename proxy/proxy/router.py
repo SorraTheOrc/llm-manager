@@ -148,11 +148,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not srv.backend_ready or srv.llama_process is None:
         return _build_backend_unavailable_response(srv, path)
 
-    # Get request body
+    # Get request body (keep original for logging before any modifications)
     body = await request.body()
-
-    # Log request
-    log_request(request, body, "local")
+    body_for_logging = body
 
     # Parse body once and determine method/key/model for attribution
     try:
@@ -160,11 +158,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     except Exception:
         body_json = {}
 
-    requested_model_name = None
-    try:
-        requested_model_name = body_json.get("model")
-    except Exception:
-        requested_model_name = None
     # Session handling – incremental prompt ingestion
     session_result = await _handle_session(
         srv, body_json, server_config, request.headers
@@ -228,6 +221,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             server_config, session_id
         )
         slot_enabled = slot_id is not None and slot_filename is not None
+
+    # Log request with resolved session_id and slot_id (LP-0MQQSM1V7004QOGL)
+    log_request(
+        request,
+        body_for_logging,
+        "local",
+        session_id=session_id,
+        slot_id=slot_id if slot_id is not None else "none",
+    )
 
     method = request.method.upper()
     key = f"{method} {request.url.path} -> local"

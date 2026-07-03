@@ -36,18 +36,81 @@ def _srv():
 # Request/response logging helpers
 # ===================================================================
 
+def _strip_system_messages_from_preview(body: bytes) -> str:
+    """Produce a body preview that excludes system message content.
+
+    Parses the JSON body and filters out any ``{"role": "system"...}``
+    messages before serialising back to a preview string.  Returns the
+    raw body decoded (capped at 500 chars) when JSON parsing fails or the
+    body does not contain a ``"messages"`` list.
+
+    This prevents sensitive system-prompt content from appearing in proxy
+    logs while still exposing user-facing message content for debugging.
+    """
+    preview = body.decode("utf-8", errors="replace")[:500]
+
+    try:
+        body_json = json.loads(body) if isinstance(body, bytes) else body
+        if isinstance(body_json, dict) and "messages" in body_json:
+            filtered_messages = [
+                msg
+                for msg in body_json["messages"]
+                if isinstance(msg, dict) and msg.get("role") != "system"
+            ]
+            if filtered_messages != body_json["messages"]:
+                # System messages were present and removed — rebuild JSON.
+                body_json = dict(body_json)
+                body_json["messages"] = filtered_messages
+                preview = json.dumps(body_json, ensure_ascii=False)[:500]
+    except Exception:
+        # If JSON parsing fails, return the raw preview (existing behaviour).
+        pass
+
+    return preview
+
+
 def log_request(
     request: Request,
     body: bytes,
     source: str,
     endpoint: str = "",
+    *,
+    session_id: Optional[str] = None,
+    slot_id: Optional[str] = "none",
 ) -> None:
-    """Log incoming request details."""
+    """Log incoming request details.
+
+    Parameters
+    ----------
+    request : Request
+        The incoming FastAPI request.
+    body : bytes
+        The raw request body.
+    source : str
+        Routing source label (``"local"`` or ``"remote"``).
+    endpoint : str, optional
+        Remote endpoint URL (used only for ``source == "remote"``).
+    session_id : str, optional
+        Resolved session ID (the internal session identifier). When
+        provided it is included in the log line as
+        ``session_id=<value>``.
+    slot_id : str, optional
+        Assigned slot identifier. Defaults to ``"none"``. When a slot
+        is assigned the actual ID is logged; otherwise the placeholder
+        ``"none"`` or ``"queued"`` is used.
+
+    Notes
+    -----
+    - System message content is stripped from the body preview to avoid
+      leaking sensitive system-prompt data in proxy logs.
+    - This function is the single source of truth for request logging and
+      is called by both ``proxy_to_local`` and ``proxy_to_remote``.
+    """
     srv = _srv()
     try:
         method = request.method
         url = str(request.url)
-        body_preview = body.decode("utf-8", errors="replace")[:500]
+        body_preview = _strip_system_messages_from_preview(body)
         session_headers = {
             k: v
             for k, v in request.headers.items()
@@ -58,15 +121,25 @@ def log_request(
                 "x-session-affinity",
             )
         }
+
+        # Build session info portion
+        session_parts = [f"session={session_headers}"]
+        if session_id is not None:
+            session_parts.insert(0, f"session_id={session_id}")
+        if slot_id is not None:
+            session_parts.append(f"slot={slot_id}")
+
+        session_info = " ".join(session_parts)
+
         if source == "remote" and endpoint:
             srv.logger.info(
                 f"[{source}] {method} {url} -> {endpoint} "
-                f"body={body_preview} session={session_headers}"
+                f"body={body_preview} {session_info}"
             )
         else:
             srv.logger.info(
                 f"[{source}] {method} {url} "
-                f"body={body_preview} session={session_headers}"
+                f"body={body_preview} {session_info}"
             )
     except Exception:
         srv.logger.debug("Failed to log request", exc_info=True)

@@ -12,12 +12,43 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Provider Fallback**: Automatic failover between providers per model with configurable cooldown and circuit breaker
 - **Streaming Support**: Full support for streaming responses (SSE)
 - **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
-- **Request/Response Logging**: Comprehensive logging with time-based rotation. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
+- **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
+
+## Request Logging
+
+The proxy logs every incoming request at **INFO** level via the `llama-proxy` logger. This is visible in normal proxy logs (no need for debug mode).
+
+### Log Format
+
+#### Local proxy path (llama-server)
+
+```
+[local] POST http://localhost:8080/v1/chat/completions body={...} session_id=sess-abc123 slot=7 session={"x-session-id": "sess-abc123"}
+```
+
+#### Remote proxy path
+
+```
+[remote] POST http://localhost:8080/v1/chat/completions -> https://api.openai.com/v1/chat/completions body={...} session_id=sess-abc123 slot=none session={"x-session-id": "sess-abc123"}
+```
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `session_id=<value>` | The resolved session ID (internal identifier used by the session manager). Omitted when no session is resolved. |
+| `slot=<value>` | The assigned slot identifier. Uses `"none"` when no slot is assigned or for the remote proxy path. Uses `"queued"` when the request is waiting in the scheduler queue. |
+| `body={...}` | A truncated preview of the request body (first 500 chars). **System message content is excluded** from the preview to prevent sensitive system-prompt data from appearing in logs. Only user-facing message content (role="user" and role="assistant") is included. |
+| `session={...}` | The session-related headers extracted from the request (X-Session-Id, X-Client-Request-Id, X-Session-Affinity). |
+
+### System Prompt Redaction
+
+The body preview automatically filters out messages with `role: "system"` to prevent sensitive system-prompt content from leaking into proxy logs. Only `role: "user"` and `role: "assistant"` messages are included in the preview.
 
 ## Host-first deployment
 
