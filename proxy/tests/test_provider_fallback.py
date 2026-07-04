@@ -1215,6 +1215,152 @@ async def test_no_fallback_log_on_success(sample_model_config, caplog):
 
 
 # ===================================================================
+# Queue bypass tests (LP-0MR5MAJNM005R905)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_local_queue_bypass_when_slot_busy(mixed_model_config):
+    """When scheduler has no idle slots and model has fallback providers,
+    skip the local provider immediately without marking it unavailable."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        raise AssertionError("Should not reach local provider when slot is busy")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=False),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # Local provider should NOT have been called; remote was used directly
+    assert call_log == [("remote", "remote-fallback")]
+    # Local provider should NOT be marked unavailable (slot busy, not failed)
+    assert "local-llama" not in provider._provider_unavailable_until
+
+
+@pytest.mark.asyncio
+async def test_local_queue_bypass_no_fallback_passes_through(mixed_model_config):
+    """When scheduler has idle slot, local provider is called normally
+    even when fallback providers exist."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        raise AssertionError("Should not reach remote when local has idle slot")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [("local", "local-llama")]
+
+
+@pytest.mark.asyncio
+async def test_local_concurrency_limit_fallback(mixed_model_config):
+    """When local concurrency limit is reached, skip to next provider
+    without marking local as unavailable."""
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {"local_max_concurrent_queries": 1},
+    }
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        raise AssertionError("Should not reach local when at concurrency limit")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", return_value=(1, 1)),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [("remote", "remote-fallback")]
+    assert "local-llama" not in provider._provider_unavailable_until
+
+
+@pytest.mark.asyncio
+async def test_local_concurrency_below_limit_calls_local(mixed_model_config):
+    """When local concurrency is below limit, local provider is called."""
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {"local_max_concurrent_queries": 1},
+    }
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        raise AssertionError("Should not reach remote when local is within concurrency limit")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", return_value=(0, 1)),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [("local", "local-llama")]
+
+
+# ===================================================================
 # Integration tests: ui.py request path uses fallback functions
 # ===================================================================
 

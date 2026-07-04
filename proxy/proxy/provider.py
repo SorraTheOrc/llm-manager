@@ -419,6 +419,40 @@ def _get_proxy_to_local():
     raise ImportError('No proxy_to_local implementation available')
 
 
+def _get_scheduler_has_idle_slot():
+    """Lazily import and check whether the JobScheduler has an idle slot.
+
+    Returns True if there is at least one idle slot, False if all slots
+    are busy, or True if no scheduler is active (no slot management).
+    """
+    try:
+        from proxy.router import _scheduler_has_idle_slot as _check
+        return _check()
+    except Exception:
+        return True
+
+
+def _get_local_concurrency_info(config: dict) -> tuple:
+    """Lazily import and return (current_local_active, max_local) from config.
+
+    Returns the current local active query count and the configured
+    local_max_concurrent_queries limit.  Defaults to (0, 1) on error.
+    """
+    cur_active = 0
+    max_local = 1
+    try:
+        import proxy.server as _srv
+        cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+    except Exception:
+        pass
+    try:
+        server_cfg = config.get("server", config)
+        max_local = max(1, int(server_cfg.get("local_max_concurrent_queries", 1) or 1))
+    except (ValueError, TypeError):
+        pass
+    return (cur_active, max_local)
+
+
 def _parse_slot_exhaustion(response):
     """Parse a slot-exhaustion response and return slot info.
 
@@ -800,6 +834,35 @@ async def proxy_with_fallback(
             # Mark attempt
             any_provider_tried = True
             if provider_type == "local":
+                # Queue bypass (LP-0MR5MAJNM005R905): if scheduler has no
+                # idle slots, skip local provider immediately without marking
+                # it as unavailable — the provider is busy, not failed.
+                if not _get_scheduler_has_idle_slot():
+                    attempts.append({
+                        "provider": provider_name,
+                        "type": provider_type,
+                        "status": "slot_busy_skip_queue",
+                    })
+                    fallback_reason = "slot_busy_skip_queue"
+                    prev_provider = provider_name
+                    continue
+
+                # Local concurrency limit check (LP-0MR5MAJNM005R905):
+                # if local_max_concurrent_queries is exceeded, skip to next
+                # provider without marking local as unavailable.
+                cur_local, max_local = _get_local_concurrency_info(config)
+                if cur_local >= max_local:
+                    attempts.append({
+                        "provider": provider_name,
+                        "type": provider_type,
+                        "status": "local_concurrency_limit",
+                        "active": cur_local,
+                        "max": max_local,
+                    })
+                    fallback_reason = "local_concurrency_limit"
+                    prev_provider = provider_name
+                    continue
+
                 response = await ptr_local(request, path)
             else:
                 response = await ptr_remote(request, path, provider_cfg)

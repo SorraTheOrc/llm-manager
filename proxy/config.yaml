@@ -210,6 +210,11 @@ server:
   llama_adaptive_timeout_per_token_seconds: 0.01
   llama_router_mode: true
   max_concurrent_queries: 16
+  # Local-model concurrency limit (LP-0MR5MAJNM005R905).
+  # Limits concurrent requests to local providers. Remote providers
+  # continue to use max_concurrent_queries. When this limit is reached,
+  # requests with fallback providers skip to the next provider immediately.
+  local_max_concurrent_queries: 1
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache

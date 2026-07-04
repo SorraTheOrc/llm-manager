@@ -70,9 +70,11 @@ from .router_helpers import (  # noqa: E402
     _check_slot_availability,
     _compute_request_timeout,
     _decrement_active_queries,
+    _decrement_local_active_queries,
     _estimate_tokens_sent,
     _handle_session,
     _increment_active_queries,
+    _increment_local_active_queries,
     _normalize_outgoing_headers,
     _schedule_recv_token_increment,
     _schedule_token_increment,
@@ -123,6 +125,47 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
     # Wire scheduler into SlotLockCoordinator
     slot_lock_coordinator.set_scheduler(_job_scheduler)
     return _job_scheduler
+
+
+def _scheduler_has_idle_slot() -> bool:
+    """
+    Check whether the JobScheduler has at least one idle slot.
+
+    Returns ``True`` if there is an idle slot (the request can be served),
+    ``False`` if all slots are busy (the request would be queued).
+    Returns ``True`` when no scheduler is active (no slot management).
+    """
+    scheduler = _get_job_scheduler()
+    if scheduler is None:
+        return True
+    return scheduler.has_idle_slot()
+
+
+def _get_local_max_concurrent_queries(server_config: dict) -> int:
+    """
+    Read the local-model concurrency limit from config.
+
+    Returns the configured ``local_max_concurrent_queries`` value
+    (default 1). This limit is separate from the global
+    ``max_concurrent_queries`` which applies to remote providers.
+    """
+    try:
+        val = server_config.get("local_max_concurrent_queries", 1)
+        return max(1, int(val or 1))
+    except (ValueError, TypeError):
+        return 1
+
+
+def _get_local_active_count(srv) -> int:
+    """
+    Get the current number of active local requests.
+
+    Returns the count stored on the server for local-provider requests.
+    """
+    try:
+        return int(getattr(srv, 'local_active_queries', 0) or 0)
+    except (ValueError, TypeError):
+        return 0
 
 
 # Core proxy routing: Local llama-server dispatch
@@ -320,6 +363,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Mark active query
     await _increment_active_queries(srv)
+    await _increment_local_active_queries(srv)
 
     # Token accounting
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
@@ -1180,10 +1224,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                     finally:
                         await _decrement_active_queries(srv)
+                        await _decrement_local_active_queries(srv)
                         if scheduler is not None and slot_id is not None:
                             await scheduler.mark_request_end(slot_id)
         except SessionSingleFlightRejected as exc:
             await _decrement_active_queries(srv)
+            await _decrement_local_active_queries(srv)
             payload = {
                 "error": {
                     "type": "session_single_flight",

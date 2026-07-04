@@ -93,9 +93,13 @@ counts_dirty = False
 counts_persist_task: Optional[asyncio.Task] = None
 periodic_broadcast_task: Optional[asyncio.Task] = None
 
-# Active local queries counter
+# Active local queries counter (global, all providers)
 active_queries: int = 0
 active_queries_lock = asyncio.Lock()
+
+# Local-only active queries counter (LP-0MR5MAJNM005R905)
+local_active_queries: int = 0
+local_active_queries_lock = asyncio.Lock()
 
 # Backend resilience/observability signals
 # Health/readiness signal for local backend

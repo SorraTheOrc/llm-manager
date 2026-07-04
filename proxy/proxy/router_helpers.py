@@ -376,6 +376,24 @@ async def _increment_active_queries(srv) -> None:
         pass
 
 
+async def _decrement_local_active_queries(srv) -> None:
+    """Safely decrement the local-only active queries counter."""
+    try:
+        async with srv.local_active_queries_lock:
+            srv.local_active_queries = max(0, srv.local_active_queries - 1)
+    except Exception:
+        pass
+
+
+async def _increment_local_active_queries(srv) -> None:
+    """Safely increment the local-only active queries counter."""
+    try:
+        async with srv.local_active_queries_lock:
+            srv.local_active_queries += 1
+    except Exception:
+        pass
+
+
 # ===================================================================
 # Header normalization helpers
 # ===================================================================

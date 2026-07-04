@@ -226,15 +226,40 @@ class JobScheduler:
         if slot_id in self.slots:
             self.slots[slot_id].active_requests += 1
 
+    def has_idle_slot(self) -> bool:
+        """
+        Check if any slot is currently idle.
+
+        Returns True if at least one slot has state == "Idle".
+        This is a cheap check with no side effects (no queuing, no assignment).
+        """
+        for slot_state in self.slots.values():
+            if slot_state.state == "Idle":
+                return True
+        return False
+
     async def mark_request_end(self, slot_id: int) -> None:
         """
         Mark that a request has ended on the given slot.
 
         Decrements the active-request counter. Must be called in a
         finally block paired with mark_request_start.
+
+        If the request was the last active one, logs the projected
+        timeout time for the slot (LP-0MR5MAJNM005R905).
         """
         if slot_id in self.slots and self.slots[slot_id].active_requests > 0:
             self.slots[slot_id].active_requests -= 1
+            # Log projected timeout if this was the last active request
+            slot_state = self.slots[slot_id]
+            if slot_state.active_requests == 0 and slot_state.job_last_request_at is not None:
+                next_timeout_at = slot_state.job_last_request_at + self.job_timeout
+                logger.info(
+                    "scheduler request complete slot=%s job=%s next_timeout_at=%.1fs",
+                    slot_id,
+                    (slot_state.job_id[:8] if slot_state.job_id else "none"),
+                    next_timeout_at,
+                )
 
     async def remove_job(self, session_id: str) -> bool:
         """
