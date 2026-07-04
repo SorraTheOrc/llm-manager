@@ -66,6 +66,25 @@ class TestJobSchedulerInit:
         assert len(sched.active_jobs) == 0
         assert len(sched.slot_to_job) == 0
 
+    def test_init_logs_configuration(self, caplog):
+        """JobScheduler.__init__ logs pool_size, max_queue_depth, job_timeout at INFO (AC 1)."""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        JobScheduler(pool_size=4, max_queue_depth=16, job_timeout=300.0)
+
+        found = False
+        for record in caplog.records:
+            msg = record.getMessage()
+            if "scheduler init" in msg:
+                assert "pool_size=4" in msg
+                assert "max_queue_depth=16" in msg
+                assert "job_timeout=300" in msg
+                assert record.levelno == logging.INFO
+                found = True
+                break
+        assert found, "Expected 'scheduler init' log message"
+
 
 # ===================================================================
 # admit_job()

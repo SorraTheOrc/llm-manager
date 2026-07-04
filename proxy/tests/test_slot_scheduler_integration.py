@@ -60,7 +60,10 @@ class TestSchedulerInit:
         """When slot_management is absent, _get_job_scheduler() returns None."""
         monkeypatch.setattr(
             "proxy.router._srv",
-            lambda: type("Srv", (), {"config": {"server": {}}})()
+            lambda: type("Srv", (), {
+                "config": {"server": {}},
+                "logger": MagicMock(),
+            })()
         )
         result = _get_job_scheduler()
         assert result is None
@@ -69,7 +72,10 @@ class TestSchedulerInit:
         """Empty slot_management config returns None."""
         monkeypatch.setattr(
             "proxy.router._srv",
-            lambda: type("Srv", (), {"config": {"slot_management": {}}})()
+            lambda: type("Srv", (), {
+                "config": {"slot_management": {}},
+                "logger": MagicMock(),
+            })()
         )
         result = _get_job_scheduler()
         assert result is None
@@ -79,7 +85,8 @@ class TestSchedulerInit:
         monkeypatch.setattr(
             "proxy.router._srv",
             lambda: type("Srv", (), {
-                "config": {"slot_management": {"slot_pool_size": 0}}
+                "config": {"slot_management": {"slot_pool_size": 0}},
+                "logger": MagicMock(),
             })()
         )
         result = _get_job_scheduler()
@@ -107,6 +114,46 @@ class TestSchedulerInit:
         assert result.queue.maxsize == 16
         assert result.job_timeout == 300.0
         assert result.queue_overflow_retry_after == 900
+
+    def test_no_slot_management_config_logs_message(self, monkeypatch):
+        """When slot_management is absent, _get_job_scheduler() logs at INFO (AC 9)."""
+        import proxy.router as router_mod
+
+        mock_srv = MagicMock()
+        mock_srv.config = {"server": {}}
+        mock_srv.logger = MagicMock()
+
+        monkeypatch.setattr("proxy.router._srv", lambda: mock_srv)
+
+        result = _get_job_scheduler()
+        assert result is None
+
+        # Verify the log was called
+        mock_srv.logger.info.assert_called_once()
+        call_args = mock_srv.logger.info.call_args[0][0]
+        assert "scheduler not initialized" in call_args
+        assert "slot_management" in call_args
+
+    def test_pool_size_zero_logs_message(self, monkeypatch):
+        """When pool_size < 1, _get_job_scheduler() logs at INFO (AC 9)."""
+        import proxy.router as router_mod
+
+        mock_srv = MagicMock()
+        mock_srv.config = {
+            "slot_management": {"slot_pool_size": 0},
+        }
+        mock_srv.logger = MagicMock()
+
+        monkeypatch.setattr("proxy.router._srv", lambda: mock_srv)
+
+        result = _get_job_scheduler()
+        assert result is None
+
+        # Verify the log was called
+        mock_srv.logger.info.assert_called_once()
+        call_args = mock_srv.logger.info.call_args[0][0]
+        assert "scheduler not initialized" in call_args
+        assert "pool_size" in call_args
 
     def test_scheduler_initialized_once(self, monkeypatch):
         """_get_job_scheduler() returns the same instance on subsequent calls."""

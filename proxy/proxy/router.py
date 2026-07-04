@@ -108,10 +108,19 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
     srv = _srv()
     slot_config = srv.config.get("slot_management", {})
     if not slot_config:
+        srv.logger.info(
+            "scheduler not initialized: slot_management config missing, "
+            "using hash-based slot assignment",
+        )
         return None
 
     pool_size = int(slot_config.get("slot_pool_size", 0) or 0)
     if pool_size < 1:
+        srv.logger.info(
+            "scheduler not initialized: pool_size=%s < 1, "
+            "using hash-based slot assignment",
+            pool_size,
+        )
         return None
 
     _job_scheduler = JobScheduler(

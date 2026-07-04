@@ -119,6 +119,13 @@ class JobScheduler:
         self._queued_jobs: Dict[str, QueuedJob] = {}  # session_id -> QueuedJob
         self._cancelled_jobs: set[str] = set()  # session_ids marked for removal
 
+        logger.info(
+            "scheduler init pool_size=%s max_queue_depth=%s job_timeout=%s",
+            pool_size,
+            max_queue_depth,
+            job_timeout,
+        )
+
     async def start(self) -> None:
         """Start the scheduler (including background timeout checks)."""
         self._timeout_check_task = asyncio.create_task(
