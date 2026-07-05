@@ -56,6 +56,7 @@ import proxy.metrics as metrics  # noqa: E402
 record_http_error = metrics.record_http_error
 
 from proxy.utils import (  # noqa: E402
+    _extract_assistant_content,
     _extract_assistant_content_from_sse,
     _extract_delta_text_from_sse_chunk,
     count_text_tokens,
@@ -177,7 +178,210 @@ def _get_local_active_count(srv) -> int:
         return 0
 
 
+# ===================================================================
+# Extracted helpers for proxy_to_local
+# ===================================================================
+
+
+def _build_session_headers(
+    session_id: Optional[str],
+    session_created: bool,
+    is_delta_request: bool,
+    session_fallback_reason: Optional[str],
+) -> dict:
+    """Build the X-Session-* response headers common to both paths."""
+    headers = {}
+    if session_id:
+        headers["X-Session-Id"] = session_id
+        headers["X-Session-Created"] = "true" if session_created else "false"
+        headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+        if session_fallback_reason:
+            headers["X-Session-Fallback-Reason"] = session_fallback_reason
+    return headers
+
+
+def _get_guardrail_config(server_config: dict) -> dict:
+    """Extract guardrail parameters from server config."""
+    return {
+        "max_runtime_seconds": float(
+            server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
+        ),
+        "max_completion_tokens": int(
+            server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
+        ),
+        "repetition_min_pattern_chars": int(
+            server_config.get("session_guardrail_repetition_min_pattern_chars", 64) or 64
+        ),
+        "repetition_min_repeats": int(
+            server_config.get("session_guardrail_repetition_min_repeats", 10) or 10
+        ),
+        "invalidate_on_guardrail": bool(
+            server_config.get("session_guardrail_invalidate_on_cutoff", True)
+        ),
+        "invalidate_on_repetition": server_config.get(
+            "session_guardrail_invalidate_on_repetition", False
+        ),
+        "max_token_rate": int(
+            server_config.get("session_guardrail_max_token_rate", 0) or 0
+        ),
+        "token_rate_window_seconds": int(
+            server_config.get("session_guardrail_token_rate_window_seconds", 5) or 5
+        ),
+    }
+
+
+async def _update_session_and_slot(
+    srv,
+    session_id: Optional[str],
+    body_json: dict,
+    is_delta_request: bool,
+    delta_messages: list,
+    original_message_count: int,
+    response,
+    llama_port: int,
+    slot_id: Optional[str],
+    slot_filename: Optional[str],
+    slot_timeout: float,
+    slot_model_payload: Optional[str],
+    slot_enabled: bool,
+    upstream_status: int,
+    slot_save_allowed: bool = True,
+    collected_content: Optional[list] = None,
+    llama_log_path=None,
+    llama_log_offset: int = 0,
+) -> None:
+    """Update session history and save slot snapshot after a response.
+
+    Shared by both streaming and buffered paths.
+    """
+    if not session_id:
+        return
+
+    # Restore signal detection and confirmation
+    try:
+        resp_content = (
+            response.content.decode("utf-8", errors="replace")
+            if hasattr(response, "content") and isinstance(getattr(response, 'content', None), (bytes, str))
+            else None
+        )
+        restore_signal_detected = _has_explicit_restore_signal(
+            dict(response.headers) if hasattr(response, "headers") else {},
+            json.loads(resp_content) if resp_content else None,
+        )
+    except Exception:
+        restore_signal_detected = False
+    if not restore_signal_detected:
+        restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
+    if not restore_signal_detected and llama_log_path is not None:
+        restore_signal_detected = _detect_restore_signal_from_log_slice(
+            llama_log_path, llama_log_offset
+        )
+    if restore_signal_detected:
+        _record_restore_success()
+    try:
+        await srv.session_manager.set_restore_confirmed(session_id, restore_signal_detected)
+    except Exception:
+        srv.logger.debug(
+            "Failed to set restore-confirmed state", exc_info=True
+        )
+
+    # Update session history
+    if (
+        session_id
+        and isinstance(body_json, dict)
+        and "messages" in body_json
+        and original_message_count > 0
+    ):
+        try:
+            if collected_content is not None and collected_content:
+                full_response = "".join(collected_content)
+                assistant_content = _extract_assistant_content_from_sse(full_response)
+                existing_messages = []
+                if is_delta_request and delta_messages:
+                    session_obj = await srv.session_manager.get(session_id)
+                    if session_obj:
+                        existing_messages = list(session_obj.messages)
+                full_messages = merge_session_history_for_update(
+                    existing_messages=existing_messages,
+                    request_messages=list(body_json.get("messages", [])),
+                    delta_messages=delta_messages,
+                    is_delta_request=is_delta_request,
+                    assistant_content=assistant_content,
+                )
+                await srv.session_manager.update_messages(session_id, full_messages)
+            elif hasattr(response, "content") and isinstance(getattr(response, 'content', None), (bytes, str)):
+                # Buffered path: parse JSON response
+                resp_content = response.content.decode("utf-8", errors="replace")
+                resp_json = json.loads(resp_content) if resp_content else {}
+                assistant_content = _extract_assistant_content(resp_json)
+                existing_messages = []
+                if is_delta_request and delta_messages:
+                    session_obj = await srv.session_manager.get(session_id)
+                    if session_obj:
+                        existing_messages = list(session_obj.messages)
+                full_messages = merge_session_history_for_update(
+                    existing_messages=existing_messages,
+                    request_messages=list(body_json.get("messages", [])),
+                    delta_messages=delta_messages,
+                    is_delta_request=is_delta_request,
+                    assistant_content=assistant_content,
+                )
+                await srv.session_manager.update_messages(session_id, full_messages)
+            else:
+                if not is_delta_request and original_message_count > 0:
+                    await srv.session_manager.update_messages(
+                        session_id, body_json.get("messages", [])
+                    )
+                elif is_delta_request and delta_messages:
+                    await srv.session_manager.append_messages(session_id, delta_messages)
+        except Exception:
+            srv.logger.debug(
+                f"Failed to update session {session_id[:8]}... history",
+                exc_info=True,
+            )
+
+    # Save slot snapshot if enabled
+    if slot_save_allowed and slot_enabled and upstream_status < 400:
+        try:
+            saved = await _save_slot_snapshot(
+                llama_port,
+                slot_id,
+                slot_filename,
+                slot_timeout,
+                model=slot_model_payload,
+            )
+            if saved:
+                srv.logger.info(
+                    "slot_save success session=%s slot=%s",
+                    session_id[:8] if session_id else "unknown",
+                    slot_id,
+                )
+        except Exception:
+            srv.logger.debug("slot_save failed", exc_info=True)
+
+
+async def _release_scheduler_and_decrement(
+    srv,
+    scheduler,
+    session_id: Optional[str],
+    slot_id: Optional[int],
+    disconnected: bool = False,
+    decrement_local: bool = True,
+) -> None:
+    """Release scheduler slot and decrement active query counters."""
+    if scheduler is not None:
+        if disconnected and session_id:
+            await scheduler.remove_job(session_id)
+        elif slot_id is not None:
+            await scheduler.mark_request_end(slot_id)
+    await _decrement_active_queries(srv)
+    if decrement_local:
+        await _decrement_local_active_queries(srv)
+
+
+# ===================================================================
 # Core proxy routing: Local llama-server dispatch
+# ===================================================================
 
 async def proxy_to_local(request: Request, path: str) -> Response:
     """Proxy request to local llama-server with session-based incremental ingestion.
@@ -502,26 +706,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         err_headers = _normalize_outgoing_headers(
                             dict(response.headers), buffered=True
                         )
-                        if session_id:
-                            err_headers["X-Session-Id"] = session_id
-                            err_headers[
-                                "X-Session-Created"
-                            ] = (
-                                "true"
-                                if session_created
-                                else "false"
+                        err_headers.update(
+                            _build_session_headers(
+                                session_id, session_created,
+                                is_delta_request, session_fallback_reason,
                             )
-                            err_headers[
-                                "X-Session-Delta"
-                            ] = (
-                                "true"
-                                if is_delta_request
-                                else "false"
-                            )
-                            if session_fallback_reason:
-                                err_headers[
-                                    "X-Session-Fallback-Reason"
-                                ] = session_fallback_reason
+                        )
                         await _decrement_active_queries(srv)
                         return Response(
                             content=body_bytes,
@@ -538,26 +728,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     }:
                         outgoing_headers["Cache-Control"] = "no-cache"
 
-                    if session_id:
-                        outgoing_headers["X-Session-Id"] = session_id
-                        outgoing_headers[
-                            "X-Session-Created"
-                        ] = (
-                            "true"
-                            if session_created
-                            else "false"
+                    outgoing_headers.update(
+                        _build_session_headers(
+                            session_id, session_created,
+                            is_delta_request, session_fallback_reason,
                         )
-                        outgoing_headers[
-                            "X-Session-Delta"
-                        ] = (
-                            "true"
-                            if is_delta_request
-                            else "false"
-                        )
-                        if session_fallback_reason:
-                            outgoing_headers[
-                                "X-Session-Fallback-Reason"
-                            ] = session_fallback_reason
+                    )
                     media_type = response.headers.get(
                         "content-type", "text/event-stream"
                     )
@@ -567,57 +743,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     completion_tokens_total = 0
                     stream_start = time.monotonic()
                     chunk_history: list[tuple[float, str]] = []
-                    max_runtime_seconds = float(
-                        server_config.get(
-                            "session_guardrail_max_runtime_seconds", 1800
-                        )
-                        or 1800
-                    )
-                    max_completion_tokens = int(
-                        server_config.get(
-                            "session_guardrail_max_completion_tokens",
-                            2048,
-                        )
-                        or 2048
-                    )
-                    repetition_min_pattern_chars = int(
-                        server_config.get(
-                            "session_guardrail_repetition_min_pattern_chars",
-                            64,
-                        )
-                        or 64
-                    )
-                    repetition_min_repeats = int(
-                        server_config.get(
-                            "session_guardrail_repetition_min_repeats",
-                            10,
-                        )
-                        or 10
-                    )
-                    invalidate_on_guardrail = bool(
-                        server_config.get(
-                            "session_guardrail_invalidate_on_cutoff", True
-                        )
-                    )
-                    invalidate_on_repetition = (
-                        server_config.get(
-                            "session_guardrail_invalidate_on_repetition",
-                            False,
-                        )
-                    )
-                    max_token_rate = int(
-                        server_config.get(
-                            "session_guardrail_max_token_rate", 0
-                        )
-                        or 0
-                    )
-                    token_rate_window_seconds = int(
-                        server_config.get(
-                            "session_guardrail_token_rate_window_seconds",
-                            5,
-                        )
-                        or 5
-                    )
+                    gc = _get_guardrail_config(server_config)
+                    max_runtime_seconds = gc["max_runtime_seconds"]
+                    max_completion_tokens = gc["max_completion_tokens"]
+                    repetition_min_pattern_chars = gc["repetition_min_pattern_chars"]
+                    repetition_min_repeats = gc["repetition_min_repeats"]
+                    invalidate_on_guardrail = gc["invalidate_on_guardrail"]
+                    invalidate_on_repetition = gc["invalidate_on_repetition"]
+                    max_token_rate = gc["max_token_rate"]
+                    token_rate_window_seconds = gc["token_rate_window_seconds"]
 
                     async def stream_generator():
                         nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed, chunk_history
@@ -848,121 +982,21 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 type(exc).__name__,
                             )
                         finally:
-                            # Strict restore confirmation state comes from explicit backend signal.
-                            if session_id:
-                                try:
-                                    if not restore_signal_detected:
-                                        restore_signal_detected = (
-                                            _detect_restore_signal_from_log_slice(
-                                                llama_log_path,
-                                                llama_log_offset,
-                                            )
-                                        )
-                                    if restore_signal_detected:
-                                        _record_restore_success()
-                                    await srv.session_manager.set_restore_confirmed(
-                                        session_id, restore_signal_detected
-                                    )
-                                except Exception:
-                                    srv.logger.debug(
-                                        "Failed to set restore-confirmed state",
-                                        exc_info=True,
-                                    )
-
-                            # Update session history with the full conversation
-                            if (
-                                session_id
-                                and original_message_count > 0
-                                and (
-                                    collected_content
-                                    or not guardrail_reason
-                                )
-                            ):
-                                try:
-                                    if collected_content:
-                                        full_response = "".join(
-                                            collected_content
-                                        )
-                                        assistant_content = (
-                                            _extract_assistant_content_from_sse(
-                                                full_response
-                                            )
-                                        )
-                                        existing_messages = []
-                                        if (
-                                            is_delta_request
-                                            and delta_messages
-                                        ):
-                                            session_obj = (
-                                                await srv.session_manager.get(
-                                                    session_id
-                                                )
-                                            )
-                                            if session_obj:
-                                                existing_messages = list(
-                                                    session_obj.messages
-                                                )
-                                        full_messages = (
-                                            merge_session_history_for_update(
-                                                existing_messages=existing_messages,
-                                                request_messages=list(
-                                                    body_json.get(
-                                                        "messages", []
-                                                    )
-                                                ),
-                                                delta_messages=delta_messages,
-                                                is_delta_request=is_delta_request,
-                                                assistant_content=assistant_content,
-                                            )
-                                        )
-                                        await srv.session_manager.update_messages(
-                                            session_id, full_messages
-                                        )
-                                    else:
-                                        if (
-                                            not is_delta_request
-                                            and original_message_count
-                                            > 0
-                                        ):
-                                            await srv.session_manager.update_messages(
-                                                session_id,
-                                                body_json.get(
-                                                    "messages", []
-                                                ),
-                                            )
-                                        elif (
-                                            is_delta_request
-                                            and delta_messages
-                                        ):
-                                            await srv.session_manager.append_messages(
-                                                session_id, delta_messages
-                                            )
-                                except Exception:
-                                    srv.logger.debug(
-                                        f"Failed to update session {session_id[:8]}... history",
-                                        exc_info=True,
-                                    )
-
-                            if (
-                                slot_save_allowed
-                                and slot_enabled
-                                and upstream_status < 400
-                            ):
-                                saved = await _save_slot_snapshot(
-                                    llama_port,
-                                    slot_id,
-                                    slot_filename,
-                                    slot_timeout,
-                                    model=slot_model_payload,
-                                )
-                                if saved:
-                                    srv.logger.info(
-                                        "slot_save success session=%s slot=%s",
-                                        session_id[:8]
-                                        if session_id
-                                        else "unknown",
-                                        slot_id,
-                                    )
+                            # Update session history and save slot (shared helper)
+                            await _update_session_and_slot(
+                                srv, session_id, body_json,
+                                is_delta_request, delta_messages,
+                                original_message_count,
+                                response,
+                                llama_port, slot_id, slot_filename,
+                                slot_timeout, slot_model_payload,
+                                slot_enabled,
+                                upstream_status=upstream_status,
+                                slot_save_allowed=slot_save_allowed,
+                                collected_content=collected_content,
+                                llama_log_path=llama_log_path,
+                                llama_log_offset=llama_log_offset,
+                            )
 
                             try:
                                 await cm.__aexit__(None, None, None)
@@ -974,12 +1008,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             except (asyncio.TimeoutError, Exception):
                                 pass
                             # If client disconnected, release scheduler slot entirely (LP-0MQTHP828000JYM6)
-                            if scheduler is not None:
-                                if disconnected and session_id:
-                                    await scheduler.remove_job(session_id)
-                                elif slot_id is not None:
-                                    await scheduler.mark_request_end(slot_id)
-                            await _decrement_active_queries(srv)
+                            await _release_scheduler_and_decrement(
+                                srv, scheduler, session_id, slot_id,
+                                disconnected=disconnected,
+                                decrement_local=False,
+                            )
 
                     return StreamingResponse(
                         stream_generator(),
@@ -988,7 +1021,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         status_code=upstream_status,
                     )
         except SessionSingleFlightRejected as exc:
-            await _decrement_active_queries(srv)
+            await _release_scheduler_and_decrement(
+                srv, scheduler, session_id, slot_id,
+                decrement_local=False,
+            )
             payload = {
                 "error": {
                     "type": "session_single_flight",
@@ -1092,110 +1128,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Loop detection via repetition check is used instead.
                             # The max_completion_tokens config is now ignored.
 
-                            # Update session history for non-streaming responses
-                            if (
-                                session_id
-                                and isinstance(body_json, dict)
-                                and "messages" in body_json
-                            ):
-                                try:
-                                    resp_content = response.content.decode(
-                                        "utf-8", errors="replace"
-                                    )
-                                    resp_json = (
-                                        json.loads(resp_content)
-                                        if resp_content
-                                        else {}
-                                    )
-                                    restore_signal_detected = (
-                                        _has_explicit_restore_signal(
-                                            dict(response.headers),
-                                            (
-                                                resp_json
-                                                if isinstance(
-                                                    resp_json, dict
-                                                )
-                                                else None
-                                            ),
-                                        )
-                                    )
-                                    if session_id and not restore_signal_detected:
-                                        restore_signal_detected = (
-                                            _detect_restore_signal_from_llama_log(
-                                                session_id
-                                            )
-                                        )
-                                    if session_id and not restore_signal_detected:
-                                        restore_signal_detected = (
-                                            _detect_restore_signal_from_log_slice(
-                                                llama_log_path,
-                                                llama_log_offset,
-                                            )
-                                        )
-                                    if restore_signal_detected:
-                                        _record_restore_success()
-                                    await srv.session_manager.set_restore_confirmed(
-                                        session_id, restore_signal_detected
-                                    )
-                                    assistant_content = _extract_assistant_content(
-                                        resp_json
-                                    )
-                                    existing_messages = []
-                                    if (
-                                        is_delta_request
-                                        and delta_messages
-                                    ):
-                                        session_obj = (
-                                            await srv.session_manager.get(
-                                                session_id
-                                            )
-                                        )
-                                        if session_obj:
-                                            existing_messages = list(
-                                                session_obj.messages
-                                            )
-                                    full_messages = (
-                                        merge_session_history_for_update(
-                                            existing_messages=existing_messages,
-                                            request_messages=list(
-                                                body_json.get(
-                                                    "messages", []
-                                                )
-                                            ),
-                                            delta_messages=delta_messages,
-                                            is_delta_request=is_delta_request,
-                                            assistant_content=assistant_content,
-                                        )
-                                    )
-                                    await srv.session_manager.update_messages(
-                                        session_id, full_messages
-                                    )
-                                except Exception:
-                                    srv.logger.debug(
-                                        f"Failed to update session {session_id[:8]}... history",
-                                        exc_info=True,
-                                    )
-
-                            if (
-                                slot_save_allowed
-                                and slot_enabled
-                                and response.status_code < 400
-                            ):
-                                saved = await _save_slot_snapshot(
-                                    llama_port,
-                                    slot_id,
-                                    slot_filename,
-                                    slot_timeout,
-                                    model=slot_model_payload,
-                                )
-                                if saved:
-                                    srv.logger.info(
-                                        "slot_save success session=%s slot=%s",
-                                        session_id[:8]
-                                        if session_id
-                                        else "unknown",
-                                        slot_id,
-                                    )
+                            # Update session history and save slot (shared helper)
+                            await _update_session_and_slot(
+                                srv, session_id, body_json,
+                                is_delta_request, delta_messages,
+                                original_message_count,
+                                response,
+                                llama_port, slot_id, slot_filename,
+                                slot_timeout, slot_model_payload,
+                                slot_enabled,
+                                upstream_status=response.status_code,
+                                llama_log_path=llama_log_path,
+                                llama_log_offset=llama_log_offset,
+                            )
 
                             log_response(
                                 response.status_code, response.content
@@ -1205,26 +1150,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             resp_headers = _normalize_outgoing_headers(
                                 dict(response.headers), buffered=True
                             )
-                            if session_id:
-                                resp_headers["X-Session-Id"] = session_id
-                                resp_headers[
-                                    "X-Session-Created"
-                                ] = (
-                                    "true"
-                                    if session_created
-                                    else "false"
+                            resp_headers.update(
+                                _build_session_headers(
+                                    session_id, session_created,
+                                    is_delta_request, session_fallback_reason,
                                 )
-                                resp_headers[
-                                    "X-Session-Delta"
-                                ] = (
-                                    "true"
-                                    if is_delta_request
-                                    else "false"
-                                )
-                                if session_fallback_reason:
-                                    resp_headers[
-                                        "X-Session-Fallback-Reason"
-                                    ] = session_fallback_reason
+                            )
 
                             return Response(
                                 content=response.content,
@@ -1232,13 +1163,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 headers=resp_headers,
                             )
                     finally:
-                        await _decrement_active_queries(srv)
-                        await _decrement_local_active_queries(srv)
-                        if scheduler is not None and slot_id is not None:
-                            await scheduler.mark_request_end(slot_id)
+                        await _release_scheduler_and_decrement(
+                            srv, scheduler, session_id, slot_id,
+                            decrement_local=True,
+                        )
         except SessionSingleFlightRejected as exc:
-            await _decrement_active_queries(srv)
-            await _decrement_local_active_queries(srv)
+            await _release_scheduler_and_decrement(
+                srv, scheduler, session_id, slot_id,
+                decrement_local=True,
+            )
             payload = {
                 "error": {
                     "type": "session_single_flight",
