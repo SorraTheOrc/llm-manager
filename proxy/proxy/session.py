@@ -509,7 +509,7 @@ async def _call_slot_endpoint(
         )
         # Debug log with full traceback for post-hoc diagnosis.
         srv.logger.debug(
-            "slot_%s failed slot=%s exc_info=True",
+            "slot_%s failed slot=%s",
             action,
             slot_id,
             exc_info=True,
