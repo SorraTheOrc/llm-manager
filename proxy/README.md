@@ -61,10 +61,18 @@ The repository supports two deployment models for running llama-server:
 
 | Mode | How it starts | Managed by | Use case |
 |------|--------------|------------|----------|
+| **Host-first (host-direct)** | Proxy's `start_llama_server()` calls `start-llama.sh` directly on the host (single attempt) before falling back to the configured container script | Proxy lifecycle | When `llama_allow_host_fallback: true` (default), preferred path for proxy-managed startups |
+| **Proxy-managed (container)** | Proxy's `start_llama_server()` runs the configured `llama_start_script` (e.g., `scripts/podman_start_llama.sh`) | Proxy lifecycle | Development, ad-hoc proxy startups, or when host-direct fails |
 | **Host-first (systemd)** | Systemd unit calls `start-llama.sh` directly on the host | `systemctl --user` or `sudo systemctl` | Production deployments, reboot-safe supervision |
-| **Proxy-managed (container)** | Proxy's `start_llama_server()` runs the configured `llama_start_script` (e.g., `scripts/podman_start_llama.sh`) | Proxy lifecycle | Development, ad-hoc proxy startups via `proxyctl start` |
 
-When `llama_allow_host_fallback` is enabled (see [Configuration](#configuration)), the proxy may attempt a host-direct start as a fallback if the primary startup method (container) fails. If host-direct start also fails, the proxy reports a clear error — distrobox is no longer used as a fallback layer.
+The container path is **not deprecated** and remains fully supported. It is the default configured `llama_start_script` in `config.yaml`. The host-first fallback (`llama_allow_host_fallback: true`) attempts host-direct startup first and falls back to the container script if the host-direct attempt fails. This provides the best of both worlds: fast host-direct startup when available, with automatic fallback to container-based operation.
+
+To disable the host-first fallback and use the container script exclusively (matching the original pre-host-first behavior), set:
+
+```yaml
+server:
+  llama_allow_host_fallback: false
+```
 
 ### Startup behavior (proxy-managed mode)
 

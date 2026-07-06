@@ -41,6 +41,32 @@ Run: scripts/build-llama-test.sh --dry-run --json
     - Build the image with podman/docker and tag it
     - Verify the image via scripts/verify-container-rocm.sh (non-dry-run recommended in staging)
 
+- To push the built image to a registry, add `--push`:
+
+  ```bash
+  scripts/rebuild-container.sh --image rocm/dev-ubuntu-24.04:7.2.4 \
+    --build --push --tag registry.example.com/llm/llama-server:rocm-7.2.4
+  ```
+
+  The script validates registry credentials before pushing. If no credentials are found for the
+  registry, the script fails with a clear message:
+
+  ```
+  Registry credentials not found for 'registry.example.com'. Run 'podman login registry.example.com' first.
+  ```
+
+  To log in to the registry before pushing:
+
+  ```bash
+  # Podman
+  podman login registry.example.com
+
+  # Docker
+  docker login registry.example.com
+  ```
+
+  > **Note:** The `--push` flag automatically implies `--build`. You do not need to pass both.
+
 5) Rebuild llama.cpp and deploy
 
 - scripts/rebuild-llama.sh --dry-run --json
