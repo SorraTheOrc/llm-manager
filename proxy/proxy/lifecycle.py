@@ -648,6 +648,73 @@ async def router_preload_models(model_names: list[str]) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Spawn helper — extracted from start_llama_server() for testability
+# ---------------------------------------------------------------------------
+
+def spawn_and_capture(
+    cmd: list[str],
+    env: dict,
+    log_file,
+    logger: logging.Logger,
+) -> tuple:
+    """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
+
+    Returns a tuple (Popen|None, captured_output_str|None).
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+    except FileNotFoundError as e:
+        logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
+        return None, f"Command not found: {cmd[0]}: {e}"
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
+        return None, f"Spawn failed: {e}\n{tb}"
+
+    try:
+        outs, _ = proc.communicate(timeout=3)
+        return None, outs
+    except subprocess.TimeoutExpired:
+        try:
+            if log_file and proc.stdout:
+                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file), daemon=True)
+                t.start()
+        except Exception:
+            pass
+        return proc, None
+
+
+def _stream_output(src, dst):
+    """Stream lines from src to dst, parsing prompt progress for console display."""
+    try:
+        for line in src:
+            dst.write(line)
+            dst.flush()
+            # Display prompt processing progress to console
+            try:
+                line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
+                if 'prompt processing' in line_str.lower():
+                    parsed = extract_progress_data(line_str)
+                    if parsed:
+                        n_tokens, progress = parsed
+                        total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
+                        progress_str = format_progress(n_tokens, total_tokens, progress)
+                        sys.stderr.write(progress_str)
+                        if progress >= 0.999:
+                            sys.stderr.write('\n')
+                        sys.stderr.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     """Start the llama-server with the specified model.
@@ -701,62 +768,6 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     else:
        srv.llama_log_file = subprocess.DEVNULL
 
-    # Helper to start a subprocess and capture immediate stderr/stdout if it
-    # exits quickly. Returns a tuple (Popen|None, captured_output_str|None).
-    def _spawn_and_capture(cmd):
-       try:
-           proc = subprocess.Popen(
-               cmd,
-               env=env,
-               stdout=subprocess.PIPE,
-               stderr=subprocess.STDOUT,
-               text=True
-           )
-       except FileNotFoundError as e:
-           srv.logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
-           return None, f"Command not found: {cmd[0]}: {e}"
-       except Exception as e:
-           tb = traceback.format_exc()
-           srv.logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
-           return None, f"Spawn failed: {e}\n{tb}"
-
-       try:
-           outs, _ = proc.communicate(timeout=3)
-           return None, outs
-       except subprocess.TimeoutExpired:
-           try:
-               if srv.llama_log_file and proc.stdout:
-                   import threading
-
-                   def _stream_output(src, dst):
-                       try:
-                           for line in src:
-                               dst.write(line)
-                               dst.flush()
-                               # Display prompt processing progress to console
-                               try:
-                                   line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
-                                   if 'prompt processing' in line_str.lower():
-                                       parsed = extract_progress_data(line_str)
-                                       if parsed:
-                                           n_tokens, progress = parsed
-                                           total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
-                                           progress_str = format_progress(n_tokens, total_tokens, progress)
-                                           sys.stderr.write(progress_str)
-                                           if progress >= 0.999:
-                                               sys.stderr.write('\n')
-                                           sys.stderr.flush()
-                               except Exception:
-                                   pass
-                       except Exception:
-                           pass
-
-                   t = threading.Thread(target=_stream_output, args=(proc.stdout, srv.llama_log_file), daemon=True)
-                   t.start()
-           except Exception:
-               pass
-           return proc, None
-
     # Build the command for the configured start script
     if router_mode:
        llama_models_max = server_config.get("llama_models_max")
@@ -782,7 +793,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = _spawn_and_capture(cmd)
+       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger)
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
