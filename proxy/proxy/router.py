@@ -673,11 +673,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Mark active query
     await _increment_active_queries(srv)
-    await _increment_local_active_queries(
-        srv,
-        session_key=session_id if session_explicit else None,
-        backend="local",
-    )
+    # Only increment local_active_queries if _try_acquire_local_dispatch did not
+    # already do so (LP-0MR96QL8400022BW: double-increment bug). When the lease
+    # check above ran (session_id and session_explicit), _try_acquire_local_dispatch
+    # already incremented local_active_queries and created the dispatch record.
+    if not (session_id and session_explicit):
+        await _increment_local_active_queries(
+            srv,
+            session_key=session_id if session_explicit else None,
+            backend="local",
+        )
 
     # Token accounting
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
@@ -1116,11 +1121,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (asyncio.TimeoutError, Exception):
                                 pass
-                            # If client disconnected, release scheduler slot entirely (LP-0MQTHP828000JYM6)
+                            # Decrement local active queries now that the stream
+                            # has finished (LP-0MR96QL8400022BW: streaming path was
+                            # not decrementing local_active_queries, causing subsequent
+                            # requests to the same session to be rejected with 503).
                             await _release_scheduler_and_decrement(
                                 srv, scheduler, session_id, slot_id,
                                 disconnected=disconnected,
-                                decrement_local=False,
+                                decrement_local=True,
+                                session_explicit=session_explicit,
                             )
 
                     return StreamingResponse(
