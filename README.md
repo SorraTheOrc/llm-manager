@@ -75,3 +75,105 @@ Contributing
 
 License
 - See upstream project for license information.
+
+---
+
+## Session Recording
+
+The proxy automatically records all session message payloads (prompts,
+completions, embeddings) to disk for debugging, auditing, and analysis. 
+Recording is **always on** and uses non-blocking I/O (``asyncio.create_task``)
+to avoid impacting request latency.
+
+### Configuration
+
+Session recording is configured under the ``session_recording`` key in
+``proxy/config.yaml``:
+
+```yaml
+session_recording:
+  path: proxy/session-recordings/   # Directory for recording files
+```
+
+The ``path`` defaults to ``proxy/session-recordings/`` if not specified.
+
+### Directory Structure
+
+Recordings are organized on disk by session ID with timestamps:
+
+```
+<recording-path>/
+  <session-id>/
+    <timestamp>-request.json            # client → proxy (original request)
+    <timestamp>-proxy_to_provider-request.json  # proxy → provider (after processing)
+    <timestamp>-response.json          # provider → client (assembled response)
+```
+
+Each JSON file contains:
+- ``session_id`` — The session identifier
+- ``direction`` — One of ``client_to_proxy``, ``proxy_to_provider``, or ``provider_to_client``
+- ``timestamp`` — ISO8601 timestamp of when the recording was written
+- ``payload`` — The actual request/response message payload
+
+### What gets recorded
+
+- **Client → Proxy**: The original request payload as received from the client
+  (messages, model, stream flag, etc.)
+- **Proxy → Provider**: The request payload after proxy processing
+  (session handling, model overrides, system prompt injection)
+- **Provider → Client**: The final assembled response from the provider.
+  For streaming responses chunks are fully assembled into a single JSON
+  document before writing.
+
+### What is NOT recorded
+
+- HTTP headers (authorization, cookies, internal routing metadata)
+- Proxy-internal secrets or API keys
+- Individual SSE chunks (only the assembled response is recorded)
+
+### Admin Endpoint
+
+Recordings can be listed and retrieved via the admin HTTP API (requires
+access to the proxy server):
+
+```
+# List all sessions with recordings
+GET /admin/sessions
+
+# List recordings for a specific session
+GET /admin/sessions/<session-id>/recordings
+
+# Retrieve a specific recording file
+GET /admin/sessions/<session-id>/recordings/<filename>
+```
+
+Example response for listing recordings:
+
+```json
+{
+  "session_id": "abc-123",
+  "recordings": [
+    {
+      "filename": "2026-07-06T10:00:00.000000-request.json",
+      "timestamp": "2026-07-06T10:00:00.000000",
+      "direction": "client_to_proxy",
+      "file_size": 1234
+    }
+  ]
+}
+```
+
+When a session has no recordings, the endpoint returns HTTP 404 with a
+descriptive message.
+
+### Security Considerations
+
+- Recordings contain user prompts and model responses, which may include
+  PII or sensitive business data.
+- Recordings are stored on the local filesystem only. There is no
+  automatic sharing, network transmission, or cloud upload.
+- The recording directory should be restricted to the user running the
+  proxy (e.g., ``chmod 700``).
+- Cleanup/retention policies should be configured separately to prevent
+  disk space exhaustion. See the ``LP-0MQW94K86004CJ59`` epic for
+  cleanup scripts and retention policies.
