@@ -52,13 +52,23 @@ The body preview automatically filters out messages with `role: "system"` to pre
 
 ## Host-first deployment
 
-The repository uses a host-first startup model for llama-server. Systemd unit files are no longer distributed from the repository, but example units are provided in `docs/systemd/` to help operators deploy and supervise the services.
+The repository supports two deployment models for running llama-server:
 
-### Startup mechanism
+- **Host-first (systemd)** — llama-server runs directly on the host, managed by systemd. The example unit files in `docs/systemd/` call `start-llama.sh` directly for direct host execution.
+- **Proxy-managed (container)** — When the proxy manages llama-server startup via `start_llama_server()` (in `proxy/proxy/lifecycle.py`), it uses the configured `llama_start_script` (default: `scripts/podman_start_llama.sh`) which runs llama-server inside a podman container.
 
-The proxy starts llama-server via the configured `llama_start_script` (default: `scripts/podman_start_llama.sh`). The start script uses podman to create and run a containerized llama-server.
+### Host vs. Container startup
 
-**Startup behavior (from `proxy/proxy/lifecycle.py`):**
+| Mode | How it starts | Managed by | Use case |
+|------|--------------|------------|----------|
+| **Host-first (systemd)** | Systemd unit calls `start-llama.sh` directly on the host | `systemctl --user` or `sudo systemctl` | Production deployments, reboot-safe supervision |
+| **Proxy-managed (container)** | Proxy's `start_llama_server()` runs the configured `llama_start_script` (e.g., `scripts/podman_start_llama.sh`) | Proxy lifecycle | Development, ad-hoc proxy startups via `proxyctl start` |
+
+When `llama_allow_host_fallback` is enabled (see [Configuration](#configuration)), the proxy may attempt a host-direct start as a fallback if the primary startup method (container) fails. If host-direct start also fails, the proxy reports a clear error — distrobox is no longer used as a fallback layer.
+
+### Startup behavior (proxy-managed mode)
+
+The proxy starts llama-server via the configured `llama_start_script` (from `proxy/proxy/lifecycle.py`):
 1. The proxy invokes the configured `llama_start_script` with the target model
 2. If the start script fails, the proxy retries up to 4 times with exponential backoff
 3. If all attempts fail, the proxy reports a clear error message
@@ -68,7 +78,15 @@ The proxy starts llama-server via the configured `llama_start_script` (default: 
 ```yaml
 server:
   llama_start_script: /path/to/start-llama.sh  # Script to start llama-server
+  llama_allow_host_fallback: true               # Allow host-direct start as fallback
 ```
+
+**`llama_allow_host_fallback`** (boolean, default: `true` in the shipped config):
+- When `true`: the proxy may attempt starting llama-server directly on the host (via the configured script) if the primary container-based startup fails.
+- When `false`: the proxy uses only the configured `llama_start_script` (container-based) and does NOT attempt host-direct fallback.
+- To disable host-fallback, set `llama_allow_host_fallback: false` in the `server:` section of `config.yaml`.
+
+> **Note:** When running under systemd (host-first mode), the systemd unit calls `start-llama.sh` directly and bypasses the proxy\'s startup logic entirely. The `llama_allow_host_fallback` config option only affects the proxy-managed startup path.
 
 ### Systemd service units
 
