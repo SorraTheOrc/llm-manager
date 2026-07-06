@@ -25,6 +25,8 @@ def reset_backend_state(monkeypatch):
         },
     )
     monkeypatch.setattr(server, "backend_ready", False)
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries", 0)
     monkeypatch.setattr(
         server,
         "backend_recovery_state",
