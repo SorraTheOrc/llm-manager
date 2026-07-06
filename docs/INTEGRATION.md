@@ -36,15 +36,16 @@ These tests cover:
 ### 2. Live tests (GPU required, opt-in)
 
 These tests require a running llama-server and proxy on the development machine.
-They are skipped by default and must be explicitly enabled:
+They are skipped by default and must be explicitly enabled. Live tests are in
+a separate file to prevent accidental collection during normal test runs:
 
 ```bash
 # Ensure llama-server and proxy are running
 ./scripts/start-llama.sh router
 ./proxy/scripts/start-proxy.sh
 
-# Run live tests
-RUN_LIVE_HOST_FLOW=1 python3 -m pytest proxy/tests/test_host_flow_integration.py -v -m live
+# Run live host-flow tests
+RUN_LIVE_HOST_FLOW=1 python3 -m pytest proxy/tests/test_host_flow_live_e2e.py -v
 ```
 
 Optional environment variables:
