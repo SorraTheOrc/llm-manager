@@ -1389,6 +1389,33 @@ preloads the embeddings model plus the configured primary model. Requests are ro
 to the appropriate model without stopping the server. The router exposes management
 endpoints like `GET /models` and `POST /models/load`.
 
+#### `llama_models_max` — Choosing a value
+
+The `llama_models_max` config option (passed as `--models-max` to llama-server)
+limits how many models can be loaded concurrently in router mode. When a new model
+is requested beyond this limit, llama-server evicts the least-recently-used model
+(triggering an `unload_lru` event). This is normal but excessive eviction/reload
+churn degrades latency.
+
+Recommended values for common setups:
+
+| Setup | `llama_models_max` | Rationale |
+|-------|-------------------|-----------|
+| **Single model** (e.g., one chat model only) | `1` | Only one model needed; no eviction risk. |
+| **Dual model** (embed + one chat model, preloaded both) | `2` | Embeddings + chat model both fit without eviction. |
+| **Multi-model** (3+ models, e.g., embed + several chat models) | `3`–`4` | Allows embed + 2–3 chat models. Monitor eviction rates to tune. |
+| **Heavy multi-model** (5+ models with varied sizes) | `5`–`8` | Requires sufficient GPU memory. Watch for OOM or eviction churn. |
+
+The proxy monitors llama-server logs for `unload_lru` events and emits a warning
+when 3 or more evictions occur within a 5-minute rolling window. The threshold
+is configurable via environment variables:
+
+- `LLAMA_UNLOAD_LRU_WINDOW_MINUTES` — rolling window duration (default: `5`)
+- `LLAMA_UNLOAD_LRU_THRESHOLD` — events that trigger a warning (default: `3`)
+
+If you see eviction warnings, increase `llama_models_max` or reduce the number
+of concurrently used models.
+
 ## Logging
 
 Logs are written with time-based rotation:

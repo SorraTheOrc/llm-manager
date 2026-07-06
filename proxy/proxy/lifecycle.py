@@ -649,6 +649,72 @@ async def router_preload_models(model_names: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Log watcher — monitors llama-server logs for unload_lru eviction events
+# ---------------------------------------------------------------------------
+
+
+def _parse_unload_lru(line):
+    """Check if a log line contains an unload_lru event.
+
+    Returns True if the line contains 'unload_lru', None otherwise.
+    Handles both str and bytes inputs gracefully.
+    """
+    if not isinstance(line, str):
+        try:
+            line = str(line)
+        except Exception:
+            return None
+    if not line:
+        return None
+    if "unload_lru" in line.lower():
+        return True
+    return None
+
+
+class _UnloadLruTracker:
+    """Tracks unload_lru events within a configurable rolling time window.
+
+    Attributes:
+        window_minutes: Rolling window duration (minutes).
+        threshold: Number of events that triggers an alert.
+        alerted: Whether the threshold has been breached since last reset.
+    """
+
+    def __init__(self, window_minutes: int = 5, threshold: int = 3):
+        self.window_minutes = window_minutes
+        self.threshold = threshold
+        self._events: list[datetime] = []
+        self.alerted = False
+
+    def record(self):
+        """Record an unload_lru event at the current time."""
+        self._events.append(datetime.now())
+        self.prune()
+
+    def prune(self):
+        """Remove events outside the rolling window."""
+        cutoff = datetime.now() - timedelta(minutes=self.window_minutes)
+        self._events = [e for e in self._events if e >= cutoff]
+
+    def count(self) -> int:
+        """Return the number of events in the current window."""
+        self.prune()
+        return len(self._events)
+
+
+def _check_unload_lru_threshold(tracker: _UnloadLruTracker) -> bool:
+    """Check if the tracker's event count has reached the threshold.
+
+    Returns True if threshold is met or exceeded, False otherwise.
+    Sets tracker.alerted = True when triggered.
+    """
+    if tracker.count() >= tracker.threshold and not tracker.alerted:
+        tracker.alerted = True
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Spawn helper — extracted from start_llama_server() for testability
 # ---------------------------------------------------------------------------
 
