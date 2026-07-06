@@ -276,6 +276,7 @@ async def _handle_remote_streaming(
     body_json: dict,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    session_id: Optional[str] = None,
 ) -> Response:
     """Handle streaming remote proxy request."""
     client = httpx.AsyncClient(timeout=remote_timeout)
@@ -317,6 +318,13 @@ async def _handle_remote_streaming(
             await client.aclose()
         except Exception:
             pass
+        # Record provider->client response for error path (fire-and-forget)
+        if session_id:
+            _schedule_traffic_recording(
+                session_id=session_id,
+                response_payload=body_bytes,
+            )
+
         return Response(
             content=body_bytes,
             status_code=upstream_status,
@@ -336,6 +344,8 @@ async def _handle_remote_streaming(
         # Client disconnect detection (LP-0MQTHP828000JYM6)
         disconnected = False
         _disconnect_check_count = 0
+        # Collect chunks for session recording (LP-0MR94O16S000WFQ0)
+        collected_chunks = [] if session_id else None
         try:
             async for chunk in response.aiter_bytes():
                 try:
@@ -378,6 +388,8 @@ async def _handle_remote_streaming(
                     except Exception:
                         pass
 
+                if collected_chunks is not None:
+                    collected_chunks.append(chunk)
                 yield chunk
                 log_response_chunk(chunk)
             # Synthesize final SSE event if upstream closed without finish marker.
@@ -391,6 +403,8 @@ async def _handle_remote_streaming(
                 final_bytes = (
                     f"data: {json.dumps(final_obj)}\n\n"
                 ).encode("utf-8")
+                if collected_chunks is not None:
+                    collected_chunks.append(final_bytes)
                 yield final_bytes
                 log_response_chunk(final_bytes)
         except GeneratorExit:
@@ -410,6 +424,14 @@ async def _handle_remote_streaming(
                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
             except (asyncio.TimeoutError, Exception):
                 pass
+
+            # Record provider->client response for streaming path (fire-and-forget)
+            if session_id and collected_chunks is not None:
+                response_body = b"".join(collected_chunks)
+                _schedule_traffic_recording(
+                    session_id=session_id,
+                    response_payload=response_body,
+                )
 
     return StreamingResponse(
         stream_generator(),
