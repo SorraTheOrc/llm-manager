@@ -787,6 +787,33 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
            return None
        cmd = [script_path, model]
 
+    # Host-first startup: if llama_allow_host_fallback is enabled AND the
+    # configured start script is different from the default start-llama.sh,
+    # attempt one host-start before falling back to the configured script.
+    host_start_script = str(Path(__file__).parent.parent / "start-llama.sh")
+    allow_host_fallback = bool(server_config.get("llama_allow_host_fallback", False))
+
+    if allow_host_fallback and script_path != host_start_script:
+        host_cmd = [host_start_script]
+        if router_mode:
+            host_cmd.append("router")
+        elif model is not None:
+            host_cmd.append(model)
+        else:
+            host_cmd.append("router")
+
+        srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
+        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger)
+
+        if host_proc is not None:
+            srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
+            return host_proc
+
+        srv.logger.warning(
+            f"Host-first startup failed (falling back to configured script "
+            f"'{script_path}'): {host_out}"
+        )
+
     # Retry loop configuration
     retries = 4
     backoff = 3  # seconds base
