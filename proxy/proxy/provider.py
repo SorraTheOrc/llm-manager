@@ -456,8 +456,13 @@ def _get_local_concurrency_info(config: dict) -> tuple:
 def _parse_slot_exhaustion(response):
     """Parse a slot-exhaustion response and return slot info.
 
-    Returns a dict with keys 'total_slots' and 'available_slots' when the
-    response indicates slot exhaustion, otherwise returns None.
+    Returns a dict with keys:
+      - total_slots
+      - available_slots
+      - reason (optional)
+      - local_owner_session_id (optional)
+
+    when the response indicates slot exhaustion, otherwise returns None.
 
     Handles two response formats:
 
@@ -480,13 +485,27 @@ def _parse_slot_exhaustion(response):
         if isinstance(error, dict) and error.get("code") == "no_slots_available":
             total = int(body.get("total_slots", 0) or 0)
             avail = int(body.get("available_slots", 0) or 0)
-            return {"total_slots": total, "available_slots": avail}
+            reason = body.get("reason") or error.get("reason")
+            owner = body.get("local_owner_session_id")
+            return {
+                "total_slots": total,
+                "available_slots": avail,
+                "reason": reason,
+                "local_owner_session_id": owner,
+            }
 
         # Format 2: flat top-level code (llama-server native)
         if body.get("code") == "no_slots_available":
             total = int(body.get("total_slots", 0) or 0)
             avail = int(body.get("available_slots", 0) or 0)
-            return {"total_slots": total, "available_slots": avail}
+            reason = body.get("reason")
+            owner = body.get("local_owner_session_id")
+            return {
+                "total_slots": total,
+                "available_slots": avail,
+                "reason": reason,
+                "local_owner_session_id": owner,
+            }
     except Exception:
         pass
     return None
@@ -495,6 +514,25 @@ def _parse_slot_exhaustion(response):
 def _is_slot_exhaustion_response(response) -> bool:
     """Backward-compatible boolean check for slot exhaustion."""
     return _parse_slot_exhaustion(response) is not None
+
+
+def _is_local_lease_active_response(response) -> bool:
+    """Return True when response indicates local lease-active contention."""
+    try:
+        slot_info = _parse_slot_exhaustion(response)
+        if isinstance(slot_info, dict):
+            reason = str(slot_info.get("reason") or "").strip().lower()
+            if reason == "local_lease_active":
+                return True
+    except Exception:
+        pass
+
+    # Fallback heuristic in case payload shape is unexpected.
+    try:
+        body_text = _response_body_text(response).lower()
+        return "local_lease_active" in body_text
+    except Exception:
+        return False
 
 
 def _resolve_provider_with_exclusions(
@@ -550,6 +588,237 @@ def _is_model_loading_response(response: Response, body_text: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Shared fallback primitives (extracted from proxy_with_remote_fallback and
+# proxy_with_fallback to eliminate duplicated state-machine logic)
+# ---------------------------------------------------------------------------
+
+
+def _record_attempt(attempts: List[Dict[str, Any]], **fields) -> None:
+    """Append a diagnostic attempt entry to the attempts list.
+
+    Each entry records which provider was tried, the outcome, and optional
+    diagnostic payload (status code, body snippet, cooldown, etc.).
+    """
+    attempts.append(dict(fields))
+
+
+def _handle_streaming_success(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    attempts: List[Dict[str, Any]],
+    prev_provider: Optional[str],
+    fallback_reason: Optional[str],
+    path: str,
+) -> Optional[Response]:
+    """If *response* is a 2xx StreamingResponse, record the attempt, add
+    the ``X-Provider`` header, log the fallback (if one occurred), and
+    return the augmented response.
+
+    Returns ``None`` if *response* is **not** a streaming success (caller
+    should continue normal processing).
+    """
+    if _is_streaming_response(response) and int(getattr(response, "status_code", 0) or 0) < 400:
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="streaming_success",
+            status_code=int(getattr(response, "status_code", 0) or 0),
+        )
+        result = _add_provider_header(response, provider_name)
+        if prev_provider:
+            logger.info(
+                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                path, prev_provider, provider_name, fallback_reason or "streaming",
+            )
+        return result
+    return None
+
+
+def _build_fallback_success_response(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    attempts: List[Dict[str, Any]],
+    prev_provider: Optional[str],
+    fallback_reason: Optional[str],
+    path: str,
+    body_text: str = "",
+    status_override: str = "success",
+) -> Response:
+    """Record a successful provider attempt, add the ``X-Provider`` header,
+    log the fallback (if one occurred), and return the augmented response.
+
+    This is the normal (non-streaming) success path used by both fallback
+    entrypoints when a provider returns a successful response.
+    """
+    _record_attempt(
+        attempts,
+        provider=provider_name,
+        type=provider_type,
+        status=status_override,
+        status_code=int(getattr(response, "status_code", 0) or 0),
+        body_snippet=(body_text[:512] if body_text else None),
+    )
+    result = _add_provider_header(response, provider_name)
+    if prev_provider:
+        logger.info(
+            "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+            path,
+            prev_provider,
+            provider_name,
+            fallback_reason or "unknown",
+        )
+    return result
+
+
+def _handle_connection_error_in_fallback(
+    exc: Exception,
+    provider_name: str,
+    provider_type: str,
+    cooldown_seconds: float,
+    attempts: List[Dict[str, Any]],
+) -> bool:
+    """If *exc* is a connection error, mark the provider unavailable, record
+    a diagnostic attempt entry, and return ``True`` (caller should ``continue``
+    to the next provider).
+
+    Returns ``False`` if *exc* is **not** a connection error (caller should
+    re-raise or handle differently).
+    """
+    if _is_connection_error(exc):
+        mark_provider_unavailable(provider_name, cooldown_seconds)
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="connection_error",
+            error=str(type(exc).__name__),
+        )
+        return True
+    return False
+
+
+def _handle_http_error_with_cooldown(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    cooldown_seconds: float,
+    attempts: List[Dict[str, Any]],
+    body_text: str,
+) -> float:
+    """Handle an HTTP error response: compute effective cooldown, mark the
+    provider unavailable, record a diagnostic attempt entry, and return the
+    effective cooldown duration.
+
+    The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
+    and ``all_slot_exhaustion`` after calling this function, and for issuing
+    ``continue``.
+    """
+    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+    mark_provider_unavailable(provider_name, effective_cooldown)
+    _record_attempt(
+        attempts,
+        provider=provider_name,
+        type=provider_type,
+        status="http_error",
+        status_code=int(response.status_code),
+        body_snippet=(body_text[:512] if body_text else None),
+        cooldown_seconds=effective_cooldown,
+    )
+    return effective_cooldown
+
+
+def _handle_empty_response_with_cooldown(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    cooldown_seconds: float,
+    attempts: List[Dict[str, Any]],
+    body_text: str,
+) -> float:
+    """Handle an empty (non-reasoning) successful response: compute effective
+    cooldown, mark the provider unavailable, record a diagnostic attempt entry,
+    and return the effective cooldown duration.
+
+    The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
+    and ``all_slot_exhaustion`` after calling this function, and for issuing
+    ``continue``.
+    """
+    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
+    mark_provider_unavailable(provider_name, effective_cooldown)
+    _record_attempt(
+        attempts,
+        provider=provider_name,
+        type=provider_type,
+        status="empty_response",
+        status_code=int(getattr(response, "status_code", 0) or 0),
+        body_snippet=(body_text[:512] if body_text else None),
+        cooldown_seconds=effective_cooldown,
+    )
+    return effective_cooldown
+
+
+def _resolve_reasoning_content_promotion(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    attempts: List[Dict[str, Any]],
+    prev_provider: Optional[str],
+    fallback_reason: Optional[str],
+    path: str,
+    body_text: str,
+) -> Optional[Response]:
+    """If the response body contains ``reasoning_content``, treat this
+    empty-but-meaningful response as a success (promote it).  Records the
+    attempt, adds the provider header, logs the fallback, and returns the
+    augmented response.
+
+    Returns ``None`` if the body does **not** contain ``reasoning_content``
+    (caller should continue with empty-response cooldown logic).
+    """
+    body_l = (body_text or "").lower()
+    if "reasoning_content" in body_l:
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="promoted_reasoning",
+            status_code=int(getattr(response, "status_code", 0) or 0),
+            body_snippet=(body_text[:512] if body_text else None),
+        )
+        result = _add_provider_header(response, provider_name)
+        if prev_provider:
+            logger.info(
+                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                path,
+                prev_provider,
+                provider_name,
+                fallback_reason or "promoted_reasoning",
+            )
+        return result
+    return None
+
+
+def _log_exhausted_providers(model_config: dict, path: str) -> Dict[str, int]:
+    """Log diagnostic details about which providers are in cooldown and return
+    the mapping of provider name to remaining cooldown seconds.
+    """
+    unavailable: Dict[str, int] = {}
+    try:
+        provider_names = [p.get("name") for p in model_config.get("providers", []) if isinstance(p, dict)]
+        for n in provider_names:
+            exp = _provider_unavailable_until.get(n)
+            if exp:
+                unavailable[n] = int(max(0, exp - time.time()))
+        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
+    except Exception:
+        pass
+    return unavailable
+
+
 async def proxy_with_remote_fallback(
     request,
     path: str,
@@ -583,7 +852,6 @@ async def proxy_with_remote_fallback(
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
-    unavailable: Dict[str, int] = {}
     attempted_provider_names: set[str] = set()
 
     # Preserve first model-loading response so single-provider models
@@ -601,24 +869,37 @@ async def proxy_with_remote_fallback(
         try:
             # Mark that we attempted this provider
             any_provider_tried = True
+
+            # Proactive rate-limit check for remote providers
+            provider_rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
+            if provider_rpm > 0:
+                from proxy.rate_limiter import get_rate_limiter
+                allowed = await get_rate_limiter().check_and_increment(
+                    provider_name, provider_rpm, window_seconds=60
+                )
+                if not allowed:
+                    logger.warning(
+                        "Rate limited: skipping provider=%s model=%s (limit=%d rpm)",
+                        provider_name, path, provider_rpm,
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type="remote",
+                        status="rate_limited",
+                        status_code=429,
+                    )
+                    continue
+
             response = await ptr(request, path, provider_cfg)
 
-            # A 2xx StreamingResponse cannot be inspected for emptiness (its
-            # body is an async generator). Treat it as success and return it.
-            if _is_streaming_response(response) and int(getattr(response, "status_code", 0) or 0) < 400:
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "streaming_success",
-                    "status_code": int(getattr(response, "status_code", 0) or 0),
-                })
-                result = _add_provider_header(response, provider_name)
-                if prev_provider:
-                    logger.info(
-                        "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
-                        path, prev_provider, provider_name, fallback_reason or "streaming",
-                    )
-                return result
+            # Shared primitive: handle streaming success
+            stream_result = _handle_streaming_success(
+                response, provider_name, provider_type, attempts,
+                prev_provider, fallback_reason, path,
+            )
+            if stream_result is not None:
+                return stream_result
 
             # Safely extract a small body snippet for diagnostics
             body_text = _response_body_text(response)
@@ -630,30 +911,24 @@ async def proxy_with_remote_fallback(
                     prev_provider = provider_name
                     if first_model_loading_response is None:
                         first_model_loading_response = response
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "model_loading",
-                        "status_code": int(response.status_code),
-                        "body_snippet": (body_text[:512] if body_text else None),
-                    })
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="model_loading",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                    )
                     all_slot_exhaustion = False
                     continue
 
-                effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                mark_provider_unavailable(provider_name, effective_cooldown)
+                # Shared primitive: HTTP error with cooldown
+                _handle_http_error_with_cooldown(
+                    response, provider_name, provider_type,
+                    cooldown_seconds, attempts, body_text,
+                )
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
-                # Record diagnostic
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "http_error",
-                    "status_code": int(response.status_code),
-                    "body_snippet": (body_text[:512] if body_text else None),
-                    "cooldown_seconds": effective_cooldown,
-                })
-                # Track whether the failure was slot-exhaustion-like
                 if response.status_code != 429:
                     all_slot_exhaustion = False
                 continue
@@ -666,98 +941,49 @@ async def proxy_with_remote_fallback(
                 except Exception:
                     resp_json = None
                 if _is_empty_response(body_text or '', resp_json):
-                    # If the upstream included reasoning_content in the payload,
-                    # promote it and return success instead of marking provider down.
-                    body_l = (body_text or "").lower()
-                    if "reasoning_content" in body_l:
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "promoted_reasoning",
-                            "status_code": int(getattr(response, 'status_code', 0) or 0),
-                            "body_snippet": (body_text[:512] if body_text else None),
-                        })
-                        result = _add_provider_header(response, provider_name)
-                        if prev_provider:
-                            logger.info(
-                                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
-                                path,
-                                prev_provider,
-                                provider_name,
-                                fallback_reason or "promoted_reasoning",
-                            )
-                        return result
+                    # Shared primitive: check for reasoning_content promotion
+                    promoted = _resolve_reasoning_content_promotion(
+                        response, provider_name, provider_type, attempts,
+                        prev_provider, fallback_reason, path, body_text,
+                    )
+                    if promoted is not None:
+                        return promoted
 
-                    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                    mark_provider_unavailable(provider_name, effective_cooldown)
+                    # Shared primitive: empty response with cooldown
+                    _handle_empty_response_with_cooldown(
+                        response, provider_name, provider_type,
+                        cooldown_seconds, attempts, body_text,
+                    )
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "empty_response",
-                        "status_code": int(getattr(response, 'status_code', 0) or 0),
-                        "body_snippet": (body_text[:512] if body_text else None),
-                        "cooldown_seconds": effective_cooldown,
-                    })
                     all_slot_exhaustion = False
                     continue
             except Exception:
                 pass
 
-            # Success — record diagnostic and return
-            attempts.append({
-                "provider": provider_name,
-                "type": provider_type,
-                "status": "success",
-                "status_code": int(getattr(response, 'status_code', 0) or 0),
-                "body_snippet": (body_text[:512] if body_text else None),
-            })
-
-            result = _add_provider_header(response, provider_name)
-            if prev_provider:
-                logger.info(
-                    "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
-                    path,
-                    prev_provider,
-                    provider_name,
-                    fallback_reason or "unknown",
-                )
-            return result
+            # Shared primitive: success path
+            return _build_fallback_success_response(
+                response, provider_name, provider_type, attempts,
+                prev_provider, fallback_reason, path, body_text,
+            )
 
         except Exception as exc:
-            # Connection errors: mark provider unavailable and continue
-            if _is_connection_error(exc):
+            # Shared primitive: handle connection errors
+            if _handle_connection_error_in_fallback(
+                exc, provider_name, provider_type, cooldown_seconds, attempts,
+            ):
                 any_provider_tried = True
-                mark_provider_unavailable(provider_name, cooldown_seconds)
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "connection_error",
-                    "error": str(type(exc).__name__),
-                })
                 all_slot_exhaustion = False
                 continue
             # Non-connection error — propagate
             raise
 
-    # All providers exhausted
-    # Log diagnostic details about provider cooldowns to aid troubleshooting
-    try:
-        provider_names = [p.get('name') for p in model_config.get('providers', []) if isinstance(p, dict)]
-        unavailable = {}
-        for n in provider_names:
-            exp = _provider_unavailable_until.get(n)
-            if exp:
-                unavailable[n] = int(max(0, exp - time.time()))
-        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
-    except Exception:
-        pass
+    # All providers exhausted — log diagnostic details
+    unavailable = _log_exhausted_providers(model_config, path)
 
     if not any_provider_tried:
-        # No providers were available at all (all in cooldown or none defined)
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
 
     if first_model_loading_response is not None:
@@ -818,11 +1044,26 @@ async def proxy_with_fallback(
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
-    unavailable: Dict[str, int] = {}
     attempted_provider_names: set[str] = set()
 
     while True:
         provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
+        if provider_cfg is None and fallback_reason == "local_lease_active":
+            # Local lease-active is expected contention, not provider failure.
+            # For transparent fallback, allow trying the next remote provider
+            # even if it is currently in cooldown.
+            providers = model_config.get("providers") or []
+            for candidate in providers:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_name = candidate.get("name", "")
+                if candidate_name in attempted_provider_names:
+                    continue
+                if candidate.get("type") != "remote":
+                    continue
+                provider_cfg = candidate
+                break
+
         if provider_cfg is None:
             break
 
@@ -838,11 +1079,12 @@ async def proxy_with_fallback(
                 # idle slots, skip local provider immediately without marking
                 # it as unavailable — the provider is busy, not failed.
                 if not _get_scheduler_has_idle_slot():
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "slot_busy_skip_queue",
-                    })
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="slot_busy_skip_queue",
+                    )
                     fallback_reason = "slot_busy_skip_queue"
                     prev_provider = provider_name
                     continue
@@ -852,42 +1094,63 @@ async def proxy_with_fallback(
                 # provider without marking local as unavailable.
                 cur_local, max_local = _get_local_concurrency_info(config)
                 if cur_local >= max_local:
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "local_concurrency_limit",
-                        "active": cur_local,
-                        "max": max_local,
-                    })
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="local_concurrency_limit",
+                        active=cur_local,
+                        max=max_local,
+                    )
                     fallback_reason = "local_concurrency_limit"
                     prev_provider = provider_name
                     continue
 
                 response = await ptr_local(request, path)
             else:
+                # Proactive rate-limit check for remote providers
+                # (LP-0MQNRDUP4008KT6T: rate limiter for remote models)
+                provider_rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
+                if provider_rpm > 0:
+                    from proxy.rate_limiter import get_rate_limiter
+                    allowed = await get_rate_limiter().check_and_increment(
+                        provider_name, provider_rpm, window_seconds=60
+                    )
+                    if not allowed:
+                        logger.warning(
+                            "Rate limited: skipping provider=%s model=%s (limit=%d rpm)",
+                            provider_name, path, provider_rpm,
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type="remote",
+                            status="rate_limited",
+                            status_code=429,
+                        )
+                        fallback_reason = "rate_limited"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
+
                 response = await ptr_remote(request, path, provider_cfg)
 
-            # A 2xx StreamingResponse cannot be inspected for emptiness (its
-            # body is an async generator). Treat it as success and return it.
-            if _is_streaming_response(response) and int(getattr(response, "status_code", 0) or 0) < 400:
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "streaming_success",
-                    "status_code": int(getattr(response, "status_code", 0) or 0),
-                })
-                result = _add_provider_header(response, provider_name)
-                if prev_provider:
-                    logger.info(
-                        "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
-                        path, prev_provider, provider_name, fallback_reason or "streaming",
-                    )
-                return result
+            # Shared primitive: handle streaming success
+            stream_result = _handle_streaming_success(
+                response, provider_name, provider_type, attempts,
+                prev_provider, fallback_reason, path,
+            )
+            if stream_result is not None:
+                return stream_result
 
             # Capture the first non-success response so we can return it when
             # all providers are exhausted (instead of the generic exhausted message).
+            # Do not capture local slot-exhaustion responses here — they are
+            # routing signals (busy/lease-active), not terminal provider errors.
             if _first_error_response is None and response.status_code >= 400:
-                _first_error_response = response
+                _first_slot_info = _parse_slot_exhaustion(response)
+                if not (provider_type == "local" and _first_slot_info is not None):
+                    _first_error_response = response
 
             # Extract small response snippet for diagnostics
             body_text = _response_body_text(response)
@@ -895,6 +1158,26 @@ async def proxy_with_fallback(
             # Check for slot exhaustion (local model)
             slot_info = _parse_slot_exhaustion(response)
             if slot_info:
+                slot_reason = str(slot_info.get("reason") or "").strip().lower()
+
+                # Lease-aware behavior: when local is reserved for another
+                # session, do not retry local and do not put local in cooldown.
+                # Route to the next provider in the chain immediately.
+                if provider_type == "local" and slot_reason == "local_lease_active":
+                    fallback_reason = "local_lease_active"
+                    prev_provider = provider_name
+                    total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
+                    available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="local_lease_active",
+                        slot_info=slot_info,
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
                 # Optional local retry window for startup races where router/model
                 # is loaded but slot probes briefly report 0 available.
                 if provider_type == "local" and local_slot_retry_attempts > 0:
@@ -907,17 +1190,23 @@ async def proxy_with_fallback(
                         retry_body_text = _response_body_text(retry_response)
                         retry_slot_info = _parse_slot_exhaustion(retry_response)
 
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "slot_exhaustion_retry",
-                            "retry_attempt": retry_idx,
-                            "status_code": int(getattr(retry_response, "status_code", 0) or 0),
-                            "slot_info": retry_slot_info,
-                            "body_snippet": (retry_body_text[:512] if retry_body_text else None),
-                        })
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="slot_exhaustion_retry",
+                            retry_attempt=retry_idx,
+                            status_code=int(getattr(retry_response, "status_code", 0) or 0),
+                            slot_info=retry_slot_info,
+                            body_snippet=(retry_body_text[:512] if retry_body_text else None),
+                        )
 
                         if retry_slot_info:
+                            # Preserve lease-aware semantics during retry loop.
+                            retry_reason = str(retry_slot_info.get("reason") or "").strip().lower()
+                            if retry_reason == "local_lease_active":
+                                slot_info = retry_slot_info
+                                break
                             slot_info = retry_slot_info
                             continue
 
@@ -931,17 +1220,36 @@ async def proxy_with_fallback(
                         # Continue evaluating updated response below.
                         pass
                     else:
+                        # If retries ended with lease-active, skip cooldown and
+                        # route to next provider immediately.
+                        final_reason = str((slot_info or {}).get("reason") or "").strip().lower()
+                        if provider_type == "local" and final_reason == "local_lease_active":
+                            fallback_reason = "local_lease_active"
+                            prev_provider = provider_name
+                            total_slots_sum += int((slot_info or {}).get("total_slots", 0) or 0)
+                            available_slots_sum += int((slot_info or {}).get("available_slots", 0) or 0)
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_lease_active",
+                                slot_info=slot_info,
+                            )
+                            all_slot_exhaustion = False
+                            continue
+
                         mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
                         fallback_reason = "slot_exhaustion"
                         prev_provider = provider_name
                         total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
                         available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "slot_exhaustion",
-                            "slot_info": slot_info,
-                        })
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="slot_exhaustion",
+                            slot_info=slot_info,
+                        )
                         continue
                 else:
                     mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
@@ -949,12 +1257,13 @@ async def proxy_with_fallback(
                     prev_provider = provider_name
                     total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
                     available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "slot_exhaustion",
-                        "slot_info": slot_info,
-                    })
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="slot_exhaustion",
+                        slot_info=slot_info,
+                    )
                     continue
 
             # Check for HTTP error status
@@ -962,13 +1271,14 @@ async def proxy_with_fallback(
                 if _is_model_loading_response(response, body_text):
                     fallback_reason = "model_loading"
                     prev_provider = provider_name
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "model_loading",
-                        "status_code": int(response.status_code),
-                        "body_snippet": (body_text[:512] if body_text else None),
-                    })
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="model_loading",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                    )
                     all_slot_exhaustion = False
                     continue
 
@@ -981,14 +1291,15 @@ async def proxy_with_fallback(
 
                         retry_response = await ptr_local(request, path)
                         retry_body_text = _response_body_text(retry_response)
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "local_http_retry",
-                            "retry_attempt": retry_idx,
-                            "status_code": int(getattr(retry_response, "status_code", 0) or 0),
-                            "body_snippet": (retry_body_text[:512] if retry_body_text else None),
-                        })
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_http_retry",
+                            retry_attempt=retry_idx,
+                            status_code=int(getattr(retry_response, "status_code", 0) or 0),
+                            body_snippet=(retry_body_text[:512] if retry_body_text else None),
+                        )
 
                         response = retry_response
                         body_text = retry_body_text
@@ -998,13 +1309,14 @@ async def proxy_with_fallback(
                     if _is_model_loading_response(response, body_text):
                         fallback_reason = "model_loading"
                         prev_provider = provider_name
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "model_loading",
-                            "status_code": int(response.status_code),
-                            "body_snippet": (body_text[:512] if body_text else None),
-                        })
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="model_loading",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                        )
                         all_slot_exhaustion = False
                         continue
 
@@ -1017,28 +1329,24 @@ async def proxy_with_fallback(
                     if provider_type == "local" and 400 <= int(response.status_code) < 500:
                         fallback_reason = f"HTTP {response.status_code}"
                         prev_provider = provider_name
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "http_error_no_cooldown",
-                            "status_code": int(response.status_code),
-                            "body_snippet": (body_text[:512] if body_text else None),
-                        })
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="http_error_no_cooldown",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                        )
                         all_slot_exhaustion = False
                         continue
 
-                    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                    mark_provider_unavailable(provider_name, effective_cooldown)
+                    # Shared primitive: HTTP error with cooldown
+                    _handle_http_error_with_cooldown(
+                        response, provider_name, provider_type,
+                        cooldown_seconds, attempts, body_text,
+                    )
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
-                    attempts.append({
-                        "provider": provider_name,
-                        "type": provider_type,
-                        "status": "http_error",
-                        "status_code": int(response.status_code),
-                        "body_snippet": (body_text[:512] if body_text else None),
-                        "cooldown_seconds": effective_cooldown,
-                    })
                     if response.status_code != 429:
                         all_slot_exhaustion = False
                     continue
@@ -1051,27 +1359,13 @@ async def proxy_with_fallback(
                 except Exception:
                     resp_json = None
                 if _is_empty_response(body_text or '', resp_json):
-                    # If the upstream included reasoning_content in the payload,
-                    # promote it and return success instead of marking provider down.
-                    body_l = (body_text or "").lower()
-                    if "reasoning_content" in body_l:
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "promoted_reasoning",
-                            "status_code": int(getattr(response, 'status_code', 0) or 0),
-                            "body_snippet": (body_text[:512] if body_text else None),
-                        })
-                        result = _add_provider_header(response, provider_name)
-                        if prev_provider:
-                            logger.info(
-                                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
-                                path,
-                                prev_provider,
-                                provider_name,
-                                fallback_reason or "promoted_reasoning",
-                            )
-                        return result
+                    # Shared primitive: check for reasoning_content promotion
+                    promoted = _resolve_reasoning_content_promotion(
+                        response, provider_name, provider_type, attempts,
+                        prev_provider, fallback_reason, path, body_text,
+                    )
+                    if promoted is not None:
+                        return promoted
 
                     # Local empty 200 can be transient (slot busy/cancelled
                     # right after a previous request). Retry locally before
@@ -1083,14 +1377,15 @@ async def proxy_with_fallback(
                                 await asyncio.sleep(local_slot_retry_delay_seconds)
                             retry_response = await ptr_local(request, path)
                             retry_body_text = _response_body_text(retry_response)
-                            attempts.append({
-                                "provider": provider_name,
-                                "type": provider_type,
-                                "status": "local_empty_retry",
-                                "retry_attempt": retry_idx,
-                                "status_code": int(getattr(retry_response, "status_code", 0) or 0),
-                                "body_snippet": (retry_body_text[:512] if retry_body_text else None),
-                            })
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_empty_retry",
+                                retry_attempt=retry_idx,
+                                status_code=int(getattr(retry_response, "status_code", 0) or 0),
+                                body_snippet=(retry_body_text[:512] if retry_body_text else None),
+                            )
                             try:
                                 retry_resp_json = json.loads(retry_body_text) if retry_body_text else None
                             except Exception:
@@ -1102,84 +1397,52 @@ async def proxy_with_fallback(
                                 break
 
                         if resolved_after_empty_retry:
-                            body_l2 = (body_text or "").lower()
-                            if "reasoning_content" in body_l2:
-                                attempts.append({
-                                    "provider": provider_name,
-                                    "type": provider_type,
-                                    "status": "promoted_reasoning",
-                                    "status_code": int(getattr(response, 'status_code', 0) or 0),
-                                    "body_snippet": (body_text[:512] if body_text else None),
-                                })
-                                result = _add_provider_header(response, provider_name)
-                                return result
+                            # Shared primitive: check reasoning_content after retry
+                            promoted2 = _resolve_reasoning_content_promotion(
+                                response, provider_name, provider_type, attempts,
+                                prev_provider, fallback_reason, path, body_text,
+                            )
+                            if promoted2 is not None:
+                                return promoted2
                             # Fall through to success path below.
                             pass
                         else:
-                            effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                            mark_provider_unavailable(provider_name, effective_cooldown)
+                            # Shared primitive: empty response with cooldown
+                            _handle_empty_response_with_cooldown(
+                                response, provider_name, provider_type,
+                                cooldown_seconds, attempts, body_text,
+                            )
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
-                            attempts.append({
-                                "provider": provider_name,
-                                "type": provider_type,
-                                "status": "empty_response",
-                                "status_code": int(getattr(response, 'status_code', 0) or 0),
-                                "body_snippet": (body_text[:512] if body_text else None),
-                                "cooldown_seconds": effective_cooldown,
-                            })
                             all_slot_exhaustion = False
                             continue
                     else:
-                        effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-                        mark_provider_unavailable(provider_name, effective_cooldown)
+                        # Shared primitive: empty response with cooldown
+                        _handle_empty_response_with_cooldown(
+                            response, provider_name, provider_type,
+                            cooldown_seconds, attempts, body_text,
+                        )
                         fallback_reason = "empty_response"
                         prev_provider = provider_name
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "empty_response",
-                            "status_code": int(getattr(response, 'status_code', 0) or 0),
-                            "body_snippet": (body_text[:512] if body_text else None),
-                            "cooldown_seconds": effective_cooldown,
-                        })
                         all_slot_exhaustion = False
                         continue
             except Exception:
                 pass
 
-            # Success — record diagnostic and return
-            attempts.append({
-                "provider": provider_name,
-                "type": provider_type,
-                "status": "success",
-                "status_code": int(getattr(response, 'status_code', 0) or 0),
-                "body_snippet": (body_text[:512] if body_text else None),
-            })
-
-            result = _add_provider_header(response, provider_name)
-            if prev_provider:
-                logger.info(
-                    "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
-                    path,
-                    prev_provider,
-                    provider_name,
-                    fallback_reason or "unknown",
-                )
-            return result
+            # Shared primitive: success path
+            return _build_fallback_success_response(
+                response, provider_name, provider_type, attempts,
+                prev_provider, fallback_reason, path, body_text,
+            )
 
         except Exception as exc:
-            if _is_connection_error(exc):
+            # Shared primitive: handle connection errors
+            if _handle_connection_error_in_fallback(
+                exc, provider_name, provider_type, cooldown_seconds, attempts,
+            ):
                 any_provider_tried = True
-                mark_provider_unavailable(provider_name, cooldown_seconds)
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "connection_error",
-                    "error": str(type(exc).__name__),
-                })
                 all_slot_exhaustion = False
                 continue
             # HTTPException from the local provider (e.g., backend busy, slot
@@ -1202,23 +1465,25 @@ async def proxy_with_fallback(
                             retry_response = await ptr_local(request, path)
                         except Exception as inner_exc:
                             retry_exc = inner_exc
-                            attempts.append({
-                                "provider": provider_name,
-                                "type": provider_type,
-                                "status": "local_http_exception_retry",
-                                "retry_attempt": retry_idx,
-                                "error": str(type(inner_exc).__name__),
-                            })
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_http_exception_retry",
+                                retry_attempt=retry_idx,
+                                error=str(type(inner_exc).__name__),
+                            )
                             continue
                         retry_exc = None
                         resolved_response = retry_response
-                        attempts.append({
-                            "provider": provider_name,
-                            "type": provider_type,
-                            "status": "local_http_exception_retry",
-                            "retry_attempt": retry_idx,
-                            "status_code": int(getattr(retry_response, "status_code", 0) or 0),
-                        })
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_http_exception_retry",
+                            retry_attempt=retry_idx,
+                            status_code=int(getattr(retry_response, "status_code", 0) or 0),
+                        )
                         break
 
                     if retry_exc is None and resolved_response is not None:
@@ -1229,14 +1494,11 @@ async def proxy_with_fallback(
                         slot_info = _parse_slot_exhaustion(response)
                         if slot_info is None and not _is_http_error_status(response.status_code):
                             # Success — record and return below via normal path.
-                            attempts.append({
-                                "provider": provider_name,
-                                "type": provider_type,
-                                "status": "success_after_http_exception_retry",
-                                "status_code": int(getattr(response, "status_code", 0) or 0),
-                            })
-                            result = _add_provider_header(response, provider_name)
-                            return result
+                            return _build_fallback_success_response(
+                                response, provider_name, provider_type, attempts,
+                                prev_provider, fallback_reason, path, body_text,
+                                status_override="success_after_http_exception_retry",
+                            )
                         # Retry produced a response but still slot-exhaustion/error;
                         # fall through to normal handling by continuing the loop.
                         continue
@@ -1260,30 +1522,21 @@ async def proxy_with_fallback(
                 mark_provider_unavailable(provider_name, cooldown_seconds)
                 fallback_reason = f"HTTPException {exc.status_code}"
                 prev_provider = provider_name
-                attempts.append({
-                    "provider": provider_name,
-                    "type": provider_type,
-                    "status": "http_exception",
-                    "status_code": exc.status_code,
-                    "error": str(exc),
-                })
+                _record_attempt(
+                    attempts,
+                    provider=provider_name,
+                    type=provider_type,
+                    status="http_exception",
+                    status_code=exc.status_code,
+                    error=str(exc),
+                )
                 all_slot_exhaustion = False
                 continue
             # Non-connection error — propagate
             raise
 
-    # All providers exhausted
-    # Log diagnostic details about provider cooldowns to aid troubleshooting
-    try:
-        provider_names = [p.get('name') for p in model_config.get('providers', []) if isinstance(p, dict)]
-        unavailable = {}
-        for n in provider_names:
-            exp = _provider_unavailable_until.get(n)
-            if exp:
-                unavailable[n] = int(max(0, exp - time.time()))
-        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
-    except Exception:
-        pass
+    # All providers exhausted — log diagnostic details
+    unavailable = _log_exhausted_providers(model_config, path)
 
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
@@ -1297,12 +1550,27 @@ async def proxy_with_fallback(
     # message.  This preserves the real error (e.g. backend_unavailable,
     # concurrency limit, slot exhaustion, backend error) that the client
     # would have received from a single-provider model or direct call.
+    #
+    # Exception: if the first error is local lease-active contention and the
+    # model has remote providers, do not return that local routing signal to
+    # clients; prefer generic exhausted/remote error semantics.
     if _first_error_response is not None:
-        logger.info(
-            "Returning first provider error response instead of generic exhausted "
-            "message for model=%s (status=%s)",
-            path, _first_error_response.status_code,
+        has_remote_provider = any(
+            isinstance(p, dict) and p.get("type") == "remote"
+            for p in (model_config.get("providers") or [])
         )
-        return _first_error_response
+        if has_remote_provider and _is_local_lease_active_response(_first_error_response):
+            logger.info(
+                "Suppressing local_lease_active first error response for model=%s; "
+                "remote fallback chain present",
+                path,
+            )
+        else:
+            logger.info(
+                "Returning first provider error response instead of generic exhausted "
+                "message for model=%s (status=%s)",
+                path, _first_error_response.status_code,
+            )
+            return _first_error_response
 
     return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)

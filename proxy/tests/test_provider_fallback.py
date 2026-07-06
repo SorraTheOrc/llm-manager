@@ -2653,3 +2653,197 @@ async def test_plan_fallback_all_exhausted_with_go_tier_error():
         "opencode-deepseek-free",
         "opencode-go-deepseek",
     ], f"Expected all providers tried, got: {call_log}"
+
+
+# ===================================================================
+# Parity tests for shared fallback primitives
+# ===================================================================
+
+
+class TestSharedFallbackPrimitives:
+    """Parity tests for the extracted shared fallback primitive functions.
+
+    These functions were extracted from ``proxy_with_remote_fallback()`` and
+    ``proxy_with_fallback()`` to eliminate duplicated state-machine logic.
+    The tests verify each primitive behaves correctly in isolation.
+    """
+
+    def test_record_attempt_stores_all_fields(self):
+        """_record_attempt appends a correctly structured dict."""
+        attempts = []
+        provider._record_attempt(
+            attempts,
+            provider="test-provider",
+            type="remote",
+            status="test_status",
+            status_code=200,
+            body_snippet="ok",
+        )
+        assert len(attempts) == 1
+        entry = attempts[0]
+        assert entry["provider"] == "test-provider"
+        assert entry["type"] == "remote"
+        assert entry["status"] == "test_status"
+        assert entry["status_code"] == 200
+        assert entry["body_snippet"] == "ok"
+
+    def test_record_attempt_multiple_entries(self):
+        """_record_attempt appends entries in order."""
+        attempts = []
+        provider._record_attempt(attempts, provider="p1", type="local", status="first")
+        provider._record_attempt(attempts, provider="p2", type="remote", status="second")
+        assert len(attempts) == 2
+        assert attempts[0]["provider"] == "p1"
+        assert attempts[1]["provider"] == "p2"
+
+    @pytest.mark.asyncio
+    async def test_handle_streaming_success_returns_response(self):
+        """_handle_streaming_success returns augmented response for streaming 2xx."""
+        from fastapi.responses import StreamingResponse
+        async def dummy_stream():
+            yield b"test"
+        response = StreamingResponse(dummy_stream(), status_code=200)
+        attempts = []
+        result = provider._handle_streaming_success(
+            response, "test-provider", "remote", attempts,
+            prev_provider=None, fallback_reason=None, path="v1/test",
+        )
+        assert result is not None
+        assert result.headers.get("X-Provider") == "test-provider"
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "streaming_success"
+
+    @pytest.mark.asyncio
+    async def test_handle_streaming_success_returns_none_for_non_streaming(self):
+        """_handle_streaming_success returns None for non-streaming response."""
+        response = Response(content=b"plain", status_code=200)
+        attempts = []
+        result = provider._handle_streaming_success(
+            response, "test-provider", "remote", attempts,
+            prev_provider=None, fallback_reason=None, path="v1/test",
+        )
+        assert result is None
+        assert len(attempts) == 0
+
+    def test_handle_connection_error_returns_true_and_records(self):
+        """_handle_connection_error_in_fallback returns True and records entry."""
+        attempts = []
+        exc = httpx.ConnectError("Connection refused")
+        result = provider._handle_connection_error_in_fallback(
+            exc, "test-provider", "remote", 60.0, attempts,
+        )
+        assert result is True
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "connection_error"
+        assert provider._is_provider_unavailable("test-provider")
+
+    def test_handle_connection_error_returns_false_for_other_exceptions(self):
+        """_handle_connection_error_in_fallback returns False for non-connection errors."""
+        attempts = []
+        exc = ValueError("Not a connection error")
+        result = provider._handle_connection_error_in_fallback(
+            exc, "test-provider", "remote", 60.0, attempts,
+        )
+        assert result is False
+        assert len(attempts) == 0
+
+    def test_handle_http_error_with_cooldown_marks_unavailable(self):
+        """_handle_http_error_with_cooldown marks provider and records attempt."""
+        provider._provider_unavailable_until.clear()
+        attempts = []
+        response = Response(status_code=502, content=b"Bad gateway")
+        cooldown = provider._handle_http_error_with_cooldown(
+            response, "test-provider", "remote", 60.0, attempts, "bad gateway",
+        )
+        assert cooldown >= 60.0
+        assert provider._is_provider_unavailable("test-provider")
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "http_error"
+
+    def test_handle_empty_response_with_cooldown_marks_unavailable(self):
+        """_handle_empty_response_with_cooldown marks provider and records attempt."""
+        provider._provider_unavailable_until.clear()
+        attempts = []
+        response = Response(status_code=200, content=b"{}")
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "test-provider", "remote", 60.0, attempts, "{}",
+        )
+        assert cooldown >= 60.0
+        assert provider._is_provider_unavailable("test-provider")
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "empty_response"
+
+    def test_resolve_reasoning_content_promotion_matches(self):
+        """_resolve_reasoning_content_promotion returns response when reasoning_content present."""
+        attempts = []
+        response = Response(
+            content=b'{"choices":[{"message":{"reasoning_content":"thinking..."}}]}',
+            status_code=200,
+        )
+        result = provider._resolve_reasoning_content_promotion(
+            response, "test-provider", "remote", attempts,
+            prev_provider=None, fallback_reason=None,
+            path="v1/test", body_text='{"choices":[{"message":{"reasoning_content":"thinking..."}}]}',
+        )
+        assert result is not None
+        assert result.headers.get("X-Provider") == "test-provider"
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "promoted_reasoning"
+
+    def test_resolve_reasoning_content_promotion_no_match(self):
+        """_resolve_reasoning_content_promotion returns None without reasoning_content."""
+        attempts = []
+        response = Response(content=b'{"choices":[{"message":{"content":"hello"}}]}', status_code=200)
+        result = provider._resolve_reasoning_content_promotion(
+            response, "test-provider", "remote", attempts,
+            prev_provider=None, fallback_reason=None,
+            path="v1/test", body_text='{"choices":[{"message":{"content":"hello"}}]}',
+        )
+        assert result is None
+        assert len(attempts) == 0
+
+    def test_build_fallback_success_response_adds_header_and_records(self):
+        """_build_fallback_success_response adds header and records attempt."""
+        attempts = []
+        response = Response(content=b'{"choices":[{"message":{"content":"ok"}}]}', status_code=200)
+        result = provider._build_fallback_success_response(
+            response, "test-provider", "remote", attempts,
+            prev_provider=None, fallback_reason=None,
+            path="v1/test", body_text='{"choices":[{"message":{"content":"ok"}}]}',
+        )
+        assert result is not None
+        assert result.headers.get("X-Provider") == "test-provider"
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "success"
+
+    def test_log_exhausted_providers_returns_empty_for_none(self):
+        """_log_exhausted_providers returns empty dict when no providers in cooldown."""
+        provider._provider_unavailable_until.clear()
+        model_config = {"providers": [{"name": "p1", "type": "remote"}]}
+        result = provider._log_exhausted_providers(model_config, "v1/test")
+        assert isinstance(result, dict)
+        assert len(result) == 0
+
+    def test_log_exhausted_providers_returns_cooldown_info(self):
+        """_log_exhausted_providers returns remaining cooldown for providers."""
+        provider._provider_unavailable_until.clear()
+        provider.mark_provider_unavailable("p1", 60.0)
+        model_config = {"providers": [{"name": "p1", "type": "remote"}, {"name": "p2", "type": "remote"}]}
+        result = provider._log_exhausted_providers(model_config, "v1/test")
+        assert "p1" in result
+        assert result["p1"] > 0
+        assert "p2" not in result
+
+    def test_build_fallback_success_response_with_status_override(self):
+        """_build_fallback_success_response uses status_override when provided."""
+        attempts = []
+        response = Response(content=b'{}', status_code=200)
+        result = provider._build_fallback_success_response(
+            response, "test-provider", "remote", attempts,
+            prev_provider=None, fallback_reason=None,
+            path="v1/test", body_text="{}",
+            status_override="success_after_http_exception_retry",
+        )
+        assert result is not None
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "success_after_http_exception_retry"
