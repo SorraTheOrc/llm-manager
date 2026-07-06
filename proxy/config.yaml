@@ -228,6 +228,12 @@ server:
   # continue to use max_concurrent_queries. When this limit is reached,
   # requests with fallback providers skip to the next provider immediately.
   local_max_concurrent_queries: 1
+  # Local dispatch lease timeout in seconds.
+  # An idle session holds an inactive lease for this duration after its
+  # last request completes, preventing other sessions from acquiring the
+  # local backend.  The lease is released when the timeout expires,
+  # allowing other sessions to use the local backend.
+  local_dispatch_lease_timeout_seconds: 180
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache

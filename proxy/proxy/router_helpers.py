@@ -376,22 +376,195 @@ async def _increment_active_queries(srv) -> None:
         pass
 
 
-async def _decrement_local_active_queries(srv) -> None:
-    """Safely decrement the local-only active queries counter."""
+def _get_lease_timeout_seconds(srv) -> float:
+    """Return the configured lease timeout in seconds (default 180)."""
+    try:
+        server_cfg = srv.config.get("server", {})
+        return float(
+            server_cfg.get("local_dispatch_lease_timeout_seconds", 180) or 180
+        )
+    except (ValueError, TypeError):
+        return 180.0
+
+
+async def _decrement_local_active_queries(
+    srv,
+    session_key: Optional[str] = None,
+) -> None:
+    """Safely decrement the local-only active queries counter.
+
+    When *session_key* is provided, the corresponding dispatch record
+    (if any) is marked as inactive with a future *expires_at* timestamp,
+    keeping the lease alive for the owner session until the timeout.
+    """
     try:
         async with srv.local_active_queries_lock:
             srv.local_active_queries = max(0, srv.local_active_queries - 1)
     except Exception:
         pass
 
+    if session_key is not None:
+        try:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None:
+                lease_timeout = _get_lease_timeout_seconds(srv)
+                async with lock:
+                    if session_key in srv.local_dispatch_records:
+                        srv.local_dispatch_records[session_key]["active"] = False
+                        srv.local_dispatch_records[session_key]["expires_at"] = (
+                            time.monotonic() + lease_timeout
+                        )
+        except Exception:
+            pass
 
-async def _increment_local_active_queries(srv) -> None:
-    """Safely increment the local-only active queries counter."""
+
+async def _increment_local_active_queries(
+    srv,
+    session_key: Optional[str] = None,
+    backend: Optional[str] = None,
+) -> None:
+    """Safely increment the local-only active queries counter.
+
+    When *session_key* and *backend* are provided, a corresponding
+    dispatch record is created in *local_dispatch_records* to track
+    lease ownership.
+    """
     try:
         async with srv.local_active_queries_lock:
             srv.local_active_queries += 1
     except Exception:
         pass
+
+    if session_key is not None and backend is not None:
+        try:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None:
+                lease_timeout = _get_lease_timeout_seconds(srv)
+                async with lock:
+                    srv.local_dispatch_records[session_key] = {
+                        "backend": backend,
+                        "started_at": time.monotonic(),
+                        "active": True,
+                        "expires_at": time.monotonic() + lease_timeout,
+                    }
+        except Exception:
+            pass
+
+
+async def _try_acquire_local_dispatch(
+    srv,
+    max_local: int,
+    session_key: str,
+    backend: str,
+) -> tuple:
+    """Try to acquire the local dispatch for *session_key*.
+
+    Returns ``(acquired, owner, active_count, retry_after)`` where:
+
+    - *acquired* is True if the local backend was acquired for the caller.
+    - *owner* is the session ID that currently holds the lease (or None).
+    - *active_count* is the current number of active local queries after
+      acquisition (or 0 if denied).
+    - *retry_after* is a suggested retry delay in seconds (minimum 1).
+
+    The no-preemption policy means that a non-owner session cannot
+    acquire the local backend while an unexpired lease exists, even if
+    the owner has no active request in flight.
+
+    If the server does not have *local_dispatch_records* or
+    *local_dispatch_records_lock* attributes (legacy state), the function
+    silently returns ``(True, None, 0, 1.0)`` to allow the request.
+    """
+    # Guard: skip if dispatch tracking is not initialised
+    if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
+        return (True, None, 0, 1.0)
+
+    lease_timeout = _get_lease_timeout_seconds(srv)
+    now = time.monotonic()
+
+    try:
+        async with srv.local_dispatch_records_lock:
+            # Check for existing leases from other sessions
+            for existing_key, record in list(srv.local_dispatch_records.items()):
+                if existing_key == session_key:
+                    # Same session -- check if previous lease expired
+                    if not record.get("active") and record.get("expires_at", 0) <= now:
+                        # Lease expired, remove old record and allow re-acquisition
+                        del srv.local_dispatch_records[existing_key]
+                        continue
+                    # Same session with valid lease -- allow
+                    continue
+
+                # Different session -- check whether it blocks acquisition
+                if record.get("active") or record.get("expires_at", 0) > now:
+                    # Owner session has an active or unexpired lease
+                    owner = existing_key
+                    active_count = getattr(srv, "local_active_queries", 0)
+                    retry_after = max(1.0, record.get("expires_at", now) - now)
+                    return (False, owner, active_count, retry_after)
+
+            # No blocking lease -- check concurrency cap
+            async with srv.local_active_queries_lock:
+                if srv.local_active_queries >= max_local:
+                    # At concurrency limit -- find the owner of the active request
+                    active_owner = None
+                    for ek, er in srv.local_dispatch_records.items():
+                        if er.get("active"):
+                            active_owner = ek
+                            break
+                    return (
+                        False,
+                        active_owner,
+                        srv.local_active_queries,
+                        max(1.0, lease_timeout),
+                    )
+
+                # Acquire: increment counter and create dispatch record
+                srv.local_active_queries += 1
+
+            srv.local_dispatch_records[session_key] = {
+                "backend": backend,
+                "started_at": now,
+                "active": True,
+                "expires_at": now + lease_timeout,
+            }
+
+        return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
+    except Exception:
+        return (True, None, 0, 1.0)
+
+
+async def _cleanup_stale_local_dispatch(srv) -> int:
+    """Remove stale lease records from *local_dispatch_records*.
+
+    A record is stale when it is not active and its *expires_at* timestamp
+    has passed (``time.monotonic() > expires_at``).  Each removed record
+    is logged with its session ID and reason.
+
+    Returns the number of records removed.
+    """
+    now = time.monotonic()
+    removed = 0
+    try:
+        async with srv.local_dispatch_records_lock:
+            stale_ids = [
+                sid
+                for sid, record in srv.local_dispatch_records.items()
+                if not record.get("active") and record.get("expires_at", 0) <= now
+            ]
+            for sid in stale_ids:
+                del srv.local_dispatch_records[sid]
+                removed += 1
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=idle_timeout",
+                        sid[:8] if sid else "unknown",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
 
 
 # ===================================================================
@@ -444,6 +617,7 @@ async def _handle_session(
     
     result = {
         "session_id": None,
+        "session_id_header": None,
         "session_created": False,
         "is_delta_request": False,
         "session_fallback_reason": None,
@@ -451,11 +625,14 @@ async def _handle_session(
         "body_json": body_json,
         "body_override": None,
         "original_message_count": 0,
+        "session_explicit": False,
     }
     
     session_id_header, session_header_source = _resolve_session_id_header(
         request_headers
     )
+    result["session_id_header"] = session_id_header
+    result["session_explicit"] = session_id_header is not None
     
     if isinstance(body_json, dict) and "messages" in body_json:
         result["original_message_count"] = len(body_json["messages"])

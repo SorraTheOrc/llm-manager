@@ -635,6 +635,23 @@ async def _invalidate_session_and_slot(
             await srv.session_manager.invalidate(session_id)
         except Exception:
             pass
+
+        # Also release any dispatch lease record for this session
+        try:
+            srv = _srv()
+            async with srv.local_dispatch_records_lock:
+                if session_id in srv.local_dispatch_records:
+                    del srv.local_dispatch_records[session_id]
+                    try:
+                        _srv().logger.info(
+                            "lease_released session=%s reason=%s",
+                            session_id[:8] if session_id else "unknown",
+                            reason or "invalidation",
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     if reason:
         _record_session_invalidation(reason)
     if slot_filename:

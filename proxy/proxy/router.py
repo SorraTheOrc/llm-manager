@@ -18,7 +18,7 @@ from typing import Optional
 
 import httpx
 from fastapi import HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # Lazy server import — avoids circular imports when server.py imports us
 def _srv():
@@ -69,6 +69,7 @@ from .router_helpers import (  # noqa: E402
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _check_slot_availability,
+    _cleanup_stale_local_dispatch,
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
@@ -79,6 +80,7 @@ from .router_helpers import (  # noqa: E402
     _normalize_outgoing_headers,
     _schedule_recv_token_increment,
     _schedule_token_increment,
+    _try_acquire_local_dispatch,
     _call_with_backend_retries,
     _call_with_empty_retry,
     normalize_upstream_request_headers,
@@ -371,8 +373,18 @@ async def _release_scheduler_and_decrement(
     slot_id: Optional[int],
     disconnected: bool = False,
     decrement_local: bool = True,
+    session_explicit: bool = False,
 ) -> None:
-    """Release scheduler slot and decrement active query counters."""
+    """Release scheduler slot and decrement active query counters.
+
+    When *disconnected* is True and *session_id* is known, any dispatch
+    lease record for that session is also removed immediately (the client
+    is gone, so no lease should persist).
+
+    When *session_explicit* is True and *session_id* is known, the
+    corresponding dispatch record is marked as inactive with a future
+    expires_at timestamp, keeping the lease alive for a returning session.
+    """
     if scheduler is not None:
         if disconnected and session_id:
             await scheduler.remove_job(session_id)
@@ -380,7 +392,29 @@ async def _release_scheduler_and_decrement(
             await scheduler.mark_request_end(slot_id)
     await _decrement_active_queries(srv)
     if decrement_local:
-        await _decrement_local_active_queries(srv)
+        await _decrement_local_active_queries(
+            srv,
+            session_key=session_id if session_explicit else None,
+        )
+
+    # On client disconnect, immediately remove the dispatch lease record
+    if disconnected and session_id:
+        try:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None:
+                async with lock:
+                    records = getattr(srv, "local_dispatch_records", {})
+                    if session_id in records:
+                        del records[session_id]
+                        try:
+                            srv.logger.info(
+                                "lease_released session=%s reason=disconnect",
+                                session_id[:8] if session_id else "unknown",
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
 
 # ===================================================================
@@ -428,6 +462,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     session_fallback_reason = session_result["session_fallback_reason"]
     delta_messages = session_result["delta_messages"]
     original_message_count = session_result["original_message_count"]
+    session_explicit = session_result.get("session_explicit", False)
     if session_result["body_override"] is not None:
         body = session_result["body_override"]
         body_json = session_result["body_json"]
@@ -589,6 +624,46 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             detail=f"Server overloaded: {cur_active} queries active. Retry later.",
         )
 
+    # -------------------------------------------------------------------
+    # Local dispatch gating — no-preemption lease check
+    # Only applies to explicitly-provided sessions (X-Session-Id header).
+    # Anonymous/auto-generated sessions are ephemeral and should not
+    # acquire a persistent lease.
+    # -------------------------------------------------------------------
+    if session_id and session_explicit:
+        local_max = _get_local_max_concurrent_queries(server_config)
+        acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
+            srv,
+            max_local=local_max,
+            session_key=session_id,
+            backend="local",
+        )
+        if not acquired:
+            srv.logger.info(
+                "local_dispatch_denied session=%s owner=%s active=%s",
+                session_id[:8] if session_id else "unknown",
+                owner[:8] if owner else "none",
+                active_count,
+            )
+            _record_backend_signal("local_dispatch_denied")
+
+            payload = {
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": (
+                        f"Local backend busy. Owner session "
+                        f"{(owner[:8] + '...') if owner else 'unknown'} "
+                        f"holds the lease."
+                    ),
+                },
+                "status": 503,
+                "retry_after": max(1, int(retry_after)),
+                "reason": "local_lease_active",
+                "local_owner_session_id": owner,
+            }
+            return JSONResponse(status_code=503, content=payload)
+
     # Check slot availability
     slot_response = await _check_slot_availability(
         srv, server_config, llama_port, slot_model_name, model_name, path
@@ -598,7 +673,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Mark active query
     await _increment_active_queries(srv)
-    await _increment_local_active_queries(srv)
+    await _increment_local_active_queries(
+        srv,
+        session_key=session_id if session_explicit else None,
+        backend="local",
+    )
 
     # Token accounting
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
@@ -1055,6 +1134,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 srv, scheduler, session_id, slot_id,
                 decrement_local=False,
             )
+            # Clean up any dispatch record that was created before the rejection
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            if session_id in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[session_id]
+                except Exception:
+                    pass
             payload = {
                 "error": {
                     "type": "session_single_flight",
@@ -1203,12 +1292,23 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         await _release_scheduler_and_decrement(
                             srv, scheduler, session_id, slot_id,
                             decrement_local=True,
+                            session_explicit=session_explicit,
                         )
         except SessionSingleFlightRejected as exc:
             await _release_scheduler_and_decrement(
                 srv, scheduler, session_id, slot_id,
                 decrement_local=True,
             )
+            # Clean up any dispatch record that was created before the rejection
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            if session_id in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[session_id]
+                except Exception:
+                    pass
             payload = {
                 "error": {
                     "type": "session_single_flight",
