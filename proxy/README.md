@@ -1416,6 +1416,49 @@ is configurable via environment variables:
 If you see eviction warnings, increase `llama_models_max` or reduce the number
 of concurrently used models.
 
+### Slot Cache Retention
+
+Slot snapshot files (`slot_*.bin`) accumulate in the directory configured by
+`session_slot_save_path` (default: `slot-cache/`). A cleanup script is provided
+to prevent disk-space exhaustion:
+
+**Script:** `scripts/cleanup-slot-cache.sh`
+
+**Default retention policy:**
+- Remove slot files older than **7 days** (`--max-age-days`, default: `7`)
+- Retain the **3 most recently modified** files per unique slot prefix
+  (`--keep-recent`, default: `3`)
+
+**Usage:**
+
+```bash
+# Preview deletions without removing anything
+./scripts/cleanup-slot-cache.sh --dry-run
+
+# Run cleanup with defaults (7 days, keep 3 per prefix)
+./scripts/cleanup-slot-cache.sh
+
+# Custom retention
+./scripts/cleanup-slot-cache.sh --max-age-days 14 --keep-recent 5
+
+# Custom slot-cache directory
+./scripts/cleanup-slot-cache.sh --path /custom/slot-cache-path
+```
+
+The script is idempotent and exits 0 on success. Errors (e.g., un-deletable files)
+are logged as warnings without causing a non-zero exit.
+
+**Automated cleanup (cron):**
+
+To run the cleanup automatically every evening at 10 PM, add the following
+crontab entry (run `crontab -e`):
+
+```cron
+0 22 * * * /home/rgardler/projects/llm/scripts/cleanup-slot-cache.sh >> /home/rgardler/projects/llm/logs/cleanup-slot-cache.log 2>&1
+```
+
+Adjust the path to match your repository location.
+
 ## Logging
 
 Logs are written with time-based rotation:
