@@ -45,6 +45,22 @@ if ! podman container exists "$container" >/dev/null 2>&1; then
     "$image" sleep infinity
 fi
 
+# Warn if an existing container lacks the host HuggingFace cache mount
+if podman container exists "$container" >/dev/null 2>&1; then
+  host_hf_cache="${LLAMA_HOST_HF_CACHE:-${HOME}/.cache/huggingface/hub}"
+  hf_mounted=$(podman inspect "$container" --format '{{json .Mounts}}' 2>/dev/null | grep -c "$host_hf_cache" || true)
+  if [ "$hf_mounted" -eq 0 ]; then
+    echo "WARNING: Existing container '$container' does not mount the host HF cache at $host_hf_cache" >&2
+    echo "The container may re-download large model files instead of reusing host cache." >&2
+    echo "" >&2
+    echo "To recreate the container with the HF cache mount, run:" >&2
+    echo "  podman stop $container && podman rm $container && $0 $*" >&2
+    echo "" >&2
+    echo "To override the HF cache path, set LLAMA_HOST_HF_CACHE:" >&2
+    echo "  LLAMA_HOST_HF_CACHE=/custom/cache/path $0 $*" >&2
+  fi
+fi
+
 # Ensure the container is running
 running=$(podman inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
 if [ "$running" != "true" ]; then
