@@ -8,7 +8,7 @@ RUN if command -v apt-get >/dev/null 2>&1; then \
       apt-get update; \
       # ensure apt-utils present to suppress debconf warnings; tolerate failure
       apt-get install -y --no-install-recommends apt-utils || true; \
-      apt-get install -y --no-install-recommends -o Dpkg::Options::="--force-overwrite" -o Dpkg::Options::="--force-confdef" git build-essential cmake ninja-build ca-certificates libssl-dev libcurl4-openssl-dev pkg-config rocm-dev hipblas hipblas-dev hipblas-common-dev hipblaslt hipblaslt-dev rocblas rocblas-dev rocsolver rocsolver-dev rocwmma-dev && \
+      apt-get install -y --no-install-recommends -o Dpkg::Options::="--force-overwrite" -o Dpkg::Options::="--force-confdef" iproute2 git build-essential cmake ninja-build ca-certificates libssl-dev libcurl4-openssl-dev pkg-config rocm-dev hipblas hipblas-dev hipblas-common-dev hipblaslt hipblaslt-dev rocblas rocblas-dev rocsolver rocsolver-dev rocwmma-dev && \
       apt-get clean && rm -rf /var/lib/apt/lists/*; \
     elif command -v dnf >/dev/null 2>&1; then \
       dnf -y install git cmake make gcc gcc-c++ ninja-build && dnf clean all; \
