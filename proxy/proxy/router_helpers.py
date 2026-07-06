@@ -712,3 +712,81 @@ def _compute_request_timeout(
     else:
         timeout_seconds = server_config.get("llama_request_timeout", 300)
     return httpx.Timeout(timeout_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Session traffic recording helpers (LP-0MR8FEKK6005V9ML)
+# ---------------------------------------------------------------------------
+
+
+def _schedule_traffic_recording(
+    session_id: str,
+    client_payload: Optional[Any] = None,
+    proxy_payload: Optional[Any] = None,
+    response_payload: Optional[Any] = None,
+) -> None:
+    """Schedule fire-and-forget recording of session traffic.
+
+    Records the client→proxy request, proxy→provider request, and
+    provider→client response for a single proxied call. All writes
+    are dispatched to the event loop as background tasks and do not
+    block the caller.
+
+    Args:
+        session_id: The session identifier for the call being recorded.
+        client_payload: The original client→proxy request payload.
+        proxy_payload: The processed proxy→provider request payload.
+        response_payload: The assembled provider→client response.
+    """
+    if not session_id:
+        return
+
+    try:
+        from proxy.session_recorder import SessionRecorder
+
+        loop = asyncio.get_running_loop()
+        recorder = SessionRecorder.from_config(_srv().config)
+
+        if client_payload is not None:
+            loop.create_task(
+                recorder.record_request(
+                    session_id, "client_to_proxy", client_payload
+                )
+            )
+
+        if proxy_payload is not None:
+            loop.create_task(
+                recorder.record_request(
+                    session_id, "proxy_to_provider", proxy_payload
+                )
+            )
+
+        if response_payload is not None:
+            # Try to parse string payload as JSON for consistent format
+            if isinstance(response_payload, str):
+                try:
+                    parsed = json.loads(response_payload)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = response_payload
+            elif isinstance(response_payload, bytes):
+                try:
+                    parsed = json.loads(response_payload.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, ValueError):
+                    parsed = response_payload.decode("utf-8", errors="replace")
+            else:
+                parsed = response_payload
+
+            loop.create_task(
+                recorder.record_response(
+                    session_id, "provider_to_client", parsed
+                )
+            )
+    except Exception as exc:
+        try:
+            _srv().logger.warning(
+                "Failed to schedule session recording for %s: %s",
+                session_id[:8] if session_id else "unknown",
+                exc,
+            )
+        except Exception:
+            pass

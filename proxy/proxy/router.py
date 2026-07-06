@@ -87,6 +87,10 @@ from .router_helpers import (  # noqa: E402
     log_response_chunk,
 )
 
+from .router_helpers import (  # noqa: E402, F401
+    _schedule_traffic_recording,
+)
+
 
 # ===================================================================
 # Job-level slot scheduler (global, lazy-initialized from config)
@@ -428,6 +432,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         body = session_result["body_override"]
         body_json = session_result["body_json"]
 
+    # Capture original client→proxy request payload for recording (LP-0MR8FEKK6005V9ML)
+    _client_request_payload = body_json
+
+    # Schedule fire-and-forget recording of the client→proxy request
+    if session_id and _client_request_payload:
+        _schedule_traffic_recording(
+            session_id=session_id,
+            client_payload=_client_request_payload,
+        )
+
     slot_id = None
     slot_filename = None
     slot_timeout = 3.0
@@ -507,6 +521,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         if slot_model_name and body_json.get("model") != slot_model_name:
             body_json["model"] = slot_model_name
             body = json.dumps(body_json).encode("utf-8")
+
+    # Capture the processed proxy→provider request payload for recording (LP-0MR8FEKK6005V9ML)
+    _proxy_provider_payload = body_json if session_id else None
+    if _proxy_provider_payload:
+        _schedule_traffic_recording(
+            session_id=session_id,
+            proxy_payload=_proxy_provider_payload,
+        )
 
     if slot_model_name:
         model_name = slot_model_name
@@ -982,6 +1004,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 type(exc).__name__,
                             )
                         finally:
+                            # Record assembled streaming response (fire-and-forget)
+                            if session_id and collected_content:
+                                _stream_full_response = "".join(collected_content)
+                                _schedule_traffic_recording(
+                                    session_id=session_id,
+                                    response_payload=_stream_full_response,
+                                )
+
                             # Update session history and save slot (shared helper)
                             await _update_session_and_slot(
                                 srv, session_id, body_json,
@@ -1127,6 +1157,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Note: Hard completion_tokens cutoff has been removed.
                             # Loop detection via repetition check is used instead.
                             # The max_completion_tokens config is now ignored.
+
+                            # Record provider→client response (fire-and-forget)
+                            if session_id and hasattr(response, "content"):
+                                _schedule_traffic_recording(
+                                    session_id=session_id,
+                                    response_payload=response.content,
+                                )
 
                             # Update session history and save slot (shared helper)
                             await _update_session_and_slot(

@@ -27,6 +27,7 @@ from .router_helpers import (
     _schedule_recv_token_increment,
     _normalize_outgoing_headers,
     normalize_upstream_request_headers,
+    _schedule_traffic_recording,
 )
 
 # Import utils functions used by this module
@@ -228,15 +229,40 @@ async def proxy_to_remote(
     if not model_name:
         model_name = _srv().current_model or model_config.get("name") or model_config.get("id") or "unknown"
 
+    # Resolve session ID from headers for recording (LP-0MR8FEKK6005V9ML)
+    _remote_session_id = (
+        request.headers.get("x-session-id")
+        or request.headers.get("session_id")
+        or request.headers.get("x-client-request-id")
+        or None
+    )
+
+    # Schedule fire-and-forget recording of client→proxy and proxy→provider requests
+    if _remote_session_id:
+        _schedule_traffic_recording(
+            session_id=_remote_session_id,
+            client_payload=body_json,
+            proxy_payload=body_json,
+        )
+
     remote_timeout = httpx.Timeout(_srv().config.get("server", {}).get("llama_request_timeout", 300))
     is_streaming = body_json.get("stream", False)
 
     if is_streaming:
+        if _remote_session_id:
+            return await _handle_remote_streaming(
+                request, target_url, headers, body, body_json,
+                model_name, remote_timeout, session_id=_remote_session_id,
+            )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
             model_name, remote_timeout,
         )
     else:
+        if _remote_session_id:
+            return await _handle_remote_non_streaming(
+                request, target_url, headers, body, model_name, remote_timeout, session_id=_remote_session_id,
+            )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
         )
@@ -400,6 +426,7 @@ async def _handle_remote_non_streaming(
     body: bytes,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    session_id: Optional[str] = None,
 ) -> Response:
     """Handle non-streaming remote proxy request."""
     key = f"{request.method.upper()} {request.url.path} -> remote"
@@ -421,6 +448,13 @@ async def _handle_remote_non_streaming(
             pass
 
         log_response(response.status_code, response.content)
+
+        # Record provider->client response (fire-and-forget)
+        if session_id:
+            _schedule_traffic_recording(
+                session_id=session_id,
+                response_payload=response.content,
+            )
 
         return Response(
             content=response.content,
