@@ -13,7 +13,7 @@ host_repo="${LLAMA_HOST_REPO:-/home/rgardler/projects/llm}"
 image="${LLAMA_CONTAINER_IMAGE:-localhost/llm-llama:local}"
 
 # Required env vars we will forward into the container (if present)
-env_vars=(PORT LLAMA_MODELS_PRESET LLAMA_MODELS_MAX LLAMA_SLOT_SAVE_PATH LLAMA_SERVER_NO_MMAP HSA_OVERRIDE_GFX_VERSION ROCM_LLVM_PRE_VEGA)
+env_vars=(PORT LLAMA_PARALLEL LLAMA_MODELS_PRESET LLAMA_MODELS_MAX LLAMA_SLOT_SAVE_PATH LLAMA_SERVER_NO_MMAP HSA_OVERRIDE_GFX_VERSION ROCM_LLVM_PRE_VEGA)
 
 if ! command -v podman >/dev/null 2>&1; then
   echo "podman not found in PATH" >&2

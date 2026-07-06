@@ -80,12 +80,17 @@ if [[ "$router_mode" -eq 1 ]]; then
 
   echo "Using llama-server binary: $LLAMA_BIN"
 
+  # Default parallelism. Can be overridden via LLAMA_PARALLEL env var (set
+  # by the proxy lifecycle from server.session_slot_pool_size in config.yaml).
+  # Keeping these values aligned is critical: mismatch causes slot exhaustion
+  # or restore failures at runtime.
+  : "${LLAMA_PARALLEL:=1}"
   LLAMA_CMD=(
     "$LLAMA_BIN"
     --models-preset "$MODELS_INI"
     --models-max "$MODELS_MAX"
     --models-autoload
-    --parallel 1
+    --parallel "$LLAMA_PARALLEL"
     --host 0.0.0.0
     --no-mmap
     --port $PORT
@@ -244,21 +249,26 @@ fi
 
 echo "Using llama-server binary: $LLAMA_BIN"
 
-LLAMA_CMD=(
-  "$LLAMA_BIN"
-  -hf "$REPOID/$MODEL:$QUANTIZATION"
-  --ctx-size "$CONTEXT"
-  --batch-size $BATCH_SIZE
-  -np 1
-  -ngl 99
-  --no-mmap
-  --parallel 1
-  $EXTRA_CMD_SWITCHES
-  --embeddings
-  --pooling mean
-  --host 0.0.0.0
-  --port $PORT
-)
+  # Default parallelism. Can be overridden via LLAMA_PARALLEL env var (set
+  # by the proxy lifecycle from server.session_slot_pool_size in config.yaml).
+  # Keeping these values aligned is critical: mismatch causes slot exhaustion
+  # or restore failures at runtime.
+  : "${LLAMA_PARALLEL:=1}"
+  LLAMA_CMD=(
+    "$LLAMA_BIN"
+    -hf "$REPOID/$MODEL:$QUANTIZATION"
+    --ctx-size "$CONTEXT"
+    --batch-size $BATCH_SIZE
+    -np "$LLAMA_PARALLEL"
+    -ngl 99
+    --no-mmap
+    --parallel "$LLAMA_PARALLEL"
+    $EXTRA_CMD_SWITCHES
+    --embeddings
+    --pooling mean
+    --host 0.0.0.0
+    --port $PORT
+  )
 
 if [[ -n "${LLAMA_SLOT_SAVE_PATH:-}" ]]; then
   mkdir -p "$LLAMA_SLOT_SAVE_PATH"

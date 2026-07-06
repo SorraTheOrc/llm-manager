@@ -811,6 +811,13 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     slot_save_path = server_config.get("session_slot_save_path")
     if slot_save_path:
        env["LLAMA_SLOT_SAVE_PATH"] = str(slot_save_path)
+
+    # Export session_slot_pool_size as LLAMA_PARALLEL so the start script can
+    # align --parallel / -np with the proxy's pool size. Falls back to 1 when
+    # not configured — matches the historical default in start-llama.sh.
+    slot_pool_size = server_config.get("session_slot_pool_size", 1)
+    env["LLAMA_PARALLEL"] = str(int(slot_pool_size or 1))
+
     try:
        if server_config.get("llama_no_mmap", True):
            env["LLAMA_SERVER_NO_MMAP"] = "1"
