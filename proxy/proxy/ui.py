@@ -907,7 +907,110 @@ async def switch_model(model_name: str):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Admin endpoint for session recordings
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_recorder():
+    """Resolve the global SessionRecorder instance from the server module."""
+    srv = _srv()
+    if not hasattr(srv, "session_recorder") or srv.session_recorder is None:
+        from proxy.session_recorder import SessionRecorder
+        srv.session_recorder = SessionRecorder.from_config(srv.config)
+    return srv.session_recorder
 
 
+async def list_session_recordings(session_id: str) -> JSONResponse:
+    """Return a list of recording files for a given session.
 
+    Args:
+        session_id: The session identifier to look up recordings for.
+
+    Returns:
+        JSONResponse with status 200 and a JSON array of recording metadata,
+        or status 404 with a descriptive message if the session has no
+        recordings.
+    """
+    recorder = _get_recorder()
+    recordings = recorder.get_recordings_list(session_id)
+    if not recordings:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "No recordings found for this session",
+                "session_id": session_id,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "session_id": session_id,
+            "recordings": recordings,
+        },
+    )
+
+
+async def get_session_recording(session_id: str, filename: str) -> JSONResponse:
+    """Return the content of a specific recording file.
+
+    Args:
+        session_id: The session identifier.
+        filename: The base filename of the recording (e.g.,
+            ``"2026-07-06T10:00:00.000000-request.json"``).
+
+    Returns:
+        JSONResponse with status 200 and the recording content,
+        or status 404 if the file is not found.
+    """
+    recorder = _get_recorder()
+    content = recorder.get_recording(session_id, filename)
+    if content is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "Recording not found",
+                "session_id": session_id,
+                "filename": filename,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content=content,
+    )
+
+
+async def list_all_sessions() -> JSONResponse:
+    """Return all session IDs that have recordings."""
+    recorder = _get_recorder()
+    sessions = recorder.list_sessions()
+    return JSONResponse(
+        status_code=200,
+        content={"sessions": sessions},
+    )
+
+
+def list_session_recording_routes(app):
+    """Register session recording admin routes on a FastAPI application.
+
+    Args:
+        app: A FastAPI application instance.
+    """
+    app.add_api_route(
+        "/admin/sessions",
+        list_all_sessions,
+        methods=["GET"],
+        summary="List all sessions with recordings",
+    )
+    app.add_api_route(
+        "/admin/sessions/{session_id}/recordings",
+        list_session_recordings,
+        methods=["GET"],
+        summary="List recordings for a session",
+    )
+    app.add_api_route(
+        "/admin/sessions/{session_id}/recordings/{filename:path}",
+        get_session_recording,
+        methods=["GET"],
+        summary="Get a specific recording file",
+    )
 

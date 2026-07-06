@@ -397,7 +397,14 @@ async def lifespan(app: FastAPI):
         session_manager.start_cleanup_task()
     except Exception as e:
         logger.warning(f"Failed to start session cleanup task: {e}")
-    
+
+    # Initialize session recorder and register admin routes
+    try:
+        from proxy.ui import list_session_recording_routes
+        list_session_recording_routes(app)
+    except Exception as e:
+        logger.warning(f"Failed to register session recording routes: {e}")
+
     yield
     
     # Shutdown
@@ -718,6 +725,10 @@ from .ui import (  # noqa: E402, F401
     create_embeddings as _ui_create_embeddings,
     proxy_openai_api as _ui_proxy_openai_api,
     switch_model as _ui_switch_model,
+    list_session_recording_routes as _ui_list_session_recording_routes,
+    list_session_recordings as _ui_list_session_recordings,
+    get_session_recording as _ui_get_session_recording,
+    list_all_sessions as _ui_list_all_sessions,
 )
 from .router import (  # noqa: E402, F401
     proxy_to_local,

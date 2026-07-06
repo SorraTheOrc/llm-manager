@@ -66,6 +66,19 @@ logging:
   rotation_hours: 6
 
 # ---------------------------------------------------------------------------
+# Session Recording
+# ---------------------------------------------------------------------------
+# Records raw client-proxy-provider message payloads to disk for later
+# debugging, auditing, and analysis. Recording is always-on and uses
+# non-blocking file writes (asyncio background tasks).
+#
+# Fields:
+#   path: Directory where recordings are stored.
+#         Default: proxy/session-recordings/
+session_recording:
+  path: proxy/session-recordings/
+
+# ---------------------------------------------------------------------------
 # Audit model configuration
 # ---------------------------------------------------------------------------
 # The audit skill (skill/audit/) uses these settings to determine which
