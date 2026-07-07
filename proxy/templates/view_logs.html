@@ -648,8 +648,22 @@
           document.body.appendChild(tip);
         }
 
+        // Helper: extract plain text from message content (handles string or array blocks)
+        function extractText(content) {
+          if (typeof content === 'string') return content;
+          if (Array.isArray(content)) {
+            return content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text || ''; }).join('\n');
+          }
+          if (typeof content === 'object' && content !== null) {
+            return content.text || JSON.stringify(content);
+          }
+          return String(content || '');
+        }
+
         // Build right column: conversation view from fetched content
         var convHtml = '<div class="conversation-view">';
+        // Use a counter for unique expand IDs
+        var _msgId = 0;
         var allContent = await Promise.all(fetchPromises);
         for (var i = 0; i < allContent.length; i++) {
           var item = allContent[i];
@@ -664,13 +678,11 @@
             for (var m = 0; m < messages.length; m++) {
               var msg = messages[m];
               if (msg.role === 'system') continue;
+              _msgId++;
+              var text = extractText(msg.content);
               convHtml += '<div class="msg ' + (msg.role || '') + '">';
               convHtml += '<div class="msg-header">## ' + (msg.role || 'unknown') + ' - ' + ts + '</div>';
-              var content = msg.content || '';
-              if (typeof content === 'object') {
-                try { content = JSON.stringify(content, null, 2); } catch(e) { content = String(content); }
-              }
-              convHtml += '<div class="msg-content">' + escapeHtml(content) + '</div>';
+              convHtml += makeExpandable(text, _msgId);
               convHtml += '</div>';
             }
           } else if (item.direction === 'provider_to_client') {
@@ -683,13 +695,11 @@
               var header = '## ' + modelName;
               if (providerName) header += ' / ' + providerName;
               header += ' - ' + ts;
+              _msgId++;
+              var text = extractText(choiceMsg.content);
               convHtml += '<div class="msg assistant">';
               convHtml += '<div class="msg-header">' + header + '</div>';
-              var content = choiceMsg.content || '';
-              if (typeof content === 'object') {
-                try { content = JSON.stringify(content, null, 2); } catch(e) { content = String(content); }
-              }
-              convHtml += '<div class="msg-content">' + escapeHtml(content) + '</div>';
+              convHtml += makeExpandable(text, _msgId);
               convHtml += '</div>';
             }
           }
@@ -705,6 +715,29 @@
       } catch (err) {
         contentEl.innerHTML = '<div class="muted">Error loading recordings.</div>';
       }
+    }
+
+    // Helper: render text with truncation at 300 chars and expand/collapse
+    function makeExpandable(text, id) {
+      var escaped = escapeHtml(text);
+      if (escaped.length <= 300) {
+        return '<div class="msg-content">' + escaped + '</div>';
+      }
+      var truncated = escaped.substring(0, 300) + '...';
+      return '<div class="msg-content" id="msgShort-' + id + '">' + truncated
+        + ' <span class="json-hover" style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="expandMsg(' + id + ')">show more</span></div>'
+        + '<div class="msg-content" id="msgFull-' + id + '" style="display:none;">' + escaped
+        + ' <span class="json-hover" style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="collapseMsg(' + id + ')">show less</span></div>';
+    }
+    function expandMsg(id) {
+      document.getElementById('msgShort-' + id).style.display = 'none';
+      var el = document.getElementById('msgFull-' + id);
+      if (el) el.style.display = 'block';
+    }
+    function collapseMsg(id) {
+      document.getElementById('msgFull-' + id).style.display = 'none';
+      var el = document.getElementById('msgShort-' + id);
+      if (el) el.style.display = 'block';
     }
 
     // Simple HTML escape for conversation content
