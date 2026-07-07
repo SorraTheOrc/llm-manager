@@ -126,7 +126,8 @@
             border-radius: 6px;
             padding: 0.75rem;
             margin-top: 0.5rem;
-            max-height: 300px;
+            min-height: 200px;
+            max-height: calc(100vh - 280px);
             overflow: auto;
             font-family: monospace;
             font-size: 0.8rem;
@@ -427,9 +428,7 @@
               <span id="modelInfo-${CSS.escape(model)}" class="muted" style="font-size:0.8rem;"></span>
             </span>
           </div>
-          <div class="log" id="modelLog-${CSS.escape(model)}" style="height: calc(100vh - 320px);"></div>
           <div id="recordingPanel-${CSS.escape(model)}" class="session-recording-panel" style="display:none;">
-            <div class="muted" style="margin-bottom:0.25rem;">Session Recording Data</div>
             <div id="recordingContent-${CSS.escape(model)}"></div>
           </div>
         `;
