@@ -656,7 +656,6 @@ from .handlers import (  # noqa: E402, F401
     admin_dump_counts,
     admin_stop_server,
     admin_reset_counts,
-    admin_list_sessions,
     admin_delete_session,
     reload_config,
 )

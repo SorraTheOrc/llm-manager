@@ -523,20 +523,8 @@ async def admin_reset_counts():
 
 
 # ---------------------------------------------------------------------------
-# /admin/sessions
+# /admin/sessions — session DELETE only; GET is served by ui.py list_all_sessions
 # ---------------------------------------------------------------------------
-
-@router.get("/admin/sessions")
-async def admin_list_sessions():
-    """List all active sessions with their metadata."""
-    srv = _srv()
-    sessions = []
-    for session_id in list(srv.session_manager._sessions.keys()):
-        info = srv.session_manager.get_session_info(session_id)
-        if info is not None:
-            sessions.append(info)
-    return {"sessions": sessions, "total": len(sessions)}
-
 
 @router.delete("/admin/sessions/{session_id}")
 async def admin_delete_session(session_id: str):

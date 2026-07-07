@@ -171,26 +171,30 @@ class SessionManager:
     async def list_sessions(self) -> List[Dict[str, Any]]:
         """Return all active session IDs with their metadata.
 
-        Returns a list of dicts with ``session_id``, ``created_at``,
-        and ``last_activity`` keys. Expired sessions are evicted
-        before listing.
+        Returns a list of dicts with session info including
+        ``session_id``, ``created_at``, ``last_activity_at``,
+        ``message_count``, ``idle_seconds``, ``age_seconds``,
+        ``invalidated``, and ``restore_confirmed``.
+
+        Expired sessions are evicted before listing.
         """
-        now = time.time()
+        now = time.monotonic()
         sessions: List[Dict[str, Any]] = []
         async with self._lock:
             expired_ids = []
             for sid, session in self._sessions.items():
-                if now - session.last_activity > self.ttl_seconds:
+                if now - session.last_activity_at > self.ttl_seconds:
                     expired_ids.append(sid)
                 else:
                     sessions.append({
                         "session_id": sid,
-                        "created_at": datetime.fromtimestamp(
-                            session.created_at, tz=timezone.utc
-                        ).isoformat(timespec="seconds") if hasattr(session, "created_at") and session.created_at else "",
-                        "last_activity": datetime.fromtimestamp(
-                            session.last_activity, tz=timezone.utc
-                        ).isoformat(timespec="seconds"),
+                        "created_at": session.created_at,
+                        "last_activity_at": session.last_activity_at,
+                        "message_count": session.message_count,
+                        "idle_seconds": round(session.idle_seconds, 1),
+                        "age_seconds": round(session.age_seconds, 1),
+                        "invalidated": session.invalidated,
+                        "restore_confirmed": session.restore_confirmed,
                     })
             for sid in expired_ids:
                 del self._sessions[sid]
