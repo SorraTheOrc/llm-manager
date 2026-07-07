@@ -480,8 +480,6 @@
         var fetchPromises = [];
         for (const rec of recordings) {
           const direction = rec.direction || 'unknown';
-          // Skip proxy_to_provider — they're echoes of user input, not useful in the entry list
-          if (direction === 'proxy_to_provider') continue;
           const short = shortDir(direction);
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
@@ -491,8 +489,8 @@
           var providerBadge = '';
           if (rec.provider) providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
           leftHtml += '<div class="recording-entry">'
-            + '<span class="timestamp">' + ts + '</span>'
-            + '<span class="direction">' + short + '</span>'
+            + '<span class="timestamp">' + ts + '</span> '
+            + '<span class="direction">' + short + '</span> '
             + modelBadge + providerBadge
             + '<span class="muted" style="font-size:0.75rem;"> ' + (rec.file_size || 0) + ' bytes</span>'
             + '<span class="json-hover" style="margin-left:0.5rem; font-size:0.7rem; color:var(--accent); text-decoration:underline; cursor:default;"'
@@ -543,12 +541,14 @@
               if (msg.role === 'user') {
                 convHtml += '<div class="msg user"><div class="msg-header">## User - ' + ts + '</div>' + makeExpandable(extractText(msg.content), _msgId) + '</div>';
               } else if (msg.role === 'assistant') {
+                var asstContent = extractText(msg.content);
+                if (!asstContent) continue;  // skip empty assistant messages (tool calls)
                 var modelName = item.data.model || '';
                 var providerName = item.data.provider || '';
                 var header = '## ' + (modelName || 'assistant');
                 if (providerName) header += ' / ' + providerName;
                 header += ' - ' + ts;
-                convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(extractText(msg.content), _msgId) + '</div>';
+                convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(asstContent, _msgId) + '</div>';
               }
             }
             seenMsgs = Math.max(seenMsgs, messages.length);
