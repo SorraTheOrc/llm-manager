@@ -192,7 +192,7 @@
 
     <!-- Tab Bar -->
     <div class="tab-bar" id="tabBar">
-      <div class="tab raw-tab active" data-tab="raw">Raw</div>
+      <div class="tab raw-tab active" data-tab="raw" id="rawTab">Raw</div>
     </div>
 
     <!-- Tab: Raw (existing two-pane view) -->
@@ -372,10 +372,29 @@
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
 
-      const tabEl = document.querySelector(`[data-tab="${tabName}"]`);
-      const contentEl = document.querySelector(`#tab-${CSS.escape(tabName)}`);
+      const tabEl = document.querySelector(`[data-tab="${CSS.escape(tabName)}"]`);
+      let contentEl = document.getElementById(`tab-${tabName}`);
+      if (!contentEl) {
+        // Try with CSS-escaped version
+        contentEl = document.querySelector(`#tab-${CSS.escape(tabName)}`);
+      }
       if (tabEl) tabEl.classList.add('active');
       if (contentEl) contentEl.classList.add('active');
+    }
+
+    // Make the Raw tab clickable
+    document.addEventListener('DOMContentLoaded', function() {
+      const rawTab = document.getElementById('rawTab');
+      if (rawTab) {
+        rawTab.addEventListener('click', function() { switchTab('raw'); });
+      }
+    });
+    // Also if DOM already loaded
+    if (document.readyState !== 'loading') {
+      const rawTab = document.getElementById('rawTab');
+      if (rawTab) {
+        rawTab.addEventListener('click', function() { switchTab('raw'); });
+      }
     }
 
     // ===================================================================

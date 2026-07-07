@@ -1,0 +1,1 @@
+{"session_id": "test-session-ns", "direction": "provider_to_client", "timestamp": "2026-07-06T11:35:44.329933+00:00", "payload": {"choices": [{"message": {"content": "Hi"}}]}}

@@ -984,6 +984,8 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
 
     Query params:
         model: Optional model name to filter sessions by.
+
+    Returns recording-based sessions merged with live session-manager sessions.
     """
     model_filter = None
     if request is not None:
@@ -1000,10 +1002,37 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
                 "count": len(sessions),
             },
         )
-    sessions = recorder.list_sessions()
+
+    # Merge recording-based sessions with live session-manager sessions
+    recording_sessions = recorder.list_sessions()
+    live_sessions = []
+    try:
+        srv = _srv()
+        if hasattr(srv, "session_manager") and srv.session_manager is not None:
+            live_sessions = await srv.session_manager.list_sessions()
+    except Exception:
+        pass
+
+    # Build a merged list: live sessions first (by last_activity), then recording-only sessions
+    seen = set()
+    merged = []
+    # Live sessions have full metadata
+    for s in live_sessions:
+        sid = s.get("session_id", "")
+        if sid:
+            seen.add(sid)
+            merged.append(s)
+    # Recording-only sessions (not already in live list)
+    for sid in recording_sessions:
+        if sid not in seen:
+            merged.append({
+                "session_id": sid,
+                "last_activity": "",
+            })
+
     return JSONResponse(
         status_code=200,
-        content={"sessions": sessions},
+        content={"sessions": merged, "count": len(merged)},
     )
 
 

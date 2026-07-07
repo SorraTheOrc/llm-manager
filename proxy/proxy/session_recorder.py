@@ -324,6 +324,10 @@ class SessionRecorder:
         given model name. Returns a list of dicts with session_id and
         timestamp of the most recent recording.
 
+        When no recordings with matching model metadata are found (e.g.
+        recordings from before the model enrichment field was added), falls
+        back to listing all available sessions as unattributed.
+
         Args:
             model: The model name to filter by.
 
@@ -338,28 +342,35 @@ class SessionRecorder:
         if not base.is_dir():
             return []
 
-        sessions: List[Dict[str, Any]] = []
+        model_sessions: List[Dict[str, Any]] = []
+        all_sessions: List[Dict[str, Any]] = []
         try:
             for entry in sorted(base.iterdir()):
                 if not entry.is_dir():
                     continue
                 sid = entry.name
                 last_ts = ""
-                found = False
+                found_model = False
                 for f in entry.iterdir():
                     if not f.is_file() or not f.name.endswith(".json"):
                         continue
                     try:
                         content = json.loads(f.read_bytes())
                         if content.get("model") == model:
-                            found = True
-                            ts = content.get("timestamp", "")
-                            if ts > last_ts:
-                                last_ts = ts
+                            found_model = True
+                        ts = content.get("timestamp", "")
+                        if ts > last_ts:
+                            last_ts = ts
                     except (json.JSONDecodeError, OSError):
                         continue
-                if found:
-                    sessions.append({
+                if found_model:
+                    model_sessions.append({
+                        "session_id": sid,
+                        "last_activity": last_ts,
+                    })
+                elif last_ts:
+                    # Session has recordings but no model metadata (pre-deployment)
+                    all_sessions.append({
                         "session_id": sid,
                         "last_activity": last_ts,
                     })
@@ -367,9 +378,14 @@ class SessionRecorder:
             logger.warning("Failed to list sessions by model %s: %s", model, e)
             return []
 
-        # Sort by last_activity descending
-        sessions.sort(key=lambda s: s["last_activity"], reverse=True)
-        return sessions
+        # Prefer model-enriched sessions over unattributed ones
+        if model_sessions:
+            model_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+            return model_sessions
+
+        # Fall back to all sessions when no model metadata exists yet
+        all_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+        return all_sessions
 
     def list_sessions(self) -> List[str]:
         """Return all session IDs that have recording directories.

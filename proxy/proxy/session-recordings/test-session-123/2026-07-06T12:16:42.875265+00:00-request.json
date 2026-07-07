@@ -1,0 +1,1 @@
+{"session_id": "test-session-123", "direction": "client_to_proxy", "timestamp": "2026-07-06T12:16:42.875265+00:00", "payload": {"messages": [], "model": "test-model", "stream": true}}

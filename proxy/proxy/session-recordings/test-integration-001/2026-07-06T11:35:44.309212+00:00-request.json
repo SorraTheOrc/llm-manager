@@ -1,0 +1,1 @@
+{"session_id": "test-integration-001", "direction": "proxy_to_provider", "timestamp": "2026-07-06T11:35:44.309212+00:00", "payload": {"messages": [], "model": "test-model", "stream": true}}

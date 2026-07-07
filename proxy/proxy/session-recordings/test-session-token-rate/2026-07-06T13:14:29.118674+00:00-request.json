@@ -1,0 +1,1 @@
+{"session_id": "test-session-token-rate", "direction": "proxy_to_provider", "timestamp": "2026-07-06T13:14:29.118674+00:00", "payload": {"model": "test-model", "messages": [{"role": "user", "content": "Tell me a story"}], "stream": true, "cache_prompt": true, "session_id": "test-session-token-rate"}}

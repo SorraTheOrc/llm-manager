@@ -168,6 +168,35 @@ class SessionManager:
                 return True
             return False
 
+    async def list_sessions(self) -> List[Dict[str, Any]]:
+        """Return all active session IDs with their metadata.
+
+        Returns a list of dicts with ``session_id``, ``created_at``,
+        and ``last_activity`` keys. Expired sessions are evicted
+        before listing.
+        """
+        now = time.time()
+        sessions: List[Dict[str, Any]] = []
+        async with self._lock:
+            expired_ids = []
+            for sid, session in self._sessions.items():
+                if now - session.last_activity > self.ttl_seconds:
+                    expired_ids.append(sid)
+                else:
+                    sessions.append({
+                        "session_id": sid,
+                        "created_at": datetime.fromtimestamp(
+                            session.created_at, tz=timezone.utc
+                        ).isoformat(timespec="seconds") if hasattr(session, "created_at") and session.created_at else "",
+                        "last_activity": datetime.fromtimestamp(
+                            session.last_activity, tz=timezone.utc
+                        ).isoformat(timespec="seconds"),
+                    })
+            for sid in expired_ids:
+                del self._sessions[sid]
+                self._sessions_expired += 1
+        return sessions
+
     # ----------------------------------------------------------------
     # Message history management
     # ----------------------------------------------------------------
