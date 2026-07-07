@@ -672,7 +672,7 @@
           var ts = '';
           try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
 
-          if (item.direction === 'client_to_proxy' || item.direction === 'proxy_to_provider') {
+          if (item.direction === 'client_to_proxy') {
             // Extract messages, skip system prompts
             var messages = payload.messages || [];
             for (var m = 0; m < messages.length; m++) {
