@@ -42,6 +42,38 @@ get_ctx_size() {
 }
 
 ##
+# Helper: read hf-repo from models.ini for a given model name
+# Usage: get_hf_repo <model-name> [models-ini-path]
+##
+get_hf_repo() {
+  local target_model="$1"
+  local ini_file="${2:-models.ini}"
+
+  if [[ ! -f "$ini_file" ]]; then
+    return 1
+  fi
+
+  # Use awk to find the matching [section] and extract hf-repo
+  # Case-insensitive section matching
+  awk -v target="$target_model" 'BEGIN { found=0; repo="" }
+  /^\[/ {
+    gsub(/\[|\]/, "")
+    if (tolower($0) == tolower(target)) {
+      found=1
+    } else {
+      found=0
+    }
+  }
+  found && /^hf-repo/ {
+    gsub(/.*=/, "")
+    gsub(/^[ \t]+|[ \t]+$/, "")
+    repo=$0
+    exit
+  }
+  END { if (repo != "") print repo }' "$ini_file"
+}
+
+##
 # Configure the server
 ##
 : "${PORT:=8080}"
@@ -206,6 +238,22 @@ if [[ -n "$INI_CTX" ]]; then
   CONTEXT="$INI_CTX"
 else
   echo "No ctx-size found in $MODELS_INI_FILE for model '$model'; using CONTEXT=$CONTEXT"
+fi
+
+##
+# Override QUANTIZATION from models.ini hf-repo suffix if available (single source of truth)
+##
+INI_HF_REPO=$(get_hf_repo "$model" "$MODELS_INI_FILE" 2>/dev/null || true)
+if [[ -n "$INI_HF_REPO" ]]; then
+  INI_QUANT=$(echo "$INI_HF_REPO" | awk -F: '{if (NF>1) print $NF}')
+  if [[ -n "$INI_QUANT" ]]; then
+    echo "Read quantization=$INI_QUANT from $MODELS_INI_FILE hf-repo suffix for model '$model' (overriding QUANTIZATION=$QUANTIZATION)"
+    QUANTIZATION="$INI_QUANT"
+  else
+    echo "No quantization suffix in $MODELS_INI_FILE hf-repo for model '$model'; using QUANTIZATION=$QUANTIZATION"
+  fi
+else
+  echo "No hf-repo found in $MODELS_INI_FILE for model '$model'; using QUANTIZATION=$QUANTIZATION"
 fi
 
 ##
