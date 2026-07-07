@@ -686,3 +686,242 @@ class TestSerializationFormat:
         assert "api_key_env" not in saved_payload
         assert "endpoint" not in saved_payload
         assert "internal" not in json.dumps(saved_payload).lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Session preview extraction (AC4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSessionPreviewExtraction:
+    """Tests for _extract_message_text, _truncate_preview, and the
+    ``preview_text`` field returned by ``list_sessions()``."""
+
+    def test_extract_message_text_returns_user_content(self):
+        """_extract_message_text returns the content of the first user message."""
+        from proxy.session_recorder import SessionRecorder
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "Paris"},
+            ]
+        }
+        result = SessionRecorder._extract_message_text(payload)
+        assert result == "What is the capital of France?"
+
+    def test_extract_message_text_skips_system_tool(self):
+        """Only 'user' role messages are returned; system/tool messages are skipped."""
+        from proxy.session_recorder import SessionRecorder
+        payload = {
+            "messages": [
+                {"role": "system", "content": "Be helpful."},
+                {"role": "tool", "content": "[result]"},
+                {"role": "user", "content": "Hello!"},
+            ]
+        }
+        result = SessionRecorder._extract_message_text(payload)
+        assert result == "Hello!"
+
+    def test_extract_message_text_no_messages(self):
+        """Returns empty string when there are no messages."""
+        from proxy.session_recorder import SessionRecorder
+        assert SessionRecorder._extract_message_text({}) == ""
+        assert SessionRecorder._extract_message_text({"messages": []}) == ""
+
+    def test_extract_message_text_no_user_msg(self):
+        """Returns empty string when no user message exists."""
+        from proxy.session_recorder import SessionRecorder
+        payload = {"messages": [{"role": "assistant", "content": "Hi"}]}
+        assert SessionRecorder._extract_message_text(payload) == ""
+
+    def test_extract_message_text_non_dict_payload(self):
+        """Returns empty string for non-dict payloads (e.g. SSE string payloads)."""
+        from proxy.session_recorder import SessionRecorder
+        assert SessionRecorder._extract_message_text("data: test\n\n") == ""
+        assert SessionRecorder._extract_message_text(None) == ""
+        assert SessionRecorder._extract_message_text(123) == ""
+
+    def test_extract_message_text_content_array(self):
+        """Handles content as an array of content parts (multimodal)."""
+        from proxy.session_recorder import SessionRecorder
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {"type": "image_url", "image_url": {"url": "data:image/..."}},
+                    ],
+                }
+            ]
+        }
+        result = SessionRecorder._extract_message_text(payload)
+        assert result == "Describe this image"
+
+    def test_truncate_preview_short_text(self):
+        """Text shorter than max_chars is returned as-is."""
+        from proxy.session_recorder import SessionRecorder
+        assert SessionRecorder._truncate_preview("Hello") == "Hello"
+
+    def test_truncate_preview_exact_length(self):
+        """Text exactly at max_chars is returned as-is."""
+        from proxy.session_recorder import SessionRecorder
+        text = "A" * 80
+        assert SessionRecorder._truncate_preview(text) == text
+
+    def test_truncate_preview_long_text(self):
+        """Long text is truncated with trailing ellipsis."""
+        from proxy.session_recorder import SessionRecorder
+        text = "Hello world! " * 20  # well over 80 chars
+        result = SessionRecorder._truncate_preview(text)
+        assert len(result) == 83  # 80 chars + "..."
+        assert result.endswith("...")
+
+    def test_truncate_preview_81_chars(self):
+        """81 chars truncates to 80 + ellipsis."""
+        from proxy.session_recorder import SessionRecorder
+        text = "A" * 81
+        result = SessionRecorder._truncate_preview(text)
+        assert result == ("A" * 80) + "..."
+        assert len(result) == 83
+
+    def test_truncate_preview_custom_max(self):
+        """Supports custom max_chars parameter."""
+        from proxy.session_recorder import SessionRecorder
+        text = "P" * 50
+        assert SessionRecorder._truncate_preview(text, max_chars=10) == ("P" * 10) + "..."
+
+    def test_list_sessions_includes_preview_text(self, temp_recording_dir):
+        """list_sessions returns preview_text field with first 80 chars of user message."""
+        from proxy.session_recorder import SessionRecorder
+
+        # Create a session with a client_to_proxy recording containing a user message
+        sess_dir = Path(temp_recording_dir) / "sess-preview-1"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+
+        recording = {
+            "session_id": "sess-preview-1",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:00:00.000000+00:00",
+            "payload": {
+                "messages": [
+                    {"role": "system", "content": "Be helpful."},
+                    {"role": "user", "content": "What is the weather in London today?"},
+                ],
+                "model": "test-model",
+                "stream": True,
+            },
+        }
+        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(recording))
+
+        recorder = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "sess-preview-1"
+        assert sessions[0]["preview_text"] == "What is the weather in London today?"
+
+    def test_list_sessions_preview_truncated(self, temp_recording_dir):
+        """Long user messages are truncated to 80 chars + ellipsis."""
+        from proxy.session_recorder import SessionRecorder
+
+        sess_dir = Path(temp_recording_dir) / "sess-preview-long"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+
+        long_message = "Hello I would like to ask a very very long question about the capital of France, Italy, and Spain because I need to travel there next month."
+        recording = {
+            "session_id": "sess-preview-long",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:00:00.000000+00:00",
+            "payload": {
+                "messages": [{"role": "user", "content": long_message}],
+                "model": "test-model",
+            },
+        }
+        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(recording))
+
+        recorder = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 1
+        result = sessions[0]["preview_text"]
+        assert len(result) == 83  # 80 chars + "..."
+        assert result.endswith("...")
+
+    def test_list_sessions_empty_preview_when_no_user_msg(self, temp_recording_dir):
+        """Sessions with no user message have empty preview_text."""
+        from proxy.session_recorder import SessionRecorder
+
+        sess_dir = Path(temp_recording_dir) / "sess-no-user"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+
+        recording = {
+            "session_id": "sess-no-user",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:00:00.000000+00:00",
+            "payload": {
+                "messages": [],
+                "model": "test-model",
+            },
+        }
+        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(recording))
+
+        recorder = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = recorder.list_sessions()
+        assert sessions[0]["preview_text"] == ""
+
+    def test_list_sessions_preview_uses_first_client_recording(self, temp_recording_dir):
+        """Preview text comes from the earliest client_to_proxy recording."""
+        from proxy.session_recorder import SessionRecorder
+
+        sess_dir = Path(temp_recording_dir) / "sess-multi-req"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+
+        # First request (system message + first user message)
+        req1 = {
+            "session_id": "sess-multi-req",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:00:00.000000+00:00",
+            "payload": {"messages": [{"role": "user", "content": "First message"}]},
+        }
+        # Second request (later user message)
+        req2 = {
+            "session_id": "sess-multi-req",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:01:00.000000+00:00",
+            "payload": {"messages": [{"role": "user", "content": "Second message"}]},
+        }
+        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(req1))
+        (sess_dir / "2026-07-07T10:01:00.000000-request.json").write_text(json.dumps(req2))
+
+        recorder = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = recorder.list_sessions()
+        assert sessions[0]["preview_text"] == "First message"
+
+    def test_list_sessions_preview_preserves_existing_fields(self, temp_recording_dir):
+        """The preview_text field is added alongside existing fields."""
+        from proxy.session_recorder import SessionRecorder
+
+        sess_dir = Path(temp_recording_dir) / "sess-all-fields"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+
+        req = {
+            "session_id": "sess-all-fields",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:00:00.000000+00:00",
+            "payload": {"messages": [{"role": "user", "content": "Hello"}]},
+            "model": "qwen3",
+            "provider": "local",
+        }
+        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(req))
+
+        recorder = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = recorder.list_sessions()
+
+        s = sessions[0]
+        assert s["session_id"] == "sess-all-fields"
+        assert s["response_time"] == "2026-07-07T10:00:00.000000+00:00"
+        assert s["model"] == "qwen3"
+        assert s["provider"] == "local"
+        assert s["preview_text"] == "Hello"

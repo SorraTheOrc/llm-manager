@@ -320,6 +320,49 @@ class SessionRecorder:
             return None
 
     @staticmethod
+    @staticmethod
+    def _extract_message_text(payload: Any) -> str:
+        """Extract the text content from the first user message in a payload.
+
+        Looks for ``payload.messages`` and returns the ``content`` of the
+        first message with ``role == "user"``.  If no user message is found
+        returns an empty string.
+
+        Args:
+            payload: The recording payload, typically a dict with optional
+                ``messages`` key.
+
+        Returns:
+            The text content of the first user message, or empty string.
+        """
+        if not isinstance(payload, dict):
+            return ""
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Content may be an array of content parts
+                    texts = [
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    return "\n".join(texts)
+                return str(content)
+        return ""
+
+    @staticmethod
+    def _truncate_preview(text: str, max_chars: int = 80) -> str:
+        """Truncate *text* to *max_chars* characters, appending ``...``
+        when truncation occurs.
+        """
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip() + "..."
+
+    @staticmethod
     def _extract_session_preview(session_dir: Path) -> Optional[Dict[str, Any]]:
         """Extract preview data for a session from its recording files.
 
@@ -328,28 +371,37 @@ class SessionRecorder:
         recording exists, falls back to the first ``client_to_proxy``
         request recording.
 
+        Also extracts a ``preview_text`` — the first 80 characters of
+        the user's first message from the earliest ``client_to_proxy``
+        recording — so the session list can show a meaningful label.
+
         Args:
             session_dir: Path to the session's recording directory.
 
         Returns:
             A dict with ``session_id``, ``response_time``,
-            ``model``, and ``provider``, or ``None`` if the directory
-            has no valid recording files.
+            ``model``, ``provider``, and ``preview_text``, or ``None``
+            if the directory has no valid recording files.
         """
         sid = session_dir.name
         recordings: List[Dict[str, Any]] = []
+        first_client_payload: Any = None
         try:
             for f in sorted(session_dir.iterdir()):
                 if not f.is_file() or not f.name.endswith(".json"):
                     continue
                 try:
                     content = json.loads(f.read_bytes())
+                    direction = content.get("direction", "")
                     recordings.append({
-                        "direction": content.get("direction", ""),
+                        "direction": direction,
                         "timestamp": content.get("timestamp", ""),
                         "model": content.get("model", ""),
                         "provider": content.get("provider", ""),
                     })
+                    # Capture the first client_to_proxy payload for preview
+                    if direction == "client_to_proxy" and first_client_payload is None:
+                        first_client_payload = content.get("payload")
                 except (json.JSONDecodeError, OSError):
                     continue
         except OSError:
@@ -374,11 +426,16 @@ class SessionRecorder:
         if source is None:
             source = recordings[0]
 
+        # Extract preview text from the first client_to_proxy payload
+        raw_text = SessionRecorder._extract_message_text(first_client_payload)
+        preview_text = SessionRecorder._truncate_preview(raw_text) if raw_text else ""
+
         return {
             "session_id": sid,
             "response_time": source.get("timestamp", ""),
             "model": source.get("model", ""),
             "provider": source.get("provider", ""),
+            "preview_text": preview_text,
         }
 
     def list_sessions_by_model(self, model: str) -> List[Dict[str, Any]]:

@@ -385,17 +385,19 @@
           const opt = document.createElement('option');
           opt.value = s.session_id;
           var prefix = s.active ? '\u25CF ' : '';
-          var label = s.session_id;
           var ts = s.response_time || '';
           if (ts) {
             try { ts = new Date(ts).toLocaleString(); } catch(e) {}
-            if (prefix) label = prefix + ' ' + ts;
-            else label = ts;
+            if (prefix) ts = prefix + ' ' + ts;
           }
+          var preview = s.preview_text || '';
+          if (preview) preview = ' | ' + preview;
+          var modelInfo = '';
           if (s.model) {
-            label += ' | ' + s.model;
-            if (s.provider) label += '/' + s.provider;
+            modelInfo = ' | ' + s.model;
+            if (s.provider) modelInfo += '/' + s.provider;
           }
+          var label = (ts || s.session_id) + preview + modelInfo;
           opt.textContent = label;
           opt.dataset.active = s.active ? 'true' : 'false';
           sessionSelect.appendChild(opt);
