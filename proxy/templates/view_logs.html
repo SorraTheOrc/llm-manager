@@ -485,18 +485,21 @@
         for (const s of sessions) {
           const opt = document.createElement('option');
           opt.value = s.session_id;
-          // Format: timestamp | model/provider
-          var label = s.session_id;
+          // Format: [active marker] timestamp | model/provider
+          var prefix = s.active ? '\u25CF ' : '  ';  // ● for active, space for inactive
+          var label = prefix + s.session_id;
           var ts = s.response_time || s.last_activity_at || '';
           if (ts) {
             try { ts = new Date(ts).toLocaleString(); } catch(e) {}
-            label = ts;
+            label = prefix + ts;
           }
           if (s.model) {
             label += ' | ' + s.model;
             if (s.provider) label += '/' + s.provider;
           }
           opt.textContent = label;
+          // Store active flag for styling
+          opt.dataset.active = s.active ? 'true' : 'false';
           selectEl.appendChild(opt);
         }
 

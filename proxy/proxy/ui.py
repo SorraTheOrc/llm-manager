@@ -1003,13 +1003,14 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
 
         seen = set()
         merged = []
-        # Live sessions first
+        # Live sessions first (mark as active)
         for s in live_sessions:
             sid = s.get("session_id", "")
             if sid:
                 seen.add(sid)
+                s["active"] = True
                 merged.append(s)
-        # Recording-only sessions (not already in live list)
+        # Recording-only sessions (not already in live list, mark as inactive)
         for s in rec_sessions:
             sid = s.get("session_id", "")
             if sid and sid not in seen:
@@ -1019,6 +1020,7 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
                     "response_time": s.get("response_time", ""),
                     "model": s.get("model", ""),
                     "provider": s.get("provider", ""),
+                    "active": False,
                 })
         return merged
 
@@ -1032,7 +1034,23 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
         sid = s.get("session_id", "")
         if sid and sid not in seen_live:
             seen_live.add(sid)
+            s["active"] = s.get("active", False)
             merged.append(s)
+
+    # Sort: active sessions first, then by response_time descending
+    def _sort_key(s):
+        active_priority = 0 if s.get("active") else 1
+        ts = s.get("response_time") or s.get("last_activity_at") or ""
+        # Negate the timestamp for descending order (Z-padded string comparison)
+        return (active_priority, ts)
+    merged.sort(key=_sort_key)
+    # Keep active groups ascending, but within each group sort by ts descending
+    # Since timestamps are ISO strings, reverse within each active group
+    active = [s for s in merged if s.get("active")]
+    inactive = [s for s in merged if not s.get("active")]
+    active.sort(key=lambda s: s.get("response_time") or s.get("last_activity_at") or "", reverse=True)
+    inactive.sort(key=lambda s: s.get("response_time") or s.get("last_activity_at") or "", reverse=True)
+    merged = active + inactive
 
     result = {"sessions": merged, "count": len(merged)}
     if model_filter:
