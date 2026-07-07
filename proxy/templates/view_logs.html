@@ -522,6 +522,7 @@
 
         var convHtml = '<div class="conversation-view">';
         var _msgId = 0;
+        var seenMsgs = 0;  // track how many messages from accumulated history we've rendered
         var allContent = await Promise.all(fetchPromises);
         for (var i = 0; i < allContent.length; i++) {
           var item = allContent[i];
@@ -530,31 +531,25 @@
           var ts = '';
           try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
 
-          if (item.direction === 'client_to_proxy') {
+          if (item.direction === 'client_to_proxy' || item.direction === 'proxy_to_provider') {
+            // Show NEW messages from the accumulated history (past seenMsgs)
             var messages = payload.messages || [];
-            var lastUser = null;
-            for (var m = messages.length - 1; m >= 0; m--) {
-              if (messages[m].role === 'user') { lastUser = messages[m]; break; }
-            }
-            if (lastUser) {
+            for (var m = seenMsgs; m < messages.length; m++) {
+              var msg = messages[m];
+              if (msg.role === 'system' || msg.role === 'tool') continue;
               _msgId++;
-              convHtml += '<div class="msg user"><div class="msg-header">## User - ' + ts + '</div>' + makeExpandable(extractText(lastUser.content), _msgId) + '</div>';
+              if (msg.role === 'user') {
+                convHtml += '<div class="msg user"><div class="msg-header">## User - ' + ts + '</div>' + makeExpandable(extractText(msg.content), _msgId) + '</div>';
+              } else if (msg.role === 'assistant') {
+                var modelName = item.data.model || '';
+                var providerName = item.data.provider || '';
+                var header = '## ' + (modelName || 'assistant');
+                if (providerName) header += ' / ' + providerName;
+                header += ' - ' + ts;
+                convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(extractText(msg.content), _msgId) + '</div>';
+              }
             }
-          } else if (item.direction === 'proxy_to_provider') {
-            var messages = payload.messages || [];
-            var lastAsst = null;
-            for (var m = messages.length - 1; m >= 0; m--) {
-              if (messages[m].role === 'assistant') { lastAsst = messages[m]; break; }
-            }
-            if (lastAsst) {
-              _msgId++;
-              var modelName = item.data.model || '';
-              var providerName = item.data.provider || '';
-              var header = '## ' + (modelName || 'assistant');
-              if (providerName) header += ' / ' + providerName;
-              header += ' - ' + ts;
-              convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(extractText(lastAsst.content), _msgId) + '</div>';
-            }
+            seenMsgs = Math.max(seenMsgs, messages.length);
           } else if (item.direction === 'provider_to_client') {
             var modelName = item.data.model || '';
             var providerName = item.data.provider || '';
@@ -564,7 +559,6 @@
             var assistantText = '';
 
             if (typeof payload === 'string') {
-              // Raw SSE data — concatenate ALL delta.content across all events
               var lines = payload.split('\n');
               var fullContent = '';
               var reasoning = '';
