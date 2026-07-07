@@ -137,6 +137,9 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
         queue_overflow_retry_after=float(
             slot_config.get("slot_queue_overflow_retry_after", 900) or 900
         ),
+        max_request_duration=float(
+            slot_config.get("slot_max_request_duration_seconds", 600.0) or 600.0
+        ),
     )
     # Wire scheduler into SlotLockCoordinator
     slot_lock_coordinator.set_scheduler(_job_scheduler)
