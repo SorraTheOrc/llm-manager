@@ -673,38 +673,66 @@
           try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
 
           if (item.direction === 'client_to_proxy') {
-            // Only show the most recent (last) non-system message
+            // Show only the last user message (diff, not accumulated history)
             var messages = payload.messages || [];
-            var lastMsg = null;
+            var lastUser = null;
             for (var m = messages.length - 1; m >= 0; m--) {
-              if (messages[m].role !== 'system') {
-                lastMsg = messages[m];
+              if (messages[m].role === 'user') {
+                lastUser = messages[m];
                 break;
               }
             }
-            if (lastMsg) {
+            if (lastUser) {
               _msgId++;
-              var text = extractText(lastMsg.content);
-              convHtml += '<div class="msg ' + (lastMsg.role || '') + '">';
-              convHtml += '<div class="msg-header">## ' + (lastMsg.role || 'unknown') + ' - ' + ts + '</div>';
+              var text = extractText(lastUser.content);
+              convHtml += '<div class="msg user">';
+              convHtml += '<div class="msg-header">## User - ' + ts + '</div>';
               convHtml += makeExpandable(text, _msgId);
               convHtml += '</div>';
             }
           } else if (item.direction === 'provider_to_client') {
-            // Extract assistant response
-            var choices = payload.choices || [];
-            if (choices.length > 0) {
-              var choiceMsg = choices[0].message || choices[0].delta || {};
-              var modelName = item.data.model || model;
-              var providerName = item.data.provider || '';
-              var header = '## ' + modelName;
-              if (providerName) header += ' / ' + providerName;
-              header += ' - ' + ts;
+            // Extract assistant response (handles both dict payloads and raw SSE strings)
+            var modelName = item.data.model || model;
+            var providerName = item.data.provider || '';
+            var header = '## ' + modelName;
+            if (providerName) header += ' / ' + providerName;
+            header += ' - ' + ts;
+            var assistantText = '';
+
+            if (typeof payload === 'string') {
+              // Raw SSE data — try to find the last data line with content
+              var lines = payload.split('\n');
+              for (var li = lines.length - 1; li >= 0; li--) {
+                var line = lines[li];
+                if (line.indexOf('data: ') === 0 && line.indexOf('[DONE]') === -1) {
+                  try {
+                    var sseObj = JSON.parse(line.substring(6));
+                    if (sseObj.choices && sseObj.choices.length > 0) {
+                      var delta = sseObj.choices[0].delta || sseObj.choices[0].message || {};
+                      if (delta.content) { assistantText = delta.content; break; }
+                    }
+                  } catch(e) {}
+                }
+              }
+            } else {
+              // Structured payload (choices array)
+              var choices = payload.choices || [];
+              if (choices.length > 0) {
+                var choiceMsg = choices[0].message || choices[0].delta || {};
+                if (typeof choiceMsg === 'string') {
+                  try { var parsed = JSON.parse(choiceMsg); choiceMsg = parsed; } catch(e) { assistantText = choiceMsg; }
+                }
+                if (typeof choiceMsg === 'object') {
+                  assistantText = choiceMsg.content || '';
+                }
+              }
+            }
+
+            if (assistantText) {
               _msgId++;
-              var text = extractText(choiceMsg.content);
               convHtml += '<div class="msg assistant">';
               convHtml += '<div class="msg-header">' + header + '</div>';
-              convHtml += makeExpandable(text, _msgId);
+              convHtml += makeExpandable(assistantText, _msgId);
               convHtml += '</div>';
             }
           }
