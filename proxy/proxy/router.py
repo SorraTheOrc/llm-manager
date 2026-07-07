@@ -18,7 +18,7 @@ from typing import Optional
 
 import httpx
 from fastapi import HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # Lazy server import — avoids circular imports when server.py imports us
 def _srv():
@@ -56,6 +56,7 @@ import proxy.metrics as metrics  # noqa: E402
 record_http_error = metrics.record_http_error
 
 from proxy.utils import (  # noqa: E402
+    _extract_assistant_content,
     _extract_assistant_content_from_sse,
     _extract_delta_text_from_sse_chunk,
     count_text_tokens,
@@ -68,19 +69,28 @@ from .router_helpers import (  # noqa: E402
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _check_slot_availability,
+    _cleanup_stale_local_dispatch,
     _compute_request_timeout,
     _decrement_active_queries,
+    _decrement_local_active_queries,
     _estimate_tokens_sent,
     _handle_session,
     _increment_active_queries,
+    _increment_local_active_queries,
     _normalize_outgoing_headers,
     _schedule_recv_token_increment,
     _schedule_token_increment,
+    _try_acquire_local_dispatch,
     _call_with_backend_retries,
     _call_with_empty_retry,
+    normalize_upstream_request_headers,
     log_request,
     log_response,
     log_response_chunk,
+)
+
+from .router_helpers import (  # noqa: E402, F401
+    _schedule_traffic_recording,
 )
 
 
@@ -105,10 +115,19 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
     srv = _srv()
     slot_config = srv.config.get("slot_management", {})
     if not slot_config:
+        srv.logger.info(
+            "scheduler not initialized: slot_management config missing, "
+            "using hash-based slot assignment",
+        )
         return None
 
     pool_size = int(slot_config.get("slot_pool_size", 0) or 0)
     if pool_size < 1:
+        srv.logger.info(
+            "scheduler not initialized: pool_size=%s < 1, "
+            "using hash-based slot assignment",
+            pool_size,
+        )
         return None
 
     _job_scheduler = JobScheduler(
@@ -124,7 +143,283 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
     return _job_scheduler
 
 
+def _scheduler_has_idle_slot() -> bool:
+    """
+    Check whether the JobScheduler has at least one idle slot.
+
+    Returns ``True`` if there is an idle slot (the request can be served),
+    ``False`` if all slots are busy (the request would be queued).
+    Returns ``True`` when no scheduler is active (no slot management).
+    """
+    scheduler = _get_job_scheduler()
+    if scheduler is None:
+        return True
+    return scheduler.has_idle_slot()
+
+
+def _get_local_max_concurrent_queries(server_config: dict) -> int:
+    """
+    Read the local-model concurrency limit from config.
+
+    Returns the configured ``local_max_concurrent_queries`` value
+    (default 1). This limit is separate from the global
+    ``max_concurrent_queries`` which applies to remote providers.
+    """
+    try:
+        val = server_config.get("local_max_concurrent_queries", 1)
+        return max(1, int(val or 1))
+    except (ValueError, TypeError):
+        return 1
+
+
+def _get_local_active_count(srv) -> int:
+    """
+    Get the current number of active local requests.
+
+    Returns the count stored on the server for local-provider requests.
+    """
+    try:
+        return int(getattr(srv, 'local_active_queries', 0) or 0)
+    except (ValueError, TypeError):
+        return 0
+
+
+# ===================================================================
+# Extracted helpers for proxy_to_local
+# ===================================================================
+
+
+def _build_session_headers(
+    session_id: Optional[str],
+    session_created: bool,
+    is_delta_request: bool,
+    session_fallback_reason: Optional[str],
+) -> dict:
+    """Build the X-Session-* response headers common to both paths."""
+    headers = {}
+    if session_id:
+        headers["X-Session-Id"] = session_id
+        headers["X-Session-Created"] = "true" if session_created else "false"
+        headers["X-Session-Delta"] = "true" if is_delta_request else "false"
+        if session_fallback_reason:
+            headers["X-Session-Fallback-Reason"] = session_fallback_reason
+    return headers
+
+
+def _get_guardrail_config(server_config: dict) -> dict:
+    """Extract guardrail parameters from server config."""
+    return {
+        "max_runtime_seconds": float(
+            server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
+        ),
+        "max_completion_tokens": int(
+            server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
+        ),
+        "repetition_min_pattern_chars": int(
+            server_config.get("session_guardrail_repetition_min_pattern_chars", 64) or 64
+        ),
+        "repetition_min_repeats": int(
+            server_config.get("session_guardrail_repetition_min_repeats", 10) or 10
+        ),
+        "invalidate_on_guardrail": bool(
+            server_config.get("session_guardrail_invalidate_on_cutoff", True)
+        ),
+        "invalidate_on_repetition": server_config.get(
+            "session_guardrail_invalidate_on_repetition", False
+        ),
+        "max_token_rate": int(
+            server_config.get("session_guardrail_max_token_rate", 0) or 0
+        ),
+        "token_rate_window_seconds": int(
+            server_config.get("session_guardrail_token_rate_window_seconds", 5) or 5
+        ),
+    }
+
+
+async def _update_session_and_slot(
+    srv,
+    session_id: Optional[str],
+    body_json: dict,
+    is_delta_request: bool,
+    delta_messages: list,
+    original_message_count: int,
+    response,
+    llama_port: int,
+    slot_id: Optional[str],
+    slot_filename: Optional[str],
+    slot_timeout: float,
+    slot_model_payload: Optional[str],
+    slot_enabled: bool,
+    upstream_status: int,
+    slot_save_allowed: bool = True,
+    collected_content: Optional[list] = None,
+    llama_log_path=None,
+    llama_log_offset: int = 0,
+) -> None:
+    """Update session history and save slot snapshot after a response.
+
+    Shared by both streaming and buffered paths.
+    """
+    if not session_id:
+        return
+
+    # Restore signal detection and confirmation
+    try:
+        resp_content = (
+            response.content.decode("utf-8", errors="replace")
+            if hasattr(response, "content") and isinstance(getattr(response, 'content', None), (bytes, str))
+            else None
+        )
+        restore_signal_detected = _has_explicit_restore_signal(
+            dict(response.headers) if hasattr(response, "headers") else {},
+            json.loads(resp_content) if resp_content else None,
+        )
+    except Exception:
+        restore_signal_detected = False
+    if not restore_signal_detected:
+        restore_signal_detected = _detect_restore_signal_from_llama_log(session_id)
+    if not restore_signal_detected and llama_log_path is not None:
+        restore_signal_detected = _detect_restore_signal_from_log_slice(
+            llama_log_path, llama_log_offset
+        )
+    if restore_signal_detected:
+        _record_restore_success()
+    try:
+        await srv.session_manager.set_restore_confirmed(session_id, restore_signal_detected)
+    except Exception:
+        srv.logger.debug(
+            "Failed to set restore-confirmed state", exc_info=True
+        )
+
+    # Update session history
+    if (
+        session_id
+        and isinstance(body_json, dict)
+        and "messages" in body_json
+        and original_message_count > 0
+    ):
+        try:
+            if collected_content is not None and collected_content:
+                full_response = "".join(collected_content)
+                assistant_content = _extract_assistant_content_from_sse(full_response)
+                existing_messages = []
+                if is_delta_request and delta_messages:
+                    session_obj = await srv.session_manager.get(session_id)
+                    if session_obj:
+                        existing_messages = list(session_obj.messages)
+                full_messages = merge_session_history_for_update(
+                    existing_messages=existing_messages,
+                    request_messages=list(body_json.get("messages", [])),
+                    delta_messages=delta_messages,
+                    is_delta_request=is_delta_request,
+                    assistant_content=assistant_content,
+                )
+                await srv.session_manager.update_messages(session_id, full_messages)
+            elif hasattr(response, "content") and isinstance(getattr(response, 'content', None), (bytes, str)):
+                # Buffered path: parse JSON response
+                resp_content = response.content.decode("utf-8", errors="replace")
+                resp_json = json.loads(resp_content) if resp_content else {}
+                assistant_content = _extract_assistant_content(resp_json)
+                existing_messages = []
+                if is_delta_request and delta_messages:
+                    session_obj = await srv.session_manager.get(session_id)
+                    if session_obj:
+                        existing_messages = list(session_obj.messages)
+                full_messages = merge_session_history_for_update(
+                    existing_messages=existing_messages,
+                    request_messages=list(body_json.get("messages", [])),
+                    delta_messages=delta_messages,
+                    is_delta_request=is_delta_request,
+                    assistant_content=assistant_content,
+                )
+                await srv.session_manager.update_messages(session_id, full_messages)
+            else:
+                if not is_delta_request and original_message_count > 0:
+                    await srv.session_manager.update_messages(
+                        session_id, body_json.get("messages", [])
+                    )
+                elif is_delta_request and delta_messages:
+                    await srv.session_manager.append_messages(session_id, delta_messages)
+        except Exception:
+            srv.logger.debug(
+                f"Failed to update session {session_id[:8]}... history",
+                exc_info=True,
+            )
+
+    # Save slot snapshot if enabled
+    if slot_save_allowed and slot_enabled and upstream_status < 400:
+        try:
+            saved = await _save_slot_snapshot(
+                llama_port,
+                slot_id,
+                slot_filename,
+                slot_timeout,
+                model=slot_model_payload,
+            )
+            if saved:
+                srv.logger.info(
+                    "slot_save success session=%s slot=%s",
+                    session_id[:8] if session_id else "unknown",
+                    slot_id,
+                )
+        except Exception:
+            srv.logger.debug("slot_save failed", exc_info=True)
+
+
+async def _release_scheduler_and_decrement(
+    srv,
+    scheduler,
+    session_id: Optional[str],
+    slot_id: Optional[int],
+    disconnected: bool = False,
+    decrement_local: bool = True,
+    session_explicit: bool = False,
+) -> None:
+    """Release scheduler slot and decrement active query counters.
+
+    When *disconnected* is True and *session_id* is known, any dispatch
+    lease record for that session is also removed immediately (the client
+    is gone, so no lease should persist).
+
+    When *session_explicit* is True and *session_id* is known, the
+    corresponding dispatch record is marked as inactive with a future
+    expires_at timestamp, keeping the lease alive for a returning session.
+    """
+    if scheduler is not None:
+        if disconnected and session_id:
+            await scheduler.remove_job(session_id)
+        elif slot_id is not None:
+            await scheduler.mark_request_end(slot_id)
+    await _decrement_active_queries(srv)
+    if decrement_local:
+        await _decrement_local_active_queries(
+            srv,
+            session_key=session_id if session_explicit else None,
+        )
+
+    # On client disconnect, immediately remove the dispatch lease record
+    if disconnected and session_id:
+        try:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None:
+                async with lock:
+                    records = getattr(srv, "local_dispatch_records", {})
+                    if session_id in records:
+                        del records[session_id]
+                        try:
+                            srv.logger.info(
+                                "lease_released session=%s reason=disconnect",
+                                session_id[:8] if session_id else "unknown",
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+
+# ===================================================================
 # Core proxy routing: Local llama-server dispatch
+# ===================================================================
 
 async def proxy_to_local(request: Request, path: str) -> Response:
     """Proxy request to local llama-server with session-based incremental ingestion.
@@ -147,11 +442,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not srv.backend_ready or srv.llama_process is None:
         return _build_backend_unavailable_response(srv, path)
 
-    # Get request body
+    # Get request body (keep original for logging before any modifications)
     body = await request.body()
-
-    # Log request
-    log_request(request, body, "local")
+    body_for_logging = body
 
     # Parse body once and determine method/key/model for attribution
     try:
@@ -159,11 +452,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     except Exception:
         body_json = {}
 
-    requested_model_name = None
-    try:
-        requested_model_name = body_json.get("model")
-    except Exception:
-        requested_model_name = None
     # Session handling – incremental prompt ingestion
     session_result = await _handle_session(
         srv, body_json, server_config, request.headers
@@ -174,9 +462,29 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     session_fallback_reason = session_result["session_fallback_reason"]
     delta_messages = session_result["delta_messages"]
     original_message_count = session_result["original_message_count"]
+    session_explicit = session_result.get("session_explicit", False)
     if session_result["body_override"] is not None:
         body = session_result["body_override"]
         body_json = session_result["body_json"]
+
+    # Capture original client→proxy request payload for recording (LP-0MR8FEKK6005V9ML)
+    _client_request_payload = body_json
+
+    # Determine model name from request for recording context
+    _recording_model = None
+    try:
+        if isinstance(body_json, dict):
+            _recording_model = body_json.get("model") or srv.current_model
+    except Exception:
+        pass
+
+    # Schedule fire-and-forget recording of the client→proxy request
+    if session_id and _client_request_payload:
+        _schedule_traffic_recording(
+            session_id=session_id,
+            client_payload=_client_request_payload,
+            model=_recording_model,
+        )
 
     slot_id = None
     slot_filename = None
@@ -228,6 +536,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         )
         slot_enabled = slot_id is not None and slot_filename is not None
 
+    # Log request with resolved session_id and slot_id (LP-0MQQSM1V7004QOGL)
+    log_request(
+        request,
+        body_for_logging,
+        "local",
+        session_id=session_id,
+        slot_id=slot_id if slot_id is not None else "none",
+    )
+
     method = request.method.upper()
     key = f"{method} {request.url.path} -> local"
     model_name = None
@@ -249,6 +566,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             body_json["model"] = slot_model_name
             body = json.dumps(body_json).encode("utf-8")
 
+    # Capture the processed proxy→provider request payload for recording (LP-0MR8FEKK6005V9ML)
+    _proxy_provider_payload = body_json if session_id else None
+    if _proxy_provider_payload:
+        _schedule_traffic_recording(
+            session_id=session_id,
+            proxy_payload=_proxy_provider_payload,
+            model=model_name,
+            provider="local",
+        )
+
     if slot_model_name:
         model_name = slot_model_name
 
@@ -267,26 +594,86 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     max_queries = server_config.get("max_concurrent_queries", 4)
     try:
         async with srv.active_queries_lock:
-            if srv.active_queries >= max_queries:
-                _record_backend_signal("concurrency_rejects")
-                srv.logger.warning(
-                    "concurrency_reject active=%s max=%s path=%s",
-                    srv.active_queries,
-                    max_queries,
-                    path,
-                )
-                # Concurrency limit reached — record 5xx with reason "concurrency_rejected"
-                record_http_error(
-                    "v1/chat/completions", "5xx", "concurrency_rejected"
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Server overloaded: {srv.active_queries} queries active. Retry later.",
-                )
-    except HTTPException:
-        raise
+            cur_active = srv.active_queries
     except Exception:
-        pass
+        cur_active = 0
+
+    if cur_active >= max_queries:
+        # Concurrency limit reached. Attempt to serve from remote providers
+        # for the requested model before rejecting, since remote calls do not
+        # consume local backend slots.
+        try:
+            model_cfg = srv.get_model_config(model_name)
+            if model_cfg:
+                providers = model_cfg.get("providers") or []
+                remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+                if remote_providers:
+                    from proxy.provider import proxy_with_remote_fallback
+                    remote_cfg = {"providers": remote_providers}
+                    try:
+                        resp = await proxy_with_remote_fallback(request, f"v1/{path}", remote_cfg, srv.config)
+                        return resp
+                    except Exception:
+                        srv.logger.exception("Remote fallback during concurrency limit failed; will return concurrency 503")
+        except Exception:
+            srv.logger.debug("Failed to attempt remote fallback under concurrency limit", exc_info=True)
+
+        # No remote providers or remote attempts failed — reject due to concurrency
+        _record_backend_signal("concurrency_rejects")
+        srv.logger.warning(
+            "concurrency_reject active=%s max=%s path=%s",
+            cur_active,
+            max_queries,
+            path,
+        )
+        # Concurrency limit reached — record 5xx with reason "concurrency_rejected"
+        record_http_error(
+            "v1/chat/completions", "5xx", "concurrency_rejected"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Server overloaded: {cur_active} queries active. Retry later.",
+        )
+
+    # -------------------------------------------------------------------
+    # Local dispatch gating — no-preemption lease check
+    # Only applies to explicitly-provided sessions (X-Session-Id header).
+    # Anonymous/auto-generated sessions are ephemeral and should not
+    # acquire a persistent lease.
+    # -------------------------------------------------------------------
+    if session_id and session_explicit:
+        local_max = _get_local_max_concurrent_queries(server_config)
+        acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
+            srv,
+            max_local=local_max,
+            session_key=session_id,
+            backend="local",
+        )
+        if not acquired:
+            srv.logger.info(
+                "local_dispatch_denied session=%s owner=%s active=%s",
+                session_id[:8] if session_id else "unknown",
+                owner[:8] if owner else "none",
+                active_count,
+            )
+            _record_backend_signal("local_dispatch_denied")
+
+            payload = {
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": (
+                        f"Local backend busy. Owner session "
+                        f"{(owner[:8] + '...') if owner else 'unknown'} "
+                        f"holds the lease."
+                    ),
+                },
+                "status": 503,
+                "retry_after": max(1, int(retry_after)),
+                "reason": "local_lease_active",
+                "local_owner_session_id": owner,
+            }
+            return JSONResponse(status_code=503, content=payload)
 
     # Check slot availability
     slot_response = await _check_slot_availability(
@@ -297,17 +684,23 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Mark active query
     await _increment_active_queries(srv)
+    # Only increment local_active_queries if _try_acquire_local_dispatch did not
+    # already do so (LP-0MR96QL8400022BW: double-increment bug). When the lease
+    # check above ran (session_id and session_explicit), _try_acquire_local_dispatch
+    # already incremented local_active_queries and created the dispatch record.
+    if not (session_id and session_explicit):
+        await _increment_local_active_queries(
+            srv,
+            session_key=session_id if session_explicit else None,
+            backend="local",
+        )
 
     # Token accounting
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
     await _schedule_token_increment(key, tokens_sent)
 
-    # Forward headers
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
+    # Forward headers (strip hop-by-hop transport headers)
+    headers = normalize_upstream_request_headers(request.headers)
 
     from proxy.session import _resolve_log_path  # noqa: E402
     llama_log_path = _resolve_log_path("llama")
@@ -430,26 +823,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         err_headers = _normalize_outgoing_headers(
                             dict(response.headers), buffered=True
                         )
-                        if session_id:
-                            err_headers["X-Session-Id"] = session_id
-                            err_headers[
-                                "X-Session-Created"
-                            ] = (
-                                "true"
-                                if session_created
-                                else "false"
+                        err_headers.update(
+                            _build_session_headers(
+                                session_id, session_created,
+                                is_delta_request, session_fallback_reason,
                             )
-                            err_headers[
-                                "X-Session-Delta"
-                            ] = (
-                                "true"
-                                if is_delta_request
-                                else "false"
-                            )
-                            if session_fallback_reason:
-                                err_headers[
-                                    "X-Session-Fallback-Reason"
-                                ] = session_fallback_reason
+                        )
                         await _decrement_active_queries(srv)
                         return Response(
                             content=body_bytes,
@@ -466,26 +845,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     }:
                         outgoing_headers["Cache-Control"] = "no-cache"
 
-                    if session_id:
-                        outgoing_headers["X-Session-Id"] = session_id
-                        outgoing_headers[
-                            "X-Session-Created"
-                        ] = (
-                            "true"
-                            if session_created
-                            else "false"
+                    outgoing_headers.update(
+                        _build_session_headers(
+                            session_id, session_created,
+                            is_delta_request, session_fallback_reason,
                         )
-                        outgoing_headers[
-                            "X-Session-Delta"
-                        ] = (
-                            "true"
-                            if is_delta_request
-                            else "false"
-                        )
-                        if session_fallback_reason:
-                            outgoing_headers[
-                                "X-Session-Fallback-Reason"
-                            ] = session_fallback_reason
+                    )
                     media_type = response.headers.get(
                         "content-type", "text/event-stream"
                     )
@@ -495,57 +860,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     completion_tokens_total = 0
                     stream_start = time.monotonic()
                     chunk_history: list[tuple[float, str]] = []
-                    max_runtime_seconds = float(
-                        server_config.get(
-                            "session_guardrail_max_runtime_seconds", 1800
-                        )
-                        or 1800
-                    )
-                    max_completion_tokens = int(
-                        server_config.get(
-                            "session_guardrail_max_completion_tokens",
-                            2048,
-                        )
-                        or 2048
-                    )
-                    repetition_min_pattern_chars = int(
-                        server_config.get(
-                            "session_guardrail_repetition_min_pattern_chars",
-                            64,
-                        )
-                        or 64
-                    )
-                    repetition_min_repeats = int(
-                        server_config.get(
-                            "session_guardrail_repetition_min_repeats",
-                            10,
-                        )
-                        or 10
-                    )
-                    invalidate_on_guardrail = bool(
-                        server_config.get(
-                            "session_guardrail_invalidate_on_cutoff", True
-                        )
-                    )
-                    invalidate_on_repetition = (
-                        server_config.get(
-                            "session_guardrail_invalidate_on_repetition",
-                            False,
-                        )
-                    )
-                    max_token_rate = int(
-                        server_config.get(
-                            "session_guardrail_max_token_rate", 0
-                        )
-                        or 0
-                    )
-                    token_rate_window_seconds = int(
-                        server_config.get(
-                            "session_guardrail_token_rate_window_seconds",
-                            5,
-                        )
-                        or 5
-                    )
+                    gc = _get_guardrail_config(server_config)
+                    max_runtime_seconds = gc["max_runtime_seconds"]
+                    max_completion_tokens = gc["max_completion_tokens"]
+                    repetition_min_pattern_chars = gc["repetition_min_pattern_chars"]
+                    repetition_min_repeats = gc["repetition_min_repeats"]
+                    invalidate_on_guardrail = gc["invalidate_on_guardrail"]
+                    invalidate_on_repetition = gc["invalidate_on_repetition"]
+                    max_token_rate = gc["max_token_rate"]
+                    token_rate_window_seconds = gc["token_rate_window_seconds"]
 
                     async def stream_generator():
                         nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed, chunk_history
@@ -765,122 +1088,42 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Client disconnected or generator is being closed.
                             # Skip the final event yield and proceed directly to cleanup.
                             pass
+                        except Exception as exc:
+                            # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
+                            # Log and let the finally block handle cleanup so backend_ready
+                            # is not spuriously set to False (which would cooldown the
+                            # local provider and trigger fallback to remotes).
+                            srv.logger.warning(
+                                "Stream error during local response for model=%s: %s",
+                                model_name,
+                                type(exc).__name__,
+                            )
                         finally:
-                            # Strict restore confirmation state comes from explicit backend signal.
-                            if session_id:
-                                try:
-                                    if not restore_signal_detected:
-                                        restore_signal_detected = (
-                                            _detect_restore_signal_from_log_slice(
-                                                llama_log_path,
-                                                llama_log_offset,
-                                            )
-                                        )
-                                    if restore_signal_detected:
-                                        _record_restore_success()
-                                    await srv.session_manager.set_restore_confirmed(
-                                        session_id, restore_signal_detected
-                                    )
-                                except Exception:
-                                    srv.logger.debug(
-                                        "Failed to set restore-confirmed state",
-                                        exc_info=True,
-                                    )
-
-                            # Update session history with the full conversation
-                            if (
-                                session_id
-                                and original_message_count > 0
-                                and (
-                                    collected_content
-                                    or not guardrail_reason
+                            # Record assembled streaming response (fire-and-forget)
+                            if session_id and collected_content:
+                                _stream_full_response = "".join(collected_content)
+                                _schedule_traffic_recording(
+                                    session_id=session_id,
+                                    response_payload=_stream_full_response,
+                                    model=model_name,
+                                    provider="local",
                                 )
-                            ):
-                                try:
-                                    if collected_content:
-                                        full_response = "".join(
-                                            collected_content
-                                        )
-                                        assistant_content = (
-                                            _extract_assistant_content_from_sse(
-                                                full_response
-                                            )
-                                        )
-                                        existing_messages = []
-                                        if (
-                                            is_delta_request
-                                            and delta_messages
-                                        ):
-                                            session_obj = (
-                                                await srv.session_manager.get(
-                                                    session_id
-                                                )
-                                            )
-                                            if session_obj:
-                                                existing_messages = list(
-                                                    session_obj.messages
-                                                )
-                                        full_messages = (
-                                            merge_session_history_for_update(
-                                                existing_messages=existing_messages,
-                                                request_messages=list(
-                                                    body_json.get(
-                                                        "messages", []
-                                                    )
-                                                ),
-                                                delta_messages=delta_messages,
-                                                is_delta_request=is_delta_request,
-                                                assistant_content=assistant_content,
-                                            )
-                                        )
-                                        await srv.session_manager.update_messages(
-                                            session_id, full_messages
-                                        )
-                                    else:
-                                        if (
-                                            not is_delta_request
-                                            and original_message_count
-                                            > 0
-                                        ):
-                                            await srv.session_manager.update_messages(
-                                                session_id,
-                                                body_json.get(
-                                                    "messages", []
-                                                ),
-                                            )
-                                        elif (
-                                            is_delta_request
-                                            and delta_messages
-                                        ):
-                                            await srv.session_manager.append_messages(
-                                                session_id, delta_messages
-                                            )
-                                except Exception:
-                                    srv.logger.debug(
-                                        f"Failed to update session {session_id[:8]}... history",
-                                        exc_info=True,
-                                    )
 
-                            if (
-                                slot_save_allowed
-                                and slot_enabled
-                                and upstream_status < 400
-                            ):
-                                saved = await _save_slot_snapshot(
-                                    llama_port,
-                                    slot_id,
-                                    slot_filename,
-                                    slot_timeout,
-                                    model=slot_model_payload,
-                                )
-                                if saved:
-                                    srv.logger.info(
-                                        "slot_save success session=%s slot=%s",
-                                        session_id[:8]
-                                        if session_id
-                                        else "unknown",
-                                        slot_id,
-                                    )
+                            # Update session history and save slot (shared helper)
+                            await _update_session_and_slot(
+                                srv, session_id, body_json,
+                                is_delta_request, delta_messages,
+                                original_message_count,
+                                response,
+                                llama_port, slot_id, slot_filename,
+                                slot_timeout, slot_model_payload,
+                                slot_enabled,
+                                upstream_status=upstream_status,
+                                slot_save_allowed=slot_save_allowed,
+                                collected_content=collected_content,
+                                llama_log_path=llama_log_path,
+                                llama_log_offset=llama_log_offset,
+                            )
 
                             try:
                                 await cm.__aexit__(None, None, None)
@@ -891,13 +1134,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (asyncio.TimeoutError, Exception):
                                 pass
-                            # If client disconnected, release scheduler slot entirely (LP-0MQTHP828000JYM6)
-                            if scheduler is not None:
-                                if disconnected and session_id:
-                                    await scheduler.remove_job(session_id)
-                                elif slot_id is not None:
-                                    await scheduler.mark_request_end(slot_id)
-                            await _decrement_active_queries(srv)
+                            # Decrement local active queries now that the stream
+                            # has finished (LP-0MR96QL8400022BW: streaming path was
+                            # not decrementing local_active_queries, causing subsequent
+                            # requests to the same session to be rejected with 503).
+                            await _release_scheduler_and_decrement(
+                                srv, scheduler, session_id, slot_id,
+                                disconnected=disconnected,
+                                decrement_local=True,
+                                session_explicit=session_explicit,
+                            )
 
                     return StreamingResponse(
                         stream_generator(),
@@ -906,7 +1152,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         status_code=upstream_status,
                     )
         except SessionSingleFlightRejected as exc:
-            await _decrement_active_queries(srv)
+            await _release_scheduler_and_decrement(
+                srv, scheduler, session_id, slot_id,
+                decrement_local=False,
+            )
+            # Clean up any dispatch record that was created before the rejection
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            if session_id in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[session_id]
+                except Exception:
+                    pass
             payload = {
                 "error": {
                     "type": "session_single_flight",
@@ -1010,110 +1269,28 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Loop detection via repetition check is used instead.
                             # The max_completion_tokens config is now ignored.
 
-                            # Update session history for non-streaming responses
-                            if (
-                                session_id
-                                and isinstance(body_json, dict)
-                                and "messages" in body_json
-                            ):
-                                try:
-                                    resp_content = response.content.decode(
-                                        "utf-8", errors="replace"
-                                    )
-                                    resp_json = (
-                                        json.loads(resp_content)
-                                        if resp_content
-                                        else {}
-                                    )
-                                    restore_signal_detected = (
-                                        _has_explicit_restore_signal(
-                                            dict(response.headers),
-                                            (
-                                                resp_json
-                                                if isinstance(
-                                                    resp_json, dict
-                                                )
-                                                else None
-                                            ),
-                                        )
-                                    )
-                                    if session_id and not restore_signal_detected:
-                                        restore_signal_detected = (
-                                            _detect_restore_signal_from_llama_log(
-                                                session_id
-                                            )
-                                        )
-                                    if session_id and not restore_signal_detected:
-                                        restore_signal_detected = (
-                                            _detect_restore_signal_from_log_slice(
-                                                llama_log_path,
-                                                llama_log_offset,
-                                            )
-                                        )
-                                    if restore_signal_detected:
-                                        _record_restore_success()
-                                    await srv.session_manager.set_restore_confirmed(
-                                        session_id, restore_signal_detected
-                                    )
-                                    assistant_content = _extract_assistant_content(
-                                        resp_json
-                                    )
-                                    existing_messages = []
-                                    if (
-                                        is_delta_request
-                                        and delta_messages
-                                    ):
-                                        session_obj = (
-                                            await srv.session_manager.get(
-                                                session_id
-                                            )
-                                        )
-                                        if session_obj:
-                                            existing_messages = list(
-                                                session_obj.messages
-                                            )
-                                    full_messages = (
-                                        merge_session_history_for_update(
-                                            existing_messages=existing_messages,
-                                            request_messages=list(
-                                                body_json.get(
-                                                    "messages", []
-                                                )
-                                            ),
-                                            delta_messages=delta_messages,
-                                            is_delta_request=is_delta_request,
-                                            assistant_content=assistant_content,
-                                        )
-                                    )
-                                    await srv.session_manager.update_messages(
-                                        session_id, full_messages
-                                    )
-                                except Exception:
-                                    srv.logger.debug(
-                                        f"Failed to update session {session_id[:8]}... history",
-                                        exc_info=True,
-                                    )
-
-                            if (
-                                slot_save_allowed
-                                and slot_enabled
-                                and response.status_code < 400
-                            ):
-                                saved = await _save_slot_snapshot(
-                                    llama_port,
-                                    slot_id,
-                                    slot_filename,
-                                    slot_timeout,
-                                    model=slot_model_payload,
+                            # Record provider→client response (fire-and-forget)
+                            if session_id and hasattr(response, "content"):
+                                _schedule_traffic_recording(
+                                    session_id=session_id,
+                                    response_payload=response.content,
+                                    model=model_name,
+                                    provider="local",
                                 )
-                                if saved:
-                                    srv.logger.info(
-                                        "slot_save success session=%s slot=%s",
-                                        session_id[:8]
-                                        if session_id
-                                        else "unknown",
-                                        slot_id,
-                                    )
+
+                            # Update session history and save slot (shared helper)
+                            await _update_session_and_slot(
+                                srv, session_id, body_json,
+                                is_delta_request, delta_messages,
+                                original_message_count,
+                                response,
+                                llama_port, slot_id, slot_filename,
+                                slot_timeout, slot_model_payload,
+                                slot_enabled,
+                                upstream_status=response.status_code,
+                                llama_log_path=llama_log_path,
+                                llama_log_offset=llama_log_offset,
+                            )
 
                             log_response(
                                 response.status_code, response.content
@@ -1123,26 +1300,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             resp_headers = _normalize_outgoing_headers(
                                 dict(response.headers), buffered=True
                             )
-                            if session_id:
-                                resp_headers["X-Session-Id"] = session_id
-                                resp_headers[
-                                    "X-Session-Created"
-                                ] = (
-                                    "true"
-                                    if session_created
-                                    else "false"
+                            resp_headers.update(
+                                _build_session_headers(
+                                    session_id, session_created,
+                                    is_delta_request, session_fallback_reason,
                                 )
-                                resp_headers[
-                                    "X-Session-Delta"
-                                ] = (
-                                    "true"
-                                    if is_delta_request
-                                    else "false"
-                                )
-                                if session_fallback_reason:
-                                    resp_headers[
-                                        "X-Session-Fallback-Reason"
-                                    ] = session_fallback_reason
+                            )
 
                             return Response(
                                 content=response.content,
@@ -1150,11 +1313,26 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 headers=resp_headers,
                             )
                     finally:
-                        await _decrement_active_queries(srv)
-                        if scheduler is not None and slot_id is not None:
-                            await scheduler.mark_request_end(slot_id)
+                        await _release_scheduler_and_decrement(
+                            srv, scheduler, session_id, slot_id,
+                            decrement_local=True,
+                            session_explicit=session_explicit,
+                        )
         except SessionSingleFlightRejected as exc:
-            await _decrement_active_queries(srv)
+            await _release_scheduler_and_decrement(
+                srv, scheduler, session_id, slot_id,
+                decrement_local=True,
+            )
+            # Clean up any dispatch record that was created before the rejection
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            if session_id in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[session_id]
+                except Exception:
+                    pass
             payload = {
                 "error": {
                     "type": "session_single_flight",

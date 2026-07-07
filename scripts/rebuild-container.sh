@@ -11,6 +11,7 @@ IMAGE="rocm/dev-ubuntu-24.04:7.2.4"
 TAG="llm/llama-server:rocm-7.2.4"
 UPDATE_CONTAINERFILE=0
 BUILD=0
+PUSH=0
 CONTAINERFILE="Containerfile"
 
 usage() {
@@ -20,6 +21,7 @@ Usage: $0 [--image IMAGE] [--tag TAG] [--update-containerfile] [--build] [--dry-
   --tag TAG                Tag for built image (default: $TAG)
   --update-containerfile   Update ${CONTAINERFILE} FROM line to use IMAGE
   --build                  Build the image using podman/docker
+  --push                   Push the built image to the registry (implies --build)
   --dry-run                Do not perform destructive actions; emit planned steps
   --json                   Emit JSON summary
   --output FILE            Write JSON output to FILE
@@ -32,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --tag) TAG="$2"; shift 2 ;;
     --update-containerfile) UPDATE_CONTAINERFILE=1; shift ;;
     --build) BUILD=1; shift ;;
+    --push) BUILD=1; PUSH=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --json) JSON=1; shift ;;
     --output) OUTFILE="$2"; shift 2 ;;
@@ -80,6 +83,25 @@ fi
 runtime=""
 if command -v podman >/dev/null 2>&1; then runtime="podman"; elif command -v docker >/dev/null 2>&1; then runtime="docker"; fi
 
+if [[ $PUSH -eq 1 ]]; then
+  # Check registry credentials before attempting push
+  if [[ "$runtime" == "podman" ]]; then
+    registry="${TAG%%/*}"
+    if ! podman login --get-login "$registry" >/dev/null 2>&1; then
+      errors+=("Registry credentials not found for '$registry'. Run 'podman login $registry' first.")
+      errors+=("Push aborted. See UPGRADE_ROCM.md for push instructions.")
+    fi
+  elif [[ "$runtime" == "docker" ]]; then
+    registry="${TAG%%/*}"
+    if ! docker login "$registry" 2>&1 | grep -q "Login Succeeded"; then
+      if ! docker system info 2>/dev/null | grep -q "Username"; then
+        errors+=("Registry credentials not found for '$registry'. Run 'docker login $registry' first.")
+        errors+=("Push aborted. See UPGRADE_ROCM.md for push instructions.")
+      fi
+    fi
+  fi
+fi
+
 if [[ $BUILD -eq 1 ]]; then
   if [[ -z "$runtime" ]]; then errors+=("No container runtime (podman/docker) found"); fi
   if [[ -n "$runtime" ]]; then
@@ -88,6 +110,15 @@ if [[ $BUILD -eq 1 ]]; then
     else
       if ! docker build -t "$TAG" -f "$CONTAINERFILE" . ; then errors+=("docker build failed"); fi
     fi
+  fi
+fi
+
+if [[ $PUSH -eq 1 && ${#errors[@]} -eq 0 ]]; then
+  planned_steps+=("push_to_registry")
+  if [[ "$runtime" == "podman" ]]; then
+    if ! podman push "$TAG" ; then errors+=("podman push failed"); fi
+  elif [[ "$runtime" == "docker" ]]; then
+    if ! docker push "$TAG" ; then errors+=("docker push failed"); fi
   fi
 fi
 

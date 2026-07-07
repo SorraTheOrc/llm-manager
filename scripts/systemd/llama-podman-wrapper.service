@@ -1,0 +1,33 @@
+[Unit]
+Description=LLM podman wrapper — runs llama-server inside podman container
+Documentation=https://github.com/SorraTheOrc/llm-manager
+After=network.target
+Wants=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=rgardler
+Group=rgardler
+WorkingDirectory=/home/rgardler/projects/llm
+ExecStart=/home/rgardler/projects/llm/scripts/podman_start_llama.sh router
+Environment=LLAMA_HOST_REPO=/home/rgardler/projects/llm
+Environment=PODMAN_LC_CONTAINER=llama
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+
+[Install]
+WantedBy=default.target

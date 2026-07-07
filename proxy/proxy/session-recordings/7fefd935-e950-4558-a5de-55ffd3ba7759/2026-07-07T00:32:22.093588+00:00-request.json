@@ -1,0 +1,1 @@
+{"session_id": "7fefd935-e950-4558-a5de-55ffd3ba7759", "direction": "client_to_proxy", "timestamp": "2026-07-07T00:32:22.093588+00:00", "payload": {"model": "qwen3", "messages": [{"role": "user", "content": "hi"}], "stream": true, "cache_prompt": true, "session_id": "7fefd935-e950-4558-a5de-55ffd3ba7759"}}

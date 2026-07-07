@@ -445,6 +445,17 @@ def _slot_persistence_enabled(slot_path: Optional[Path | str], slot_pool_size: i
     return bool(slot_path and slot_pool_size > 0)
 
 
+def _truncate_body(body: str, maxlen: int = 500) -> str:
+    """Truncate *body* to *maxlen* characters, appending '...' if truncated.
+
+    Used when logging HTTP response bodies to prevent sensitive data
+    (conversation content, model responses) from flooding logs.
+    """
+    if len(body) <= maxlen:
+        return body
+    return body[:maxlen] + "..."
+
+
 async def _call_slot_endpoint(
     llama_port: int,
     slot_id: int,
@@ -453,6 +464,16 @@ async def _call_slot_endpoint(
     timeout: float,
     model: Optional[str] = None,
 ) -> bool:
+    """Make a slot save/restore HTTP call to llama-server.
+
+    Improved logging (LP-0MQWXX17C005BX1E):
+    - Exceptions include the exception type name in the warning message so
+      empty __str__ values never produce empty error fields.
+    - Non-200 responses are logged at WARNING with status code and a truncated
+      (≤500 char) response body.
+    - A DEBUG-level log with exc_info=True is emitted for every exception,
+      capturing the full stack trace for post-hoc diagnosis.
+    """
     if not filename:
         return False
     url = f"http://localhost:{llama_port}/slots/{slot_id}?action={action}"
@@ -463,9 +484,36 @@ async def _call_slot_endpoint(
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=timeout)
     try:
         response = await client.post(url, json=payload, timeout=timeout)
-        return getattr(response, "status_code", None) == 200
+        if getattr(response, "status_code", None) != 200:
+            body = getattr(response, "text", "")
+            srv.logger.warning(
+                "slot_%s failed slot=%s status=%s body=%s",
+                action,
+                slot_id,
+                response.status_code,
+                _truncate_body(body),
+            )
+            return False
+        return True
     except Exception as exc:
-        srv.logger.warning("slot_%s failed slot=%s error=%s", action, slot_id, exc)
+        # Log exception type name in the warning so empty __str__ values
+        # never produce an empty error field (LP-0MQWXX17C005BX1E).
+        exc_type = type(exc).__name__
+        detail = str(exc) if str(exc) else exc_type
+        srv.logger.warning(
+            "slot_%s failed slot=%s error=%s/%s",
+            action,
+            slot_id,
+            exc_type,
+            detail,
+        )
+        # Debug log with full traceback for post-hoc diagnosis.
+        srv.logger.debug(
+            "slot_%s failed slot=%s",
+            action,
+            slot_id,
+            exc_info=True,
+        )
         return False
     finally:
         if not srv._http_client:
@@ -585,6 +633,23 @@ async def _invalidate_session_and_slot(
         try:
             srv = _srv()
             await srv.session_manager.invalidate(session_id)
+        except Exception:
+            pass
+
+        # Also release any dispatch lease record for this session
+        try:
+            srv = _srv()
+            async with srv.local_dispatch_records_lock:
+                if session_id in srv.local_dispatch_records:
+                    del srv.local_dispatch_records[session_id]
+                    try:
+                        _srv().logger.info(
+                            "lease_released session=%s reason=%s",
+                            session_id[:8] if session_id else "unknown",
+                            reason or "invalidation",
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
     if reason:

@@ -66,6 +66,25 @@ class TestJobSchedulerInit:
         assert len(sched.active_jobs) == 0
         assert len(sched.slot_to_job) == 0
 
+    def test_init_logs_configuration(self, caplog):
+        """JobScheduler.__init__ logs pool_size, max_queue_depth, job_timeout at INFO (AC 1)."""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        JobScheduler(pool_size=4, max_queue_depth=16, job_timeout=300.0)
+
+        found = False
+        for record in caplog.records:
+            msg = record.getMessage()
+            if "scheduler init" in msg:
+                assert "pool_size=4" in msg
+                assert "max_queue_depth=16" in msg
+                assert "job_timeout=300" in msg
+                assert record.levelno == logging.INFO
+                found = True
+                break
+        assert found, "Expected 'scheduler init' log message"
+
 
 # ===================================================================
 # admit_job()
@@ -541,3 +560,114 @@ class TestTimeoutWithActiveRequests:
             assert s.slots[slot_id].active_requests == 0
         finally:
             await cleanup_scheduler(s)
+
+
+# ===================================================================
+# Idle slot check (LP-0MR5MAJNM005R905)
+# ===================================================================
+
+
+class TestIdleSlotCheck:
+    """Tests for has_idle_slot()."""
+
+    @pytest.mark.asyncio
+    async def test_has_idle_slot_returns_true_when_idle(self):
+        """has_idle_slot returns True when at least one slot is idle."""
+        s = await make_scheduler()
+        try:
+            assert s.has_idle_slot() is True
+        finally:
+            await cleanup_scheduler(s)
+
+    @pytest.mark.asyncio
+    async def test_has_idle_slot_returns_false_when_all_busy(self):
+        """has_idle_slot returns False when all slots are busy."""
+        s = await make_scheduler()
+        try:
+            # Admit 2 jobs to fill both slots
+            await s.admit_job("session-a")
+            await s.admit_job("session-b")
+            assert s.has_idle_slot() is False
+        finally:
+            await cleanup_scheduler(s)
+
+    @pytest.mark.asyncio
+    async def test_has_idle_slot_returns_true_after_release(self):
+        """has_idle_slot returns True after a slot is released."""
+        s = await make_scheduler()
+        try:
+            await s.admit_job("session-a")
+            await s.admit_job("session-b")
+            assert s.has_idle_slot() is False
+
+            slot_a = s.active_jobs["session-a"]
+            await s.release_slot(slot_a)
+            assert s.has_idle_slot() is True
+        finally:
+            await cleanup_scheduler(s)
+
+
+# ===================================================================
+# Slot release time logging (LP-0MR5MAJNM005R905)
+# ===================================================================
+
+
+class TestSlotReleaseTimeLogging:
+    """Tests for mark_request_end log output."""
+
+    @pytest.mark.asyncio
+    async def test_mark_request_end_logs_timeout_projection(self, caplog):
+        """mark_request_end logs the projected timeout when last request ends."""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        s = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=300.0)
+        await s.start()
+        try:
+            import time
+            await s.admit_job("session-a")
+            slot_id = s.active_jobs["session-a"]
+
+            await s.mark_request_start(slot_id)
+            await s.mark_request_end(slot_id)
+
+            # Check the log output
+            assert any(
+                "scheduler request complete" in record.getMessage()
+                for record in caplog.records
+            ), "Expected 'scheduler request complete' log message"
+
+            # Find the specific record
+            for record in caplog.records:
+                msg = record.getMessage()
+                if "scheduler request complete" in msg:
+                    assert "slot=" in msg
+                    assert "job=" in msg
+                    assert "next_timeout_at=" in msg
+                    break
+        finally:
+            await s.stop()
+
+    @pytest.mark.asyncio
+    async def test_mark_request_end_no_log_when_requests_active(self, caplog):
+        """No timeout log when there are still active requests."""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        s = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=300.0)
+        await s.start()
+        try:
+            await s.admit_job("session-a")
+            slot_id = s.active_jobs["session-a"]
+
+            await s.mark_request_start(slot_id)
+            await s.mark_request_start(slot_id)
+            await s.mark_request_end(slot_id)  # Still 1 active
+
+            # Should NOT log timeout projected (still 1 active request)
+            assert not any(
+                "scheduler request complete" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            await s.stop()

@@ -132,6 +132,9 @@ async def test_override_mode_injects_system_prompt(monkeypatch, tmp_path):
         return resp
 
     monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
+    from proxy import router as router_module
+    monkeypatch.setattr(router_module, 'proxy_to_local', fake_proxy_to_local)
+    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
 
     resp = await proxy_openai_api(mock_request, "chat/completions")
 
@@ -269,6 +272,9 @@ async def test_prepend_mode_injects_system_prompt(monkeypatch, tmp_path):
         return resp
 
     monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
+    from proxy import router as router_module
+    monkeypatch.setattr(router_module, 'proxy_to_local', fake_proxy_to_local)
+    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
 
     resp = await proxy_openai_api(mock_request, "chat/completions")
     await client.aclose()
@@ -388,6 +394,9 @@ async def test_no_system_prompt_passes_through(monkeypatch):
         return resp
 
     monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
+    from proxy import router as router_module
+    monkeypatch.setattr(router_module, 'proxy_to_local', fake_proxy_to_local)
+    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
 
     resp = await proxy_openai_api(mock_request, "chat/completions")
     await client.aclose()

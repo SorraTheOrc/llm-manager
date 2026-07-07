@@ -33,10 +33,8 @@
             padding-bottom: 4rem;
         }
         .container { max-width: 1400px; margin: 0 auto; }
-        .header { display:flex; gap:1rem; align-items:center; margin-bottom:1rem; flex-wrap:wrap; }
+        .header { display:flex; gap:1rem; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap; }
         .header-left { display:flex; align-items:center; gap:1rem; }
-        .controls { display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; }
-        .controls-llama { display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; }
         input[type=number] { width:5rem; padding:0.35rem; border-radius:6px; border:1px solid var(--border); background:var(--bg-card); color:var(--text-primary); }
         button { border:none; padding:0.4rem 0.6rem; border-radius:6px; cursor:pointer; }
         button.proxy-btn { background:var(--accent); color:#fff; }
@@ -65,6 +63,100 @@
         .summary-card { background:var(--bg-card); padding:0.75rem; border-radius:6px; border:1px solid var(--border); max-height:140px; overflow:auto; }
         .summary-card h4 { color:var(--text-secondary); font-size:0.85rem; margin-bottom:0.25rem; }
         .pane-label { font-size:0.9rem; min-width:80px; }
+
+        /* Session bar */
+        .session-bar {
+            display:flex;
+            gap:0.5rem;
+            align-items:center;
+            margin-bottom:0.75rem;
+            flex-wrap:wrap;
+        }
+        .session-bar select {
+            padding:0.35rem;
+            border-radius:6px;
+            border:1px solid var(--border);
+            background:var(--bg-card);
+            color:var(--text-primary);
+            font-size:0.85rem;
+            min-width:16rem;
+            max-width:30rem;
+        }
+
+        .session-recording-panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.75rem;
+            margin-top: 0.5rem;
+            min-height: 200px;
+            max-height: calc(100vh - 280px);
+            overflow: auto;
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+        .recording-columns {
+            display: grid;
+            grid-template-columns: 1fr 1.5fr;
+            gap: 0.75rem;
+            height: 100%;
+        }
+        .recording-column {
+            overflow: auto;
+        }
+        .recording-column .recording-entry {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .recording-column .recording-entry .direction {
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .recording-column .recording-entry .timestamp {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+        .conversation-view {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 0.8rem;
+        }
+        .conversation-view .msg {
+            padding: 0.5rem;
+            margin-bottom: 0.5rem;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.03);
+            border-left: 3px solid var(--border);
+        }
+        .conversation-view .msg.user {
+            border-left-color: var(--accent);
+        }
+        .conversation-view .msg.assistant {
+            border-left-color: var(--accent-llama);
+        }
+        .conversation-view .msg-header {
+            font-weight: 600;
+            font-size: 0.75rem;
+            margin-bottom: 0.25rem;
+            color: var(--text-secondary);
+        }
+        .conversation-view .msg-content {
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: var(--text-primary);
+            line-height: 1.4;
+        }
+
+        .provider-badge {
+            display: inline-block;
+            padding: 0.1rem 0.35rem;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            margin-left: 0.25rem;
+        }
+        .provider-badge.local { background: rgba(79,140,255,0.2); color: var(--accent); }
+        .provider-badge.remote { background: rgba(255,140,79,0.2); color: var(--accent-llama); }
+
         .version-footer {
             position: fixed;
             bottom: 0;
@@ -93,59 +185,75 @@
       </div>
     </div>
 
-    <div class="summary">
-      <h3>Request Summary</h3>
-      <div class="summary-grid">
-        <div class="summary-card">
-          <h4>Counts</h4>
-          <div id="counts"></div>
-          <pre id="rawCounts" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+    <!-- Session bar (top-level dropdown) -->
+    <div class="session-bar">
+      <select id="sessionSelect">
+        <option value="">Select a session...</option>
+      </select>
+      <button class="proxy-btn" id="refreshSessions" style="font-size:0.75rem;">Refresh</button>
+      <span id="sessionInfo" class="muted" style="font-size:0.8rem;"></span>
+    </div>
+
+    <!-- Two-pane log view (default visible, shown for "Raw" and initial load) -->
+    <div id="twoPaneContent">
+      <div class="summary">
+        <h3>Request Summary</h3>
+        <div class="summary-grid">
+          <div class="summary-card">
+            <h4>Counts</h4>
+            <div id="counts"></div>
+            <pre id="rawCounts" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+          </div>
+          <div class="summary-card">
+            <h4>Tokens</h4>
+            <div id="tokens"></div>
+            <pre id="rawTokens" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+          </div>
         </div>
-        <div class="summary-card">
-          <h4>Tokens</h4>
-          <div id="tokens"></div>
-          <pre id="rawTokens" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+      </div>
+
+      <div class="log-panes">
+        <div class="pane" id="proxyPane">
+          <div class="pane-header proxy">
+            <span class="pane-label">Proxy log</span>
+            <div class="pane-controls">
+              <input id="proxyLines" type="number" value="200" min="1" />
+              <button id="proxyConnect" class="proxy-btn">Connect</button>
+              <button id="proxyDisconnect" class="proxy-btn" disabled>Disconnect</button>
+              <button id="proxyClear" class="proxy-btn">Clear</button>
+              <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
+                <input id="proxyAutoscroll" type="checkbox" checked /> Auto
+              </label>
+              <button id="proxyDownload" class="proxy-btn">Download</button>
+            </div>
+          </div>
+          <div id="proxyLog" class="log"></div>
+        </div>
+
+        <div class="pane" id="llamaPane">
+          <div class="pane-header llama">
+            <span class="pane-label">Llama-server log</span>
+            <div class="pane-controls">
+              <input id="llamaLines" type="number" value="200" min="1" />
+              <button id="llamaConnect" class="llama-btn">Connect</button>
+              <button id="llamaDisconnect" class="llama-btn" disabled>Disconnect</button>
+              <button id="llamaClear" class="llama-btn">Clear</button>
+              <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
+                <input id="llamaAutoscroll" type="checkbox" checked /> Auto
+              </label>
+              <button id="llamaDownload" class="llama-btn">Download</button>
+            </div>
+          </div>
+          <div id="llamaLog" class="log"></div>
         </div>
       </div>
     </div>
 
-    <div class="log-panes">
-      <!-- Proxy Log Pane -->
-      <div class="pane" id="proxyPane">
-        <div class="pane-header proxy">
-          <span class="pane-label">Proxy log</span>
-          <div class="pane-controls">
-            <input id="proxyLines" type="number" value="200" min="1" />
-            <button id="proxyConnect" class="proxy-btn">Connect</button>
-            <button id="proxyDisconnect" class="proxy-btn" disabled>Disconnect</button>
-            <button id="proxyClear" class="proxy-btn">Clear</button>
-            <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
-              <input id="proxyAutoscroll" type="checkbox" checked /> Auto
-            </label>
-            <button id="proxyDownload" class="proxy-btn">Download</button>
-          </div>
-        </div>
-        <div id="proxyLog" class="log"></div>
-      </div>
-
-      <!-- Llama-server Log Pane -->
-      <div class="pane" id="llamaPane">
-        <div class="pane-header llama">
-          <span class="pane-label">Llama-server log</span>
-          <div class="pane-controls">
-            <input id="llamaLines" type="number" value="200" min="1" />
-            <button id="llamaConnect" class="llama-btn">Connect</button>
-            <button id="llamaDisconnect" class="llama-btn" disabled>Disconnect</button>
-            <button id="llamaClear" class="llama-btn">Clear</button>
-            <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
-              <input id="llamaAutoscroll" type="checkbox" checked /> Auto
-            </label>
-            <button id="llamaDownload" class="llama-btn">Download</button>
-          </div>
-        </div>
-        <div id="llamaLog" class="log"></div>
-      </div>
+    <!-- Recording panel (hidden by default) -->
+    <div id="recordingPanel" class="session-recording-panel" style="display:none;">
+      <div id="recordingContent"></div>
     </div>
+
   </div>
 
   <footer class="version-footer">
@@ -165,6 +273,9 @@
     let latestTokens = {};
     let esProxy = null;
     let esLlama = null;
+    let pollTimer = null;
+    let sessionCache = [];
+    let selectedSessionId = null;
 
     const proxyLog = document.getElementById('proxyLog');
     const llamaLog = document.getElementById('llamaLog');
@@ -177,28 +288,26 @@
     const llamaDisconnectBtn = document.getElementById('llamaDisconnect');
     const proxyAutoscrollCb = document.getElementById('proxyAutoscroll');
     const llamaAutoscrollCb = document.getElementById('llamaAutoscroll');
+    const sessionSelect = document.getElementById('sessionSelect');
+    const sessionInfo = document.getElementById('sessionInfo');
+    const twoPaneContent = document.getElementById('twoPaneContent');
+    const recordingPanel = document.getElementById('recordingPanel');
+    const recordingContent = document.getElementById('recordingContent');
 
-    // Sync shared lines input with individual inputs
     sharedLinesInput.addEventListener('change', () => {
       const n = sharedLinesInput.value;
       proxyLinesInput.value = n;
       llamaLinesInput.value = n;
     });
-    proxyLinesInput.addEventListener('change', () => {
-      sharedLinesInput.value = proxyLinesInput.value;
-    });
-    llamaLinesInput.addEventListener('change', () => {
-      sharedLinesInput.value = llamaLinesInput.value;
-    });
+    proxyLinesInput.addEventListener('change', () => { sharedLinesInput.value = proxyLinesInput.value; });
+    llamaLinesInput.addEventListener('change', () => { sharedLinesInput.value = llamaLinesInput.value; });
 
     function appendLine(logEl, autoscrollCb, text) {
       const div = document.createElement('div');
       div.className = 'line';
       div.textContent = text;
       logEl.appendChild(div);
-      if (autoscrollCb.checked) {
-        logEl.scrollTop = logEl.scrollHeight;
-      }
+      if (autoscrollCb.checked) logEl.scrollTop = logEl.scrollHeight;
     }
 
     function renderSummary() {
@@ -222,7 +331,7 @@
               if (reqPath && (reqPath === path || reqPath === pathNoV1) && !k.includes('-> model:')) {
                 reqTotal += Number(v || 0);
               }
-            } catch (e) { /* ignore */ }
+            } catch (e) {}
           }
 
           let sent = 0, recv = 0;
@@ -232,7 +341,7 @@
               const n = Number(v || 0);
               if (k.startsWith('sent:') && k.includes(path)) sent += n;
               if (k.startsWith('recv:') && k.includes(path)) recv += n;
-            } catch (e) { /* ignore */ }
+            } catch (e) {}
           }
 
           countsParts.push(`<div class="line">${label}: <strong>${reqTotal}</strong></div>`);
@@ -246,7 +355,7 @@
         const rawTokensEl = document.getElementById('rawTokens');
         if (rawCountsEl) rawCountsEl.textContent = JSON.stringify(counts, null, 2);
         if (rawTokensEl) rawTokensEl.textContent = JSON.stringify(tokens, null, 2);
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
     }
 
     try {
@@ -255,30 +364,332 @@
         latestTokens = window.__INITIAL_STATS.tokens || {};
         renderSummary();
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
+
+    // ===================================================================
+    // Session list management
+    // ===================================================================
+
+    async function loadSessions() {
+      if (sessionInfo) sessionInfo.textContent = 'Loading sessions...';
+      try {
+        const resp = await fetch('/admin/sessions');
+        if (!resp.ok) { if (sessionInfo) sessionInfo.textContent = 'API not available'; return; }
+        const data = await resp.json();
+        const sessions = data.sessions || [];
+        sessionCache = sessions;
+
+        const currentVal = sessionSelect.value;
+        sessionSelect.innerHTML = '<option value="">Raw</option>';
+        for (const s of sessions) {
+          const opt = document.createElement('option');
+          opt.value = s.session_id;
+          var prefix = s.active ? '\u25CF ' : '';
+          var ts = s.response_time || '';
+          if (ts) {
+            try { ts = new Date(ts).toLocaleString(); } catch(e) {}
+            if (prefix) ts = prefix + ' ' + ts;
+          }
+          var preview = s.preview_text || '';
+          if (preview) preview = ' | ' + preview;
+          var modelInfo = '';
+          if (s.model) {
+            modelInfo = ' | ' + s.model;
+            if (s.provider) modelInfo += '/' + s.provider;
+          }
+          var label = (ts || s.session_id) + preview + modelInfo;
+          opt.textContent = label;
+          opt.dataset.active = s.active ? 'true' : 'false';
+          sessionSelect.appendChild(opt);
+        }
+
+        // Preserve selection if still valid
+        if (currentVal) {
+          var stillExists = sessions.some(function(s) { return s.session_id === currentVal; });
+          if (stillExists) {
+            sessionSelect.value = currentVal;
+            return;
+          }
+        }
+        // Default to "Raw"
+        sessionSelect.value = '';
+
+        if (sessionInfo) {
+          var activeCount = sessions.filter(function(s) { return s.active; }).length;
+          sessionInfo.textContent = sessions.length + ' session' + (sessions.length !== 1 ? 's' : '') +
+            (activeCount > 0 ? ' (' + activeCount + ' active)' : '');
+        }
+      } catch (err) {
+        if (sessionInfo) sessionInfo.textContent = 'Error loading sessions';
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(loadSessions, 5000);
+    }
+
+    // ===================================================================
+    // Session selection
+    // ===================================================================
+
+    sessionSelect.addEventListener('change', function() {
+      var val = sessionSelect.value;
+      if (!val) {
+        // "Raw" selected — show two-pane view, hide recording panel
+        showRawView();
+      } else {
+        showSessionRecording(val);
+      }
+    });
+
+    function showRawView() {
+      selectedSessionId = null;
+      recordingPanel.style.display = 'none';
+      twoPaneContent.style.display = 'block';
+    }
+
+    function showSessionRecording(sessionId) {
+      selectedSessionId = sessionId;
+      twoPaneContent.style.display = 'none';
+      recordingPanel.style.display = 'block';
+      loadSessionRecordings(sessionId);
+    }
+
+    document.getElementById('refreshSessions').addEventListener('click', loadSessions);
+
+    // ===================================================================
+    // Session recording display
+    // ===================================================================
+
+    function shortDir(direction) {
+      var parts = direction.split('_to_');
+      return parts[0] || direction;
+    }
+
+    async function loadSessionRecordings(sessionId) {
+      recordingContent.innerHTML = '<div class="muted">Loading recordings...</div>';
+
+      try {
+        const resp = await fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings');
+        if (!resp.ok) { recordingContent.innerHTML = '<div class="muted">No recordings available for this session.</div>'; return; }
+        const data = await resp.json();
+        const recordings = data.recordings || [];
+
+        if (recordings.length === 0) { recordingContent.innerHTML = '<div class="muted">No recording files found.</div>'; return; }
+
+        var leftHtml = '';
+        var fetchPromises = [];
+        for (const rec of recordings) {
+          const direction = rec.direction || 'unknown';
+          const short = shortDir(direction);
+          const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
+          const safeFilename = rec.filename.replace(/'/g, "\\'");
+          var recModel = rec.model || '';
+          var modelBadge = '';
+          if (recModel) modelBadge = '<span class="provider-badge local">model: ' + recModel + '</span>';
+          var providerBadge = '';
+          if (rec.provider) providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
+          leftHtml += '<div class="recording-entry">'
+            + '<span class="timestamp">' + ts + '</span> '
+            + '<span class="direction">' + short + '</span> '
+            + modelBadge + providerBadge
+            + '<span class="muted" style="font-size:0.75rem;"> ' + (rec.file_size || 0) + ' bytes</span>'
+            + '<span class="json-hover" style="margin-left:0.5rem; font-size:0.7rem; color:var(--accent); text-decoration:underline; cursor:default;"'
+            + 'data-session="' + sessionId + '" data-filename="' + safeFilename + '"'
+            + ' onmouseover="showJsonTooltip(event, this)" onmouseout="scheduleHideTooltip()">JSON</span>'
+            + '</div>';
+          fetchPromises.push(
+            fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings/' + safeFilename)
+              .then(function(r) { return r.ok ? r.json() : null; })
+              .then(function(recData) { return {filename: rec.filename, data: recData, direction: direction, ts: rec.timestamp}; })
+          );
+        }
+
+        if (!document.getElementById('jsonTooltip')) {
+          const tip = document.createElement('div');
+          tip.id = 'jsonTooltip';
+          tip.style.cssText = 'display:none; position:fixed; z-index:1000; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:0.75rem; font-family:monospace; font-size:0.75rem; max-width:800px; max-height:500px; overflow:auto; white-space:pre-wrap; color:var(--text-primary); box-shadow:0 4px 12px rgba(0,0,0,0.5); line-height:1.3;';
+          tip.onmouseover = function() { clearTimeout(_tooltipHideTimer); };
+          tip.onmouseout = function() { scheduleHideTooltip(); };
+          document.body.appendChild(tip);
+        }
+
+        function extractText(content) {
+          if (typeof content === 'string') return content;
+          if (Array.isArray(content)) return content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text || ''; }).join('\n');
+          if (typeof content === 'object' && content !== null) return content.text || JSON.stringify(content);
+          return String(content || '');
+        }
+
+        var convHtml = '<div class="conversation-view">';
+        var _msgId = 0;
+        var seenMsgs = 0;  // track how many messages from accumulated history we've rendered
+        var allContent = await Promise.all(fetchPromises);
+        for (var i = 0; i < allContent.length; i++) {
+          var item = allContent[i];
+          if (!item || !item.data) continue;
+          var payload = item.data.payload || {};
+          var ts = '';
+          try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
+
+          if (item.direction === 'client_to_proxy' || item.direction === 'proxy_to_provider') {
+            // Show NEW messages from the accumulated history (past seenMsgs)
+            var messages = payload.messages || [];
+            for (var m = seenMsgs; m < messages.length; m++) {
+              var msg = messages[m];
+              if (msg.role === 'system' || msg.role === 'tool') continue;
+              _msgId++;
+              if (msg.role === 'user') {
+                convHtml += '<div class="msg user"><div class="msg-header">## User - ' + ts + '</div>' + makeExpandable(extractText(msg.content), _msgId) + '</div>';
+              } else if (msg.role === 'assistant') {
+                var asstContent = extractText(msg.content);
+                var modelName = item.data.model || '';
+                var providerName = item.data.provider || '';
+                var header = '## ' + (modelName || 'assistant');
+                if (providerName) header += ' / ' + providerName;
+                header += ' - ' + ts;
+                if (asstContent) {
+                  _msgId++;
+                  convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(asstContent, _msgId) + '</div>';
+                } else if (msg.tool_calls) {
+                  var tcList = Array.isArray(msg.tool_calls) ? msg.tool_calls : [msg.tool_calls];
+                  var tcSummary = tcList.map(function(tc) { return tc.function ? tc.function.name + '(' + (tc.function.arguments || '') + ')' : 'tool_call'; }).join('\n');
+                  _msgId++;
+                  convHtml += '<div class="msg assistant" style="border-left-color:var(--warning);"><div class="msg-header">' + header + ' [tool calls]</div>' + makeExpandable(tcSummary, _msgId) + '</div>';
+                }
+              }
+            }
+            seenMsgs = Math.max(seenMsgs, messages.length);
+          } else if (item.direction === 'provider_to_client') {
+            var modelName = item.data.model || '';
+            var providerName = item.data.provider || '';
+            var header = '## ' + (modelName || 'assistant');
+            if (providerName) header += ' / ' + providerName;
+            header += ' - ' + ts;
+            var assistantText = '';
+
+            if (typeof payload === 'string') {
+              var lines = payload.split('\n');
+              var fullContent = '';
+              var reasoning = '';
+              for (var li = 0; li < lines.length; li++) {
+                var line = lines[li];
+                if (line.indexOf('data: ') === 0 && line.indexOf('[DONE]') === -1) {
+                  try {
+                    var sseObj = JSON.parse(line.substring(6));
+                    if (sseObj.choices && sseObj.choices.length > 0) {
+                      var delta = sseObj.choices[0].delta || sseObj.choices[0].message || {};
+                      if (delta.content) { fullContent += delta.content; }
+                      if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
+                      if (delta.thinking) { reasoning += (typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)); }
+                    }
+                  } catch(e) {}
+                }
+              }
+              assistantText = fullContent || reasoning || '';
+            } else {
+              var choices = payload.choices || [];
+              if (choices.length > 0) {
+                var choiceMsg = choices[0].message || choices[0].delta || {};
+                if (typeof choiceMsg === 'string') {
+                  try { var parsed = JSON.parse(choiceMsg); choiceMsg = parsed; } catch(e) { assistantText = choiceMsg; }
+                }
+                if (typeof choiceMsg === 'object') assistantText = choiceMsg.content || choiceMsg.reasoning_content || choiceMsg.thinking || '';
+              }
+            }
+            if (assistantText) { _msgId++; convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(assistantText, _msgId) + '</div>'; }
+          }
+        }
+        convHtml += '</div>';
+
+        recordingContent.innerHTML = '<div class="recording-columns">'
+          + '<div class="recording-column">' + leftHtml + '</div>'
+          + '<div class="recording-column">' + convHtml + '</div>'
+          + '</div>';
+      } catch (err) {
+        recordingContent.innerHTML = '<div class="muted">Error loading recordings.</div>';
+      }
+    }
+
+    function makeExpandable(text, id) {
+      var escaped = escapeHtml(text);
+      if (escaped.length <= 300) return '<div class="msg-content">' + escaped + '</div>';
+      return '<div class="msg-content" id="msgShort-' + id + '">' + escaped.substring(0, 300) + '...'
+        + ' <span style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="expandMsg(' + id + ')">show more</span></div>'
+        + '<div class="msg-content" id="msgFull-' + id + '" style="display:none;">' + escaped
+        + ' <span style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="collapseMsg(' + id + ')">show less</span></div>';
+    }
+    function expandMsg(id) { document.getElementById('msgShort-' + id).style.display = 'none'; var el = document.getElementById('msgFull-' + id); if (el) el.style.display = 'block'; }
+    function collapseMsg(id) { document.getElementById('msgFull-' + id).style.display = 'none'; var el = document.getElementById('msgShort-' + id); if (el) el.style.display = 'block'; }
+
+    function escapeHtml(str) {
+      if (typeof str !== 'string') return String(str || '');
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // ===================================================================
+    // JSON tooltip
+    // ===================================================================
+
+    let _jsonTooltipCache = {};
+
+    function showJsonTooltip(event, el) {
+      const tip = document.getElementById('jsonTooltip');
+      if (!tip) return;
+      const sessionId = el.getAttribute('data-session');
+      const filename = el.getAttribute('data-filename');
+      if (!sessionId || !filename) return;
+      const cacheKey = sessionId + '/' + filename;
+      tip.textContent = 'Loading...';
+      tip.style.display = 'block';
+      positionTooltip(event, tip);
+      if (_jsonTooltipCache[cacheKey]) { tip.textContent = _jsonTooltipCache[cacheKey]; return; }
+      fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings/' + encodeURIComponent(filename))
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+          if (!data) { tip.textContent = 'Not found'; return; }
+          var formatted = JSON.stringify(data, null, 2);
+          var display = formatted;
+          _jsonTooltipCache[cacheKey] = display;
+          tip.textContent = display;
+          positionTooltip(event, tip);
+        })
+        .catch(function() { tip.textContent = 'Error loading'; });
+    }
+
+    function positionTooltip(event, tip) {
+      var w = Math.min(800, window.innerWidth - 20);
+      var h = Math.min(500, window.innerHeight - 20);
+      tip.style.maxWidth = w + 'px';
+      tip.style.maxHeight = h + 'px';
+      var x = Math.min(event.clientX + 10, window.innerWidth - w - 10);
+      var y = Math.min(event.clientY + 10, window.innerHeight - h - 10);
+      tip.style.left = Math.max(5, x) + 'px';
+      tip.style.top = Math.max(5, y) + 'px';
+    }
+
+    var _tooltipHideTimer = null;
+    function scheduleHideTooltip() {
+      clearTimeout(_tooltipHideTimer);
+      _tooltipHideTimer = setTimeout(function() { const tip = document.getElementById('jsonTooltip'); if (tip) tip.style.display = 'none'; }, 300);
+    }
+    function hideJsonTooltip() { clearTimeout(_tooltipHideTimer); const tip = document.getElementById('jsonTooltip'); if (tip) tip.style.display = 'none'; }
+
+    // ===================================================================
+    // Raw log event source handling
+    // ===================================================================
 
     function handleMessage(logEl, autoscrollCb, obj) {
       if (obj.initial) {
         appendLine(logEl, autoscrollCb, '--- initial log ---');
         obj.initial.split(String.fromCharCode(10)).forEach(l => appendLine(logEl, autoscrollCb, l));
         appendLine(logEl, autoscrollCb, '--- end initial ---');
-      } else if (obj.line) {
-        appendLine(logEl, autoscrollCb, obj.line);
-      } else if (obj.counts) {
-        try {
-          latestCounts = obj.counts || {};
-          renderSummary();
-        } catch (e) { /* ignore */ }
-      } else if (obj.tokens) {
-        try {
-          latestTokens = obj.tokens || {};
-          renderSummary();
-        } catch (e) { /* ignore */ }
-      } else if (obj.info) {
-        appendLine(logEl, autoscrollCb, '[info] ' + obj.info);
-      } else if (obj.error) {
-        appendLine(logEl, autoscrollCb, '[error] ' + JSON.stringify(obj));
-      }
+      } else if (obj.line) { appendLine(logEl, autoscrollCb, obj.line);
+      } else if (obj.counts) { try { latestCounts = obj.counts || {}; renderSummary(); } catch (e) {}
+      } else if (obj.tokens) { try { latestTokens = obj.tokens || {}; renderSummary(); } catch (e) {}
+      } else if (obj.info) { appendLine(logEl, autoscrollCb, '[info] ' + obj.info);
+      } else if (obj.error) { appendLine(logEl, autoscrollCb, '[error] ' + JSON.stringify(obj)); }
     }
 
     function connectProxy() {
@@ -286,66 +697,22 @@
       const n = Math.max(1, parseInt(proxyLinesInput.value || '200'));
       const url = '/logs/tail?lines=' + encodeURIComponent(n) + '&source=proxy';
       esProxy = new EventSource(url);
-      proxyConnectBtn.disabled = true;
-      proxyDisconnectBtn.disabled = false;
-      proxyConnectBtn.classList.add('connected');
-
-      esProxy.onmessage = e => {
-        try {
-          const obj = JSON.parse(e.data);
-          handleMessage(proxyLog, proxyAutoscrollCb, obj);
-        } catch (err) {
-          appendLine(proxyLog, proxyAutoscrollCb, e.data);
-        }
-      };
-
-      esProxy.onerror = () => {
-        appendLine(proxyLog, proxyAutoscrollCb, '[connection closed]');
-        disconnectProxy();
-      };
+      proxyConnectBtn.disabled = true; proxyDisconnectBtn.disabled = false; proxyConnectBtn.classList.add('connected');
+      esProxy.onmessage = e => { try { const obj = JSON.parse(e.data); handleMessage(proxyLog, proxyAutoscrollCb, obj); } catch (err) { appendLine(proxyLog, proxyAutoscrollCb, e.data); } };
+      esProxy.onerror = () => { appendLine(proxyLog, proxyAutoscrollCb, '[connection closed]'); disconnectProxy(); };
     }
-
-    function disconnectProxy() {
-      if (!esProxy) return;
-      esProxy.close();
-      esProxy = null;
-      proxyConnectBtn.disabled = false;
-      proxyDisconnectBtn.disabled = true;
-      proxyConnectBtn.classList.remove('connected');
-    }
+    function disconnectProxy() { if (!esProxy) return; esProxy.close(); esProxy = null; proxyConnectBtn.disabled = false; proxyDisconnectBtn.disabled = true; proxyConnectBtn.classList.remove('connected'); }
 
     function connectLlama() {
       if (esLlama) return;
       const n = Math.max(1, parseInt(llamaLinesInput.value || '200'));
       const url = '/logs/tail?lines=' + encodeURIComponent(n) + '&source=llama';
       esLlama = new EventSource(url);
-      llamaConnectBtn.disabled = true;
-      llamaDisconnectBtn.disabled = false;
-      llamaConnectBtn.classList.add('connected');
-
-      esLlama.onmessage = e => {
-        try {
-          const obj = JSON.parse(e.data);
-          handleMessage(llamaLog, llamaAutoscrollCb, obj);
-        } catch (err) {
-          appendLine(llamaLog, llamaAutoscrollCb, e.data);
-        }
-      };
-
-      esLlama.onerror = () => {
-        appendLine(llamaLog, llamaAutoscrollCb, '[connection closed]');
-        disconnectLlama();
-      };
+      llamaConnectBtn.disabled = true; llamaDisconnectBtn.disabled = false; llamaConnectBtn.classList.add('connected');
+      esLlama.onmessage = e => { try { const obj = JSON.parse(e.data); handleMessage(llamaLog, llamaAutoscrollCb, obj); } catch (err) { appendLine(llamaLog, llamaAutoscrollCb, e.data); } };
+      esLlama.onerror = () => { appendLine(llamaLog, llamaAutoscrollCb, '[connection closed]'); disconnectLlama(); };
     }
-
-    function disconnectLlama() {
-      if (!esLlama) return;
-      esLlama.close();
-      esLlama = null;
-      llamaConnectBtn.disabled = false;
-      llamaDisconnectBtn.disabled = true;
-      llamaConnectBtn.classList.remove('connected');
-    }
+    function disconnectLlama() { if (!esLlama) return; esLlama.close(); esLlama = null; llamaConnectBtn.disabled = false; llamaDisconnectBtn.disabled = true; llamaConnectBtn.classList.remove('connected'); }
 
     function downloadLog(logEl, filename) {
       const text = Array.from(logEl.querySelectorAll('.line')).map(n => n.textContent).join(String.fromCharCode(10));
@@ -359,18 +726,21 @@
     proxyDisconnectBtn.addEventListener('click', disconnectProxy);
     document.getElementById('proxyClear').addEventListener('click', () => proxyLog.innerHTML = '');
     document.getElementById('proxyDownload').addEventListener('click', () => downloadLog(proxyLog, 'proxy.log'));
-
     llamaConnectBtn.addEventListener('click', connectLlama);
     llamaDisconnectBtn.addEventListener('click', disconnectLlama);
     document.getElementById('llamaClear').addEventListener('click', () => llamaLog.innerHTML = '');
     document.getElementById('llamaDownload').addEventListener('click', () => downloadLog(llamaLog, 'llama-server.log'));
 
+    // Initialise
     connectProxy();
     connectLlama();
+    loadSessions();
+    startPolling();
 
     window.addEventListener('beforeunload', () => {
       if (esProxy) esProxy.close();
       if (esLlama) esLlama.close();
+      if (pollTimer) clearInterval(pollTimer);
     });
   </script>
 __LOG_VIEWER_SCRIPT__</body>

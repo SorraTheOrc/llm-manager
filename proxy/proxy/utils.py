@@ -114,13 +114,15 @@ def _extract_tool_call_from_reasoning(reasoning_content: Optional[str]) -> Optio
 
 
 def _extract_assistant_content(resp_json: dict) -> Optional[str]:
-    """Extract assistant content from a non-streaming OpenAI API response.
+    """Extract assistant content from a non-streaming OpenAI-style response.
 
-    Looks for choices[0].message.content and returns it.
-    If content is null but reasoning_content contains a tool call
-    pattern (<function=...>...</function>), the tool call is extracted
-    and returned instead.
-    Returns None if unable to extract content or tool call.
+    Prefer explicit message.content when it is non-empty. If message.content
+    is present but empty/whitespace-only, treat it as absent and fall back to
+    reasoning_content extraction (tool call extraction or promoting plain
+    reasoning text). This handles models that write replies into
+    reasoning_content during their 'thinking' phase.
+
+    Returns extracted content string, or None when no usable content is found.
     """
     srv = _srv()
     try:
@@ -128,8 +130,20 @@ def _extract_assistant_content(resp_json: dict) -> Optional[str]:
         if choices:
             message = choices[0].get("message", {})
             content = message.get("content")
+            # Treat None or empty/whitespace-only strings as missing content
             if content is not None:
-                return str(content)
+                try:
+                    if isinstance(content, str):
+                        if content.strip():
+                            return str(content)
+                        # empty string -> treat as missing and fall through
+                    else:
+                        # Non-string content (rare) - return its string form
+                        return str(content)
+                except Exception:
+                    # On any extraction error, fall through to reasoning_content
+                    pass
+
             # Fall back to extracting tool call from reasoning_content
             reasoning_content = message.get("reasoning_content")
             tool_call = _extract_tool_call_from_reasoning(reasoning_content)
@@ -139,6 +153,7 @@ def _extract_assistant_content(resp_json: dict) -> Optional[str]:
                     tool_call,
                 )
                 return tool_call
+
             # Promote plain reasoning text (non-tool) as a fallback so clients
             # receive a usable assistant message when the model emitted its
             # reply into the thinking channel instead of content.

@@ -648,6 +648,139 @@ async def router_preload_models(model_names: list[str]) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Log watcher — monitors llama-server logs for unload_lru eviction events
+# ---------------------------------------------------------------------------
+
+
+def _parse_unload_lru(line):
+    """Check if a log line contains an unload_lru event.
+
+    Returns True if the line contains 'unload_lru', None otherwise.
+    Handles both str and bytes inputs gracefully.
+    """
+    if not isinstance(line, str):
+        try:
+            line = str(line)
+        except Exception:
+            return None
+    if not line:
+        return None
+    if "unload_lru" in line.lower():
+        return True
+    return None
+
+
+class _UnloadLruTracker:
+    """Tracks unload_lru events within a configurable rolling time window.
+
+    Attributes:
+        window_minutes: Rolling window duration (minutes).
+        threshold: Number of events that triggers an alert.
+        alerted: Whether the threshold has been breached since last reset.
+    """
+
+    def __init__(self, window_minutes: int = 5, threshold: int = 3):
+        self.window_minutes = window_minutes
+        self.threshold = threshold
+        self._events: list[datetime] = []
+        self.alerted = False
+
+    def record(self):
+        """Record an unload_lru event at the current time."""
+        self._events.append(datetime.now())
+        self.prune()
+
+    def prune(self):
+        """Remove events outside the rolling window."""
+        cutoff = datetime.now() - timedelta(minutes=self.window_minutes)
+        self._events = [e for e in self._events if e >= cutoff]
+
+    def count(self) -> int:
+        """Return the number of events in the current window."""
+        self.prune()
+        return len(self._events)
+
+
+def _check_unload_lru_threshold(tracker: _UnloadLruTracker) -> bool:
+    """Check if the tracker's event count has reached the threshold.
+
+    Returns True if threshold is met or exceeded, False otherwise.
+    Sets tracker.alerted = True when triggered.
+    """
+    if tracker.count() >= tracker.threshold and not tracker.alerted:
+        tracker.alerted = True
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Spawn helper — extracted from start_llama_server() for testability
+# ---------------------------------------------------------------------------
+
+def spawn_and_capture(
+    cmd: list[str],
+    env: dict,
+    log_file,
+    logger: logging.Logger,
+) -> tuple:
+    """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
+
+    Returns a tuple (Popen|None, captured_output_str|None).
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+    except FileNotFoundError as e:
+        logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
+        return None, f"Command not found: {cmd[0]}: {e}"
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
+        return None, f"Spawn failed: {e}\n{tb}"
+
+    try:
+        outs, _ = proc.communicate(timeout=3)
+        return None, outs
+    except subprocess.TimeoutExpired:
+        try:
+            if log_file and proc.stdout:
+                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file), daemon=True)
+                t.start()
+        except Exception:
+            pass
+        return proc, None
+
+
+def _stream_output(src, dst):
+    """Stream lines from src to dst, parsing prompt progress for console display."""
+    try:
+        for line in src:
+            dst.write(line)
+            dst.flush()
+            # Display prompt processing progress to console
+            try:
+                line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
+                if 'prompt processing' in line_str.lower():
+                    parsed = extract_progress_data(line_str)
+                    if parsed:
+                        n_tokens, progress = parsed
+                        total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
+                        progress_str = format_progress(n_tokens, total_tokens, progress)
+                        sys.stderr.write(progress_str)
+                        if progress >= 0.999:
+                            sys.stderr.write('\n')
+                        sys.stderr.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     """Start the llama-server with the specified model.
@@ -678,6 +811,13 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     slot_save_path = server_config.get("session_slot_save_path")
     if slot_save_path:
        env["LLAMA_SLOT_SAVE_PATH"] = str(slot_save_path)
+
+    # Export session_slot_pool_size as LLAMA_PARALLEL so the start script can
+    # align --parallel / -np with the proxy's pool size. Falls back to 1 when
+    # not configured — matches the historical default in start-llama.sh.
+    slot_pool_size = server_config.get("session_slot_pool_size", 1)
+    env["LLAMA_PARALLEL"] = str(int(slot_pool_size or 1))
+
     try:
        if server_config.get("llama_no_mmap", True):
            env["LLAMA_SERVER_NO_MMAP"] = "1"
@@ -701,62 +841,6 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     else:
        srv.llama_log_file = subprocess.DEVNULL
 
-    # Helper to start a subprocess and capture immediate stderr/stdout if it
-    # exits quickly. Returns a tuple (Popen|None, captured_output_str|None).
-    def _spawn_and_capture(cmd):
-       try:
-           proc = subprocess.Popen(
-               cmd,
-               env=env,
-               stdout=subprocess.PIPE,
-               stderr=subprocess.STDOUT,
-               text=True
-           )
-       except FileNotFoundError as e:
-           srv.logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
-           return None, f"Command not found: {cmd[0]}: {e}"
-       except Exception as e:
-           tb = traceback.format_exc()
-           srv.logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
-           return None, f"Spawn failed: {e}\n{tb}"
-
-       try:
-           outs, _ = proc.communicate(timeout=3)
-           return None, outs
-       except subprocess.TimeoutExpired:
-           try:
-               if srv.llama_log_file and proc.stdout:
-                   import threading
-
-                   def _stream_output(src, dst):
-                       try:
-                           for line in src:
-                               dst.write(line)
-                               dst.flush()
-                               # Display prompt processing progress to console
-                               try:
-                                   line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
-                                   if 'prompt processing' in line_str.lower():
-                                       parsed = extract_progress_data(line_str)
-                                       if parsed:
-                                           n_tokens, progress = parsed
-                                           total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
-                                           progress_str = format_progress(n_tokens, total_tokens, progress)
-                                           sys.stderr.write(progress_str)
-                                           if progress >= 0.999:
-                                               sys.stderr.write('\n')
-                                           sys.stderr.flush()
-                               except Exception:
-                                   pass
-                       except Exception:
-                           pass
-
-                   t = threading.Thread(target=_stream_output, args=(proc.stdout, srv.llama_log_file), daemon=True)
-                   t.start()
-           except Exception:
-               pass
-           return proc, None
-
     # Build the command for the configured start script
     if router_mode:
        llama_models_max = server_config.get("llama_models_max")
@@ -776,13 +860,40 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
            return None
        cmd = [script_path, model]
 
+    # Host-first startup: if llama_allow_host_fallback is enabled AND the
+    # configured start script is different from the default start-llama.sh,
+    # attempt one host-start before falling back to the configured script.
+    host_start_script = str(Path(__file__).parent.parent / "start-llama.sh")
+    allow_host_fallback = bool(server_config.get("llama_allow_host_fallback", False))
+
+    if allow_host_fallback and script_path != host_start_script:
+        host_cmd = [host_start_script]
+        if router_mode:
+            host_cmd.append("router")
+        elif model is not None:
+            host_cmd.append(model)
+        else:
+            host_cmd.append("router")
+
+        srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
+        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger)
+
+        if host_proc is not None:
+            srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
+            return host_proc
+
+        srv.logger.warning(
+            f"Host-first startup failed (falling back to configured script "
+            f"'{script_path}'): {host_out}"
+        )
+
     # Retry loop configuration
     retries = 4
     backoff = 3  # seconds base
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = _spawn_and_capture(cmd)
+       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger)
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")

@@ -93,9 +93,58 @@ counts_dirty = False
 counts_persist_task: Optional[asyncio.Task] = None
 periodic_broadcast_task: Optional[asyncio.Task] = None
 
-# Active local queries counter
+# Active local queries counter (global, all providers)
 active_queries: int = 0
 active_queries_lock = asyncio.Lock()
+
+# Local-only active queries counter (LP-0MR5MAJNM005R905)
+local_active_queries: int = 0
+local_active_queries_lock = asyncio.Lock()
+
+# Dispatch lease tracking — per-session records that persist as inactive
+# leases after a request completes, preventing other sessions from
+# acquiring the local backend for a configured timeout.
+local_dispatch_records: dict = {}
+local_dispatch_records_lock = asyncio.Lock()
+
+# Session observability counters (for SSE events and metrics)
+session_observability: dict = {
+    "session_activity_total": 0,
+}
+
+# Provider fallback counters (provider_name → count)
+provider_fallback_count: dict = {}
+
+# Background lease cleanup task (started in lifespan)
+_dispatch_cleanup_task: Optional[asyncio.Task] = None
+
+
+async def _dispatch_cleanup_loop() -> None:
+    """Background task that periodically removes stale dispatch leases.
+
+    Runs every 10 seconds (matching the JobScheduler interval) and
+    calls ``_cleanup_stale_local_dispatch`` on the server state to
+    evict inactive lease records whose *expires_at* has passed.
+    """
+    try:
+        while True:
+            await asyncio.sleep(10.0)
+            from proxy.router_helpers import _cleanup_stale_local_dispatch
+            # Import via _srv() to get the current module state
+            import proxy.server as _srv
+            removed = await _cleanup_stale_local_dispatch(_srv)
+            if removed:
+                try:
+                    logger.info(
+                        "dispatch_cleanup removed %s stale lease(s)",
+                        removed,
+                    )
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        logger.info("Dispatch lease cleanup task cancelled")
+    except Exception:
+        logger.exception("Unexpected error in dispatch lease cleanup loop")
 
 # Backend resilience/observability signals
 # Health/readiness signal for local backend
@@ -227,7 +276,7 @@ async def _capture_rocm_version() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global config, logger, llama_process, _http_client, backend_watchdog_task, model_health_task, backend_ready, backend_recovery_state
+    global config, logger, llama_process, _http_client, backend_watchdog_task, model_health_task, backend_ready, backend_recovery_state, _dispatch_cleanup_task
     
     # Startup
     config = load_config()
@@ -393,7 +442,22 @@ async def lifespan(app: FastAPI):
         session_manager.start_cleanup_task()
     except Exception as e:
         logger.warning(f"Failed to start session cleanup task: {e}")
-    
+
+    # Start dispatch lease cleanup task
+    if _dispatch_cleanup_task is None:
+        try:
+            _dispatch_cleanup_task = loop.create_task(_dispatch_cleanup_loop())
+            logger.info("Dispatch lease cleanup task started")
+        except Exception as e:
+            logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
+
+    # Initialize session recorder and register admin routes
+    try:
+        from proxy.ui import list_session_recording_routes
+        list_session_recording_routes(app)
+    except Exception as e:
+        logger.warning(f"Failed to register session recording routes: {e}")
+
     yield
     
     # Shutdown
@@ -403,6 +467,15 @@ async def lifespan(app: FastAPI):
         session_manager.stop_cleanup_task()
     except Exception:
         pass
+
+    # Stop dispatch lease cleanup task
+    if _dispatch_cleanup_task is not None:
+        _dispatch_cleanup_task.cancel()
+        try:
+            await _dispatch_cleanup_task
+        except Exception:
+            pass
+        _dispatch_cleanup_task = None
     if _http_client is not None:
         try:
             await _http_client.aclose()
@@ -583,7 +656,6 @@ from .handlers import (  # noqa: E402, F401
     admin_dump_counts,
     admin_stop_server,
     admin_reset_counts,
-    admin_list_sessions,
     admin_delete_session,
     reload_config,
 )
@@ -714,6 +786,10 @@ from .ui import (  # noqa: E402, F401
     create_embeddings as _ui_create_embeddings,
     proxy_openai_api as _ui_proxy_openai_api,
     switch_model as _ui_switch_model,
+    list_session_recording_routes as _ui_list_session_recording_routes,
+    list_session_recordings as _ui_list_session_recordings,
+    get_session_recording as _ui_get_session_recording,
+    list_all_sessions as _ui_list_all_sessions,
 )
 from .router import (  # noqa: E402, F401
     proxy_to_local,

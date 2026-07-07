@@ -1,0 +1,1 @@
+{"session_id": "new-session", "direction": "proxy_to_provider", "timestamp": "2026-07-06T12:16:57.323385+00:00", "payload": {"model": "plan", "messages": [{"role": "user", "content": "hello"}], "stream": false}}

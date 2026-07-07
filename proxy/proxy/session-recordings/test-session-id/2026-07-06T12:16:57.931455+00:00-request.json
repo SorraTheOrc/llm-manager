@@ -1,0 +1,1 @@
+{"session_id": "test-session-id", "direction": "proxy_to_provider", "timestamp": "2026-07-06T12:16:57.931455+00:00", "payload": {"model": "test", "messages": [{"role": "user", "content": "hi"}]}}
