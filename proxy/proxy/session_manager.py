@@ -173,12 +173,15 @@ class SessionManager:
 
         Returns a list of dicts with session info including
         ``session_id``, ``created_at``, ``last_activity_at``,
-        ``message_count``, ``idle_seconds``, ``age_seconds``,
-        ``invalidated``, and ``restore_confirmed``.
+        ``response_time`` (ISO8601), ``message_count``,
+        ``idle_seconds``, ``age_seconds``, ``invalidated``, and
+        ``restore_confirmed``.
 
         Expired sessions are evicted before listing.
         """
         now = time.monotonic()
+        wall_now = time.time()
+        monotonic_offset = wall_now - now
         sessions: List[Dict[str, Any]] = []
         async with self._lock:
             expired_ids = []
@@ -186,10 +189,14 @@ class SessionManager:
                 if now - session.last_activity_at > self.ttl_seconds:
                     expired_ids.append(sid)
                 else:
+                    # Convert monotonic timestamps to wall-clock ISO8601 for sorting
+                    wall_last = monotonic_offset + session.last_activity_at
+                    wall_created = monotonic_offset + session.created_at
                     sessions.append({
                         "session_id": sid,
                         "created_at": session.created_at,
                         "last_activity_at": session.last_activity_at,
+                        "response_time": datetime.fromtimestamp(wall_last, tz=timezone.utc).isoformat(timespec="seconds"),
                         "message_count": session.message_count,
                         "idle_seconds": round(session.idle_seconds, 1),
                         "age_seconds": round(session.age_seconds, 1),

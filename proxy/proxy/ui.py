@@ -1038,18 +1038,10 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
             merged.append(s)
 
     # Sort: active sessions first, then by response_time descending
-    def _sort_key(s):
-        active_priority = 0 if s.get("active") else 1
-        ts = s.get("response_time") or s.get("last_activity_at") or ""
-        # Negate the timestamp for descending order (Z-padded string comparison)
-        return (active_priority, ts)
-    merged.sort(key=_sort_key)
-    # Keep active groups ascending, but within each group sort by ts descending
-    # Since timestamps are ISO strings, reverse within each active group
     active = [s for s in merged if s.get("active")]
     inactive = [s for s in merged if not s.get("active")]
-    active.sort(key=lambda s: s.get("response_time") or s.get("last_activity_at") or "", reverse=True)
-    inactive.sort(key=lambda s: s.get("response_time") or s.get("last_activity_at") or "", reverse=True)
+    active.sort(key=lambda s: s.get("response_time", ""), reverse=True)
+    inactive.sort(key=lambda s: s.get("response_time", ""), reverse=True)
     merged = active + inactive
 
     result = {"sessions": merged, "count": len(merged)}
