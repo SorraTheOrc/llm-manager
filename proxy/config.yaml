@@ -66,6 +66,19 @@ logging:
   rotation_hours: 6
 
 # ---------------------------------------------------------------------------
+# Session Recording
+# ---------------------------------------------------------------------------
+# Records raw client-proxy-provider message payloads to disk for later
+# debugging, auditing, and analysis. Recording is always-on and uses
+# non-blocking file writes (asyncio background tasks).
+#
+# Fields:
+#   path: Directory where recordings are stored.
+#         Default: proxy/session-recordings/
+session_recording:
+  path: proxy/session-recordings/
+
+# ---------------------------------------------------------------------------
 # Audit model configuration
 # ---------------------------------------------------------------------------
 # The audit skill (skill/audit/) uses these settings to determine which
@@ -106,7 +119,6 @@ models:
       - name: github-primary
         type: remote
         endpoint: https://models.inference.ai.azure.com
-        api_key_env: GITHUB_TOKEN
     aliases:
     - github-*
   gpt120:
@@ -134,7 +146,11 @@ models:
   # Slot exhaustion on the local model falls through to the free remote tier.
   # Rate limiting (429) on the free tier falls through to the paid Go tier.
   # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
-  qwen3-fallback:
+  # Cascading fallback: local Qwen3 first, then OpenCode free, then OpenCode Go.
+  # Slot exhaustion on the local model falls through to the free remote tier.
+  # Rate limiting (429) on the free tier falls through to the paid Go tier.
+  # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
+  plan:
     providers:
       - name: local-qwen3
         type: local
@@ -150,9 +166,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
     aliases:
-    - qwen3-fallback*
-    - fallback-router
-    - auto
+    - plan*
     force_full_prompt: true
 
   qwen3-next:
@@ -164,14 +178,6 @@ models:
     - qwen3-next
     - qwen3-coder-next
     - qwen3-next*
-    force_full_prompt: true
-  plan:
-    providers:
-      - name: local-qwen3-next
-        type: local
-        llama_model: Qwen3-Next
-    aliases:
-    - plan
     force_full_prompt: true
   code:
     providers:
@@ -204,18 +210,40 @@ server:
   llama_model_health_grace_period_seconds: 15
   llama_model_load_timeout: 600
   llama_models_max: 2
-  llama_request_timeout: 300
+  llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
+  # Local slot-exhaustion grace retries before remote fallback.
+  # Helps right-after-restart races where slot probes briefly report 0 available.
+  local_slot_exhaustion_retry_attempts: 1
+  local_slot_exhaustion_retry_delay_seconds: 0.1
   # Adaptive timeout: base + per_token * prompt_tokens
   llama_adaptive_timeout_enabled: true
   llama_adaptive_timeout_base_seconds: 60
   llama_adaptive_timeout_per_token_seconds: 0.01
   llama_router_mode: true
   max_concurrent_queries: 16
+  # Local-model concurrency limit (LP-0MR5MAJNM005R905).
+  # Limits concurrent requests to local providers. Remote providers
+  # continue to use max_concurrent_queries. When this limit is reached,
+  # requests with fallback providers skip to the next provider immediately.
+  local_max_concurrent_queries: 1
+  # Local dispatch lease timeout in seconds.
+  # An idle session holds an inactive lease for this duration after its
+  # last request completes, preventing other sessions from acquiring the
+  # local backend.  The lease is released when the timeout expires,
+  # allowing other sessions to use the local backend.
+  local_dispatch_lease_timeout_seconds: 180
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
+  # Number of slots (GPU contexts) available for hash-based session slot assignment.
+  # MUST match llama-server's --parallel / -np flag passed in start-llama.sh.
+  # Mismatch causes slot exhaustion or restore failures:
+  #   - pool_size < --parallel → some server slots go unused
+  #   - pool_size > --parallel → sessions map to slot IDs that do not exist
+  # The start script reads LLAMA_PARALLEL env var (set by lifecycle from this value)
+  # to automatically keep them aligned.
   session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
@@ -223,7 +251,7 @@ server:
   session_guardrail_max_completion_tokens: 2048
   session_guardrail_repetition_min_pattern_chars: 64
   session_guardrail_repetition_min_repeats: 10
-  session_guardrail_invalidate_on_cutoff: false
+  session_guardrail_invalidate_on_cutoff: true
   session_guardrail_invalidate_on_repetition: false
   # Token-rate guardrail settings (disabled by default)
   # Maximum tokens/second threshold. Set to 0 to disable token-rate guardrail.

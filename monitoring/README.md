@@ -21,7 +21,7 @@ host using systemd user services (host-first deployment).
   loginctl enable-linger $USER
   ```
 
-- Ports 9090 (Prometheus) and 3000 (Grafana) are available.
+- Ports 9090 (Prometheus), 3000 (Grafana), and 5000 (rocm-exporter) are available.
 
 ## Installation
 
@@ -246,7 +246,80 @@ systemctl --user enable grafana-server.service
   - llama-server RSS (bytes) — time-series graph
   - Models loaded — gauge/time-series
   - Proxy 5xx Errors — rate graph
+  - GPU VRAM Usage (bytes) — time-series graph showing total and used VRAM
 - **Datasource**: Prometheus
+
+## ROCm Exporter
+
+The AMD ROCm exporter (`rocm-exporter`) provides GPU VRAM metrics for
+Prometheus scraping. It is deployed as a systemd user service on the host.
+
+### Prerequisites
+
+- ROCm is installed and GPU is accessible:
+  ```bash
+  rocm-smi --showtag
+  rocm-smi --showmeminfo vram
+  ```
+- Port 5000 is available for the exporter's metrics endpoint.
+
+### Installation
+
+See `docs/systemd/rocm-exporter.service` for full installation instructions,
+including both user-service and system-service deployment options.
+
+Quick-start (user service):
+
+```bash
+# Download and install the rocm-exporter binary
+# See https://github.com/amd/rocm-exporter/releases for the latest version
+ROCM_EXPORTER_VERSION="0.1.0"
+wget "https://github.com/amd/rocm-exporter/releases/download/v${ROCM_EXPORTER_VERSION}/rocm-exporter-${ROCM_EXPORTER_VERSION}.linux-amd64.tar.gz"
+tar xzf rocm-exporter-${ROCM_EXPORTER_VERSION}.linux-amd64.tar.gz
+mkdir -p ~/bin/rocm-exporter
+cp rocm-exporter ~/bin/rocm-exporter/
+rm -rf rocm-exporter rocm-exporter-${ROCM_EXPORTER_VERSION}.linux-amd64.tar.gz
+
+# Create log directory
+mkdir -p ~/.local/state/rocm-exporter/logs
+
+# Install the systemd unit
+mkdir -p ~/.config/systemd/user
+cp docs/systemd/rocm-exporter.service ~/.config/systemd/user/rocm-exporter.service
+systemctl --user daemon-reload
+systemctl --user enable rocm-exporter.service
+systemctl --user start rocm-exporter.service
+
+# Verify
+systemctl --user status rocm-exporter.service
+```
+
+### Verification
+
+```bash
+# Check the metrics endpoint
+curl http://localhost:5000/metrics | grep rocm_vram
+
+# Expected metrics:
+#   rocm_vram_total_bytes{gpu_id="0"} 17179869184
+#   rocm_vram_used_bytes{gpu_id="0"}  8589934592
+#   rocm_vram_free_bytes{gpu_id="0"} 8589934592
+```
+
+### Prometheus scrape configuration
+
+The rocm-exporter is already configured as a scrape target in
+`monitoring/prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: "rocm-exporter"
+    static_configs:
+      - targets: ["localhost:5000"]
+    metrics_path: /metrics
+```
+
+No additional configuration changes are needed for basic operation.
 
 ## Alerting Rules
 
@@ -257,6 +330,8 @@ The following alert rules are loaded into Prometheus:
 | `LlamaMemoryHighWarning` | warning | RSS > 75% of 90GB for 2m | Process memory above 75% threshold |
 | `LlamaMemoryHighCritical` | critical | RSS > 90GB for 1m | Process memory above 90GB |
 | `ProxyHttpErrorsHigh` | critical | 5xx rate > 5/s for 5m | Proxy returning excessive errors |
+| `GpuVramHighWarning` | warning | VRAM usage > 75% for 2m | GPU VRAM above 75% threshold |
+| `GpuVramHighCritical` | critical | VRAM usage > 90% for 1m | GPU VRAM above 90% threshold |
 
 Alerts are visible in the Prometheus UI (`http://localhost:9090/alerts`) and
 API (`http://localhost:9090/api/v1/rules`). Alert notification routing

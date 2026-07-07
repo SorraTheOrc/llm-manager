@@ -12,22 +12,71 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Provider Fallback**: Automatic failover between providers per model with configurable cooldown and circuit breaker
 - **Streaming Support**: Full support for streaming responses (SSE)
 - **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
-- **Request/Response Logging**: Comprehensive logging with time-based rotation. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
+- **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
 
+## Request Logging
+
+The proxy logs every incoming request at **INFO** level via the `llama-proxy` logger. This is visible in normal proxy logs (no need for debug mode).
+
+### Log Format
+
+#### Local proxy path (llama-server)
+
+```
+[local] POST http://localhost:8080/v1/chat/completions body={...} session_id=sess-abc123 slot=7 session={"x-session-id": "sess-abc123"}
+```
+
+#### Remote proxy path
+
+```
+[remote] POST http://localhost:8080/v1/chat/completions -> https://api.openai.com/v1/chat/completions body={...} session_id=sess-abc123 slot=none session={"x-session-id": "sess-abc123"}
+```
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `session_id=<value>` | The resolved session ID (internal identifier used by the session manager). Omitted when no session is resolved. |
+| `slot=<value>` | The assigned slot identifier. Uses `"none"` when no slot is assigned or for the remote proxy path. Uses `"queued"` when the request is waiting in the scheduler queue. |
+| `body={...}` | A truncated preview of the request body (first 500 chars). **System message content is excluded** from the preview to prevent sensitive system-prompt data from appearing in logs. Only user-facing message content (role="user" and role="assistant") is included. |
+| `session={...}` | The session-related headers extracted from the request (X-Session-Id, X-Client-Request-Id, X-Session-Affinity). |
+
+### System Prompt Redaction
+
+The body preview automatically filters out messages with `role: "system"` to prevent sensitive system-prompt content from leaking into proxy logs. Only `role: "user"` and `role: "assistant"` messages are included in the preview.
+
 ## Host-first deployment
 
-The repository uses a host-first startup model for llama-server. Systemd unit files are no longer distributed from the repository, but example units are provided in `docs/systemd/` to help operators deploy and supervise the services.
+The repository supports two deployment models for running llama-server:
 
-### Startup mechanism
+- **Host-first (systemd)** — llama-server runs directly on the host, managed by systemd. The example unit files in `docs/systemd/` call `start-llama.sh` directly for direct host execution.
+- **Proxy-managed (container)** — When the proxy manages llama-server startup via `start_llama_server()` (in `proxy/proxy/lifecycle.py`), it uses the configured `llama_start_script` (default: `scripts/podman_start_llama.sh`) which runs llama-server inside a podman container.
 
-The proxy starts llama-server via the configured `llama_start_script` (default: `scripts/podman_start_llama.sh`). The start script uses podman to create and run a containerized llama-server.
+### Host vs. Container startup
 
-**Startup behavior (from `proxy/proxy/lifecycle.py`):**
+| Mode | How it starts | Managed by | Use case |
+|------|--------------|------------|----------|
+| **Host-first (host-direct)** | Proxy's `start_llama_server()` calls `start-llama.sh` directly on the host (single attempt) before falling back to the configured container script | Proxy lifecycle | When `llama_allow_host_fallback: true` (default), preferred path for proxy-managed startups |
+| **Proxy-managed (container)** | Proxy's `start_llama_server()` runs the configured `llama_start_script` (e.g., `scripts/podman_start_llama.sh`) | Proxy lifecycle | Development, ad-hoc proxy startups, or when host-direct fails |
+| **Host-first (systemd)** | Systemd unit calls `start-llama.sh` directly on the host | `systemctl --user` or `sudo systemctl` | Production deployments, reboot-safe supervision |
+
+The container path is **not deprecated** and remains fully supported. It is the default configured `llama_start_script` in `config.yaml`. The host-first fallback (`llama_allow_host_fallback: true`) attempts host-direct startup first and falls back to the container script if the host-direct attempt fails. This provides the best of both worlds: fast host-direct startup when available, with automatic fallback to container-based operation.
+
+To disable the host-first fallback and use the container script exclusively (matching the original pre-host-first behavior), set:
+
+```yaml
+server:
+  llama_allow_host_fallback: false
+```
+
+### Startup behavior (proxy-managed mode)
+
+The proxy starts llama-server via the configured `llama_start_script` (from `proxy/proxy/lifecycle.py`):
 1. The proxy invokes the configured `llama_start_script` with the target model
 2. If the start script fails, the proxy retries up to 4 times with exponential backoff
 3. If all attempts fail, the proxy reports a clear error message
@@ -37,7 +86,15 @@ The proxy starts llama-server via the configured `llama_start_script` (default: 
 ```yaml
 server:
   llama_start_script: /path/to/start-llama.sh  # Script to start llama-server
+  llama_allow_host_fallback: true               # Allow host-direct start as fallback
 ```
+
+**`llama_allow_host_fallback`** (boolean, default: `true` in the shipped config):
+- When `true`: the proxy may attempt starting llama-server directly on the host (via the configured script) if the primary container-based startup fails.
+- When `false`: the proxy uses only the configured `llama_start_script` (container-based) and does NOT attempt host-direct fallback.
+- To disable host-fallback, set `llama_allow_host_fallback: false` in the `server:` section of `config.yaml`.
+
+> **Note:** When running under systemd (host-first mode), the systemd unit calls `start-llama.sh` directly and bypasses the proxy\'s startup logic entirely. The `llama_allow_host_fallback` config option only affects the proxy-managed startup path.
 
 ### Systemd service units
 
@@ -1331,6 +1388,76 @@ When `llama_router_mode` is enabled, the proxy launches llama-server in router m
 preloads the embeddings model plus the configured primary model. Requests are routed
 to the appropriate model without stopping the server. The router exposes management
 endpoints like `GET /models` and `POST /models/load`.
+
+#### `llama_models_max` — Choosing a value
+
+The `llama_models_max` config option (passed as `--models-max` to llama-server)
+limits how many models can be loaded concurrently in router mode. When a new model
+is requested beyond this limit, llama-server evicts the least-recently-used model
+(triggering an `unload_lru` event). This is normal but excessive eviction/reload
+churn degrades latency.
+
+Recommended values for common setups:
+
+| Setup | `llama_models_max` | Rationale |
+|-------|-------------------|-----------|
+| **Single model** (e.g., one chat model only) | `1` | Only one model needed; no eviction risk. |
+| **Dual model** (embed + one chat model, preloaded both) | `2` | Embeddings + chat model both fit without eviction. |
+| **Multi-model** (3+ models, e.g., embed + several chat models) | `3`–`4` | Allows embed + 2–3 chat models. Monitor eviction rates to tune. |
+| **Heavy multi-model** (5+ models with varied sizes) | `5`–`8` | Requires sufficient GPU memory. Watch for OOM or eviction churn. |
+
+The proxy monitors llama-server logs for `unload_lru` events and emits a warning
+when 3 or more evictions occur within a 5-minute rolling window. The threshold
+is configurable via environment variables:
+
+- `LLAMA_UNLOAD_LRU_WINDOW_MINUTES` — rolling window duration (default: `5`)
+- `LLAMA_UNLOAD_LRU_THRESHOLD` — events that trigger a warning (default: `3`)
+
+If you see eviction warnings, increase `llama_models_max` or reduce the number
+of concurrently used models.
+
+### Slot Cache Retention
+
+Slot snapshot files (`slot_*.bin`) accumulate in the directory configured by
+`session_slot_save_path` (default: `slot-cache/`). A cleanup script is provided
+to prevent disk-space exhaustion:
+
+**Script:** `scripts/cleanup-slot-cache.sh`
+
+**Default retention policy:**
+- Remove slot files older than **7 days** (`--max-age-days`, default: `7`)
+- Retain the **3 most recently modified** files per unique slot prefix
+  (`--keep-recent`, default: `3`)
+
+**Usage:**
+
+```bash
+# Preview deletions without removing anything
+./scripts/cleanup-slot-cache.sh --dry-run
+
+# Run cleanup with defaults (7 days, keep 3 per prefix)
+./scripts/cleanup-slot-cache.sh
+
+# Custom retention
+./scripts/cleanup-slot-cache.sh --max-age-days 14 --keep-recent 5
+
+# Custom slot-cache directory
+./scripts/cleanup-slot-cache.sh --path /custom/slot-cache-path
+```
+
+The script is idempotent and exits 0 on success. Errors (e.g., un-deletable files)
+are logged as warnings without causing a non-zero exit.
+
+**Automated cleanup (cron):**
+
+To run the cleanup automatically every evening at 10 PM, add the following
+crontab entry (run `crontab -e`):
+
+```cron
+0 22 * * * /home/rgardler/projects/llm/scripts/cleanup-slot-cache.sh >> /home/rgardler/projects/llm/logs/cleanup-slot-cache.log 2>&1
+```
+
+Adjust the path to match your repository location.
 
 ## Logging
 

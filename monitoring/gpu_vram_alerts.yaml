@@ -1,0 +1,20 @@
+groups:
+  - name: gpu-vram.rules
+    rules:
+      - alert: GpuVramHighWarning
+        expr: rocm_vram_used_bytes / rocm_vram_total_bytes > 0.75
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU VRAM usage > 75%"
+          description: "GPU VRAM usage on {{ $labels.instance }} (GPU {{ $labels.gpu_id }}) is above 75% ({{ $value | humanizePercentage }})."
+
+      - alert: GpuVramHighCritical
+        expr: rocm_vram_used_bytes / rocm_vram_total_bytes > 0.90
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU VRAM usage > 90% (critical)"
+          description: "GPU VRAM usage on {{ $labels.instance }} (GPU {{ $labels.gpu_id }}) is above 90% ({{ $value | humanizePercentage }}). Immediate attention required."

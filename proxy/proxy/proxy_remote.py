@@ -12,7 +12,8 @@ circular import issues.
 import asyncio
 import json
 import os
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import Request, Response
@@ -25,10 +26,130 @@ from .router_helpers import (
     log_response_chunk,
     _schedule_recv_token_increment,
     _normalize_outgoing_headers,
+    normalize_upstream_request_headers,
+    _schedule_traffic_recording,
 )
 
 # Import utils functions used by this module
 from proxy.utils import count_text_tokens  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Auth.json fallback helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_auth_json_path() -> Path:
+    """Return the path to pi's auth.json."""
+    return Path.home() / ".pi" / "agent" / "auth.json"
+
+
+def _try_pi_auth_json(provider_name: str) -> Optional[str]:
+    """Attempt to resolve an API key from ~/.pi/agent/auth.json.
+
+    Performs a case-insensitive lookup matching *provider_name* against
+    keys in the auth JSON file.  Strip trailing ``_api_key`` suffix from
+    *provider_name* before lookup.
+
+    The resolution order follows the ``start-proxy.sh`` logic:
+      1. Exact match (case-insensitive) on the provider name
+      2. ``api_key_env``-style names (e.g. ``OPENCODE_API_KEY``) are matched
+         by stripping the ``_api_key`` suffix and looking up the stem
+         (e.g. ``OPENCODE`` -> ``opencode``)
+
+    Returns the API key string (from the ``key`` field of a matching
+    ``api_key``-type entry), or ``None`` if no match is found.
+    """
+    path = _get_auth_json_path()
+    if not path.exists():
+        return None
+
+    try:
+        auth_data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if not isinstance(auth_data, dict):
+        return None
+
+    lookup_key = provider_name.lower()
+
+    # For OPENCODE_API_KEY-style env vars, prefer opencode-go then opencode
+    if lookup_key == "opencode_api_key":
+        for preferred in ("opencode-go", "opencode"):
+            entry = auth_data.get(preferred)
+            if isinstance(entry, dict) and entry.get("type") == "api_key":
+                key = entry.get("key")
+                if key:
+                    return str(key)
+
+    # Exact lowercase match
+    entry = auth_data.get(lookup_key)
+    if isinstance(entry, dict) and entry.get("type") == "api_key":
+        key = entry.get("key")
+        if key:
+            return str(key)
+
+    # Strip _API_KEY suffix and retry (for env-var-style names)
+    if lookup_key.endswith("_api_key"):
+        stem = lookup_key[:-8]
+        entry = auth_data.get(stem)
+        if isinstance(entry, dict) and entry.get("type") == "api_key":
+            key = entry.get("key")
+            if key:
+                return str(key)
+
+    return None
+
+
+# A conservative OpenAI-compatible subset for remote chat completions.
+# Unknown/experimental client keys can trigger 4xx on some providers.
+_REMOTE_CHAT_FIELD_ALLOWLIST = {
+    "model",
+    "messages",
+    "stream",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "frequency_penalty",
+    "stop",
+    "n",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
+    "seed",
+    "logit_bias",
+    "user",
+    "reasoning_effort",
+}
+
+
+def _sanitize_remote_chat_payload(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize chat-completions payload for remote providers.
+
+    Keeps a conservative OpenAI-compatible field subset for
+    ``v1/chat/completions``. This improves cross-provider compatibility
+    when clients include local-only or experimental fields.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if not (path == "v1/chat/completions" or str(path).endswith("chat/completions")):
+        return payload
+
+    sanitized = {k: v for k, v in payload.items() if k in _REMOTE_CHAT_FIELD_ALLOWLIST}
+    dropped = sorted(k for k in payload.keys() if k not in sanitized)
+    if dropped:
+        try:
+            _srv().logger.info(
+                "[remote] stripped unsupported chat-completions fields: %s",
+                ",".join(dropped),
+            )
+        except Exception:
+            pass
+    return sanitized
 
 
 async def proxy_to_remote(
@@ -43,7 +164,7 @@ async def proxy_to_remote(
     # Get request body
     body = await request.body()
 
-    # Log request
+    # Log request (remote path has no slot concept; slot_id defaults to "none")
     log_request(request, body, "remote", endpoint)
 
     # Get API key
@@ -53,12 +174,26 @@ async def proxy_to_remote(
         api_key = os.environ.get(api_key_env)
     if not api_key:
         api_key = model_config.get("api_key")
+    if not api_key:
+        # Fall back to pi's auth.json
+        api_key = _try_pi_auth_json(api_key_env or "")
 
-    # Forward headers
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
+    # Forward headers (strip hop-by-hop transport headers)
+    headers = normalize_upstream_request_headers(request.headers)
+
+    # Remove local/proxy auth/session headers before forwarding.
+    # In particular, prevent duplicate Authorization variants
+    # (e.g. "authorization" + "Authorization") which can trigger
+    # Cloudflare 400 Bad Request on upstream.
+    for hk in list(headers.keys()):
+        hkl = str(hk).lower()
+        if hkl in {
+            "authorization",
+            "x-session-id",
+            "x-client-request-id",
+            "x-session-affinity",
+        }:
+            headers.pop(hk, None)
 
     # Add API key
     if api_key:
@@ -69,6 +204,11 @@ async def proxy_to_remote(
     headers.update(custom_headers)
 
     body_json = json.loads(body) if body else {}
+    if not isinstance(body_json, dict):
+        body_json = {}
+
+    # Sanitize request-shape for remote compatibility before model override.
+    body_json = _sanitize_remote_chat_payload(path, body_json)
 
     # Override model name in body if provider config specifies an upstream model ID.
     # This allows the proxy to present a different model name to the remote API
@@ -77,7 +217,8 @@ async def proxy_to_remote(
     upstream_model = model_config.get("model")
     if upstream_model and body_json.get("model"):
         body_json["model"] = upstream_model
-        body = json.dumps(body_json).encode("utf-8")
+
+    body = json.dumps(body_json).encode("utf-8")
 
     # Determine model name for attribution (may be provided in body)
     model_name = None
@@ -88,15 +229,42 @@ async def proxy_to_remote(
     if not model_name:
         model_name = _srv().current_model or model_config.get("name") or model_config.get("id") or "unknown"
 
+    # Resolve session ID from headers for recording (LP-0MR8FEKK6005V9ML)
+    _remote_session_id = (
+        request.headers.get("x-session-id")
+        or request.headers.get("session_id")
+        or request.headers.get("x-client-request-id")
+        or None
+    )
+
+    # Schedule fire-and-forget recording of client→proxy and proxy→provider requests
+    if _remote_session_id:
+        _schedule_traffic_recording(
+            session_id=_remote_session_id,
+            client_payload=body_json,
+            proxy_payload=body_json,
+            model=model_name,
+            provider="remote",
+        )
+
     remote_timeout = httpx.Timeout(_srv().config.get("server", {}).get("llama_request_timeout", 300))
     is_streaming = body_json.get("stream", False)
 
     if is_streaming:
+        if _remote_session_id:
+            return await _handle_remote_streaming(
+                request, target_url, headers, body, body_json,
+                model_name, remote_timeout, session_id=_remote_session_id,
+            )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
             model_name, remote_timeout,
         )
     else:
+        if _remote_session_id:
+            return await _handle_remote_non_streaming(
+                request, target_url, headers, body, model_name, remote_timeout, session_id=_remote_session_id,
+            )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
         )
@@ -110,6 +278,7 @@ async def _handle_remote_streaming(
     body_json: dict,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    session_id: Optional[str] = None,
 ) -> Response:
     """Handle streaming remote proxy request."""
     client = httpx.AsyncClient(timeout=remote_timeout)
@@ -131,6 +300,19 @@ async def _handle_remote_streaming(
         except Exception:
             body_bytes = b""
         try:
+            # Keep error-path visibility parity with non-streaming calls.
+            log_response(upstream_status, body_bytes or b"")
+            if upstream_status >= 400:
+                err_preview = (body_bytes or b"").decode("utf-8", errors="replace")[:500]
+                _srv().logger.warning(
+                    "[remote] upstream error status=%s url=%s body=%s",
+                    upstream_status,
+                    target_url,
+                    err_preview,
+                )
+        except Exception:
+            pass
+        try:
             await cm.__aexit__(None, None, None)
         except Exception:
             pass
@@ -138,6 +320,13 @@ async def _handle_remote_streaming(
             await client.aclose()
         except Exception:
             pass
+        # Record provider->client response for error path (fire-and-forget)
+        if session_id:
+            _schedule_traffic_recording(
+                session_id=session_id,
+                response_payload=body_bytes,
+            )
+
         return Response(
             content=body_bytes,
             status_code=upstream_status,
@@ -157,6 +346,8 @@ async def _handle_remote_streaming(
         # Client disconnect detection (LP-0MQTHP828000JYM6)
         disconnected = False
         _disconnect_check_count = 0
+        # Collect chunks for session recording (LP-0MR94O16S000WFQ0)
+        collected_chunks = [] if session_id else None
         try:
             async for chunk in response.aiter_bytes():
                 try:
@@ -199,6 +390,8 @@ async def _handle_remote_streaming(
                     except Exception:
                         pass
 
+                if collected_chunks is not None:
+                    collected_chunks.append(chunk)
                 yield chunk
                 log_response_chunk(chunk)
             # Synthesize final SSE event if upstream closed without finish marker.
@@ -212,6 +405,8 @@ async def _handle_remote_streaming(
                 final_bytes = (
                     f"data: {json.dumps(final_obj)}\n\n"
                 ).encode("utf-8")
+                if collected_chunks is not None:
+                    collected_chunks.append(final_bytes)
                 yield final_bytes
                 log_response_chunk(final_bytes)
         except GeneratorExit:
@@ -232,6 +427,16 @@ async def _handle_remote_streaming(
             except (asyncio.TimeoutError, Exception):
                 pass
 
+            # Record provider->client response for streaming path (fire-and-forget)
+            if session_id and collected_chunks is not None:
+                response_body = b"".join(collected_chunks)
+                _schedule_traffic_recording(
+                    session_id=session_id,
+                    response_payload=response_body,
+                    model=model_name,
+                    provider="remote",
+                )
+
     return StreamingResponse(
         stream_generator(),
         media_type=media_type,
@@ -247,6 +452,7 @@ async def _handle_remote_non_streaming(
     body: bytes,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    session_id: Optional[str] = None,
 ) -> Response:
     """Handle non-streaming remote proxy request."""
     key = f"{request.method.upper()} {request.url.path} -> remote"
@@ -268,6 +474,15 @@ async def _handle_remote_non_streaming(
             pass
 
         log_response(response.status_code, response.content)
+
+        # Record provider->client response (fire-and-forget)
+        if session_id:
+            _schedule_traffic_recording(
+                session_id=session_id,
+                response_payload=response.content,
+                model=model_name,
+                provider="remote",
+            )
 
         return Response(
             content=response.content,

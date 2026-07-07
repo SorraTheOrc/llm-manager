@@ -27,6 +27,25 @@ def _srv():
     return _m
 
 
+def _has_fallback_providers(model_cfg):
+    """Check if a model config has providers that need fallback routing.
+
+    Returns ``True`` when there are multiple providers or at least one
+    remote provider — scenarios where ``proxy_with_fallback`` is needed
+    to cascade through alternatives.  A single local provider does NOT
+    need fallback; direct ``proxy_to_local`` preserves the original
+    response (e.g., a transient 503) instead of converting it to the
+    generic "All providers exhausted" error.
+    """
+    providers = model_cfg.get("providers") or []
+    if not isinstance(providers, list):
+        return False
+    if len(providers) > 1:
+        return True
+    first = providers[0] if providers else {}
+    return isinstance(first, dict) and first.get("type") == "remote"
+
+
 async def index(request: Request):
     """Serve the index page with API documentation."""
     # Build models table rows and quick link buttons for local models
@@ -372,12 +391,6 @@ async def view_logs(request: Request):
     async with srv.token_lock:
         tokens_snapshot = dict(srv.token_counts)
 
-    model_list = list(srv.config.get("models", {}).keys())
-    router_mode = srv.config.get("server", {}).get("llama_router_mode", False)
-    router_models = None
-    if router_mode:
-        router_models = await srv.router_list_models()
-    model_list_json = json.dumps(model_list)
     initial_stats_json = json.dumps({"counts": counts_snapshot, "tokens": tokens_snapshot})
 
     # Replace placeholders with empty containers; client will render using INITIAL_STATS
@@ -388,8 +401,8 @@ async def view_logs(request: Request):
     html = html.replace('__LLAMA_SERVER_VERSION__', srv.llama_server_version)
     html = html.replace('__ROCM_VERSION__', srv.rocm_version)
 
-    # Inject initial stats and model list script before </body>
-    log_viewer_script = f'<script>window.__INITIAL_STATS = {initial_stats_json}; window.__MODEL_LIST = {model_list_json}; window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'
+    # Inject initial stats script before </body>
+    log_viewer_script = f'<script>window.__INITIAL_STATS = {initial_stats_json};</script>'
     html = html.replace('__LOG_VIEWER_SCRIPT__', log_viewer_script)
 
     return HTMLResponse(content=html)
@@ -487,8 +500,7 @@ async def create_embeddings(request: Request):
 
         # If model already active and process running, proceed immediately
         if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
-            providers = model_cfg.get("providers")
-            if providers:
+            if _has_fallback_providers(model_cfg):
                 from proxy.provider import proxy_with_fallback
                 return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
             return await srv.proxy_to_local(request, "v1/embeddings")
@@ -499,8 +511,7 @@ async def create_embeddings(request: Request):
                 if await srv.router_is_model_loaded(llama_model_str):
                     srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
                     srv.current_model = llama_model_str
-                    providers = model_cfg.get("providers")
-                    if providers:
+                    if _has_fallback_providers(model_cfg):
                         from proxy.provider import proxy_with_fallback
                         return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
                     return await srv.proxy_to_local(request, "v1/embeddings")
@@ -508,10 +519,84 @@ async def create_embeddings(request: Request):
                 # Non-fatal: fall through to scheduling background load
                 srv.logger.debug("Fast router check failed; scheduling background load")
 
-        # Otherwise, schedule a background load and return 503 immediately
+        # Otherwise, schedule a background load. If this request is restoring
+        # a session slot we must return model_loading. Otherwise, attempt remote
+        # providers (if configured) before returning model_loading so clients
+        # can be served by remotes when appropriate.
         target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
         scheduled = srv.schedule_background_load(target_model)
         srv.logger.info(f"Scheduled background load for embeddings request: {target_model} scheduled={scheduled}")
+
+        # If the request is attempting a session restore (slot file exists),
+        # return the model_loading response so the local restore can proceed.
+        try:
+            from proxy.session import _resolve_session_id_header, _build_slot_context
+            session_id_header, _ = _resolve_session_id_header(request.headers)
+            # Prefer checking the scheduler for an existing slot assignment (reenter)
+            try:
+                from proxy.router import _get_job_scheduler
+                scheduler = _get_job_scheduler()
+                if scheduler is not None and session_id_header:
+                    slot_reenter = await scheduler.reenter_job(session_id_header)
+                    if slot_reenter is not None:
+                        # Job already owns a slot — must proceed with local restore/loading
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint="/v1/embeddings",
+                        )
+            except Exception:
+                # Best-effort scheduler check failed; fall back to slot file heuristic
+                srv.logger.debug("Scheduler reenter check failed for embeddings; falling back to slot-file check", exc_info=True)
+
+            slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
+            if slot_filename and slot_filename != "" and Path(slot_filename).exists():
+                return srv._model_loading_response(
+                    requested_model=model_name if isinstance(model_name, str) else None,
+                    target_model=target_model,
+                    scheduled=scheduled,
+                    endpoint="/v1/embeddings",
+                )
+        except Exception:
+            srv.logger.debug("Session/slot detection failed for embeddings; will attempt remote fallback", exc_info=True)
+
+        # Try remote providers first if any are configured for this model
+        try:
+            providers = model_cfg.get("providers") or []
+            remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+            if remote_providers:
+                remote_cfg = {"providers": remote_providers}
+                from proxy.provider import proxy_with_remote_fallback
+                try:
+                    resp = await proxy_with_remote_fallback(request, "v1/embeddings", remote_cfg, srv.config)
+                    # remote fallback may return an error response (503) when all
+                    # remote providers are exhausted — don't propagate this;
+                    # return model_loading so the client waits for the local model.
+                    if resp.status_code >= 400:
+                        srv.logger.warning(
+                            "Remote fallback returned error for model=%s status=%s; "
+                            "returning model_loading response",
+                            model_name, resp.status_code,
+                        )
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint="/v1/embeddings",
+                        )
+                    return resp
+                except Exception:
+                    srv.logger.exception("Remote embeddings fallback raised exception; returning model_loading response")
+                    return srv._model_loading_response(
+                        requested_model=model_name if isinstance(model_name, str) else None,
+                        target_model=target_model,
+                        scheduled=scheduled,
+                        endpoint="/v1/embeddings",
+                    )
+        except Exception:
+            srv.logger.exception("Failed while attempting remote embeddings fallback; returning model_loading response")
+
         return srv._model_loading_response(
             requested_model=model_name if isinstance(model_name, str) else None,
             target_model=target_model,
@@ -537,10 +622,37 @@ async def proxy_openai_api(request: Request, path: str):
     """
     Main proxy endpoint for OpenAI API requests.
     Routes to local llama-server or remote API based on model.
+
+    Duplicate in-flight requests are coalesced via ``RequestCoalescer``
+    to prevent retry cascades when the Pi client retries a request that
+    is still being processed.
     """
-    # Get the request body to determine the model
+    from proxy.request_coalescer import get_coalescer
+
+    # Read the body early so the coalescer has the hash key.
     srv = _srv()
     body = await request.body()
+
+    # Wrap the rest of the processing in an inner coroutine so we can
+    # pass it to the coalescer for deduplication.
+    async def _process_request():
+        return await _do_proxy_openai_api(request, path, body, srv)
+
+    return await get_coalescer().coalesce_or_execute(path, body, _process_request)
+
+
+async def _do_proxy_openai_api(
+    request: Request,
+    path: str,
+    body: bytes,
+    srv,
+):
+    """Inner implementation of proxy_openai_api.
+
+    Extracted so that request coalescing can wrap just the outer call
+    without interfering with the processing logic.
+    """
+    # Get the request body to determine the model
     body_json = {}
     model_name = None
     
@@ -601,8 +713,7 @@ async def proxy_openai_api(request: Request, path: str):
 
         # If model already active and process running, proceed immediately
         if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
-            providers = model_cfg.get("providers")
-            if providers:
+            if _has_fallback_providers(model_cfg):
                 from proxy.provider import proxy_with_fallback
                 return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
             return await srv.proxy_to_local(request, f"v1/{path}")
@@ -613,18 +724,123 @@ async def proxy_openai_api(request: Request, path: str):
                 if await srv.router_is_model_loaded(llama_model_str):
                     srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
                     srv.current_model = llama_model_str
-                    providers = model_cfg.get("providers")
-                    if providers:
+                    if _has_fallback_providers(model_cfg):
                         from proxy.provider import proxy_with_fallback
                         return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
                     return await srv.proxy_to_local(request, f"v1/{path}")
             except Exception:
                 srv.logger.debug("Fast router check failed; scheduling background load")
 
-        # Otherwise, schedule background load and return 503 so client doesn't hang
+        # Otherwise, schedule background load. If this request is restoring a session
+        # slot we must return model_loading. Otherwise, attempt remote providers
+        # before returning model_loading so clients can be served by remotes when possible.
         target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
         scheduled = srv.schedule_background_load(target_model)
         srv.logger.info(f"Scheduled background load for request: model={target_model} scheduled={scheduled}")
+
+        # In router mode, allow a short grace window for transient model-state
+        # lag (e.g. /models briefly reports "loading" while requests are already
+        # serviceable). If the target model becomes visible during this window,
+        # serve locally before attempting remote fallback.
+        if router_mode:
+            grace_seconds = float(server_config.get("model_loading_local_grace_seconds", 0.75) or 0.75)
+            grace_seconds = max(0.0, grace_seconds)
+            if grace_seconds > 0:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + grace_seconds
+                while loop.time() < deadline:
+                    try:
+                        model_ready = await srv.router_is_model_loaded(llama_model_str)
+                        if not model_ready:
+                            # Some router builds may still report "loading" in
+                            # /models even when /models/load returns already-loaded.
+                            # Treat a successful router_load_model() call as an
+                            # availability hint for this grace-window check.
+                            try:
+                                model_ready = await srv.router_load_model(llama_model_str)
+                            except Exception:
+                                model_ready = False
+
+                        if model_ready:
+                            srv.logger.info(
+                                "Router model %s became available during grace window; serving locally",
+                                llama_model_str,
+                            )
+                            srv.current_model = llama_model_str
+                            if _has_fallback_providers(model_cfg):
+                                from proxy.provider import proxy_with_fallback
+                                return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
+                            return await srv.proxy_to_local(request, f"v1/{path}")
+                    except Exception:
+                        srv.logger.debug("Grace-window router check failed; retrying", exc_info=True)
+                    await asyncio.sleep(0.1)
+
+        try:
+            from proxy.session import _resolve_session_id_header, _build_slot_context
+            session_id_header, _ = _resolve_session_id_header(request.headers)
+            # First try scheduler.reenter_job to detect existing slot ownership (non-invasive)
+            try:
+                from proxy.router import _get_job_scheduler
+                scheduler = _get_job_scheduler()
+                if scheduler is not None and session_id_header:
+                    slot_reenter = await scheduler.reenter_job(session_id_header)
+                    if slot_reenter is not None:
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint=f"/v1/{path}",
+                        )
+            except Exception:
+                srv.logger.debug("Scheduler reenter check failed; falling back to slot-file check", exc_info=True)
+
+            slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
+            if slot_filename and slot_filename != "" and Path(slot_filename).exists():
+                return srv._model_loading_response(
+                    requested_model=model_name if isinstance(model_name, str) else None,
+                    target_model=target_model,
+                    scheduled=scheduled,
+                    endpoint=f"/v1/{path}",
+                )
+        except Exception:
+            srv.logger.debug("Session/slot detection failed; will attempt remote fallback before returning model_loading", exc_info=True)
+
+        # Try configured remote providers first
+        try:
+            providers = model_cfg.get("providers") or []
+            remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+            if remote_providers:
+                remote_cfg = {"providers": remote_providers}
+                from proxy.provider import proxy_with_remote_fallback
+                try:
+                    resp = await proxy_with_remote_fallback(request, f"v1/{path}", remote_cfg, srv.config)
+                    # remote fallback may return an error response (503) when all
+                    # remote providers are exhausted — don't propagate this;
+                    # return model_loading so the client waits for the local model.
+                    if resp.status_code >= 400:
+                        srv.logger.warning(
+                            "Remote fallback returned error for model=%s status=%s; "
+                            "returning model_loading response",
+                            model_name, resp.status_code,
+                        )
+                        return srv._model_loading_response(
+                            requested_model=model_name if isinstance(model_name, str) else None,
+                            target_model=target_model,
+                            scheduled=scheduled,
+                            endpoint=f"/v1/{path}",
+                        )
+                    return resp
+                except Exception:
+                    srv.logger.exception("Remote fallback attempt raised exception; returning model_loading response")
+                    return srv._model_loading_response(
+                        requested_model=model_name if isinstance(model_name, str) else None,
+                        target_model=target_model,
+                        scheduled=scheduled,
+                        endpoint=f"/v1/{path}",
+                    )
+        except Exception:
+            srv.logger.exception("Failed while attempting remote fallback; returning model_loading response")
+
         return srv._model_loading_response(
             requested_model=model_name if isinstance(model_name, str) else None,
             target_model=target_model,
@@ -685,7 +901,172 @@ async def switch_model(model_name: str):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Admin endpoint for session recordings
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_recorder():
+    """Resolve the global SessionRecorder instance from the server module."""
+    srv = _srv()
+    if not hasattr(srv, "session_recorder") or srv.session_recorder is None:
+        from proxy.session_recorder import SessionRecorder
+        srv.session_recorder = SessionRecorder.from_config(srv.config)
+    return srv.session_recorder
 
 
+async def list_session_recordings(session_id: str) -> JSONResponse:
+    """Return a list of recording files for a given session.
 
+    Args:
+        session_id: The session identifier to look up recordings for.
+
+    Returns:
+        JSONResponse with status 200 and a JSON array of recording metadata,
+        or status 404 with a descriptive message if the session has no
+        recordings.
+    """
+    recorder = _get_recorder()
+    recordings = recorder.get_recordings_list(session_id)
+    if not recordings:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "No recordings found for this session",
+                "session_id": session_id,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "session_id": session_id,
+            "recordings": recordings,
+        },
+    )
+
+
+async def get_session_recording(session_id: str, filename: str) -> JSONResponse:
+    """Return the content of a specific recording file.
+
+    Args:
+        session_id: The session identifier.
+        filename: The base filename of the recording (e.g.,
+            ``"2026-07-06T10:00:00.000000-request.json"``).
+
+    Returns:
+        JSONResponse with status 200 and the recording content,
+        or status 404 if the file is not found.
+    """
+    recorder = _get_recorder()
+    content = recorder.get_recording(session_id, filename)
+    if content is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "Recording not found",
+                "session_id": session_id,
+                "filename": filename,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content=content,
+    )
+
+
+async def list_all_sessions(request: Request = None) -> JSONResponse:
+    """Return all session IDs that have recordings, optionally filtered by model.
+
+    Query params:
+        model: Optional model name to filter sessions by.
+
+    Returns recording-based sessions merged with live session-manager sessions.
+    """
+    model_filter = None
+    if request is not None:
+        model_filter = request.query_params.get("model")
+
+    # Helper: merge recording sessions with live session-manager sessions
+    async def _merge_live_and_recording_sessions(rec_sessions):
+        live_sessions = []
+        try:
+            srv = _srv()
+            if hasattr(srv, "session_manager") and srv.session_manager is not None:
+                live_sessions = await srv.session_manager.list_sessions()
+        except Exception:
+            pass
+
+        seen = set()
+        merged = []
+        # Live sessions first (mark as active)
+        for s in live_sessions:
+            sid = s.get("session_id", "")
+            if sid:
+                seen.add(sid)
+                s["active"] = True
+                merged.append(s)
+        # Recording-only sessions (not already in live list, mark as inactive)
+        for s in rec_sessions:
+            sid = s.get("session_id", "")
+            if sid and sid not in seen:
+                seen.add(sid)
+                merged.append({
+                    "session_id": sid,
+                    "response_time": s.get("response_time", ""),
+                    "model": s.get("model", ""),
+                    "provider": s.get("provider", ""),
+                    "active": False,
+                })
+        return merged
+
+    recorder = _get_recorder()
+    rec_sessions = recorder.list_sessions_by_model(model_filter) if model_filter else recorder.list_sessions()
+    merged = await _merge_live_and_recording_sessions(rec_sessions)
+
+    # Also include recording sessions not already merged from the live list
+    seen_live = {s.get("session_id", "") for s in merged}
+    for s in rec_sessions:
+        sid = s.get("session_id", "")
+        if sid and sid not in seen_live:
+            seen_live.add(sid)
+            s["active"] = s.get("active", False)
+            merged.append(s)
+
+    # Sort: active sessions first, then by response_time descending
+    active = [s for s in merged if s.get("active")]
+    inactive = [s for s in merged if not s.get("active")]
+    active.sort(key=lambda s: s.get("response_time", ""), reverse=True)
+    inactive.sort(key=lambda s: s.get("response_time", ""), reverse=True)
+    merged = active + inactive
+
+    result = {"sessions": merged, "count": len(merged)}
+    if model_filter:
+        result["model"] = model_filter
+
+    return JSONResponse(status_code=200, content=result)
+
+
+def list_session_recording_routes(app):
+    """Register session recording admin routes on a FastAPI application.
+
+    Args:
+        app: A FastAPI application instance.
+    """
+    app.add_api_route(
+        "/admin/sessions",
+        list_all_sessions,
+        methods=["GET"],
+        summary="List all sessions with recordings (filter by ?model=<name>)",
+    )
+    app.add_api_route(
+        "/admin/sessions/{session_id}/recordings",
+        list_session_recordings,
+        methods=["GET"],
+        summary="List recordings for a session",
+    )
+    app.add_api_route(
+        "/admin/sessions/{session_id}/recordings/{filename:path}",
+        get_session_recording,
+        methods=["GET"],
+        summary="Get a specific recording file",
+    )
 

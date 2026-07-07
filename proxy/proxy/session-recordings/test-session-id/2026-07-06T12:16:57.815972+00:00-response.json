@@ -1,0 +1,1 @@
+{"session_id": "test-session-id", "direction": "provider_to_client", "timestamp": "2026-07-06T12:16:57.815972+00:00", "payload": {"id": "test", "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "Hello!"}}]}}

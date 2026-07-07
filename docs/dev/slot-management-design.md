@@ -525,6 +525,7 @@ With `pool_size=4` and 4 sessions:
 | **LP-0MQMC4MKY006J08E** (Prompt-cache / session reuse tests) | Cache preservation tests should be updated to verify reservation behavior | Share reservation timeout config; update test fixtures to simulate within-timeout and after-timeout scenarios |
 | **LP-0MQMC4MNU002QJK4** (Slot-cache retention & cleanup) | Slot persistence reliability affects save/restore cost | Ensure cleanup script doesn't delete active reservation snapshot files |
 | **LP-0MQ0PYH8P008DLPJ** (Web based logging per slot) | Instrumentation touch points in F1 findings overlap | Reservation events (grant, release, preempt) are natural logging events for per-slot UI |
+| **LP-0MQWXX17C005BX1E** (slot_save failed) | Improved error logging for `_call_slot_endpoint` — exception type names, non-200 response logging, and debug-level stack traces | Operators can now diagnose save/restore failures from proxy logs without requiring reproduction |
 | **LP-0MPU11WBN004MFQ8** (Session Routing Regression Suite) | Regression coverage for slot coordination must be updated | Add tests for reservation timeout and queue behavior |
 
 ---

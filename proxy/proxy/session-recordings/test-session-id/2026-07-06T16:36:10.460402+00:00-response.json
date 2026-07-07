@@ -1,0 +1,1 @@
+{"session_id": "test-session-id", "direction": "provider_to_client", "timestamp": "2026-07-06T16:36:10.460402+00:00", "payload": "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"index\":0}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n"}

@@ -7,6 +7,30 @@ It uses the host-first model via `start-llama.sh` (router mode) and is designed
 to be deployed as a **user service** (recommended), though a system-service
 variant is documented below.
 
+> **IMPORTANT — parallelism alignment:** The llama-server `--parallel` flag
+> (controlled via the `LLAMA_PARALLEL` environment variable) MUST match the
+> proxy's `session_slot_pool_size` in `proxy/config.yaml`. Mismatch causes
+> slot exhaustion or restore failures.
+>
+> The proxy lifecycle automatically exports `LLAMA_PARALLEL` from
+> `server.session_slot_pool_size`. If you set `LLAMA_PARALLEL` manually in
+> this unit file, ensure it matches the proxy configuration.
+
+## Runtime alignment: `--parallel` vs `session_slot_pool_size`
+
+The llama-server `--parallel` (or `-np`) flag must match the proxy's
+`server.session_slot_pool_size` in `proxy/config.yaml`. A mismatch causes slot
+exhaustion or restore failures:
+
+- `pool_size < --parallel` → some server slots go unused.
+- `pool_size > --parallel` → sessions map to slot IDs that do not exist.
+
+When started through the proxy (standard production path), the proxy lifecycle
+automatically exports `LLAMA_PARALLEL` from `session_slot_pool_size`, and
+`start-llama.sh` reads that env var. If you start llama-server directly (e.g.,
+via systemd bypassing the proxy), ensure the `Environment=LLAMA_PARALLEL=N`
+value matches the proxy's `session_slot_pool_size` value.
+
 ## User Service (Recommended)
 
 This is the recommended deployment approach for single-operator setups. It

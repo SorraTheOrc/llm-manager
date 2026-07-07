@@ -198,7 +198,9 @@ async def get_llama_local_status():
          "current_model": str | None,
          "llama_server_running": bool,
          "available_slots": int,
-         "total_slots": int}
+         "total_slots": int,
+         "local_owner_session_id": str | None,
+         "local_owner_lease_remaining_seconds": float | None}
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
@@ -278,6 +280,23 @@ async def get_llama_local_status():
             # slots query is best-effort; default to 0 on failure
             pass
 
+    # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
+    local_owner_session_id = None
+    local_owner_lease_remaining_seconds = None
+    try:
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        records = getattr(srv, "local_dispatch_records", {})
+        if lock is not None:
+            async with lock:
+                for sid, rec in list(records.items()):
+                    if rec.get("active"):
+                        local_owner_session_id = sid
+                        remaining = rec.get("expires_at", 0) - time.monotonic()
+                        local_owner_lease_remaining_seconds = max(0.0, remaining)
+                        break
+    except Exception:
+        pass
+
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
     logger.info(
@@ -290,6 +309,8 @@ async def get_llama_local_status():
             "current_model": cm,
             "available_slots": available_slots,
             "total_slots": total_slots,
+            "local_owner_session_id": local_owner_session_id,
+            "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         },
     )
 
@@ -300,6 +321,8 @@ async def get_llama_local_status():
         "llama_server_running": bool(llama_running),
         "available_slots": available_slots,
         "total_slots": total_slots,
+        "local_owner_session_id": local_owner_session_id,
+        "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
     }
 
 
@@ -500,20 +523,8 @@ async def admin_reset_counts():
 
 
 # ---------------------------------------------------------------------------
-# /admin/sessions
+# /admin/sessions — session DELETE only; GET is served by ui.py list_all_sessions
 # ---------------------------------------------------------------------------
-
-@router.get("/admin/sessions")
-async def admin_list_sessions():
-    """List all active sessions with their metadata."""
-    srv = _srv()
-    sessions = []
-    for session_id in list(srv.session_manager._sessions.keys()):
-        info = srv.session_manager.get_session_info(session_id)
-        if info is not None:
-            sessions.append(info)
-    return {"sessions": sessions, "total": len(sessions)}
-
 
 @router.delete("/admin/sessions/{session_id}")
 async def admin_delete_session(session_id: str):

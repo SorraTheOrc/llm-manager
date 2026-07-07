@@ -1,0 +1,33 @@
+[Unit]
+Description=LLM proxy server — OpenAI-compatible API proxy
+Documentation=https://github.com/SorraTheOrc/llm-manager
+After=network.target llama-podman-wrapper.service
+Requires=llama-podman-wrapper.service
+Wants=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=rgardler
+Group=rgardler
+WorkingDirectory=/home/rgardler/projects/llm/proxy
+ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
+Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml
+Environment=LLAMA_START_SCRIPT=/home/rgardler/projects/llm/scripts/podman_start_llama.sh
+Environment=PYTHONPATH=/home/rgardler/projects/llm/proxy
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target

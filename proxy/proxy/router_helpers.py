@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import httpx
 from fastapi import HTTPException, Request
@@ -36,18 +36,81 @@ def _srv():
 # Request/response logging helpers
 # ===================================================================
 
+def _strip_system_messages_from_preview(body: bytes) -> str:
+    """Produce a body preview that excludes system message content.
+
+    Parses the JSON body and filters out any ``{"role": "system"...}``
+    messages before serialising back to a preview string.  Returns the
+    raw body decoded (capped at 500 chars) when JSON parsing fails or the
+    body does not contain a ``"messages"`` list.
+
+    This prevents sensitive system-prompt content from appearing in proxy
+    logs while still exposing user-facing message content for debugging.
+    """
+    preview = body.decode("utf-8", errors="replace")[:500]
+
+    try:
+        body_json = json.loads(body) if isinstance(body, bytes) else body
+        if isinstance(body_json, dict) and "messages" in body_json:
+            filtered_messages = [
+                msg
+                for msg in body_json["messages"]
+                if isinstance(msg, dict) and msg.get("role") != "system"
+            ]
+            if filtered_messages != body_json["messages"]:
+                # System messages were present and removed — rebuild JSON.
+                body_json = dict(body_json)
+                body_json["messages"] = filtered_messages
+                preview = json.dumps(body_json, ensure_ascii=False)[:500]
+    except Exception:
+        # If JSON parsing fails, return the raw preview (existing behaviour).
+        pass
+
+    return preview
+
+
 def log_request(
     request: Request,
     body: bytes,
     source: str,
     endpoint: str = "",
+    *,
+    session_id: Optional[str] = None,
+    slot_id: Optional[str] = "none",
 ) -> None:
-    """Log incoming request details."""
+    """Log incoming request details.
+
+    Parameters
+    ----------
+    request : Request
+        The incoming FastAPI request.
+    body : bytes
+        The raw request body.
+    source : str
+        Routing source label (``"local"`` or ``"remote"``).
+    endpoint : str, optional
+        Remote endpoint URL (used only for ``source == "remote"``).
+    session_id : str, optional
+        Resolved session ID (the internal session identifier). When
+        provided it is included in the log line as
+        ``session_id=<value>``.
+    slot_id : str, optional
+        Assigned slot identifier. Defaults to ``"none"``. When a slot
+        is assigned the actual ID is logged; otherwise the placeholder
+        ``"none"`` or ``"queued"`` is used.
+
+    Notes
+    -----
+    - System message content is stripped from the body preview to avoid
+      leaking sensitive system-prompt data in proxy logs.
+    - This function is the single source of truth for request logging and
+      is called by both ``proxy_to_local`` and ``proxy_to_remote``.
+    """
     srv = _srv()
     try:
         method = request.method
         url = str(request.url)
-        body_preview = body.decode("utf-8", errors="replace")[:500]
+        body_preview = _strip_system_messages_from_preview(body)
         session_headers = {
             k: v
             for k, v in request.headers.items()
@@ -58,15 +121,25 @@ def log_request(
                 "x-session-affinity",
             )
         }
+
+        # Build session info portion
+        session_parts = [f"session={session_headers}"]
+        if session_id is not None:
+            session_parts.insert(0, f"session_id={session_id}")
+        if slot_id is not None:
+            session_parts.append(f"slot={slot_id}")
+
+        session_info = " ".join(session_parts)
+
         if source == "remote" and endpoint:
             srv.logger.info(
                 f"[{source}] {method} {url} -> {endpoint} "
-                f"body={body_preview} session={session_headers}"
+                f"body={body_preview} {session_info}"
             )
         else:
             srv.logger.info(
                 f"[{source}] {method} {url} "
-                f"body={body_preview} session={session_headers}"
+                f"body={body_preview} {session_info}"
             )
     except Exception:
         srv.logger.debug("Failed to log request", exc_info=True)
@@ -95,6 +168,60 @@ def log_response_chunk(chunk: bytes) -> None:
         srv.logger.info(f"STREAM CHUNK | {chunk_str}")
     except Exception:
         pass
+
+
+# ===================================================================
+# Upstream request header normalization
+# ===================================================================
+
+_HOP_BY_HOP_REQUEST_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "expect",
+    "proxy-connection",
+}
+
+
+def normalize_upstream_request_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    """Normalize inbound headers before proxying to upstream/local backends.
+
+    Removes hop-by-hop transport headers that can produce malformed upstream
+    requests (especially when forwarding from one HTTP connection to another).
+    Also strips headers referenced by the Connection header token list.
+    """
+    if not headers:
+        return {}
+
+    connection_tokens: set[str] = set()
+    for k, v in headers.items():
+        if str(k).lower() == "connection":
+            try:
+                connection_tokens.update(
+                    token.strip().lower()
+                    for token in str(v).split(",")
+                    if token and token.strip()
+                )
+            except Exception:
+                pass
+
+    out: Dict[str, str] = {}
+    for k, v in headers.items():
+        lk = str(k).lower()
+        if lk in ("host", "content-length"):
+            continue
+        if lk in _HOP_BY_HOP_REQUEST_HEADERS:
+            continue
+        if lk in connection_tokens:
+            continue
+        out[str(k)] = str(v)
+
+    return out
 
 
 # ===================================================================
@@ -249,6 +376,197 @@ async def _increment_active_queries(srv) -> None:
         pass
 
 
+def _get_lease_timeout_seconds(srv) -> float:
+    """Return the configured lease timeout in seconds (default 180)."""
+    try:
+        server_cfg = srv.config.get("server", {})
+        return float(
+            server_cfg.get("local_dispatch_lease_timeout_seconds", 180) or 180
+        )
+    except (ValueError, TypeError):
+        return 180.0
+
+
+async def _decrement_local_active_queries(
+    srv,
+    session_key: Optional[str] = None,
+) -> None:
+    """Safely decrement the local-only active queries counter.
+
+    When *session_key* is provided, the corresponding dispatch record
+    (if any) is marked as inactive with a future *expires_at* timestamp,
+    keeping the lease alive for the owner session until the timeout.
+    """
+    try:
+        async with srv.local_active_queries_lock:
+            srv.local_active_queries = max(0, srv.local_active_queries - 1)
+    except Exception:
+        pass
+
+    if session_key is not None:
+        try:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None:
+                lease_timeout = _get_lease_timeout_seconds(srv)
+                async with lock:
+                    if session_key in srv.local_dispatch_records:
+                        srv.local_dispatch_records[session_key]["active"] = False
+                        srv.local_dispatch_records[session_key]["expires_at"] = (
+                            time.monotonic() + lease_timeout
+                        )
+        except Exception:
+            pass
+
+
+async def _increment_local_active_queries(
+    srv,
+    session_key: Optional[str] = None,
+    backend: Optional[str] = None,
+) -> None:
+    """Safely increment the local-only active queries counter.
+
+    When *session_key* and *backend* are provided, a corresponding
+    dispatch record is created in *local_dispatch_records* to track
+    lease ownership.
+    """
+    try:
+        async with srv.local_active_queries_lock:
+            srv.local_active_queries += 1
+    except Exception:
+        pass
+
+    if session_key is not None and backend is not None:
+        try:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None:
+                lease_timeout = _get_lease_timeout_seconds(srv)
+                async with lock:
+                    srv.local_dispatch_records[session_key] = {
+                        "backend": backend,
+                        "started_at": time.monotonic(),
+                        "active": True,
+                        "expires_at": time.monotonic() + lease_timeout,
+                    }
+        except Exception:
+            pass
+
+
+async def _try_acquire_local_dispatch(
+    srv,
+    max_local: int,
+    session_key: str,
+    backend: str,
+) -> tuple:
+    """Try to acquire the local dispatch for *session_key*.
+
+    Returns ``(acquired, owner, active_count, retry_after)`` where:
+
+    - *acquired* is True if the local backend was acquired for the caller.
+    - *owner* is the session ID that currently holds the lease (or None).
+    - *active_count* is the current number of active local queries after
+      acquisition (or 0 if denied).
+    - *retry_after* is a suggested retry delay in seconds (minimum 1).
+
+    The no-preemption policy means that a non-owner session cannot
+    acquire the local backend while an unexpired lease exists, even if
+    the owner has no active request in flight.
+
+    If the server does not have *local_dispatch_records* or
+    *local_dispatch_records_lock* attributes (legacy state), the function
+    silently returns ``(True, None, 0, 1.0)`` to allow the request.
+    """
+    # Guard: skip if dispatch tracking is not initialised
+    if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
+        return (True, None, 0, 1.0)
+
+    lease_timeout = _get_lease_timeout_seconds(srv)
+    now = time.monotonic()
+
+    try:
+        async with srv.local_dispatch_records_lock:
+            # Check for existing leases from other sessions
+            for existing_key, record in list(srv.local_dispatch_records.items()):
+                if existing_key == session_key:
+                    # Same session -- check if previous lease expired
+                    if not record.get("active") and record.get("expires_at", 0) <= now:
+                        # Lease expired, remove old record and allow re-acquisition
+                        del srv.local_dispatch_records[existing_key]
+                        continue
+                    # Same session with valid lease -- allow
+                    continue
+
+                # Different session -- check whether it blocks acquisition
+                if record.get("active") or record.get("expires_at", 0) > now:
+                    # Owner session has an active or unexpired lease
+                    owner = existing_key
+                    active_count = getattr(srv, "local_active_queries", 0)
+                    retry_after = max(1.0, record.get("expires_at", now) - now)
+                    return (False, owner, active_count, retry_after)
+
+            # No blocking lease -- check concurrency cap
+            async with srv.local_active_queries_lock:
+                if srv.local_active_queries >= max_local:
+                    # At concurrency limit -- find the owner of the active request
+                    active_owner = None
+                    for ek, er in srv.local_dispatch_records.items():
+                        if er.get("active"):
+                            active_owner = ek
+                            break
+                    return (
+                        False,
+                        active_owner,
+                        srv.local_active_queries,
+                        max(1.0, lease_timeout),
+                    )
+
+                # Acquire: increment counter and create dispatch record
+                srv.local_active_queries += 1
+
+            srv.local_dispatch_records[session_key] = {
+                "backend": backend,
+                "started_at": now,
+                "active": True,
+                "expires_at": now + lease_timeout,
+            }
+
+        return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
+    except Exception:
+        return (True, None, 0, 1.0)
+
+
+async def _cleanup_stale_local_dispatch(srv) -> int:
+    """Remove stale lease records from *local_dispatch_records*.
+
+    A record is stale when it is not active and its *expires_at* timestamp
+    has passed (``time.monotonic() > expires_at``).  Each removed record
+    is logged with its session ID and reason.
+
+    Returns the number of records removed.
+    """
+    now = time.monotonic()
+    removed = 0
+    try:
+        async with srv.local_dispatch_records_lock:
+            stale_ids = [
+                sid
+                for sid, record in srv.local_dispatch_records.items()
+                if not record.get("active") and record.get("expires_at", 0) <= now
+            ]
+            for sid in stale_ids:
+                del srv.local_dispatch_records[sid]
+                removed += 1
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=idle_timeout",
+                        sid[:8] if sid else "unknown",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
+
+
 # ===================================================================
 # Header normalization helpers
 # ===================================================================
@@ -299,6 +617,7 @@ async def _handle_session(
     
     result = {
         "session_id": None,
+        "session_id_header": None,
         "session_created": False,
         "is_delta_request": False,
         "session_fallback_reason": None,
@@ -306,11 +625,14 @@ async def _handle_session(
         "body_json": body_json,
         "body_override": None,
         "original_message_count": 0,
+        "session_explicit": False,
     }
     
     session_id_header, session_header_source = _resolve_session_id_header(
         request_headers
     )
+    result["session_id_header"] = session_id_header
+    result["session_explicit"] = session_id_header is not None
     
     if isinstance(body_json, dict) and "messages" in body_json:
         result["original_message_count"] = len(body_json["messages"])
@@ -567,3 +889,88 @@ def _compute_request_timeout(
     else:
         timeout_seconds = server_config.get("llama_request_timeout", 300)
     return httpx.Timeout(timeout_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Session traffic recording helpers (LP-0MR8FEKK6005V9ML)
+# ---------------------------------------------------------------------------
+
+
+def _schedule_traffic_recording(
+    session_id: str,
+    client_payload: Optional[Any] = None,
+    proxy_payload: Optional[Any] = None,
+    response_payload: Optional[Any] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> None:
+    """Schedule fire-and-forget recording of session traffic.
+
+    Records the client→proxy request, proxy→provider request, and
+    provider→client response for a single proxied call. All writes
+    are dispatched to the event loop as background tasks and do not
+    block the caller.
+
+    Args:
+        session_id: The session identifier for the call being recorded.
+        client_payload: The original client→proxy request payload.
+        proxy_payload: The processed proxy→provider request payload.
+        response_payload: The assembled provider→client response.
+        model: Optional model name to include in recording metadata.
+        provider: Optional provider name to include in recording metadata.
+    """
+    if not session_id:
+        return
+
+    try:
+        from proxy.session_recorder import SessionRecorder
+
+        loop = asyncio.get_running_loop()
+        recorder = SessionRecorder.from_config(_srv().config)
+
+        if client_payload is not None:
+            loop.create_task(
+                recorder.record_request(
+                    session_id, "client_to_proxy", client_payload,
+                    model=model, provider=provider,
+                )
+            )
+
+        if proxy_payload is not None:
+            loop.create_task(
+                recorder.record_request(
+                    session_id, "proxy_to_provider", proxy_payload,
+                    model=model, provider=provider,
+                )
+            )
+
+        if response_payload is not None:
+            # Try to parse string payload as JSON for consistent format
+            if isinstance(response_payload, str):
+                try:
+                    parsed = json.loads(response_payload)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = response_payload
+            elif isinstance(response_payload, bytes):
+                try:
+                    parsed = json.loads(response_payload.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, ValueError):
+                    parsed = response_payload.decode("utf-8", errors="replace")
+            else:
+                parsed = response_payload
+
+            loop.create_task(
+                recorder.record_response(
+                    session_id, "provider_to_client", parsed,
+                    model=model, provider=provider,
+                )
+            )
+    except Exception as exc:
+        try:
+            _srv().logger.warning(
+                "Failed to schedule session recording for %s: %s",
+                session_id[:8] if session_id else "unknown",
+                exc,
+            )
+        except Exception:
+            pass
