@@ -673,15 +673,20 @@
           try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
 
           if (item.direction === 'client_to_proxy') {
-            // Extract messages, skip system prompts
+            // Only show the most recent (last) non-system message
             var messages = payload.messages || [];
-            for (var m = 0; m < messages.length; m++) {
-              var msg = messages[m];
-              if (msg.role === 'system') continue;
+            var lastMsg = null;
+            for (var m = messages.length - 1; m >= 0; m--) {
+              if (messages[m].role !== 'system') {
+                lastMsg = messages[m];
+                break;
+              }
+            }
+            if (lastMsg) {
               _msgId++;
-              var text = extractText(msg.content);
-              convHtml += '<div class="msg ' + (msg.role || '') + '">';
-              convHtml += '<div class="msg-header">## ' + (msg.role || 'unknown') + ' - ' + ts + '</div>';
+              var text = extractText(lastMsg.content);
+              convHtml += '<div class="msg ' + (lastMsg.role || '') + '">';
+              convHtml += '<div class="msg-header">## ' + (lastMsg.role || 'unknown') + ' - ' + ts + '</div>';
               convHtml += makeExpandable(text, _msgId);
               convHtml += '</div>';
             }
