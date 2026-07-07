@@ -275,6 +275,8 @@ class SessionRecorder:
                         "timestamp": content.get("timestamp", ""),
                         "direction": content.get("direction", ""),
                         "file_size": entry.stat().st_size,
+                        "model": content.get("model", ""),
+                        "provider": content.get("provider", ""),
                     })
                 except (json.JSONDecodeError, OSError):
                     # Skip corrupted/unreadable files

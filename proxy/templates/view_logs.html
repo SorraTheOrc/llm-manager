@@ -550,16 +550,25 @@
           const direction = rec.direction || 'unknown';
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
+          var modelBadge = '';
+          if (rec.model) {
+            modelBadge = '<span class="provider-badge local">model: ' + rec.model + '</span>';
+          }
+          var providerBadge = '';
+          if (rec.provider) {
+            providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
+          }
           html += `<div class="recording-entry">
             <span class="timestamp">${ts}</span>
             <span class="direction">${direction}</span>
+            ${modelBadge}
+            ${providerBadge}
             <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
             <span class="json-hover" style="margin-left:0.5rem; position:relative; cursor:default; font-size:0.7rem; color:var(--accent); text-decoration:underline;"
               data-session="${sessionId}"
               data-filename="${safeFilename}"
               onmouseover="showJsonTooltip(event, this)"
-              onmouseout="scheduleHideTooltip()"
-              onclick="loadRecordingContent('${model}', '${sessionId}', '${safeFilename}')">JSON</span>
+              onmouseout="scheduleHideTooltip()">JSON</span>
           </div>`;
         }
         contentEl.innerHTML = html;
@@ -642,46 +651,7 @@
       if (tip) tip.style.display = 'none';
     }
 
-    async function loadRecordingContent(model, sessionId, filename) {
-      const contentEl = document.getElementById(`recordingContent-${CSS.escape(model)}`);
-      if (!contentEl) return;
-
-      contentEl.innerHTML = '<div class="muted">Loading recording content...</div>';
-
-      try {
-        const resp = await fetch(`/admin/sessions/${encodeURIComponent(sessionId)}/recordings/${encodeURIComponent(filename)}`);
-        if (!resp.ok) {
-          contentEl.innerHTML = '<div class="muted">Recording not found.</div>';
-          return;
-        }
-        const data = await resp.json();
-
-        // Show formatted JSON with model/provider info highlighted
-        const modelInfo = data.model ? `<span class="provider-badge local">model: ${data.model}</span>` : '';
-        const providerInfo = data.provider ? `<span class="provider-badge ${data.provider}">provider: ${data.provider}</span>` : '';
-        const direction = data.direction || '';
-        const ts = data.timestamp || '';
-
-        let html = `<div style="margin-bottom:0.5rem;">
-          <span class="direction">${direction}</span>
-          ${modelInfo}
-          ${providerInfo}
-          <span class="timestamp" style="margin-left:0.5rem;">${ts}</span>
-        </div>`;
-
-        // Show payload
-        if (data.payload) {
-          html += `<pre style="font-size:0.75rem; white-space:pre-wrap; color:var(--text-primary);">${JSON.stringify(data.payload, null, 2)}</pre>`;
-        }
-
-        // Show raw JSON
-        html += `<pre style="font-size:0.7rem; white-space:pre-wrap; color:var(--text-secondary); margin-top:0.5rem; border-top:1px solid var(--border); padding-top:0.5rem;">${JSON.stringify(data, null, 2)}</pre>`;
-
-        contentEl.innerHTML = html;
-      } catch (err) {
-        contentEl.innerHTML = '<div class="muted">Error loading recording content.</div>';
-      }
-    }
+    // loadRecordingContent removed — the JSON hover tooltip is sufficient
 
     try {
       if (window.__INITIAL_STATS) {
