@@ -419,7 +419,6 @@
           <div class="model-session-list">
             <label class="muted" style="font-size:0.85rem;">Session:</label>
             <select id="sessionFilter-${CSS.escape(model)}" class="session-filter" data-model="${model}">
-              <option value="">All sessions</option>
             </select>
             <span style="margin-left:0.5rem;">
               <button class="proxy-btn" id="refreshSessions-${CSS.escape(model)}" data-model="${model}" style="font-size:0.75rem;">Refresh</button>
@@ -443,12 +442,8 @@
 
         if (filterEl) {
           filterEl.addEventListener('change', () => {
-            const selectedSession = filterEl.value;
-            if (selectedSession) {
-              loadSessionRecordings(model, selectedSession);
-            } else {
-              const panelEl = document.getElementById(`recordingPanel-${CSS.escape(model)}`);
-              if (panelEl) panelEl.style.display = 'none';
+            if (filterEl.value) {
+              loadSessionRecordings(model, filterEl.value);
             }
           });
         }
@@ -486,14 +481,22 @@
 
         // Rebuild select options, preserving current selection
         const currentVal = selectEl.value;
-        selectEl.innerHTML = '<option value="">All sessions</option>';
+        selectEl.innerHTML = '';
         for (const s of sessions) {
           const opt = document.createElement('option');
           opt.value = s.session_id;
           opt.textContent = s.session_id;
           selectEl.appendChild(opt);
         }
-        selectEl.value = currentVal;
+
+        // Auto-select first session if available and nothing selected yet
+        if (sessions.length > 0 && !currentVal) {
+          selectEl.value = sessions[0].session_id;
+          // Trigger recording load for the first session
+          loadSessionRecordings(model, sessions[0].session_id);
+        } else if (currentVal) {
+          selectEl.value = currentVal;
+        }
 
         if (infoEl) {
           infoEl.textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`;
@@ -546,20 +549,48 @@
         for (const rec of recordings) {
           const direction = rec.direction || 'unknown';
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
+          const safeFilename = rec.filename.replace(/'/g, "\\'");
+          const rawJson = JSON.stringify(rec, null, 2).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
           html += `<div class="recording-entry">
             <span class="timestamp">${ts}</span>
             <span class="direction">${direction}</span>
             <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
-            <span style="margin-left:0.5rem;">
-              <button class="proxy-btn" style="font-size:0.7rem; padding:0.1rem 0.3rem;"
-                onclick="loadRecordingContent('${model}', '${sessionId}', '${rec.filename.replace(/'/g, "\\'")}')">View</button>
-            </span>
+            <span class="json-hover" style="margin-left:0.5rem; position:relative; cursor:default; font-size:0.7rem; color:var(--accent); text-decoration:underline;"
+              onmouseover="showJsonTooltip(event, '${rawJson}')"
+              onmouseout="hideJsonTooltip()"
+              onclick="loadRecordingContent('${model}', '${sessionId}', '${safeFilename}')">JSON</span>
           </div>`;
         }
         contentEl.innerHTML = html;
+        // Add tooltip container if not present
+        if (!document.getElementById('jsonTooltip')) {
+          const tip = document.createElement('div');
+          tip.id = 'jsonTooltip';
+          tip.style.cssText = 'display:none; position:fixed; z-index:1000; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:0.5rem; font-family:monospace; font-size:0.7rem; max-width:600px; max-height:400px; overflow:auto; white-space:pre; color:var(--text-primary); box-shadow:0 4px 12px rgba(0,0,0,0.5);';
+          document.body.appendChild(tip);
+        }
       } catch (err) {
         contentEl.innerHTML = '<div class="muted">Error loading recordings.</div>';
       }
+    }
+
+    // JSON tooltip helpers
+    function showJsonTooltip(event, json) {
+      const tip = document.getElementById('jsonTooltip');
+      if (!tip) return;
+      // Truncate very large payloads for tooltip display
+      const truncated = json.length > 5000 ? json.substring(0, 5000) + '\n... (truncated)' : json;
+      tip.textContent = truncated;
+      tip.style.display = 'block';
+      // Position near the cursor
+      const x = Math.min(event.clientX + 10, window.innerWidth - 620);
+      const y = Math.min(event.clientY + 10, window.innerHeight - 420);
+      tip.style.left = x + 'px';
+      tip.style.top = y + 'px';
+    }
+    function hideJsonTooltip() {
+      const tip = document.getElementById('jsonTooltip');
+      if (tip) tip.style.display = 'none';
     }
 
     async function loadRecordingContent(model, sessionId, filename) {
