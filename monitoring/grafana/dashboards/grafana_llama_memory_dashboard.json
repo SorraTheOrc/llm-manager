@@ -41,6 +41,23 @@
       ],
       "datasource": "Prometheus",
       "gridPos": {"h": 6, "w": 24, "x": 0, "y": 12}
+    },
+    {
+      "type": "graph",
+      "title": "GPU VRAM Usage (bytes)",
+      "id": 4,
+      "targets": [
+        {
+          "expr": "rocm_vram_total_bytes",
+          "legendFormat": "total"
+        },
+        {
+          "expr": "rocm_vram_used_bytes",
+          "legendFormat": "used"
+        }
+      ],
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 18}
     }
   ],
   "schemaVersion": 16,

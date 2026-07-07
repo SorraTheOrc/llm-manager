@@ -1,0 +1,182 @@
+# rocm-exporter.service — Host-first deployment systemd unit
+
+## Overview
+
+This systemd unit file runs AMD's official rocm-exporter to expose GPU VRAM
+and ROCm metrics for the LLM proxy stack monitoring infrastructure. It uses
+the host-first model (binary installation, no containers) and is designed to
+be deployed as a **user service** (recommended), though a system-service
+variant is documented below.
+
+The rocm-exporter provides Prometheus-compatible metrics including:
+- `rocm_vram_total_bytes` — Total VRAM per GPU
+- `rocm_vram_used_bytes` — Used VRAM per GPU
+- `rocm_vram_free_bytes` — Free VRAM per GPU
+
+Metrics are scraped by Prometheus and visualized in the Grafana dashboard.
+
+## User Service (Recommended)
+
+**File location**: `~/.config/systemd/user/rocm-exporter.service`
+
+```ini
+[Unit]
+Description=AMD ROCm exporter for GPU VRAM metrics
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/rgardler/bin/rocm-exporter/rocm-exporter --web.listen-address=:5000
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/home/rgardler/.local/state/rocm-exporter/logs/rocm-exporter.log
+StandardError=append:/home/rgardler/.local/state/rocm-exporter/logs/rocm-exporter.log
+
+# Resource limits
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target
+```
+
+### Setup commands (user service)
+
+```bash
+# 1. Download and install the rocm-exporter binary
+ROCM_EXPORTER_VERSION="0.1.0"  # Check https://github.com/amd/rocm-exporter/releases for latest
+wget "https://github.com/amd/rocm-exporter/releases/download/v${ROCM_EXPORTER_VERSION}/rocm-exporter-${ROCM_EXPORTER_VERSION}.linux-amd64.tar.gz"
+tar xzf rocm-exporter-${ROCM_EXPORTER_VERSION}.linux-amd64.tar.gz
+mkdir -p ~/bin/rocm-exporter
+cp rocm-exporter ~/bin/rocm-exporter/
+rm -rf rocm-exporter rocm-exporter-${ROCM_EXPORTER_VERSION}.linux-amd64.tar.gz
+
+# 2. Create log directory
+mkdir -p ~/.local/state/rocm-exporter/logs
+
+# 3. Install and start the service
+cp docs/systemd/rocm-exporter.service ~/.config/systemd/user/rocm-exporter.service
+systemctl --user daemon-reload
+systemctl --user enable rocm-exporter.service
+systemctl --user start rocm-exporter.service
+
+# 4. Verify
+systemctl --user status rocm-exporter.service
+journalctl --user -u rocm-exporter.service -f
+```
+
+## System Service (Alternative)
+
+Use this approach only if the rocm-exporter must survive logout or run
+independently of any user session. This requires root or sudo access.
+
+**File location**: `/etc/systemd/system/rocm-exporter.service`
+
+```ini
+[Unit]
+Description=AMD ROCm exporter for GPU VRAM metrics
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=rgardler
+Group=rgardler
+ExecStart=/home/rgardler/bin/rocm-exporter/rocm-exporter --web.listen-address=:5000
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/var/log/rocm-exporter/rocm-exporter.log
+StandardError=append:/var/log/rocm-exporter/rocm-exporter.log
+
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Setup commands (system service)
+
+```bash
+# Create log directory
+sudo mkdir -p /var/log/rocm-exporter
+sudo chown rgardler:rgardler /var/log/rocm-exporter
+
+# Install the unit
+sudo cp docs/systemd/rocm-exporter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable rocm-exporter.service
+sudo systemctl start rocm-exporter.service
+
+# Check status
+sudo systemctl status rocm-exporter.service
+
+# View logs
+sudo journalctl -u rocm-exporter.service -f
+```
+
+## Pre-installation checks
+
+Before installing the rocm-exporter, verify ROCm is properly installed and
+GPU is accessible:
+
+```bash
+# Check ROCm version
+rocm-smi --showtag
+
+# Check GPU status
+rocm-smi --showmeminfo vram
+
+# Expected output should show VRAM total and used values for at least one GPU
+```
+
+## Verification
+
+Regardless of deployment approach, verify the exporter is running and
+exposing metrics:
+
+```bash
+# Check metrics endpoint
+curl http://localhost:5000/metrics | grep rocm_vram
+
+# Expected metrics (example values):
+#   rocm_vram_total_bytes{gpu_id="0"} 17179869184  # 16 GB
+#   rocm_vram_used_bytes{gpu_id="0"}  8589934592   # 8 GB
+#   rocm_vram_free_bytes{gpu_id="0"} 8589934592    # 8 GB
+
+# Check specific VRAM metrics
+curl http://localhost:5000/metrics | grep -E "rocm_vram_(total|used|free)_bytes"
+```
+
+## Prometheus scrape configuration
+
+Add the following scrape job to Prometheus configuration:
+
+```yaml
+scrape_configs:
+  - job_name: "rocm-exporter"
+    static_configs:
+      - targets: ["localhost:5000"]
+    metrics_path: /metrics
+```
+
+This is already configured in `monitoring/prometheus.yml`.
+
+## Log paths
+
+- **User service**: `~/.local/state/rocm-exporter/logs/rocm-exporter.log`
+- **System service**: `/var/log/rocm-exporter/rocm-exporter.log`
+
+## Cross-references
+
+- See also: `monitoring/README.md` for full monitoring deployment documentation.
+- See also: `monitoring/gpu_vram_alerts.yaml` for GPU VRAM alerting rules.
+- See also: `monitoring/grafana_llama_memory_dashboard.json` for the Grafana dashboard with VRAM panels.
+- See also: `docs/systemd/prometheus.service` for the Prometheus systemd unit.
+- See also: `docs/systemd/grafana-server.service` for the Grafana systemd unit.
+- See also: `scripts/rocm-preflight.sh` for ROCm pre-flight checks.
