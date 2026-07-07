@@ -132,17 +132,55 @@
             font-family: monospace;
             font-size: 0.8rem;
         }
-        .session-recording-panel .recording-entry {
+        .recording-columns {
+            display: grid;
+            grid-template-columns: 1fr 1.5fr;
+            gap: 0.75rem;
+            height: 100%;
+        }
+        .recording-column {
+            overflow: auto;
+        }
+        .recording-column .recording-entry {
             padding: 0.25rem 0;
             border-bottom: 1px solid rgba(255,255,255,0.05);
         }
-        .session-recording-panel .recording-entry .direction {
+        .recording-column .recording-entry .direction {
             color: var(--accent);
             font-weight: 600;
         }
-        .session-recording-panel .recording-entry .timestamp {
+        .recording-column .recording-entry .timestamp {
             color: var(--text-secondary);
             font-size: 0.75rem;
+        }
+        .conversation-view {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 0.8rem;
+        }
+        .conversation-view .msg {
+            padding: 0.5rem;
+            margin-bottom: 0.5rem;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.03);
+            border-left: 3px solid var(--border);
+        }
+        .conversation-view .msg.user {
+            border-left-color: var(--accent);
+        }
+        .conversation-view .msg.assistant {
+            border-left-color: var(--accent-llama);
+        }
+        .conversation-view .msg-header {
+            font-weight: 600;
+            font-size: 0.75rem;
+            margin-bottom: 0.25rem;
+            color: var(--text-secondary);
+        }
+        .conversation-view .msg-content {
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: var(--text-primary);
+            line-height: 1.4;
         }
 
         .provider-badge {
@@ -536,6 +574,12 @@
     // Session recording display — load recordings for a selected session
     // ===================================================================
 
+    // Abbreviate direction names: client_to_proxy → client, etc.
+    function shortDir(direction) {
+      var parts = direction.split('_to_');
+      return parts[0] || direction;
+    }
+
     async function loadSessionRecordings(model, sessionId) {
       const panelEl = document.getElementById(`recordingPanel-${CSS.escape(model)}`);
       const contentEl = document.getElementById(`recordingContent-${CSS.escape(model)}`);
@@ -559,32 +603,40 @@
           return;
         }
 
-        let html = '';
+        // Build left column: abbreviated recording entries
+        var leftHtml = '';
+        var fetchPromises = [];
         for (const rec of recordings) {
           const direction = rec.direction || 'unknown';
+          const short = shortDir(direction);
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
-          // Show model badge from recording metadata, fall back to tab model
           var recModel = rec.model || model;
           var modelBadge = '<span class="provider-badge local">model: ' + recModel + '</span>';
           var providerBadge = '';
           if (rec.provider) {
             providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
           }
-          html += `<div class="recording-entry">
+          leftHtml += `<div class="recording-entry">
             <span class="timestamp">${ts}</span>
-            <span class="direction">${direction}</span>
+            <span class="direction">${short}</span>
             ${modelBadge}
             ${providerBadge}
             <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
-            <span class="json-hover" style="margin-left:0.5rem; position:relative; cursor:default; font-size:0.7rem; color:var(--accent); text-decoration:underline;"
+            <span class="json-hover" style="margin-left:0.5rem; font-size:0.7rem; color:var(--accent); text-decoration:underline; cursor:default;"
               data-session="${sessionId}"
               data-filename="${safeFilename}"
               onmouseover="showJsonTooltip(event, this)"
               onmouseout="scheduleHideTooltip()">JSON</span>
           </div>`;
+          // Fetch full content for conversation view
+          fetchPromises.push(
+            fetch(`/admin/sessions/${encodeURIComponent(sessionId)}/recordings/${safeFilename}`)
+              .then(function(r) { return r.ok ? r.json() : null; })
+              .then(function(recData) { return {filename: rec.filename, data: recData, direction: direction, ts: rec.timestamp}; })
+          );
         }
-        contentEl.innerHTML = html;
+
         // Add tooltip container if not present
         if (!document.getElementById('jsonTooltip')) {
           const tip = document.createElement('div');
@@ -594,9 +646,70 @@
           tip.onmouseout = function() { scheduleHideTooltip(); };
           document.body.appendChild(tip);
         }
+
+        // Build right column: conversation view from fetched content
+        var convHtml = '<div class="conversation-view">';
+        var allContent = await Promise.all(fetchPromises);
+        for (var i = 0; i < allContent.length; i++) {
+          var item = allContent[i];
+          if (!item || !item.data) continue;
+          var payload = item.data.payload || {};
+          var ts = '';
+          try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
+
+          if (item.direction === 'client_to_proxy' || item.direction === 'proxy_to_provider') {
+            // Extract messages, skip system prompts
+            var messages = payload.messages || [];
+            for (var m = 0; m < messages.length; m++) {
+              var msg = messages[m];
+              if (msg.role === 'system') continue;
+              convHtml += '<div class="msg ' + (msg.role || '') + '">';
+              convHtml += '<div class="msg-header">## ' + (msg.role || 'unknown') + ' - ' + ts + '</div>';
+              var content = msg.content || '';
+              if (typeof content === 'object') {
+                try { content = JSON.stringify(content, null, 2); } catch(e) { content = String(content); }
+              }
+              convHtml += '<div class="msg-content">' + escapeHtml(content) + '</div>';
+              convHtml += '</div>';
+            }
+          } else if (item.direction === 'provider_to_client') {
+            // Extract assistant response
+            var choices = payload.choices || [];
+            if (choices.length > 0) {
+              var choiceMsg = choices[0].message || choices[0].delta || {};
+              var modelName = item.data.model || model;
+              var providerName = item.data.provider || '';
+              var header = '## ' + modelName;
+              if (providerName) header += ' / ' + providerName;
+              header += ' - ' + ts;
+              convHtml += '<div class="msg assistant">';
+              convHtml += '<div class="msg-header">' + header + '</div>';
+              var content = choiceMsg.content || '';
+              if (typeof content === 'object') {
+                try { content = JSON.stringify(content, null, 2); } catch(e) { content = String(content); }
+              }
+              convHtml += '<div class="msg-content">' + escapeHtml(content) + '</div>';
+              convHtml += '</div>';
+            }
+          }
+        }
+        convHtml += '</div>';
+
+        // Combine into two-column layout
+        contentEl.innerHTML = '<div class="recording-columns">'
+          + '<div class="recording-column">' + leftHtml + '</div>'
+          + '<div class="recording-column">' + convHtml + '</div>'
+          + '</div>';
+
       } catch (err) {
         contentEl.innerHTML = '<div class="muted">Error loading recordings.</div>';
       }
+    }
+
+    // Simple HTML escape for conversation content
+    function escapeHtml(str) {
+      if (typeof str !== 'string') return String(str || '');
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
     // JSON tooltip helpers — fetch full recording content on hover
