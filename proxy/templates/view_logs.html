@@ -444,7 +444,13 @@
 
         if (filterEl) {
           filterEl.addEventListener('change', () => {
-            updateModelLog(model);
+            const selectedSession = filterEl.value;
+            if (selectedSession) {
+              loadSessionRecordings(model, selectedSession);
+            } else {
+              const panelEl = document.getElementById(`recordingPanel-${CSS.escape(model)}`);
+              if (panelEl) panelEl.style.display = 'none';
+            }
           });
         }
         if (refreshBtn) {
@@ -494,8 +500,6 @@
           infoEl.textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`;
         }
 
-        // Update log with session filter
-        updateModelLog(model);
       } catch (err) {
         if (infoEl) infoEl.textContent = 'Error loading sessions';
       }
@@ -513,54 +517,13 @@
     }
 
     // ===================================================================
-    // Model log update
+    // Session recording display — load recordings for a selected session
     // ===================================================================
 
-    function updateModelLog(model) {
-      const logEl = document.getElementById(`modelLog-${CSS.escape(model)}`);
-      if (!logEl) return;
-
-      const filterEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
-      const selectedSession = filterEl ? filterEl.value : '';
-
-      // Clear and show latest sessions with their request info
-      let html = '';
-      const sessions = modelSessionCache[model] || [];
-
-      for (const s of sessions) {
-        if (selectedSession && s.session_id !== selectedSession) continue;
-        const ts = s.last_activity ? new Date(s.last_activity).toLocaleTimeString() : '—';
-        html += `<div class="line" style="cursor:pointer;" onclick="toggleRecording('${model}', '${s.session_id}')">
-          <strong>${s.session_id}</strong>
-          <span class="muted" style="font-size:0.75rem;">last activity: ${ts}</span>
-          <span class="muted" style="font-size:0.7rem; margin-left:0.5rem;">[click to view recordings]</span>
-        </div>`;
-      }
-
-      if (!html) {
-        if (selectedSession) {
-          html = '<div class="muted">No activity for selected session.</div>';
-        } else {
-          html = '<div class="muted">No session activity recorded yet for this model.</div>';
-        }
-      }
-
-      logEl.innerHTML = html;
-    }
-
-    // ===================================================================
-    // Session recording display
-    // ===================================================================
-
-    async function toggleRecording(model, sessionId) {
+    async function loadSessionRecordings(model, sessionId) {
       const panelEl = document.getElementById(`recordingPanel-${CSS.escape(model)}`);
       const contentEl = document.getElementById(`recordingContent-${CSS.escape(model)}`);
       if (!panelEl || !contentEl) return;
-
-      if (panelEl.style.display !== 'none' && panelEl.dataset.sessionId === sessionId) {
-        panelEl.style.display = 'none';
-        return;
-      }
 
       panelEl.style.display = 'block';
       panelEl.dataset.sessionId = sessionId;
