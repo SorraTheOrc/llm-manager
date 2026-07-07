@@ -542,13 +542,20 @@
                 convHtml += '<div class="msg user"><div class="msg-header">## User - ' + ts + '</div>' + makeExpandable(extractText(msg.content), _msgId) + '</div>';
               } else if (msg.role === 'assistant') {
                 var asstContent = extractText(msg.content);
-                if (!asstContent) continue;  // skip empty assistant messages (tool calls)
                 var modelName = item.data.model || '';
                 var providerName = item.data.provider || '';
                 var header = '## ' + (modelName || 'assistant');
                 if (providerName) header += ' / ' + providerName;
                 header += ' - ' + ts;
-                convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(asstContent, _msgId) + '</div>';
+                if (asstContent) {
+                  _msgId++;
+                  convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(asstContent, _msgId) + '</div>';
+                } else if (msg.tool_calls) {
+                  var tcList = Array.isArray(msg.tool_calls) ? msg.tool_calls : [msg.tool_calls];
+                  var tcSummary = tcList.map(function(tc) { return tc.function ? tc.function.name + '(' + (tc.function.arguments || '') + ')' : 'tool_call'; }).join('\n');
+                  _msgId++;
+                  convHtml += '<div class="msg assistant" style="border-left-color:var(--warning);"><div class="msg-header">' + header + ' [tool calls]</div>' + makeExpandable(tcSummary, _msgId) + '</div>';
+                }
               }
             }
             seenMsgs = Math.max(seenMsgs, messages.length);
