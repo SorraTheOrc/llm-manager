@@ -480,6 +480,8 @@
         var fetchPromises = [];
         for (const rec of recordings) {
           const direction = rec.direction || 'unknown';
+          // Skip proxy_to_provider — they're echoes of user input, not useful in the entry list
+          if (direction === 'proxy_to_provider') continue;
           const short = shortDir(direction);
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
