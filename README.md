@@ -175,5 +175,92 @@ descriptive message.
 - The recording directory should be restricted to the user running the
   proxy (e.g., ``chmod 700``).
 - Cleanup/retention policies should be configured separately to prevent
-  disk space exhaustion. See the ``LP-0MQW94K86004CJ59`` epic for
+  disk space exhaustion. See the [Disk Space Management](#disk-space-management) section for
   cleanup scripts and retention policies.
+
+---
+
+## Disk Space Management
+
+This project includes automated cleanup scripts to manage disk usage from
+stale model caches, unused container images, and pi agent session logs.
+
+### Cleanup Scripts
+
+All scripts are in `scripts/` and support `--dry-run` (preview without
+deletion) and `--json` (machine-readable output).
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/cleanup-model-cache.sh` | Remove HuggingFace models not in `models.ini` and duplicate llama.cpp GGUF cache |
+| `scripts/cleanup-container-images.sh` | Remove container images not referenced by project scripts or Containerfile |
+| `scripts/cleanup-pi-sessions.sh` | Remove old pi agent session logs (keep last 90 days / 50 sessions per workspace) |
+| `scripts/cleanup-all.sh` | Orchestrator that runs all three cleanup scripts |
+| `scripts/install-cron.sh` | Install daily crontab entries for automated cleanup |
+
+### Quick Start
+
+```bash
+# Preview what would be deleted
+./scripts/cleanup-all.sh --dry-run
+
+# Run actual cleanup
+./scripts/cleanup-all.sh
+
+# Install daily cron job (runs at 3 AM)
+./scripts/install-cron.sh
+```
+
+### Retention Policies
+
+| Category | Default Retention | Configuration |
+|----------|------------------|--------------|
+| Model cache | Keep only models listed in `models.ini` | Edit `models.ini` to add/remove models |
+| Container images | Keep only images referenced by `scripts/` and `Containerfile` | `LLM_CLEANUP_ALL=1` to remove cross-project images |
+| Pi session logs | Keep last 90 days AND last 50 sessions per workspace | `--retention-days`, `--keep-sessions` flags |
+
+### Cron Automation
+
+By default, cleanup runs daily at **3:00 AM**. Slot cache cleanup
+(if installed) runs at **4:00 AM** to avoid resource contention.
+
+#### Individual Toggles
+
+Each cleanup category can be independently disabled via environment
+variables:
+
+```bash
+# Disable specific cleanup categories
+CLEANUP_ENABLE_MODELS=0     # Skip model cache cleanup
+CLEANUP_ENABLE_CONTAINERS=0 # Skip container image cleanup
+CLEANUP_ENABLE_PI=0         # Skip pi session log cleanup
+
+# Combine with the orchestrator
+CLEANUP_ENABLE_PI=0 ./scripts/cleanup-all.sh
+```
+
+#### Manual Cron Installation
+
+```bash
+# Install cron entries (daily at 3 AM)
+./scripts/install-cron.sh
+
+# Preview cron entries without installing
+./scripts/install-cron.sh --dry-run
+
+# Uninstall cron entries
+./scripts/install-cron.sh --uninstall
+
+# Use a custom hour (e.g., 2 AM)
+CLEANUP_HOUR=2 ./scripts/install-cron.sh
+```
+
+Logs are written to `/var/log/pi-cleanup.log` by default. Log rotation
+should be configured via the system's logrotate.
+
+### Related Work
+
+- Slot cache cleanup (LP-0MQMC4MNU002QJK4) — separate script
+  `scripts/cleanup-slot-cache.sh` for KV cache snapshot retention.
+  Runs at 4:00 AM to avoid conflict with the main cleanup at 3:00 AM.
+  See the slot cache cleanup epic for details.
