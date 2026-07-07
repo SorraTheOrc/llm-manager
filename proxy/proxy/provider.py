@@ -154,6 +154,10 @@ def _is_provider_unavailable(provider_name: str) -> bool:
 
     Returns ``True`` if the provider is marked unavailable and its cooldown
     has not yet expired.  Expired entries are cleaned up lazily.
+
+    This check is global — it reads from the shared module-level dict, so
+    any session calling this function sees the same cooldown state. There is
+    no per-session isolation of cooldown state.
     """
     expiry = _provider_unavailable_until.get(provider_name)
     if expiry is None:

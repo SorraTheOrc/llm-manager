@@ -9,6 +9,7 @@ node_modules/
 # Runtime artifacts
 logs/
 test-results/
+session-recordings/
 
 ##################################
 Worklog Specific Ignores
