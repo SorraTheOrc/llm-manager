@@ -3,14 +3,10 @@ windows:
   - name: LLM
     cwd: ~/projects/llm
     panes:
-      - cmd: "pi --continue"
+      - cmd: "wl pi"
         cwd: "~/projects/llm"
         focus: true
-      - cmd: "wl tui"
-        split:
-          dir: vertical
-          size_pct: 50
       - cmd: "clear"
         split:
-          dir: horizontal
+          dir: vertical
           size_pct: 30
