@@ -30,6 +30,7 @@ from proxy.lifecycle import (  # noqa: E402
     _is_self_healing_active,
     _self_healing_response,
     _resolve_slot_model_name,
+    _compute_adaptive_timeout,
     get_model_config,
 )
 from proxy.session import (  # noqa: E402
@@ -214,7 +215,7 @@ def _get_guardrail_config(server_config: dict) -> dict:
     """Extract guardrail parameters from server config.
 
     Defaults (when config keys are absent or falsy):
-        max_runtime_seconds: 300 (5 minutes)
+        max_runtime_seconds: 1800 (30 minutes) — acts as safety cap for adaptive budget
         max_completion_tokens: 2048
         repetition_min_pattern_chars: 64
         repetition_min_repeats: 10
@@ -222,7 +223,7 @@ def _get_guardrail_config(server_config: dict) -> dict:
     """
     return {
         "max_runtime_seconds": float(
-            server_config.get("session_guardrail_max_runtime_seconds", 300) or 300
+            server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
         ),
         "max_completion_tokens": int(
             server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
@@ -874,6 +875,31 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     chunk_history: list[tuple[float, str]] = []
                     gc = _get_guardrail_config(server_config)
                     max_runtime_seconds = gc["max_runtime_seconds"]
+                    # Compute adaptive guardrail budget when adaptive timeout is enabled
+                    # (LP-0MRB9AZDJ00716OT).  Reuses the same adaptive timeout formula
+                    # from lifecycle.py that is already used for the HTTP request timeout.
+                    _adaptive_enabled = server_config.get(
+                        "llama_adaptive_timeout_enabled", False
+                    )
+                    if _adaptive_enabled and isinstance(body_json, dict):
+                        _adaptive_base = float(
+                            server_config.get(
+                                "llama_adaptive_timeout_base_seconds", 60
+                            )
+                        )
+                        _adaptive_per_token = float(
+                            server_config.get(
+                                "llama_adaptive_timeout_per_token_seconds", 0.01
+                            )
+                        )
+                        runtime_budget = _compute_adaptive_timeout(
+                            body_json,
+                            _adaptive_base,
+                            _adaptive_per_token,
+                            max_runtime_seconds,
+                        )
+                    else:
+                        runtime_budget = float(max_runtime_seconds)
                     max_completion_tokens = gc["max_completion_tokens"]
                     repetition_min_pattern_chars = gc["repetition_min_pattern_chars"]
                     repetition_min_repeats = gc["repetition_min_repeats"]
@@ -920,7 +946,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                             _heartbeat_interval = stream_heartbeat_interval
                             _heartbeat_bytes = b"data: {\"type\":\"heartbeat\"}\n\n"
-                            remaining_budget = float(max_runtime_seconds)
+                            remaining_budget = runtime_budget
                             while True:
                                 _hb_task = asyncio.ensure_future(
                                     asyncio.sleep(_heartbeat_interval)

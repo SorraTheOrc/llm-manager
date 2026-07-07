@@ -879,7 +879,7 @@ def _compute_request_timeout(
         per_token_timeout = float(
             server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01)
         )
-        max_timeout = float(server_config.get("llama_request_timeout", 300))
+        max_timeout = float(server_config.get("llama_request_timeout", 1800))
         timeout_seconds = _compute_adaptive_timeout(
             body_json, base_timeout, per_token_timeout, max_timeout
         )
@@ -889,7 +889,7 @@ def _compute_request_timeout(
             timeout_seconds,
         )
     else:
-        timeout_seconds = server_config.get("llama_request_timeout", 300)
+        timeout_seconds = server_config.get("llama_request_timeout", 1800)
     return httpx.Timeout(timeout_seconds)
 
 
