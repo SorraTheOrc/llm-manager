@@ -550,13 +550,16 @@
           const direction = rec.direction || 'unknown';
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
-          const rawJson = JSON.stringify(rec, null, 2).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+          // Store JSON metadata in a data attribute (base64 encoded to avoid escaping issues)
+          const jsonData = JSON.stringify(rec);
+          const b64 = btoa(unescape(encodeURIComponent(jsonData)));
           html += `<div class="recording-entry">
             <span class="timestamp">${ts}</span>
             <span class="direction">${direction}</span>
             <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
             <span class="json-hover" style="margin-left:0.5rem; position:relative; cursor:default; font-size:0.7rem; color:var(--accent); text-decoration:underline;"
-              onmouseover="showJsonTooltip(event, '${rawJson}')"
+              data-json="${b64}"
+              onmouseover="showJsonTooltip(event, this)"
               onmouseout="hideJsonTooltip()"
               onclick="loadRecordingContent('${model}', '${sessionId}', '${safeFilename}')">JSON</span>
           </div>`;
@@ -575,18 +578,26 @@
     }
 
     // JSON tooltip helpers
-    function showJsonTooltip(event, json) {
+    function showJsonTooltip(event, el) {
       const tip = document.getElementById('jsonTooltip');
       if (!tip) return;
-      // Truncate very large payloads for tooltip display
-      const truncated = json.length > 5000 ? json.substring(0, 5000) + '\n... (truncated)' : json;
-      tip.textContent = truncated;
+      // Read base64-encoded JSON from data attribute
+      const b64 = el.getAttribute('data-json');
+      if (!b64) return;
+      try {
+        const jsonStr = decodeURIComponent(escape(atob(b64)));
+        const pretty = JSON.stringify(JSON.parse(jsonStr), null, 2);
+        const truncated = pretty.length > 5000 ? pretty.substring(0, 5000) + '\n... (truncated)' : pretty;
+        tip.textContent = truncated;
+      } catch (e) {
+        tip.textContent = 'Error parsing JSON';
+      }
       tip.style.display = 'block';
       // Position near the cursor
       const x = Math.min(event.clientX + 10, window.innerWidth - 620);
       const y = Math.min(event.clientY + 10, window.innerHeight - 420);
-      tip.style.left = x + 'px';
-      tip.style.top = y + 'px';
+      tip.style.left = Math.max(0, x) + 'px';
+      tip.style.top = Math.max(0, y) + 'px';
     }
     function hideJsonTooltip() {
       const tip = document.getElementById('jsonTooltip');
