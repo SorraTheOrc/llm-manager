@@ -564,19 +564,25 @@
             var assistantText = '';
 
             if (typeof payload === 'string') {
+              // Raw SSE data — concatenate ALL delta.content across all events
               var lines = payload.split('\n');
-              for (var li = lines.length - 1; li >= 0; li--) {
+              var fullContent = '';
+              var reasoning = '';
+              for (var li = 0; li < lines.length; li++) {
                 var line = lines[li];
                 if (line.indexOf('data: ') === 0 && line.indexOf('[DONE]') === -1) {
                   try {
                     var sseObj = JSON.parse(line.substring(6));
                     if (sseObj.choices && sseObj.choices.length > 0) {
                       var delta = sseObj.choices[0].delta || sseObj.choices[0].message || {};
-                      if (delta.content) { assistantText = delta.content; break; }
+                      if (delta.content) { fullContent += delta.content; }
+                      if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
+                      if (delta.thinking) { reasoning += (typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)); }
                     }
                   } catch(e) {}
                 }
               }
+              assistantText = fullContent || reasoning || '';
             } else {
               var choices = payload.choices || [];
               if (choices.length > 0) {
@@ -584,7 +590,7 @@
                 if (typeof choiceMsg === 'string') {
                   try { var parsed = JSON.parse(choiceMsg); choiceMsg = parsed; } catch(e) { assistantText = choiceMsg; }
                 }
-                if (typeof choiceMsg === 'object') assistantText = choiceMsg.content || '';
+                if (typeof choiceMsg === 'object') assistantText = choiceMsg.content || choiceMsg.reasoning_content || choiceMsg.thinking || '';
               }
             }
             if (assistantText) { _msgId++; convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(assistantText, _msgId) + '</div>'; }
