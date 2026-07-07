@@ -550,10 +550,9 @@
           const direction = rec.direction || 'unknown';
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
-          var modelBadge = '';
-          if (rec.model) {
-            modelBadge = '<span class="provider-badge local">model: ' + rec.model + '</span>';
-          }
+          // Show model badge from recording metadata, fall back to tab model
+          var recModel = rec.model || model;
+          var modelBadge = '<span class="provider-badge local">model: ' + recModel + '</span>';
           var providerBadge = '';
           if (rec.provider) {
             providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
