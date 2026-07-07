@@ -85,7 +85,7 @@
             border-bottom: none;
             border-radius: 6px 6px 0 0;
             cursor: pointer;
-            color: var(--text-secondary);
+            color: var(--accent);
             font-size: 0.85rem;
             white-space: nowrap;
             transition: background 0.15s, color 0.15s;
@@ -93,20 +93,13 @@
         }
         .tab:hover {
             background: var(--tab-hover-bg);
-            color: var(--text-primary);
+            color: #fff;
         }
         .tab.active {
             background: var(--tab-active-bg);
-            color: var(--accent);
+            color: #fff;
             border-bottom: 2px solid var(--accent);
             font-weight: 600;
-        }
-        .tab.raw-tab {
-            color: var(--accent);
-        }
-        .tab.raw-tab.active {
-            color: #fff;
-            border-bottom-color: var(--accent);
         }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
