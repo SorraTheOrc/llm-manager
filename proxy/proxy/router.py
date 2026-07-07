@@ -939,6 +939,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     remaining_budget -= _heartbeat_interval
                                     yield b"data: {\"type\":\"heartbeat\"}\n\n"
                                     continue
+                                except StopAsyncIteration:
+                                    # Upstream connection closed normally (no more data).
+                                    # Exit the read loop to synthesise [DONE] below.
+                                    break
                                 # count tokens in this chunk (best-effort)
                                 try:
                                     chunk_text = chunk.decode(
