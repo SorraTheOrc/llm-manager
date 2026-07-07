@@ -979,9 +979,27 @@ async def get_session_recording(session_id: str, filename: str) -> JSONResponse:
     )
 
 
-async def list_all_sessions() -> JSONResponse:
-    """Return all session IDs that have recordings."""
+async def list_all_sessions(request: Request = None) -> JSONResponse:
+    """Return all session IDs that have recordings, optionally filtered by model.
+
+    Query params:
+        model: Optional model name to filter sessions by.
+    """
+    model_filter = None
+    if request is not None:
+        model_filter = request.query_params.get("model")
+
     recorder = _get_recorder()
+    if model_filter:
+        sessions = recorder.list_sessions_by_model(model_filter)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "sessions": sessions,
+                "model": model_filter,
+                "count": len(sessions),
+            },
+        )
     sessions = recorder.list_sessions()
     return JSONResponse(
         status_code=200,
@@ -999,7 +1017,7 @@ def list_session_recording_routes(app):
         "/admin/sessions",
         list_all_sessions,
         methods=["GET"],
-        summary="List all sessions with recordings",
+        summary="List all sessions with recordings (filter by ?model=<name>)",
     )
     app.add_api_route(
         "/admin/sessions/{session_id}/recordings",

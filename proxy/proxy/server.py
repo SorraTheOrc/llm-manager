@@ -107,6 +107,14 @@ local_active_queries_lock = asyncio.Lock()
 local_dispatch_records: dict = {}
 local_dispatch_records_lock = asyncio.Lock()
 
+# Session observability counters (for SSE events and metrics)
+session_observability: dict = {
+    "session_activity_total": 0,
+}
+
+# Provider fallback counters (provider_name → count)
+provider_fallback_count: dict = {}
+
 # Background lease cleanup task (started in lifespan)
 _dispatch_cleanup_task: Optional[asyncio.Task] = None
 

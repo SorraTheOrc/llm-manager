@@ -470,11 +470,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Capture original client→proxy request payload for recording (LP-0MR8FEKK6005V9ML)
     _client_request_payload = body_json
 
+    # Determine model name from request for recording context
+    _recording_model = None
+    try:
+        if isinstance(body_json, dict):
+            _recording_model = body_json.get("model") or srv.current_model
+    except Exception:
+        pass
+
     # Schedule fire-and-forget recording of the client→proxy request
     if session_id and _client_request_payload:
         _schedule_traffic_recording(
             session_id=session_id,
             client_payload=_client_request_payload,
+            model=_recording_model,
         )
 
     slot_id = None
@@ -563,6 +572,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         _schedule_traffic_recording(
             session_id=session_id,
             proxy_payload=_proxy_provider_payload,
+            model=model_name,
+            provider="local",
         )
 
     if slot_model_name:
@@ -1094,6 +1105,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 _schedule_traffic_recording(
                                     session_id=session_id,
                                     response_payload=_stream_full_response,
+                                    model=model_name,
+                                    provider="local",
                                 )
 
                             # Update session history and save slot (shared helper)
@@ -1261,6 +1274,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 _schedule_traffic_recording(
                                     session_id=session_id,
                                     response_payload=response.content,
+                                    model=model_name,
+                                    provider="local",
                                 )
 
                             # Update session history and save slot (shared helper)

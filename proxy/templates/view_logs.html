@@ -22,6 +22,8 @@
             --log-warning: #f59e0b;
             --log-info: #60a5fa;
             --log-debug: #9ca3af;
+            --tab-active-bg: #1f2940;
+            --tab-hover-bg: #1e2d4a;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -65,6 +67,101 @@
         .summary-card { background:var(--bg-card); padding:0.75rem; border-radius:6px; border:1px solid var(--border); max-height:140px; overflow:auto; }
         .summary-card h4 { color:var(--text-secondary); font-size:0.85rem; margin-bottom:0.25rem; }
         .pane-label { font-size:0.9rem; min-width:80px; }
+
+        /* Tab bar styles */
+        .tab-bar {
+            display: flex;
+            gap: 2px;
+            margin-bottom: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0;
+            overflow-x: auto;
+            flex-wrap: nowrap;
+        }
+        .tab {
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-bottom: none;
+            border-radius: 6px 6px 0 0;
+            cursor: pointer;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            white-space: nowrap;
+            transition: background 0.15s, color 0.15s;
+            user-select: none;
+        }
+        .tab:hover {
+            background: var(--tab-hover-bg);
+            color: var(--text-primary);
+        }
+        .tab.active {
+            background: var(--tab-active-bg);
+            color: var(--accent);
+            border-bottom: 2px solid var(--accent);
+            font-weight: 600;
+        }
+        .tab.raw-tab {
+            color: var(--accent);
+        }
+        .tab.raw-tab.active {
+            color: #fff;
+            border-bottom-color: var(--accent);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Model tab session list */
+        .model-session-list {
+            margin-bottom: 0.75rem;
+        }
+        .model-session-list select,
+        .model-session-list input {
+            padding: 0.35rem;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            color: var(--text-primary);
+            font-size: 0.85rem;
+        }
+        .model-session-list input { width: 20rem; }
+        .model-session-list select { width: auto; min-width: 12rem; }
+
+        .session-recording-panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.75rem;
+            margin-top: 0.5rem;
+            max-height: 300px;
+            overflow: auto;
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+        .session-recording-panel .recording-entry {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .session-recording-panel .recording-entry .direction {
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .session-recording-panel .recording-entry .timestamp {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        .provider-badge {
+            display: inline-block;
+            padding: 0.1rem 0.35rem;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            margin-left: 0.25rem;
+        }
+        .provider-badge.local { background: rgba(79,140,255,0.2); color: var(--accent); }
+        .provider-badge.remote { background: rgba(255,140,79,0.2); color: var(--accent-llama); }
+
         .version-footer {
             position: fixed;
             bottom: 0;
@@ -93,59 +190,71 @@
       </div>
     </div>
 
-    <div class="summary">
-      <h3>Request Summary</h3>
-      <div class="summary-grid">
-        <div class="summary-card">
-          <h4>Counts</h4>
-          <div id="counts"></div>
-          <pre id="rawCounts" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+    <!-- Tab Bar -->
+    <div class="tab-bar" id="tabBar">
+      <div class="tab raw-tab active" data-tab="raw">Raw</div>
+    </div>
+
+    <!-- Tab: Raw (existing two-pane view) -->
+    <div class="tab-content active" id="tab-raw">
+      <div class="summary">
+        <h3>Request Summary</h3>
+        <div class="summary-grid">
+          <div class="summary-card">
+            <h4>Counts</h4>
+            <div id="counts"></div>
+            <pre id="rawCounts" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+          </div>
+          <div class="summary-card">
+            <h4>Tokens</h4>
+            <div id="tokens"></div>
+            <pre id="rawTokens" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+          </div>
         </div>
-        <div class="summary-card">
-          <h4>Tokens</h4>
-          <div id="tokens"></div>
-          <pre id="rawTokens" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
+      </div>
+
+      <div class="log-panes">
+        <!-- Proxy Log Pane -->
+        <div class="pane" id="proxyPane">
+          <div class="pane-header proxy">
+            <span class="pane-label">Proxy log</span>
+            <div class="pane-controls">
+              <input id="proxyLines" type="number" value="200" min="1" />
+              <button id="proxyConnect" class="proxy-btn">Connect</button>
+              <button id="proxyDisconnect" class="proxy-btn" disabled>Disconnect</button>
+              <button id="proxyClear" class="proxy-btn">Clear</button>
+              <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
+                <input id="proxyAutoscroll" type="checkbox" checked /> Auto
+              </label>
+              <button id="proxyDownload" class="proxy-btn">Download</button>
+            </div>
+          </div>
+          <div id="proxyLog" class="log"></div>
+        </div>
+
+        <!-- Llama-server Log Pane -->
+        <div class="pane" id="llamaPane">
+          <div class="pane-header llama">
+            <span class="pane-label">Llama-server log</span>
+            <div class="pane-controls">
+              <input id="llamaLines" type="number" value="200" min="1" />
+              <button id="llamaConnect" class="llama-btn">Connect</button>
+              <button id="llamaDisconnect" class="llama-btn" disabled>Disconnect</button>
+              <button id="llamaClear" class="llama-btn">Clear</button>
+              <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
+                <input id="llamaAutoscroll" type="checkbox" checked /> Auto
+              </label>
+              <button id="llamaDownload" class="llama-btn">Download</button>
+            </div>
+          </div>
+          <div id="llamaLog" class="log"></div>
         </div>
       </div>
     </div>
 
-    <div class="log-panes">
-      <!-- Proxy Log Pane -->
-      <div class="pane" id="proxyPane">
-        <div class="pane-header proxy">
-          <span class="pane-label">Proxy log</span>
-          <div class="pane-controls">
-            <input id="proxyLines" type="number" value="200" min="1" />
-            <button id="proxyConnect" class="proxy-btn">Connect</button>
-            <button id="proxyDisconnect" class="proxy-btn" disabled>Disconnect</button>
-            <button id="proxyClear" class="proxy-btn">Clear</button>
-            <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
-              <input id="proxyAutoscroll" type="checkbox" checked /> Auto
-            </label>
-            <button id="proxyDownload" class="proxy-btn">Download</button>
-          </div>
-        </div>
-        <div id="proxyLog" class="log"></div>
-      </div>
+    <!-- Tab content areas for model tabs (dynamically populated) -->
+    <div id="modelTabContents"></div>
 
-      <!-- Llama-server Log Pane -->
-      <div class="pane" id="llamaPane">
-        <div class="pane-header llama">
-          <span class="pane-label">Llama-server log</span>
-          <div class="pane-controls">
-            <input id="llamaLines" type="number" value="200" min="1" />
-            <button id="llamaConnect" class="llama-btn">Connect</button>
-            <button id="llamaDisconnect" class="llama-btn" disabled>Disconnect</button>
-            <button id="llamaClear" class="llama-btn">Clear</button>
-            <label style="display:flex; align-items:center; gap:0.25rem; color:var(--text-secondary); font-size:0.8rem;">
-              <input id="llamaAutoscroll" type="checkbox" checked /> Auto
-            </label>
-            <button id="llamaDownload" class="llama-btn">Download</button>
-          </div>
-        </div>
-        <div id="llamaLog" class="log"></div>
-      </div>
-    </div>
   </div>
 
   <footer class="version-footer">
@@ -165,6 +274,11 @@
     let latestTokens = {};
     let esProxy = null;
     let esLlama = null;
+    // Per-model event sources
+    let modelEventSources = {};
+    // Model tab polling state
+    let modelPollTimers = {};
+    let modelSessionCache = {};
 
     const proxyLog = document.getElementById('proxyLog');
     const llamaLog = document.getElementById('llamaLog');
@@ -249,6 +363,272 @@
       } catch (e) { /* ignore */ }
     }
 
+    // ===================================================================
+    // Tab management
+    // ===================================================================
+
+    function switchTab(tabName) {
+      // Update tab bar
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
+
+      const tabEl = document.querySelector(`[data-tab="${tabName}"]`);
+      const contentEl = document.querySelector(`#tab-${CSS.escape(tabName)}`);
+      if (tabEl) tabEl.classList.add('active');
+      if (contentEl) contentEl.classList.add('active');
+    }
+
+    // ===================================================================
+    // Build model tabs from __MODEL_LIST
+    // ===================================================================
+
+    function buildModelTabs() {
+      const modelList = window.__MODEL_LIST || [];
+      const tabBar = document.getElementById('tabBar');
+      const modelContents = document.getElementById('modelTabContents');
+
+      for (const model of modelList) {
+        // Add tab
+        const tab = document.createElement('div');
+        tab.className = 'tab';
+        tab.dataset.tab = `model-${model}`;
+        tab.textContent = model;
+        tab.title = `View activity for model: ${model}`;
+        tab.addEventListener('click', () => switchTab(`model-${model}`));
+        tabBar.appendChild(tab);
+
+        // Add tab content
+        const content = document.createElement('div');
+        content.className = 'tab-content';
+        content.id = `tab-model-${CSS.escape(model)}`;
+
+        content.innerHTML = `
+          <div class="model-session-list">
+            <label class="muted" style="font-size:0.85rem;">Session:</label>
+            <select id="sessionFilter-${CSS.escape(model)}" class="session-filter" data-model="${model}">
+              <option value="">All sessions</option>
+            </select>
+            <span style="margin-left:0.5rem;">
+              <button class="proxy-btn" id="refreshSessions-${CSS.escape(model)}" data-model="${model}" style="font-size:0.75rem;">Refresh</button>
+            </span>
+            <span style="margin-left:0.5rem;">
+              <span id="modelInfo-${CSS.escape(model)}" class="muted" style="font-size:0.8rem;"></span>
+            </span>
+          </div>
+          <div class="log" id="modelLog-${CSS.escape(model)}" style="height: calc(100vh - 320px);"></div>
+          <div id="recordingPanel-${CSS.escape(model)}" class="session-recording-panel" style="display:none;">
+            <div class="muted" style="margin-bottom:0.25rem;">Session Recording Data</div>
+            <div id="recordingContent-${CSS.escape(model)}"></div>
+          </div>
+        `;
+
+        modelContents.appendChild(content);
+      }
+
+      // Set up session filter and refresh events for each model
+      for (const model of modelList) {
+        const filterEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
+        const refreshBtn = document.getElementById(`refreshSessions-${CSS.escape(model)}`);
+
+        if (filterEl) {
+          filterEl.addEventListener('change', () => {
+            updateModelLog(model);
+          });
+        }
+        if (refreshBtn) {
+          refreshBtn.addEventListener('click', () => {
+            loadModelSessions(model);
+          });
+        }
+
+        // Load initial sessions for this model
+        loadModelSessions(model);
+        // Start periodic polling
+        startModelPolling(model);
+      }
+    }
+
+    // ===================================================================
+    // Model session loading
+    // ===================================================================
+
+    async function loadModelSessions(model) {
+      const selectEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
+      const infoEl = document.getElementById(`modelInfo-${CSS.escape(model)}`);
+      if (!selectEl) return;
+
+      try {
+        const resp = await fetch(`/admin/sessions?model=${encodeURIComponent(model)}`);
+        if (!resp.ok) {
+          if (infoEl) infoEl.textContent = 'API not available';
+          return;
+        }
+        const data = await resp.json();
+        const sessions = data.sessions || [];
+        modelSessionCache[model] = sessions;
+
+        // Rebuild select options, preserving current selection
+        const currentVal = selectEl.value;
+        selectEl.innerHTML = '<option value="">All sessions</option>';
+        for (const s of sessions) {
+          const opt = document.createElement('option');
+          opt.value = s.session_id;
+          opt.textContent = s.session_id;
+          selectEl.appendChild(opt);
+        }
+        selectEl.value = currentVal;
+
+        if (infoEl) {
+          infoEl.textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`;
+        }
+
+        // Update log with session filter
+        updateModelLog(model);
+      } catch (err) {
+        if (infoEl) infoEl.textContent = 'Error loading sessions';
+      }
+    }
+
+    function startModelPolling(model) {
+      if (modelPollTimers[model]) return;
+      modelPollTimers[model] = setInterval(() => {
+        // Only poll if this tab is visible or recently active
+        const tabEl = document.querySelector(`[data-tab="model-${model}"]`);
+        if (tabEl && tabEl.classList.contains('active')) {
+          loadModelSessions(model);
+        }
+      }, 5000); // Poll every 5 seconds
+    }
+
+    // ===================================================================
+    // Model log update
+    // ===================================================================
+
+    function updateModelLog(model) {
+      const logEl = document.getElementById(`modelLog-${CSS.escape(model)}`);
+      if (!logEl) return;
+
+      const filterEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
+      const selectedSession = filterEl ? filterEl.value : '';
+
+      // Clear and show latest sessions with their request info
+      let html = '';
+      const sessions = modelSessionCache[model] || [];
+
+      for (const s of sessions) {
+        if (selectedSession && s.session_id !== selectedSession) continue;
+        const ts = s.last_activity ? new Date(s.last_activity).toLocaleTimeString() : '—';
+        html += `<div class="line" style="cursor:pointer;" onclick="toggleRecording('${model}', '${s.session_id}')">
+          <strong>${s.session_id}</strong>
+          <span class="muted" style="font-size:0.75rem;">last activity: ${ts}</span>
+          <span class="muted" style="font-size:0.7rem; margin-left:0.5rem;">[click to view recordings]</span>
+        </div>`;
+      }
+
+      if (!html) {
+        if (selectedSession) {
+          html = '<div class="muted">No activity for selected session.</div>';
+        } else {
+          html = '<div class="muted">No session activity recorded yet for this model.</div>';
+        }
+      }
+
+      logEl.innerHTML = html;
+    }
+
+    // ===================================================================
+    // Session recording display
+    // ===================================================================
+
+    async function toggleRecording(model, sessionId) {
+      const panelEl = document.getElementById(`recordingPanel-${CSS.escape(model)}`);
+      const contentEl = document.getElementById(`recordingContent-${CSS.escape(model)}`);
+      if (!panelEl || !contentEl) return;
+
+      if (panelEl.style.display !== 'none' && panelEl.dataset.sessionId === sessionId) {
+        panelEl.style.display = 'none';
+        return;
+      }
+
+      panelEl.style.display = 'block';
+      panelEl.dataset.sessionId = sessionId;
+      contentEl.innerHTML = '<div class="muted">Loading recordings...</div>';
+
+      try {
+        const resp = await fetch(`/admin/sessions/${encodeURIComponent(sessionId)}/recordings`);
+        if (!resp.ok) {
+          contentEl.innerHTML = '<div class="muted">No recordings available for this session.</div>';
+          return;
+        }
+        const data = await resp.json();
+        const recordings = data.recordings || [];
+
+        if (recordings.length === 0) {
+          contentEl.innerHTML = '<div class="muted">No recording files found.</div>';
+          return;
+        }
+
+        let html = '';
+        for (const rec of recordings) {
+          const direction = rec.direction || 'unknown';
+          const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
+          html += `<div class="recording-entry">
+            <span class="timestamp">${ts}</span>
+            <span class="direction">${direction}</span>
+            <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
+            <span style="margin-left:0.5rem;">
+              <button class="proxy-btn" style="font-size:0.7rem; padding:0.1rem 0.3rem;"
+                onclick="loadRecordingContent('${model}', '${sessionId}', '${rec.filename.replace(/'/g, "\\'")}')">View</button>
+            </span>
+          </div>`;
+        }
+        contentEl.innerHTML = html;
+      } catch (err) {
+        contentEl.innerHTML = '<div class="muted">Error loading recordings.</div>';
+      }
+    }
+
+    async function loadRecordingContent(model, sessionId, filename) {
+      const contentEl = document.getElementById(`recordingContent-${CSS.escape(model)}`);
+      if (!contentEl) return;
+
+      contentEl.innerHTML = '<div class="muted">Loading recording content...</div>';
+
+      try {
+        const resp = await fetch(`/admin/sessions/${encodeURIComponent(sessionId)}/recordings/${encodeURIComponent(filename)}`);
+        if (!resp.ok) {
+          contentEl.innerHTML = '<div class="muted">Recording not found.</div>';
+          return;
+        }
+        const data = await resp.json();
+
+        // Show formatted JSON with model/provider info highlighted
+        const modelInfo = data.model ? `<span class="provider-badge local">model: ${data.model}</span>` : '';
+        const providerInfo = data.provider ? `<span class="provider-badge ${data.provider}">provider: ${data.provider}</span>` : '';
+        const direction = data.direction || '';
+        const ts = data.timestamp || '';
+
+        let html = `<div style="margin-bottom:0.5rem;">
+          <span class="direction">${direction}</span>
+          ${modelInfo}
+          ${providerInfo}
+          <span class="timestamp" style="margin-left:0.5rem;">${ts}</span>
+        </div>`;
+
+        // Show payload
+        if (data.payload) {
+          html += `<pre style="font-size:0.75rem; white-space:pre-wrap; color:var(--text-primary);">${JSON.stringify(data.payload, null, 2)}</pre>`;
+        }
+
+        // Show raw JSON
+        html += `<pre style="font-size:0.7rem; white-space:pre-wrap; color:var(--text-secondary); margin-top:0.5rem; border-top:1px solid var(--border); padding-top:0.5rem;">${JSON.stringify(data, null, 2)}</pre>`;
+
+        contentEl.innerHTML = html;
+      } catch (err) {
+        contentEl.innerHTML = '<div class="muted">Error loading recording content.</div>';
+      }
+    }
+
     try {
       if (window.__INITIAL_STATS) {
         latestCounts = window.__INITIAL_STATS.counts || {};
@@ -256,6 +636,17 @@
         renderSummary();
       }
     } catch (e) { /* ignore */ }
+
+    // Build model tabs when DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', buildModelTabs);
+    } else {
+      buildModelTabs();
+    }
+
+    // ===================================================================
+    // Raw tab event source handling (preserved as-is)
+    // ===================================================================
 
     function handleMessage(logEl, autoscrollCb, obj) {
       if (obj.initial) {
@@ -371,6 +762,10 @@
     window.addEventListener('beforeunload', () => {
       if (esProxy) esProxy.close();
       if (esLlama) esLlama.close();
+      // Clean up model poll timers
+      for (const key in modelPollTimers) {
+        clearInterval(modelPollTimers[key]);
+      }
     });
   </script>
 __LOG_VIEWER_SCRIPT__</body>

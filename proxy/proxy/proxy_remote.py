@@ -243,6 +243,8 @@ async def proxy_to_remote(
             session_id=_remote_session_id,
             client_payload=body_json,
             proxy_payload=body_json,
+            model=model_name,
+            provider="remote",
         )
 
     remote_timeout = httpx.Timeout(_srv().config.get("server", {}).get("llama_request_timeout", 300))
@@ -431,6 +433,8 @@ async def _handle_remote_streaming(
                 _schedule_traffic_recording(
                     session_id=session_id,
                     response_payload=response_body,
+                    model=model_name,
+                    provider="remote",
                 )
 
     return StreamingResponse(
@@ -476,6 +480,8 @@ async def _handle_remote_non_streaming(
             _schedule_traffic_recording(
                 session_id=session_id,
                 response_payload=response.content,
+                model=model_name,
+                provider="remote",
             )
 
         return Response(

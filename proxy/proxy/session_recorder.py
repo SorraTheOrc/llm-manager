@@ -106,6 +106,8 @@ class SessionRecorder:
         session_id: str,
         direction: str,
         payload: Any,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[str]:
         """Record a request payload to disk (non-blocking).
 
@@ -114,18 +116,22 @@ class SessionRecorder:
             direction: One of ``"client_to_proxy"``, ``"proxy_to_provider"``,
                 or ``"provider_to_client"``.
             payload: The request payload to record (must be JSON-serializable).
+            model: Optional model name to include in recording metadata.
+            provider: Optional provider name to include in recording metadata.
 
         Returns:
             The absolute file path of the written recording, or ``None`` if
             the write failed.
         """
-        return await self._write_recording(session_id, direction, payload, suffix="request")
+        return await self._write_recording(session_id, direction, payload, suffix="request", model=model, provider=provider)
 
     async def record_response(
         self,
         session_id: str,
         direction: str,
         payload: Any,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[str]:
         """Record a response payload to disk (non-blocking).
 
@@ -138,12 +144,14 @@ class SessionRecorder:
             direction: One of ``"client_to_proxy"``, ``"proxy_to_provider"``,
                 or ``"provider_to_client"``.
             payload: The assembled response payload to record.
+            model: Optional model name to include in recording metadata.
+            provider: Optional provider name to include in recording metadata.
 
         Returns:
             The absolute file path of the written recording, or ``None`` if
             the write failed.
         """
-        return await self._write_recording(session_id, direction, payload, suffix="response")
+        return await self._write_recording(session_id, direction, payload, suffix="response", model=model, provider=provider)
 
     async def _write_recording(
         self,
@@ -151,11 +159,21 @@ class SessionRecorder:
         direction: str,
         payload: Any,
         suffix: str,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[str]:
         """Core recording method — serialize, build path, write to disk.
 
         Uses ``asyncio.to_thread`` to perform the synchronous file write
         on a thread pool executor, keeping the event loop responsive.
+
+        Args:
+            session_id: Unique session identifier.
+            direction: Recording direction constant.
+            payload: The payload to record (must be JSON-serializable).
+            suffix: ``"request"`` or ``"response"``.
+            model: Optional model name to include in recording metadata.
+            provider: Optional provider name to include in recording metadata.
         """
         if direction not in VALID_DIRECTIONS:
             logger.warning("Invalid recording direction: %s", direction)
@@ -179,13 +197,17 @@ class SessionRecorder:
         filename = f"{timestamp}-{suffix}.json"
         filepath = session_dir / filename
 
-        # Prepare the record envelope
+        # Prepare the record envelope (include model/provider when available)
         record = {
             "session_id": session_id,
             "direction": direction,
             "timestamp": timestamp,
             "payload": payload,
         }
+        if model:
+            record["model"] = model
+        if provider:
+            record["provider"] = provider
 
         # Serialize to JSON
         try:
@@ -294,6 +316,60 @@ class SessionRecorder:
             return json.loads(filepath.read_bytes())
         except (json.JSONDecodeError, OSError):
             return None
+
+    def list_sessions_by_model(self, model: str) -> List[Dict[str, Any]]:
+        """Return session IDs that have recordings for a specific model.
+
+        Scans session directories and checks recording metadata for the
+        given model name. Returns a list of dicts with session_id and
+        timestamp of the most recent recording.
+
+        Args:
+            model: The model name to filter by.
+
+        Returns:
+            A list of dicts with ``session_id`` and ``last_activity`` keys,
+            sorted by most recent activity first.
+        """
+        if not model:
+            return []
+
+        base = Path(self.recording_path)
+        if not base.is_dir():
+            return []
+
+        sessions: List[Dict[str, Any]] = []
+        try:
+            for entry in sorted(base.iterdir()):
+                if not entry.is_dir():
+                    continue
+                sid = entry.name
+                last_ts = ""
+                found = False
+                for f in entry.iterdir():
+                    if not f.is_file() or not f.name.endswith(".json"):
+                        continue
+                    try:
+                        content = json.loads(f.read_bytes())
+                        if content.get("model") == model:
+                            found = True
+                            ts = content.get("timestamp", "")
+                            if ts > last_ts:
+                                last_ts = ts
+                    except (json.JSONDecodeError, OSError):
+                        continue
+                if found:
+                    sessions.append({
+                        "session_id": sid,
+                        "last_activity": last_ts,
+                    })
+        except OSError as e:
+            logger.warning("Failed to list sessions by model %s: %s", model, e)
+            return []
+
+        # Sort by last_activity descending
+        sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+        return sessions
 
     def list_sessions(self) -> List[str]:
         """Return all session IDs that have recording directories.

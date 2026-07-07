@@ -901,6 +901,8 @@ def _schedule_traffic_recording(
     client_payload: Optional[Any] = None,
     proxy_payload: Optional[Any] = None,
     response_payload: Optional[Any] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> None:
     """Schedule fire-and-forget recording of session traffic.
 
@@ -914,6 +916,8 @@ def _schedule_traffic_recording(
         client_payload: The original client→proxy request payload.
         proxy_payload: The processed proxy→provider request payload.
         response_payload: The assembled provider→client response.
+        model: Optional model name to include in recording metadata.
+        provider: Optional provider name to include in recording metadata.
     """
     if not session_id:
         return
@@ -927,14 +931,16 @@ def _schedule_traffic_recording(
         if client_payload is not None:
             loop.create_task(
                 recorder.record_request(
-                    session_id, "client_to_proxy", client_payload
+                    session_id, "client_to_proxy", client_payload,
+                    model=model, provider=provider,
                 )
             )
 
         if proxy_payload is not None:
             loop.create_task(
                 recorder.record_request(
-                    session_id, "proxy_to_provider", proxy_payload
+                    session_id, "proxy_to_provider", proxy_payload,
+                    model=model, provider=provider,
                 )
             )
 
@@ -955,7 +961,8 @@ def _schedule_traffic_recording(
 
             loop.create_task(
                 recorder.record_response(
-                    session_id, "provider_to_client", parsed
+                    session_id, "provider_to_client", parsed,
+                    model=model, provider=provider,
                 )
             )
     except Exception as exc:

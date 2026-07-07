@@ -13,6 +13,7 @@ import asyncio
 from typing import Any
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 import httpx
 
@@ -76,9 +77,14 @@ log_tail_clients: set[asyncio.Queue] = set()
 # ===================================================================
 
 async def broadcast_status(event_type: str, data: dict):
-    """Broadcast a status event to all connected SSE clients."""
+    """Broadcast a status event to all connected SSE clients.
+
+    All events include a ``type`` field, an ISO8601 ``timestamp``,
+    and any additional fields provided in *data*.
+    """
     srv = _srv()
-    event_data = json.dumps({"type": event_type, **data})
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    event_data = json.dumps({"type": event_type, "timestamp": now, **data})
     message = f"data: {event_data}\n\n"
     
     # Send to all connected clients
@@ -103,6 +109,72 @@ def broadcast_status_sync(event_type: str, data: dict):
         loop.create_task(broadcast_status(event_type, data))
     except RuntimeError:
         # No running loop, skip broadcast
+        pass
+
+
+async def broadcast_session_event(
+    session_id: str,
+    event: str,
+    model: str = "",
+    details: str = "",
+) -> None:
+    """Broadcast a session lifecycle event (created, ended, restored).
+
+    Args:
+        session_id: The session identifier.
+        event: The event type (e.g. ``"session_created"``, ``"session_ended"``).
+        model: Optional model name associated with the session.
+        details: Optional human-readable detail message.
+    """
+    await broadcast_status(
+        "session_activity",
+        {
+            "session_id": session_id,
+            "event": event,
+            "message": f"Session {event}: {session_id[:16] if session_id else 'unknown'}",
+        },
+    )
+    # Increment session activity counter
+    try:
+        srv = _srv()
+        srv.session_observability["session_activity_total"] = (
+            int(srv.session_observability.get("session_activity_total", 0)) + 1
+        )
+    except Exception:
+        pass
+
+
+async def broadcast_provider_event(
+    provider_name: str,
+    event: str,
+    model: str = "",
+    details: str = "",
+) -> None:
+    """Broadcast a provider lifecycle event (fallback, cooldown, recovery).
+
+    Args:
+        provider_name: The provider identifier.
+        event: The event type (e.g. ``"provider_fallback"``, ``"provider_cooldown"``).
+        model: Optional model name associated with the event.
+        details: Optional human-readable detail message.
+    """
+    data = {
+        "provider": provider_name,
+        "event": event,
+        "message": f"Provider {event}: {provider_name}",
+    }
+    if model:
+        data["model"] = model
+    if details:
+        data["details"] = details
+    await broadcast_status("provider_fallback", data)
+    # Increment provider fallback counter
+    try:
+        srv = _srv()
+        if event in ("provider_fallback", "provider_cooldown"):
+            bucket = srv.provider_fallback_count.get(provider_name, 0)
+            srv.provider_fallback_count[provider_name] = bucket + 1
+    except Exception:
         pass
 
 
