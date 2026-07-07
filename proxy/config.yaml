@@ -255,6 +255,12 @@ server:
   session_guardrail_invalidate_on_repetition: false
   # Token-rate guardrail settings (disabled by default)
   # Maximum tokens/second threshold. Set to 0 to disable token-rate guardrail.
+  # Per-chunk read timeout for SSE streaming (LP-0MRB29HJ1009OR6G).
+  # When the upstream stops sending data without emitting a [DONE] event
+  # or closing the connection, the proxy waits this long for the next
+  # chunk before synthesising a final finish_reason:stop event and ending
+  # the stream.  Default: 30 seconds.
+  stream_idle_timeout_seconds: 30
   session_guardrail_max_token_rate: 0
   # Rolling window duration in seconds for token-rate calculation.
   # The guardrail only triggers if the rate exceeds max_token_rate for the

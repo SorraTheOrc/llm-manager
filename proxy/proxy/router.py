@@ -880,6 +880,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     invalidate_on_repetition = gc["invalidate_on_repetition"]
                     max_token_rate = gc["max_token_rate"]
                     token_rate_window_seconds = gc["token_rate_window_seconds"]
+                    stream_idle_timeout = float(
+                        server_config.get("stream_idle_timeout_seconds", 30) or 30
+                    )
 
                     async def stream_generator():
                         nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed, chunk_history
@@ -891,7 +894,25 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         disconnected = False
                         _disconnect_check_count = 0
                         try:
-                            async for chunk in response.aiter_bytes():
+                            # Use an explicit async iterator with per-chunk idle timeout
+                            # so that a stuck upstream (no [DONE], no connection close)
+                            # does not block the generator forever (LP-0MRB29HJ1009OR6G).
+                            _stream_iter = response.aiter_bytes().__aiter__()
+                            while True:
+                                try:
+                                    chunk = await asyncio.wait_for(
+                                        _stream_iter.__anext__(),
+                                        timeout=stream_idle_timeout,
+                                    )
+                                except asyncio.TimeoutError:
+                                    # Upstream idle — treat as stream end, synthesise
+                                    # [DONE] below by breaking the read loop.
+                                    srv.logger.info(
+                                        "stream_idle_timeout session=%s idle=%.1fs",
+                                        session_id[:8] if session_id else "unknown",
+                                        stream_idle_timeout,
+                                    )
+                                    break
                                 # count tokens in this chunk (best-effort)
                                 try:
                                     chunk_text = chunk.decode(
