@@ -639,7 +639,7 @@
         .then(function(data) {
           if (!data) { tip.textContent = 'Not found'; return; }
           var formatted = JSON.stringify(data, null, 2);
-          var display = formatted.length > 50000 ? formatted.substring(0, 50000) + '\n... (truncated)' : formatted;
+          var display = formatted;
           _jsonTooltipCache[cacheKey] = display;
           tip.textContent = display;
           positionTooltip(event, tip);
