@@ -550,15 +550,13 @@
           const direction = rec.direction || 'unknown';
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
-          // Store JSON metadata in a data attribute (base64 encoded to avoid escaping issues)
-          const jsonData = JSON.stringify(rec);
-          const b64 = btoa(unescape(encodeURIComponent(jsonData)));
           html += `<div class="recording-entry">
             <span class="timestamp">${ts}</span>
             <span class="direction">${direction}</span>
             <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
             <span class="json-hover" style="margin-left:0.5rem; position:relative; cursor:default; font-size:0.7rem; color:var(--accent); text-decoration:underline;"
-              data-json="${b64}"
+              data-session="${sessionId}"
+              data-filename="${safeFilename}"
               onmouseover="showJsonTooltip(event, this)"
               onmouseout="hideJsonTooltip()"
               onclick="loadRecordingContent('${model}', '${sessionId}', '${safeFilename}')">JSON</span>
@@ -569,7 +567,7 @@
         if (!document.getElementById('jsonTooltip')) {
           const tip = document.createElement('div');
           tip.id = 'jsonTooltip';
-          tip.style.cssText = 'display:none; position:fixed; z-index:1000; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:0.5rem; font-family:monospace; font-size:0.7rem; max-width:600px; max-height:400px; overflow:auto; white-space:pre; color:var(--text-primary); box-shadow:0 4px 12px rgba(0,0,0,0.5);';
+          tip.style.cssText = 'display:none; position:fixed; z-index:1000; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:0.75rem; font-family:monospace; font-size:0.75rem; max-width:800px; max-height:500px; overflow:auto; white-space:pre-wrap; color:var(--text-primary); box-shadow:0 4px 12px rgba(0,0,0,0.5); line-height:1.3;';
           document.body.appendChild(tip);
         }
       } catch (err) {
@@ -577,28 +575,55 @@
       }
     }
 
-    // JSON tooltip helpers
+    // JSON tooltip helpers — fetch full recording content on hover
+    let _jsonTooltipCache = {};
+
     function showJsonTooltip(event, el) {
       const tip = document.getElementById('jsonTooltip');
       if (!tip) return;
-      // Read base64-encoded JSON from data attribute
-      const b64 = el.getAttribute('data-json');
-      if (!b64) return;
-      try {
-        const jsonStr = decodeURIComponent(escape(atob(b64)));
-        const pretty = JSON.stringify(JSON.parse(jsonStr), null, 2);
-        const truncated = pretty.length > 5000 ? pretty.substring(0, 5000) + '\n... (truncated)' : pretty;
-        tip.textContent = truncated;
-      } catch (e) {
-        tip.textContent = 'Error parsing JSON';
-      }
+
+      const sessionId = el.getAttribute('data-session');
+      const filename = el.getAttribute('data-filename');
+      if (!sessionId || !filename) return;
+
+      const cacheKey = sessionId + '/' + filename;
+
+      tip.textContent = 'Loading...';
       tip.style.display = 'block';
-      // Position near the cursor
-      const x = Math.min(event.clientX + 10, window.innerWidth - 620);
-      const y = Math.min(event.clientY + 10, window.innerHeight - 420);
-      tip.style.left = Math.max(0, x) + 'px';
-      tip.style.top = Math.max(0, y) + 'px';
+      positionTooltip(event, tip);
+
+      if (_jsonTooltipCache[cacheKey]) {
+        tip.textContent = _jsonTooltipCache[cacheKey];
+        return;
+      }
+
+      fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings/' + encodeURIComponent(filename))
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+          if (!data) { tip.textContent = 'Not found'; return; }
+          var formatted = JSON.stringify(data, null, 2);
+          // Truncate only if extremely large (keep full for reasonable sizes)
+          var display = formatted.length > 50000 ? formatted.substring(0, 50000) + '\n... (truncated)' : formatted;
+          _jsonTooltipCache[cacheKey] = display;
+          tip.textContent = display;
+          positionTooltip(event, tip);
+        })
+        .catch(function() {
+          tip.textContent = 'Error loading';
+        });
     }
+
+    function positionTooltip(event, tip) {
+      var w = Math.min(800, window.innerWidth - 20);
+      var h = Math.min(500, window.innerHeight - 20);
+      tip.style.maxWidth = w + 'px';
+      tip.style.maxHeight = h + 'px';
+      var x = Math.min(event.clientX + 10, window.innerWidth - w - 10);
+      var y = Math.min(event.clientY + 10, window.innerHeight - h - 10);
+      tip.style.left = Math.max(5, x) + 'px';
+      tip.style.top = Math.max(5, y) + 'px';
+    }
+
     function hideJsonTooltip() {
       const tip = document.getElementById('jsonTooltip');
       if (tip) tip.style.display = 'none';
