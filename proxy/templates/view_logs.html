@@ -22,8 +22,6 @@
             --log-warning: #f59e0b;
             --log-info: #60a5fa;
             --log-debug: #9ca3af;
-            --tab-active-bg: #1f2940;
-            --tab-hover-bg: #1e2d4a;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -35,10 +33,8 @@
             padding-bottom: 4rem;
         }
         .container { max-width: 1400px; margin: 0 auto; }
-        .header { display:flex; gap:1rem; align-items:center; margin-bottom:1rem; flex-wrap:wrap; }
+        .header { display:flex; gap:1rem; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap; }
         .header-left { display:flex; align-items:center; gap:1rem; }
-        .controls { display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; }
-        .controls-llama { display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; }
         input[type=number] { width:5rem; padding:0.35rem; border-radius:6px; border:1px solid var(--border); background:var(--bg-card); color:var(--text-primary); }
         button { border:none; padding:0.4rem 0.6rem; border-radius:6px; cursor:pointer; }
         button.proxy-btn { background:var(--accent); color:#fff; }
@@ -68,57 +64,24 @@
         .summary-card h4 { color:var(--text-secondary); font-size:0.85rem; margin-bottom:0.25rem; }
         .pane-label { font-size:0.9rem; min-width:80px; }
 
-        /* Tab bar styles */
-        .tab-bar {
-            display: flex;
-            gap: 2px;
-            margin-bottom: 0.75rem;
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 0;
-            overflow-x: auto;
-            flex-wrap: nowrap;
+        /* Session bar */
+        .session-bar {
+            display:flex;
+            gap:0.5rem;
+            align-items:center;
+            margin-bottom:0.75rem;
+            flex-wrap:wrap;
         }
-        .tab {
-            padding: 0.5rem 1rem;
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            border-bottom: none;
-            border-radius: 6px 6px 0 0;
-            cursor: pointer;
-            color: var(--accent);
-            font-size: 0.85rem;
-            white-space: nowrap;
-            transition: background 0.15s, color 0.15s;
-            user-select: none;
+        .session-bar select {
+            padding:0.35rem;
+            border-radius:6px;
+            border:1px solid var(--border);
+            background:var(--bg-card);
+            color:var(--text-primary);
+            font-size:0.85rem;
+            min-width:16rem;
+            max-width:30rem;
         }
-        .tab:hover {
-            background: var(--tab-hover-bg);
-            color: #fff;
-        }
-        .tab.active {
-            background: var(--tab-active-bg);
-            color: #fff;
-            border-bottom: 2px solid var(--accent);
-            font-weight: 600;
-        }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-
-        /* Model tab session list */
-        .model-session-list {
-            margin-bottom: 0.75rem;
-        }
-        .model-session-list select,
-        .model-session-list input {
-            padding: 0.35rem;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            background: var(--bg-card);
-            color: var(--text-primary);
-            font-size: 0.85rem;
-        }
-        .model-session-list input { width: 20rem; }
-        .model-session-list select { width: auto; min-width: 12rem; }
 
         .session-recording-panel {
             background: var(--bg-card);
@@ -222,13 +185,17 @@
       </div>
     </div>
 
-    <!-- Tab Bar -->
-    <div class="tab-bar" id="tabBar">
-      <div class="tab raw-tab active" data-tab="raw" id="rawTab">Raw</div>
+    <!-- Session bar (top-level dropdown) -->
+    <div class="session-bar">
+      <select id="sessionSelect">
+        <option value="">Select a session...</option>
+      </select>
+      <button class="proxy-btn" id="refreshSessions" style="font-size:0.75rem;">Refresh</button>
+      <span id="sessionInfo" class="muted" style="font-size:0.8rem;"></span>
     </div>
 
-    <!-- Tab: Raw (existing two-pane view) -->
-    <div class="tab-content active" id="tab-raw">
+    <!-- Two-pane log view (default visible, shown for "Raw" and initial load) -->
+    <div id="twoPaneContent">
       <div class="summary">
         <h3>Request Summary</h3>
         <div class="summary-grid">
@@ -246,7 +213,6 @@
       </div>
 
       <div class="log-panes">
-        <!-- Proxy Log Pane -->
         <div class="pane" id="proxyPane">
           <div class="pane-header proxy">
             <span class="pane-label">Proxy log</span>
@@ -264,7 +230,6 @@
           <div id="proxyLog" class="log"></div>
         </div>
 
-        <!-- Llama-server Log Pane -->
         <div class="pane" id="llamaPane">
           <div class="pane-header llama">
             <span class="pane-label">Llama-server log</span>
@@ -284,8 +249,10 @@
       </div>
     </div>
 
-    <!-- Tab content areas for model tabs (dynamically populated) -->
-    <div id="modelTabContents"></div>
+    <!-- Recording panel (hidden by default) -->
+    <div id="recordingPanel" class="session-recording-panel" style="display:none;">
+      <div id="recordingContent"></div>
+    </div>
 
   </div>
 
@@ -306,11 +273,9 @@
     let latestTokens = {};
     let esProxy = null;
     let esLlama = null;
-    // Per-model event sources
-    let modelEventSources = {};
-    // Model tab polling state
-    let modelPollTimers = {};
-    let modelSessionCache = {};
+    let pollTimer = null;
+    let sessionCache = [];
+    let selectedSessionId = null;
 
     const proxyLog = document.getElementById('proxyLog');
     const llamaLog = document.getElementById('llamaLog');
@@ -323,28 +288,26 @@
     const llamaDisconnectBtn = document.getElementById('llamaDisconnect');
     const proxyAutoscrollCb = document.getElementById('proxyAutoscroll');
     const llamaAutoscrollCb = document.getElementById('llamaAutoscroll');
+    const sessionSelect = document.getElementById('sessionSelect');
+    const sessionInfo = document.getElementById('sessionInfo');
+    const twoPaneContent = document.getElementById('twoPaneContent');
+    const recordingPanel = document.getElementById('recordingPanel');
+    const recordingContent = document.getElementById('recordingContent');
 
-    // Sync shared lines input with individual inputs
     sharedLinesInput.addEventListener('change', () => {
       const n = sharedLinesInput.value;
       proxyLinesInput.value = n;
       llamaLinesInput.value = n;
     });
-    proxyLinesInput.addEventListener('change', () => {
-      sharedLinesInput.value = proxyLinesInput.value;
-    });
-    llamaLinesInput.addEventListener('change', () => {
-      sharedLinesInput.value = llamaLinesInput.value;
-    });
+    proxyLinesInput.addEventListener('change', () => { sharedLinesInput.value = proxyLinesInput.value; });
+    llamaLinesInput.addEventListener('change', () => { sharedLinesInput.value = llamaLinesInput.value; });
 
     function appendLine(logEl, autoscrollCb, text) {
       const div = document.createElement('div');
       div.className = 'line';
       div.textContent = text;
       logEl.appendChild(div);
-      if (autoscrollCb.checked) {
-        logEl.scrollTop = logEl.scrollHeight;
-      }
+      if (autoscrollCb.checked) logEl.scrollTop = logEl.scrollHeight;
     }
 
     function renderSummary() {
@@ -368,7 +331,7 @@
               if (reqPath && (reqPath === path || reqPath === pathNoV1) && !k.includes('-> model:')) {
                 reqTotal += Number(v || 0);
               }
-            } catch (e) { /* ignore */ }
+            } catch (e) {}
           }
 
           let sent = 0, recv = 0;
@@ -378,7 +341,7 @@
               const n = Number(v || 0);
               if (k.startsWith('sent:') && k.includes(path)) sent += n;
               if (k.startsWith('recv:') && k.includes(path)) recv += n;
-            } catch (e) { /* ignore */ }
+            } catch (e) {}
           }
 
           countsParts.push(`<div class="line">${label}: <strong>${reqTotal}</strong></div>`);
@@ -392,219 +355,127 @@
         const rawTokensEl = document.getElementById('rawTokens');
         if (rawCountsEl) rawCountsEl.textContent = JSON.stringify(counts, null, 2);
         if (rawTokensEl) rawTokensEl.textContent = JSON.stringify(tokens, null, 2);
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
     }
 
-    // ===================================================================
-    // Tab management
-    // ===================================================================
-
-    function switchTab(tabName) {
-      // Update tab bar
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-
-      const tabEl = document.querySelector(`[data-tab="${CSS.escape(tabName)}"]`);
-      let contentEl = document.getElementById(`tab-${tabName}`);
-      if (!contentEl) {
-        // Try with CSS-escaped version
-        contentEl = document.querySelector(`#tab-${CSS.escape(tabName)}`);
+    try {
+      if (window.__INITIAL_STATS) {
+        latestCounts = window.__INITIAL_STATS.counts || {};
+        latestTokens = window.__INITIAL_STATS.tokens || {};
+        renderSummary();
       }
-      if (tabEl) tabEl.classList.add('active');
-      if (contentEl) contentEl.classList.add('active');
-    }
-
-    // Make the Raw tab clickable
-    document.addEventListener('DOMContentLoaded', function() {
-      const rawTab = document.getElementById('rawTab');
-      if (rawTab) {
-        rawTab.addEventListener('click', function() { switchTab('raw'); });
-      }
-    });
-    // Also if DOM already loaded
-    if (document.readyState !== 'loading') {
-      const rawTab = document.getElementById('rawTab');
-      if (rawTab) {
-        rawTab.addEventListener('click', function() { switchTab('raw'); });
-      }
-    }
+    } catch (e) {}
 
     // ===================================================================
-    // Build model tabs from __MODEL_LIST
+    // Session list management
     // ===================================================================
 
-    function buildModelTabs() {
-      const modelList = window.__MODEL_LIST || [];
-      const tabBar = document.getElementById('tabBar');
-      const modelContents = document.getElementById('modelTabContents');
-
-      for (const model of modelList) {
-        // Add tab
-        const tab = document.createElement('div');
-        tab.className = 'tab';
-        tab.dataset.tab = `model-${model}`;
-        tab.textContent = model;
-        tab.title = `View activity for model: ${model}`;
-        tab.addEventListener('click', () => switchTab(`model-${model}`));
-        tabBar.appendChild(tab);
-
-        // Add tab content
-        const content = document.createElement('div');
-        content.className = 'tab-content';
-        content.id = `tab-model-${CSS.escape(model)}`;
-
-        content.innerHTML = `
-          <div class="model-session-list">
-            <label class="muted" style="font-size:0.85rem;">Session:</label>
-            <select id="sessionFilter-${CSS.escape(model)}" class="session-filter" data-model="${model}">
-            </select>
-            <span style="margin-left:0.5rem;">
-              <button class="proxy-btn" id="refreshSessions-${CSS.escape(model)}" data-model="${model}" style="font-size:0.75rem;">Refresh</button>
-            </span>
-            <span style="margin-left:0.5rem;">
-              <span id="modelInfo-${CSS.escape(model)}" class="muted" style="font-size:0.8rem;"></span>
-            </span>
-          </div>
-          <div id="recordingPanel-${CSS.escape(model)}" class="session-recording-panel" style="display:none;">
-            <div id="recordingContent-${CSS.escape(model)}"></div>
-          </div>
-        `;
-
-        modelContents.appendChild(content);
-      }
-
-      // Set up session filter and refresh events for each model
-      for (const model of modelList) {
-        const filterEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
-        const refreshBtn = document.getElementById(`refreshSessions-${CSS.escape(model)}`);
-
-        if (filterEl) {
-          filterEl.addEventListener('change', () => {
-            if (filterEl.value) {
-              loadSessionRecordings(model, filterEl.value);
-            }
-          });
-        }
-        if (refreshBtn) {
-          refreshBtn.addEventListener('click', () => {
-            loadModelSessions(model);
-          });
-        }
-
-        // Load initial sessions for this model
-        loadModelSessions(model);
-        // Start periodic polling
-        startModelPolling(model);
-      }
-    }
-
-    // ===================================================================
-    // Model session loading
-    // ===================================================================
-
-    async function loadModelSessions(model) {
-      const selectEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
-      const infoEl = document.getElementById(`modelInfo-${CSS.escape(model)}`);
-      if (!selectEl) return;
-      if (infoEl) infoEl.textContent = 'Loading sessions...';
-
+    async function loadSessions() {
+      if (sessionInfo) sessionInfo.textContent = 'Loading sessions...';
       try {
-        const resp = await fetch(`/admin/sessions?model=${encodeURIComponent(model)}`);
-        if (!resp.ok) {
-          if (infoEl) infoEl.textContent = 'API not available';
-          return;
-        }
+        const resp = await fetch('/admin/sessions');
+        if (!resp.ok) { if (sessionInfo) sessionInfo.textContent = 'API not available'; return; }
         const data = await resp.json();
         const sessions = data.sessions || [];
-        modelSessionCache[model] = sessions;
+        sessionCache = sessions;
 
-        // Rebuild select options, preserving current selection
-        const currentVal = selectEl.value;
-        selectEl.innerHTML = '';
+        const currentVal = sessionSelect.value;
+        sessionSelect.innerHTML = '<option value="">Raw</option>';
         for (const s of sessions) {
           const opt = document.createElement('option');
           opt.value = s.session_id;
-          // Format: [active marker] timestamp | model/provider
-          var prefix = s.active ? '\u25CF ' : '  ';  // ● for active, space for inactive
-          var label = prefix + s.session_id;
-          var ts = s.response_time || s.last_activity_at || '';
+          var prefix = s.active ? '\u25CF ' : '';
+          var label = s.session_id;
+          var ts = s.response_time || '';
           if (ts) {
             try { ts = new Date(ts).toLocaleString(); } catch(e) {}
-            label = prefix + ts;
+            if (prefix) label = prefix + ' ' + ts;
+            else label = ts;
           }
           if (s.model) {
             label += ' | ' + s.model;
             if (s.provider) label += '/' + s.provider;
           }
           opt.textContent = label;
-          // Store active flag for styling
           opt.dataset.active = s.active ? 'true' : 'false';
-          selectEl.appendChild(opt);
+          sessionSelect.appendChild(opt);
         }
 
-        // Auto-select first session if available and nothing selected yet
-        if (sessions.length > 0 && !currentVal) {
-          selectEl.value = sessions[0].session_id;
-          // Trigger recording load for the first session
-          loadSessionRecordings(model, sessions[0].session_id);
-        } else if (currentVal) {
-          selectEl.value = currentVal;
+        // Preserve selection if still valid
+        if (currentVal) {
+          var stillExists = sessions.some(function(s) { return s.session_id === currentVal; });
+          if (stillExists) {
+            sessionSelect.value = currentVal;
+            return;
+          }
         }
+        // Default to "Raw"
+        sessionSelect.value = '';
 
-        if (infoEl) {
-          infoEl.textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`;
+        if (sessionInfo) {
+          var activeCount = sessions.filter(function(s) { return s.active; }).length;
+          sessionInfo.textContent = sessions.length + ' session' + (sessions.length !== 1 ? 's' : '') +
+            (activeCount > 0 ? ' (' + activeCount + ' active)' : '');
         }
-
       } catch (err) {
-        if (infoEl) infoEl.textContent = 'Error loading sessions';
+        if (sessionInfo) sessionInfo.textContent = 'Error loading sessions';
       }
     }
 
-    function startModelPolling(model) {
-      if (modelPollTimers[model]) return;
-      modelPollTimers[model] = setInterval(() => {
-        // Only poll if this tab is visible or recently active
-        const tabEl = document.querySelector(`[data-tab="model-${model}"]`);
-        if (tabEl && tabEl.classList.contains('active')) {
-          loadModelSessions(model);
-        }
-      }, 5000); // Poll every 5 seconds
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(loadSessions, 5000);
     }
 
     // ===================================================================
-    // Session recording display — load recordings for a selected session
+    // Session selection
     // ===================================================================
 
-    // Abbreviate direction names: client_to_proxy → client, etc.
+    sessionSelect.addEventListener('change', function() {
+      var val = sessionSelect.value;
+      if (!val) {
+        // "Raw" selected — show two-pane view, hide recording panel
+        showRawView();
+      } else {
+        showSessionRecording(val);
+      }
+    });
+
+    function showRawView() {
+      selectedSessionId = null;
+      recordingPanel.style.display = 'none';
+      twoPaneContent.style.display = 'block';
+    }
+
+    function showSessionRecording(sessionId) {
+      selectedSessionId = sessionId;
+      twoPaneContent.style.display = 'none';
+      recordingPanel.style.display = 'block';
+      loadSessionRecordings(sessionId);
+    }
+
+    document.getElementById('refreshSessions').addEventListener('click', loadSessions);
+
+    // ===================================================================
+    // Session recording display
+    // ===================================================================
+
     function shortDir(direction) {
       var parts = direction.split('_to_');
       return parts[0] || direction;
     }
 
-    async function loadSessionRecordings(model, sessionId) {
-      const panelEl = document.getElementById(`recordingPanel-${CSS.escape(model)}`);
-      const contentEl = document.getElementById(`recordingContent-${CSS.escape(model)}`);
-      if (!panelEl || !contentEl) return;
-
-      panelEl.style.display = 'block';
-      panelEl.dataset.sessionId = sessionId;
-      contentEl.innerHTML = '<div class="muted">Loading recordings...</div>';
+    async function loadSessionRecordings(sessionId) {
+      recordingContent.innerHTML = '<div class="muted">Loading recordings...</div>';
 
       try {
-        const resp = await fetch(`/admin/sessions/${encodeURIComponent(sessionId)}/recordings`);
-        if (!resp.ok) {
-          contentEl.innerHTML = '<div class="muted">No recordings available for this session.</div>';
-          return;
-        }
+        const resp = await fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings');
+        if (!resp.ok) { recordingContent.innerHTML = '<div class="muted">No recordings available for this session.</div>'; return; }
         const data = await resp.json();
         const recordings = data.recordings || [];
 
-        if (recordings.length === 0) {
-          contentEl.innerHTML = '<div class="muted">No recording files found.</div>';
-          return;
-        }
+        if (recordings.length === 0) { recordingContent.innerHTML = '<div class="muted">No recording files found.</div>'; return; }
 
-        // Build left column: abbreviated recording entries
         var leftHtml = '';
         var fetchPromises = [];
         for (const rec of recordings) {
@@ -612,33 +483,27 @@
           const short = shortDir(direction);
           const ts = rec.timestamp ? new Date(rec.timestamp).toLocaleTimeString() : '';
           const safeFilename = rec.filename.replace(/'/g, "\\'");
-          var recModel = rec.model || model;
-          var modelBadge = '<span class="provider-badge local">model: ' + recModel + '</span>';
+          var recModel = rec.model || '';
+          var modelBadge = '';
+          if (recModel) modelBadge = '<span class="provider-badge local">model: ' + recModel + '</span>';
           var providerBadge = '';
-          if (rec.provider) {
-            providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
-          }
-          leftHtml += `<div class="recording-entry">
-            <span class="timestamp">${ts}</span>
-            <span class="direction">${short}</span>
-            ${modelBadge}
-            ${providerBadge}
-            <span class="muted" style="font-size:0.75rem;">${rec.file_size || 0} bytes</span>
-            <span class="json-hover" style="margin-left:0.5rem; font-size:0.7rem; color:var(--accent); text-decoration:underline; cursor:default;"
-              data-session="${sessionId}"
-              data-filename="${safeFilename}"
-              onmouseover="showJsonTooltip(event, this)"
-              onmouseout="scheduleHideTooltip()">JSON</span>
-          </div>`;
-          // Fetch full content for conversation view
+          if (rec.provider) providerBadge = '<span class="provider-badge ' + rec.provider + '">provider: ' + rec.provider + '</span>';
+          leftHtml += '<div class="recording-entry">'
+            + '<span class="timestamp">' + ts + '</span>'
+            + '<span class="direction">' + short + '</span>'
+            + modelBadge + providerBadge
+            + '<span class="muted" style="font-size:0.75rem;"> ' + (rec.file_size || 0) + ' bytes</span>'
+            + '<span class="json-hover" style="margin-left:0.5rem; font-size:0.7rem; color:var(--accent); text-decoration:underline; cursor:default;"'
+            + 'data-session="' + sessionId + '" data-filename="' + safeFilename + '"'
+            + ' onmouseover="showJsonTooltip(event, this)" onmouseout="scheduleHideTooltip()">JSON</span>'
+            + '</div>';
           fetchPromises.push(
-            fetch(`/admin/sessions/${encodeURIComponent(sessionId)}/recordings/${safeFilename}`)
+            fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings/' + safeFilename)
               .then(function(r) { return r.ok ? r.json() : null; })
               .then(function(recData) { return {filename: rec.filename, data: recData, direction: direction, ts: rec.timestamp}; })
           );
         }
 
-        // Add tooltip container if not present
         if (!document.getElementById('jsonTooltip')) {
           const tip = document.createElement('div');
           tip.id = 'jsonTooltip';
@@ -648,21 +513,14 @@
           document.body.appendChild(tip);
         }
 
-        // Helper: extract plain text from message content (handles string or array blocks)
         function extractText(content) {
           if (typeof content === 'string') return content;
-          if (Array.isArray(content)) {
-            return content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text || ''; }).join('\n');
-          }
-          if (typeof content === 'object' && content !== null) {
-            return content.text || JSON.stringify(content);
-          }
+          if (Array.isArray(content)) return content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text || ''; }).join('\n');
+          if (typeof content === 'object' && content !== null) return content.text || JSON.stringify(content);
           return String(content || '');
         }
 
-        // Build right column: conversation view from fetched content
         var convHtml = '<div class="conversation-view">';
-        // Use a counter for unique expand IDs
         var _msgId = 0;
         var allContent = await Promise.all(fetchPromises);
         for (var i = 0; i < allContent.length; i++) {
@@ -673,57 +531,39 @@
           try { ts = new Date(item.ts).toLocaleString(); } catch(e) { ts = item.ts; }
 
           if (item.direction === 'client_to_proxy') {
-            // Show only the last user message (diff, not accumulated history)
             var messages = payload.messages || [];
             var lastUser = null;
             for (var m = messages.length - 1; m >= 0; m--) {
-              if (messages[m].role === 'user') {
-                lastUser = messages[m];
-                break;
-              }
+              if (messages[m].role === 'user') { lastUser = messages[m]; break; }
             }
             if (lastUser) {
               _msgId++;
-              var text = extractText(lastUser.content);
-              convHtml += '<div class="msg user">';
-              convHtml += '<div class="msg-header">## User - ' + ts + '</div>';
-              convHtml += makeExpandable(text, _msgId);
-              convHtml += '</div>';
+              convHtml += '<div class="msg user"><div class="msg-header">## User - ' + ts + '</div>' + makeExpandable(extractText(lastUser.content), _msgId) + '</div>';
             }
           } else if (item.direction === 'proxy_to_provider') {
-            // Show only the last assistant message from accumulated history
             var messages = payload.messages || [];
             var lastAsst = null;
             for (var m = messages.length - 1; m >= 0; m--) {
-              if (messages[m].role === 'assistant') {
-                lastAsst = messages[m];
-                break;
-              }
+              if (messages[m].role === 'assistant') { lastAsst = messages[m]; break; }
             }
             if (lastAsst) {
               _msgId++;
-              var text = extractText(lastAsst.content);
-              var modelName = lastAsst.model || item.data.model || model;
+              var modelName = item.data.model || '';
               var providerName = item.data.provider || '';
-              var header = '## ' + modelName;
+              var header = '## ' + (modelName || 'assistant');
               if (providerName) header += ' / ' + providerName;
               header += ' - ' + ts;
-              convHtml += '<div class="msg assistant">';
-              convHtml += '<div class="msg-header">' + header + '</div>';
-              convHtml += makeExpandable(text, _msgId);
-              convHtml += '</div>';
+              convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(extractText(lastAsst.content), _msgId) + '</div>';
             }
           } else if (item.direction === 'provider_to_client') {
-            // Extract assistant response (handles both dict payloads and raw SSE strings)
-            var modelName = item.data.model || model;
+            var modelName = item.data.model || '';
             var providerName = item.data.provider || '';
-            var header = '## ' + modelName;
+            var header = '## ' + (modelName || 'assistant');
             if (providerName) header += ' / ' + providerName;
             header += ' - ' + ts;
             var assistantText = '';
 
             if (typeof payload === 'string') {
-              // Raw SSE data — try to find the last data line with content
               var lines = payload.split('\n');
               for (var li = lines.length - 1; li >= 0; li--) {
                 var line = lines[li];
@@ -738,106 +578,73 @@
                 }
               }
             } else {
-              // Structured payload (choices array)
               var choices = payload.choices || [];
               if (choices.length > 0) {
                 var choiceMsg = choices[0].message || choices[0].delta || {};
                 if (typeof choiceMsg === 'string') {
                   try { var parsed = JSON.parse(choiceMsg); choiceMsg = parsed; } catch(e) { assistantText = choiceMsg; }
                 }
-                if (typeof choiceMsg === 'object') {
-                  assistantText = choiceMsg.content || '';
-                }
+                if (typeof choiceMsg === 'object') assistantText = choiceMsg.content || '';
               }
             }
-
-            if (assistantText) {
-              _msgId++;
-              convHtml += '<div class="msg assistant">';
-              convHtml += '<div class="msg-header">' + header + '</div>';
-              convHtml += makeExpandable(assistantText, _msgId);
-              convHtml += '</div>';
-            }
+            if (assistantText) { _msgId++; convHtml += '<div class="msg assistant"><div class="msg-header">' + header + '</div>' + makeExpandable(assistantText, _msgId) + '</div>'; }
           }
         }
         convHtml += '</div>';
 
-        // Combine into two-column layout
-        contentEl.innerHTML = '<div class="recording-columns">'
+        recordingContent.innerHTML = '<div class="recording-columns">'
           + '<div class="recording-column">' + leftHtml + '</div>'
           + '<div class="recording-column">' + convHtml + '</div>'
           + '</div>';
-
       } catch (err) {
-        contentEl.innerHTML = '<div class="muted">Error loading recordings.</div>';
+        recordingContent.innerHTML = '<div class="muted">Error loading recordings.</div>';
       }
     }
 
-    // Helper: render text with truncation at 300 chars and expand/collapse
     function makeExpandable(text, id) {
       var escaped = escapeHtml(text);
-      if (escaped.length <= 300) {
-        return '<div class="msg-content">' + escaped + '</div>';
-      }
-      var truncated = escaped.substring(0, 300) + '...';
-      return '<div class="msg-content" id="msgShort-' + id + '">' + truncated
-        + ' <span class="json-hover" style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="expandMsg(' + id + ')">show more</span></div>'
+      if (escaped.length <= 300) return '<div class="msg-content">' + escaped + '</div>';
+      return '<div class="msg-content" id="msgShort-' + id + '">' + escaped.substring(0, 300) + '...'
+        + ' <span style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="expandMsg(' + id + ')">show more</span></div>'
         + '<div class="msg-content" id="msgFull-' + id + '" style="display:none;">' + escaped
-        + ' <span class="json-hover" style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="collapseMsg(' + id + ')">show less</span></div>';
+        + ' <span style="cursor:pointer;color:var(--accent);font-size:0.75rem;" onclick="collapseMsg(' + id + ')">show less</span></div>';
     }
-    function expandMsg(id) {
-      document.getElementById('msgShort-' + id).style.display = 'none';
-      var el = document.getElementById('msgFull-' + id);
-      if (el) el.style.display = 'block';
-    }
-    function collapseMsg(id) {
-      document.getElementById('msgFull-' + id).style.display = 'none';
-      var el = document.getElementById('msgShort-' + id);
-      if (el) el.style.display = 'block';
-    }
+    function expandMsg(id) { document.getElementById('msgShort-' + id).style.display = 'none'; var el = document.getElementById('msgFull-' + id); if (el) el.style.display = 'block'; }
+    function collapseMsg(id) { document.getElementById('msgFull-' + id).style.display = 'none'; var el = document.getElementById('msgShort-' + id); if (el) el.style.display = 'block'; }
 
-    // Simple HTML escape for conversation content
     function escapeHtml(str) {
       if (typeof str !== 'string') return String(str || '');
       return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
-    // JSON tooltip helpers — fetch full recording content on hover
+    // ===================================================================
+    // JSON tooltip
+    // ===================================================================
+
     let _jsonTooltipCache = {};
 
     function showJsonTooltip(event, el) {
       const tip = document.getElementById('jsonTooltip');
       if (!tip) return;
-
       const sessionId = el.getAttribute('data-session');
       const filename = el.getAttribute('data-filename');
       if (!sessionId || !filename) return;
-
       const cacheKey = sessionId + '/' + filename;
-
       tip.textContent = 'Loading...';
       tip.style.display = 'block';
       positionTooltip(event, tip);
-
-      if (_jsonTooltipCache[cacheKey]) {
-        tip.textContent = _jsonTooltipCache[cacheKey];
-        return;
-      }
-
+      if (_jsonTooltipCache[cacheKey]) { tip.textContent = _jsonTooltipCache[cacheKey]; return; }
       fetch('/admin/sessions/' + encodeURIComponent(sessionId) + '/recordings/' + encodeURIComponent(filename))
         .then(function(r) { return r.ok ? r.json() : null; })
         .then(function(data) {
           if (!data) { tip.textContent = 'Not found'; return; }
           var formatted = JSON.stringify(data, null, 2);
-          // Truncate only if extremely large (keep full for reasonable sizes)
           var display = formatted.length > 50000 ? formatted.substring(0, 50000) + '\n... (truncated)' : formatted;
           _jsonTooltipCache[cacheKey] = display;
           tip.textContent = display;
           positionTooltip(event, tip);
         })
-        .catch(function() {
-          tip.textContent = 'Error loading';
-        });
+        .catch(function() { tip.textContent = 'Error loading'; });
     }
 
     function positionTooltip(event, tip) {
@@ -852,40 +659,14 @@
     }
 
     var _tooltipHideTimer = null;
-
     function scheduleHideTooltip() {
       clearTimeout(_tooltipHideTimer);
-      _tooltipHideTimer = setTimeout(function() {
-        const tip = document.getElementById('jsonTooltip');
-        if (tip) tip.style.display = 'none';
-      }, 300);
+      _tooltipHideTimer = setTimeout(function() { const tip = document.getElementById('jsonTooltip'); if (tip) tip.style.display = 'none'; }, 300);
     }
-
-    function hideJsonTooltip() {
-      clearTimeout(_tooltipHideTimer);
-      const tip = document.getElementById('jsonTooltip');
-      if (tip) tip.style.display = 'none';
-    }
-
-    // loadRecordingContent removed — the JSON hover tooltip is sufficient
-
-    try {
-      if (window.__INITIAL_STATS) {
-        latestCounts = window.__INITIAL_STATS.counts || {};
-        latestTokens = window.__INITIAL_STATS.tokens || {};
-        renderSummary();
-      }
-    } catch (e) { /* ignore */ }
-
-    // Build model tabs when DOM is ready
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', buildModelTabs);
-    } else {
-      buildModelTabs();
-    }
+    function hideJsonTooltip() { clearTimeout(_tooltipHideTimer); const tip = document.getElementById('jsonTooltip'); if (tip) tip.style.display = 'none'; }
 
     // ===================================================================
-    // Raw tab event source handling (preserved as-is)
+    // Raw log event source handling
     // ===================================================================
 
     function handleMessage(logEl, autoscrollCb, obj) {
@@ -893,23 +674,11 @@
         appendLine(logEl, autoscrollCb, '--- initial log ---');
         obj.initial.split(String.fromCharCode(10)).forEach(l => appendLine(logEl, autoscrollCb, l));
         appendLine(logEl, autoscrollCb, '--- end initial ---');
-      } else if (obj.line) {
-        appendLine(logEl, autoscrollCb, obj.line);
-      } else if (obj.counts) {
-        try {
-          latestCounts = obj.counts || {};
-          renderSummary();
-        } catch (e) { /* ignore */ }
-      } else if (obj.tokens) {
-        try {
-          latestTokens = obj.tokens || {};
-          renderSummary();
-        } catch (e) { /* ignore */ }
-      } else if (obj.info) {
-        appendLine(logEl, autoscrollCb, '[info] ' + obj.info);
-      } else if (obj.error) {
-        appendLine(logEl, autoscrollCb, '[error] ' + JSON.stringify(obj));
-      }
+      } else if (obj.line) { appendLine(logEl, autoscrollCb, obj.line);
+      } else if (obj.counts) { try { latestCounts = obj.counts || {}; renderSummary(); } catch (e) {}
+      } else if (obj.tokens) { try { latestTokens = obj.tokens || {}; renderSummary(); } catch (e) {}
+      } else if (obj.info) { appendLine(logEl, autoscrollCb, '[info] ' + obj.info);
+      } else if (obj.error) { appendLine(logEl, autoscrollCb, '[error] ' + JSON.stringify(obj)); }
     }
 
     function connectProxy() {
@@ -917,66 +686,22 @@
       const n = Math.max(1, parseInt(proxyLinesInput.value || '200'));
       const url = '/logs/tail?lines=' + encodeURIComponent(n) + '&source=proxy';
       esProxy = new EventSource(url);
-      proxyConnectBtn.disabled = true;
-      proxyDisconnectBtn.disabled = false;
-      proxyConnectBtn.classList.add('connected');
-
-      esProxy.onmessage = e => {
-        try {
-          const obj = JSON.parse(e.data);
-          handleMessage(proxyLog, proxyAutoscrollCb, obj);
-        } catch (err) {
-          appendLine(proxyLog, proxyAutoscrollCb, e.data);
-        }
-      };
-
-      esProxy.onerror = () => {
-        appendLine(proxyLog, proxyAutoscrollCb, '[connection closed]');
-        disconnectProxy();
-      };
+      proxyConnectBtn.disabled = true; proxyDisconnectBtn.disabled = false; proxyConnectBtn.classList.add('connected');
+      esProxy.onmessage = e => { try { const obj = JSON.parse(e.data); handleMessage(proxyLog, proxyAutoscrollCb, obj); } catch (err) { appendLine(proxyLog, proxyAutoscrollCb, e.data); } };
+      esProxy.onerror = () => { appendLine(proxyLog, proxyAutoscrollCb, '[connection closed]'); disconnectProxy(); };
     }
-
-    function disconnectProxy() {
-      if (!esProxy) return;
-      esProxy.close();
-      esProxy = null;
-      proxyConnectBtn.disabled = false;
-      proxyDisconnectBtn.disabled = true;
-      proxyConnectBtn.classList.remove('connected');
-    }
+    function disconnectProxy() { if (!esProxy) return; esProxy.close(); esProxy = null; proxyConnectBtn.disabled = false; proxyDisconnectBtn.disabled = true; proxyConnectBtn.classList.remove('connected'); }
 
     function connectLlama() {
       if (esLlama) return;
       const n = Math.max(1, parseInt(llamaLinesInput.value || '200'));
       const url = '/logs/tail?lines=' + encodeURIComponent(n) + '&source=llama';
       esLlama = new EventSource(url);
-      llamaConnectBtn.disabled = true;
-      llamaDisconnectBtn.disabled = false;
-      llamaConnectBtn.classList.add('connected');
-
-      esLlama.onmessage = e => {
-        try {
-          const obj = JSON.parse(e.data);
-          handleMessage(llamaLog, llamaAutoscrollCb, obj);
-        } catch (err) {
-          appendLine(llamaLog, llamaAutoscrollCb, e.data);
-        }
-      };
-
-      esLlama.onerror = () => {
-        appendLine(llamaLog, llamaAutoscrollCb, '[connection closed]');
-        disconnectLlama();
-      };
+      llamaConnectBtn.disabled = true; llamaDisconnectBtn.disabled = false; llamaConnectBtn.classList.add('connected');
+      esLlama.onmessage = e => { try { const obj = JSON.parse(e.data); handleMessage(llamaLog, llamaAutoscrollCb, obj); } catch (err) { appendLine(llamaLog, llamaAutoscrollCb, e.data); } };
+      esLlama.onerror = () => { appendLine(llamaLog, llamaAutoscrollCb, '[connection closed]'); disconnectLlama(); };
     }
-
-    function disconnectLlama() {
-      if (!esLlama) return;
-      esLlama.close();
-      esLlama = null;
-      llamaConnectBtn.disabled = false;
-      llamaDisconnectBtn.disabled = true;
-      llamaConnectBtn.classList.remove('connected');
-    }
+    function disconnectLlama() { if (!esLlama) return; esLlama.close(); esLlama = null; llamaConnectBtn.disabled = false; llamaDisconnectBtn.disabled = true; llamaConnectBtn.classList.remove('connected'); }
 
     function downloadLog(logEl, filename) {
       const text = Array.from(logEl.querySelectorAll('.line')).map(n => n.textContent).join(String.fromCharCode(10));
@@ -990,22 +715,21 @@
     proxyDisconnectBtn.addEventListener('click', disconnectProxy);
     document.getElementById('proxyClear').addEventListener('click', () => proxyLog.innerHTML = '');
     document.getElementById('proxyDownload').addEventListener('click', () => downloadLog(proxyLog, 'proxy.log'));
-
     llamaConnectBtn.addEventListener('click', connectLlama);
     llamaDisconnectBtn.addEventListener('click', disconnectLlama);
     document.getElementById('llamaClear').addEventListener('click', () => llamaLog.innerHTML = '');
     document.getElementById('llamaDownload').addEventListener('click', () => downloadLog(llamaLog, 'llama-server.log'));
 
+    // Initialise
     connectProxy();
     connectLlama();
+    loadSessions();
+    startPolling();
 
     window.addEventListener('beforeunload', () => {
       if (esProxy) esProxy.close();
       if (esLlama) esLlama.close();
-      // Clean up model poll timers
-      for (const key in modelPollTimers) {
-        clearInterval(modelPollTimers[key]);
-      }
+      if (pollTimer) clearInterval(pollTimer);
     });
   </script>
 __LOG_VIEWER_SCRIPT__</body>

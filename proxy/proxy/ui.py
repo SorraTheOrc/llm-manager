@@ -391,12 +391,6 @@ async def view_logs(request: Request):
     async with srv.token_lock:
         tokens_snapshot = dict(srv.token_counts)
 
-    model_list = list(srv.config.get("models", {}).keys())
-    router_mode = srv.config.get("server", {}).get("llama_router_mode", False)
-    router_models = None
-    if router_mode:
-        router_models = await srv.router_list_models()
-    model_list_json = json.dumps(model_list)
     initial_stats_json = json.dumps({"counts": counts_snapshot, "tokens": tokens_snapshot})
 
     # Replace placeholders with empty containers; client will render using INITIAL_STATS
@@ -407,8 +401,8 @@ async def view_logs(request: Request):
     html = html.replace('__LLAMA_SERVER_VERSION__', srv.llama_server_version)
     html = html.replace('__ROCM_VERSION__', srv.rocm_version)
 
-    # Inject initial stats and model list script before </body>
-    log_viewer_script = f'<script>window.__INITIAL_STATS = {initial_stats_json}; window.__MODEL_LIST = {model_list_json}; window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'
+    # Inject initial stats script before </body>
+    log_viewer_script = f'<script>window.__INITIAL_STATS = {initial_stats_json};</script>'
     html = html.replace('__LOG_VIEWER_SCRIPT__', log_viewer_script)
 
     return HTMLResponse(content=html)
