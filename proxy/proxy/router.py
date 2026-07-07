@@ -961,8 +961,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 except StopAsyncIteration:
                                     break
 
-                                remaining_budget = float(stream_idle_timeout)
-
                                 # ── process this chunk ──────────────────────
                                 try:
                                     chunk_text = chunk.decode(
@@ -1011,9 +1009,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 except Exception:
                                     pass
 
+                                # Determine if this chunk carries actual SSE data
+                                # (as opposed to a keepalive comment ":").
+                                # Only actual data chunks reset the between-chunks
+                                # budget, preventing premature timeout on slow
+                                # upstream processing.
+                                txt = chunk.decode("utf-8", errors="replace")
+                                _has_actual_data = bool(
+                                    txt.strip()
+                                    and not txt.strip().startswith(":")
+                                )
+
                                 # SSE finish indicators
                                 try:
-                                    txt = chunk.decode("utf-8", errors="replace")
                                     for line in txt.splitlines():
                                         line = line.strip()
                                         if not line.startswith("data:"):
@@ -1021,6 +1029,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         payload = line[5:].strip()
                                         if payload == "[DONE]":
                                             saw_done = True
+                                            _has_actual_data = True
                                         else:
                                             try:
                                                 j = json.loads(payload)
@@ -1031,6 +1040,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                                 pass
                                 except Exception:
                                     pass
+
+                                if _has_actual_data:
+                                    remaining_budget = float(stream_idle_timeout)
 
                                 # guardrail check
                                 if not guardrail_reason:
