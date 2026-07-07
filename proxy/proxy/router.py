@@ -883,6 +883,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     stream_idle_timeout = float(
                         server_config.get("stream_idle_timeout_seconds", 30) or 30
                     )
+                    stream_heartbeat_interval = float(
+                        server_config.get("stream_heartbeat_interval_seconds", 10) or 10
+                    )
 
                     async def stream_generator():
                         nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed, chunk_history
@@ -894,25 +897,48 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         disconnected = False
                         _disconnect_check_count = 0
                         try:
-                            # Use an explicit async iterator with per-chunk idle timeout
-                            # so that a stuck upstream (no [DONE], no connection close)
-                            # does not block the generator forever (LP-0MRB29HJ1009OR6G).
+                            # Use an explicit async iterator with a two-phase
+                            # idle timeout so that a stuck upstream does not block
+                            # the generator forever (LP-0MRB29HJ1009OR6G).
+                            #
+                            # Phase 1 (pre-fill / first chunk): budget is
+                            #   max_runtime_seconds (long — assumes the upstream may
+                            #   need significant time to ingest a large prompt).
+                            # Phase 2 (between chunks): budget switches to the
+                            #   shorter stream_idle_timeout_seconds.
+                            #
+                            # During any idle period a heartbeat event is yielded
+                            # every HEARTBEAT_INTERVAL seconds, keeping the client
+                            # connection alive during long pre-fill.
                             _stream_iter = response.aiter_bytes().__aiter__()
+                            _heartbeat_interval = stream_heartbeat_interval
+                            remaining_budget = float(max_runtime_seconds)
                             while True:
                                 try:
+                                    wait = min(remaining_budget, _heartbeat_interval)
                                     chunk = await asyncio.wait_for(
                                         _stream_iter.__anext__(),
-                                        timeout=stream_idle_timeout,
+                                        timeout=wait,
                                     )
+                                    # Chunk received — switch to the shorter
+                                    # between-chunks budget on the next iteration.
+                                    remaining_budget = float(stream_idle_timeout)
                                 except asyncio.TimeoutError:
-                                    # Upstream idle — treat as stream end, synthesise
-                                    # [DONE] below by breaking the read loop.
-                                    srv.logger.info(
-                                        "stream_idle_timeout session=%s idle=%.1fs",
-                                        session_id[:8] if session_id else "unknown",
-                                        stream_idle_timeout,
-                                    )
-                                    break
+                                    if remaining_budget <= _heartbeat_interval:
+                                        # Budget exhausted — treat upstream as idle.
+                                        srv.logger.info(
+                                            "stream_idle_timeout session=%s "
+                                            "idle=%.1fs budget=%.1fs",
+                                            session_id[:8] if session_id else "unknown",
+                                            stream_idle_timeout,
+                                            remaining_budget,
+                                        )
+                                        break
+                                    # Budget not exhausted — heartbeat to keep client
+                                    # alive, then continue waiting.
+                                    remaining_budget -= _heartbeat_interval
+                                    yield b"data: {\"type\":\"heartbeat\"}\n\n"
+                                    continue
                                 # count tokens in this chunk (best-effort)
                                 try:
                                     chunk_text = chunk.decode(

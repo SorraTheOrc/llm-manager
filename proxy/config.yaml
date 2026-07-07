@@ -261,6 +261,12 @@ server:
   # chunk before synthesising a final finish_reason:stop event and ending
   # the stream.  Default: 30 seconds.
   stream_idle_timeout_seconds: 30
+
+  # Heartbeat interval (in seconds) for SSE streaming.
+  # During idle periods (e.g. long pre-fill on large prompts), the proxy
+  # emits {"type":"heartbeat"} events every N seconds to keep the client
+  # connection alive and prevent client-side timeouts.  Default: 10.
+  stream_heartbeat_interval_seconds: 10
   session_guardrail_max_token_rate: 0
   # Rolling window duration in seconds for token-rate calculation.
   # The guardrail only triggers if the rate exceeds max_token_rate for the
