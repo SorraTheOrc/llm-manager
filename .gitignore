@@ -28,6 +28,12 @@ Worklog Specific Ignores
 # Local slot cache (large runtime artifacts) — must not be committed
 slot-cache/
 
+# ds4 is a nested repo (separate project), not a submodule
+ds4/
+
+# Session recordings — runtime artifacts
+proxy/session-recordings/
+
 
 bundles/
 logs/
