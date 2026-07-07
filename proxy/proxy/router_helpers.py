@@ -537,9 +537,11 @@ async def _try_acquire_local_dispatch(
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    A record is stale when it is not active and its *expires_at* timestamp
-    has passed (``time.monotonic() > expires_at``).  Each removed record
-    is logged with its session ID and reason.
+    A record is stale when its *expires_at* timestamp has passed
+    (``time.monotonic() > expires_at``), regardless of whether it is
+    *active* or *inactive*.  This ensures abandoned/crashed requests
+    (where *active* stays ``True`` permanently) are eventually cleaned.
+    Each removed record is logged with its session ID and reason.
 
     Returns the number of records removed.
     """
@@ -550,7 +552,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             stale_ids = [
                 sid
                 for sid, record in srv.local_dispatch_records.items()
-                if not record.get("active") and record.get("expires_at", 0) <= now
+                if record.get("expires_at", 0) <= now
             ]
             for sid in stale_ids:
                 del srv.local_dispatch_records[sid]

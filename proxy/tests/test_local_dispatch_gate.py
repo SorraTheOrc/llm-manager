@@ -284,3 +284,86 @@ async def test_try_acquire_allows_new_owner_after_lease_expiry():
     assert retry_after >= 1
     assert "sess-new" in srv.local_dispatch_records
     assert srv.local_dispatch_records["sess-new"]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_removes_expired_active_lease():
+    """
+    _cleanup_stale_local_dispatch should remove expired lease records
+    even when they have active=True (abandoned/crashed requests).
+    """
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            # Expired active lease — should be cleaned
+            "sess-stuck": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 0.0,  # expired
+            },
+            # Valid inactive lease that hasn't expired — should NOT be cleaned
+            "sess-valid": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 10**12,  # far in the future
+            },
+            # Expired inactive lease — should be cleaned (existing behaviour)
+            "sess-expired-inactive": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 0.0,
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    # The expired active lease should be removed
+    assert "sess-stuck" not in srv.local_dispatch_records, (
+        "Expired active lease should have been cleaned up"
+    )
+    # The expired inactive lease should be removed (existing behaviour)
+    assert "sess-expired-inactive" not in srv.local_dispatch_records
+    # The valid future lease should still exist
+    assert "sess-valid" in srv.local_dispatch_records
+    assert removed == 2, "Expected 2 leases removed (stuck + expired-inactive)"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_preserves_active_unexpired_lease():
+    """
+    _cleanup_stale_local_dispatch must NOT remove active lease records
+    whose expires_at is still in the future (legitimate in-flight requests).
+    """
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=1,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-active": {
+                "backend": "local",
+                "started_at": 100.0,
+                "active": True,
+                "expires_at": 10**12,  # far in the future
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert "sess-active" in srv.local_dispatch_records, (
+        "Active unexpired lease must be preserved"
+    )
+    assert removed == 0, "No leases should have been removed"
+    assert srv.local_dispatch_records["sess-active"]["active"] is True
