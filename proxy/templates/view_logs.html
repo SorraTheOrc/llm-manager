@@ -506,6 +506,7 @@
       const selectEl = document.getElementById(`sessionFilter-${CSS.escape(model)}`);
       const infoEl = document.getElementById(`modelInfo-${CSS.escape(model)}`);
       if (!selectEl) return;
+      if (infoEl) infoEl.textContent = 'Loading sessions...';
 
       try {
         const resp = await fetch(`/admin/sessions?model=${encodeURIComponent(model)}`);
