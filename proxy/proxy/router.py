@@ -210,10 +210,18 @@ def _build_session_headers(
 
 
 def _get_guardrail_config(server_config: dict) -> dict:
-    """Extract guardrail parameters from server config."""
+    """Extract guardrail parameters from server config.
+
+    Defaults (when config keys are absent or falsy):
+        max_runtime_seconds: 300 (5 minutes)
+        max_completion_tokens: 2048
+        repetition_min_pattern_chars: 64
+        repetition_min_repeats: 10
+        invalidate_on_guardrail: False
+    """
     return {
         "max_runtime_seconds": float(
-            server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
+            server_config.get("session_guardrail_max_runtime_seconds", 300) or 300
         ),
         "max_completion_tokens": int(
             server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
