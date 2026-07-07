@@ -690,6 +690,29 @@
               convHtml += makeExpandable(text, _msgId);
               convHtml += '</div>';
             }
+          } else if (item.direction === 'proxy_to_provider') {
+            // Show only the last assistant message from accumulated history
+            var messages = payload.messages || [];
+            var lastAsst = null;
+            for (var m = messages.length - 1; m >= 0; m--) {
+              if (messages[m].role === 'assistant') {
+                lastAsst = messages[m];
+                break;
+              }
+            }
+            if (lastAsst) {
+              _msgId++;
+              var text = extractText(lastAsst.content);
+              var modelName = lastAsst.model || item.data.model || model;
+              var providerName = item.data.provider || '';
+              var header = '## ' + modelName;
+              if (providerName) header += ' / ' + providerName;
+              header += ' - ' + ts;
+              convHtml += '<div class="msg assistant">';
+              convHtml += '<div class="msg-header">' + header + '</div>';
+              convHtml += makeExpandable(text, _msgId);
+              convHtml += '</div>';
+            }
           } else if (item.direction === 'provider_to_client') {
             // Extract assistant response (handles both dict payloads and raw SSE strings)
             var modelName = item.data.model || model;
