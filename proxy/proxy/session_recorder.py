@@ -319,12 +319,73 @@ class SessionRecorder:
         except (json.JSONDecodeError, OSError):
             return None
 
+    @staticmethod
+    def _extract_session_preview(session_dir: Path) -> Optional[Dict[str, Any]]:
+        """Extract preview data for a session from its recording files.
+
+        Finds the first ``provider_to_client`` response recording and
+        returns its timestamp, model, and provider. If no response
+        recording exists, falls back to the first ``client_to_proxy``
+        request recording.
+
+        Args:
+            session_dir: Path to the session's recording directory.
+
+        Returns:
+            A dict with ``session_id``, ``response_time``,
+            ``model``, and ``provider``, or ``None`` if the directory
+            has no valid recording files.
+        """
+        sid = session_dir.name
+        recordings: List[Dict[str, Any]] = []
+        try:
+            for f in sorted(session_dir.iterdir()):
+                if not f.is_file() or not f.name.endswith(".json"):
+                    continue
+                try:
+                    content = json.loads(f.read_bytes())
+                    recordings.append({
+                        "direction": content.get("direction", ""),
+                        "timestamp": content.get("timestamp", ""),
+                        "model": content.get("model", ""),
+                        "provider": content.get("provider", ""),
+                    })
+                except (json.JSONDecodeError, OSError):
+                    continue
+        except OSError:
+            return None
+
+        if not recordings:
+            return None
+
+        # Find first provider_to_client response
+        first_resp = None
+        first_req = None
+        for r in recordings:
+            if r["direction"] == "provider_to_client":
+                if first_resp is None or r["timestamp"] < first_resp["timestamp"]:
+                    first_resp = r
+            if r["direction"] == "client_to_proxy":
+                if first_req is None or r["timestamp"] < first_req["timestamp"]:
+                    first_req = r
+
+        # Prefer response data, fall back to request data
+        source = first_resp or first_req
+        if source is None:
+            source = recordings[0]
+
+        return {
+            "session_id": sid,
+            "response_time": source.get("timestamp", ""),
+            "model": source.get("model", ""),
+            "provider": source.get("provider", ""),
+        }
+
     def list_sessions_by_model(self, model: str) -> List[Dict[str, Any]]:
         """Return session IDs that have recordings for a specific model.
 
-        Scans session directories and checks recording metadata for the
-        given model name. Returns a list of dicts with session_id and
-        timestamp of the most recent recording.
+        Scans session directories and returns preview data (first response
+        timestamp, model, provider) for each session matching the model.
 
         When no recordings with matching model metadata are found (e.g.
         recordings from before the model enrichment field was added), falls
@@ -334,8 +395,8 @@ class SessionRecorder:
             model: The model name to filter by.
 
         Returns:
-            A list of dicts with ``session_id`` and ``last_activity`` keys,
-            sorted by most recent activity first.
+            A list of dicts with ``session_id``, ``response_time``,
+            ``model``, and ``provider``, sorted by most recent activity.
         """
         if not model:
             return []
@@ -350,67 +411,59 @@ class SessionRecorder:
             for entry in sorted(base.iterdir()):
                 if not entry.is_dir():
                     continue
-                sid = entry.name
-                last_ts = ""
-                found_model = False
-                for f in entry.iterdir():
-                    if not f.is_file() or not f.name.endswith(".json"):
-                        continue
-                    try:
-                        content = json.loads(f.read_bytes())
-                        if content.get("model") == model:
-                            found_model = True
-                        ts = content.get("timestamp", "")
-                        if ts > last_ts:
-                            last_ts = ts
-                    except (json.JSONDecodeError, OSError):
-                        continue
-                if found_model:
-                    model_sessions.append({
-                        "session_id": sid,
-                        "last_activity": last_ts,
-                    })
-                elif last_ts:
-                    # Session has recordings but no model metadata (pre-deployment)
-                    all_sessions.append({
-                        "session_id": sid,
-                        "last_activity": last_ts,
-                    })
+                preview = self._extract_session_preview(entry)
+                if preview is None:
+                    continue
+                if preview.get("model") == model:
+                    model_sessions.append(preview)
+                else:
+                    # Check if any recording in this session matches the model
+                    found_model = False
+                    for f in entry.iterdir():
+                        if not f.is_file() or not f.name.endswith(".json"):
+                            continue
+                        try:
+                            content = json.loads(f.read_bytes())
+                            if content.get("model") == model:
+                                found_model = True
+                                break
+                        except (json.JSONDecodeError, OSError):
+                            continue
+                    if found_model:
+                        model_sessions.append(preview)
+                    elif preview.get("response_time"):
+                        all_sessions.append(preview)
         except OSError as e:
             logger.warning("Failed to list sessions by model %s: %s", model, e)
             return []
 
         # Prefer model-enriched sessions over unattributed ones
         if model_sessions:
-            model_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+            model_sessions.sort(key=lambda s: s["response_time"], reverse=True)
             return model_sessions
 
         # Fall back to all sessions when no model metadata exists yet
-        all_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+        all_sessions.sort(key=lambda s: s["response_time"], reverse=True)
         return all_sessions
 
-    def list_sessions(self) -> List[str]:
+    def list_sessions(self) -> List[Dict[str, Any]]:
         """Return all session IDs that have recording directories.
 
-        Sessions are sorted alphabetically. Only directories that contain
-        at least one ``.json`` file are included.
+        Returns a list of dicts with ``session_id``, ``response_time``,
+        ``model``, and ``provider``, sorted by most recent activity.
         """
         base = Path(self.recording_path)
         if not base.is_dir():
             return []
 
-        sessions: List[str] = []
+        sessions: List[Dict[str, Any]] = []
         try:
             for entry in sorted(base.iterdir()):
                 if not entry.is_dir():
                     continue
-                # Check if the directory has at least one .json file
-                has_json = any(
-                    f.is_file() and f.name.endswith(".json")
-                    for f in entry.iterdir()
-                )
-                if has_json:
-                    sessions.append(entry.name)
+                preview = self._extract_session_preview(entry)
+                if preview is not None:
+                    sessions.append(preview)
         except OSError as e:
             logger.warning(
                 "Failed to list sessions in %s: %s",
@@ -418,6 +471,7 @@ class SessionRecorder:
             )
             return []
 
+        sessions.sort(key=lambda s: s["response_time"], reverse=True)
         return sessions
 
     @staticmethod

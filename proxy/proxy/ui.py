@@ -992,7 +992,7 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
         model_filter = request.query_params.get("model")
 
     # Helper: merge recording sessions with live session-manager sessions
-    async def _merge_live_and_recording_sessions(rec_sessions, model_filter=None):
+    async def _merge_live_and_recording_sessions(rec_sessions):
         live_sessions = []
         try:
             srv = _srv()
@@ -1003,48 +1003,42 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
 
         seen = set()
         merged = []
-        # Live sessions first (by last_activity)
+        # Live sessions first
         for s in live_sessions:
             sid = s.get("session_id", "")
             if sid:
                 seen.add(sid)
                 merged.append(s)
         # Recording-only sessions (not already in live list)
-        if not model_filter:
-            for sid in rec_sessions:
-                if sid not in seen:
-                    merged.append({
-                        "session_id": sid,
-                        "last_activity": "",
-                    })
+        for s in rec_sessions:
+            sid = s.get("session_id", "")
+            if sid and sid not in seen:
+                seen.add(sid)
+                merged.append({
+                    "session_id": sid,
+                    "response_time": s.get("response_time", ""),
+                    "model": s.get("model", ""),
+                    "provider": s.get("provider", ""),
+                })
         return merged
 
     recorder = _get_recorder()
+    rec_sessions = recorder.list_sessions_by_model(model_filter) if model_filter else recorder.list_sessions()
+    merged = await _merge_live_and_recording_sessions(rec_sessions)
+
+    # Also include recording sessions not already merged from the live list
+    seen_live = {s.get("session_id", "") for s in merged}
+    for s in rec_sessions:
+        sid = s.get("session_id", "")
+        if sid and sid not in seen_live:
+            seen_live.add(sid)
+            merged.append(s)
+
+    result = {"sessions": merged, "count": len(merged)}
     if model_filter:
-        rec_sessions = recorder.list_sessions_by_model(model_filter)
-        merged = await _merge_live_and_recording_sessions(rec_sessions, model_filter=model_filter)
-        # Also include recording sessions not yet in live list but matching model
-        seen_live = {s.get("session_id", "") for s in merged}
-        for s in rec_sessions:
-            if s.get("session_id", "") not in seen_live:
-                merged.append(s)
-        return JSONResponse(
-            status_code=200,
-            content={
-                "sessions": merged,
-                "model": model_filter,
-                "count": len(merged),
-            },
-        )
+        result["model"] = model_filter
 
-    # No model filter: merge all recording sessions with live sessions
-    recording_sessions = recorder.list_sessions()
-    merged = await _merge_live_and_recording_sessions(recording_sessions)
-
-    return JSONResponse(
-        status_code=200,
-        content={"sessions": merged, "count": len(merged)},
-    )
+    return JSONResponse(status_code=200, content=result)
 
 
 def list_session_recording_routes(app):

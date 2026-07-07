@@ -568,9 +568,15 @@ class TestListAndRetrieve:
         await recorder.record_request("sess-b", "client_to_proxy", {"b": 2})
 
         sessions = recorder.list_sessions()
+        session_ids = [s["session_id"] for s in sessions]
 
-        assert "sess-a" in sessions
-        assert "sess-b" in sessions
+        assert "sess-a" in session_ids
+        assert "sess-b" in session_ids
+        # Each session should include preview fields
+        for s in sessions:
+            assert "response_time" in s
+            assert "model" in s
+            assert "provider" in s
 
     @pytest.mark.asyncio
     async def test_list_sessions_empty(self, recorder, temp_recording_dir):

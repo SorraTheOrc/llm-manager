@@ -485,7 +485,18 @@
         for (const s of sessions) {
           const opt = document.createElement('option');
           opt.value = s.session_id;
-          opt.textContent = s.session_id;
+          // Format: timestamp | model/provider
+          var label = s.session_id;
+          var ts = s.response_time || s.last_activity_at || '';
+          if (ts) {
+            try { ts = new Date(ts).toLocaleString(); } catch(e) {}
+            label = ts;
+          }
+          if (s.model) {
+            label += ' | ' + s.model;
+            if (s.provider) label += '/' + s.provider;
+          }
+          opt.textContent = label;
           selectEl.appendChild(opt);
         }
 
