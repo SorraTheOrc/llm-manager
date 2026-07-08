@@ -31,6 +31,14 @@ logger = logging.getLogger("llama-proxy.provider")
 # In-memory cooldown tracking: provider_name -> expiry_timestamp (seconds since epoch)
 _provider_unavailable_until: Dict[str, float] = {}
 
+# Consecutive failure count for exponential backoff: provider_name -> count
+# Incremented on each failure, reset to 0 on success.
+_provider_failure_count: Dict[str, int] = {}
+
+# Exponential backoff constants (remote providers only)
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 45.0
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -131,18 +139,45 @@ def get_remote_endpoint(model_config: dict) -> Optional[str]:
 def mark_provider_unavailable(
     provider_name: str,
     cooldown_seconds: float,
+    use_exponential_backoff: bool = False,
 ) -> None:
     """Mark a provider as unavailable for the given cooldown duration.
 
-    During the cooldown period ``resolve_provider()`` will skip this
-    provider.
+    When *use_exponential_backoff* is ``True``, the actual cooldown is
+    computed via exponential backoff based on consecutive failure count
+    instead of using *cooldown_seconds* directly:
+
+        cooldown = min(BACKOFF_BASE * 2^failure_count, BACKOFF_MAX)
+
+    The failure count is incremented on each call and reset to 0 on
+    successful provider response via ``_reset_provider_failure_count()``.
 
     Args:
         provider_name: Name of the provider to mark.
         cooldown_seconds: Number of seconds the provider should be
-                          considered unavailable.
+                          considered unavailable (used as max when
+                          *use_exponential_backoff* is ``True``).
+        use_exponential_backoff: If ``True``, apply exponential backoff.
+                                 Default is ``False``.
     """
+    if use_exponential_backoff:
+        count = _provider_failure_count.get(provider_name, 0)
+        cooldown_seconds = min(
+            _BACKOFF_BASE_SECONDS * (2 ** count),
+            _BACKOFF_MAX_SECONDS,
+        )
+        _provider_failure_count[provider_name] = count + 1
+
     _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
+
+
+def _reset_provider_failure_count(provider_name: str) -> None:
+    """Reset the consecutive failure count for a provider on success.
+
+    Removes the provider from the failure count dict so that the next
+    failure starts with the base backoff interval.
+    """
+    _provider_failure_count.pop(provider_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +711,8 @@ def _handle_streaming_success(
             status="streaming_success",
             status_code=int(getattr(response, "status_code", 0) or 0),
         )
+        # Reset exponential-backoff failure count on success
+        _reset_provider_failure_count(provider_name)
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
@@ -711,6 +748,8 @@ def _build_fallback_success_response(
         status_code=int(getattr(response, "status_code", 0) or 0),
         body_snippet=(body_text[:512] if body_text else None),
     )
+    # Reset exponential-backoff failure count on success
+    _reset_provider_failure_count(provider_name)
     result = _add_provider_header(response, provider_name)
     if prev_provider:
         logger.info(
@@ -734,11 +773,23 @@ def _handle_connection_error_in_fallback(
     a diagnostic attempt entry, and return ``True`` (caller should ``continue``
     to the next provider).
 
+    Applies exponential backoff for remote providers (capped at configured
+    *cooldown_seconds*, so setting it to 0 disables backoff entirely).
+
     Returns ``False`` if *exc* is **not** a connection error (caller should
     re-raise or handle differently).
     """
     if _is_connection_error(exc):
-        mark_provider_unavailable(provider_name, cooldown_seconds)
+        cooldown = cooldown_seconds
+        if provider_type == "remote" and cooldown_seconds > 0:
+            count = _provider_failure_count.get(provider_name, 0)
+            backoff = min(
+                _BACKOFF_BASE_SECONDS * (2 ** count),
+                _BACKOFF_MAX_SECONDS,
+            )
+            cooldown = min(backoff, cooldown_seconds)
+            _provider_failure_count[provider_name] = count + 1
+        mark_provider_unavailable(provider_name, cooldown)
         _record_attempt(
             attempts,
             provider=provider_name,
@@ -762,12 +813,30 @@ def _handle_http_error_with_cooldown(
     provider unavailable, record a diagnostic attempt entry, and return the
     effective cooldown duration.
 
+    Applies exponential backoff for remote providers.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
     """
-    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-    mark_provider_unavailable(provider_name, effective_cooldown)
+    # Parse Retry-After separately so we can respect it alongside backoff
+    retry_after = _parse_retry_after(response)
+
+    cooldown = cooldown_seconds
+    if provider_type == "remote" and cooldown_seconds > 0:
+        count = _provider_failure_count.get(provider_name, 0)
+        backoff = min(
+            _BACKOFF_BASE_SECONDS * (2 ** count),
+            _BACKOFF_MAX_SECONDS,
+        )
+        cooldown = min(backoff, cooldown_seconds)
+        _provider_failure_count[provider_name] = count + 1
+
+    # Respect Retry-After header regardless of backoff
+    if retry_after is not None:
+        cooldown = max(cooldown, retry_after)
+
+    mark_provider_unavailable(provider_name, cooldown)
     _record_attempt(
         attempts,
         provider=provider_name,
@@ -775,9 +844,9 @@ def _handle_http_error_with_cooldown(
         status="http_error",
         status_code=int(response.status_code),
         body_snippet=(body_text[:512] if body_text else None),
-        cooldown_seconds=effective_cooldown,
+        cooldown_seconds=cooldown,
     )
-    return effective_cooldown
+    return cooldown
 
 
 def _handle_empty_response_with_cooldown(
@@ -792,12 +861,30 @@ def _handle_empty_response_with_cooldown(
     cooldown, mark the provider unavailable, record a diagnostic attempt entry,
     and return the effective cooldown duration.
 
+    Applies exponential backoff for remote providers.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
     """
-    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-    mark_provider_unavailable(provider_name, effective_cooldown)
+    # Parse Retry-After separately so we can respect it alongside backoff
+    retry_after = _parse_retry_after(response)
+
+    cooldown = cooldown_seconds
+    if provider_type == "remote" and cooldown_seconds > 0:
+        count = _provider_failure_count.get(provider_name, 0)
+        backoff = min(
+            _BACKOFF_BASE_SECONDS * (2 ** count),
+            _BACKOFF_MAX_SECONDS,
+        )
+        cooldown = min(backoff, cooldown_seconds)
+        _provider_failure_count[provider_name] = count + 1
+
+    # Respect Retry-After header regardless of backoff
+    if retry_after is not None:
+        cooldown = max(cooldown, retry_after)
+
+    mark_provider_unavailable(provider_name, cooldown)
     _record_attempt(
         attempts,
         provider=provider_name,
@@ -805,9 +892,9 @@ def _handle_empty_response_with_cooldown(
         status="empty_response",
         status_code=int(getattr(response, "status_code", 0) or 0),
         body_snippet=(body_text[:512] if body_text else None),
-        cooldown_seconds=effective_cooldown,
+        cooldown_seconds=cooldown,
     )
-    return effective_cooldown
+    return cooldown
 
 
 def _resolve_reasoning_content_promotion(
@@ -838,6 +925,8 @@ def _resolve_reasoning_content_promotion(
             status_code=int(getattr(response, "status_code", 0) or 0),
             body_snippet=(body_text[:512] if body_text else None),
         )
+        # Reset exponential-backoff failure count on success
+        _reset_provider_failure_count(provider_name)
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(

@@ -39,8 +39,9 @@ class _DummyRequest:
 
 @pytest.fixture(autouse=True)
 def reset_cooldown_state():
-    """Reset cooldown state between tests to avoid cross-test leakage."""
+    """Reset cooldown and failure-count state between tests to avoid cross-test leakage."""
     provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
     yield
 
 
@@ -2750,12 +2751,14 @@ class TestSharedFallbackPrimitives:
     def test_handle_http_error_with_cooldown_marks_unavailable(self):
         """_handle_http_error_with_cooldown marks provider and records attempt."""
         provider._provider_unavailable_until.clear()
+        provider._provider_failure_count.clear()
         attempts = []
         response = Response(status_code=502, content=b"Bad gateway")
         cooldown = provider._handle_http_error_with_cooldown(
             response, "test-provider", "remote", 60.0, attempts, "bad gateway",
         )
-        assert cooldown >= 60.0
+        # Remote providers use exponential backoff starting at 1s
+        assert cooldown == 1.0
         assert provider._is_provider_unavailable("test-provider")
         assert len(attempts) == 1
         assert attempts[0]["status"] == "http_error"
@@ -2763,12 +2766,14 @@ class TestSharedFallbackPrimitives:
     def test_handle_empty_response_with_cooldown_marks_unavailable(self):
         """_handle_empty_response_with_cooldown marks provider and records attempt."""
         provider._provider_unavailable_until.clear()
+        provider._provider_failure_count.clear()
         attempts = []
         response = Response(status_code=200, content=b"{}")
         cooldown = provider._handle_empty_response_with_cooldown(
             response, "test-provider", "remote", 60.0, attempts, "{}",
         )
-        assert cooldown >= 60.0
+        # Remote providers use exponential backoff starting at 1s
+        assert cooldown == 1.0
         assert provider._is_provider_unavailable("test-provider")
         assert len(attempts) == 1
         assert attempts[0]["status"] == "empty_response"
