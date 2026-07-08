@@ -161,11 +161,55 @@ def log_response_chunk(chunk: bytes) -> None:
 
     The ContentOnlyConsoleHandler extracts and displays just the content to console.
     Raw JSON is written to the log file only.
+
+    If the chunk contains a ``finish_reason`` in any ``choices[]`` entry,
+    an additional ``Stream finished: reason=<reason>`` log line is emitted
+    so the stop reason (and optional token usage) appears in both console
+    and file logs (LP-0MQZXHHHO0063YCI).
     """
     srv = _srv()
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
         srv.logger.info(f"STREAM CHUNK | {chunk_str}")
+    except Exception:
+        pass
+
+    # Detect finish_reason and log stop-reason line (LP-0MQZXHHHO0063YCI)
+    try:
+        if not chunk:
+            return
+        chunk_full = chunk.decode("utf-8", errors="replace")
+        for line in chunk_full.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                j = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(j, dict):
+                continue
+            # Look for finish_reason in any choices[] entry
+            finish_reason = None
+            for choice in j.get("choices", []):
+                if isinstance(choice, dict):
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reason = fr
+                        break
+            if finish_reason is not None:
+                parts = [f"Stream finished: reason={finish_reason}"]
+                usage = j.get("usage")
+                if isinstance(usage, dict):
+                    pt = usage.get("prompt_tokens")
+                    ct = usage.get("completion_tokens")
+                    tt = usage.get("total_tokens")
+                    if pt is not None or ct is not None or tt is not None:
+                        parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
+                srv.logger.info(" ".join(parts))
     except Exception:
         pass
 

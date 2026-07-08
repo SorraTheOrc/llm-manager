@@ -368,6 +368,11 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
     def _extract_and_format_content(self, chunk_str: str) -> Optional[str]:
         """Extract content from chunk and apply formatting based on type.
 
+        Detects ``finish_reason`` in any ``choices[]`` entry and appends
+        a trailing newline when present (so the shell prompt appears on a
+        fresh line after streaming finishes).  Returns just ``\n`` for
+        finish_reason-only chunks that carry no delta content.
+
         Returns formatted string with ANSI codes, or None if no content
         found.
         """
@@ -375,6 +380,7 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
             return None
 
         parts: list[str] = []
+        has_finish_reason = False
         for line in chunk_str.splitlines():
             line = line.strip()
             if not line or not line.startswith("data:"):
@@ -387,6 +393,12 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
             except Exception:
                 continue
             for choice in j.get("choices", []):
+                if not isinstance(choice, dict):
+                    continue
+                # Track finish_reason for trailing-newline logic
+                fr = choice.get("finish_reason")
+                if fr is not None:
+                    has_finish_reason = True
                 delta = choice.get("delta", {})
                 if not isinstance(delta, dict):
                     continue
@@ -396,6 +408,11 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
                 content = delta.get("content")
                 if content is not None:
                     parts.append(f"{self.BOLD}{content}{self.RESET}")
+
+        if has_finish_reason:
+            if parts:
+                return "".join(parts) + "\n"
+            return "\n"
 
         return "".join(parts) if parts else None
 

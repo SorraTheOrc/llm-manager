@@ -91,3 +91,99 @@ def test_console_formats_content_as_bold(tmp_path):
     # Should contain BOLD ANSI code (\x1b[1m) for content
     assert '\x1b[1m' in out
     assert 'hello' in _strip_ansi(out)
+
+
+# --- Tests for finish_reason / trailing newline and stop-reason logging ---
+
+
+def test_console_appends_newline_on_finish_reason(tmp_path):
+    """When the final chunk has finish_reason, append newline after content."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = _strip_ansi(strio.getvalue())
+    # The content "hello" should be followed by a newline before the log line
+    assert "hello\n" in out, f"Expected newline after content, got: {out!r}"
+
+
+def test_console_no_newline_without_finish_reason(tmp_path):
+    """No trailing newline when finish_reason is absent."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = _strip_ansi(strio.getvalue())
+    # Content should appear as-is without an appended newline
+    assert out == "hello"
+
+
+def test_console_newline_for_finish_reason_only_chunk(tmp_path):
+    """Even a finish_reason-only chunk (no delta.content) produces a newline."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    # Should contain at least a newline somewhere in the output
+    assert "\n" in out, f"Expected a newline in output, got: {out!r}"
+
+
+def test_stop_reason_logged_on_finish_reason(tmp_path):
+    """Logger emits a stop-reason line when finish_reason is present."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=stop" in out
+
+
+def test_stop_reason_with_usage(tmp_path):
+    """Stop-reason line includes token usage when usage object is present."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=stop tokens=10/20/30" in out
+
+
+def test_stop_reason_no_usage(tmp_path):
+    """Stop-reason line omits tokens when usage is absent."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=stop" in out
+    assert "tokens=" not in out
+
+
+def test_no_stop_reason_without_finish_reason(tmp_path):
+    """No stop-reason log line when finish_reason is absent."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    assert "Stream finished:" not in out
+
+
+def test_done_sentinel_no_side_effects(tmp_path):
+    """[DONE] sentinel events produce no spurious newlines or log lines."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = b'data: [DONE]\n\n'
+    server.log_response_chunk(chunk)
+
+    out = strio.getvalue()
+    # No content to display, no finish_reason to log
+    assert out == "" or "Stream finished:" not in out
