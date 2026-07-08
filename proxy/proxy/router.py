@@ -864,6 +864,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             is_delta_request, session_fallback_reason,
                         )
                     )
+                    # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                    outgoing_headers["X-Resolved-Model"] = f"local/{model_name}"
                     media_type = response.headers.get(
                         "content-type", "text/event-stream"
                     )
@@ -1414,6 +1416,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     is_delta_request, session_fallback_reason,
                                 )
                             )
+                            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                            resp_headers["X-Resolved-Model"] = f"local/{model_name}"
 
                             return Response(
                                 content=response.content,

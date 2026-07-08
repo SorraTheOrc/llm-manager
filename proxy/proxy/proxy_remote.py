@@ -250,23 +250,34 @@ async def proxy_to_remote(
     remote_timeout = httpx.Timeout(_srv().config.get("server", {}).get("llama_request_timeout", 300))
     is_streaming = body_json.get("stream", False)
 
+    # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header
+    _provider_name = model_config.get("name", "unknown")
+    _resolved_model_id = body_json.get("model", "unknown")
+    _resolved_model_header = f"{_provider_name}/{_resolved_model_id}"
+
     if is_streaming:
         if _remote_session_id:
             return await _handle_remote_streaming(
                 request, target_url, headers, body, body_json,
-                model_name, remote_timeout, session_id=_remote_session_id,
+                model_name, remote_timeout,
+                resolved_model=_resolved_model_header,
+                session_id=_remote_session_id,
             )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
             model_name, remote_timeout,
+            resolved_model=_resolved_model_header,
         )
     else:
         if _remote_session_id:
             return await _handle_remote_non_streaming(
-                request, target_url, headers, body, model_name, remote_timeout, session_id=_remote_session_id,
+                request, target_url, headers, body, model_name, remote_timeout,
+                resolved_model=_resolved_model_header,
+                session_id=_remote_session_id,
             )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
+            resolved_model=_resolved_model_header,
         )
 
 
@@ -278,6 +289,7 @@ async def _handle_remote_streaming(
     body_json: dict,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    resolved_model: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> Response:
     """Handle streaming remote proxy request."""
@@ -327,15 +339,23 @@ async def _handle_remote_streaming(
                 response_payload=body_bytes,
             )
 
+        _err_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+        # LP-0MR4ZIGDT004A3E1: Include resolved model info in error path
+        if resolved_model:
+            _err_headers["X-Resolved-Model"] = resolved_model
         return Response(
             content=body_bytes,
             status_code=upstream_status,
-            headers=_normalize_outgoing_headers(dict(response.headers), buffered=True),
+            headers=_err_headers,
         )
 
     outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
     if "cache-control" not in {k.lower() for k in outgoing_headers.keys()}:
         outgoing_headers["Cache-Control"] = "no-cache"
+
+    # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+    if resolved_model:
+        outgoing_headers["X-Resolved-Model"] = resolved_model
 
     media_type = response.headers.get("content-type", "text/event-stream")
     key = f"{request.method.upper()} {request.url.path} -> remote"
@@ -473,6 +493,7 @@ async def _handle_remote_non_streaming(
     body: bytes,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    resolved_model: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> Response:
     """Handle non-streaming remote proxy request."""
@@ -505,10 +526,14 @@ async def _handle_remote_non_streaming(
                 provider="remote",
             )
 
+        _ns_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+        if resolved_model:
+            _ns_headers["X-Resolved-Model"] = resolved_model
         return Response(
             content=response.content,
             status_code=response.status_code,
-            headers=_normalize_outgoing_headers(dict(response.headers), buffered=True),
+            headers=_ns_headers,
         )
 
 

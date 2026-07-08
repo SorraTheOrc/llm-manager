@@ -300,6 +300,36 @@ def _add_provider_header(response: Response, provider_name: str) -> Response:
     return response
 
 
+def _build_resolved_model_value(provider_cfg: dict) -> Optional[str]:
+    """Build the X-Resolved-Model header value from a provider config.
+
+    Returns ``<provider-name>/<model-id>`` or ``None`` if the config
+    doesn't have the required fields.
+
+    For local providers, uses ``llama_model`` as the model ID.
+    For remote providers, uses ``model`` (upstream model ID).
+    """
+    provider_name = provider_cfg.get("name")
+    if not provider_name:
+        return None
+    model_id = provider_cfg.get("llama_model") or provider_cfg.get("model")
+    if not model_id:
+        return None
+    return f"{provider_name}/{model_id}"
+
+
+def _add_resolved_model_header(response: Response, provider_cfg: dict) -> Response:
+    """Add X-Resolved-Model header to a response based on provider config.
+
+    Sets the header using ``_build_resolved_model_value()``. Overwrites
+    any existing value so the fallback's resolved provider takes priority.
+    """
+    value = _build_resolved_model_value(provider_cfg)
+    if value:
+        response.headers["X-Resolved-Model"] = value
+    return response
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: Optional[dict] = None, diagnostics: Optional[List[Dict[str, Any]]] = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -951,6 +981,8 @@ async def proxy_with_remote_fallback(
                         prev_provider, fallback_reason, path, body_text,
                     )
                     if promoted is not None:
+                        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                        _add_resolved_model_header(promoted, provider_cfg)
                         return promoted
 
                     # Shared primitive: empty response with cooldown
@@ -966,10 +998,13 @@ async def proxy_with_remote_fallback(
                 pass
 
             # Shared primitive: success path
-            return _build_fallback_success_response(
+            result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+            _add_resolved_model_header(result, provider_cfg)
+            return result
 
         except Exception as exc:
             # Shared primitive: handle connection errors
@@ -1145,6 +1180,8 @@ async def proxy_with_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                _add_resolved_model_header(stream_result, provider_cfg)
                 return stream_result
 
             # Capture the first non-success response so we can return it when
@@ -1369,6 +1406,8 @@ async def proxy_with_fallback(
                         prev_provider, fallback_reason, path, body_text,
                     )
                     if promoted is not None:
+                        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                        _add_resolved_model_header(promoted, provider_cfg)
                         return promoted
 
                     # Local empty 200 can be transient (slot busy/cancelled
@@ -1407,6 +1446,8 @@ async def proxy_with_fallback(
                                 prev_provider, fallback_reason, path, body_text,
                             )
                             if promoted2 is not None:
+                                # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
+                                _add_resolved_model_header(promoted2, provider_cfg)
                                 return promoted2
                             # Fall through to success path below.
                             pass
@@ -1434,10 +1475,13 @@ async def proxy_with_fallback(
                 pass
 
             # Shared primitive: success path
-            return _build_fallback_success_response(
+            result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+            _add_resolved_model_header(result, provider_cfg)
+            return result
 
         except Exception as exc:
             # Shared primitive: handle connection errors
@@ -1498,11 +1542,14 @@ async def proxy_with_fallback(
                         slot_info = _parse_slot_exhaustion(response)
                         if slot_info is None and not _is_http_error_status(response.status_code):
                             # Success — record and return below via normal path.
-                            return _build_fallback_success_response(
+                            result = _build_fallback_success_response(
                                 response, provider_name, provider_type, attempts,
                                 prev_provider, fallback_reason, path, body_text,
                                 status_override="success_after_http_exception_retry",
                             )
+                            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
+                            _add_resolved_model_header(result, provider_cfg)
+                            return result
                         # Retry produced a response but still slot-exhaustion/error;
                         # fall through to normal handling by continuing the loop.
                         continue

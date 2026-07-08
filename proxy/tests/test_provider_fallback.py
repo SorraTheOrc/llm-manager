@@ -1611,7 +1611,7 @@ async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
 
     observed_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal observed_headers
         observed_headers = headers
         return Response(
@@ -1659,7 +1659,7 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -1703,7 +1703,7 @@ async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibili
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -1750,7 +1750,7 @@ async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -2183,7 +2183,7 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -2230,7 +2230,7 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_autho
 
     captured_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal captured_headers
         captured_headers = headers
         return Response(
@@ -2280,7 +2280,7 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
 
     captured_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal captured_headers
         captured_headers = headers
         return Response(
@@ -2329,7 +2329,7 @@ async def test_proxy_to_remote_falls_back_to_auth_json_when_env_var_not_set():
 
     captured_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal captured_headers
         captured_headers = headers
         return Response(
