@@ -2778,6 +2778,301 @@ class TestSharedFallbackPrimitives:
         assert len(attempts) == 1
         assert attempts[0]["status"] == "empty_response"
 
+    # ------------------------------------------------------------------
+    # Comprehensive exponential backoff tests (AC1-AC5)
+    # ------------------------------------------------------------------
+
+    def test_connection_error_backoff_exponential_sequence(self):
+        """AC1: Connection error backoff doubles each consecutive failure (1s, 2s, 4s...)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        attempts = []
+        exc = httpx.ConnectError("Connection refused")
+        with patch('time.time', return_value=1000.0):
+            for i, expected in enumerate([1.0, 2.0, 4.0, 8.0, 16.0, 32.0]):
+                provider._handle_connection_error_in_fallback(
+                    exc, "seq-provider", "remote", 60.0, attempts,
+                )
+                expiry = provider._provider_unavailable_until["seq-provider"]
+                assert expiry == 1000.0 + expected, (
+                    f"Failure {i+1}: expected {1000.0+expected}s, got {expiry}s"
+                )
+                assert provider._provider_failure_count["seq-provider"] == i + 1
+
+    def test_connection_error_backoff_capped_at_45s(self):
+        """AC1: Connection error backoff is capped at BACKOFF_MAX (45s)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        attempts = []
+        exc = httpx.ConnectError("Connection refused")
+        with patch('time.time', return_value=1000.0):
+            # 6 failures: 1, 2, 4, 8, 16, 32, then 7th = min(64, 45) = 45
+            for _ in range(7):
+                provider._handle_connection_error_in_fallback(
+                    exc, "cap45-provider", "remote", 60.0, attempts,
+                )
+            expiry = provider._provider_unavailable_until["cap45-provider"]
+            # 7th failure: backoff = min(64, 45) = 45, capped by cooldown_seconds=60 -> 45
+            # Start at 1000, after 6 increments the remaining cooldown is for the 7th:
+            # The 7th call uses count=6: backoff = min(1*64, 45) = 45
+            assert expiry == 1045.0, f"Expected cap at 45s, got expiry={expiry}"
+
+    def test_connection_error_backoff_capped_by_cooldown_seconds(self):
+        """AC1: Connection error backoff is capped by cooldown_seconds."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        attempts = []
+        exc = httpx.ConnectError("Connection refused")
+        with patch('time.time', return_value=1000.0):
+            # 3rd failure: 1*2^2 = 4s, but cooldown_seconds=3 should cap at 3
+            for _ in range(3):
+                provider._handle_connection_error_in_fallback(
+                    exc, "cap-cd-provider", "remote", 3.0, attempts,
+                )
+            expiry = provider._provider_unavailable_until["cap-cd-provider"]
+            # 3rd: count=2, backoff=4, min(backoff, cooldown_seconds)=min(4,3)=3
+            assert expiry == 1003.0, f"Expected cap at cooldown_seconds=3, got expiry={expiry}"
+
+    def test_connection_error_local_provider_no_backoff(self):
+        """AC5: Local providers do NOT get exponential backoff for connection errors."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        attempts = []
+        exc = httpx.ConnectError("Connection refused")
+        with patch('time.time', return_value=1000.0):
+            # Multiple calls with local provider should always use cooldown_seconds
+            for i in range(3):
+                provider._handle_connection_error_in_fallback(
+                    exc, "local-provider", "local", 60.0, attempts,
+                )
+                expiry = provider._provider_unavailable_until["local-provider"]
+                assert expiry == 1000.0 + 60.0, (
+                    f"Call {i+1}: local provider should get 60s, got expiry={expiry}"
+                )
+
+    def test_http_error_backoff_exponential_sequence(self):
+        """AC2: HTTP error backoff doubles each consecutive failure (1s, 2s, 4s...)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=502, content=b"Bad gateway")
+        with patch('time.time', return_value=1000.0):
+            for i, expected in enumerate([1.0, 2.0, 4.0, 8.0, 16.0, 32.0]):
+                attempts = []
+                cooldown = provider._handle_http_error_with_cooldown(
+                    response, "http-seq-provider", "remote", 60.0, attempts, "bad gateway",
+                )
+                assert cooldown == expected, (
+                    f"Call {i+1}: expected cooldown={expected}, got {cooldown}"
+                )
+
+    def test_http_error_backoff_capped_at_45s(self):
+        """AC2: HTTP error backoff is capped at BACKOFF_MAX (45s)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=502, content=b"Bad gateway")
+        with patch('time.time', return_value=1000.0):
+            for _ in range(6):
+                provider._handle_http_error_with_cooldown(
+                    response, "http-cap45-provider", "remote", 60.0, attempts=[], body_text="bad",
+                )
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "http-cap45-provider", "remote", 60.0, attempts=[], body_text="bad",
+            )
+            # 7th: count=6 -> backoff = min(64, 45) = 45
+            assert cooldown == 45.0, f"Expected cap at 45s, got {cooldown}"
+
+    def test_http_error_backoff_capped_by_cooldown_seconds(self):
+        """AC2: HTTP error backoff is capped by cooldown_seconds."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=502, content=b"Bad gateway")
+        with patch('time.time', return_value=1000.0):
+            for _ in range(2):
+                provider._handle_http_error_with_cooldown(
+                    response, "http-cap-cd-provider", "remote", 3.0, attempts=[], body_text="bad",
+                )
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "http-cap-cd-provider", "remote", 3.0, attempts=[], body_text="bad",
+            )
+            # 3rd: count=2 -> backoff=min(4,45)=4, capped by cooldown_seconds=3 -> 3
+            assert cooldown == 3.0, f"Expected cap at cooldown_seconds=3, got {cooldown}"
+
+    def test_http_error_local_provider_no_backoff(self):
+        """AC5: Local providers do NOT get exponential backoff for HTTP errors."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=502, content=b"Bad gateway")
+        with patch('time.time', return_value=1000.0):
+            for i in range(3):
+                attempts = []
+                cooldown = provider._handle_http_error_with_cooldown(
+                    response, "http-local-provider", "local", 60.0, attempts, "bad gateway",
+                )
+                assert cooldown == 60.0, (
+                    f"Call {i+1}: local provider should get 60s, got {cooldown}"
+                )
+
+    def test_empty_response_backoff_exponential_sequence(self):
+        """AC2: Empty response backoff doubles each consecutive failure (1s, 2s, 4s...)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=200, content=b"{}")
+        with patch('time.time', return_value=1000.0):
+            for i, expected in enumerate([1.0, 2.0, 4.0, 8.0, 16.0, 32.0]):
+                attempts = []
+                cooldown = provider._handle_empty_response_with_cooldown(
+                    response, "empty-seq-provider", "remote", 60.0, attempts, "{}",
+                )
+                assert cooldown == expected, (
+                    f"Call {i+1}: expected cooldown={expected}, got {cooldown}"
+                )
+
+    def test_empty_response_backoff_capped_at_45s(self):
+        """AC2: Empty response backoff is capped at BACKOFF_MAX (45s)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=200, content=b"{}")
+        with patch('time.time', return_value=1000.0):
+            for _ in range(6):
+                provider._handle_empty_response_with_cooldown(
+                    response, "empty-cap45-provider", "remote", 60.0, attempts=[], body_text="{}",
+                )
+            cooldown = provider._handle_empty_response_with_cooldown(
+                response, "empty-cap45-provider", "remote", 60.0, attempts=[], body_text="{}",
+            )
+            # 7th: count=6 -> backoff = min(64, 45) = 45
+            assert cooldown == 45.0, f"Expected cap at 45s, got {cooldown}"
+
+    def test_empty_response_local_provider_no_backoff(self):
+        """AC5: Local providers do NOT get exponential backoff for empty responses."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=200, content=b"{}")
+        with patch('time.time', return_value=1000.0):
+            for i in range(3):
+                attempts = []
+                cooldown = provider._handle_empty_response_with_cooldown(
+                    response, "empty-local-provider", "local", 60.0, attempts, "{}",
+                )
+                assert cooldown == 60.0, (
+                    f"Call {i+1}: local provider should get 60s, got {cooldown}"
+                )
+
+    def test_success_resets_failure_count_http_error(self):
+        """AC3: Success resets failure count, next failure starts at base (1s)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=502, content=b"Bad gateway")
+        with patch('time.time', return_value=1000.0):
+            # Two failures to push count to 2
+            provider._handle_http_error_with_cooldown(
+                response, "reset-provider", "remote", 60.0, attempts=[], body_text="bad",
+            )
+            provider._handle_http_error_with_cooldown(
+                response, "reset-provider", "remote", 60.0, attempts=[], body_text="bad",
+            )
+            assert provider._provider_failure_count["reset-provider"] == 2
+
+            # Reset the failure count
+            provider._reset_provider_failure_count("reset-provider")
+            assert "reset-provider" not in provider._provider_failure_count
+
+            # Next failure should start at 1s again
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "reset-provider", "remote", 60.0, attempts=[], body_text="bad",
+            )
+            assert cooldown == 1.0, f"After reset, expected 1s, got {cooldown}"
+            assert provider._provider_failure_count["reset-provider"] == 1
+
+    def test_success_resets_failure_count_empty_response(self):
+        """AC3: Success resets failure count for empty-response path."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        response = Response(status_code=200, content=b"{}")
+        with patch('time.time', return_value=1000.0):
+            # Two failures
+            provider._handle_empty_response_with_cooldown(
+                response, "reset-empty-provider", "remote", 60.0, attempts=[], body_text="{}",
+            )
+            provider._handle_empty_response_with_cooldown(
+                response, "reset-empty-provider", "remote", 60.0, attempts=[], body_text="{}",
+            )
+            assert provider._provider_failure_count["reset-empty-provider"] == 2
+
+            provider._reset_provider_failure_count("reset-empty-provider")
+
+            cooldown = provider._handle_empty_response_with_cooldown(
+                response, "reset-empty-provider", "remote", 60.0, attempts=[], body_text="{}",
+            )
+            assert cooldown == 1.0, f"After reset, expected 1s, got {cooldown}"
+
+    def test_success_resets_failure_count_connection_error(self):
+        """AC3: Success resets failure count for connection-error path."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        exc = httpx.ConnectError("Connection refused")
+        with patch('time.time', return_value=1000.0):
+            for _ in range(2):
+                provider._handle_connection_error_in_fallback(
+                    exc, "reset-conn-provider", "remote", 60.0, attempts=[],
+                )
+            assert provider._provider_failure_count["reset-conn-provider"] == 2
+
+            provider._reset_provider_failure_count("reset-conn-provider")
+            assert "reset-conn-provider" not in provider._provider_failure_count
+
+            # Next failure should start at 1s
+            provider._handle_connection_error_in_fallback(
+                exc, "reset-conn-provider", "remote", 60.0, attempts=[],
+            )
+            expiry = provider._provider_unavailable_until["reset-conn-provider"]
+            assert expiry == 1001.0, f"After reset, expected expiry=1001, got {expiry}"
+            assert provider._provider_failure_count["reset-conn-provider"] == 1
+
+    def test_retry_after_respected_alongside_backoff(self):
+        """AC4: Retry-After header is respected alongside backoff (whichever is longer)."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        with patch('time.time', return_value=1000.0):
+            # Backoff would give 1s, but Retry-After=30 should take precedence
+            response = Response(status_code=429, content=b"Rate limited", headers={"Retry-After": "30"})
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "retry-provider", "remote", 60.0, attempts=[], body_text="rate limited",
+            )
+            assert cooldown == 30.0, f"Expected max(1, 30)=30, got {cooldown}"
+
+            # With longer backoff (later in sequence), backoff may exceed Retry-After
+            provider._handle_http_error_with_cooldown(
+                response, "retry-provider", "remote", 60.0, attempts=[], body_text="rate limited",
+            )
+            # 3rd call: count=2 -> backoff=4, max(4, 30) = 30
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "retry-provider", "remote", 60.0, attempts=[], body_text="rate limited",
+            )
+            assert cooldown == 30.0, f"Expected max(4, 30)=30, got {cooldown}"
+
+            # When backoff exceeds Retry-After, backoff takes precedence
+            # Fast-forward: at count=5 (6th call), backoff=32 > retry-after=30
+            # Use a separate provider that already has accumulated failures
+            provider._provider_failure_count["retry-long-provider"] = 5
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "retry-long-provider", "remote", 60.0, attempts=[], body_text="rate limited",
+            )
+            # backoff = min(1*2^5, 45) = 32, max(32, 30) = 32
+            assert cooldown == 32.0, f"Expected max(32, 30)=32, got {cooldown}"
+
+    def test_retry_after_respected_with_empty_response(self):
+        """AC4: Retry-After header is respected alongside backoff for empty responses."""
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+        with patch('time.time', return_value=1000.0):
+            response = Response(status_code=200, content=b"{}", headers={"Retry-After": "15"})
+            cooldown = provider._handle_empty_response_with_cooldown(
+                response, "retry-empty-provider", "remote", 60.0, attempts=[], body_text="{}",
+            )
+            # backoff=1, max(1, 15) = 15
+            assert cooldown == 15.0, f"Expected max(1, 15)=15, got {cooldown}"
+
     def test_resolve_reasoning_content_promotion_matches(self):
         """_resolve_reasoning_content_promotion returns response when reasoning_content present."""
         attempts = []
