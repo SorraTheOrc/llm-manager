@@ -233,21 +233,7 @@ def _parse_retry_after(response: Response) -> Optional[float]:
         return None
 
 
-def _compute_cooldown(
-    cooldown_seconds: float,
-    response: Optional[Response] = None,
-) -> float:
-    """Compute the effective cooldown duration.
 
-    Uses the larger of the configured cooldown and any Retry-After header
-    value present in the response.
-    """
-    if response is None:
-        return cooldown_seconds
-    retry_after = _parse_retry_after(response)
-    if retry_after is not None:
-        return max(cooldown_seconds, retry_after)
-    return cooldown_seconds
 
 
 def _get_cooldown_seconds(config: dict) -> float:

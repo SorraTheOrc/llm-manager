@@ -809,7 +809,6 @@ from .provider import (  # noqa: E402, F401
     _is_http_error_status,
     _is_slot_exhaustion_response,
     _parse_retry_after,
-    _compute_cooldown,
 )
 
 
