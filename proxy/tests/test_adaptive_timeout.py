@@ -216,3 +216,92 @@ class TestAdaptiveTimeoutIntegration:
         # Large request should have extended timeout
         assert timeout >= 95.0
         assert timeout <= 300.0
+
+
+class TestAdaptiveGuardrailBudget:
+    """Tests for adaptive guardrail budget computation in router.py (LP-0MRB9AZDJ00716OT).
+
+    Verifies that the guardrail runtime budget scales with prompt size when
+    adaptive timeout is enabled, and that the fixed path is preserved when
+    adaptive timeout is disabled.
+    """
+
+    def _compute_guardrail_budget(
+        self,
+        body_json: dict,
+        adaptive_enabled: bool = True,
+        base: float = 60.0,
+        per_token: float = 0.01,
+        max_cap: float = 1800.0,
+    ) -> float:
+        """Simulate the same logic used in router.py stream_generator."""
+        if adaptive_enabled and isinstance(body_json, dict):
+            return server._compute_adaptive_timeout(
+                body_json, base, per_token, max_cap
+            )
+        else:
+            return max_cap
+
+    def test_adaptive_budget_scales_with_prompt_size(self):
+        """AC 5a: Adaptive budget should scale with prompt size."""
+        small_body = {
+            "messages": [{"role": "user", "content": "Hello, world!"}]
+        }
+        large_body = {
+            "messages": [
+                {"role": "user", "content": "This is a test. " * 1000}
+            ]
+        }
+        small_budget = self._compute_guardrail_budget(small_body)
+        large_budget = self._compute_guardrail_budget(large_body)
+        assert large_budget > small_budget, (
+            f"Expected large prompt budget ({large_budget}) > small ({small_budget})"
+        )
+
+    def test_fixed_budget_path_when_adaptive_disabled(self):
+        """AC 5b: When adaptive timeout is disabled, the fixed max cap is used."""
+        large_body = {
+            "messages": [
+                {"role": "user", "content": "x" * 100_000}
+            ]
+        }
+        budget = self._compute_guardrail_budget(
+            large_body, adaptive_enabled=False, max_cap=300.0
+        )
+        assert budget == 300.0, (
+            f"Expected fixed budget 300.0, got {budget}"
+        )
+
+    def test_large_87k_token_prompt_gets_sufficient_budget(self):
+        """AC 5c: 87k-token-scale prompts should receive >500s budget.
+
+        ~87k tokens * 0.01 = 870s, plus base 60s = 930s (capped at 1800).
+        """
+        # ~348k chars → ~87k tokens (chars // 4)
+        large_content = "x" * 348_000
+        body = {
+            "messages": [{"role": "user", "content": large_content}]
+        }
+        budget = self._compute_guardrail_budget(body)
+        assert budget > 500.0, (
+            f"Expected budget >500s for 87k-token prompt, got {budget}"
+        )
+
+    def test_adaptive_budget_uses_max_cap_as_upper_bound(self):
+        """Adaptive budget should never exceed the max cap."""
+        huge_body = {
+            "messages": [
+                {"role": "user", "content": "x" * 1_000_000}
+            ]
+        }
+        budget = self._compute_guardrail_budget(huge_body, max_cap=600.0)
+        assert budget == 600.0, (
+            f"Expected budget capped at 600.0, got {budget}"
+        )
+
+    def test_empty_body_with_adaptive_enabled(self):
+        """Empty body should fall back to base timeout when adaptive is enabled."""
+        budget = self._compute_guardrail_budget({}, base=60.0)
+        assert budget == 60.0, (
+            f"Expected base budget 60.0 for empty body, got {budget}"
+        )

@@ -31,6 +31,14 @@ logger = logging.getLogger("llama-proxy.provider")
 # In-memory cooldown tracking: provider_name -> expiry_timestamp (seconds since epoch)
 _provider_unavailable_until: Dict[str, float] = {}
 
+# Consecutive failure count for exponential backoff: provider_name -> count
+# Incremented on each failure, reset to 0 on success.
+_provider_failure_count: Dict[str, int] = {}
+
+# Exponential backoff constants (remote providers only)
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 45.0
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -131,18 +139,45 @@ def get_remote_endpoint(model_config: dict) -> Optional[str]:
 def mark_provider_unavailable(
     provider_name: str,
     cooldown_seconds: float,
+    use_exponential_backoff: bool = False,
 ) -> None:
     """Mark a provider as unavailable for the given cooldown duration.
 
-    During the cooldown period ``resolve_provider()`` will skip this
-    provider.
+    When *use_exponential_backoff* is ``True``, the actual cooldown is
+    computed via exponential backoff based on consecutive failure count
+    instead of using *cooldown_seconds* directly:
+
+        cooldown = min(BACKOFF_BASE * 2^failure_count, BACKOFF_MAX)
+
+    The failure count is incremented on each call and reset to 0 on
+    successful provider response via ``_reset_provider_failure_count()``.
 
     Args:
         provider_name: Name of the provider to mark.
         cooldown_seconds: Number of seconds the provider should be
-                          considered unavailable.
+                          considered unavailable (used as max when
+                          *use_exponential_backoff* is ``True``).
+        use_exponential_backoff: If ``True``, apply exponential backoff.
+                                 Default is ``False``.
     """
+    if use_exponential_backoff:
+        count = _provider_failure_count.get(provider_name, 0)
+        cooldown_seconds = min(
+            _BACKOFF_BASE_SECONDS * (2 ** count),
+            _BACKOFF_MAX_SECONDS,
+        )
+        _provider_failure_count[provider_name] = count + 1
+
     _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
+
+
+def _reset_provider_failure_count(provider_name: str) -> None:
+    """Reset the consecutive failure count for a provider on success.
+
+    Removes the provider from the failure count dict so that the next
+    failure starts with the base backoff interval.
+    """
+    _provider_failure_count.pop(provider_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +189,10 @@ def _is_provider_unavailable(provider_name: str) -> bool:
 
     Returns ``True`` if the provider is marked unavailable and its cooldown
     has not yet expired.  Expired entries are cleaned up lazily.
+
+    This check is global — it reads from the shared module-level dict, so
+    any session calling this function sees the same cooldown state. There is
+    no per-session isolation of cooldown state.
     """
     expiry = _provider_unavailable_until.get(provider_name)
     if expiry is None:
@@ -293,6 +332,51 @@ def _response_body_text(response: Response) -> str:
 def _add_provider_header(response: Response, provider_name: str) -> Response:
     """Add X-Provider header to a response."""
     response.headers.append("X-Provider", provider_name)
+    return response
+
+
+def _build_resolved_model_value(provider_cfg: dict) -> Optional[str]:
+    """Build the X-Resolved-Model header value from a provider config.
+
+    Returns ``<provider-name>/<model-id>`` or ``None`` if the config
+    doesn't have the required fields.
+
+    For local providers, uses ``llama_model`` as the model ID.
+    For remote providers, uses ``model`` (upstream model ID).
+
+    The provider name is taken from the ``provider`` field first (actual
+    provider brand name), falling back to ``name`` (provider entry name)
+    for backward compatibility.  A warning is logged when a remote provider
+    entry lacks the ``provider`` field.
+    """
+    provider_name = provider_cfg.get("provider") or provider_cfg.get("name")
+    if not provider_name:
+        return None
+    model_id = provider_cfg.get("llama_model") or provider_cfg.get("model")
+    if not model_id:
+        return None
+    # Warn when a remote provider entry is missing the ``provider`` field
+    if not provider_cfg.get("provider") and provider_cfg.get("type") == "remote":
+        logger.warning(
+            "Remote provider entry %r is missing the 'provider' field; "
+            "X-Resolved-Model header will use 'name' (%r) instead of the "
+            "actual provider brand name. Add 'provider: <brand>' to the "
+            "provider config to fix this.",
+            provider_cfg.get("name"),
+            provider_name,
+        )
+    return f"{provider_name}/{model_id}"
+
+
+def _add_resolved_model_header(response: Response, provider_cfg: dict) -> Response:
+    """Add X-Resolved-Model header to a response based on provider config.
+
+    Sets the header using ``_build_resolved_model_value()``. Overwrites
+    any existing value so the fallback's resolved provider takes priority.
+    """
+    value = _build_resolved_model_value(provider_cfg)
+    if value:
+        response.headers["X-Resolved-Model"] = value
     return response
 
 
@@ -627,6 +711,8 @@ def _handle_streaming_success(
             status="streaming_success",
             status_code=int(getattr(response, "status_code", 0) or 0),
         )
+        # Reset exponential-backoff failure count on success
+        _reset_provider_failure_count(provider_name)
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
@@ -662,6 +748,8 @@ def _build_fallback_success_response(
         status_code=int(getattr(response, "status_code", 0) or 0),
         body_snippet=(body_text[:512] if body_text else None),
     )
+    # Reset exponential-backoff failure count on success
+    _reset_provider_failure_count(provider_name)
     result = _add_provider_header(response, provider_name)
     if prev_provider:
         logger.info(
@@ -685,11 +773,23 @@ def _handle_connection_error_in_fallback(
     a diagnostic attempt entry, and return ``True`` (caller should ``continue``
     to the next provider).
 
+    Applies exponential backoff for remote providers (capped at configured
+    *cooldown_seconds*, so setting it to 0 disables backoff entirely).
+
     Returns ``False`` if *exc* is **not** a connection error (caller should
     re-raise or handle differently).
     """
     if _is_connection_error(exc):
-        mark_provider_unavailable(provider_name, cooldown_seconds)
+        cooldown = cooldown_seconds
+        if provider_type == "remote" and cooldown_seconds > 0:
+            count = _provider_failure_count.get(provider_name, 0)
+            backoff = min(
+                _BACKOFF_BASE_SECONDS * (2 ** count),
+                _BACKOFF_MAX_SECONDS,
+            )
+            cooldown = min(backoff, cooldown_seconds)
+            _provider_failure_count[provider_name] = count + 1
+        mark_provider_unavailable(provider_name, cooldown)
         _record_attempt(
             attempts,
             provider=provider_name,
@@ -713,12 +813,30 @@ def _handle_http_error_with_cooldown(
     provider unavailable, record a diagnostic attempt entry, and return the
     effective cooldown duration.
 
+    Applies exponential backoff for remote providers.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
     """
-    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-    mark_provider_unavailable(provider_name, effective_cooldown)
+    # Parse Retry-After separately so we can respect it alongside backoff
+    retry_after = _parse_retry_after(response)
+
+    cooldown = cooldown_seconds
+    if provider_type == "remote" and cooldown_seconds > 0:
+        count = _provider_failure_count.get(provider_name, 0)
+        backoff = min(
+            _BACKOFF_BASE_SECONDS * (2 ** count),
+            _BACKOFF_MAX_SECONDS,
+        )
+        cooldown = min(backoff, cooldown_seconds)
+        _provider_failure_count[provider_name] = count + 1
+
+    # Respect Retry-After header regardless of backoff
+    if retry_after is not None:
+        cooldown = max(cooldown, retry_after)
+
+    mark_provider_unavailable(provider_name, cooldown)
     _record_attempt(
         attempts,
         provider=provider_name,
@@ -726,9 +844,9 @@ def _handle_http_error_with_cooldown(
         status="http_error",
         status_code=int(response.status_code),
         body_snippet=(body_text[:512] if body_text else None),
-        cooldown_seconds=effective_cooldown,
+        cooldown_seconds=cooldown,
     )
-    return effective_cooldown
+    return cooldown
 
 
 def _handle_empty_response_with_cooldown(
@@ -743,12 +861,30 @@ def _handle_empty_response_with_cooldown(
     cooldown, mark the provider unavailable, record a diagnostic attempt entry,
     and return the effective cooldown duration.
 
+    Applies exponential backoff for remote providers.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
     """
-    effective_cooldown = _compute_cooldown(cooldown_seconds, response)
-    mark_provider_unavailable(provider_name, effective_cooldown)
+    # Parse Retry-After separately so we can respect it alongside backoff
+    retry_after = _parse_retry_after(response)
+
+    cooldown = cooldown_seconds
+    if provider_type == "remote" and cooldown_seconds > 0:
+        count = _provider_failure_count.get(provider_name, 0)
+        backoff = min(
+            _BACKOFF_BASE_SECONDS * (2 ** count),
+            _BACKOFF_MAX_SECONDS,
+        )
+        cooldown = min(backoff, cooldown_seconds)
+        _provider_failure_count[provider_name] = count + 1
+
+    # Respect Retry-After header regardless of backoff
+    if retry_after is not None:
+        cooldown = max(cooldown, retry_after)
+
+    mark_provider_unavailable(provider_name, cooldown)
     _record_attempt(
         attempts,
         provider=provider_name,
@@ -756,9 +892,9 @@ def _handle_empty_response_with_cooldown(
         status="empty_response",
         status_code=int(getattr(response, "status_code", 0) or 0),
         body_snippet=(body_text[:512] if body_text else None),
-        cooldown_seconds=effective_cooldown,
+        cooldown_seconds=cooldown,
     )
-    return effective_cooldown
+    return cooldown
 
 
 def _resolve_reasoning_content_promotion(
@@ -789,6 +925,8 @@ def _resolve_reasoning_content_promotion(
             status_code=int(getattr(response, "status_code", 0) or 0),
             body_snippet=(body_text[:512] if body_text else None),
         )
+        # Reset exponential-backoff failure count on success
+        _reset_provider_failure_count(provider_name)
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
@@ -947,6 +1085,8 @@ async def proxy_with_remote_fallback(
                         prev_provider, fallback_reason, path, body_text,
                     )
                     if promoted is not None:
+                        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                        _add_resolved_model_header(promoted, provider_cfg)
                         return promoted
 
                     # Shared primitive: empty response with cooldown
@@ -962,10 +1102,13 @@ async def proxy_with_remote_fallback(
                 pass
 
             # Shared primitive: success path
-            return _build_fallback_success_response(
+            result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+            _add_resolved_model_header(result, provider_cfg)
+            return result
 
         except Exception as exc:
             # Shared primitive: handle connection errors
@@ -1141,6 +1284,8 @@ async def proxy_with_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                _add_resolved_model_header(stream_result, provider_cfg)
                 return stream_result
 
             # Capture the first non-success response so we can return it when
@@ -1365,6 +1510,8 @@ async def proxy_with_fallback(
                         prev_provider, fallback_reason, path, body_text,
                     )
                     if promoted is not None:
+                        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                        _add_resolved_model_header(promoted, provider_cfg)
                         return promoted
 
                     # Local empty 200 can be transient (slot busy/cancelled
@@ -1403,6 +1550,8 @@ async def proxy_with_fallback(
                                 prev_provider, fallback_reason, path, body_text,
                             )
                             if promoted2 is not None:
+                                # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
+                                _add_resolved_model_header(promoted2, provider_cfg)
                                 return promoted2
                             # Fall through to success path below.
                             pass
@@ -1430,10 +1579,13 @@ async def proxy_with_fallback(
                 pass
 
             # Shared primitive: success path
-            return _build_fallback_success_response(
+            result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+            _add_resolved_model_header(result, provider_cfg)
+            return result
 
         except Exception as exc:
             # Shared primitive: handle connection errors
@@ -1494,11 +1646,14 @@ async def proxy_with_fallback(
                         slot_info = _parse_slot_exhaustion(response)
                         if slot_info is None and not _is_http_error_status(response.status_code):
                             # Success — record and return below via normal path.
-                            return _build_fallback_success_response(
+                            result = _build_fallback_success_response(
                                 response, provider_name, provider_type, attempts,
                                 prev_provider, fallback_reason, path, body_text,
                                 status_override="success_after_http_exception_retry",
                             )
+                            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
+                            _add_resolved_model_header(result, provider_cfg)
+                            return result
                         # Retry produced a response but still slot-exhaustion/error;
                         # fall through to normal handling by continuing the loop.
                         continue

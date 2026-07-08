@@ -413,3 +413,42 @@ class TestTokenRateGuardrailIntegrationWithEvaluate:
         assert result == "token_rate", (
             f"Expected 'token_rate' (rate exceeds threshold), got {result}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests for guardrail config defaults
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGuardrailConfigDefaults:
+    """Tests for _get_guardrail_config defaults."""
+
+    def test_guardrail_config_default_max_runtime_seconds_is_1800(self):
+        """
+        _get_guardrail_config should default to 1800s when no config is provided.
+        This is now a safety cap for the adaptive guardrail budget (LP-0MRB9AZDJ00716OT).
+        """
+        from proxy.router import _get_guardrail_config
+
+        config = _get_guardrail_config({})
+        assert config["max_runtime_seconds"] == 1800.0, (
+            f"Expected default 1800.0s, got {config['max_runtime_seconds']}"
+        )
+
+    def test_guardrail_config_honors_explicit_config(self):
+        """_get_guardrail_config should use the value from config when provided."""
+        from proxy.router import _get_guardrail_config
+
+        config = _get_guardrail_config(
+            {"session_guardrail_max_runtime_seconds": 600}
+        )
+        assert config["max_runtime_seconds"] == 600.0
+
+    def test_guardrail_config_runtime_handles_zero_value(self):
+        """_get_guardrail_config should fall back to 1800 when config is 0/falsy."""
+        from proxy.router import _get_guardrail_config
+
+        config = _get_guardrail_config(
+            {"session_guardrail_max_runtime_seconds": 0}
+        )
+        assert config["max_runtime_seconds"] == 1800.0

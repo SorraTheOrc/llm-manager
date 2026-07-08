@@ -334,18 +334,63 @@
             } catch (e) {}
           }
 
+          // Aggregate flat sent/recv and per-category breakdown
           let sent = 0, recv = 0;
+          var catSent = { user: 0, assistant: 0, tool: 0, system: 0 };
+          var catRecv = { response: 0 };
+
           for (const [k,v] of Object.entries(tokens)) {
             try {
               if (!k) continue;
               const n = Number(v || 0);
-              if (k.startsWith('sent:') && k.includes(path)) sent += n;
-              if (k.startsWith('recv:') && k.includes(path)) recv += n;
+
+              // Match category-prefixed sent keys: sent:<category>:<path...>
+              var catSentMatch = k.match(/^sent:(user|assistant|tool|system):(.+)$/);
+              if (catSentMatch && (catSentMatch[2].includes(path) || catSentMatch[2].includes(path.replace(/^\/v1\//, '/')))) {
+                catSent[catSentMatch[1]] += n;
+              }
+
+              // Match category-prefixed recv key: recv:response:<path...>
+              var catRecvMatch = k.match(/^recv:(response):(.+)$/);
+              if (catRecvMatch && (catRecvMatch[2].includes(path) || catRecvMatch[2].includes(path.replace(/^\/v1\//, '/')))) {
+                catRecv[catRecvMatch[1]] += n;
+              }
+
+              // Flat totals (only match non-prefixed keys to avoid double-count)
+              if (k.startsWith('sent:') && k.includes(path) && !k.includes('user:') && !k.includes('assistant:') && !k.includes('tool:') && !k.includes('system:')) sent += n;
+              if (k.startsWith('recv:') && k.includes(path) && !k.includes('response:')) recv += n;
             } catch (e) {}
           }
 
-          countsParts.push(`<div class="line">${label}: <strong>${reqTotal}</strong></div>`);
-          tokensParts.push(`<div class="line">${label}: <strong>sent ${sent}</strong> <span style="margin-left:8px;">recv <strong>${recv}</strong></span></div>`);
+          countsParts.push('<div class="line">' + label + ': <strong>' + reqTotal + '</strong></div>');
+
+          // Build per-category breakdown HTML
+          var sentBreakdown = '';
+          var catLabels = { user: 'User', assistant: 'Asst.', tool: 'Tool', system: 'Sys.' };
+          var parts = [];
+          for (var cat of ['user', 'assistant', 'tool', 'system']) {
+            if (catSent[cat] > 0) {
+              parts.push(catLabels[cat] + ' ' + catSent[cat]);
+            }
+          }
+          if (parts.length > 0) {
+            sentBreakdown = '<span style="font-size:0.75rem;color:var(--text-secondary);margin-left:4px;">(' + parts.join(' | ') + ')</span>';
+          }
+
+          var recvBreakdown = '';
+          var recvParts = [];
+          if (catRecv.response > 0) {
+            recvParts.push('resp. ' + catRecv.response);
+          }
+          if (recvParts.length > 0) {
+            recvBreakdown = '<span style="font-size:0.75rem;color:var(--text-secondary);margin-left:4px;">(' + recvParts.join(' | ') + ')</span>';
+          }
+
+          tokensParts.push(
+            '<div class="line">' + label + ': <strong>sent ' + sent + '</strong>' + sentBreakdown +
+            ' <span style="margin-left:8px;">recv <strong>' + recv + '</strong></span>' + recvBreakdown +
+            '</div>'
+          );
         }
 
         if (countsEl) countsEl.innerHTML = countsParts.join('') || '<div class="muted">No requests recorded yet.</div>';
@@ -603,7 +648,78 @@
         }
         convHtml += '</div>';
 
-        recordingContent.innerHTML = '<div class="recording-columns">'
+        // Build token breakdown for the selected session
+        var tokenBreakdownHtml = '';
+        var tokData = latestTokens || {};
+        var hasTokens = false;
+        var breakdownParts = [];
+        for (var def of endpointDefs) {
+          var epSentParts = [];
+          var epRecvParts = [];
+          var epSentTotal = 0, epRecvTotal = 0;
+          var catLabels = { user: 'User', assistant: 'Asst.', tool: 'Tool', system: 'Sys.', response: 'Resp.' };
+          for (var cat of ['user', 'assistant', 'tool', 'system']) {
+            var catKey = 'sent:' + cat + ':' + def.path.replace(/^\/v1\//, '/');
+            var found = false;
+            for (var [tk, tv] of Object.entries(tokData)) {
+              var cm = tk.match(new RegExp('^sent:' + cat + ':'));
+              if (cm && tk.includes(def.path)) {
+                var nv = Number(tv || 0);
+                if (nv > 0) {
+                  epSentParts.push(catLabels[cat] + ':' + nv);
+                  epSentTotal += nv;
+                  found = true;
+                }
+              }
+            }
+            if (!found) {
+              // Check with /v1/ prefix
+              for (var [tk, tv] of Object.entries(tokData)) {
+                var cm2 = tk.match(new RegExp('^sent:' + cat + ':'));
+                if (cm2 && tk.includes(def.path)) {
+                  var nv2 = Number(tv || 0);
+                  if (nv2 > 0) {
+                    epSentParts.push(catLabels[cat] + ':' + nv2);
+                    epSentTotal += nv2;
+                  }
+                }
+              }
+            }
+          }
+          // Recv breakdown
+          for (var [tk, tv] of Object.entries(tokData)) {
+            var rm = tk.match(/^recv:response:/);
+            if (rm && tk.includes(def.path)) {
+              var nv = Number(tv || 0);
+              if (nv > 0) {
+                epRecvParts.push('Resp.:' + nv);
+                epRecvTotal += nv;
+              }
+            }
+          }
+          if (epSentParts.length > 0 || epRecvParts.length > 0) {
+            hasTokens = true;
+            var line = '<div class="line" style="font-size:0.75rem;">' + def.label + ': ';
+            if (epSentParts.length > 0) {
+              line += 'sent ' + epSentParts.join(' | ');
+            }
+            if (epRecvParts.length > 0) {
+              if (epSentParts.length > 0) line += ' | ';
+              line += 'recv ' + epRecvParts.join(' | ');
+            }
+            line += '</div>';
+            breakdownParts.push(line);
+          }
+        }
+        if (hasTokens) {
+          tokenBreakdownHtml = '<div style="margin-bottom:0.5rem;padding:0.5rem;background:rgba(255,255,255,0.03);border-radius:4px;">'
+            + '<div style="font-size:0.75rem;font-weight:600;color:var(--text-secondary);margin-bottom:0.25rem;">Token Breakdown</div>'
+            + breakdownParts.join('')
+            + '</div>';
+        }
+
+        recordingContent.innerHTML = tokenBreakdownHtml
+          + '<div class="recording-columns">'
           + '<div class="recording-column">' + leftHtml + '</div>'
           + '<div class="recording-column">' + convHtml + '</div>'
           + '</div>';

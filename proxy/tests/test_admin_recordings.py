@@ -244,10 +244,11 @@ class TestAdminListSessions:
         assert "sess-abc" in session_ids
         # sess-empty has no .json files, so it should NOT be in the list
         assert "sess-empty" not in session_ids
-        # Each session should have response_time, model, provider fields
+        # Each session should have response_time, last_activity, model, provider fields
         for s in sessions:
             assert "session_id" in s
             assert "response_time" in s
+            assert "last_activity" in s
 
     def test_list_sessions_no_data(self, tmp_path):
         """list_sessions returns empty list when recording dir is empty."""
@@ -260,13 +261,13 @@ class TestAdminListSessions:
         assert recorder.list_sessions() == []
 
     def test_list_sessions_sorts_naturally(self, temp_recording_dir):
-        """Session list is sorted by response_time descending."""
+        """Session list is sorted by last_activity descending."""
         from proxy.session_recorder import SessionRecorder
         recorder = SessionRecorder(recording_path=temp_recording_dir)
 
         sessions = recorder.list_sessions()
-        # Verify sorted by response_time descending
-        times = [s.get("response_time", "") for s in sessions]
+        # Verify sorted by last_activity descending
+        times = [s.get("last_activity", "") for s in sessions]
         assert times == sorted(times, reverse=True)
 
 

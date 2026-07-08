@@ -1012,6 +1012,7 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
                 merged.append({
                     "session_id": sid,
                     "response_time": s.get("response_time", ""),
+                    "last_activity": s.get("last_activity", s.get("response_time", "")),
                     "model": s.get("model", ""),
                     "provider": s.get("provider", ""),
                     "active": False,
@@ -1031,12 +1032,9 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
             s["active"] = s.get("active", False)
             merged.append(s)
 
-    # Sort: active sessions first, then by response_time descending
-    active = [s for s in merged if s.get("active")]
-    inactive = [s for s in merged if not s.get("active")]
-    active.sort(key=lambda s: s.get("response_time", ""), reverse=True)
-    inactive.sort(key=lambda s: s.get("response_time", ""), reverse=True)
-    merged = active + inactive
+    # Sort all sessions by last_activity descending — the most recently updated
+    # session appears at the top regardless of active/inactive status.
+    merged.sort(key=lambda s: s.get("last_activity", s.get("response_time", "")), reverse=True)
 
     result = {"sessions": merged, "count": len(merged)}
     if model_filter:

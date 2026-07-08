@@ -39,8 +39,9 @@ class _DummyRequest:
 
 @pytest.fixture(autouse=True)
 def reset_cooldown_state():
-    """Reset cooldown state between tests to avoid cross-test leakage."""
+    """Reset cooldown and failure-count state between tests to avoid cross-test leakage."""
     provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
     yield
 
 
@@ -1611,7 +1612,7 @@ async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
 
     observed_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal observed_headers
         observed_headers = headers
         return Response(
@@ -1659,7 +1660,7 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -1703,7 +1704,7 @@ async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibili
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -1750,7 +1751,7 @@ async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -2183,7 +2184,7 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
 
     captured_body = None
 
-    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, _headers, body, _model_name, _timeout, **kwargs):
         nonlocal captured_body
         captured_body = body
         return Response(
@@ -2230,7 +2231,7 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_autho
 
     captured_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal captured_headers
         captured_headers = headers
         return Response(
@@ -2280,7 +2281,7 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
 
     captured_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal captured_headers
         captured_headers = headers
         return Response(
@@ -2329,7 +2330,7 @@ async def test_proxy_to_remote_falls_back_to_auth_json_when_env_var_not_set():
 
     captured_headers = None
 
-    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout):
+    async def mock_non_streaming(_req, _url, headers, _body, _model_name, _timeout, **kwargs):
         nonlocal captured_headers
         captured_headers = headers
         return Response(
@@ -2750,12 +2751,14 @@ class TestSharedFallbackPrimitives:
     def test_handle_http_error_with_cooldown_marks_unavailable(self):
         """_handle_http_error_with_cooldown marks provider and records attempt."""
         provider._provider_unavailable_until.clear()
+        provider._provider_failure_count.clear()
         attempts = []
         response = Response(status_code=502, content=b"Bad gateway")
         cooldown = provider._handle_http_error_with_cooldown(
             response, "test-provider", "remote", 60.0, attempts, "bad gateway",
         )
-        assert cooldown >= 60.0
+        # Remote providers use exponential backoff starting at 1s
+        assert cooldown == 1.0
         assert provider._is_provider_unavailable("test-provider")
         assert len(attempts) == 1
         assert attempts[0]["status"] == "http_error"
@@ -2763,12 +2766,14 @@ class TestSharedFallbackPrimitives:
     def test_handle_empty_response_with_cooldown_marks_unavailable(self):
         """_handle_empty_response_with_cooldown marks provider and records attempt."""
         provider._provider_unavailable_until.clear()
+        provider._provider_failure_count.clear()
         attempts = []
         response = Response(status_code=200, content=b"{}")
         cooldown = provider._handle_empty_response_with_cooldown(
             response, "test-provider", "remote", 60.0, attempts, "{}",
         )
-        assert cooldown >= 60.0
+        # Remote providers use exponential backoff starting at 1s
+        assert cooldown == 1.0
         assert provider._is_provider_unavailable("test-provider")
         assert len(attempts) == 1
         assert attempts[0]["status"] == "empty_response"
@@ -2847,3 +2852,187 @@ class TestSharedFallbackPrimitives:
         assert result is not None
         assert len(attempts) == 1
         assert attempts[0]["status"] == "success_after_http_exception_retry"
+
+
+# ===================================================================
+# Cross-session cooldown persistence tests
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_cross_session_cooldown_first_session_failure_skipped_by_second(sample_model_config):
+    """Cooldown set during one session is respected by a subsequent session.
+
+    Simulates two independent client sessions:
+    - Session 1: First provider fails (ReadTimeout), is marked unavailable.
+                Second provider succeeds.
+    - Session 2: First provider is still in cooldown from session 1, so
+                 it is skipped and the second provider is used directly.
+
+    This verifies that cooldown state persists across session boundaries
+    (the core requirement of LP-0MRB94JOE0075JNY).
+    """
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    # Session 1: first provider fails, second succeeds
+    session1_call_count = 0
+
+    async def _session1_mock(_req, _path, provider_cfg):
+        nonlocal session1_call_count
+        session1_call_count += 1
+        if session1_call_count == 1:
+            # First provider fails with ReadTimeout
+            raise httpx.ReadTimeout("Read timeout", request=None)
+        # Second provider succeeds
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _session1_mock):
+        result1 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result1.status_code == 200
+    assert result1.headers.get("X-Provider") == "remote-fallback"
+    assert session1_call_count == 2
+
+    # Verify first provider is now in cooldown
+    assert provider._is_provider_unavailable("remote-primary")
+
+    # Session 2: first provider is in cooldown, should be skipped
+    session2_call_count = 0
+
+    async def _session2_mock(_req, _path, provider_cfg):
+        nonlocal session2_call_count
+        session2_call_count += 1
+        # Should only be called for the second provider since first is in cooldown
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-session2"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _session2_mock):
+        result2 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result2.status_code == 200
+    # The second session should have skipped the cooldowned provider
+    # and gone directly to the second provider
+    assert result2.headers.get("X-Provider") == "remote-fallback"
+    assert session2_call_count == 1, (
+        f"Expected only 1 call (second provider), got {session2_call_count}. "
+        "First provider was in cooldown but was not skipped."
+    )
+
+
+@pytest.mark.asyncio
+async def test_cross_session_cooldown_all_providers_down(sample_model_config):
+    """When all providers are in cooldown from a previous session,
+    a new session should get 503 immediately without retrying any provider.
+
+    Simulates:
+    - Session 1: Both providers fail, both marked unavailable.
+    - Session 2: Both providers in cooldown, returns 503.
+    """
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    # Session 1: both providers fail
+    async def _session1_mock(_req, _path, provider_cfg):
+        raise httpx.ReadTimeout("Read timeout", request=None)
+
+    with patch("proxy.server.proxy_to_remote", _session1_mock):
+        result1 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result1.status_code == 503
+    assert provider._is_provider_unavailable("remote-primary")
+    assert provider._is_provider_unavailable("remote-fallback")
+
+    # Session 2: both providers in cooldown
+    # If the mock is called, the cooldown bypass has occurred
+    session2_mock_called = False
+
+    async def _session2_mock(_req, _path, provider_cfg):
+        nonlocal session2_mock_called
+        session2_mock_called = True
+        return Response(status_code=502, content=b"Bad gateway")
+
+    with patch("proxy.server.proxy_to_remote", _session2_mock):
+        result2 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result2.status_code == 503
+    assert not session2_mock_called, (
+        "Session 2 should not have called any provider - all are in cooldown. "
+        "This indicates cooldown bypass."
+    )
+
+
+@pytest.mark.asyncio
+async def test_cross_session_cooldown_does_not_affect_available_providers(mixed_model_config):
+    """Cooldown of one provider does not affect other providers.
+
+    Simulates:
+    - Session 1: Remote provider fails, marked unavailable.
+                 Local provider succeeds.
+    - Session 2: Remote provider still in cooldown, local provider available.
+                 Should use local provider directly.
+    """
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    # Session 1: local succeeds, remote would have failed but isn't reached
+    local_call_count = 0
+    remote_call_count = 0
+
+    async def _local_mock_s1(_req, _path):
+        nonlocal local_call_count
+        local_call_count += 1
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _remote_mock_s1(_req, _path, provider_cfg):
+        # This should never be called in session 1 since local succeeds
+        nonlocal remote_call_count
+        remote_call_count += 1
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    # Mark remote as unavailable to simulate it was already in cooldown
+    provider.mark_provider_unavailable("remote-fallback", 60.0)
+
+    # Mark local as NOT unavailable
+    assert not provider._is_provider_unavailable("local-llama")
+
+    with (
+        patch("proxy.router.proxy_to_local", _local_mock_s1),
+        patch("proxy.server.proxy_to_remote", _remote_mock_s1),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_call_count == 1
+    # Remote should NOT have been called (it's in cooldown, and local succeeded)
+    assert remote_call_count == 0, (
+        "Remote provider should not have been called - it's in cooldown "
+        "and local provider succeeded."
+    )
