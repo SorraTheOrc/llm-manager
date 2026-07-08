@@ -30,6 +30,7 @@ from proxy.lifecycle import (  # noqa: E402
     _is_self_healing_active,
     _self_healing_response,
     _resolve_slot_model_name,
+    _compute_adaptive_timeout,
     get_model_config,
 )
 from proxy.session import (  # noqa: E402
@@ -49,6 +50,7 @@ from proxy.session import (  # noqa: E402
     slot_lock_coordinator,
 )
 from proxy.observability import (  # noqa: E402
+    _increment_tokens,
     _record_backend_signal,
 )
 import proxy.metrics as metrics  # noqa: E402
@@ -74,6 +76,7 @@ from .router_helpers import (  # noqa: E402
     _decrement_active_queries,
     _decrement_local_active_queries,
     _estimate_tokens_sent,
+    _get_request_preview,
     _handle_session,
     _increment_active_queries,
     _increment_local_active_queries,
@@ -136,6 +139,9 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
         job_timeout=float(slot_config.get("slot_job_timeout_seconds", 300.0) or 300.0),
         queue_overflow_retry_after=float(
             slot_config.get("slot_queue_overflow_retry_after", 900) or 900
+        ),
+        max_request_duration=float(
+            slot_config.get("slot_max_request_duration_seconds", 600.0) or 600.0
         ),
     )
     # Wire scheduler into SlotLockCoordinator
@@ -207,7 +213,15 @@ def _build_session_headers(
 
 
 def _get_guardrail_config(server_config: dict) -> dict:
-    """Extract guardrail parameters from server config."""
+    """Extract guardrail parameters from server config.
+
+    Defaults (when config keys are absent or falsy):
+        max_runtime_seconds: 1800 (30 minutes) — acts as safety cap for adaptive budget
+        max_completion_tokens: 2048
+        repetition_min_pattern_chars: 64
+        repetition_min_repeats: 10
+        invalidate_on_guardrail: False
+    """
     return {
         "max_runtime_seconds": float(
             server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
@@ -851,6 +865,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             is_delta_request, session_fallback_reason,
                         )
                     )
+                    # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                    outgoing_headers["X-Resolved-Model"] = f"local/{model_name}"
                     media_type = response.headers.get(
                         "content-type", "text/event-stream"
                     )
@@ -862,6 +878,31 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     chunk_history: list[tuple[float, str]] = []
                     gc = _get_guardrail_config(server_config)
                     max_runtime_seconds = gc["max_runtime_seconds"]
+                    # Compute adaptive guardrail budget when adaptive timeout is enabled
+                    # (LP-0MRB9AZDJ00716OT).  Reuses the same adaptive timeout formula
+                    # from lifecycle.py that is already used for the HTTP request timeout.
+                    _adaptive_enabled = server_config.get(
+                        "llama_adaptive_timeout_enabled", False
+                    )
+                    if _adaptive_enabled and isinstance(body_json, dict):
+                        _adaptive_base = float(
+                            server_config.get(
+                                "llama_adaptive_timeout_base_seconds", 60
+                            )
+                        )
+                        _adaptive_per_token = float(
+                            server_config.get(
+                                "llama_adaptive_timeout_per_token_seconds", 0.01
+                            )
+                        )
+                        runtime_budget = _compute_adaptive_timeout(
+                            body_json,
+                            _adaptive_base,
+                            _adaptive_per_token,
+                            max_runtime_seconds,
+                        )
+                    else:
+                        runtime_budget = float(max_runtime_seconds)
                     max_completion_tokens = gc["max_completion_tokens"]
                     repetition_min_pattern_chars = gc["repetition_min_pattern_chars"]
                     repetition_min_repeats = gc["repetition_min_repeats"]
@@ -869,6 +910,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     invalidate_on_repetition = gc["invalidate_on_repetition"]
                     max_token_rate = gc["max_token_rate"]
                     token_rate_window_seconds = gc["token_rate_window_seconds"]
+                    stream_idle_timeout = float(
+                        server_config.get("stream_idle_timeout_seconds", 30) or 30
+                    )
+                    stream_heartbeat_interval = float(
+                        server_config.get("stream_heartbeat_interval_seconds", 10) or 10
+                    )
 
                     async def stream_generator():
                         nonlocal guardrail_reason, guardrail_response_text, completion_tokens_total, slot_save_allowed, chunk_history
@@ -879,117 +926,176 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         # Client disconnect detection (LP-0MQTHP828000JYM6)
                         disconnected = False
                         _disconnect_check_count = 0
+
+                        # Log stream started with session context (LP-0MR90HJED005WI1Z)
                         try:
-                            async for chunk in response.aiter_bytes():
-                                # count tokens in this chunk (best-effort)
+                            _request_preview = _get_request_preview(body_json)
+                            srv.logger.info(
+                                "Stream started: provider=local model=%s session=%s request=%s",
+                                model_name,
+                                session_id or "unknown",
+                                _request_preview or "",
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            # Use asyncio.wait(FIRST_COMPLETED) to concurrently
+                            # listen for two events:
+                            #   1. A chunk from the upstream (aiter_bytes)
+                            #   2. A heartbeat interval expiry
+                            #
+                            # Unlike asyncio.wait_for(), this approach does NOT
+                            # cancel the pending tasks when the heartbeat fires.
+                            # Cancelling an in-flight httpx read would destroy the
+                            # underlying HTTP connection (llama-server sees "Connection
+                            # handling canceled").
+                            #
+                            # Budget tracking:
+                            #   Phase 1 (pre-fill / first chunk): budget =
+                            #     max_runtime_seconds (long — large prompt ingestion).
+                            #   Phase 2 (between chunks): budget =
+                            #     stream_idle_timeout_seconds (short).
+                            _stream_aiter = response.aiter_bytes().__aiter__()
+                            _stream_iter = asyncio.ensure_future(
+                                _stream_aiter.__anext__()
+                            )
+                            _heartbeat_interval = stream_heartbeat_interval
+                            _heartbeat_bytes = b"data: {\"type\":\"heartbeat\"}\n\n"
+                            remaining_budget = runtime_budget
+                            while True:
+                                _hb_task = asyncio.ensure_future(
+                                    asyncio.sleep(_heartbeat_interval)
+                                )
+                                done, pending = await asyncio.wait(
+                                    [_stream_iter, _hb_task],
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                # CRITICAL: only cancel the heartbeat task (the
+                                # one we just created), NEVER cancel _stream_iter
+                                # (the pending upstream read).  Cancelling an
+                                # in-flight httpx read would destroy the HTTP
+                                # connection to llama-server.
+                                if _hb_task in done:
+                                    # Heartbeat interval elapsed with no chunk.
+                                    if remaining_budget <= _heartbeat_interval:
+                                        srv.logger.info(
+                                            "stream_idle_timeout session=%s "
+                                            "idle=%.1fs budget=%.1fs",
+                                            session_id[:8] if session_id else "unknown",
+                                            stream_idle_timeout,
+                                            remaining_budget,
+                                        )
+                                        break
+                                    remaining_budget -= _heartbeat_interval
+                                    yield _heartbeat_bytes
+                                    continue
+
+                                # A chunk arrived — cancel the heartbeat task
+                                _hb_task.cancel()
+                                try:
+                                    await _hb_task
+                                except asyncio.CancelledError:
+                                    pass
+
+                                try:
+                                    chunk = _stream_iter.result()
+                                except StopAsyncIteration:
+                                    break
+
+                                # ── process this chunk ──────────────────────
                                 try:
                                     chunk_text = chunk.decode(
                                         "utf-8", errors="replace"
                                     )
-                                    chunk_tokens = count_text_tokens(
-                                        chunk_text, model_name
-                                    )
-                                    delta_text = (
-                                        _extract_delta_text_from_sse_chunk(
-                                            chunk_text
-                                        )
-                                    )
-                                    if delta_text:
-                                        completion_tokens_total += (
-                                            count_text_tokens(
-                                                delta_text, model_name
-                                            )
-                                        )
-                                        guardrail_response_text = (
-                                            guardrail_response_text
-                                            + delta_text
-                                        )[-2000:]
-                                    try:
-                                        loop = asyncio.get_running_loop()
-                                        loop.create_task(
-                                            _increment_tokens(
-                                                "recv",
-                                                key,
-                                                chunk_tokens,
-                                            )
-                                        )
-                                    except RuntimeError:
-                                        asyncio.run(
-                                            _increment_tokens(
-                                                "recv",
-                                                key,
-                                                chunk_tokens,
-                                            )
-                                        )
                                 except Exception:
                                     chunk_text = ""
-                                    delta_text = ""
 
-                                # Track chunk for token-rate guardrail (rolling window)
+                                chunk_tokens = count_text_tokens(
+                                    chunk_text, model_name
+                                )
+                                delta_text = _extract_delta_text_from_sse_chunk(
+                                    chunk_text
+                                )
+                                if delta_text:
+                                    completion_tokens_total += count_text_tokens(
+                                        delta_text, model_name
+                                    )
+                                    guardrail_response_text = (
+                                        guardrail_response_text + delta_text
+                                    )[-2000:]
+                                try:
+                                    loop = asyncio.get_running_loop()
+                                    loop.create_task(
+                                        _increment_tokens("recv", key, chunk_tokens)
+                                    )
+                                    loop.create_task(
+                                        _increment_tokens("recv", f"response:{key}", chunk_tokens)
+                                    )
+                                except RuntimeError:
+                                    asyncio.run(
+                                        _increment_tokens("recv", key, chunk_tokens)
+                                    )
+                                    asyncio.run(
+                                        _increment_tokens("recv", f"response:{key}", chunk_tokens)
+                                    )
+
                                 now_ts = time.monotonic()
                                 chunk_history.append((now_ts, chunk_text))
 
-                                # Emit token-rate metrics (best-effort) — gauge + histogram per-session
+                                # token-rate metrics
                                 try:
-                                    # Only emit if prometheus metrics enabled and we have a session_id
                                     if getattr(metrics, '_enabled', False) and session_id:
-                                        # Compute instantaneous rate from last two chunks
                                         if len(chunk_history) >= 2:
                                             t_prev, _ = chunk_history[-2]
                                             t_curr, _ = chunk_history[-1]
                                             elapsed = t_curr - t_prev
                                             if elapsed > 0:
-                                                # chunk_tokens computed earlier represents tokens in this raw chunk
-                                                try:
-                                                    token_rate = float(chunk_tokens) / float(elapsed)
-                                                except Exception:
-                                                    token_rate = 0.0
-                                                try:
-                                                    # Use session_id label to scope metrics
-                                                    metrics.llama_token_rate_gauge.labels(session_id=session_id).set(token_rate)
-                                                    metrics.llama_token_rate_histogram.labels(session_id=session_id).observe(token_rate)
-                                                except Exception:
-                                                    pass
+                                                token_rate = float(chunk_tokens) / float(elapsed)
+                                                metrics.llama_token_rate_gauge.labels(session_id=session_id).set(token_rate)
+                                                metrics.llama_token_rate_histogram.labels(session_id=session_id).observe(token_rate)
                                 except Exception:
                                     pass
 
-                                # Inspect SSE-style 'data:' lines for finish indicators
+                                # Determine if this chunk carries actual SSE data
+                                # (as opposed to a keepalive comment ":").
+                                # Only actual data chunks reset the between-chunks
+                                # budget, preventing premature timeout on slow
+                                # upstream processing.
+                                txt = chunk.decode("utf-8", errors="replace")
+                                _has_actual_data = bool(
+                                    txt.strip()
+                                    and not txt.strip().startswith(":")
+                                )
+
+                                # SSE finish indicators
                                 try:
-                                    txt = chunk.decode(
-                                        "utf-8", errors="replace"
-                                    )
                                     for line in txt.splitlines():
                                         line = line.strip()
-                                        if not line.startswith(
-                                            "data:"
-                                        ):
+                                        if not line.startswith("data:"):
                                             continue
                                         payload = line[5:].strip()
                                         if payload == "[DONE]":
                                             saw_done = True
+                                            _has_actual_data = True
                                         else:
                                             try:
                                                 j = json.loads(payload)
-                                                for choice in j.get(
-                                                    "choices", []
-                                                ):
-                                                    if (
-                                                        choice.get(
-                                                            "finish_reason"
-                                                        )
-                                                        is not None
-                                                    ):
+                                                for choice in j.get("choices", []):
+                                                    if choice.get("finish_reason") is not None:
                                                         saw_finish = True
                                             except Exception:
-                                                # ignore non-json payloads
                                                 pass
                                 except Exception:
                                     pass
 
+                                if _has_actual_data:
+                                    remaining_budget = float(stream_idle_timeout)
+
+                                # guardrail check
                                 if not guardrail_reason:
                                     guardrail_reason = evaluate_stream_guardrail(
-                                        runtime_seconds=time.monotonic()
-                                        - stream_start,
+                                        runtime_seconds=time.monotonic() - stream_start,
                                         completion_tokens=completion_tokens_total,
                                         response_text=guardrail_response_text,
                                         max_runtime_seconds=max_runtime_seconds,
@@ -1001,24 +1107,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         token_rate_window_seconds=token_rate_window_seconds,
                                     )
                                     if guardrail_reason:
-                                        _record_guardrail_cutoff(
-                                            guardrail_reason
-                                        )
+                                        _record_guardrail_cutoff(guardrail_reason)
                                         srv.logger.warning(
                                             "session_guardrail_cutoff session=%s reason=%s",
-                                            session_id[:8]
-                                            if session_id
-                                            else "unknown",
+                                            session_id[:8] if session_id else "unknown",
                                             guardrail_reason,
                                         )
-                                        should_invalidate = (
-                                            _should_invalidate_on_guardrail(
-                                                guardrail_reason,
-                                                invalidate_on_guardrail,
-                                                bool(
-                                                    invalidate_on_repetition
-                                                ),
-                                            )
+                                        should_invalidate = _should_invalidate_on_guardrail(
+                                            guardrail_reason,
+                                            invalidate_on_guardrail,
+                                            bool(invalidate_on_repetition),
                                         )
                                         if session_id and should_invalidate:
                                             await _invalidate_session_and_slot(
@@ -1031,18 +1129,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                             slot_save_allowed = False
                                         break
 
-                                # Collect content for session history if session is active
+                                # collect session history
                                 if session_id:
                                     try:
                                         collected_content.append(
-                                            chunk.decode(
-                                                "utf-8", errors="replace"
-                                            )
+                                            chunk.decode("utf-8", errors="replace")
                                         )
                                     except Exception:
                                         pass
 
-                                # Check for client disconnect periodically (LP-0MQTHP828000JYM6)
+                                # client disconnect
                                 _disconnect_check_count += 1
                                 if _disconnect_check_count % 10 == 0:
                                     try:
@@ -1059,9 +1155,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         pass
 
                                 yield chunk
-                                log_response_chunk(chunk)
+                                log_response_chunk(chunk, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+
+                                # Prepare the next anext task
+                                _stream_iter = asyncio.ensure_future(
+                                    _stream_aiter.__anext__()
+                                )
+
                             # Synthesize final SSE event if upstream closed without finish marker.
-                            # Skip if client disconnected (LP-0MQTHP828000JYM6)
                             if not disconnected and not saw_done and not saw_finish:
                                 finish_reason = (
                                     "stop"
@@ -1081,9 +1182,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     f"data: {json.dumps(final_obj)}\n\n"
                                 ).encode("utf-8")
                                 yield final_bytes
-                                log_response_chunk(
-                                    final_bytes
-                                )
+                                log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
                             # Client disconnected or generator is being closed.
                             # Skip the final event yield and proceed directly to cleanup.
@@ -1093,11 +1192,28 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Log and let the finally block handle cleanup so backend_ready
                             # is not spuriously set to False (which would cooldown the
                             # local provider and trigger fallback to remotes).
-                            srv.logger.warning(
-                                "Stream error during local response for model=%s: %s",
-                                model_name,
-                                type(exc).__name__,
-                            )
+                            try:
+                                _error_type = type(exc).__name__
+                                srv.logger.warning(
+                                    "Stream error: session=%s provider=local model=%s error=%s",
+                                    session_id or "unknown",
+                                    model_name,
+                                    _error_type,
+                                )
+                            except Exception:
+                                pass
+                            # Synthesize a final SSE event so the client receives a
+                            # proper finish_reason marker even on stream error.
+                            final_obj = {
+                                "choices": [
+                                    {"delta": {}, "finish_reason": "error", "index": 0}
+                                ]
+                            }
+                            final_bytes = (
+                                f"data: {json.dumps(final_obj)}\n\n"
+                            ).encode("utf-8")
+                            yield final_bytes
+                            log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
                             # Record assembled streaming response (fire-and-forget)
                             if session_id and collected_content:
@@ -1134,6 +1250,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (asyncio.TimeoutError, Exception):
                                 pass
+                            # Clean up the pending _stream_iter task if the
+                            # stream_generator used FIRST_COMPLETED waiting.
+                            try:
+                                if _stream_iter is not None and not _stream_iter.done():
+                                    _stream_iter.cancel()
+                                    try:
+                                        await _stream_iter
+                                    except (asyncio.CancelledError, StopAsyncIteration):
+                                        pass
+                            except (NameError, AttributeError):
+                                # _stream_iter may not exist in all code paths
+                                pass
+
                             # Decrement local active queries now that the stream
                             # has finished (LP-0MR96QL8400022BW: streaming path was
                             # not decrementing local_active_queries, causing subsequent
@@ -1306,6 +1435,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     is_delta_request, session_fallback_reason,
                                 )
                             )
+                            # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+                            resp_headers["X-Resolved-Model"] = f"local/{model_name}"
 
                             return Response(
                                 content=response.content,

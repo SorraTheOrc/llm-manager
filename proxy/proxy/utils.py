@@ -457,7 +457,7 @@ def setup_logging(config: dict) -> logging.Logger:
         try:
             dir_path.mkdir(parents=True, exist_ok=True)
         except PermissionError:
-            dir_path = Path(__file__).parent / "logs"
+            dir_path = Path(__file__).parent.parent / "logs"
             dir_path.mkdir(parents=True, exist_ok=True)
             print(f"[INFO] Using local log directory: {dir_path}")
 
@@ -491,5 +491,10 @@ def setup_logging(config: dict) -> logging.Logger:
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
     logger.addHandler(console_handler)
+
+    logger.info(
+        "Logging initialised at %s",
+        log_file,
+    )
 
     return logger

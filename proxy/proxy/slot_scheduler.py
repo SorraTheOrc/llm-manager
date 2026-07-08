@@ -56,6 +56,7 @@ class SlotState:
     job_assigned_at: Optional[float] = None
     job_last_request_at: Optional[float] = None
     active_requests: int = 0
+    request_started_at: Optional[float] = None
 
 
 @dataclass
@@ -100,6 +101,7 @@ class JobScheduler:
         max_queue_depth: int,
         job_timeout: float,
         queue_overflow_retry_after: float = 900.0,
+        max_request_duration: float = 600.0,
     ):
         if pool_size < 1:
             raise ValueError("pool_size must be >= 1")
@@ -114,16 +116,18 @@ class JobScheduler:
         self.slot_to_job: Dict[int, str] = {}  # slot_id → session_id
         self.job_timeout = job_timeout
         self.queue_overflow_retry_after = queue_overflow_retry_after
+        self.max_request_duration = max_request_duration
         self._timeout_check_task: Optional[asyncio.Task] = None
         # Tracking for queued job removal (LP-0MQTHP828000JYM6)
         self._queued_jobs: Dict[str, QueuedJob] = {}  # session_id -> QueuedJob
         self._cancelled_jobs: set[str] = set()  # session_ids marked for removal
 
         logger.info(
-            "scheduler init pool_size=%s max_queue_depth=%s job_timeout=%s",
+            "scheduler init pool_size=%s max_queue_depth=%s job_timeout=%s max_request_duration=%s",
             pool_size,
             max_queue_depth,
             job_timeout,
+            max_request_duration,
         )
 
     async def start(self) -> None:
@@ -228,10 +232,14 @@ class JobScheduler:
 
         This increments the active-request counter, preventing the
         background timeout check from releasing the slot while a
-        request is actively being served.
+        request is actively being served.  Also records the start
+        timestamp so that abnormally long-lived requests can be
+        detected and released (see max_request_duration in
+        _check_timeouts_now).
         """
         if slot_id in self.slots:
             self.slots[slot_id].active_requests += 1
+            self.slots[slot_id].request_started_at = time.monotonic()
 
     def has_idle_slot(self) -> bool:
         """
@@ -331,6 +339,7 @@ class JobScheduler:
         slot_state.job_assigned_at = None
         slot_state.job_last_request_at = None
         slot_state.active_requests = 0
+        slot_state.request_started_at = None
 
         if job_id and job_id in self.active_jobs:
             del self.active_jobs[job_id]
@@ -370,19 +379,22 @@ class JobScheduler:
 
     async def _check_timeouts_now(self) -> None:
         """
-        Single-pass timeout check. Releases all jobs that have been idle
-        for longer than self.job_timeout.
+        Single-pass timeout check. Releases slots under two conditions:
 
-        Skips slots that have active requests in flight to prevent
-        premature release during a streaming response.
+        1. **Idle timeout** — a slot whose last request finished longer
+           than *job_timeout* ago is released (existing behaviour).
+        2. **Request duration timeout** — a slot whose active request has
+           been running for longer than *max_request_duration* is
+           force-released.  This prevents slots from being stuck forever
+           when ``mark_request_end`` is never called (e.g. crash, abnormal
+           disconnect — LP-0MRB29YF0001YBU2).
         """
         now = time.monotonic()
         for slot_id, slot_state in self.slots.items():
-            if (
-                slot_state.state == "Owned"
-                and slot_state.job_last_request_at is not None
-                and slot_state.active_requests == 0
-            ):
+            if slot_state.state != "Owned":
+                continue
+
+            if slot_state.job_last_request_at is not None and slot_state.active_requests == 0:
                 idle_time = now - slot_state.job_last_request_at
                 if idle_time > self.job_timeout:
                     logger.warning(
@@ -390,6 +402,21 @@ class JobScheduler:
                         slot_id,
                         (slot_state.job_id[:8] if slot_state.job_id else "none"),
                         idle_time,
+                    )
+                    await self.release_slot(slot_id)
+            elif (
+                slot_state.active_requests > 0
+                and slot_state.request_started_at is not None
+            ):
+                request_duration = now - slot_state.request_started_at
+                if request_duration > self.max_request_duration:
+                    logger.warning(
+                        "scheduler force_release slot=%s job=%s request_duration=%.1fs "
+                        "exceeded max_request_duration=%.1fs",
+                        slot_id,
+                        (slot_state.job_id[:8] if slot_state.job_id else "none"),
+                        request_duration,
+                        self.max_request_duration,
                     )
                     await self.release_slot(slot_id)
 

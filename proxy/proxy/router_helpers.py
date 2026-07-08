@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Mapping, Union
 
 import httpx
 from fastapi import HTTPException, Request
@@ -35,6 +35,51 @@ def _srv():
 # ===================================================================
 # Request/response logging helpers
 # ===================================================================
+
+def _get_request_preview(body_json: Optional[Union[dict, bytes]]) -> str:
+    """Extract the first 80 characters of the first non-system user message.
+
+    Parses the JSON body to find the first message whose ``role`` is not
+    ``"system"`` and returns the first 80 characters of its ``content``
+    field, appending ``...`` if the content is longer than 80 characters.
+
+    Returns an empty string if the body cannot be parsed, contains no
+    messages, or contains only system messages.
+
+    Parameters
+    ----------
+    body_json : dict or bytes or None
+        The request body as a parsed dict, raw bytes, or None.
+
+    Returns
+    -------
+    str
+        The request preview (max 83 characters including ``...``).
+    """
+    try:
+        if isinstance(body_json, bytes):
+            body_json = json.loads(body_json.decode("utf-8", errors="replace"))
+        if not isinstance(body_json, dict):
+            return ""
+        messages = body_json.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "system":
+                continue
+            content = msg.get("content", "")
+            if not content:
+                continue
+            content_str = str(content)
+            if len(content_str) > 80:
+                return content_str[:80] + "..."
+            return content_str
+    except Exception:
+        pass
+    return ""
+
 
 def _strip_system_messages_from_preview(body: bytes) -> str:
     """Produce a body preview that excludes system message content.
@@ -156,16 +201,81 @@ def log_response(status_code: int, content: bytes) -> None:
         pass
 
 
-def log_response_chunk(chunk: bytes) -> None:
+def log_response_chunk(
+    chunk: bytes,
+    session_id: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    body_json: Optional[Union[dict, bytes]] = None,
+) -> None:
     """Log streaming response chunk.
 
-    The ContentOnlyConsoleHandler extracts and displays just the content to console.
-    Raw JSON is written to the log file only.
+    The ContentOnlyConsoleHandler no longer displays streaming content to the
+    console (LP-0MR90HJED005WI1Z). Raw JSON is written to the log file only.
+
+    If the chunk contains a ``finish_reason`` in any ``choices[]`` entry,
+    an enhanced ``Stream finished: reason=<reason>`` log line is emitted
+    so the stop reason (and optional token usage) appears in both console
+    and file logs. When *session_id*, *model*, and *provider* are provided,
+    they are appended to the log line.
+
+    When *body_json* is provided, a request preview (first 80 characters of
+    the first non-system user message) is included in the finished line.
     """
     srv = _srv()
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
         srv.logger.info(f"STREAM CHUNK | {chunk_str}")
+    except Exception:
+        pass
+
+    # Detect finish_reason and log stop-reason line (LP-0MQZXHHHO0063YCI)
+    try:
+        if not chunk:
+            return
+        chunk_full = chunk.decode("utf-8", errors="replace")
+        for line in chunk_full.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                j = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(j, dict):
+                continue
+            # Look for finish_reason in any choices[] entry
+            finish_reason = None
+            for choice in j.get("choices", []):
+                if isinstance(choice, dict):
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reason = fr
+                        break
+            if finish_reason is not None:
+                parts = [f"Stream finished: reason={finish_reason}"]
+                usage = j.get("usage")
+                if isinstance(usage, dict):
+                    pt = usage.get("prompt_tokens")
+                    ct = usage.get("completion_tokens")
+                    tt = usage.get("total_tokens")
+                    if pt is not None or ct is not None or tt is not None:
+                        parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
+                # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
+                if session_id:
+                    parts.append(f"session={session_id}")
+                if provider:
+                    parts.append(f"provider={provider}")
+                if model:
+                    parts.append(f"model={model}")
+                if body_json is not None:
+                    preview = _get_request_preview(body_json)
+                    if preview:
+                        parts.append(f"request={preview}")
+                srv.logger.info(" ".join(parts))
     except Exception:
         pass
 
@@ -537,9 +647,11 @@ async def _try_acquire_local_dispatch(
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    A record is stale when it is not active and its *expires_at* timestamp
-    has passed (``time.monotonic() > expires_at``).  Each removed record
-    is logged with its session ID and reason.
+    A record is stale when its *expires_at* timestamp has passed
+    (``time.monotonic() > expires_at``), regardless of whether it is
+    *active* or *inactive*.  This ensures abandoned/crashed requests
+    (where *active* stays ``True`` permanently) are eventually cleaned.
+    Each removed record is logged with its session ID and reason.
 
     Returns the number of records removed.
     """
@@ -550,7 +662,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             stale_ids = [
                 sid
                 for sid, record in srv.local_dispatch_records.items()
-                if not record.get("active") and record.get("expires_at", 0) <= now
+                if record.get("expires_at", 0) <= now
             ]
             for sid in stale_ids:
                 del srv.local_dispatch_records[sid]
@@ -748,44 +860,135 @@ def _should_force_full_prompt_from_config(
 
 def _estimate_tokens_sent(
     body: bytes, body_json: dict, model_name: Optional[str]
-) -> int:
-    """Estimate tokens sent in the request body."""
+) -> dict:
+    """Estimate tokens sent in the request body, broken down by category.
+
+    Returns a dict with keys ``user``, ``assistant``, ``tool``, ``system``
+    mapping to integer token counts for each message role.
+
+    Category mapping:
+    - **User messages**: tokens in ``role: "user"`` message content
+    - **Agent responses**: tokens in ``role: "assistant"`` message content
+    - **Tool Calls**: tokens in ``role: "tool"`` message content +
+      tool_use content blocks within assistant messages + ``tools`` array
+      definitions
+    - **System Prompt**: tokens in the ``system`` field or
+      ``role: "system"`` message content
+
+    Falls back to the ``user`` category for non-message formats
+    (e.g. raw ``/v1/completions`` input).
+    """
     from proxy.utils import count_text_tokens
-    
+
+    result = {"user": 0, "assistant": 0, "tool": 0, "system": 0}
+
     try:
-        tokens_sent = 0
         if isinstance(body_json, dict) and "messages" in body_json:
-            for m in body_json.get("messages", []):
-                tokens_sent += count_text_tokens(
-                    str(m.get("content", "")), model_name
+            messages = body_json.get("messages", [])
+            # First pass: count content tokens per role
+            for m in messages:
+                role = m.get("role", "")
+                content = str(m.get("content", ""))
+                tokens = count_text_tokens(content, model_name)
+                if role == "user":
+                    result["user"] += tokens
+                elif role == "assistant":
+                    result["assistant"] += tokens
+                elif role == "tool":
+                    result["tool"] += tokens
+                elif role == "system":
+                    result["system"] += tokens
+                else:
+                    # Unknown role — attribute to user as fallback
+                    result["user"] += tokens
+
+            # Second pass: count tool_calls embedded in assistant messages
+            for m in messages:
+                if m.get("role") == "assistant":
+                    tool_calls = m.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            func = tc.get("function", {})
+                            args_str = func.get("arguments", "")
+                            if args_str:
+                                result["tool"] += count_text_tokens(
+                                    str(args_str), model_name
+                                )
+                            name_str = func.get("name", "")
+                            if name_str:
+                                result["tool"] += count_text_tokens(
+                                    str(name_str), model_name
+                                )
+
+            # Count tools array definitions
+            tools = body_json.get("tools")
+            if tools:
+                import json as _json
+                result["tool"] += count_text_tokens(
+                    _json.dumps(tools, separators=(",", ":"), ensure_ascii=False),
+                    model_name,
                 )
+
         elif isinstance(body_json, dict) and "input" in body_json:
             inp = body_json["input"]
             if isinstance(inp, list):
                 for it in inp:
-                    tokens_sent += count_text_tokens(str(it), model_name)
+                    result["user"] += count_text_tokens(str(it), model_name)
             else:
-                tokens_sent += count_text_tokens(str(inp), model_name)
+                result["user"] += count_text_tokens(str(inp), model_name)
         else:
-            tokens_sent += count_text_tokens(
+            result["user"] += count_text_tokens(
                 body.decode("utf-8", errors="replace"), model_name
             )
     except Exception:
-        tokens_sent = 0
-    return tokens_sent
+        result = {"user": 0, "assistant": 0, "tool": 0, "system": 0}
+    return result
 
 
 async def _schedule_token_increment(
-    key: str, tokens: int
+    key: str, tokens: Any
 ) -> None:
-    """Schedule a token increment in the running event loop."""
+    """Schedule a token increment in the running event loop.
+
+    Accepts either:
+    - A ``dict`` with per-category keys (``user``, ``assistant``, ``tool``,
+      ``system``) for the new per-category breakdown.
+    - An ``int`` for backward compatibility with existing callers and tests.
+
+    When a dict is provided, both the category-prefixed keys
+    (``sent:<category>:<key>``) and the flat total key (``sent:<key>``)
+    are incremented.
+    """
     from proxy.observability import _increment_tokens
-    
+
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_increment_tokens("sent", key, tokens))
+        if isinstance(tokens, dict):
+            total = 0
+            for category, count in tokens.items():
+                if count > 0:
+                    total += count
+                    loop.create_task(
+                        _increment_tokens("sent", f"{category}:{key}", count)
+                    )
+            if total > 0:
+                loop.create_task(_increment_tokens("sent", key, total))
+        else:
+            # Legacy int path
+            loop.create_task(_increment_tokens("sent", key, int(tokens)))
     except RuntimeError:
-        asyncio.run(_increment_tokens("sent", key, tokens))
+        if isinstance(tokens, dict):
+            total = 0
+            for category, count in tokens.items():
+                if count > 0:
+                    total += count
+                    asyncio.run(
+                        _increment_tokens("sent", f"{category}:{key}", count)
+                    )
+            if total > 0:
+                asyncio.run(_increment_tokens("sent", key, total))
+        else:
+            asyncio.run(_increment_tokens("sent", key, int(tokens)))
     except Exception:
         pass
 
@@ -793,14 +996,25 @@ async def _schedule_token_increment(
 async def _schedule_recv_token_increment(
     key: str, tokens: int
 ) -> None:
-    """Schedule a received token increment."""
+    """Schedule a received token increment.
+
+    Stores both the flat recv key (``recv:<key>``) for backward
+    compatibility and the category-prefixed key
+    (``recv:response:<key>``) for the per-category breakdown.
+    """
     from proxy.observability import _increment_tokens
-    
+
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_increment_tokens("recv", key, tokens))
+        loop.create_task(
+            _increment_tokens("recv", f"response:{key}", tokens)
+        )
     except RuntimeError:
         asyncio.run(_increment_tokens("recv", key, tokens))
+        asyncio.run(
+            _increment_tokens("recv", f"response:{key}", tokens)
+        )
     except Exception:
         pass
 
@@ -877,7 +1091,7 @@ def _compute_request_timeout(
         per_token_timeout = float(
             server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01)
         )
-        max_timeout = float(server_config.get("llama_request_timeout", 300))
+        max_timeout = float(server_config.get("llama_request_timeout", 1800))
         timeout_seconds = _compute_adaptive_timeout(
             body_json, base_timeout, per_token_timeout, max_timeout
         )
@@ -887,7 +1101,7 @@ def _compute_request_timeout(
             timeout_seconds,
         )
     else:
-        timeout_seconds = server_config.get("llama_request_timeout", 300)
+        timeout_seconds = server_config.get("llama_request_timeout", 1800)
     return httpx.Timeout(timeout_seconds)
 
 

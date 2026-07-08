@@ -491,68 +491,6 @@ class TestContentOnlyConsoleHandler:
     def handler(self):
         return server.ContentOnlyConsoleHandler()
 
-    # _extract_and_format_content
-
-    def test_extract_format_content_reasoning_content(self, handler):
-        """_extract_and_format_content extracts reasoning_content with dim formatting."""
-        chunk = 'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n'
-        result = handler._extract_and_format_content(chunk)
-        assert result is not None
-        assert handler.DIM in result
-        assert "thinking..." in result
-        assert handler.RESET in result
-
-    def test_extract_format_content_content(self, handler):
-        """_extract_and_format_content extracts content with bold formatting."""
-        chunk = 'data: {"choices":[{"delta":{"content":"Hello"}}]}\n'
-        result = handler._extract_and_format_content(chunk)
-        assert result is not None
-        assert handler.BOLD in result
-        assert "Hello" in result
-        assert handler.RESET in result
-
-    def test_extract_format_content_both(self, handler):
-        """_extract_and_format_content handles both reasoning_content and content."""
-        chunk = 'data: {"choices":[{"delta":{"reasoning_content":"think","content":"answer"}}]}\n'
-        result = handler._extract_and_format_content(chunk)
-        assert result is not None
-        assert handler.DIM in result
-        assert "think" in result
-        assert handler.BOLD in result
-        assert "answer" in result
-
-    def test_extract_format_content_skips_done(self, handler):
-        """_extract_and_format_content skips [DONE] lines."""
-        chunk = 'data: [DONE]\n'
-        result = handler._extract_and_format_content(chunk)
-        # Should return None since there's no content
-        assert result is None
-
-    def test_extract_format_content_non_json_data(self, handler):
-        """_extract_and_format_content skips non-JSON data lines."""
-        chunk = 'data: some non-json text\n'
-        result = handler._extract_and_format_content(chunk)
-        assert result is None
-
-    def test_extract_format_content_none_input(self, handler):
-        """_extract_and_format_content returns None for None input."""
-        assert handler._extract_and_format_content(None) is None
-
-    def test_extract_format_content_empty_string(self, handler):
-        """_extract_and_format_content returns None for empty string."""
-        assert handler._extract_and_format_content("") is None
-
-    def test_extract_format_content_multiple_choices(self, handler):
-        """_extract_and_format_content concatenates content from multiple choices."""
-        chunk = (
-            'data: {"choices":[{"delta":{"content":"Hello"}}]}\n'
-            'data: {"choices":[{"delta":{"content":" World"}}]}\n'
-        )
-        result = handler._extract_and_format_content(chunk)
-        assert result is not None
-        assert "Hello" in result
-        assert "World" in result
-
     # extract_streamed_content_from_chunk
 
     def test_extract_streamed_content_from_chunk(self):
@@ -583,8 +521,8 @@ class TestContentOnlyConsoleHandler:
 
     # emit (using mock stream)
 
-    def test_emit_stream_chunk_with_content(self, handler):
-        """emit writes formatted content for STREAM CHUNK records."""
+    def test_emit_stream_chunk_suppressed(self, handler):
+        """emit suppresses STREAM CHUNK records from console output."""
         record = MagicMock()
         record.getMessage.return_value = 'STREAM CHUNK | data: {"choices":[{"delta":{"content":"Hello"}}]}\n'
         # Mock the stream
@@ -593,15 +531,11 @@ class TestContentOnlyConsoleHandler:
 
         handler.emit(record)
 
-        # Should have been called with bold-formatted content
-        args, _ = mock_stream.write.call_args
-        written = args[0]
-        assert handler.BOLD in written
-        assert "Hello" in written
-        assert handler.RESET in written
+        # stream.write should NOT have been called at all
+        assert mock_stream.write.call_count == 0
 
-    def test_emit_stream_chunk_without_content_returns_early(self, handler):
-        """emit returns without writing when STREAM CHUNK has no extractable content."""
+    def test_emit_stream_chunk_without_content_suppressed(self, handler):
+        """emit suppresses even STREAM CHUNK without extractable content."""
         record = MagicMock()
         record.getMessage.return_value = 'STREAM CHUNK | data: {"choices":[{"delta":{}}]}\n'
         mock_stream = MagicMock()
@@ -609,12 +543,8 @@ class TestContentOnlyConsoleHandler:
 
         handler.emit(record)
 
-        # stream.write should NOT have been called for content
-        # (emit returns early without writing to stream)
-        calls = [c for c in mock_stream.write.call_args_list]
-        assert len(calls) == 0 or not any(
-            handler.BOLD in str(c) or handler.DIM in str(c) for c in calls
-        )
+        # stream.write should NOT have been called at all
+        assert mock_stream.write.call_count == 0
 
     def test_emit_non_stream_chunk_delegates_to_super(self, monkeypatch):
         """emit delegates to super().emit for non-STREAM CHUNK records."""

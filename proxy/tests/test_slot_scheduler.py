@@ -501,8 +501,8 @@ class TestTimeoutWithActiveRequests:
 
     @pytest.mark.asyncio
     async def test_timeout_skips_slot_with_active_request(self):
-        """A slot with an active request is NOT released by timeout."""
-        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.01)
+        """A slot with an active request is NOT released by idle timeout."""
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.01, max_request_duration=999.0)
         await sched.start()
         try:
             await sched.admit_job("session-a")
@@ -515,7 +515,7 @@ class TestTimeoutWithActiveRequests:
             await asyncio.sleep(0.02)
             await sched._check_timeouts_now()
 
-            # Slot should still be owned (not released)
+            # Slot should still be owned (not released) — active request in flight
             assert "session-a" in sched.active_jobs
             assert sched.slots[slot_id].state == "Owned"
             assert sched.slots[slot_id].active_requests == 1
@@ -525,7 +525,7 @@ class TestTimeoutWithActiveRequests:
     @pytest.mark.asyncio
     async def test_timeout_releases_after_request_ends(self):
         """After request ends, idle timeout releases the slot normally."""
-        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.01)
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=0.01, max_request_duration=999.0)
         await sched.start()
         try:
             await sched.admit_job("session-a")
@@ -542,6 +542,59 @@ class TestTimeoutWithActiveRequests:
             # Slot should be released now
             assert "session-a" not in sched.active_jobs
             assert sched.slots[slot_id].state == "Idle"
+        finally:
+            await sched.stop()
+
+    @pytest.mark.asyncio
+    async def test_active_request_timeout_releases_leaked_slot(self):
+        """
+        A slot with active_requests > 0 for longer than max_request_duration
+        is force-released (leak protection).
+        """
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=999.0, max_request_duration=0.01)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            # Mark request as active — simulate a leak (no mark_request_end called)
+            await sched.mark_request_start(slot_id)
+            old_started_at = sched.slots[slot_id].request_started_at
+            assert old_started_at is not None
+
+            # Manually set started_at far in the past to simulate a stuck request
+            sched.slots[slot_id].request_started_at = old_started_at - 999.0
+
+            await sched._check_timeouts_now()
+
+            # Slot should be released despite active_requests > 0
+            assert "session-a" not in sched.active_jobs, (
+                "Leaked slot should be force-released"
+            )
+            assert sched.slots[slot_id].state == "Idle"
+        finally:
+            await sched.stop()
+
+    @pytest.mark.asyncio
+    async def test_active_request_timeout_does_not_release_recent_request(self):
+        """
+        A slot with active_requests > 0 that recently started is NOT
+        released by the max_request_duration check.
+        """
+        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=999.0, max_request_duration=60.0)
+        await sched.start()
+        try:
+            await sched.admit_job("session-a")
+            slot_id = sched.active_jobs["session-a"]
+
+            await sched.mark_request_start(slot_id)
+
+            # Check immediately — request just started, should NOT be released
+            await sched._check_timeouts_now()
+
+            assert "session-a" in sched.active_jobs
+            assert sched.slots[slot_id].state == "Owned"
+            assert sched.slots[slot_id].active_requests == 1
         finally:
             await sched.stop()
 

@@ -13,7 +13,6 @@ import hashlib
 import json
 import logging
 import re
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -344,78 +343,29 @@ def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
 # ===================================================================
 
 class ContentOnlyConsoleHandler(logging.StreamHandler):
-    """Console handler that prints only streamed content for STREAM CHUNK
-    records.
+    """Console handler for streaming-related log records.
 
     For log records whose formatted message begins with the prefix
-    "STREAM CHUNK | ", this handler will attempt to extract delta.content
-    values from any JSON payloads inside the chunk and write only the
-    concatenated content to the console stream (without adding extra
-    newlines). Raw JSON is never displayed in the console — only extracted
-    text content is shown.
+    "STREAM CHUNK | ", this handler **suppresses** console output entirely
+    (the raw JSON continues to be logged to file handlers only).
 
-    - reasoning_content is displayed in dim/grey
-    - content is displayed in bold
+    For other records (e.g., lifecycle log lines like ``Stream started:``,
+    ``Stream finished:``, ``Stream error:``), normal formatting is used.
 
-    For other records, normal formatting is used.
+    This is intentionally a no-op for STREAM CHUNK records to prevent
+    interleaved content in the console when multiple streaming responses
+    are active simultaneously (LP-0MR90HJED005WI1Z).
     """
 
     PREFIX = "STREAM CHUNK | "
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
-    def _extract_and_format_content(self, chunk_str: str) -> Optional[str]:
-        """Extract content from chunk and apply formatting based on type.
-
-        Returns formatted string with ANSI codes, or None if no content
-        found.
-        """
-        if not chunk_str:
-            return None
-
-        parts: list[str] = []
-        for line in chunk_str.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("data:"):
-                continue
-            payload = line[len("data:"):].strip()
-            if payload == "[DONE]":
-                continue
-            try:
-                j = json.loads(payload)
-            except Exception:
-                continue
-            for choice in j.get("choices", []):
-                delta = choice.get("delta", {})
-                if not isinstance(delta, dict):
-                    continue
-                reasoning = delta.get("reasoning_content")
-                if reasoning is not None:
-                    parts.append(f"{self.DIM}{reasoning}{self.RESET}")
-                content = delta.get("content")
-                if content is not None:
-                    parts.append(f"{self.BOLD}{content}{self.RESET}")
-
-        return "".join(parts) if parts else None
 
     def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover
         try:
             msg = record.getMessage()
             if isinstance(msg, str) and msg.startswith(self.PREFIX):
-                chunk_str = msg[len(self.PREFIX):]
-                formatted = self._extract_and_format_content(chunk_str)
-                if formatted:
-                    if getattr(self, "stream", None) is None:
-                        self.stream = sys.stderr
-                    try:
-                        self.stream.write(formatted)
-                        try:
-                            self.flush()
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                # Suppress STREAM CHUNK content from console output.
+                # The raw JSON continues to be written to file handlers
+                # independently (LP-0MR90HJED005WI1Z).
                 return
             super().emit(record)
         except Exception:

@@ -20,6 +20,7 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
 from .router_helpers import (
+    _get_request_preview,
     _srv,
     log_request,
     log_response,
@@ -250,23 +251,48 @@ async def proxy_to_remote(
     remote_timeout = httpx.Timeout(_srv().config.get("server", {}).get("llama_request_timeout", 300))
     is_streaming = body_json.get("stream", False)
 
+    # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header
+    # Use the ``provider`` field (actual provider brand name) if present,
+    # falling back to ``name`` (provider entry name) for backward compatibility.
+    _provider_name = model_config.get("provider") or model_config.get("name", "unknown")
+    _resolved_model_id = body_json.get("model", "unknown")
+    _resolved_model_header = f"{_provider_name}/{_resolved_model_id}"
+    # Warn when a remote provider entry is missing the ``provider`` field
+    if not model_config.get("provider") and model_config.get("type") == "remote":
+        _srv().logger.warning(
+            "Remote provider entry %r is missing the 'provider' field; "
+            "X-Resolved-Model header will use 'name' (%r) instead of the "
+            "actual provider brand name. Add 'provider: <brand>' to the "
+            "provider config to fix this.",
+            model_config.get("name"),
+            _provider_name,
+        )
+
     if is_streaming:
         if _remote_session_id:
             return await _handle_remote_streaming(
                 request, target_url, headers, body, body_json,
-                model_name, remote_timeout, session_id=_remote_session_id,
+                model_name, remote_timeout,
+                resolved_model=_resolved_model_header,
+                session_id=_remote_session_id,
+                provider=_provider_name,
             )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
             model_name, remote_timeout,
+            resolved_model=_resolved_model_header,
+            provider=_provider_name,
         )
     else:
         if _remote_session_id:
             return await _handle_remote_non_streaming(
-                request, target_url, headers, body, model_name, remote_timeout, session_id=_remote_session_id,
+                request, target_url, headers, body, model_name, remote_timeout,
+                resolved_model=_resolved_model_header,
+                session_id=_remote_session_id,
             )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
+            resolved_model=_resolved_model_header,
         )
 
 
@@ -278,7 +304,9 @@ async def _handle_remote_streaming(
     body_json: dict,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    resolved_model: Optional[str] = None,
     session_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Response:
     """Handle streaming remote proxy request."""
     client = httpx.AsyncClient(timeout=remote_timeout)
@@ -327,15 +355,23 @@ async def _handle_remote_streaming(
                 response_payload=body_bytes,
             )
 
+        _err_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+        # LP-0MR4ZIGDT004A3E1: Include resolved model info in error path
+        if resolved_model:
+            _err_headers["X-Resolved-Model"] = resolved_model
         return Response(
             content=body_bytes,
             status_code=upstream_status,
-            headers=_normalize_outgoing_headers(dict(response.headers), buffered=True),
+            headers=_err_headers,
         )
 
     outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
     if "cache-control" not in {k.lower() for k in outgoing_headers.keys()}:
         outgoing_headers["Cache-Control"] = "no-cache"
+
+    # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+    if resolved_model:
+        outgoing_headers["X-Resolved-Model"] = resolved_model
 
     media_type = response.headers.get("content-type", "text/event-stream")
     key = f"{request.method.upper()} {request.url.path} -> remote"
@@ -348,6 +384,20 @@ async def _handle_remote_streaming(
         _disconnect_check_count = 0
         # Collect chunks for session recording (LP-0MR94O16S000WFQ0)
         collected_chunks = [] if session_id else None
+
+        # Log stream started with session context (LP-0MR90HJED005WI1Z)
+        try:
+            _request_preview = _get_request_preview(body_json)
+            _srv().logger.info(
+                "Stream started: provider=%s model=%s session=%s request=%s",
+                provider or "remote",
+                model_name,
+                session_id or "unknown",
+                _request_preview or "",
+            )
+        except Exception:
+            pass
+
         try:
             async for chunk in response.aiter_bytes():
                 try:
@@ -393,7 +443,7 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(chunk)
                 yield chunk
-                log_response_chunk(chunk)
+                log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
             # Synthesize final SSE event if upstream closed without finish marker.
             # Skip if client disconnected (LP-0MQTHP828000JYM6)
             if not disconnected and not saw_done and not saw_finish:
@@ -408,11 +458,38 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(final_bytes)
                 yield final_bytes
-                log_response_chunk(final_bytes)
+                log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
         except GeneratorExit:
             # Client disconnected or generator is being closed.
             # Skip the final event yield and proceed directly to cleanup.
             pass
+        except Exception as exc:
+            # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
+            # Yield a synthetic final SSE event so the client receives a
+            # proper finish_reason marker even on stream error.
+            try:
+                _error_type = type(exc).__name__
+                _srv().logger.warning(
+                    "Stream error: session=%s provider=%s model=%s error=%s",
+                    session_id or "unknown",
+                    provider or "remote",
+                    model_name,
+                    _error_type,
+                )
+            except Exception:
+                pass
+            final_obj = {
+                "choices": [
+                    {"delta": {}, "finish_reason": "error", "index": 0}
+                ]
+            }
+            final_bytes = (
+                f"data: {json.dumps(final_obj)}\n\n"
+            ).encode("utf-8")
+            if collected_chunks is not None:
+                collected_chunks.append(final_bytes)
+            yield final_bytes
+            log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
         finally:
             try:
                 await cm.__aexit__(None, None, None)
@@ -452,6 +529,7 @@ async def _handle_remote_non_streaming(
     body: bytes,
     model_name: str,
     remote_timeout: httpx.Timeout,
+    resolved_model: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> Response:
     """Handle non-streaming remote proxy request."""
@@ -484,10 +562,14 @@ async def _handle_remote_non_streaming(
                 provider="remote",
             )
 
+        _ns_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+        if resolved_model:
+            _ns_headers["X-Resolved-Model"] = resolved_model
         return Response(
             content=response.content,
             status_code=response.status_code,
-            headers=_normalize_outgoing_headers(dict(response.headers), buffered=True),
+            headers=_ns_headers,
         )
 
 
