@@ -76,6 +76,7 @@ from .router_helpers import (  # noqa: E402
     _decrement_active_queries,
     _decrement_local_active_queries,
     _estimate_tokens_sent,
+    _get_request_preview,
     _handle_session,
     _increment_active_queries,
     _increment_local_active_queries,
@@ -925,6 +926,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         # Client disconnect detection (LP-0MQTHP828000JYM6)
                         disconnected = False
                         _disconnect_check_count = 0
+
+                        # Log stream started with session context (LP-0MR90HJED005WI1Z)
+                        try:
+                            _request_preview = _get_request_preview(body_json)
+                            srv.logger.info(
+                                "Stream started: provider=local model=%s session=%s request=%s",
+                                model_name,
+                                session_id or "unknown",
+                                _request_preview or "",
+                            )
+                        except Exception:
+                            pass
+
                         try:
                             # Use asyncio.wait(FIRST_COMPLETED) to concurrently
                             # listen for two events:
@@ -1141,7 +1155,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         pass
 
                                 yield chunk
-                                log_response_chunk(chunk)
+                                log_response_chunk(chunk, session_id=session_id, model=model_name, provider="local", body_json=body_json)
 
                                 # Prepare the next anext task
                                 _stream_iter = asyncio.ensure_future(
@@ -1168,7 +1182,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     f"data: {json.dumps(final_obj)}\n\n"
                                 ).encode("utf-8")
                                 yield final_bytes
-                                log_response_chunk(final_bytes)
+                                log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
                             # Client disconnected or generator is being closed.
                             # Skip the final event yield and proceed directly to cleanup.
@@ -1178,11 +1192,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Log and let the finally block handle cleanup so backend_ready
                             # is not spuriously set to False (which would cooldown the
                             # local provider and trigger fallback to remotes).
-                            srv.logger.warning(
-                                "Stream error during local response for model=%s: %s",
-                                model_name,
-                                type(exc).__name__,
-                            )
+                            try:
+                                _error_type = type(exc).__name__
+                                srv.logger.warning(
+                                    "Stream error: session=%s provider=local model=%s error=%s",
+                                    session_id or "unknown",
+                                    model_name,
+                                    _error_type,
+                                )
+                            except Exception:
+                                pass
                             # Synthesize a final SSE event so the client receives a
                             # proper finish_reason marker even on stream error.
                             final_obj = {
@@ -1194,7 +1213,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 f"data: {json.dumps(final_obj)}\n\n"
                             ).encode("utf-8")
                             yield final_bytes
-                            log_response_chunk(final_bytes)
+                            log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
                             # Record assembled streaming response (fire-and-forget)
                             if session_id and collected_content:

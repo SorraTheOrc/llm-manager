@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Mapping, Union
 
 import httpx
 from fastapi import HTTPException, Request
@@ -35,6 +35,51 @@ def _srv():
 # ===================================================================
 # Request/response logging helpers
 # ===================================================================
+
+def _get_request_preview(body_json: Optional[Union[dict, bytes]]) -> str:
+    """Extract the first 80 characters of the first non-system user message.
+
+    Parses the JSON body to find the first message whose ``role`` is not
+    ``"system"`` and returns the first 80 characters of its ``content``
+    field, appending ``...`` if the content is longer than 80 characters.
+
+    Returns an empty string if the body cannot be parsed, contains no
+    messages, or contains only system messages.
+
+    Parameters
+    ----------
+    body_json : dict or bytes or None
+        The request body as a parsed dict, raw bytes, or None.
+
+    Returns
+    -------
+    str
+        The request preview (max 83 characters including ``...``).
+    """
+    try:
+        if isinstance(body_json, bytes):
+            body_json = json.loads(body_json.decode("utf-8", errors="replace"))
+        if not isinstance(body_json, dict):
+            return ""
+        messages = body_json.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "system":
+                continue
+            content = msg.get("content", "")
+            if not content:
+                continue
+            content_str = str(content)
+            if len(content_str) > 80:
+                return content_str[:80] + "..."
+            return content_str
+    except Exception:
+        pass
+    return ""
+
 
 def _strip_system_messages_from_preview(body: bytes) -> str:
     """Produce a body preview that excludes system message content.
@@ -156,16 +201,26 @@ def log_response(status_code: int, content: bytes) -> None:
         pass
 
 
-def log_response_chunk(chunk: bytes) -> None:
+def log_response_chunk(
+    chunk: bytes,
+    session_id: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    body_json: Optional[Union[dict, bytes]] = None,
+) -> None:
     """Log streaming response chunk.
 
-    The ContentOnlyConsoleHandler extracts and displays just the content to console.
-    Raw JSON is written to the log file only.
+    The ContentOnlyConsoleHandler no longer displays streaming content to the
+    console (LP-0MR90HJED005WI1Z). Raw JSON is written to the log file only.
 
     If the chunk contains a ``finish_reason`` in any ``choices[]`` entry,
-    an additional ``Stream finished: reason=<reason>`` log line is emitted
+    an enhanced ``Stream finished: reason=<reason>`` log line is emitted
     so the stop reason (and optional token usage) appears in both console
-    and file logs (LP-0MQZXHHHO0063YCI).
+    and file logs. When *session_id*, *model*, and *provider* are provided,
+    they are appended to the log line.
+
+    When *body_json* is provided, a request preview (first 80 characters of
+    the first non-system user message) is included in the finished line.
     """
     srv = _srv()
     try:
@@ -209,6 +264,17 @@ def log_response_chunk(chunk: bytes) -> None:
                     tt = usage.get("total_tokens")
                     if pt is not None or ct is not None or tt is not None:
                         parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
+                # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
+                if session_id:
+                    parts.append(f"session={session_id}")
+                if provider:
+                    parts.append(f"provider={provider}")
+                if model:
+                    parts.append(f"model={model}")
+                if body_json is not None:
+                    preview = _get_request_preview(body_json)
+                    if preview:
+                        parts.append(f"request={preview}")
                 srv.logger.info(" ".join(parts))
     except Exception:
         pass

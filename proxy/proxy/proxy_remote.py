@@ -20,6 +20,7 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
 from .router_helpers import (
+    _get_request_preview,
     _srv,
     log_request,
     log_response,
@@ -274,11 +275,13 @@ async def proxy_to_remote(
                 model_name, remote_timeout,
                 resolved_model=_resolved_model_header,
                 session_id=_remote_session_id,
+                provider=_provider_name,
             )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
             model_name, remote_timeout,
             resolved_model=_resolved_model_header,
+            provider=_provider_name,
         )
     else:
         if _remote_session_id:
@@ -303,6 +306,7 @@ async def _handle_remote_streaming(
     remote_timeout: httpx.Timeout,
     resolved_model: Optional[str] = None,
     session_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Response:
     """Handle streaming remote proxy request."""
     client = httpx.AsyncClient(timeout=remote_timeout)
@@ -380,6 +384,20 @@ async def _handle_remote_streaming(
         _disconnect_check_count = 0
         # Collect chunks for session recording (LP-0MR94O16S000WFQ0)
         collected_chunks = [] if session_id else None
+
+        # Log stream started with session context (LP-0MR90HJED005WI1Z)
+        try:
+            _request_preview = _get_request_preview(body_json)
+            _srv().logger.info(
+                "Stream started: provider=%s model=%s session=%s request=%s",
+                provider or "remote",
+                model_name,
+                session_id or "unknown",
+                _request_preview or "",
+            )
+        except Exception:
+            pass
+
         try:
             async for chunk in response.aiter_bytes():
                 try:
@@ -425,7 +443,7 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(chunk)
                 yield chunk
-                log_response_chunk(chunk)
+                log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
             # Synthesize final SSE event if upstream closed without finish marker.
             # Skip if client disconnected (LP-0MQTHP828000JYM6)
             if not disconnected and not saw_done and not saw_finish:
@@ -440,7 +458,7 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(final_bytes)
                 yield final_bytes
-                log_response_chunk(final_bytes)
+                log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
         except GeneratorExit:
             # Client disconnected or generator is being closed.
             # Skip the final event yield and proceed directly to cleanup.
@@ -449,11 +467,17 @@ async def _handle_remote_streaming(
             # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
             # Yield a synthetic final SSE event so the client receives a
             # proper finish_reason marker even on stream error.
-            _srv().logger.warning(
-                "Stream error during remote response for model=%s: %s",
-                model_name,
-                type(exc).__name__,
-            )
+            try:
+                _error_type = type(exc).__name__
+                _srv().logger.warning(
+                    "Stream error: session=%s provider=%s model=%s error=%s",
+                    session_id or "unknown",
+                    provider or "remote",
+                    model_name,
+                    _error_type,
+                )
+            except Exception:
+                pass
             final_obj = {
                 "choices": [
                     {"delta": {}, "finish_reason": "error", "index": 0}
@@ -465,7 +489,7 @@ async def _handle_remote_streaming(
             if collected_chunks is not None:
                 collected_chunks.append(final_bytes)
             yield final_bytes
-            log_response_chunk(final_bytes)
+            log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
         finally:
             try:
                 await cm.__aexit__(None, None, None)
