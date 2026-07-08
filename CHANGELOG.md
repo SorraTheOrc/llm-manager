@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.1.2 (2026-07-09)
+### Features
+- Bug: SSE Streaming Generator Hangs on Missing [DONE] from Upstream (LP-0MRB29HJ1009OR6G)
+- Parallel requests seem to intefere with one another (LP-0MR90HJED005WI1Z)
+- Fix X-Resolved-Model header format: use actual provider name, not provider entry name (LP-0MRC4G7ZL005L1BO)
+- Token breakdown by category in session log display (LP-0MRAW8XUF005IB4K)
+- Session dropdown should order by most recently updated, not most recently started (LP-0MRAZQ60R005V4MP)
+- proxyctl: core CLI (LP-0MPY3DFYD008M75U)
+- proxyctl: docs and install (LP-0MPY3DGY2009CTP0)
+### Bug Fixes
+- Flaky test: test_concurrent_embeddings_and_chat fails intermittently (LP-0MRAWF4T0001WICF)
+- Provider cooldown should persist across client sessions (LP-0MRB94JOE0075JNY)
+- Scale guardrail runtime budget with prompt size using adaptive timeout (LP-0MRB9AZDJ00716OT)
+- Bug: Stale Local Dispatch Lease Blocks Subsequent Local Requests (LP-0MRB29PP60012UYF)
+- Bug: JobScheduler Slot Active_Requests Counter Leaks on Abnormal Termination (LP-0MRB29YF0001YBU2)
+- Bug: Default Guardrail Runtime Cutoff Too Long (1800s / 30 Minutes) (LP-0MRB2A55L00400XF)
+- Bug: Proxy Logger Not Writing Runtime Output to Configured Log File (LP-0MRB2ABNX008SF9P)
+- RCA: Abandoned asyncio futures in streaming path cause unretrieved ReadError exceptions (LP-0MRCMKG9O004XE0Q)
+- Exponential backoff for remote provider fallback cooldowns (LP-0MRCJD1WW0023AKX)
+- Error: Stream ended without finish_reason (LP-0MQSQZ1W20024WJW)
+### Other
+- Client-Proxy 'Working' State Freeze - Root Cause Analysis and Fix (LP-0MRB28WTV0031SQE)
+- Add comprehensive exponential backoff tests (LP-0MRCNPRAH008K8T4)
+- Fix docstring/implementation mismatch in mark_provider_unavailable (LP-0MRCNPRAH0021R9M)
+- Remove dead code _compute_cooldown (LP-0MRCNPRAJ008OZO7)
+- add new line after final message send to log (LP-0MQZXHHHO0063YCI)
+- Show the model being used in Pi (LP-0MR4ZIGDT004A3E1)
+- Centralize quantization and ctx-size in models.ini (single source of truth) (LP-0MQMH0GJR001NG0B)
+- Fix proxyctl: use start-proxy.sh as default start script (LP-0MQ1LZCM90088U5E)
+- proxyctl: test config detection (LP-0MPY3DEZ8006V4MV)
+- proxyctl: test stop (LP-0MPY3DFB0000XLHN)
+- proxyctl: test status (LP-0MPY3DFMH003RUUY)
+- proxyctl: test logs (LP-0MPY3DFSB006VE2I)
+
 ## v0.1.1 (2026-07-08)
 ### Features
 - Bug: SSE Streaming Generator Hangs on Missing [DONE] from Upstream (LP-0MRB29HJ1009OR6G)
