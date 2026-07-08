@@ -1250,15 +1250,35 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (asyncio.TimeoutError, Exception):
                                 pass
-                            # Clean up the pending _stream_iter task if the
+                            # Clean up the pending _stream_iter future if the
                             # stream_generator used FIRST_COMPLETED waiting.
+                            # CRITICAL: NEVER cancel _stream_iter — cancelling an
+                            # in-flight httpx read would destroy the underlying HTTP
+                            # connection to llama-server (LP-0MQTHP828000JYM6).
+                            # Instead, retrieve the exception (if any) to prevent
+                            # "Task exception was never retrieved" warnings from
+                            # abandoned asyncio futures (LP-0MRCMKG9O004XE0Q).
                             try:
-                                if _stream_iter is not None and not _stream_iter.done():
-                                    _stream_iter.cancel()
-                                    try:
-                                        await _stream_iter
-                                    except (asyncio.CancelledError, StopAsyncIteration):
-                                        pass
+                                if _stream_iter is not None:
+                                    if _stream_iter.done():
+                                        # Retrieve the exception (if any) to prevent
+                                        # the "never retrieved" warning.  Safe: returns
+                                        # None if the future completed successfully.
+                                        _stream_iter.exception()
+                                    else:
+                                        # Future is still pending (in-flight httpx
+                                        # read).  Do NOT cancel (CRITICAL constraint).
+                                        # Attach a done callback that retrieves the
+                                        # exception to prevent the warning when the
+                                        # future eventually completes.
+                                        def _suppress_abandoned_future(fut):
+                                            try:
+                                                fut.exception()
+                                            except (asyncio.InvalidStateError, Exception):
+                                                pass
+                                        _stream_iter.add_done_callback(
+                                            _suppress_abandoned_future
+                                        )
                             except (NameError, AttributeError):
                                 # _stream_iter may not exist in all code paths
                                 pass
