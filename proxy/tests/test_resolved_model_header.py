@@ -623,3 +623,142 @@ async def test_proxy_to_remote_header_reflects_upstream_model_override(mock_requ
     assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
     assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash-free", \
         f"Expected opencode/deepseek-v4-flash-free, got {headers['X-Resolved-Model']}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AC10: _build_resolved_model_value prefers provider field over name
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_build_resolved_model_value_prefers_provider_field():
+    """_build_resolved_model_value() uses provider field when present."""
+    cfg = {
+        "name": "deepseek-v4-flash",        # provider entry name (matches model ID)
+        "provider": "deepseek",             # actual provider brand name
+        "type": "remote",
+        "endpoint": "https://api.deepseek.com/v1",
+        "model": "deepseek-v4-flash",
+    }
+    result = provider._build_resolved_model_value(cfg)
+    assert result == "deepseek/deepseek-v4-flash", \
+        f"Expected deepseek/deepseek-v4-flash, got {result}"
+
+
+def test_build_resolved_model_value_falls_back_to_name():
+    """_build_resolved_model_value() falls back to name when provider field is absent."""
+    cfg = {
+        "name": "opencode",
+        "type": "remote",
+        "endpoint": "https://api.opencode.com/v1",
+        "model": "deepseek-v4-flash-free",
+    }
+    result = provider._build_resolved_model_value(cfg)
+    assert result == "opencode/deepseek-v4-flash-free", \
+        f"Expected opencode/deepseek-v4-flash-free, got {result}"
+
+
+def test_build_resolved_model_value_local_provider():
+    """_build_resolved_model_value() works for local providers with provider field."""
+    cfg = {
+        "name": "local-qwen3",
+        "type": "local",
+        "llama_model": "Qwen3",
+    }
+    result = provider._build_resolved_model_value(cfg)
+    # Local providers don't typically need a provider field, fallback to name
+    assert result == "local-qwen3/Qwen3", \
+        f"Expected local-qwen3/Qwen3, got {result}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AC11: proxy_to_remote uses provider field over name for streaming
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_streaming_uses_provider_field(mock_request):
+    """proxy_to_remote streaming uses provider field over name when both present."""
+    provider_cfg = {
+        "name": "deepseek-v4-flash",        # provider entry name (matches model)
+        "provider": "deepseek",             # actual provider brand name
+        "type": "remote",
+        "endpoint": "https://api.deepseek.com/v1",
+        "model": "deepseek-v4-flash",
+    }
+
+    sse_chunk = b'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}\n\ndata: [DONE]\n\n'
+    mock_resp = _make_mock_remote_response(status_code=200, body=sse_chunk)
+    mock_client_cls = _make_mock_client(mock_resp)
+
+    mock_request.body = AsyncMock(return_value=b'{"model":"deepseek-v4-flash","stream":true}')
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await proxy_to_remote(
+                            request=mock_request,
+                            path="v1/chat/completions",
+                            model_config=provider_cfg,
+                        )
+
+    assert isinstance(result, StreamingResponse), f"Expected StreamingResponse, got {type(result).__name__}"
+    headers = dict(result.headers)
+    assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
+    assert headers["x-resolved-model"] == "deepseek/deepseek-v4-flash", \
+        f"Expected deepseek/deepseek-v4-flash, got {headers['X-Resolved-Model']}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AC12: proxy_with_fallback uses provider field for resolved model header
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_proxy_with_fallback_uses_provider_field(monkeypatch):
+    """proxy_with_fallback() uses provider field for the X-Resolved-Model header."""
+    model_config = {
+        "providers": [
+            {
+                "name": "opencode-deepseek-free",
+                "provider": "opencode",
+                "type": "remote",
+                "endpoint": "https://api.opencode.com/v1",
+                "model": "deepseek-v4-flash-free",
+            },
+        ]
+    }
+
+    server_config = {
+        "server": {
+            "provider_cooldown_seconds": 60,
+            "local_slot_exhaustion_retry_attempts": 0,
+            "local_slot_exhaustion_retry_delay_seconds": 0.2,
+            "local_max_concurrent_queries": 4,
+        }
+    }
+
+    req = MagicMock(spec=Request)
+    req.method = "POST"
+    req.url.path = "/v1/chat/completions"
+    req.is_disconnected = AsyncMock(return_value=False)
+    req.body = AsyncMock(return_value=b'{"model":"test","messages":[{"role":"user","content":"hi"}]}')
+
+    remote_response = Response(
+        content=b'{"id":"test","choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"Hello!"}}]}',
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+    async def mock_proxy_to_remote(request, path, provider_cfg):
+        return remote_response
+
+    with patch("proxy.provider._get_proxy_to_remote", return_value=mock_proxy_to_remote):
+        result = await proxy_with_remote_fallback(req, "v1/chat/completions", model_config, server_config)
+
+    assert isinstance(result, Response), f"Expected Response, got {type(result).__name__}"
+    headers = dict(result.headers)
+    assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
+    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash-free", \
+        f"Expected opencode/deepseek-v4-flash-free, got {headers['X-Resolved-Model']}"

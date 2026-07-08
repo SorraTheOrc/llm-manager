@@ -251,9 +251,21 @@ async def proxy_to_remote(
     is_streaming = body_json.get("stream", False)
 
     # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header
-    _provider_name = model_config.get("name", "unknown")
+    # Use the ``provider`` field (actual provider brand name) if present,
+    # falling back to ``name`` (provider entry name) for backward compatibility.
+    _provider_name = model_config.get("provider") or model_config.get("name", "unknown")
     _resolved_model_id = body_json.get("model", "unknown")
     _resolved_model_header = f"{_provider_name}/{_resolved_model_id}"
+    # Warn when a remote provider entry is missing the ``provider`` field
+    if not model_config.get("provider") and model_config.get("type") == "remote":
+        _srv().logger.warning(
+            "Remote provider entry %r is missing the 'provider' field; "
+            "X-Resolved-Model header will use 'name' (%r) instead of the "
+            "actual provider brand name. Add 'provider: <brand>' to the "
+            "provider config to fix this.",
+            model_config.get("name"),
+            _provider_name,
+        )
 
     if is_streaming:
         if _remote_session_id:

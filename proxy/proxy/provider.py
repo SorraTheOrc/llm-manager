@@ -308,13 +308,28 @@ def _build_resolved_model_value(provider_cfg: dict) -> Optional[str]:
 
     For local providers, uses ``llama_model`` as the model ID.
     For remote providers, uses ``model`` (upstream model ID).
+
+    The provider name is taken from the ``provider`` field first (actual
+    provider brand name), falling back to ``name`` (provider entry name)
+    for backward compatibility.  A warning is logged when a remote provider
+    entry lacks the ``provider`` field.
     """
-    provider_name = provider_cfg.get("name")
+    provider_name = provider_cfg.get("provider") or provider_cfg.get("name")
     if not provider_name:
         return None
     model_id = provider_cfg.get("llama_model") or provider_cfg.get("model")
     if not model_id:
         return None
+    # Warn when a remote provider entry is missing the ``provider`` field
+    if not provider_cfg.get("provider") and provider_cfg.get("type") == "remote":
+        logger.warning(
+            "Remote provider entry %r is missing the 'provider' field; "
+            "X-Resolved-Model header will use 'name' (%r) instead of the "
+            "actual provider brand name. Add 'provider: <brand>' to the "
+            "provider config to fix this.",
+            provider_cfg.get("name"),
+            provider_name,
+        )
     return f"{provider_name}/{model_id}"
 
 
