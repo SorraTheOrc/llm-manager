@@ -1181,6 +1181,18 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 model_name,
                                 type(exc).__name__,
                             )
+                            # Synthesize a final SSE event so the client receives a
+                            # proper finish_reason marker even on stream error.
+                            final_obj = {
+                                "choices": [
+                                    {"delta": {}, "finish_reason": "error", "index": 0}
+                                ]
+                            }
+                            final_bytes = (
+                                f"data: {json.dumps(final_obj)}\n\n"
+                            ).encode("utf-8")
+                            yield final_bytes
+                            log_response_chunk(final_bytes)
                         finally:
                             # Record assembled streaming response (fire-and-forget)
                             if session_id and collected_content:

@@ -413,6 +413,27 @@ async def _handle_remote_streaming(
             # Client disconnected or generator is being closed.
             # Skip the final event yield and proceed directly to cleanup.
             pass
+        except Exception as exc:
+            # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
+            # Yield a synthetic final SSE event so the client receives a
+            # proper finish_reason marker even on stream error.
+            _srv().logger.warning(
+                "Stream error during remote response for model=%s: %s",
+                model_name,
+                type(exc).__name__,
+            )
+            final_obj = {
+                "choices": [
+                    {"delta": {}, "finish_reason": "error", "index": 0}
+                ]
+            }
+            final_bytes = (
+                f"data: {json.dumps(final_obj)}\n\n"
+            ).encode("utf-8")
+            if collected_chunks is not None:
+                collected_chunks.append(final_bytes)
+            yield final_bytes
+            log_response_chunk(final_bytes)
         finally:
             try:
                 await cm.__aexit__(None, None, None)
