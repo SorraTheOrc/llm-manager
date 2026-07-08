@@ -750,44 +750,135 @@ def _should_force_full_prompt_from_config(
 
 def _estimate_tokens_sent(
     body: bytes, body_json: dict, model_name: Optional[str]
-) -> int:
-    """Estimate tokens sent in the request body."""
+) -> dict:
+    """Estimate tokens sent in the request body, broken down by category.
+
+    Returns a dict with keys ``user``, ``assistant``, ``tool``, ``system``
+    mapping to integer token counts for each message role.
+
+    Category mapping:
+    - **User messages**: tokens in ``role: "user"`` message content
+    - **Agent responses**: tokens in ``role: "assistant"`` message content
+    - **Tool Calls**: tokens in ``role: "tool"`` message content +
+      tool_use content blocks within assistant messages + ``tools`` array
+      definitions
+    - **System Prompt**: tokens in the ``system`` field or
+      ``role: "system"`` message content
+
+    Falls back to the ``user`` category for non-message formats
+    (e.g. raw ``/v1/completions`` input).
+    """
     from proxy.utils import count_text_tokens
-    
+
+    result = {"user": 0, "assistant": 0, "tool": 0, "system": 0}
+
     try:
-        tokens_sent = 0
         if isinstance(body_json, dict) and "messages" in body_json:
-            for m in body_json.get("messages", []):
-                tokens_sent += count_text_tokens(
-                    str(m.get("content", "")), model_name
+            messages = body_json.get("messages", [])
+            # First pass: count content tokens per role
+            for m in messages:
+                role = m.get("role", "")
+                content = str(m.get("content", ""))
+                tokens = count_text_tokens(content, model_name)
+                if role == "user":
+                    result["user"] += tokens
+                elif role == "assistant":
+                    result["assistant"] += tokens
+                elif role == "tool":
+                    result["tool"] += tokens
+                elif role == "system":
+                    result["system"] += tokens
+                else:
+                    # Unknown role — attribute to user as fallback
+                    result["user"] += tokens
+
+            # Second pass: count tool_calls embedded in assistant messages
+            for m in messages:
+                if m.get("role") == "assistant":
+                    tool_calls = m.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            func = tc.get("function", {})
+                            args_str = func.get("arguments", "")
+                            if args_str:
+                                result["tool"] += count_text_tokens(
+                                    str(args_str), model_name
+                                )
+                            name_str = func.get("name", "")
+                            if name_str:
+                                result["tool"] += count_text_tokens(
+                                    str(name_str), model_name
+                                )
+
+            # Count tools array definitions
+            tools = body_json.get("tools")
+            if tools:
+                import json as _json
+                result["tool"] += count_text_tokens(
+                    _json.dumps(tools, separators=(",", ":"), ensure_ascii=False),
+                    model_name,
                 )
+
         elif isinstance(body_json, dict) and "input" in body_json:
             inp = body_json["input"]
             if isinstance(inp, list):
                 for it in inp:
-                    tokens_sent += count_text_tokens(str(it), model_name)
+                    result["user"] += count_text_tokens(str(it), model_name)
             else:
-                tokens_sent += count_text_tokens(str(inp), model_name)
+                result["user"] += count_text_tokens(str(inp), model_name)
         else:
-            tokens_sent += count_text_tokens(
+            result["user"] += count_text_tokens(
                 body.decode("utf-8", errors="replace"), model_name
             )
     except Exception:
-        tokens_sent = 0
-    return tokens_sent
+        result = {"user": 0, "assistant": 0, "tool": 0, "system": 0}
+    return result
 
 
 async def _schedule_token_increment(
-    key: str, tokens: int
+    key: str, tokens: Any
 ) -> None:
-    """Schedule a token increment in the running event loop."""
+    """Schedule a token increment in the running event loop.
+
+    Accepts either:
+    - A ``dict`` with per-category keys (``user``, ``assistant``, ``tool``,
+      ``system``) for the new per-category breakdown.
+    - An ``int`` for backward compatibility with existing callers and tests.
+
+    When a dict is provided, both the category-prefixed keys
+    (``sent:<category>:<key>``) and the flat total key (``sent:<key>``)
+    are incremented.
+    """
     from proxy.observability import _increment_tokens
-    
+
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_increment_tokens("sent", key, tokens))
+        if isinstance(tokens, dict):
+            total = 0
+            for category, count in tokens.items():
+                if count > 0:
+                    total += count
+                    loop.create_task(
+                        _increment_tokens("sent", f"{category}:{key}", count)
+                    )
+            if total > 0:
+                loop.create_task(_increment_tokens("sent", key, total))
+        else:
+            # Legacy int path
+            loop.create_task(_increment_tokens("sent", key, int(tokens)))
     except RuntimeError:
-        asyncio.run(_increment_tokens("sent", key, tokens))
+        if isinstance(tokens, dict):
+            total = 0
+            for category, count in tokens.items():
+                if count > 0:
+                    total += count
+                    asyncio.run(
+                        _increment_tokens("sent", f"{category}:{key}", count)
+                    )
+            if total > 0:
+                asyncio.run(_increment_tokens("sent", key, total))
+        else:
+            asyncio.run(_increment_tokens("sent", key, int(tokens)))
     except Exception:
         pass
 
@@ -795,14 +886,25 @@ async def _schedule_token_increment(
 async def _schedule_recv_token_increment(
     key: str, tokens: int
 ) -> None:
-    """Schedule a received token increment."""
+    """Schedule a received token increment.
+
+    Stores both the flat recv key (``recv:<key>``) for backward
+    compatibility and the category-prefixed key
+    (``recv:response:<key>``) for the per-category breakdown.
+    """
     from proxy.observability import _increment_tokens
-    
+
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_increment_tokens("recv", key, tokens))
+        loop.create_task(
+            _increment_tokens("recv", f"response:{key}", tokens)
+        )
     except RuntimeError:
         asyncio.run(_increment_tokens("recv", key, tokens))
+        asyncio.run(
+            _increment_tokens("recv", f"response:{key}", tokens)
+        )
     except Exception:
         pass
 

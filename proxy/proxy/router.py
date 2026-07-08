@@ -1013,9 +1013,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     loop.create_task(
                                         _increment_tokens("recv", key, chunk_tokens)
                                     )
+                                    loop.create_task(
+                                        _increment_tokens("recv", f"response:{key}", chunk_tokens)
+                                    )
                                 except RuntimeError:
                                     asyncio.run(
                                         _increment_tokens("recv", key, chunk_tokens)
+                                    )
+                                    asyncio.run(
+                                        _increment_tokens("recv", f"response:{key}", chunk_tokens)
                                     )
 
                                 now_ts = time.monotonic()
