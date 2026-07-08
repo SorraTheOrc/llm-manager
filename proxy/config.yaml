@@ -142,14 +142,9 @@ models:
     - Qwen3*
     force_full_prompt: true
 
-  # Cascading fallback: local Qwen3 first, then OpenCode free, then OpenCode Go.
-  # Slot exhaustion on the local model falls through to the free remote tier.
-  # Rate limiting (429) on the free tier falls through to the paid Go tier.
-  # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
-  # Cascading fallback: local Qwen3 first, then OpenCode free, then OpenCode Go.
-  # Slot exhaustion on the local model falls through to the free remote tier.
-  # Rate limiting (429) on the free tier falls through to the paid Go tier.
-  # Requires OPENCODE_API_KEY env var (the same key works for both opencode providers).
+  # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, then DeepSeek direct.
+  # Slot exhaustion on the local model falls through to remote tiers.
+  # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
   plan:
     providers:
       - name: local-qwen3
@@ -164,6 +159,11 @@ models:
         type: remote
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+      - name: deepseek-v4-flash
+        type: remote
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
         model: deepseek-v4-flash
     aliases:
     - plan*
@@ -184,6 +184,22 @@ models:
       - name: local-qwen3-next
         type: local
         llama_model: Qwen3-Next
+      - name: opencode-deepseek-free
+        type: remote
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+      - name: opencode-go-deepseek
+        type: remote
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+      - name: deepseek-v4-flash
+        type: remote
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        model: deepseek-v4-flash
     aliases:
     - code
     force_full_prompt: true
