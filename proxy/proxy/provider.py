@@ -162,10 +162,11 @@ def mark_provider_unavailable(
     """
     if use_exponential_backoff:
         count = _provider_failure_count.get(provider_name, 0)
-        cooldown_seconds = min(
+        backoff = min(
             _BACKOFF_BASE_SECONDS * (2 ** count),
             _BACKOFF_MAX_SECONDS,
         )
+        cooldown_seconds = min(backoff, cooldown_seconds)
         _provider_failure_count[provider_name] = count + 1
 
     _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
