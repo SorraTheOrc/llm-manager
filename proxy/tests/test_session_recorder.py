@@ -575,6 +575,7 @@ class TestListAndRetrieve:
         # Each session should include preview fields
         for s in sessions:
             assert "response_time" in s
+            assert "last_activity" in s
             assert "model" in s
             assert "provider" in s
 
@@ -899,6 +900,56 @@ class TestSessionPreviewExtraction:
         sessions = recorder.list_sessions()
         assert sessions[0]["preview_text"] == "First message"
 
+    def test_list_sessions_last_activity_differs_from_response_time(self, temp_recording_dir):
+        """last_activity reflects the latest recording, not the first response."""
+        from proxy.session_recorder import SessionRecorder
+
+        sess_dir = Path(temp_recording_dir) / "sess-last-activity"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+
+        # Early request
+        req = {
+            "session_id": "sess-last-activity",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:00:00.000000+00:00",
+            "payload": {"messages": [{"role": "user", "content": "Hello"}]},
+        }
+        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(req))
+
+        # Early response
+        resp = {
+            "session_id": "sess-last-activity",
+            "direction": "provider_to_client",
+            "timestamp": "2026-07-07T10:00:05.000000+00:00",
+            "payload": {"choices": [{"text": "Hi"}]},
+            "model": "test-model",
+            "provider": "test-provider",
+        }
+        (sess_dir / "2026-07-07T10:00:05.000000-response.json").write_text(json.dumps(resp))
+
+        # Later request (second turn)
+        req2 = {
+            "session_id": "sess-last-activity",
+            "direction": "client_to_proxy",
+            "timestamp": "2026-07-07T10:01:00.000000+00:00",
+            "payload": {"messages": [{"role": "user", "content": "Follow up"}]},
+        }
+        (sess_dir / "2026-07-07T10:01:00.000000-request.json").write_text(json.dumps(req2))
+
+        recorder = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 1
+        s = sessions[0]
+        # response_time should be the first provider_to_client response
+        assert s["response_time"] == "2026-07-07T10:00:05.000000+00:00"
+        # last_activity should be the latest recording timestamp
+        assert s["last_activity"] == "2026-07-07T10:01:00.000000+00:00"
+        # Model/provider come from the first response (or first request)
+        assert s["model"] == "test-model"
+        assert s["provider"] == "test-provider"
+        assert s["preview_text"] == "Hello"
+
     def test_list_sessions_preview_preserves_existing_fields(self, temp_recording_dir):
         """The preview_text field is added alongside existing fields."""
         from proxy.session_recorder import SessionRecorder
@@ -922,6 +973,7 @@ class TestSessionPreviewExtraction:
         s = sessions[0]
         assert s["session_id"] == "sess-all-fields"
         assert s["response_time"] == "2026-07-07T10:00:00.000000+00:00"
+        assert s["last_activity"] == "2026-07-07T10:00:00.000000+00:00"
         assert s["model"] == "qwen3"
         assert s["provider"] == "local"
         assert s["preview_text"] == "Hello"

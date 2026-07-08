@@ -367,9 +367,13 @@ class SessionRecorder:
         """Extract preview data for a session from its recording files.
 
         Finds the first ``provider_to_client`` response recording and
-        returns its timestamp, model, and provider. If no response
-        recording exists, falls back to the first ``client_to_proxy``
-        request recording.
+        returns its timestamp (as ``response_time``), model, and provider.
+        If no response recording exists, falls back to the first
+        ``client_to_proxy`` request recording.
+
+        Also determines the **latest** recording timestamp across all
+        files in the session and returns it as ``last_activity`` — this
+        is the sorting key used to order sessions by most recent update.
 
         Also extracts a ``preview_text`` — the first 80 characters of
         the user's first message from the earliest ``client_to_proxy``
@@ -380,8 +384,9 @@ class SessionRecorder:
 
         Returns:
             A dict with ``session_id``, ``response_time``,
-            ``model``, ``provider``, and ``preview_text``, or ``None``
-            if the directory has no valid recording files.
+            ``last_activity``, ``model``, ``provider``, and
+            ``preview_text``, or ``None`` if the directory has no valid
+            recording files.
         """
         sid = session_dir.name
         recordings: List[Dict[str, Any]] = []
@@ -413,12 +418,17 @@ class SessionRecorder:
         # Find first provider_to_client response
         first_resp = None
         first_req = None
+        # Determine the latest recording timestamp across all files
+        last_timestamp: Optional[str] = None
         for r in recordings:
+            ts = r["timestamp"]
+            if last_timestamp is None or ts > last_timestamp:
+                last_timestamp = ts
             if r["direction"] == "provider_to_client":
-                if first_resp is None or r["timestamp"] < first_resp["timestamp"]:
+                if first_resp is None or ts < first_resp["timestamp"]:
                     first_resp = r
             if r["direction"] == "client_to_proxy":
-                if first_req is None or r["timestamp"] < first_req["timestamp"]:
+                if first_req is None or ts < first_req["timestamp"]:
                     first_req = r
 
         # Prefer response data, fall back to request data
@@ -433,6 +443,7 @@ class SessionRecorder:
         return {
             "session_id": sid,
             "response_time": source.get("timestamp", ""),
+            "last_activity": last_timestamp or source.get("timestamp", ""),
             "model": source.get("model", ""),
             "provider": source.get("provider", ""),
             "preview_text": preview_text,
@@ -496,11 +507,11 @@ class SessionRecorder:
 
         # Prefer model-enriched sessions over unattributed ones
         if model_sessions:
-            model_sessions.sort(key=lambda s: s["response_time"], reverse=True)
+            model_sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
             return model_sessions
 
         # Fall back to all sessions when no model metadata exists yet
-        all_sessions.sort(key=lambda s: s["response_time"], reverse=True)
+        all_sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
         return all_sessions
 
     def list_sessions(self) -> List[Dict[str, Any]]:
@@ -528,7 +539,7 @@ class SessionRecorder:
             )
             return []
 
-        sessions.sort(key=lambda s: s["response_time"], reverse=True)
+        sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
         return sessions
 
     @staticmethod

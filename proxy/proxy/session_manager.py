@@ -14,6 +14,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
@@ -192,11 +193,13 @@ class SessionManager:
                     # Convert monotonic timestamps to wall-clock ISO8601 for sorting
                     wall_last = monotonic_offset + session.last_activity_at
                     wall_created = monotonic_offset + session.created_at
+                    response_time_str = datetime.fromtimestamp(wall_last, tz=timezone.utc).isoformat(timespec="seconds")
                     sessions.append({
                         "session_id": sid,
                         "created_at": session.created_at,
                         "last_activity_at": session.last_activity_at,
-                        "response_time": datetime.fromtimestamp(wall_last, tz=timezone.utc).isoformat(timespec="seconds"),
+                        "response_time": response_time_str,
+                        "last_activity": response_time_str,
                         "message_count": session.message_count,
                         "idle_seconds": round(session.idle_seconds, 1),
                         "age_seconds": round(session.age_seconds, 1),
