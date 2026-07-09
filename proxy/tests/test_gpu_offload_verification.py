@@ -23,11 +23,13 @@ Reference:
   - Router mode command (current): does NOT include -ngl
 """
 
+import asyncio
 import io
 import logging
 import os
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 import pytest
@@ -422,3 +424,101 @@ class TestCpuOnlyRollback:
         )
         # Verify it can be set to 0 (CPU-only)
         assert ngl_value >= 0, "ngl should support 0 as CPU-only mode"
+
+
+# ── Embeddings GPU Offload Verification Tests ────────────────────────────────────
+
+class TestEmbeddingsGpuOffload:
+    """Verify that the embeddings preset benefits from router-mode GPU offload.
+
+    The router-mode -ngl flag (added in LP-0MRE1ECIQ000B8MU) applies to ALL
+    model workers spawned by the router, so the mxbai-embed preset automatically
+    uses GPU offload without additional changes.
+    """
+
+    def test_models_ini_has_embeddings_section(self):
+        """models.ini must have an [mxbai-embed] section for embeddings."""
+        assert MODELS_INI.exists(), f"models.ini not found at {MODELS_INI}"
+        content = MODELS_INI.read_text()
+        assert "[mxbai-embed]" in content or "[embed]" in content, (
+            "models.ini missing embeddings preset section"
+        )
+
+    def test_embeddings_pinned_after_router_startup(self):
+        """The lifecycle ensures the embeddings preset remains loaded after
+        router-mode startup. The ensure_model_loaded function explicitly calls
+        router_load_model for the embeddings preset."""
+        content = lifecycle.__file__
+        lifecycle_source = Path(content).read_text()
+
+        # Verify the lifecycle source references embeddings preset pinning
+        assert "embeddings_preset" in lifecycle_source, (
+            "Lifecycle must reference embeddings pinning after router startup"
+        )
+        assert "router_load_model(embeddings_preset)" in lifecycle_source.replace(
+            "\n", " "
+        ).replace("await ", ""), (
+            "Lifecycle must call router_load_model for the embeddings preset"
+        )
+
+        # Verify the config key
+        assert 'embeddings_model' in lifecycle_source, (
+            "Lifecycle must reference the embeddings_model config key"
+        )
+
+    def test_embeddings_router_ngl_forwarded_globally(self):
+        """The -ngl flag is in the router-mode command, so embeddings workers
+        automatically benefit from GPU offload."""
+        content = START_SCRIPT.read_text()
+        lines = content.splitlines()
+
+        # Find router mode section
+        router_start = None
+        router_if_depth = 0
+        in_router = False
+        router_lines = []
+
+        for i, line in enumerate(lines):
+            ls = line.strip()
+            if not router_start and ls.startswith('if [[ "$router_mode" -eq 1 ]]; then'):
+                router_start = i
+                in_router = True
+                router_if_depth = 1
+                router_lines.append(ls)
+                continue
+            if in_router:
+                router_lines.append(ls)
+                if ls.startswith("if "):
+                    router_if_depth += 1
+                if ls == "fi" or ls.startswith("fi #"):
+                    router_if_depth -= 1
+                    if router_if_depth == 0:
+                        break
+
+        # Verify -ngl is present in router command (applies to ALL models)
+        ngl_in_router = any("-ngl" in rl for rl in router_lines)
+        assert ngl_in_router, (
+            "Router-mode command must include -ngl flag which applies to "
+            "all model workers including embeddings"
+        )
+
+    def test_embeddings_single_model_also_has_gpu_offload(self):
+        """The single-model path for mxbai-embed includes -ngl 99 via the
+        shared command template (all single-model paths use -ngl 99)."""
+        content = START_SCRIPT.read_text()
+        # The -ngl 99 is in the shared command template, not in each
+        # case block. Verify the script contains -ngl 99 for single-model mode.
+        assert "-ngl 99" in content, (
+            "Single-model mode must include -ngl 99 for GPU offload"
+        )
+        # Verify this is NOT in the router section (router uses get_global_ngl)
+        # by checking there's a -ngl 99 outside the router if block
+        lines = content.splitlines()
+        non_router_ngl = [
+            l.strip() for l in lines
+            if "-ngl" in l.strip() and "--models-preset" not in l
+        ]
+        assert any("-ngl 99" in l for l in non_router_ngl), (
+            "Single-model -ngl 99 must be present outside router section"
+        )
+
