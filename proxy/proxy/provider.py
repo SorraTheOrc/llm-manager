@@ -115,19 +115,20 @@ def initialize_cache_cold_from_config(config: dict) -> None:
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     """Estimate prompt token count for smart-routing decisions.
 
-    This is a lightweight version of lifecycle._estimate_prompt_tokens that
-    only counts user and assistant message content (excluding system prompts)
-    to estimate the "working context" size. System prompts are typically small
-    and not the driver of large-context timeouts.
+    Concatenates all non-system message content (including reasoning_content
+    and tool_calls) and uses tiktoken for accurate counting, falling back
+    to a byte-based heuristic if tiktoken is unavailable.
 
-    Uses a heuristic of ~4 bytes per token.
+    System prompts are excluded as they are typically small and not the
+    driver of large-context timeouts.
     """
     if not isinstance(body_json, dict):
         return 0
     messages = body_json.get("messages", [])
     if not messages:
         return 0
-    total_chars = 0
+
+    parts = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -136,17 +137,18 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         # timeouts and should not trigger cache-cold bypass.
         if role == "system":
             continue
+        # Count content field
         content = msg.get("content", "")
         if isinstance(content, str):
-            total_chars += len(content)
+            parts.append(content)
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and "text" in item:
-                    total_chars += len(str(item["text"]))
+                    parts.append(str(item["text"]))
         # Count reasoning_content (assistant messages with long reasoning)
         reasoning = msg.get("reasoning_content")
         if isinstance(reasoning, str):
-            total_chars += len(reasoning)
+            parts.append(reasoning)
         # Count tool_calls (function names and arguments)
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -157,11 +159,21 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
                 if isinstance(tc_func, dict):
                     name = tc_func.get("name", "")
                     if isinstance(name, str):
-                        total_chars += len(name)
+                        parts.append(name)
                     args = tc_func.get("arguments", "")
                     if isinstance(args, str):
-                        total_chars += len(args)
-    return max(0, total_chars // 4)
+                        parts.append(args)
+
+    if not parts:
+        return 0
+
+    text = " ".join(parts)
+    try:
+        from proxy.utils import count_text_tokens
+        return count_text_tokens(text)
+    except Exception:
+        # Fallback heuristic: ~4 bytes per token
+        return max(1, len(text.encode("utf-8")) // 4)
 
 
 def _get_large_context_fallback_threshold(config: dict) -> int:
