@@ -84,6 +84,7 @@ from .router_helpers import (  # noqa: E402
     _schedule_recv_token_increment,
     _schedule_token_increment,
     _try_acquire_local_dispatch,
+    _get_lease_timeout_seconds,
     _call_with_backend_retries,
     _call_with_empty_retry,
     normalize_upstream_request_headers,
@@ -1102,6 +1103,25 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                                 if _has_actual_data:
                                     remaining_budget = float(stream_idle_timeout)
+
+                                # Refresh dispatch lease expiry for long-running
+                                # streams (LP-0MRDKV44T003FRBP).  Extend the lease
+                                # whenever real data arrives, not on heartbeats,
+                                # so that streams lasting longer than
+                                # local_dispatch_lease_timeout_seconds do not lose
+                                # their lease mid-stream.
+                                if _has_actual_data and session_id and session_explicit:
+                                    try:
+                                        _lease_lock = getattr(srv, 'local_dispatch_records_lock', None)
+                                        if _lease_lock is not None:
+                                            _lease_timeout = _get_lease_timeout_seconds(srv)
+                                            async with _lease_lock:
+                                                if session_id in srv.local_dispatch_records:
+                                                    srv.local_dispatch_records[session_id]['expires_at'] = (
+                                                        time.monotonic() + _lease_timeout
+                                                    )
+                                    except Exception:
+                                        pass
 
                                 # guardrail check
                                 if not guardrail_reason:

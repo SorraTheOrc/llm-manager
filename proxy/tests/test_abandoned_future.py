@@ -12,6 +12,7 @@ Verifies that:
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -358,6 +359,95 @@ async def test_idle_timeout_cleans_up_pending_future(monkeypatch):
 
     # Clean up the hanging event
     _hang_event.set()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lease_refreshed_during_streaming(monkeypatch):
+    """The dispatch lease expires_at should be refreshed on each data chunk.
+
+    LP-0MRDKV44T003FRBP: When a streaming response delivers real data,
+    the dispatch record's expires_at must be extended so long-running
+    streams (> local_dispatch_lease_timeout_seconds) do not lose their
+    lease mid-stream.
+    """
+    from proxy.router import proxy_to_local
+
+    # Set up dispatch tracking on server state
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+
+    async def _aiter():
+        yield b'data: {"choices": [{"delta": {"content": "Hello"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {"content": " world"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    cm, resp = _make_mock_cm(_aiter)
+    monkeypatch.setattr(
+        "proxy.router._call_with_backend_retries",
+        AsyncMock(return_value=(cm, resp)),
+    )
+
+    # Use an explicit session so the dispatch lease path is exercised
+    monkeypatch.setattr(
+        "proxy.router._handle_session",
+        AsyncMock(
+            return_value={
+                "session_id": "test-session-lease-refresh",
+                "session_id_header": "test-session-lease-refresh",
+                "session_explicit": True,
+                "session_created": False,
+                "is_delta_request": False,
+                "session_fallback_reason": None,
+                "delta_messages": [],
+                "original_message_count": 1,
+                "body_override": None,
+                "body_json": None,
+            }
+        ),
+    )
+
+    monkeypatch.setattr(
+        "proxy.router._build_slot_context",
+        MagicMock(return_value=(None, None, 3.0)),
+    )
+    monkeypatch.setattr(
+        "proxy.router._check_slot_availability",
+        AsyncMock(return_value=None),
+    )
+
+    response = await proxy_to_local(
+        _dummy_request(
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            stream=True,
+        ),
+        "v1/chat/completions",
+    )
+
+    # Consume the first chunk (triggers lease refresh in stream_generator)
+    gen = response.body_iterator.__aiter__()
+    chunk1 = await gen.__anext__()
+    assert chunk1 is not None
+
+    # After consuming one chunk, the dispatch record should exist and have
+    # a future expires_at (refreshed when _has_actual_data was True).
+    assert "test-session-lease-refresh" in server.local_dispatch_records, (
+        "Dispatch record should exist for the explicit session"
+    )
+    record = server.local_dispatch_records["test-session-lease-refresh"]
+    assert record["expires_at"] > time.monotonic(), (
+        f"Dispatch lease expires_at ({record['expires_at']}) should be in the "
+        f"future, but time.monotonic()={time.monotonic()}"
+    )
+
+    # Consume remaining chunks (clean shutdown)
+    try:
+        while True:
+            await gen.__anext__()
+    except StopAsyncIteration:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
