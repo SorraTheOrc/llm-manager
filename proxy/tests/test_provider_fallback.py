@@ -2715,6 +2715,62 @@ async def test_cache_cold_bypass_uses_session_history_tokens(mixed_model_config)
     assert call_log == ["remote-fallback"]
 
 
+@pytest.mark.asyncio
+async def test_cache_cold_bypass_first_request_after_restart(mixed_model_config):
+    """First request after restart with cold cache and large body should skip local.
+
+    Regression for LP-0MRDE669Y003V1SO: a request with >40K tokens on a cold
+    cache with no existing session must still be routed to remote fallback.
+    """
+    provider._model_cache_cold.clear()
+    provider.mark_model_cache_cold("Qwen3")
+
+    # First request: no session header, large body
+    large_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
+        b'test message content for token estimation ' * 7000 + \
+        b'"}],"stream":false}'
+    request = _DummyRequest(body=large_body)
+    # No session header — this is the first request after restart
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "local_large_context_fallback_threshold": 40000,
+    }
+
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-llama")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200, (
+        f"Expected 200, got {result.status_code}: {result.body.decode()}"
+    )
+    assert call_log == ["remote-fallback"], (
+        f"Expected remote-provider call, got: {call_log}"
+    )
+
+
 # ===================================================================
 # Parity tests for shared fallback primitives
 # ===================================================================
