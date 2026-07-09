@@ -115,14 +115,19 @@ def initialize_cache_cold_from_config(config: dict) -> None:
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     """Estimate prompt token count for smart-routing decisions.
 
-    Counts all non-system message content bytes (including reasoning_content
-    and tool_calls) and estimates using a conservative ~2.5 bytes per token
-    ratio. This is intentionally conservative (~2.5 bpt instead of the
-    typical ~4) to avoid undershooting for code/tool-heavy agent sessions
-    where the actual ratio is closer to 1.4.
+    Concatenates all non-system message content (including reasoning_content
+    and tool_calls) and uses tiktoken (via ``count_text_tokens``) for
+    accurate token counting.  Falls back to a conservative byte-based
+    heuristic (1 byte per token) when tiktoken is unavailable.
 
     System prompts are excluded as they are typically small and not the
     driver of large-context timeouts.
+
+    Using tiktoken guarantees correct routing decisions regardless of
+    content density — the previous byte heuristic with ``// 2`` could
+    underestimate by 2× for very dense content (hex, compact JSON with
+    bpt ~1.2), causing the cache-cold bypass to miss requests with 70K+
+    actual tokens.
     """
     if not isinstance(body_json, dict):
         return 0
@@ -130,6 +135,7 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     if not messages:
         return 0
 
+    parts: list[str] = []
     total_bytes = 0
     for msg in messages:
         if not isinstance(msg, dict):
@@ -142,14 +148,18 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         # Count content field
         content = msg.get("content", "")
         if isinstance(content, str):
+            parts.append(content)
             total_bytes += len(content.encode("utf-8"))
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and "text" in item:
-                    total_bytes += len(str(item["text"]).encode("utf-8"))
+                    text = str(item["text"])
+                    parts.append(text)
+                    total_bytes += len(text.encode("utf-8"))
         # Count reasoning_content (assistant messages with long reasoning)
         reasoning = msg.get("reasoning_content")
         if isinstance(reasoning, str):
+            parts.append(reasoning)
             total_bytes += len(reasoning.encode("utf-8"))
         # Count tool_calls (function names and arguments)
         tool_calls = msg.get("tool_calls")
@@ -161,19 +171,28 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
                 if isinstance(tc_func, dict):
                     name = tc_func.get("name", "")
                     if isinstance(name, str):
+                        parts.append(name)
                         total_bytes += len(name.encode("utf-8"))
                     args = tc_func.get("arguments", "")
                     if isinstance(args, str):
+                        parts.append(args)
                         total_bytes += len(args.encode("utf-8"))
 
-    if total_bytes <= 0:
+    if not parts:
         return 0
 
-    # Conservative estimate: ~2 bytes per token.
-    # Agent sessions with code/tool data average ~1.4 bpt, but we use 2
-    # to avoid false negatives (underrouting) while still allowing fast
-    # byte-only computation.
-    return max(1, total_bytes // 2)
+    # Primary path: use tiktoken for accurate token counting.
+    # This correctly handles all content densities (code, JSON, text).
+    try:
+        from proxy.utils import count_text_tokens
+        text = " ".join(parts)
+        return count_text_tokens(text)
+    except Exception:
+        # Fallback: ultra-conservative byte-based heuristic (~1 byte per
+        # token).  This overestimates for all content types (code bpt ~3,
+        # JSON ~4, text ~4) guaranteeing the bypass always fires for large
+        # requests even when tiktoken is unavailable.
+        return max(1, total_bytes // 1)
 
 
 def _get_large_context_fallback_threshold(config: dict) -> int:

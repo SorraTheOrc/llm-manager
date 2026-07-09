@@ -83,19 +83,18 @@ class TestEstimatePromptTokensForRouting:
         assert 1 <= tokens <= 5
 
     def test_large_message(self):
-        """A large message should yield a large estimate.
-
-        ~360K bytes / 2 = ~180K estimated tokens.
-        """
-        large_content = "x" * 360_000
+        """A large message should yield a large estimate using tiktoken."""
+        phrase = "test message content for token estimation "
+        large_content = phrase * 12000  # ~72K tokens with tiktoken
         body = {"messages": [{"role": "user", "content": large_content}]}
         tokens = _estimate_prompt_tokens_for_routing(body)
-        assert tokens >= 160_000
-        assert tokens <= 200_000
+        assert tokens >= 65_000
+        assert tokens <= 80_000
 
     def test_40k_threshold_crossing(self):
-        """A message at ~41K tokens should be detected as above 40K threshold."""
-        content = "x" * 164_000  # ~82K estimated
+        """A message with >40K actual tokens should be detected as above threshold."""
+        phrase = "test message content for token estimation "
+        content = phrase * 7000  # ~42K actual tokens with tiktoken
         body = {"messages": [{"role": "user", "content": content}]}
         tokens = _estimate_prompt_tokens_for_routing(body)
         assert tokens > 40_000
@@ -126,54 +125,59 @@ class TestEstimatePromptTokensForRouting:
 
     def test_combined_user_assistant_messages_counted(self):
         """Both user and assistant messages should be counted."""
+        phrase = "test message "
         body = {
             "messages": [
-                {"role": "user", "content": "x" * 80_000},
-                {"role": "assistant", "content": "y" * 80_000},
+                {"role": "user", "content": phrase * 20000},  # ~40K tokens
+                {"role": "assistant", "content": phrase * 20000},  # ~40K tokens
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count both: ~80K estimated
-        assert tokens >= 70_000
-        assert tokens <= 90_000
+        # Should count both: ~80K total
+        assert tokens >= 75_000
+        assert tokens <= 85_000
 
     def test_array_content_counts_text_only(self):
         """Array content (multimodal) should count text fields only."""
+        phrase = "test message content for token estimation "
         body = {
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "x" * 160_000},
+                        {"type": "text", "text": phrase * 10000},  # ~60K tokens
                         {"type": "image", "url": "http://example.com/img.jpg"},
                     ],
                 }
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count only the text part: ~80K
-        assert tokens >= 70_000
-        assert tokens <= 90_000
+        # Should count only the text part: ~60K
+        assert tokens >= 55_000
+        assert tokens <= 65_000
 
     def test_reasoning_content_counted(self):
         """Assistant reasoning_content should be counted (LP-0MRDE669Y003V1SO)."""
+        phrase = "test message content for token estimation "
         body = {
             "messages": [
                 {"role": "user", "content": "Hello"},
                 {
                     "role": "assistant",
                     "content": None,
-                    "reasoning_content": "x" * 160_000,
+                    "reasoning_content": phrase * 10000,  # ~60K tokens
                 },
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count reasoning_content: ~80K
-        assert tokens >= 70_000
-        assert tokens <= 90_000
+        # Should count reasoning_content: ~60K
+        assert tokens >= 55_000
+        assert tokens <= 65_000
 
     def test_tool_calls_counted(self):
         """Tool call function names and arguments should be counted (LP-0MRDE669Y003V1SO)."""
+        phrase = "test message content for token estimation "
+        args_content = '{"command": "' + phrase * 5000 + '"}'
         body = {
             "messages": [
                 {"role": "user", "content": "Hello"},
@@ -185,14 +189,14 @@ class TestEstimatePromptTokensForRouting:
                             "id": "call_1",
                             "function": {
                                 "name": "bash",
-                                "arguments": '{"command": "' + "x" * 80_000 + '"}',
+                                "arguments": args_content,
                             },
                         },
                         {
                             "id": "call_2",
                             "function": {
                                 "name": "read",
-                                "arguments": '{"path": "' + "y" * 80_000 + '"}',
+                                "arguments": args_content,
                             },
                         },
                     ],
@@ -200,25 +204,27 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count both tool calls: ~80K total
-        assert tokens >= 70_000
-        assert tokens <= 90_000
+        # Should count both tool calls: ~60K total
+        assert tokens >= 55_000
+        assert tokens <= 65_000
 
     def test_mixed_content_reasoning_tool_calls_counted(self):
         """Mixed content, reasoning, and tool calls should all be counted (LP-0MRDE669Y003V1SO)."""
+        phrase = "test message "
+        phrase2 = "test message content for token estimation "
         body = {
             "messages": [
-                {"role": "user", "content": "x" * 40_000},
+                {"role": "user", "content": phrase * 6000},  # ~12K tokens
                 {
                     "role": "assistant",
-                    "content": "y" * 40_000,
-                    "reasoning_content": "z" * 40_000,
+                    "content": phrase * 6000,  # ~12K tokens
+                    "reasoning_content": phrase2 * 5000,  # ~30K tokens
                     "tool_calls": [
                         {
                             "id": "call_1",
                             "function": {
                                 "name": "test_func",
-                                "arguments": "w" * 40_000,
+                                "arguments": phrase2 * 5000,  # ~30K tokens
                             },
                         },
                     ],
@@ -226,9 +232,9 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count content + reasoning + tool_call args: ~80K
-        assert tokens >= 70_000
-        assert tokens <= 90_000
+        # Should count content + reasoning + tool_call args: ~84K total
+        assert tokens >= 75_000
+        assert tokens <= 95_000
 
 
 class TestSmartRoutingThresholdConfig:
@@ -279,7 +285,8 @@ class TestSmartRoutingDecision:
 
     def test_warm_cache_large_request_routes_local(self):
         """AC 1 & 4: Warm cache + >40K tokens → routes local (normal)."""
-        body = {"messages": [{"role": "user", "content": "x" * 200_000}]}
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
         threshold = 40000
         cache_cold = False
         should_skip = _should_skip_local(cache_cold, body, threshold)
@@ -296,7 +303,8 @@ class TestSmartRoutingDecision:
     def test_cold_cache_large_request_skips_local(self):
         """AC 3: Cold cache + >40K tokens → skips local."""
         mark_model_cache_cold("Qwen3")
-        body = {"messages": [{"role": "user", "content": "x" * 200_000}]}
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
         threshold = 40000
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is True
@@ -304,25 +312,26 @@ class TestSmartRoutingDecision:
     def test_threshold_disabled_cold_cache_large_request_routes_local(self):
         """Threshold=0 (disabled) → always routes local regardless of cache state."""
         mark_model_cache_cold("Qwen3")
-        body = {"messages": [{"role": "user", "content": "x" * 200_000}]}
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
         threshold = 0
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is False
 
     def test_cold_cache_exact_threshold_does_not_skip(self):
-        """Exactly at threshold (<=) should NOT skip local."""
+        """Content below threshold should NOT skip local."""
         mark_model_cache_cold("Qwen3")
-        # 80_000 bytes / 2 = 40_000 tokens
-        body = {"messages": [{"role": "user", "content": "x" * 80_000}]}
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 5500}]}  # ~33K tokens (<40K)
         threshold = 40000
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is False
 
     def test_cold_cache_just_above_threshold_skips(self):
-        """Just above threshold (>40K) should skip local when cache is cold."""
+        """Content above threshold should skip local when cache is cold."""
         mark_model_cache_cold("Qwen3")
-        # 82_000 bytes / 2 = 41_000 tokens
-        body = {"messages": [{"role": "user", "content": "x" * 82_000}]}
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens (>40K)
         threshold = 40000
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is True
@@ -474,7 +483,8 @@ class TestCacheColdLifecycle:
         assert is_model_cache_cold("Qwen3") is True
 
         # Large request (>40K tokens) with cold cache should skip local
-        body = {"messages": [{"role": "user", "content": "x" * 200_000}]}
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
         threshold = 40000
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is True
