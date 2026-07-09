@@ -961,7 +961,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 _stream_aiter.__anext__()
                             )
                             _heartbeat_interval = stream_heartbeat_interval
-                            _heartbeat_bytes = b"data: {\"type\":\"heartbeat\"}\n\n"
                             remaining_budget = runtime_budget
                             while True:
                                 _hb_task = asyncio.ensure_future(
@@ -988,7 +987,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         )
                                         break
                                     remaining_budget -= _heartbeat_interval
-                                    yield _heartbeat_bytes
+                                    # Build heartbeat JSON with token progress (LP-0MRDFUHMP005SFU2)
+                                    _pct = (
+                                        round(completion_tokens_total / max_completion_tokens * 100, 1)
+                                        if max_completion_tokens > 0
+                                        else 0.0
+                                    )
+                                    _hb = (
+                                        'data: {"type":"heartbeat",'
+                                        f'"tokens":{completion_tokens_total},'
+                                        f'"max_tokens":{max_completion_tokens},'
+                                        f'"pct":{_pct}}}' + '\n\n'
+                                    ).encode("utf-8")
+                                    yield _hb
                                     continue
 
                                 # A chunk arrived — cancel the heartbeat task
