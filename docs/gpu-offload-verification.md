@@ -256,32 +256,49 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
 rocm-smi --showmeminfo vram
 ```
 
-### 4.2 Rollback to Pre-Offload State
+### 4.2 Rollback via LLAMA_NGL env var
+
+```bash
+# Override GPU layers to 0 for CPU-only mode (no models.ini change needed)
+LLAMA_NGL=0 LLAMA_SERVER_BIN=/home/rgardler/llama.cpp/build/bin/llama-server \
+  ./start-llama.sh router &
+```
+
+This is useful for temporary rollback or A/B testing without modifying
+configuration files.
+
+### 4.3 Rollback to Pre-Offload State
 
 If ROCm instability reappears:
 
-1. Set `ngl = 0` in `[global]` section of `models.ini`
-2. Restart the proxy: `systemctl --user restart llama-proxy`
-3. Verify health endpoints return 200
-4. Verify chat and embeddings requests complete successfully (CPU-only)
-5. Confirm GPU memory stays at idle levels
+1. **Quick rollback (env var):** `LLAMA_NGL=0 ./start-llama.sh router`
+2. **Permanent rollback:** Set `ngl = 0` in `[global]` section of `models.ini`
+3. Restart the proxy: `systemctl --user restart llama-proxy`
+4. Verify health endpoints return 200
+5. Verify chat and embeddings requests complete successfully (CPU-only)
+6. Confirm GPU memory stays at idle levels via `rocm-smi --showmeminfo vram`
 
 ---
 
-## 5. Guard Test Interpretation
+## 5. Final Guard Test Status
 
-The test file `proxy/tests/test_gpu_offload_verification.py` contains two
-guard tests that are currently **skipped**:
+All guard tests in `proxy/tests/test_gpu_offload_verification.py` now **PASS**
+(17 tests total). The two tests that were previously skipped are now passing:
 
-1. `test_models_ini_global_ngl_is_forwarded_to_router` — Skipped because
-   router mode does not yet forward `-ngl`. Once
-   **LP-0MRE1ECIQ000B8MU (Qwen3 Router GPU Offload)** is implemented, the
-   skip should be removed and the assertion enabled.
-2. `test_ngl_zero_rollback_possible_via_env` — Skipped until an env-var
-   override for ngl in router mode is implemented.
+1. `test_models_ini_global_ngl_is_forwarded_to_router` — **PASSING**
+   Router-mode command in start-llama.sh now includes `-ngl` from models.ini
+   `[global]`. Implemented in LP-0MRE1ECIQ000B8MU (Qwen3 Router GPU Offload).
 
-When these tests change from SKIPPED to PASSING, the offload and rollback
-implementation is complete.
+2. `test_ngl_zero_rollback_possible_via_env` — **PASSING**
+   The `LLAMA_NGL` env var override for CPU-only rollback is implemented in
+   start-llama.sh. Setting `LLAMA_NGL=0` forces CPU-only mode.
+
+3. `test_embeddings_router_ngl_forwarded_globally` — **PASSING**
+   Verified that the router-mode -ngl flag applies to ALL models (including
+   the mxbai-embed embeddings preset), added in LP-0MRE1ECQ600325CS.
+
+If any of these tests fail in the future, it indicates that GPU offload
+settings are no longer being propagated correctly.
 
 ## 6. Integration with Existing Monitoring
 

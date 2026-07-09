@@ -274,3 +274,45 @@ should be configured via the system's logrotate.
   `scripts/cleanup-slot-cache.sh` for KV cache snapshot retention.
   Runs at 4:00 AM to avoid conflict with the main cleanup at 3:00 AM.
   See the slot cache cleanup epic for details.
+
+## GPU Offload (ROCm)
+
+The proxy supports AMD ROCm GPU acceleration for LLM inference via the
+router-mode llama-server. GPU offload is configured in `models.ini`:
+
+```ini
+[global]
+ngl = 99          # GPU layers (99 = offload all layers to GPU)
+```
+
+### How it works
+
+- Router-mode startup in `start-llama.sh` reads `[global] ngl` from `models.ini`
+  and passes it as `-ngl <value>` to the llama-server command.
+- This applies to ALL model workers spawned by the router (both Qwen3 and the
+  mxbai-embed embeddings preset).
+- Single-model mode also uses `-ngl 99` for GPU offload.
+
+### Rollback to CPU-only
+
+If ROCm instability occurs, operators can roll back to CPU-only mode:
+
+1. **Quick (env var):** `LLAMA_NGL=0 ./start-llama.sh router`
+2. **Permanent:** Set `ngl = 0` in `[global]` in `models.ini` and restart.
+
+### Verification
+
+- **Unit tests:** `proxy/tests/test_gpu_offload_verification.py` validates
+  models.ini parsing, env var propagation, and command construction.
+- **Live verification:** See `docs/gpu-offload-verification.md` for health
+  checks, ROCm confirmation steps, and baseline measurement.
+- **Guard tests:** All guard tests pass. A regression in GPU offload
+  settings will cause test failures.
+
+### Pre-requisites
+
+- AMD GPU with ROCm drivers
+- llama-server compiled with `-DGGML_HIP=ON`
+- ROCm environment variables in `start-llama.sh`:
+  - `HSA_OVERRIDE_GFX_VERSION=11.5.1`
+  - `ROCM_LLVM_PRE_VEGA=1`
