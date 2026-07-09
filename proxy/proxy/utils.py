@@ -360,6 +360,9 @@ async def _call_with_empty_retry(
 def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dict:
     """Normalize headers before sending to clients.
 
+    - Always strips ``content-encoding`` since httpx auto-decompresses
+      upstream bodies; forwarding the encoding header causes downstream
+      clients to attempt double-decompression and fail.
     - If buffered=True (we are sending a full body via Response), remove
       any Transfer-Encoding header so frameworks/servers may set a proper
       Content-Length for the buffered body.
@@ -371,6 +374,12 @@ def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dic
         return {}
     lc_map = {k.lower(): k for k in in_headers.keys()}
     out = dict(in_headers)
+
+    # Always strip content-encoding — httpx decompresses the body
+    if 'content-encoding' in lc_map:
+        out.pop(lc_map['content-encoding'], None)
+        # Rebuild lc_map since we removed a key
+        lc_map = {k.lower(): k for k in out.keys()}
 
     if buffered:
         # We're returning a buffered body; ensure Transfer-Encoding is not forwarded

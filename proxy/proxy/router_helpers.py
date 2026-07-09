@@ -687,10 +687,21 @@ def _normalize_outgoing_headers(
     headers: dict, buffered: bool = False
 ) -> dict:
     """Normalize outgoing response headers.
-    
-    Removes content-length when transfer-encoding is present (for streaming).
+
+    - Always strips ``content-encoding`` since httpx auto-decompresses
+      upstream bodies; forwarding the encoding header causes downstream
+      clients to attempt double-decompression and fail.
+    - Removes ``content-length`` when ``transfer-encoding`` is present
+      (for streaming).
     """
     result = dict(headers)
+
+    # Always strip content-encoding — httpx decompresses the body
+    for k in list(result.keys()):
+        if k.lower() == "content-encoding":
+            del result[k]
+            break
+
     if buffered:
         pass
     else:
