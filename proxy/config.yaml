@@ -306,6 +306,15 @@ server:
   # the stream.  Default: 30 seconds.
   stream_idle_timeout_seconds: 30
 
+  # Upstream stall idle timeout (LP-0MRE52D3C001KP1H).
+  # When the remote upstream stops sending data mid-stream without closing
+  # the connection or sending a finish_reason, the proxy waits this long
+  # for the next chunk before detecting a stall, closing the connection,
+  # and retrying with bounded exponential backoff.
+  # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
+  # Default: 60 seconds.
+  upstream_idle_timeout_seconds: 60
+
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
   # emits {"type":"heartbeat"} events every N seconds to keep the client
