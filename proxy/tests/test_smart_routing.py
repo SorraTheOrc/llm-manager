@@ -155,6 +155,81 @@ class TestEstimatePromptTokensForRouting:
         assert tokens >= 35_000
         assert tokens <= 45_000
 
+    def test_reasoning_content_counted(self):
+        """Assistant reasoning_content should be counted (LP-0MRDE669Y003V1SO)."""
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "x" * 160_000,  # ~40K tokens
+                },
+            ]
+        }
+        tokens = _estimate_prompt_tokens_for_routing(body)
+        # Should count reasoning_content: ~40K
+        assert tokens >= 35_000
+        assert tokens <= 45_000
+
+    def test_tool_calls_counted(self):
+        """Tool call function names and arguments should be counted (LP-0MRDE669Y003V1SO)."""
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command": "' + "x" * 80_000 + '"}',  # ~20K
+                            },
+                        },
+                        {
+                            "id": "call_2",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path": "' + "y" * 80_000 + '"}',  # ~20K
+                            },
+                        },
+                    ],
+                },
+            ]
+        }
+        tokens = _estimate_prompt_tokens_for_routing(body)
+        # Should count both tool calls: ~40K total
+        assert tokens >= 38_000
+        assert tokens <= 45_000
+
+    def test_mixed_content_reasoning_tool_calls_counted(self):
+        """Mixed content, reasoning, and tool calls should all be counted (LP-0MRDE669Y003V1SO)."""
+        body = {
+            "messages": [
+                {"role": "user", "content": "x" * 40_000},  # ~10K
+                {
+                    "role": "assistant",
+                    "content": "y" * 40_000,  # ~10K
+                    "reasoning_content": "z" * 40_000,  # ~10K
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "test_func",
+                                "arguments": "w" * 40_000,  # ~10K
+                            },
+                        },
+                    ],
+                },
+            ]
+        }
+        tokens = _estimate_prompt_tokens_for_routing(body)
+        # Should count content + reasoning + tool_call args: ~40K
+        assert tokens >= 35_000
+        assert tokens <= 45_000
+
 
 class TestSmartRoutingThresholdConfig:
     """Tests for the threshold configuration parsing."""

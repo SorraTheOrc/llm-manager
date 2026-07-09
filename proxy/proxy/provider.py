@@ -143,6 +143,24 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
             for item in content:
                 if isinstance(item, dict) and "text" in item:
                     total_chars += len(str(item["text"]))
+        # Count reasoning_content (assistant messages with long reasoning)
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str):
+            total_chars += len(reasoning)
+        # Count tool_calls (function names and arguments)
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_func = tc.get("function")
+                if isinstance(tc_func, dict):
+                    name = tc_func.get("name", "")
+                    if isinstance(name, str):
+                        total_chars += len(name)
+                    args = tc_func.get("arguments", "")
+                    if isinstance(args, str):
+                        total_chars += len(args)
     return max(0, total_chars // 4)
 
 
