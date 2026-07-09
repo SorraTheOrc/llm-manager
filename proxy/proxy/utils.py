@@ -357,29 +357,43 @@ async def _call_with_empty_retry(
 # Header normalization
 # ===================================================================
 
+# Upstream response headers that MUST NOT be forwarded to downstream clients.
+_OUTGOING_STRIPPED_HEADERS = frozenset({
+    "content-encoding",
+    "date",
+    "server",
+    "connection",
+})
+
+
 def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dict:
     """Normalize headers before sending to clients.
 
-    - Always strips ``content-encoding`` since httpx auto-decompresses
-      upstream bodies; forwarding the encoding header causes downstream
-      clients to attempt double-decompression and fail.
-    - If buffered=True (we are sending a full body via Response), remove
-      any Transfer-Encoding header so frameworks/servers may set a proper
-      Content-Length for the buffered body.
-    - If buffered=False (we are streaming and will not pre-compute a
-      Content-Length), remove Content-Length if Transfer-Encoding is present
-      to avoid sending both headers.
+    Strips upstream headers that should not be forwarded to the downstream
+    client:
+
+    - ``content-encoding`` — httpx auto-decompresses upstream bodies;
+      forwarding the encoding header causes downstream clients to attempt
+      double-decompression and fail.
+    - ``date``, ``server`` — uvicorn/Starlette set these automatically;
+      forwarding them creates duplicate RFC-violating headers.
+    - ``connection`` — hop-by-hop header managed by the HTTP stack.
+    - ``content-length`` — removed when ``transfer-encoding`` is present
+      (for streaming).
+    - ``transfer-encoding`` — removed in the buffered path (the framework
+      will set the correct CL or TE for the new response body).
     """
     if not in_headers:
         return {}
     lc_map = {k.lower(): k for k in in_headers.keys()}
     out = dict(in_headers)
 
-    # Always strip content-encoding — httpx decompresses the body
-    if 'content-encoding' in lc_map:
-        out.pop(lc_map['content-encoding'], None)
-        # Rebuild lc_map since we removed a key
-        lc_map = {k.lower(): k for k in out.keys()}
+    # Always strip headers that uvicorn/Starlette set or that are incorrect
+    # after httpx processing
+    for lk in list(lc_map.keys()):
+        if lk in _OUTGOING_STRIPPED_HEADERS:
+            out.pop(lc_map[lk], None)
+            del lc_map[lk]
 
     if buffered:
         # We're returning a buffered body; ensure Transfer-Encoding is not forwarded

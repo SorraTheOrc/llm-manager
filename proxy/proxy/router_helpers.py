@@ -683,24 +683,43 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 # Header normalization helpers
 # ===================================================================
 
+# Upstream response headers that MUST NOT be forwarded to downstream clients.
+# These are either set automatically by uvicorn/Starlette (date, server),
+# are hop-by-hop (connection), or are incorrect after httpx auto-decompression
+# (content-encoding). Forwarding them causes duplicate headers, violated RFCs,
+# or downstream decompression failures.
+_OUTGOING_STRIPPED_HEADERS = {
+    "content-encoding",
+    "date",
+    "server",
+    "connection",
+}
+
+
 def _normalize_outgoing_headers(
     headers: dict, buffered: bool = False
 ) -> dict:
     """Normalize outgoing response headers.
 
-    - Always strips ``content-encoding`` since httpx auto-decompresses
-      upstream bodies; forwarding the encoding header causes downstream
-      clients to attempt double-decompression and fail.
-    - Removes ``content-length`` when ``transfer-encoding`` is present
+    Strips upstream headers that should not be forwarded to the downstream
+    client:
+
+    - ``content-encoding`` — httpx auto-decompresses upstream bodies;
+      forwarding the encoding header causes downstream clients to attempt
+      double-decompression and fail.
+    - ``date``, ``server`` — uvicorn/Starlette set these automatically;
+      forwarding them creates duplicate RFC-violating headers.
+    - ``connection`` — hop-by-hop header managed by the HTTP stack.
+    - ``content-length`` — removed when ``transfer-encoding`` is present
       (for streaming).
     """
     result = dict(headers)
 
-    # Always strip content-encoding — httpx decompresses the body
+    # Always strip headers that uvicorn/Starlette set or that are incorrect
+    # after httpx processing
     for k in list(result.keys()):
-        if k.lower() == "content-encoding":
+        if k.lower() in _OUTGOING_STRIPPED_HEADERS:
             del result[k]
-            break
 
     if buffered:
         pass
