@@ -1032,12 +1032,6 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                # Check if process is still running
                if srv.llama_process.poll() is None:
                    srv.backend_ready = True
-                   # Model is already running; cache is valid (LP-0MRCSSBTM002NK3B)
-                   try:
-                       from proxy.provider import clear_model_cache_cold as _clear_cache
-                       _clear_cache(llama_model)
-                   except Exception:
-                       pass
                    return True
                else:
                    srv.logger.warning("llama-server process died, restarting...")
@@ -1124,12 +1118,6 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    "llama_server_running": True
                })
                srv.backend_ready = True
-               # Model loaded successfully via router; cache is valid (LP-0MRCSSBTM002NK3B)
-               try:
-                   from proxy.provider import clear_model_cache_cold as _clear_cache
-                   _clear_cache(llama_model)
-               except Exception:
-                   pass
                return True
 
            # Need to switch models or restart (single-model path)
@@ -1162,12 +1150,6 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    "llama_server_running": True
                })
                srv.backend_ready = True
-               # Model loaded successfully; cache is valid (LP-0MRCSSBTM002NK3B)
-               try:
-                   from proxy.provider import clear_model_cache_cold as _clear_cache
-                   _clear_cache(llama_model)
-               except Exception:
-                   pass
                return True
            else:
                # Broadcast failure

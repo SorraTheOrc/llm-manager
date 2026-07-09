@@ -282,6 +282,15 @@ async def lifespan(app: FastAPI):
     config = load_config()
     logger = setup_logging(config)
     logger.info("Starting LLama Proxy Server")
+
+    # LP-0MRDE669Y003V1SO: Mark all local model caches as cold on startup.
+    # This ensures large-context requests are routed to remote fallback
+    # immediately after restart, rather than attempting expensive full re-prefill.
+    try:
+        from proxy.provider import initialize_cache_cold_from_config as _init_cache
+        _init_cache(config)
+    except Exception:
+        pass
     backend_ready = False
     backend_recovery_state = {
         "in_progress": False,

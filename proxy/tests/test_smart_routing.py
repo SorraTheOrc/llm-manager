@@ -9,6 +9,7 @@ from proxy.provider import (
     mark_model_cache_cold,
     clear_model_cache_cold,
     is_model_cache_cold,
+    initialize_cache_cold_from_config,
     _estimate_prompt_tokens_for_routing,
 )
 
@@ -19,8 +20,10 @@ class TestModelCacheColdTracking:
     def setup_method(self):
         _model_cache_cold.clear()
 
-    def test_initial_state_is_warm(self):
-        """All models start with cache considered valid (warm)."""
+    def test_initial_state_is_cold(self):
+        """All models start with cache considered cold (LP-0MRDE669Y003V1SO)."""
+        # After clearing, no models are marked cold. The initialize_cache_cold_from_config
+        # function is called at startup to populate the set from config.
         assert is_model_cache_cold("Qwen3") is False
         assert is_model_cache_cold("gemma4") is False
         assert is_model_cache_cold("nonexistent") is False
@@ -253,3 +256,150 @@ class TestSmartRoutingDecision:
 # The function tested above lives in provider.py; we import it here.
 # It's defined for test purposes - the real implementation is in provider.py
 from proxy.provider import _should_skip_local
+
+
+class TestInitializeCacheColdFromConfig:
+    """Tests for the startup cache-cold initialization."""
+
+    def setup_method(self):
+        _model_cache_cold.clear()
+
+    def test_marks_local_models_cold(self):
+        """Local models should be marked cold after init."""
+        config = {
+            "models": {
+                "plan": {
+                    "providers": [
+                        {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
+                        {"name": "opencode", "type": "remote"},
+                    ]
+                },
+                "qwen3": {
+                    "providers": [
+                        {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
+                    ]
+                },
+            }
+        }
+        initialize_cache_cold_from_config(config)
+        assert is_model_cache_cold("Qwen3") is True
+
+    def test_skips_remote_only_models(self):
+        """Models with only remote providers should NOT be marked cold."""
+        config = {
+            "models": {
+                "opencode-model": {
+                    "providers": [
+                        {"name": "opencode", "type": "remote", "model": "deepseek"},
+                    ]
+                },
+            }
+        }
+        initialize_cache_cold_from_config(config)
+        assert is_model_cache_cold("Qwen3") is False
+
+    def test_multiple_local_models_all_cold(self):
+        """Multiple local models should all be marked cold."""
+        config = {
+            "models": {
+                "plan": {
+                    "providers": [
+                        {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
+                    ]
+                },
+                "gemma4": {
+                    "providers": [
+                        {"name": "local-gemma4", "type": "local", "llama_model": "gemma4"},
+                    ]
+                },
+            }
+        }
+        initialize_cache_cold_from_config(config)
+        assert is_model_cache_cold("Qwen3") is True
+        assert is_model_cache_cold("gemma4") is True
+
+    def test_clears_existing_state(self):
+        """Re-initializing should clear any previous state."""
+        # Set some state first
+        _model_cache_cold.add("unknown-model")
+        _model_cache_cold.add("Qwen3")
+        assert len(_model_cache_cold) == 2
+
+        # Re-initialize
+        config = {
+            "models": {
+                "plan": {
+                    "providers": [
+                        {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
+                    ]
+                },
+            }
+        }
+        initialize_cache_cold_from_config(config)
+        # unknown-model should be gone, Qwen3 should still be cold
+        assert is_model_cache_cold("Qwen3") is True
+        assert is_model_cache_cold("unknown-model") is False
+
+
+class TestCacheColdLifecycle:
+    """Tests for the full cache-cold lifecycle."""
+
+    def setup_method(self):
+        _model_cache_cold.clear()
+
+    def test_startup_to_warm_to_cold_cycle(self):
+        """
+        Full lifecycle: startup (cold) → successful local (warm) → invalidation (cold).
+        """
+        # Startup: initialize from config
+        config = {
+            "models": {
+                "plan": {
+                    "providers": [
+                        {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
+                        {"name": "opencode", "type": "remote"},
+                    ]
+                },
+            }
+        }
+        initialize_cache_cold_from_config(config)
+        assert is_model_cache_cold("Qwen3") is True
+
+        # After a successful local response, cache should be warm
+        clear_model_cache_cold("Qwen3")
+        assert is_model_cache_cold("Qwen3") is False
+
+        # After session invalidation, cache should be cold again
+        mark_model_cache_cold("Qwen3")
+        assert is_model_cache_cold("Qwen3") is True
+
+    def test_model_not_in_config_starts_unknown(self):
+        """
+        A model not in the config should not be in the cold set.
+        """
+        config = {"models": {}}
+        initialize_cache_cold_from_config(config)
+        assert is_model_cache_cold("Qwen3") is False
+
+    def test_large_context_bypass_works_after_startup(self):
+        """
+        AC 3: A large-context request with cold cache should be routed to remote.
+        """
+        # Simulate startup init
+        config = {
+            "models": {
+                "plan": {
+                    "providers": [
+                        {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
+                    ]
+                },
+            }
+        }
+        initialize_cache_cold_from_config(config)
+        assert is_model_cache_cold("Qwen3") is True
+
+        # Large request (>40K tokens) with cold cache should skip local
+        body = {"messages": [{"role": "user", "content": "x" * 200_000}]}
+        threshold = 40000
+        should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
+        assert should_skip is True

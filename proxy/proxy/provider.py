@@ -46,8 +46,12 @@ _BACKOFF_MAX_SECONDS = 45.0
 # Set of model names whose slot cache is currently invalidated (cold).
 # When the slot cache for a model is cold, large-context requests may be
 # routed directly to remote fallback to avoid expensive full re-prefill.
-# Cache state is set to cold on invalidation events (session mismatch,
-# guardrail cutoff, model reload) and cleared on successful local request.
+# Models whose slot cache is currently cold (invalidated or just started).
+# Cache state is set to cold:
+#   - On proxy startup (via initialize_cache_cold_from_config)
+#   - On model reload (via initialize_cache_cold_from_config)
+#   - On invalidation events (session mismatch, guardrail cutoff)
+# Cache state is cleared to warm on successful local request response.
 _model_cache_cold: set[str] = set()
 
 def mark_model_cache_cold(model_name: str) -> None:
@@ -71,6 +75,41 @@ def is_model_cache_cold(model_name: str) -> bool:
     valid (warm) to avoid false-positive routing to remote.
     """
     return model_name in _model_cache_cold if model_name else False
+
+
+def initialize_cache_cold_from_config(config: dict) -> None:
+    """Mark all local models' caches as cold at startup.
+
+    Scans the config for models with local providers and adds their
+    ``llama_model`` names to the cache-cold set. This ensures that after
+    proxy restart or model reload, large-context requests are routed to
+    remote fallback instead of attempting expensive full re-prefill.
+
+    Safe to call multiple times — clears any existing state first.
+    """
+    _model_cache_cold.clear()
+    models = config.get("models", {})
+    if not isinstance(models, dict):
+        return
+    for model_name, model_cfg in models.items():
+        if not isinstance(model_cfg, dict):
+            continue
+        providers = model_cfg.get("providers", [])
+        if not isinstance(providers, list):
+            continue
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            if provider.get("type") == "local":
+                llama_model = provider.get("llama_model")
+                if llama_model:
+                    _model_cache_cold.add(str(llama_model))
+    if _model_cache_cold:
+        import logging as _logging
+        _logging.getLogger("llama-proxy.provider").info(
+            "cache_cold_initialized models=%s",
+            sorted(_model_cache_cold),
+        )
 
 
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
@@ -1418,6 +1457,13 @@ async def proxy_with_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                # LP-0MRDE669Y003V1SO: On successful local response, mark
+                # cache as warm so subsequent requests route locally.
+                if provider_type == "local":
+                    try:
+                        clear_model_cache_cold(_llama_model)
+                    except Exception:
+                        pass
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 return stream_result
@@ -1717,6 +1763,13 @@ async def proxy_with_fallback(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MRDE669Y003V1SO: On successful local response, mark cache
+            # as warm so subsequent requests route locally.
+            if provider_type == "local":
+                try:
+                    clear_model_cache_cold(_llama_model)
+                except Exception:
+                    pass
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result
