@@ -183,7 +183,8 @@ descriptive message.
 ## Disk Space Management
 
 This project includes automated cleanup scripts to manage disk usage from
-stale model caches, unused container images, and pi agent session logs.
+stale model caches, unused container images, stopped containers, and pi agent
+session logs.
 
 ### Cleanup Scripts
 
@@ -194,8 +195,9 @@ deletion) and `--json` (machine-readable output).
 |--------|---------|
 | `scripts/cleanup-model-cache.sh` | Remove HuggingFace models not in `models.ini` and duplicate llama.cpp GGUF cache |
 | `scripts/cleanup-container-images.sh` | Remove container images not referenced by project scripts or Containerfile |
+| `scripts/cleanup-stopped-containers.sh` | Remove exited containers stopped for more than 7 days |
 | `scripts/cleanup-pi-sessions.sh` | Remove old pi agent session logs (keep last 90 days / 50 sessions per workspace) |
-| `scripts/cleanup-all.sh` | Orchestrator that runs all three cleanup scripts |
+| `scripts/cleanup-all.sh` | Orchestrator that runs all cleanup scripts |
 | `scripts/install-cron.sh` | Install daily crontab entries for automated cleanup |
 
 ### Quick Start
@@ -217,6 +219,7 @@ deletion) and `--json` (machine-readable output).
 |----------|------------------|--------------|
 | Model cache | Keep only models listed in `models.ini` | Edit `models.ini` to add/remove models |
 | Container images | Keep only images referenced by `scripts/` and `Containerfile` | `LLM_CLEANUP_ALL=1` to remove cross-project images |
+| Stopped containers | Remove containers exited for >7 days | `--max-age DAYS` flag |
 | Pi session logs | Keep last 90 days AND last 50 sessions per workspace | `--retention-days`, `--keep-sessions` flags |
 
 ### Cron Automation
@@ -232,12 +235,19 @@ variables:
 ```bash
 # Disable specific cleanup categories
 CLEANUP_ENABLE_MODELS=0     # Skip model cache cleanup
-CLEANUP_ENABLE_CONTAINERS=0 # Skip container image cleanup
+CLEANUP_ENABLE_CONTAINERS=0 # Skip container and image cleanup
 CLEANUP_ENABLE_PI=0         # Skip pi session log cleanup
 
 # Combine with the orchestrator
 CLEANUP_ENABLE_PI=0 ./scripts/cleanup-all.sh
 ```
+
+> **Note:** Stopped container cleanup and container image cleanup are both
+> controlled by `CLEANUP_ENABLE_CONTAINERS`. Stopped containers are removed
+> before images to release image references held by stopped containers.
+> Use the `--yes` flag with `cleanup-stopped-containers.sh` for non-interactive
+> / cron use. Without `--yes` in a non-TTY environment, the script will prompt
+> with a clear message instructing use of `--yes`.
 
 #### Manual Cron Installation
 
