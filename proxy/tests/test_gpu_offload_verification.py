@@ -268,49 +268,53 @@ class TestRocmEnvVars:
     def test_models_ini_global_ngl_is_forwarded_to_router(self):
         """GATE TEST: Router-mode command must include -ngl from models.ini.
 
-        This test verifies that ngl is forwarded to the router-mode command.
-        It currently EXPECTS FAILURE because the router-mode startup path in
-        start-llama.sh does NOT yet pass -ngl. Once child work item
-        LP-0MRE1ECIQ000B8MU (Qwen3 Router GPU Offload) is implemented, this
-        test should pass.
+        This test verifies that -ngl is forwarded to the router-mode command.
+        The value comes from models.ini [global] ngl, with a LLAMA_NGL env
+        var override for CPU-only rollback.
 
-        If this test fails after the offload implementation is complete, it
-        indicates that router-mode GPU offload settings are no longer being
-        propagated.
+        If this test fails, it indicates that router-mode GPU offload settings
+        are no longer being propagated.
         """
-        # Check the router-mode command in start-llama.sh
         content = START_SCRIPT.read_text()
 
-        # Find the router-mode command construction block
-        # Look for -ngl or --gpu-layers in the router section
-        router_section = False
-        found_ngl = False
-        for line in content.splitlines():
-            line_stripped = line.strip()
-            if line_stripped.startswith('if [[ "$router_mode" -eq 1 ]]; then'):
-                router_section = True
-                continue
-            if router_section:
-                if line_stripped.startswith("fi"):
-                    router_section = False
-                    continue
-                if "-ngl" in line_stripped or "--gpu-layers" in line_stripped:
-                    found_ngl = True
-                    break
+        # Find router-mode section: starts at 'if [[ "$router_mode" -eq 1 ]]'
+        # and ends at the 'fi' that closes the router if block.
+        # The router section contains nested if/fi blocks (for LLAMA_SERVER_BIN
+        # and LLAMA_MODELS_DIR checks). To find the outermost closing fi, we
+        # track the nesting depth of if/fi keywords.
+        lines = content.splitlines()
+        router_start = None
+        router_if_depth = 0
+        in_router = False
+        router_lines = []
 
-        # NOTE: This is expected to FAIL until the offload implementation is done.
-        # The test documents the current state and will serve as a guard.
-        if not found_ngl:
-            pytest.skip(
-                "Router-mode does not yet forward -ngl — this is expected until "
-                "LP-0MRE1ECIQ000B8MU (Qwen3 Router GPU Offload) is implemented. "
-                "Once implemented, this skip should be removed and the assertion below enabled."
-            )
+        for i, line in enumerate(lines):
+            ls = line.strip()
+            if not router_start and ls.startswith('if [[ "$router_mode" -eq 1 ]]; then'):
+                router_start = i
+                in_router = True
+                router_if_depth = 1
+                router_lines.append(ls)
+                continue
+
+            if in_router:
+                router_lines.append(ls)
+                # Track if/fi depth
+                if ls.startswith("if "):
+                    router_if_depth += 1
+                if ls == "fi" or ls.startswith("fi #"):
+                    router_if_depth -= 1
+                    if router_if_depth == 0:
+                        break  # Found the closing fi for router if
+
+        # Search the router lines for -ngl or --gpu-layers
+        found_ngl = any("-ngl" in rl or "--gpu-layers" in rl for rl in router_lines)
 
         assert found_ngl, (
             "Router-mode startup in start-llama.sh must include -ngl flag. "
             "The [global] ngl value from models.ini must be forwarded "
-            "to the llama-server command."
+            "to the llama-server command. Router lines searched: "
+            + "\n".join(router_lines[:50])
         )
 
 
@@ -387,28 +391,23 @@ class TestCpuOnlyRollback:
     """
 
     def test_ngl_zero_rollback_possible_via_env(self):
-        """The infrastructure allows operators to override ngl=0 via env var.
+        """Operators can override ngl=0 via LLAMA_NGL env var for CPU-only rollback.
 
-        Operators can set NGL=0 or LLAMA_NGL=0 before starting to force
-        CPU-only operation. This test verifies that the startup script
-        honors such an override.
+        Setting LLAMA_NGL=0 before starting forces CPU-only operation.
+        This test verifies that the startup script honors such an override.
         """
-        # Currently there's no env-var override for ngl in the router path.
-        # Documenting that this will be needed for the rollback toggle.
         content = START_SCRIPT.read_text()
 
-        has_ngl_env_override = "NGL" in content or "LLAMA_NGL" in content
+        # Verify LLAMA_NGL env var override exists
+        assert "LLAMA_NGL" in content, (
+            "LLAMA_NGL env var override must exist in start-llama.sh so "
+            "operators can force CPU-only mode by setting LLAMA_NGL=0."
+        )
 
-        if not has_ngl_env_override:
-            pytest.skip(
-                "No env-var override for -ngl exists in the router path yet. "
-                "This will be added as part of the rollback toggle "
-                "(LP-0MRE1ECIQ000B8MU)."
-            )
-
-        assert has_ngl_env_override, (
-            "An env-var override (e.g., LLAMA_NGL) must exist so operators "
-            "can force CPU-only mode by setting NGL=0."
+        # Verify LLAMA_NGL takes precedence over models.ini [global] ngl
+        assert 'GLOBAL_NGL="${LLAMA_NGL:-' in content, (
+            "start-llama.sh must use LLAMA_NGL as an override with fallback "
+            "to get_global_ngl from models.ini"
         )
 
     def test_models_ini_ngl_is_configurable(self):
