@@ -61,6 +61,18 @@ These tests cover:
 - Embedding request via proxy
 - Chat completion via proxy
 
+### 3. GPU Offload Verification Tests (no GPU required for unit tests)
+
+GPU offload verification tests are in `proxy/tests/test_gpu_offload_verification.py`.
+These validate that the infrastructure for ROCm GPU offload (models.ini `[global] ngl`
+parsing, environment variable propagation, router-mode command construction) is in place:
+
+```bash
+python3 -m pytest proxy/tests/test_gpu_offload_verification.py -v
+```
+
+For live GPU offload verification steps, see `docs/gpu-offload-verification.md`.
+
 ## Running all tests
 
 ```bash
