@@ -1396,8 +1396,20 @@ async def proxy_with_fallback(
                 # large contexts when the slot cache is invalidated.
                 _llama_model = provider_cfg.get("llama_model", "")
                 _threshold = _get_large_context_fallback_threshold(config)
+                _cache_is_cold = is_model_cache_cold(_llama_model)
+                _estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+                logger.info(
+                    "routing_check provider=%s model=%s cache_cold=%s "
+                    "estimated_tokens=%d threshold=%d messages=%d",
+                    provider_name,
+                    _llama_model or "unknown",
+                    _cache_is_cold,
+                    _estimated_tokens,
+                    _threshold,
+                    len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
+                )
                 if _should_skip_local(
-                    is_model_cache_cold(_llama_model),
+                    _cache_is_cold,
                     body_json,
                     _threshold,
                 ):
