@@ -5,6 +5,7 @@ invalidation, and fallback to full history for expired/invalid sessions.
 """
 
 import asyncio
+import json
 import time
 import pytest
 
@@ -12,6 +13,10 @@ from proxy.session_manager import (
     Session,
     SessionManager,
     DEFAULT_SESSION_TTL_SECONDS,
+)
+from proxy.session import (
+    extract_streamed_assistant_message_from_sse,
+    merge_session_history_for_update,
 )
 
 pytestmark = pytest.mark.refactor_parity
@@ -241,6 +246,98 @@ class TestSessionManagerMessages:
         session = await mgr.get("s1")
         assert session is not None
         assert session.restore_confirmed is True
+
+
+class TestSessionHistoryMetadataPreservation:
+    def test_merge_session_history_preserves_assistant_metadata(self):
+        existing_messages = [{"role": "user", "content": "hello"}]
+        request_messages = list(existing_messages)
+        assistant_message = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "thinking...",
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\": \"echo hi\"}",
+                    },
+                }
+            ],
+        }
+
+        merged = merge_session_history_for_update(
+            existing_messages=existing_messages,
+            request_messages=request_messages,
+            delta_messages=None,
+            is_delta_request=False,
+            assistant_content=None,
+            assistant_message=assistant_message,
+        )
+
+        assert merged[-1]["role"] == "assistant"
+        assert merged[-1]["reasoning_content"] == "thinking..."
+        assert merged[-1]["tool_calls"][0]["function"]["name"] == "bash"
+        assert merged[-1]["tool_calls"][0]["function"]["arguments"] == '{"command": "echo hi"}'
+
+    def test_extract_streamed_assistant_message_preserves_metadata(self):
+        chunk1 = {
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "content": "Hello ",
+                        "reasoning_content": "pondering ",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": "{\"command\": \"echo ",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        chunk2 = {
+            "choices": [
+                {
+                    "delta": {
+                        "content": "world",
+                        "reasoning_content": "still thinking",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "arguments": "hi\"}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        sse = (
+            f"data: {json.dumps(chunk1)}\n\n"
+            f"data: {json.dumps(chunk2)}\n\n"
+            "data: [DONE]\n\n"
+        )
+
+        assistant_message = extract_streamed_assistant_message_from_sse(sse)
+
+        assert assistant_message is not None
+        assert assistant_message["role"] == "assistant"
+        assert assistant_message["content"] == "Hello world"
+        assert assistant_message["reasoning_content"] == "pondering still thinking"
+        assert assistant_message["tool_calls"][0]["function"]["name"] == "bash"
+        assert assistant_message["tool_calls"][0]["function"]["arguments"] == '{"command": "echo hi"}'
 
 
 class TestDeltaComputation:

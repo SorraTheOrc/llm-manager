@@ -45,6 +45,7 @@ from proxy.session import (  # noqa: E402
     _record_restore_success,
     evaluate_stream_guardrail,
     _should_invalidate_on_guardrail,
+    extract_streamed_assistant_message_from_sse,
     merge_session_history_for_update,
     session_single_flight_coordinator,
     slot_lock_coordinator,
@@ -317,6 +318,9 @@ async def _update_session_and_slot(
             if collected_content is not None and collected_content:
                 full_response = "".join(collected_content)
                 assistant_content = _extract_assistant_content_from_sse(full_response)
+                assistant_message = extract_streamed_assistant_message_from_sse(
+                    full_response
+                )
                 existing_messages = []
                 if is_delta_request and delta_messages:
                     session_obj = await srv.session_manager.get(session_id)
@@ -328,6 +332,7 @@ async def _update_session_and_slot(
                     delta_messages=delta_messages,
                     is_delta_request=is_delta_request,
                     assistant_content=assistant_content,
+                    assistant_message=assistant_message,
                 )
                 await srv.session_manager.update_messages(session_id, full_messages)
             elif hasattr(response, "content") and isinstance(getattr(response, 'content', None), (bytes, str)):
@@ -335,6 +340,13 @@ async def _update_session_and_slot(
                 resp_content = response.content.decode("utf-8", errors="replace")
                 resp_json = json.loads(resp_content) if resp_content else {}
                 assistant_content = _extract_assistant_content(resp_json)
+                assistant_message = None
+                if isinstance(resp_json, dict):
+                    choices = resp_json.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        maybe_message = choices[0].get("message")
+                        if isinstance(maybe_message, dict):
+                            assistant_message = maybe_message
                 existing_messages = []
                 if is_delta_request and delta_messages:
                     session_obj = await srv.session_manager.get(session_id)
@@ -346,6 +358,7 @@ async def _update_session_and_slot(
                     delta_messages=delta_messages,
                     is_delta_request=is_delta_request,
                     assistant_content=assistant_content,
+                    assistant_message=assistant_message,
                 )
                 await srv.session_manager.update_messages(session_id, full_messages)
             else:
