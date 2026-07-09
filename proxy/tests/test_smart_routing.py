@@ -85,24 +85,24 @@ class TestEstimatePromptTokensForRouting:
     def test_large_message(self):
         """A large message should yield a large estimate.
 
-        ~360K bytes / 3 = ~120K estimated tokens.
+        ~360K bytes / 2 = ~180K estimated tokens.
         """
         large_content = "x" * 360_000
         body = {"messages": [{"role": "user", "content": large_content}]}
         tokens = _estimate_prompt_tokens_for_routing(body)
-        assert tokens >= 100_000
-        assert tokens <= 130_000
+        assert tokens >= 160_000
+        assert tokens <= 200_000
 
     def test_40k_threshold_crossing(self):
         """A message at ~41K tokens should be detected as above 40K threshold."""
-        content = "x" * 164_000  # ~41K tokens
+        content = "x" * 164_000  # ~82K estimated
         body = {"messages": [{"role": "user", "content": content}]}
         tokens = _estimate_prompt_tokens_for_routing(body)
         assert tokens > 40_000
 
     def test_below_40k(self):
-        """A message at ~10K tokens should be below 40K threshold."""
-        content = "x" * 40_000  # ~10K tokens
+        """A message at ~20K tokens should be below 40K threshold."""
+        content = "x" * 40_000  # ~20K estimated
         body = {"messages": [{"role": "user", "content": content}]}
         tokens = _estimate_prompt_tokens_for_routing(body)
         assert tokens < 40_000
@@ -133,9 +133,9 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count both: ~53K estimated
-        assert tokens >= 48_000
-        assert tokens <= 58_000
+        # Should count both: ~80K estimated
+        assert tokens >= 70_000
+        assert tokens <= 90_000
 
     def test_array_content_counts_text_only(self):
         """Array content (multimodal) should count text fields only."""
@@ -151,9 +151,9 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count only the text part: ~53K
-        assert tokens >= 48_000
-        assert tokens <= 58_000
+        # Should count only the text part: ~80K
+        assert tokens >= 70_000
+        assert tokens <= 90_000
 
     def test_reasoning_content_counted(self):
         """Assistant reasoning_content should be counted (LP-0MRDE669Y003V1SO)."""
@@ -168,9 +168,9 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count reasoning_content: ~53K
-        assert tokens >= 48_000
-        assert tokens <= 58_000
+        # Should count reasoning_content: ~80K
+        assert tokens >= 70_000
+        assert tokens <= 90_000
 
     def test_tool_calls_counted(self):
         """Tool call function names and arguments should be counted (LP-0MRDE669Y003V1SO)."""
@@ -200,9 +200,9 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count both tool calls: ~53K total
-        assert tokens >= 48_000
-        assert tokens <= 58_000
+        # Should count both tool calls: ~80K total
+        assert tokens >= 70_000
+        assert tokens <= 90_000
 
     def test_mixed_content_reasoning_tool_calls_counted(self):
         """Mixed content, reasoning, and tool calls should all be counted (LP-0MRDE669Y003V1SO)."""
@@ -226,9 +226,9 @@ class TestEstimatePromptTokensForRouting:
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should count content + reasoning + tool_call args: ~53K
-        assert tokens >= 48_000
-        assert tokens <= 58_000
+        # Should count content + reasoning + tool_call args: ~80K
+        assert tokens >= 70_000
+        assert tokens <= 90_000
 
 
 class TestSmartRoutingThresholdConfig:
@@ -312,8 +312,8 @@ class TestSmartRoutingDecision:
     def test_cold_cache_exact_threshold_does_not_skip(self):
         """Exactly at threshold (<=) should NOT skip local."""
         mark_model_cache_cold("Qwen3")
-        # 120_000 bytes / 3 = 40_000 tokens
-        body = {"messages": [{"role": "user", "content": "x" * 120_000}]}
+        # 80_000 bytes / 2 = 40_000 tokens
+        body = {"messages": [{"role": "user", "content": "x" * 80_000}]}
         threshold = 40000
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is False
@@ -321,8 +321,8 @@ class TestSmartRoutingDecision:
     def test_cold_cache_just_above_threshold_skips(self):
         """Just above threshold (>40K) should skip local when cache is cold."""
         mark_model_cache_cold("Qwen3")
-        # 124_000 bytes / 3 = 41_333 tokens
-        body = {"messages": [{"role": "user", "content": "x" * 124_000}]}
+        # 82_000 bytes / 2 = 41_000 tokens
+        body = {"messages": [{"role": "user", "content": "x" * 82_000}]}
         threshold = 40000
         should_skip = _should_skip_local(is_model_cache_cold("Qwen3"), body, threshold)
         assert should_skip is True

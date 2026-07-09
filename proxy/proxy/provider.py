@@ -169,11 +169,11 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     if total_bytes <= 0:
         return 0
 
-    # Conservative estimate: ~2.5 bytes per token.
-    # Agent sessions with code/tool data average ~1.4 bpt, but we use 2.5
+    # Conservative estimate: ~2 bytes per token.
+    # Agent sessions with code/tool data average ~1.4 bpt, but we use 2
     # to avoid false negatives (underrouting) while still allowing fast
     # byte-only computation.
-    return max(1, total_bytes // 3)
+    return max(1, total_bytes // 2)
 
 
 def _get_large_context_fallback_threshold(config: dict) -> int:
