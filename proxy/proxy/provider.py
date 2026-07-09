@@ -115,9 +115,11 @@ def initialize_cache_cold_from_config(config: dict) -> None:
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     """Estimate prompt token count for smart-routing decisions.
 
-    Concatenates all non-system message content (including reasoning_content
-    and tool_calls) and uses tiktoken for accurate counting, falling back
-    to a byte-based heuristic if tiktoken is unavailable.
+    Counts all non-system message content bytes (including reasoning_content
+    and tool_calls) and estimates using a conservative ~2.5 bytes per token
+    ratio. This is intentionally conservative (~2.5 bpt instead of the
+    typical ~4) to avoid undershooting for code/tool-heavy agent sessions
+    where the actual ratio is closer to 1.4.
 
     System prompts are excluded as they are typically small and not the
     driver of large-context timeouts.
@@ -128,7 +130,7 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     if not messages:
         return 0
 
-    parts = []
+    total_bytes = 0
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -140,15 +142,15 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         # Count content field
         content = msg.get("content", "")
         if isinstance(content, str):
-            parts.append(content)
+            total_bytes += len(content.encode("utf-8"))
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and "text" in item:
-                    parts.append(str(item["text"]))
+                    total_bytes += len(str(item["text"]).encode("utf-8"))
         # Count reasoning_content (assistant messages with long reasoning)
         reasoning = msg.get("reasoning_content")
         if isinstance(reasoning, str):
-            parts.append(reasoning)
+            total_bytes += len(reasoning.encode("utf-8"))
         # Count tool_calls (function names and arguments)
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -159,21 +161,19 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
                 if isinstance(tc_func, dict):
                     name = tc_func.get("name", "")
                     if isinstance(name, str):
-                        parts.append(name)
+                        total_bytes += len(name.encode("utf-8"))
                     args = tc_func.get("arguments", "")
                     if isinstance(args, str):
-                        parts.append(args)
+                        total_bytes += len(args.encode("utf-8"))
 
-    if not parts:
+    if total_bytes <= 0:
         return 0
 
-    text = " ".join(parts)
-    try:
-        from proxy.utils import count_text_tokens
-        return count_text_tokens(text)
-    except Exception:
-        # Fallback heuristic: ~4 bytes per token
-        return max(1, len(text.encode("utf-8")) // 4)
+    # Conservative estimate: ~2.5 bytes per token.
+    # Agent sessions with code/tool data average ~1.4 bpt, but we use 2.5
+    # to avoid false negatives (underrouting) while still allowing fast
+    # byte-only computation.
+    return max(1, total_bytes // 3)
 
 
 def _get_large_context_fallback_threshold(config: dict) -> int:
