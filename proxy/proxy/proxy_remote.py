@@ -25,6 +25,7 @@ from .router_helpers import (
     log_request,
     log_response,
     log_response_chunk,
+    _compute_request_timeout,
     _schedule_recv_token_increment,
     _normalize_outgoing_headers,
     normalize_upstream_request_headers,
@@ -249,7 +250,8 @@ async def proxy_to_remote(
             provider="remote",
         )
 
-    remote_timeout = httpx.Timeout(_srv().config.get("server", {}).get("llama_request_timeout", 300))
+    server_config = _srv().config.get("server", {})
+    remote_timeout = _compute_request_timeout(server_config, body_json)
     is_streaming = body_json.get("stream", False)
 
     # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header
