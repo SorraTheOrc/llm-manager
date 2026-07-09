@@ -193,6 +193,7 @@ async def proxy_to_remote(
             "x-session-id",
             "x-client-request-id",
             "x-session-affinity",
+            "session_id",
         }:
             headers.pop(hk, None)
 
