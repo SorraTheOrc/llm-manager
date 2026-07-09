@@ -353,3 +353,240 @@ class TestAdaptiveGuardrailBudget:
         assert budget == 60.0, (
             f"Expected base budget 60.0 for empty body, got {budget}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LP-0MRDI0NQV000838X: Remote-specific timeout configuration keys
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests for _compute_request_timeout() with remote-specific override keys.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRemoteSpecificTimeoutConfig:
+    """Tests for remote-specific timeout config keys (LP-0MRDI0NQV000838X).
+
+    Verifies that:
+    1. Remote-specific keys (llama_remote_request_timeout_base_seconds and
+       llama_remote_request_timeout_per_token_seconds) are used when configured.
+    2. Fallback to local values when remote keys are not configured.
+    3. Local path continues to use local keys when no remote keys are set.
+    """
+
+    def _make_body(self, content: str = "Hello") -> dict:
+        return {"messages": [{"role": "user", "content": content}]}
+
+    def _make_body_large(self, content_size: int = 100_000) -> dict:
+        return {
+            "messages": [{"role": "user", "content": "x" * content_size}]
+        }
+
+    # AC1: Remote-specific keys are used when configured
+
+    def test_remote_uses_remote_specific_base_when_configured(self):
+        """AC1: remote=True uses llama_remote_request_timeout_base_seconds when set."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+            "llama_adaptive_timeout_base_seconds": 60,
+            "llama_adaptive_timeout_per_token_seconds": 0.015,
+            "llama_remote_request_timeout_base_seconds": 30,
+            "llama_remote_request_timeout_per_token_seconds": 0.01,
+            "llama_request_timeout": 1500,
+        }
+        body = self._make_body()
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Remote with shorter base should produce a shorter timeout
+        assert remote_to.read < local_to.read, (
+            f"Expected remote timeout ({remote_to.read}) < local ({local_to.read}) "
+            "when remote base is shorter"
+        )
+
+    def test_remote_uses_remote_specific_per_token_when_configured(self):
+        """AC1: remote=True uses llama_remote_request_timeout_per_token_seconds."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+            "llama_adaptive_timeout_base_seconds": 60,
+            "llama_adaptive_timeout_per_token_seconds": 0.015,
+            "llama_remote_request_timeout_base_seconds": 60,
+            "llama_remote_request_timeout_per_token_seconds": 0.005,
+            "llama_request_timeout": 1500,
+        }
+        body = self._make_body_large()
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Remote with lower per_token should produce a shorter timeout for large prompts
+        assert remote_to.read < local_to.read, (
+            f"Expected remote timeout ({remote_to.read}) < local ({local_to.read}) "
+            "when remote per_token is lower"
+        )
+
+    # AC2: Fallback to local values when remote keys are not configured
+
+    def test_remote_falls_back_to_local_when_no_remote_keys(self):
+        """AC2: Without remote keys, remote=True falls back to local values."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+            "llama_adaptive_timeout_base_seconds": 60,
+            "llama_adaptive_timeout_per_token_seconds": 0.015,
+            "llama_request_timeout": 1500,
+            # No remote-specific keys
+        }
+        body = self._make_body_large()
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Without remote keys, both should produce the same timeout
+        assert abs(remote_to.read - local_to.read) < 0.001, (
+            f"Expected remote timeout ({remote_to.read}) == local ({local_to.read}) "
+            "when no remote-specific keys are configured"
+        )
+
+    def test_remote_falls_back_to_local_when_empty_dict(self):
+        """AC2: Empty server_config falls back to defaults for both paths."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+        }
+        body = self._make_body()
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Both should fall back to the same code defaults (60 base, 0.01 per_token)
+        assert remote_to.read > 0
+        assert local_to.read > 0
+        assert abs(remote_to.read - local_to.read) < 0.001, (
+            "Remote and local should use the same defaults when no config"
+        )
+
+    # AC3: Local path continues to use local keys
+
+    def test_local_ignores_remote_keys(self):
+        """AC3: Local path (remote=False) ignores remote-specific keys."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+            "llama_adaptive_timeout_base_seconds": 60,
+            "llama_adaptive_timeout_per_token_seconds": 0.01,
+            "llama_remote_request_timeout_base_seconds": 999,
+            "llama_remote_request_timeout_per_token_seconds": 0.5,
+            "llama_request_timeout": 1500,
+        }
+        body = self._make_body()
+        to = _compute_request_timeout(config, body, remote=False)
+
+        # Local path should use local per_token (0.01), not remote (0.5)
+        expected = 60.0 + (0.01 * 1)  # ~1 token
+        assert abs(to.read - expected) < 5.0, (
+            f"Expected local timeout ~{expected}, got {to.read}"
+        )
+
+    # AC1+AC3: Remote and local produce different results with different configs
+
+    def test_remote_and_local_independence(self):
+        """AC1+AC3: Remote and local timeout configs operate independently."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+            "llama_adaptive_timeout_base_seconds": 60,
+            "llama_adaptive_timeout_per_token_seconds": 0.015,
+            "llama_remote_request_timeout_base_seconds": 30,
+            "llama_remote_request_timeout_per_token_seconds": 0.005,
+            "llama_request_timeout": 1500,
+        }
+        body = self._make_body_large(200_000)
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Both should be meaningful but different
+        assert local_to.read > 0
+        assert remote_to.read > 0
+        assert remote_to.read < local_to.read, (
+            f"Expected remote ({remote_to.read}) < local ({local_to.read}) "
+            "with different configs"
+        )
+
+    # Adaptive disabled fallback
+
+    def test_adaptive_disabled_uses_fixed_timeout(self):
+        """When adaptive timeout is disabled, remote=True still uses fixed timeout."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": False,
+            "llama_request_timeout": 300,
+        }
+        body = self._make_body_large()
+        to = _compute_request_timeout(config, body, remote=True)
+
+        assert to.read == 300, (
+            f"Expected fixed timeout 300 when adaptive disabled, got {to.read}"
+        )
+
+    def test_adaptive_disabled_local_uses_fixed_timeout(self):
+        """When adaptive timeout is disabled, local path uses fixed timeout."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": False,
+            "llama_request_timeout": 300,
+        }
+        body = self._make_body_large()
+        to = _compute_request_timeout(config, body, remote=False)
+
+        assert to.read == 300, (
+            f"Expected fixed timeout 300 when adaptive disabled, got {to.read}"
+        )
+
+    # Default per_token values same for remote and local at code level
+
+    def test_remote_and_local_defaults_match_when_no_config(self):
+        """When no config keys are set, remote and local defaults match.
+
+        Both remote and local fall back to the same code defaults:
+        base=60s, per_token=0.01s, max=1500s.
+        """
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+        }
+        body = self._make_body()
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Both should use the same defaults -> same timeout
+        assert abs(local_to.read - remote_to.read) < 0.001, (
+            f"Expected local ({local_to.read}) == remote ({remote_to.read}) "
+            "with no config keys"
+        )
+
+    def test_remote_defaults_match_via_config(self):
+        """When config has explicit local values, remote falls back to them."""
+        from proxy.router_helpers import _compute_request_timeout
+
+        config = {
+            "llama_adaptive_timeout_enabled": True,
+            "llama_adaptive_timeout_base_seconds": 120,
+            "llama_adaptive_timeout_per_token_seconds": 0.02,
+            "llama_request_timeout": 1500,
+        }
+        body = self._make_body_large()
+        local_to = _compute_request_timeout(config, body, remote=False)
+        remote_to = _compute_request_timeout(config, body, remote=True)
+
+        # Remote falls back to local config values
+        assert abs(local_to.read - remote_to.read) < 0.001, (
+            f"Expected remote ({remote_to.read}) == local ({local_to.read}) "
+            "when remote falls back to local config"
+        )

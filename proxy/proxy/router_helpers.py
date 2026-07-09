@@ -1109,26 +1109,64 @@ async def _check_slot_availability(
 def _compute_request_timeout(
     server_config: dict,
     body_json: dict,
+    remote: bool = False,
 ) -> httpx.Timeout:
-    """Compute the request timeout, using adaptive timeout if enabled."""
+    """Compute the request timeout, using adaptive timeout if enabled.
+
+    Parameters
+    ----------
+    server_config : dict
+        The server configuration dictionary.
+    body_json : dict
+        The parsed request body, used to estimate prompt tokens.
+    remote : bool, optional
+        When True, use remote-specific timeout override keys
+        (``llama_remote_request_timeout_base_seconds`` and
+        ``llama_remote_request_timeout_per_token_seconds``) if
+        configured. Falls back to the local keys when remote-specific
+        keys are not set.  Defaults to False (local path).
+
+    Returns
+    -------
+    httpx.Timeout
+        The computed timeout value.
+    """
     from proxy.lifecycle import _compute_adaptive_timeout, _estimate_prompt_tokens
-    
+
     adaptive_enabled = server_config.get("llama_adaptive_timeout_enabled", False)
     if adaptive_enabled and body_json:
-        base_timeout = float(
-            server_config.get("llama_adaptive_timeout_base_seconds", 60)
-        )
-        per_token_timeout = float(
-            server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01)
-        )
+        # Resolve base and per-token timeout: use remote-specific keys when
+        # *remote=True* and they are explicitly configured; otherwise fall
+        # back to the local/default keys for backward compatibility.
+        if remote:
+            base_timeout = float(
+                server_config.get(
+                    "llama_remote_request_timeout_base_seconds",
+                    server_config.get("llama_adaptive_timeout_base_seconds", 60),
+                )
+            )
+            per_token_timeout = float(
+                server_config.get(
+                    "llama_remote_request_timeout_per_token_seconds",
+                    server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01),
+                )
+            )
+        else:
+            base_timeout = float(
+                server_config.get("llama_adaptive_timeout_base_seconds", 60)
+            )
+            per_token_timeout = float(
+                server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01)
+            )
         max_timeout = float(server_config.get("llama_request_timeout", 1800))
         timeout_seconds = _compute_adaptive_timeout(
             body_json, base_timeout, per_token_timeout, max_timeout
         )
         _srv().logger.debug(
-            "Adaptive timeout: tokens=%d timeout=%.1fs",
+            "Adaptive timeout: tokens=%d timeout=%.1fs%s",
             _estimate_prompt_tokens(body_json),
             timeout_seconds,
+            " remote=True" if remote else "",
         )
     else:
         timeout_seconds = server_config.get("llama_request_timeout", 1800)

@@ -251,7 +251,7 @@ async def proxy_to_remote(
         )
 
     server_config = _srv().config.get("server", {})
-    remote_timeout = _compute_request_timeout(server_config, body_json)
+    remote_timeout = _compute_request_timeout(server_config, body_json, remote=True)
     is_streaming = body_json.get("stream", False)
 
     # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header

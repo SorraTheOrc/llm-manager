@@ -246,6 +246,13 @@ server:
   llama_adaptive_timeout_enabled: true
   llama_adaptive_timeout_base_seconds: 60
   llama_adaptive_timeout_per_token_seconds: 0.015
+  # Remote-specific adaptive timeout overrides (optional).
+  # When set, these values are used instead of the local adaptive timeout
+  # parameters for remote provider requests. Remote providers may have
+  # different latency characteristics requiring shorter timeouts.
+  # Falls back to the local values above when not configured.
+  llama_remote_request_timeout_base_seconds: 60
+  llama_remote_request_timeout_per_token_seconds: 0.015
   # Large-context fallback threshold (LP-0MRCSSBTM002NK3B).
   # When the slot cache is invalidated and estimated prompt tokens exceed this
   # value, local routing is bypassed and the request falls through to the next
