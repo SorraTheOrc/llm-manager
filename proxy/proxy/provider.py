@@ -213,7 +213,67 @@ def _get_large_context_fallback_threshold(config: dict) -> int:
         return 0
 
 
-def _should_skip_local(cache_cold: bool, body_json: dict, threshold: int) -> bool:
+async def _estimate_effective_prompt_tokens_for_routing(
+    request,
+    body_json: dict,
+) -> int:
+    """Estimate prompt tokens for routing, including active session history.
+
+    ``proxy_with_fallback`` runs before local session handling has a chance to
+    compute/forward deltas. For long-running sessions, the incoming request
+    body may be small while the active session history is very large.
+
+    To avoid missing cache-cold large-context bypass in that case, this helper
+    takes the max of:
+
+    - incoming request token estimate
+    - existing session history token estimate (if a session header resolves)
+    """
+    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
+        if not session_id:
+            return estimated_tokens
+
+        import proxy.server as _srv
+
+        session_manager = getattr(_srv, "session_manager", None)
+        if session_manager is None:
+            return estimated_tokens
+
+        session = await session_manager.get(session_id)
+        if session is None:
+            return estimated_tokens
+
+        session_messages = getattr(session, "messages", None)
+        if not isinstance(session_messages, list) or not session_messages:
+            return estimated_tokens
+
+        session_tokens = _estimate_prompt_tokens_for_routing(
+            {"messages": session_messages}
+        )
+        if session_tokens > estimated_tokens:
+            logger.info(
+                "routing_estimate_session session=%s request_tokens=%d session_tokens=%d",
+                session_id[:8],
+                estimated_tokens,
+                session_tokens,
+            )
+
+        return max(estimated_tokens, session_tokens)
+    except Exception:
+        return estimated_tokens
+
+
+def _should_skip_local(
+    cache_cold: bool,
+    body_json: dict,
+    threshold: int,
+    estimated_tokens: Optional[int] = None,
+) -> bool:
     """Determine whether a local provider should be skipped due to cold cache.
 
     Local is skipped when ALL of the following are true:
@@ -225,13 +285,15 @@ def _should_skip_local(cache_cold: bool, body_json: dict, threshold: int) -> boo
         cache_cold: Whether the model's cache is marked as invalidated.
         body_json: The parsed request body.
         threshold: Token count threshold. 0 means disabled.
+        estimated_tokens: Optional pre-computed estimate.
 
     Returns:
         True if local should be skipped, False for normal local routing.
     """
     if not cache_cold or threshold <= 0:
         return False
-    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+    if estimated_tokens is None:
+        estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
     return estimated_tokens > threshold
 
 
@@ -1446,7 +1508,10 @@ async def proxy_with_fallback(
                 _llama_model = provider_cfg.get("llama_model", "")
                 _threshold = _get_large_context_fallback_threshold(config)
                 _cache_is_cold = is_model_cache_cold(_llama_model)
-                _estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+                _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
+                    request,
+                    body_json,
+                )
                 logger.info(
                     "routing_check provider=%s model=%s cache_cold=%s "
                     "estimated_tokens=%d threshold=%d messages=%d",
@@ -1461,13 +1526,14 @@ async def proxy_with_fallback(
                     _cache_is_cold,
                     body_json,
                     _threshold,
+                    estimated_tokens=_estimated_tokens,
                 ):
                     logger.info(
                         "cache_cold_bypass provider=%s model=%s estimated_tokens=%d threshold=%d "
                         "→ skipping local, routing to next remote provider",
                         provider_name,
                         _llama_model or "unknown",
-                        _estimate_prompt_tokens_for_routing(body_json),
+                        _estimated_tokens,
                         _threshold,
                     )
                     _record_attempt(
@@ -1475,7 +1541,7 @@ async def proxy_with_fallback(
                         provider=provider_name,
                         type=provider_type,
                         status="cache_cold_skip",
-                        estimated_tokens=_estimate_prompt_tokens_for_routing(body_json),
+                        estimated_tokens=_estimated_tokens,
                         threshold=_threshold,
                     )
                     fallback_reason = "cache_cold_large_context"
