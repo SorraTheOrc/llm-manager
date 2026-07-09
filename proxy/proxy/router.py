@@ -456,6 +456,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not srv.backend_ready or srv.llama_process is None:
         return _build_backend_unavailable_response(srv, path)
 
+    # Clear cache-cold flag for this model — we are about to attempt a local
+    # request, which will warm the cache (LP-0MRCSSBTM002NK3B).
+    try:
+        from proxy.provider import clear_model_cache_cold
+        clear_model_cache_cold(srv.current_model)
+    except Exception:
+        pass
+
     # Get request body (keep original for logging before any modifications)
     body = await request.body()
     body_for_logging = body

@@ -7,6 +7,54 @@ import proxy.server as server
 class TestEstimatePromptTokens:
     """Tests for _estimate_prompt_tokens function."""
 
+    def test_90k_token_with_new_per_token_rate(self):
+        """AC 2: 90K-token request with per_token=0.015 must get >= 1050s timeout.
+
+        ~360K chars / 4 = ~90K tokens.
+        60 + 0.015 * 90000 = 1410s
+        """
+        large_content = "x" * 360_000
+        body = {"messages": [{"role": "user", "content": large_content}]}
+        timeout = server._compute_adaptive_timeout(
+            body,
+            base_timeout=60.0,
+            per_token_timeout=0.015,
+            max_timeout=1500.0,
+        )
+        assert timeout >= 1050.0, (
+            f"Expected timeout >= 1050s for 90K tokens with per_token=0.015, got {timeout}"
+        )
+
+    def test_90k_token_does_not_exceed_max(self):
+        """90K-token request with per_token=0.015 should NOT exceed max (1500).
+
+        ~360K chars / 4 = ~90K tokens.
+        60 + 0.015 * 90000 = 1410s < 1500, so not capped.
+        """
+        large_content = "x" * 360_000
+        body = {"messages": [{"role": "user", "content": large_content}]}
+        timeout = server._compute_adaptive_timeout(
+            body,
+            base_timeout=60.0,
+            per_token_timeout=0.015,
+            max_timeout=1500.0,
+        )
+        assert timeout <= 1500.0
+
+    def test_old_per_token_insufficient_for_90k(self):
+        """Regression: old per_token=0.01 gives ~960s for 90K, insufficient."""
+        large_content = "x" * 360_000
+        body = {"messages": [{"role": "user", "content": large_content}]}
+        timeout = server._compute_adaptive_timeout(
+            body,
+            base_timeout=60.0,
+            per_token_timeout=0.01,
+            max_timeout=1500.0,
+        )
+        assert timeout < 1050.0, (
+            f"Expected old per_token=0.01 to give < 1050s for 90K, got {timeout}"
+        )
+
     def test_empty_body(self):
         """Empty body should return 0."""
         assert server._estimate_prompt_tokens({}) == 0

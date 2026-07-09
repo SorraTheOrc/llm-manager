@@ -39,6 +39,113 @@ _provider_failure_count: Dict[str, int] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
+# ---------------------------------------------------------------------------
+# Cache-invalidation state for smart routing (LP-0MRCSSBTM002NK3B)
+# ---------------------------------------------------------------------------
+
+# Set of model names whose slot cache is currently invalidated (cold).
+# When the slot cache for a model is cold, large-context requests may be
+# routed directly to remote fallback to avoid expensive full re-prefill.
+# Cache state is set to cold on invalidation events (session mismatch,
+# guardrail cutoff, model reload) and cleared on successful local request.
+_model_cache_cold: set[str] = set()
+
+def mark_model_cache_cold(model_name: str) -> None:
+    """Mark a model's slot cache as invalidated (cold).
+
+    This causes large-context requests for this model to skip local routing
+    and fall through to the next remote provider in the chain.
+    """
+    if model_name:
+        _model_cache_cold.add(model_name)
+
+def clear_model_cache_cold(model_name: str) -> None:
+    """Clear a model's cache-cold flag, restoring normal local routing."""
+    if model_name:
+        _model_cache_cold.discard(model_name)
+
+def is_model_cache_cold(model_name: str) -> bool:
+    """Check if a model's slot cache is currently marked as cold.
+
+    Conservative default: if the model name is not tracked, assume cache is
+    valid (warm) to avoid false-positive routing to remote.
+    """
+    return model_name in _model_cache_cold if model_name else False
+
+
+def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
+    """Estimate prompt token count for smart-routing decisions.
+
+    This is a lightweight version of lifecycle._estimate_prompt_tokens that
+    only counts user and assistant message content (excluding system prompts)
+    to estimate the "working context" size. System prompts are typically small
+    and not the driver of large-context timeouts.
+
+    Uses a heuristic of ~4 bytes per token.
+    """
+    if not isinstance(body_json, dict):
+        return 0
+    messages = body_json.get("messages", [])
+    if not messages:
+        return 0
+    total_chars = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        # Skip system messages — they are not the driver of large-context
+        # timeouts and should not trigger cache-cold bypass.
+        if role == "system":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    total_chars += len(str(item["text"]))
+    return max(0, total_chars // 4)
+
+
+def _get_large_context_fallback_threshold(config: dict) -> int:
+    """Read the large-context fallback threshold from config.
+
+    Supports both nested (``config["server"]["local_large_context_fallback_threshold"]``)
+    and flat (``config["local_large_context_fallback_threshold"]``) keys for
+    production and test compatibility.
+
+    Returns 0 when not configured (disabled).
+    """
+    val = config.get("local_large_context_fallback_threshold")
+    if val is None:
+        val = config.get("server", {}).get("local_large_context_fallback_threshold", 0)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _should_skip_local(cache_cold: bool, body_json: dict, threshold: int) -> bool:
+    """Determine whether a local provider should be skipped due to cold cache.
+
+    Local is skipped when ALL of the following are true:
+    - The model's slot cache is cold (invalidated)
+    - The threshold is non-zero (feature is enabled)
+    - The estimated prompt tokens exceed the threshold
+
+    Args:
+        cache_cold: Whether the model's cache is marked as invalidated.
+        body_json: The parsed request body.
+        threshold: Token count threshold. 0 means disabled.
+
+    Returns:
+        True if local should be skipped, False for normal local routing.
+    """
+    if not cache_cold or threshold <= 0:
+        return False
+    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+    return estimated_tokens > threshold
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -1172,6 +1279,15 @@ async def proxy_with_fallback(
     ptr_remote = _get_proxy_to_remote()
     ptr_local = _get_proxy_to_local()
 
+    # Read request body for smart-routing decisions (LP-0MRCSSBTM002NK3B).
+    # The body is cached by Starlette/FastAPI after the first read, so this
+    # is safe to call before dispatching to local/remote.
+    _raw_body = await request.body()
+    try:
+        body_json = json.loads(_raw_body) if _raw_body else {}
+    except Exception:
+        body_json = {}
+
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
@@ -1234,6 +1350,37 @@ async def proxy_with_fallback(
                     )
                     fallback_reason = "local_concurrency_limit"
                     prev_provider = provider_name
+                    continue
+
+                # Smart routing: skip local when cache is cold and request is large
+                # (LP-0MRCSSBTM002NK3B). This avoids expensive full re-prefill of
+                # large contexts when the slot cache is invalidated.
+                _llama_model = provider_cfg.get("llama_model", "")
+                _threshold = _get_large_context_fallback_threshold(config)
+                if _should_skip_local(
+                    is_model_cache_cold(_llama_model),
+                    body_json,
+                    _threshold,
+                ):
+                    logger.info(
+                        "cache_cold_bypass provider=%s model=%s estimated_tokens=%d threshold=%d "
+                        "→ skipping local, routing to next remote provider",
+                        provider_name,
+                        _llama_model or "unknown",
+                        _estimate_prompt_tokens_for_routing(body_json),
+                        _threshold,
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="cache_cold_skip",
+                        estimated_tokens=_estimate_prompt_tokens_for_routing(body_json),
+                        threshold=_threshold,
+                    )
+                    fallback_reason = "cache_cold_large_context"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
                     continue
 
                 response = await ptr_local(request, path)

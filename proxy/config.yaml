@@ -245,7 +245,12 @@ server:
   # Adaptive timeout: base + per_token * prompt_tokens
   llama_adaptive_timeout_enabled: true
   llama_adaptive_timeout_base_seconds: 60
-  llama_adaptive_timeout_per_token_seconds: 0.01
+  llama_adaptive_timeout_per_token_seconds: 0.015
+  # Large-context fallback threshold (LP-0MRCSSBTM002NK3B).
+  # When the slot cache is invalidated and estimated prompt tokens exceed this
+  # value, local routing is bypassed and the request falls through to the next
+  # remote provider immediately. Set to 0 to disable this behavior.
+  local_large_context_fallback_threshold: 40000
   llama_router_mode: true
   max_concurrent_queries: 16
   # Local-model concurrency limit (LP-0MR5MAJNM005R905).
