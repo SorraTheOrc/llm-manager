@@ -676,6 +676,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             max_local=local_max,
             session_key=session_id,
             backend="local",
+            body_json=body_json if isinstance(body_json, dict) else None,
         )
         if not acquired:
             srv.logger.info(

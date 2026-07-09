@@ -270,6 +270,13 @@ server:
   # last request completes, preventing other sessions from acquiring the
   # local backend.  The lease is released when the timeout expires,
   # allowing other sessions to use the local backend.
+  #
+  # local_dispatch_lease_per_token_seconds: Additional lease time (seconds)
+  #   added per estimated prompt token for large-context requests, reused from
+  #   llama_adaptive_timeout_per_token_seconds (0.015) if not explicitly set.
+  #   This prevents mid-stream lease expiry during cache prefill.
+  # local_dispatch_lease_max_seconds: Hard upper bound for the adaptive lease
+  #   timeout, defaults to 1500 (same as default llama_request_timeout).
   local_dispatch_lease_timeout_seconds: 180
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1

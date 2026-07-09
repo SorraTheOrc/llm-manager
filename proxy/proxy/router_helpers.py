@@ -497,6 +497,49 @@ def _get_lease_timeout_seconds(srv) -> float:
         return 180.0
 
 
+def _get_adaptive_lease_timeout_seconds(
+    srv,
+    body_json: Optional[dict] = None,
+) -> float:
+    """Return an adaptive lease timeout based on estimated prompt tokens.
+
+    For large-context requests, the base lease timeout (default 180s) may
+    be insufficient to cover the cache prefill phase where no data chunks
+    arrive to refresh the lease. This function extends the lease timeout
+    based on estimated prompt tokens using the same per-token multiplier
+    as the request timeout computation.
+
+    Formula:
+        adaptive_timeout = min(base_timeout + tokens * per_token_secs, max_lease)
+
+    When *body_json* is not provided or the adaptive timeout is not enabled,
+    the base lease timeout is returned unchanged (LP-0MRDUQ9QC003LDDP).
+    """
+    base_timeout = _get_lease_timeout_seconds(srv)
+
+    if body_json is None:
+        return base_timeout
+
+    try:
+        from proxy.lifecycle import _estimate_prompt_tokens
+
+        server_cfg = srv.config.get("server", {})
+        per_token_seconds = float(
+            server_cfg.get(
+                "local_dispatch_lease_per_token_seconds",
+                server_cfg.get("llama_adaptive_timeout_per_token_seconds", 0.015),
+            )
+        )
+        max_lease = float(
+            server_cfg.get("local_dispatch_lease_max_seconds", 1500)
+        )
+        estimated_tokens = _estimate_prompt_tokens(body_json)
+        adaptive = base_timeout + (estimated_tokens * per_token_seconds)
+        return min(adaptive, max_lease)
+    except Exception:
+        return base_timeout
+
+
 async def _decrement_local_active_queries(
     srv,
     session_key: Optional[str] = None,
@@ -566,6 +609,7 @@ async def _try_acquire_local_dispatch(
     max_local: int,
     session_key: str,
     backend: str,
+    body_json: Optional[dict] = None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -581,6 +625,11 @@ async def _try_acquire_local_dispatch(
     acquire the local backend while an unexpired lease exists, even if
     the owner has no active request in flight.
 
+    When *body_json* is provided, the lease timeout is extended adaptively
+    based on the estimated prompt token count. This prevents mid-stream
+    lease expiry during the cache prefill phase for large-context requests
+    (LP-0MRDUQ9QC003LDDP).
+
     If the server does not have *local_dispatch_records* or
     *local_dispatch_records_lock* attributes (legacy state), the function
     silently returns ``(True, None, 0, 1.0)`` to allow the request.
@@ -589,7 +638,7 @@ async def _try_acquire_local_dispatch(
     if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
         return (True, None, 0, 1.0)
 
-    lease_timeout = _get_lease_timeout_seconds(srv)
+    lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
     now = time.monotonic()
 
     try:

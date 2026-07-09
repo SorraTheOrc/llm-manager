@@ -450,6 +450,115 @@ async def test_dispatch_lease_refreshed_during_streaming(monkeypatch):
         pass
 
 
+@pytest.mark.asyncio
+async def test_dispatch_lease_adaptive_timeout_large_prompt(monkeypatch):
+    """The dispatch lease initial timeout should be extended for large prompts.
+
+    LP-0MRDUQ9QC003LDDP: Large-context requests with cache prefill >180s must
+    have an extended initial lease timeout so the lease covers the prefill phase
+    before any data chunks arrive. For a ~48K-token prompt, the extension is
+    approximately 48K * 0.015s = 720s, giving a total lease of ~900s.
+    """
+    from proxy.router_helpers import _try_acquire_local_dispatch, _get_lease_timeout_seconds
+
+    # Set up dispatch tracking on server state
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+
+    # Configure server with base 180s lease timeout
+    monkeypatch.setattr(
+        server, "config",
+        {"server": {"local_dispatch_lease_timeout_seconds": 180}},
+    )
+    monkeypatch.setattr(server, "logger", MagicMock())
+
+    # Large prompt (~48K tokens: 48000 * 4 chars/token = 192000 chars)
+    large_body = {
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "hello " * 48000},
+        ],
+    }
+
+    acquired, owner, count, retry = await _try_acquire_local_dispatch(
+        server,
+        max_local=1,
+        session_key="test-large-prompt",
+        backend="local",
+        body_json=large_body,
+    )
+
+    assert acquired is True
+    record = server.local_dispatch_records["test-large-prompt"]
+
+    base_timeout = _get_lease_timeout_seconds(server)
+    actual_lease = record["expires_at"] - record["started_at"]
+
+    # For a 48K-token prompt: base=180s, extension ~720s => ~900s total
+    # The lease should be significantly longer than the base 180s
+    assert actual_lease > base_timeout + 300, (
+        f"Expected lease extended for large prompt (48K tokens), "
+        f"got {actual_lease:.0f}s (base={base_timeout}s)"
+    )
+    # But it shouldn't exceed the max (1500s)
+    assert actual_lease <= 1500, (
+        f"Expected lease capped at 1500s max, got {actual_lease:.0f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lease_adaptive_timeout_small_prompt(monkeypatch):
+    """Small prompts should use the base lease timeout without significant extension.
+
+    LP-0MRDUQ9QC003LDDP: For small requests (<180s), the lease timeout
+    should remain at the base 180s without significant adaptive extension.
+    """
+    from proxy.router_helpers import _try_acquire_local_dispatch, _get_lease_timeout_seconds
+
+    # Set up dispatch tracking on server state
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+
+    monkeypatch.setattr(
+        server, "config",
+        {"server": {"local_dispatch_lease_timeout_seconds": 180}},
+    )
+    monkeypatch.setattr(server, "logger", MagicMock())
+
+    # Small prompt (~10 tokens)
+    small_body = {
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "Hello, how are you?"},
+        ],
+    }
+
+    acquired, owner, count, retry = await _try_acquire_local_dispatch(
+        server,
+        max_local=1,
+        session_key="test-small-prompt",
+        backend="local",
+        body_json=small_body,
+    )
+
+    assert acquired is True
+    record = server.local_dispatch_records["test-small-prompt"]
+
+    base_timeout = _get_lease_timeout_seconds(server)
+    actual_lease = record["expires_at"] - record["started_at"]
+
+    # For a small prompt, the lease should be close to the base timeout
+    # (extension is negligible: ~10 tokens * 0.015 = 0.15s)
+    assert abs(actual_lease - base_timeout) < 10, (
+        f"Expected lease close to base timeout for small prompt, "
+        f"got {actual_lease:.0f}s (base={base_timeout}s)"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Structural verification test
 # ═══════════════════════════════════════════════════════════════════════════════
