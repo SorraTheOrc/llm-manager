@@ -47,12 +47,20 @@ _BACKOFF_MAX_SECONDS = 45.0
 # When the slot cache for a model is cold, large-context requests may be
 # routed directly to remote fallback to avoid expensive full re-prefill.
 # Models whose slot cache is currently cold (invalidated or just started).
-# Cache state is set to cold:
-#   - On proxy startup (via initialize_cache_cold_from_config)
-#   - On model reload (via initialize_cache_cold_from_config)
-#   - On invalidation events (session mismatch, guardrail cutoff)
-# Cache state is cleared to warm on successful local request response.
+# Sentinel: True until initialize_cache_cold_from_config runs.
+# This prevents a race between proxy restart (where the OLD process handles
+# requests before the NEW process's lifespan startup executes). Without this,
+# _model_cache_cold is an empty set() and all models appear warm.
+_model_cache_cold_uninitialized: bool = True
+
+# Set of model names whose slot cache is currently cold.
+# Populated by initialize_cache_cold_from_config at startup.
 _model_cache_cold: set[str] = set()
+
+def _cache_cold_initialized() -> None:
+    """Mark the cache-cold state as fully initialized."""
+    global _model_cache_cold_uninitialized
+    _model_cache_cold_uninitialized = False
 
 def mark_model_cache_cold(model_name: str) -> None:
     """Mark a model's slot cache as invalidated (cold).
@@ -71,9 +79,12 @@ def clear_model_cache_cold(model_name: str) -> None:
 def is_model_cache_cold(model_name: str) -> bool:
     """Check if a model's slot cache is currently marked as cold.
 
-    Conservative default: if the model name is not tracked, assume cache is
-    valid (warm) to avoid false-positive routing to remote.
+    Before initialize_cache_cold_from_config has been called, ALL models are
+    assumed cold to prevent a race between proxy process restarts.
+    After initialization, returns True only for explicitly-cold models.
     """
+    if _model_cache_cold_uninitialized:
+        return bool(model_name)
     return model_name in _model_cache_cold if model_name else False
 
 
@@ -87,6 +98,7 @@ def initialize_cache_cold_from_config(config: dict) -> None:
 
     Safe to call multiple times — clears any existing state first.
     """
+    _cache_cold_initialized()
     _model_cache_cold.clear()
     models = config.get("models", {})
     if not isinstance(models, dict):
@@ -104,12 +116,12 @@ def initialize_cache_cold_from_config(config: dict) -> None:
                 llama_model = provider.get("llama_model")
                 if llama_model:
                     _model_cache_cold.add(str(llama_model))
-    if _model_cache_cold:
-        import logging as _logging
-        _logging.getLogger("llama-proxy.provider").info(
-            "cache_cold_initialized models=%s",
-            sorted(_model_cache_cold),
-        )
+    import logging as _logging
+    _logging.getLogger("llama-proxy.provider").info(
+        "cache_cold_initialized models=%s uninitialized_sentinel_cold_until=%s",
+        sorted(_model_cache_cold) if _model_cache_cold else "(none)",
+        _model_cache_cold_uninitialized,
+    )
 
 
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:

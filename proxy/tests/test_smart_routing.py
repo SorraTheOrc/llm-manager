@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from proxy.provider import (
     _model_cache_cold,
+    _cache_cold_initialized,
     mark_model_cache_cold,
     clear_model_cache_cold,
     is_model_cache_cold,
@@ -18,12 +19,13 @@ class TestModelCacheColdTracking:
     """Tests for the in-memory cache-invalidation tracking."""
 
     def setup_method(self):
+        _cache_cold_initialized()
         _model_cache_cold.clear()
 
-    def test_initial_state_is_cold(self):
-        """All models start with cache considered cold (LP-0MRDE669Y003V1SO)."""
-        # After clearing, no models are marked cold. The initialize_cache_cold_from_config
-        # function is called at startup to populate the set from config.
+    def test_initial_state_is_not_cold_after_init(self):
+        """After initialization with empty config, no models are cold."""
+        # After clearing and initialization, no models are marked cold.
+        # The initialize_cache_cold_from_config function populates the set from config.
         assert is_model_cache_cold("Qwen3") is False
         assert is_model_cache_cold("gemma4") is False
         assert is_model_cache_cold("nonexistent") is False
@@ -273,6 +275,7 @@ class TestSmartRoutingDecision:
     """
 
     def setup_method(self):
+        _cache_cold_initialized()
         _model_cache_cold.clear()
 
     def test_warm_cache_small_request_routes_local(self):
@@ -346,6 +349,7 @@ class TestInitializeCacheColdFromConfig:
     """Tests for the startup cache-cold initialization."""
 
     def setup_method(self):
+        _cache_cold_initialized()
         _model_cache_cold.clear()
 
     def test_marks_local_models_cold(self):
@@ -429,6 +433,7 @@ class TestCacheColdLifecycle:
     """Tests for the full cache-cold lifecycle."""
 
     def setup_method(self):
+        _cache_cold_initialized()
         _model_cache_cold.clear()
 
     def test_startup_to_warm_to_cold_cycle(self):
