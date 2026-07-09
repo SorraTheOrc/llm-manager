@@ -332,9 +332,12 @@ async def test_watchdog_detects_worker_failure_and_triggers_router_recovery(monk
     monkeypatch.setattr(server, "llama_process", Proc())
     monkeypatch.setattr(server, "current_model", "qwen3")
     monkeypatch.setattr(server, "backend_ready", True)
-    monkeypatch.setattr(server, "config", {"server": {"llama_router_mode": True, "llama_watchdog_interval_seconds": 0}})
+    monkeypatch.setattr(server, "config", {"server": {"llama_router_mode": True, "llama_watchdog_interval_seconds": 0, "llama_server_port": 8080}})
     monkeypatch.setattr(server, "_worker_process_unhealthy", lambda _proc: True)
     monkeypatch.setattr(server, "_attempt_router_self_heal", fake_recover)
+    async def fake_probe_unreachable(port):
+        return False
+    monkeypatch.setattr(server, "_probe_backend_reachable", fake_probe_unreachable)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     await server._backend_watchdog_loop()
@@ -626,6 +629,7 @@ async def test_watchdog_retries_restart_when_process_is_none(monkeypatch):
             "server": {
                 "llama_router_mode": True,
                 "llama_watchdog_interval_seconds": 0.01,
+                "llama_server_port": 8080,
                 "llama_self_heal_max_attempts": 2,
                 "llama_self_heal_window_seconds": 300,
                 "llama_self_heal_backoff_base_seconds": 0,
@@ -640,6 +644,10 @@ async def test_watchdog_retries_restart_when_process_is_none(monkeypatch):
         "exception": lambda *a, **kw: None,
     })())
     monkeypatch.setattr(server, "_record_backend_signal", lambda *a: None)
+    async def fake_probe_unreachable(port):
+        return False
+    # Mock probe to return False (backend unreachable) so watchdog falls through to restart
+    monkeypatch.setattr(server, "_probe_backend_reachable", fake_probe_unreachable)
 
     # Run watchdog for a short time
     task = asyncio.create_task(server._backend_watchdog_loop())
