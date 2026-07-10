@@ -211,7 +211,7 @@ case "$model" in
     # forces weights to be loaded into memory which often improves throughput.
     EXTRA_CMD_SWITCHES="--gpt-oss-120b-default --no-mmap"
     ;;
-  qwen3|qwen3-next)
+  qwen3)
     REPOID=unsloth
     MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
     QUANTIZATION=Q8_0
@@ -225,7 +225,7 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj"
+    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj --jinja"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   mxbai-embed)

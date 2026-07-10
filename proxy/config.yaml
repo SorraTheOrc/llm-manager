@@ -179,7 +179,7 @@ models:
     providers:
       - name: local-qwen3-next
         type: local
-        llama_model: Qwen3-Next
+        llama_model: Qwen3
     aliases:
     - qwen3-next
     - qwen3-coder-next
@@ -189,7 +189,7 @@ models:
     providers:
       - name: local-qwen3-next
         type: local
-        llama_model: Qwen3-Next
+        llama_model: Qwen3
       - name: opencode-deepseek-free
         type: remote
         provider: opencode
