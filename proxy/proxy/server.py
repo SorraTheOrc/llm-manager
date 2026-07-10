@@ -309,16 +309,18 @@ async def lifespan(app: FastAPI):
     )
 
     # Initialize shared remote HTTP client with connection pooling (LP-0MRE8G3JK0099Y4J)
-    _remote_client_config = server_config.get("remote_http_client", {})
+    _remote_client_config = config.get("server", {}).get("remote_http_client", {})
     _remote_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(
             connect=float(_remote_client_config.get("connect_timeout_seconds", 30) or 30),
             read=float(_remote_client_config.get("read_timeout_seconds", 300) or 300),
+            write=float(_remote_client_config.get("write_timeout_seconds", 300) or 300),
+            pool=float(_remote_client_config.get("pool_timeout_seconds", 30) or 30),
         ),
         limits=httpx.Limits(
             max_connections=int(_remote_client_config.get("pool_connections", 50) or 50),
             max_keepalive_connections=int(_remote_client_config.get("pool_keepalive_connections", 10) or 10),
-            keepalive_seconds=float(_remote_client_config.get("keepalive_seconds", 60) or 60),
+            keepalive_expiry=float(_remote_client_config.get("keepalive_expiry", 60) or 60),
         ),
     )
 
