@@ -1445,3 +1445,4 @@
 {"data":{"auditedAt":"2026-07-09T12:18:37.253Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MRCU7PTG005VVD4"},"type":"audit_result"}
 {"data":{"auditedAt":"2026-07-09T12:19:27.898Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MRCU7YIU003E9EO"},"type":"audit_result"}
 {"data":{"auditedAt":"2026-07-09T12:55:21.290Z","author":"rgardler","rawOutput":null,"readyToClose":false,"summary":"Rejected by manual review. Right now there is a process that has been routed to local-qwen3 with 78147 tokens on a cold cache","workItemId":"LP-0MRDE669Y003V1SO"},"type":"audit_result"}
+{"data":{"auditedAt":"2026-07-10T10:02:18.302Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MRERDMQP004447U"},"type":"audit_result"}
