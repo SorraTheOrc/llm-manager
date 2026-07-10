@@ -315,6 +315,14 @@ server:
   # Default: 60 seconds.
   upstream_idle_timeout_seconds: 60
 
+  # Upstream retry connection timeout (LP-0MRE8FYKV008WOTB).
+  # When the proxy retries a stalled upstream connection, this timeout
+  # controls how long to wait for the retry connection to be established.
+  # Decoupled from upstream_idle_timeout_seconds so operators can tune
+  # retry connection timeouts independently (typically shorter).
+  # Default: 30 seconds.
+  upstream_retry_connect_timeout_seconds: 30
+
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
   # emits {"type":"heartbeat"} events every N seconds to keep the client

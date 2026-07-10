@@ -696,6 +696,17 @@ localhost (127.0.0.1).
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
 
+### Upstream Timeout Configuration
+
+The proxy uses two separate timeout values for upstream remote connections:
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `server.upstream_idle_timeout_seconds` | `60` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. |
+| `server.upstream_retry_connect_timeout_seconds` | `30` | Timeout for establishing a retry connection after a stall. Decoupled from the idle timeout so operators can tune retry connection timeouts independently (typically shorter). |
+
+The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
+
 ### Development Mode
 
 The proxy supports a development mode that allows running a dev instance side-by-side with the production proxy. Dev mode uses alternate ports, DEBUG logging, and auto-reload for rapid iteration.

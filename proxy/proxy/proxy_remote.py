@@ -275,6 +275,10 @@ async def proxy_to_remote(
     _upstream_idle_timeout = float(
         server_config.get("upstream_idle_timeout_seconds", 60) or 60
     )
+    # Read upstream retry connect timeout from config (LP-0MRE8FYKV008WOTB)
+    _upstream_retry_connect_timeout = float(
+        server_config.get("upstream_retry_connect_timeout_seconds", 30) or 30
+    )
 
     if is_streaming:
         if _remote_session_id:
@@ -285,6 +289,7 @@ async def proxy_to_remote(
                 session_id=_remote_session_id,
                 provider=_provider_name,
                 upstream_idle_timeout_seconds=_upstream_idle_timeout,
+                upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
             )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
@@ -292,6 +297,7 @@ async def proxy_to_remote(
             resolved_model=_resolved_model_header,
             provider=_provider_name,
             upstream_idle_timeout_seconds=_upstream_idle_timeout,
+            upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
         )
     else:
         if _remote_session_id:
@@ -318,6 +324,7 @@ async def _handle_remote_streaming(
     session_id: Optional[str] = None,
     provider: Optional[str] = None,
     upstream_idle_timeout_seconds: Optional[float] = None,
+    upstream_retry_connect_timeout_seconds: Optional[float] = None,
 ) -> Response:
     """Handle streaming remote proxy request with upstream stall detection and retry.
 
@@ -341,6 +348,17 @@ async def _handle_remote_streaming(
             )
         except Exception:
             upstream_idle_timeout_seconds = 60.0
+
+    # Resolve upstream_retry_connect_timeout_seconds from parameter or config
+    if upstream_retry_connect_timeout_seconds is None:
+        try:
+            upstream_retry_connect_timeout_seconds = float(
+                _srv().config.get("server", {}).get(
+                    "upstream_retry_connect_timeout_seconds", 30
+                ) or 30
+            )
+        except Exception:
+            upstream_retry_connect_timeout_seconds = 30.0
 
     max_retries = 3
     retry_base_delay = 1.0
@@ -507,7 +525,7 @@ async def _handle_remote_streaming(
                     )
                     _current_response = await asyncio.wait_for(
                         _current_cm.__aenter__(),
-                        timeout=upstream_idle_timeout_seconds,
+                        timeout=upstream_retry_connect_timeout_seconds,
                     )
                     _retry_upstream_status = _current_response.status_code
                     _retry_upstream_ct = _current_response.headers.get("content-type", "")

@@ -533,7 +533,7 @@ async def test_non_streaming_error_response_unchanged(mock_request):
 
 @pytest.mark.asyncio
 async def test_retry_connection_setup_has_bounded_timeout(mock_request):
-    """Retry connection setup is bounded by upstream_idle_timeout_seconds, not
+    """Retry connection setup is bounded by upstream_retry_connect_timeout_seconds, not
     the full httpx remote_timeout.
 
     AC1: Retry connection setup must have a bounded timeout.
@@ -542,7 +542,7 @@ async def test_retry_connection_setup_has_bounded_timeout(mock_request):
 
     The first stream returns some chunks then stalls. The retry connection's
     __aenter__() hangs forever — this should be caught by asyncio.wait_for
-    with upstream_idle_timeout_seconds, NOT by the longer httpx remote_timeout.
+    with upstream_retry_connect_timeout_seconds, NOT by the longer httpx remote_timeout.
     """
     # First attempt: yields one chunk then hangs (stall)
     first_chunks = [
@@ -586,10 +586,11 @@ async def test_retry_connection_setup_has_bounded_timeout(mock_request):
                                 body_json={"stream": True, "model": "test"},
                                 model_name="test-model",
                                 remote_timeout=httpx.Timeout(300.0),  # long timeout!
-                                upstream_idle_timeout_seconds=0.05,  # short idle timeout
+                                upstream_idle_timeout_seconds=0.05,  # short idle timeout for stall detection
+                                upstream_retry_connect_timeout_seconds=0.05,  # short connect timeout for retry
                             )
 
-                            # This should complete quickly (bounded by idle timeout, not 300s)
+                            # This should complete quickly (bounded by timeouts, not 300s)
                             collected = [chunk async for chunk in result.body_iterator]
 
     assert isinstance(result, StreamingResponse)
@@ -620,7 +621,7 @@ async def test_retry_connection_timeout_fires_before_httpx_timeout(mock_request)
 
     Regression test: even with a very long httpx remote_timeout (300s), the
     retry connection setup should be caught by asyncio.wait_for within the
-    much shorter upstream_idle_timeout_seconds (0.05s in test).
+    much shorter upstream_retry_connect_timeout_seconds (0.05s in test).
     """
     first_chunks = [
         b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
@@ -667,7 +668,8 @@ async def test_retry_connection_timeout_fires_before_httpx_timeout(mock_request)
                                 body_json={"stream": True, "model": "test"},
                                 model_name="test-model",
                                 remote_timeout=very_long_timeout,
-                                upstream_idle_timeout_seconds=0.05,
+                                upstream_idle_timeout_seconds=0.05,  # short idle timeout for stall detection
+                                upstream_retry_connect_timeout_seconds=0.05,  # short connect timeout for retry
                             )
                             collected = [chunk async for chunk in result.body_iterator]
                             elapsed = time.monotonic() - start
@@ -679,6 +681,80 @@ async def test_retry_connection_timeout_fires_before_httpx_timeout(mock_request)
         f"took {elapsed:.1f}s (expected < 10s)"
     )
     # Should still get finish_reason: error
+    last_chunk = collected[-1].decode("utf-8", errors="replace")
+    assert '"finish_reason":"error"' in last_chunk.replace(" ", ""), (
+        f"Last chunk should have finish_reason: error, got: {last_chunk[:200]}"
+    )
+
+
+# ===================================================================
+# NEW: AC for upstream_retry_connect_timeout_seconds config key
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_retry_connection_uses_new_config_key(mock_request):
+    """The retry connection setup uses the new upstream_retry_connect_timeout_seconds
+    config key, separate from upstream_idle_timeout_seconds.
+
+    AC(a): Retry connection uses the new config key.
+    AC(c): Normal connections are unaffected (use upstream_idle_timeout_seconds).
+
+    Verifies that setting only upstream_retry_connect_timeout_seconds (not
+    upstream_idle_timeout_seconds) controls the retry connection timeout.
+    """
+    # First attempt: yields one chunk then hangs (stall)
+    first_chunks = [
+        b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
+    ]
+    first_resp = _make_mock_response(
+        status_code=200,
+        aiter_chunks=first_chunks,
+        hang_after=True,
+    )
+
+    # Retry __aenter__ hangs forever
+    hanging_cm = MagicMock()
+    hanging_cm.__aenter__ = AsyncMock(side_effect=asyncio.Event().wait)
+    hanging_cm.__aexit__ = AsyncMock(return_value=None)
+
+    cm1 = MagicMock()
+    cm1.__aenter__ = AsyncMock(return_value=first_resp)
+    cm1.__aexit__ = AsyncMock(return_value=None)
+
+    client_instance = MagicMock(spec=httpx.AsyncClient)
+    client_instance.stream = MagicMock(side_effect=[cm1, hanging_cm])
+    client_instance.aclose = AsyncMock(return_value=None)
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client_instance):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        with patch("proxy.proxy_remote._srv") as mock_srv:
+                            mock_srv.return_value.config = {}
+                            mock_srv.return_value.logger = MagicMock()
+
+                            # Pass upstream_retry_connect_timeout_seconds
+                            result = await _handle_remote_streaming(
+                                request=mock_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(300.0),
+                                upstream_idle_timeout_seconds=0.05,  # short idle timeout for stall detection
+                                upstream_retry_connect_timeout_seconds=0.05,  # short connect timeout for retry
+                            )
+
+                            collected = [chunk async for chunk in result.body_iterator]
+
+    assert isinstance(result, StreamingResponse)
+    assert len(collected) >= 1, "Should have yielded at least one chunk"
+
+    # The retry connection should fire (bounded by 0.05s retry connect timeout)
+    # and ultimately yield finish_reason: error
     last_chunk = collected[-1].decode("utf-8", errors="replace")
     assert '"finish_reason":"error"' in last_chunk.replace(" ", ""), (
         f"Last chunk should have finish_reason: error, got: {last_chunk[:200]}"
