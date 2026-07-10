@@ -280,6 +280,9 @@ async def proxy_to_remote(
         server_config.get("upstream_retry_connect_timeout_seconds", 30) or 30
     )
 
+    # Get shared HTTP connection pool for remote upstream requests (LP-0MRE8G3JK0099Y4J)
+    _pool_client = getattr(_srv(), "_remote_http_client", None)
+
     if is_streaming:
         if _remote_session_id:
             return await _handle_remote_streaming(
@@ -290,6 +293,7 @@ async def proxy_to_remote(
                 provider=_provider_name,
                 upstream_idle_timeout_seconds=_upstream_idle_timeout,
                 upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
+                pool_client=_pool_client,
             )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
@@ -298,6 +302,7 @@ async def proxy_to_remote(
             provider=_provider_name,
             upstream_idle_timeout_seconds=_upstream_idle_timeout,
             upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
+            pool_client=_pool_client,
         )
     else:
         if _remote_session_id:
@@ -305,10 +310,12 @@ async def proxy_to_remote(
                 request, target_url, headers, body, model_name, remote_timeout,
                 resolved_model=_resolved_model_header,
                 session_id=_remote_session_id,
+                pool_client=_pool_client,
             )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
             resolved_model=_resolved_model_header,
+            pool_client=_pool_client,
         )
 
 
@@ -325,6 +332,7 @@ async def _handle_remote_streaming(
     provider: Optional[str] = None,
     upstream_idle_timeout_seconds: Optional[float] = None,
     upstream_retry_connect_timeout_seconds: Optional[float] = None,
+    pool_client: Optional[httpx.AsyncClient] = None,
 ) -> Response:
     """Handle streaming remote proxy request with upstream stall detection and retry.
 
@@ -365,13 +373,18 @@ async def _handle_remote_streaming(
     retry_max_delay = 4.0
 
     # We need to manage client/context manager lifecycle for retries.
-    # Create the first client and stream now for the initial attempt.
-    client = httpx.AsyncClient(timeout=remote_timeout)
+    # Use the shared pool client or create a fallback if unavailable.
+    _pool_client = pool_client
+    if _pool_client is None:
+        _pool_client = httpx.AsyncClient(timeout=remote_timeout)
+    _owns_client = pool_client is None  # Track if we need to close the client
+    client = _pool_client
     cm = client.stream(
         request.method,
         target_url,
         headers=headers,
         content=body,
+        timeout=remote_timeout,
     )
 
     response = await cm.__aenter__()
@@ -401,10 +414,11 @@ async def _handle_remote_streaming(
             await cm.__aexit__(None, None, None)
         except Exception:
             pass
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+        if _owns_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
         # Record provider->client response for error path (fire-and-forget)
         if session_id:
             _schedule_traffic_recording(
@@ -514,14 +528,15 @@ async def _handle_remote_streaming(
                     pass
                 await asyncio.sleep(_backoff_delay)
 
-                # Create fresh httpx client and connection for retry
+                # Create fresh stream on the pool client for retry
                 try:
-                    _current_client = httpx.AsyncClient(timeout=remote_timeout)
-                    _current_cm = _current_client.stream(
+                    _current_client = _pool_client
+                    _current_cm = _pool_client.stream(
                         request.method,
                         target_url,
                         headers=headers,
                         content=body,
+                        timeout=remote_timeout,
                     )
                     _current_response = await asyncio.wait_for(
                         _current_cm.__aenter__(),
@@ -720,11 +735,12 @@ async def _handle_remote_streaming(
                             await _current_cm.__aexit__(None, None, None)
                         except Exception:
                             pass
-                        try:
-                            disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
-                            await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
-                        except (asyncio.TimeoutError, Exception):
-                            pass
+                        if _owns_client:
+                            try:
+                                disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
+                                await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
+                            except (asyncio.TimeoutError, Exception):
+                                pass
 
             if saw_done or saw_finish or disconnected:
                 break
@@ -741,11 +757,12 @@ async def _handle_remote_streaming(
                 await _current_cm.__aexit__(None, None, None)
             except Exception:
                 pass
-        try:
-            disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
-            await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
-        except (asyncio.TimeoutError, Exception):
-            pass
+        if _owns_client:
+            try:
+                disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
+                await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
         # Record provider->client response for streaming path (fire-and-forget)
         if session_id and collected_chunks is not None:
@@ -774,17 +791,27 @@ async def _handle_remote_non_streaming(
     remote_timeout: httpx.Timeout,
     resolved_model: Optional[str] = None,
     session_id: Optional[str] = None,
+    pool_client: Optional[httpx.AsyncClient] = None,
 ) -> Response:
     """Handle non-streaming remote proxy request."""
     key = f"{request.method.upper()} {request.url.path} -> remote"
     
-    async with httpx.AsyncClient(timeout=remote_timeout) as client:
+    if pool_client is not None:
         method = request.method.lower()
-        response = await getattr(client, method)(
+        response = await getattr(pool_client, method)(
             target_url,
             headers=headers,
             content=body,
+            timeout=remote_timeout,
         )
+    else:
+        async with httpx.AsyncClient(timeout=remote_timeout) as client:
+            method = request.method.lower()
+            response = await getattr(client, method)(
+                target_url,
+                headers=headers,
+                content=body,
+            )
 
         # Non-streaming: count tokens in response
         try:

@@ -707,6 +707,22 @@ The proxy uses two separate timeout values for upstream remote connections:
 
 The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
 
+### Remote HTTP Client Configuration
+
+The proxy uses a shared, pooled `httpx.AsyncClient` for all remote upstream requests, replacing per-request client creation. This enables connection reuse (TCP/TLS keepalive) and configurable connection-level timeouts.
+
+Configuration is under `server.remote_http_client`:
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `server.remote_http_client.connect_timeout_seconds` | `30` | Timeout for establishing new connections to upstream providers. |
+| `server.remote_http_client.read_timeout_seconds` | `300` | Read timeout for the entire response. Set generously to avoid interfering with per-request adaptive timeouts. |
+| `server.remote_http_client.pool_connections` | `50` | Maximum number of connections in the pool. |
+| `server.remote_http_client.pool_keepalive_connections` | `10` | Maximum number of idle keepalive connections to maintain. |
+| `server.remote_http_client.keepalive_seconds` | `60` | Time in seconds before an idle keepalive connection is closed. |
+
+The pool is initialized at server startup and closed on shutdown. Per-request adaptive timeouts (see Adaptive Timeouts) still apply via the `timeout` parameter passed to each request, independent of the pool's connection-level timeouts.
+
 ### Development Mode
 
 The proxy supports a development mode that allows running a dev instance side-by-side with the production proxy. Dev mode uses alternate ports, DEBUG logging, and auto-reload for rapid iteration.

@@ -65,8 +65,10 @@ rocm_version: str = "unknown"
 session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
 
 
-# Shared httpx client for connection pooling
+# Shared httpx client for connection pooling (local/internal operations)
 _http_client: Optional[httpx.AsyncClient] = None
+# Shared httpx client for remote upstream requests (LP-0MRE8G3JK0099Y4J)
+_remote_http_client: Optional[httpx.AsyncClient] = None
 # Cache for which llama-server endpoint successfully provided status
 _llama_status_endpoint_cache: Optional[str] = None
 # Record recent failures for endpoints to avoid hammering endpoints that 404
@@ -276,7 +278,7 @@ async def _capture_rocm_version() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global config, logger, llama_process, _http_client, backend_watchdog_task, model_health_task, backend_ready, backend_recovery_state, _dispatch_cleanup_task
+    global config, logger, llama_process, _http_client, _remote_http_client, backend_watchdog_task, model_health_task, backend_ready, backend_recovery_state, _dispatch_cleanup_task
     
     # Startup
     config = load_config()
@@ -304,6 +306,20 @@ async def lifespan(app: FastAPI):
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(5.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    )
+
+    # Initialize shared remote HTTP client with connection pooling (LP-0MRE8G3JK0099Y4J)
+    _remote_client_config = server_config.get("remote_http_client", {})
+    _remote_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=float(_remote_client_config.get("connect_timeout_seconds", 30) or 30),
+            read=float(_remote_client_config.get("read_timeout_seconds", 300) or 300),
+        ),
+        limits=httpx.Limits(
+            max_connections=int(_remote_client_config.get("pool_connections", 50) or 50),
+            max_keepalive_connections=int(_remote_client_config.get("pool_keepalive_connections", 10) or 10),
+            keepalive_seconds=float(_remote_client_config.get("keepalive_seconds", 60) or 60),
+        ),
     )
 
     # Capture llama-server and ROCm versions asynchronously at startup.
@@ -491,6 +507,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         _http_client = None
+    if _remote_http_client is not None:
+        try:
+            await _remote_http_client.aclose()
+        except Exception:
+            pass
+        _remote_http_client = None
 
     if backend_watchdog_task is not None:
         backend_watchdog_task.cancel()

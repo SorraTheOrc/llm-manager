@@ -323,6 +323,22 @@ server:
   # Default: 30 seconds.
   upstream_retry_connect_timeout_seconds: 30
 
+  # Remote HTTP client configuration (LP-0MRE8G3JK0099Y4J).
+  # Controls connection pooling and timeouts for remote upstream requests.
+  # The shared pool replaces per-request httpx.AsyncClient() creation.
+  remote_http_client:
+    # Connection-level timeout for establishing new connections.
+    connect_timeout_seconds: 30
+    # Read timeout for the entire response (generous to not interfere
+    # with per-request adaptive timeouts).
+    read_timeout_seconds: 300
+    # Maximum number of connections in the pool.
+    pool_connections: 50
+    # Maximum number of keepalive connections to maintain.
+    pool_keepalive_connections: 10
+    # Time in seconds before an idle keepalive connection is closed.
+    keepalive_seconds: 60
+
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
   # emits {"type":"heartbeat"} events every N seconds to keep the client
