@@ -40,9 +40,9 @@ _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
 # ---------------------------------------------------------------------------
-# Two-tier retry system (LP-0MRE8G94H005ZBLV)
+# Three-tier retry system (LP-0MRE8G94H005ZBLV, LP-0MRFEXXVC001RYKB)
 #
-# The proxy has two layers of retry for remote upstream requests:
+# The proxy has three layers of retry for remote upstream requests:
 #
 # Tier 1 — Per-stream retries (proxy_remote.py:_handle_remote_streaming)
 #   - Fires on upstream stall (idle timeout) or httpx ReadTimeout
@@ -58,12 +58,20 @@ _BACKOFF_MAX_SECONDS = 45.0
 #   - Uses its own exponential backoff via _provider_failure_count
 #   - Configurable via server.provider_cooldown_seconds
 #
+# Tier 3 — Cross-request stall circuit breaker
+#           (stall_circuit_breaker.py:_check_stall_circuit_breaker)
+#   - Tracks stall frequency per provider within a sliding time window
+#   - When stall count exceeds threshold within window, marks provider
+#     unavailable via the same Tier 2 cooldown mechanism
+#   - Configurable via server.upstream_stall_window_seconds,
+#     server.upstream_stall_threshold, server.upstream_stall_cooldown_seconds
+#   - Default: 3 stalls within 300s window triggers 180s cooldown
+#
 # Interaction:
 #   Tier 1 retries fire first for streaming connections that stall.
-#   If Tier 1 exhausts (max retries reached), the stream falls through
-#   to the fallback provider chain (provider.py). The failed provider
-#   is then marked in cooldown (Tier 2) for the configured duration,
-#   preventing immediate retry by subsequent requests.
+#   If Tier 1 exhausts (max retries reached), the stall circuit breaker
+#   (Tier 3) records the stall. If the threshold is exceeded across
+#   requests, the provider is marked unavailable via Tier 2 cooldown.
 #   For non-streaming errors (e.g., HTTP 4xx/5xx), Tier 1 is bypassed
 #   and Tier 2 cooldown applies directly.
 # ---------------------------------------------------------------------------

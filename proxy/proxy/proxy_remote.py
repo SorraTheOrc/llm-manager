@@ -35,6 +35,9 @@ from .router_helpers import (
 # Import utils functions used by this module
 from proxy.utils import count_text_tokens  # noqa: E402
 
+# Import stall circuit breaker for Tier 3 cross-request stall tracking
+from .stall_circuit_breaker import _check_stall_circuit_breaker
+
 
 # ---------------------------------------------------------------------------
 # Auth.json fallback helpers
@@ -529,6 +532,20 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
+
+                # Wire into Tier 3 cross-request stall circuit breaker
+                # (LP-0MRFEXXVC001RYKB). Record the stall so repeated
+                # failures across requests accumulate and trigger provider
+                # cooldown.
+                try:
+                    _config = _srv().config if hasattr(_srv(), 'config') else {}
+                    _check_stall_circuit_breaker(
+                        provider or "remote",
+                        _config,
+                    )
+                except Exception:
+                    pass
+
                 _final_error_obj = {
                     "choices": [
                         {"delta": {}, "finish_reason": "error", "index": 0}

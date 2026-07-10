@@ -536,6 +536,29 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
   unavailable until the cooldown expires. Multi-worker deployments (multiple
   proxy processes) have independent cooldown state per worker.
 
+##### Cross-Request Stall Circuit Breaker (Tier 3)
+
+In addition to the per-failure cooldown above (Tier 2), the proxy includes a
+cross-request stall circuit breaker (Tier 3) that tracks stall frequency per
+provider within a sliding time window. When a provider exceeds the stall
+threshold within the window, it is marked unavailable via the same cooldown
+mechanism, affecting subsequent requests immediately.
+
+This prevents unreliable providers from stalling on every request, since the
+per-stream retry count resets between requests. A provider that stalls
+repeatedly across requests is quarantined after the threshold is exceeded.
+
+- **Sliding window**: 300 seconds (default)
+- **Stall threshold**: 3 stalls (default) within window triggers cooldown
+- **Cooldown duration**: 180 seconds (default) — separate from provider_cooldown_seconds
+- **Configuration keys** (optional, defaults apply when absent):
+  - `server.upstream_stall_window_seconds` (default: 300)
+  - `server.upstream_stall_threshold` (default: 3)
+  - `server.upstream_stall_cooldown_seconds` (default: 180)
+- **State**: In-memory only, resets on proxy restart. Shared across all sessions.
+- **Integration**: Uses the same `mark_provider_unavailable()` mechanism as Tier 2.
+  Stalls during cooldown are recorded but do not extend the cooldown.
+
 #### All Providers Exhausted
 
 When all providers are exhausted:
@@ -702,11 +725,14 @@ The proxy uses two separate timeout values for upstream remote connections:
 
 | Config Key | Default | Description |
 |-----------|---------|-------------|
-| `server.upstream_idle_timeout_seconds` | `60` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. |
+| `server.upstream_idle_timeout_seconds` | `30` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. Reduced from 60s to 30s for faster stall detection (LP-0MRFEXXVC001RYKB). Operators with long-thinking models may increase this value. |
 | `server.upstream_retry_connect_timeout_seconds` | `30` | Timeout for establishing a retry connection after a stall. Decoupled from the idle timeout so operators can tune retry connection timeouts independently (typically shorter). |
 | `server.upstream_retry_max_attempts` | `3` | Maximum number of retry attempts (initial attempt + retries) for a stalled upstream stream. Aligned with Pi's default maxRetries=3. |
 | `server.upstream_retry_base_delay_seconds` | `2.0` | Base delay for exponential backoff between retries. The actual delay is `min(base_delay * 2^attempt, max_delay)`. Aligned with Pi's default maxRetryDelayMs=60000. |
 | `server.upstream_retry_max_delay_seconds` | `60.0` | Maximum delay between retries (cap on exponential backoff). |
+| `server.upstream_stall_window_seconds` | `300` | Sliding window duration (seconds) for the cross-request stall circuit breaker (Tier 3). Stalls older than this are ignored when counting toward the threshold. |
+| `server.upstream_stall_threshold` | `3` | Number of stalls within the sliding window that triggers the circuit breaker to mark the provider unavailable for the cooldown duration. |
+| `server.upstream_stall_cooldown_seconds` | `180` | Cooldown duration (seconds) applied when the stall circuit breaker threshold is exceeded. Separate from `provider_cooldown_seconds` (Tier 2 cooldown). |
 
 The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
 

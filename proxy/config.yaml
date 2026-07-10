@@ -312,8 +312,26 @@ server:
   # for the next chunk before detecting a stall, closing the connection,
   # and retrying with bounded exponential backoff.
   # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
-  # Default: 60 seconds.
-  upstream_idle_timeout_seconds: 60
+  # Reduced from 60s to 30s for faster stall detection (LP-0MRFEXXVC001RYKB).
+  # Operators with long-thinking models may increase this value.
+  # Default: 30 seconds.
+  upstream_idle_timeout_seconds: 30
+
+  # Cross-request stall circuit breaker (LP-0MRFEXXVC001RYKB).
+  # Tracks stall frequency per provider within a sliding time window.
+  # When the stall count exceeds the threshold within the window, the
+  # provider is marked unavailable for the cooldown duration, causing
+  # subsequent requests to skip directly to the next provider.
+  #
+  # This is Tier 3 of the retry system (complementing Tier 1 per-stream
+  # retries and Tier 2 provider cooldown). All keys are optional; defaults
+  # apply silently when absent.
+  # Sliding window duration in seconds. Stalls older than this are ignored.
+  upstream_stall_window_seconds: 300
+  # Stall count threshold within window before triggering cooldown.
+  upstream_stall_threshold: 3
+  # Cooldown duration in seconds for providers exceeding threshold.
+  upstream_stall_cooldown_seconds: 180
 
   # Upstream retry connection timeout (LP-0MRE8FYKV008WOTB).
   # When the proxy retries a stalled upstream connection, this timeout
