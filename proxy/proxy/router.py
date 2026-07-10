@@ -1286,12 +1286,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 llama_log_offset=llama_log_offset,
                             )
 
+                            # Wrap both cm.__aexit__ and client.aclose() with a
+                            # configurable timeout so that an unresponsive upstream
+                            # (llama-server stalled mid-stream) does not block the
+                            # generator cleanup, which would prevent session counter
+                            # and scheduler slot release (LP-0MRE7CMVZ002D2QU).
+                            disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
                             try:
-                                await cm.__aexit__(None, None, None)
-                            except Exception:
+                                await asyncio.wait_for(
+                                    cm.__aexit__(None, None, None),
+                                    timeout=disconnect_cleanup_timeout,
+                                )
+                            except (asyncio.TimeoutError, Exception):
                                 pass
                             try:
-                                disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (asyncio.TimeoutError, Exception):
                                 pass
