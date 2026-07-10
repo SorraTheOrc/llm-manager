@@ -505,7 +505,10 @@ async def _handle_remote_streaming(
                         headers=headers,
                         content=body,
                     )
-                    _current_response = await _current_cm.__aenter__()
+                    _current_response = await asyncio.wait_for(
+                        _current_cm.__aenter__(),
+                        timeout=upstream_idle_timeout_seconds,
+                    )
                     _retry_upstream_status = _current_response.status_code
                     _retry_upstream_ct = _current_response.headers.get("content-type", "")
 
