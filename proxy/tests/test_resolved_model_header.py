@@ -762,3 +762,142 @@ async def test_proxy_with_fallback_uses_provider_field(monkeypatch):
     assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
     assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash-free", \
         f"Expected opencode/deepseek-v4-flash-free, got {headers['X-Resolved-Model']}"
+
+
+# ===================================================================
+# Provider attribution headers (LP-0MRE8GHNG003R8YX)
+# ===================================================================
+
+
+def test_add_provider_header_uses_set_not_append():
+    """_add_provider_header sets the header (not appends) to prevent
+    duplicate X-Provider header values on fallback responses.
+    """
+    from proxy.provider import _add_provider_header
+    from fastapi import Response as FastAPIResponse
+
+    resp = FastAPIResponse(status_code=200)
+    # First call should set the header
+    _add_provider_header(resp, "provider-a")
+    assert resp.headers["X-Provider"] == "provider-a"
+
+    # Second call with different provider should OVERWRITE (not append)
+    _add_provider_header(resp, "provider-b")
+    assert resp.headers["X-Provider"] == "provider-b", (
+        "Second provider should overwrite, not append"
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_attribution_headers_forwarded():
+    """attribution_headers from provider config are forwarded to upstream."""
+    import proxy.proxy_remote as pr
+
+    mock_req = MagicMock(spec=Request)
+    mock_req.method = "POST"
+    mock_req.url.path = "/v1/chat/completions"
+    mock_req.headers = {"content-type": "application/json"}
+    mock_req.body = AsyncMock(return_value=b'{"model":"test","messages":[]}')
+
+    model_config = {
+        "endpoint": "https://api.example.com/v1",
+        "type": "remote",
+        "name": "test-provider",
+        "provider": "opencode",
+        "attribution_headers": {
+            "HTTP-Referer": "https://myapp.com",
+            "X-OpenRouter-Title": "My App",
+        },
+    }
+
+    captured_headers = {}
+    mock_client = MagicMock()
+    async def _capture_post(url, **kwargs):
+        captured_headers.update(kwargs.get("headers", {}))
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.content = b'{"ok":true}'
+        return resp
+    mock_client.post = AsyncMock(side_effect=_capture_post)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(pr, "_srv") as mock_srv:
+        mock_srv.return_value.config = {"server": {}}
+        mock_srv.return_value.logger = MagicMock()
+        mock_srv.return_value.current_model = "test"
+
+        with patch.object(pr, "normalize_upstream_request_headers", return_value=dict(mock_req.headers)):
+            with patch.object(pr, "log_request"):
+                with patch.object(pr, "log_response"):
+                    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=mock_client):
+                        await pr.proxy_to_remote(
+                            request=mock_req,
+                            path="v1/chat/completions",
+                            model_config=model_config,
+                        )
+
+    # Verify attribution headers are present in forwarded request
+    header_keys_lower = {k.lower(): k for k in captured_headers.keys()}
+    assert "http-referer" in header_keys_lower, (
+        f"HTTP-Referer attribution header missing from: {list(captured_headers.keys())}"
+    )
+    assert "x-openrouter-title" in header_keys_lower, (
+        f"X-OpenRouter-Title attribution header missing from: {list(captured_headers.keys())}"
+    )
+    actual_key = header_keys_lower["http-referer"]
+    assert captured_headers[actual_key] == "https://myapp.com"
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_no_attribution_headers_by_default():
+    """When attribution_headers is not set, no extra headers are sent."""
+    import proxy.proxy_remote as pr
+
+    mock_req = MagicMock(spec=Request)
+    mock_req.method = "POST"
+    mock_req.url.path = "/v1/chat/completions"
+    mock_req.headers = {"content-type": "application/json"}
+    mock_req.body = AsyncMock(return_value=b'{"model":"test","messages":[]}')
+
+    model_config = {
+        "endpoint": "https://api.example.com/v1",
+        "type": "remote",
+        "name": "test-provider",
+        "provider": "opencode",
+        # No attribution_headers
+    }
+
+    captured_headers = {}
+    mock_client = MagicMock()
+    async def _capture_post(url, **kwargs):
+        captured_headers.update(kwargs.get("headers", {}))
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.content = b'{"ok":true}'
+        return resp
+    mock_client.post = AsyncMock(side_effect=_capture_post)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(pr, "_srv") as mock_srv:
+        mock_srv.return_value.config = {"server": {}}
+        mock_srv.return_value.logger = MagicMock()
+        mock_srv.return_value.current_model = "test"
+
+        with patch.object(pr, "normalize_upstream_request_headers", return_value=dict(mock_req.headers)):
+            with patch.object(pr, "log_request"):
+                with patch.object(pr, "log_response"):
+                    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=mock_client):
+                        await pr.proxy_to_remote(
+                            request=mock_req,
+                            path="v1/chat/completions",
+                            model_config=model_config,
+                        )
+
+    # Verify no unexpected attribution headers
+    header_keys_lower = {k.lower() for k in captured_headers.keys()}
+    assert "http-referer" not in header_keys_lower, "HTTP-Referer should not be sent by default"
+    assert "x-openrouter-title" not in header_keys_lower, "X-OpenRouter-Title should not be sent by default"

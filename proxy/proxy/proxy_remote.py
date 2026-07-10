@@ -213,6 +213,13 @@ async def proxy_to_remote(
     custom_headers = model_config.get("headers", {})
     headers.update(custom_headers)
 
+    # Add provider attribution headers from config (LP-0MRE8GHNG003R8YX)
+    # Allows operators to forward provider-specific headers (e.g.,
+    # HTTP-Referer, X-OpenRouter-Title for OpenRouter billing).
+    attribution_headers = model_config.get("attribution_headers", {})
+    if attribution_headers and isinstance(attribution_headers, dict):
+        headers.update(attribution_headers)
+
     body_json = json.loads(body) if body else {}
     if not isinstance(body_json, dict):
         body_json = {}

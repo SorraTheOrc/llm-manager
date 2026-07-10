@@ -615,8 +615,11 @@ def _response_body_text(response: Response) -> str:
 
 
 def _add_provider_header(response: Response, provider_name: str) -> Response:
-    """Add X-Provider header to a response."""
-    response.headers.append("X-Provider", provider_name)
+    """Add X-Provider header to a response.
+
+    Uses set (not append) to prevent duplicate headers on fallback responses.
+    """
+    response.headers["X-Provider"] = provider_name
     return response
 
 
