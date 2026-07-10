@@ -183,19 +183,26 @@ async def proxy_to_remote(
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
 
+    # Determine whether to forward session affinity headers (LP-0MRE8GD1H0028CGN).
+    # Default: forward (True) to maintain session locality for upstream providers
+    # that support it. Set forward_session_headers: false on a provider config
+    # to opt out for incompatible upstreams.
+    _forward_session_headers = model_config.get("forward_session_headers", True)
+    if _forward_session_headers is None:
+        _forward_session_headers = True
+
     # Remove local/proxy auth/session headers before forwarding.
     # In particular, prevent duplicate Authorization variants
     # (e.g. "authorization" + "Authorization") which can trigger
     # Cloudflare 400 Bad Request on upstream.
+    # Session affinity headers are stripped only when forward_session_headers
+    # is False (or absent with backward-compatible default).
+    _session_header_keys = {"x-session-id", "x-client-request-id", "x-session-affinity", "session_id"}
     for hk in list(headers.keys()):
         hkl = str(hk).lower()
-        if hkl in {
-            "authorization",
-            "x-session-id",
-            "x-client-request-id",
-            "x-session-affinity",
-            "session_id",
-        }:
+        if hkl == "authorization":
+            headers.pop(hk, None)
+        elif not _forward_session_headers and hkl in _session_header_keys:
             headers.pop(hk, None)
 
     # Add API key
