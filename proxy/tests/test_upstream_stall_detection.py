@@ -654,7 +654,12 @@ async def test_retry_connection_timeout_fires_before_httpx_timeout(mock_request)
                 with patch("proxy.proxy_remote.log_response"):
                     with patch("proxy.proxy_remote.log_request"):
                         with patch("proxy.proxy_remote._srv") as mock_srv:
-                            mock_srv.return_value.config = {}
+                            mock_srv.return_value.config = {
+                                "server": {
+                                    "upstream_retry_base_delay_seconds": 1.0,
+                                    "upstream_retry_max_delay_seconds": 4.0,
+                                }
+                            }
                             mock_srv.return_value.logger = MagicMock()
 
                             # Time the execution
@@ -758,4 +763,89 @@ async def test_retry_connection_uses_new_config_key(mock_request):
     last_chunk = collected[-1].decode("utf-8", errors="replace")
     assert '"finish_reason":"error"' in last_chunk.replace(" ", ""), (
         f"Last chunk should have finish_reason: error, got: {last_chunk[:200]}"
+    )
+
+
+# ===================================================================
+# AC for upstream_retry_* config keys (LP-0MRE8G94H005ZBLV)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_retry_config_keys_are_used(mock_request):
+    """The retry config keys (upstream_retry_max_attempts,
+    upstream_retry_base_delay_seconds, upstream_retry_max_delay_seconds)
+    are read from server config and used instead of hardcoded defaults.
+
+    AC: New config keys drive retry behavior.
+
+    Uses a custom config with faster retry timing to verify the
+    config values are actually read and applied.
+    """
+    # First attempt yields one chunk then hangs
+    first_chunks = [
+        b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
+    ]
+    first_resp = _make_mock_response(
+        status_code=200,
+        aiter_chunks=first_chunks,
+        hang_after=True,
+    )
+
+    # Retry __aenter__ hangs forever
+    hanging_cm = MagicMock()
+    hanging_cm.__aenter__ = AsyncMock(side_effect=asyncio.Event().wait)
+    hanging_cm.__aexit__ = AsyncMock(return_value=None)
+
+    cm1 = MagicMock()
+    cm1.__aenter__ = AsyncMock(return_value=first_resp)
+    cm1.__aexit__ = AsyncMock(return_value=None)
+
+    client_instance = MagicMock(spec=httpx.AsyncClient)
+    # Use max_attempts=2 (from config), so only 1 retry
+    client_instance.stream = MagicMock(side_effect=[cm1, hanging_cm])
+    client_instance.aclose = AsyncMock(return_value=None)
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client_instance):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        with patch("proxy.proxy_remote._srv") as mock_srv:
+                            mock_srv.return_value.config = {
+                                "server": {
+                                    "upstream_retry_max_attempts": 2,
+                                    "upstream_retry_base_delay_seconds": 0.01,
+                                    "upstream_retry_max_delay_seconds": 0.02,
+                                }
+                            }
+                            mock_srv.return_value.logger = MagicMock()
+
+                            result = await _handle_remote_streaming(
+                                request=mock_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(300.0),
+                                upstream_idle_timeout_seconds=0.05,
+                                upstream_retry_connect_timeout_seconds=0.05,
+                            )
+
+                            collected = [chunk async for chunk in result.body_iterator]
+
+    assert isinstance(result, StreamingResponse)
+    assert len(collected) >= 1, "Should have yielded at least one chunk"
+
+    # With max_attempts=2 (initial + 1 retry), should exhaust quickly
+    # and yield finish_reason: error
+    last_chunk = collected[-1].decode("utf-8", errors="replace")
+    assert '"finish_reason":"error"' in last_chunk.replace(" ", ""), (
+        f"Last chunk should have finish_reason: error, got: {last_chunk[:200]}"
+    )
+    # stream() should be called 2 times (initial + 1 retry)
+    assert client_instance.stream.call_count == 2, (
+        f"Expected 2 stream() calls (initial + 1 retry), "
+        f"got {client_instance.stream.call_count}"
     )

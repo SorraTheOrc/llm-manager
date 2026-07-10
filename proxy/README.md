@@ -704,6 +704,9 @@ The proxy uses two separate timeout values for upstream remote connections:
 |-----------|---------|-------------|
 | `server.upstream_idle_timeout_seconds` | `60` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. |
 | `server.upstream_retry_connect_timeout_seconds` | `30` | Timeout for establishing a retry connection after a stall. Decoupled from the idle timeout so operators can tune retry connection timeouts independently (typically shorter). |
+| `server.upstream_retry_max_attempts` | `3` | Maximum number of retry attempts (initial attempt + retries) for a stalled upstream stream. Aligned with Pi's default maxRetries=3. |
+| `server.upstream_retry_base_delay_seconds` | `2.0` | Base delay for exponential backoff between retries. The actual delay is `min(base_delay * 2^attempt, max_delay)`. Aligned with Pi's default maxRetryDelayMs=60000. |
+| `server.upstream_retry_max_delay_seconds` | `60.0` | Maximum delay between retries (cap on exponential backoff). |
 
 The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
 
@@ -722,6 +725,8 @@ Configuration is under `server.remote_http_client`:
 | `server.remote_http_client.keepalive_seconds` | `60` | Time in seconds before an idle keepalive connection is closed. |
 
 The pool is initialized at server startup and closed on shutdown. Per-request adaptive timeouts (see Adaptive Timeouts) still apply via the `timeout` parameter passed to each request, independent of the pool's connection-level timeouts.
+
+Retry behavior uses bounded exponential backoff: `delay = min(base_delay * 2^attempt, max_delay)`. After all retry attempts are exhausted, the provider-level cooldown (see Provider Fallback) applies separately, preventing immediate retry by subsequent requests.
 
 ### Development Mode
 

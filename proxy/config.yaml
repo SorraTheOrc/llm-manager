@@ -339,6 +339,15 @@ server:
     # Time in seconds before an idle keepalive connection is closed.
     keepalive_seconds: 60
 
+  # Upstream retry configuration (LP-0MRE8G94H005ZBLV).
+  # Controls per-stream retry behavior for remote upstream connections.
+  # Aligned with Pi's default retry settings (maxRetries=3, maxRetryDelayMs=60000).
+  # Note: these are per-stream retries; after they exhaust, the provider-level
+  # cooldown in provider.py applies separately.
+  upstream_retry_max_attempts: 3
+  upstream_retry_base_delay_seconds: 2.0
+  upstream_retry_max_delay_seconds: 60.0
+
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
   # emits {"type":"heartbeat"} events every N seconds to keep the client

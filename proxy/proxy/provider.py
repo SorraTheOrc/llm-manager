@@ -40,6 +40,35 @@ _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
 # ---------------------------------------------------------------------------
+# Two-tier retry system (LP-0MRE8G94H005ZBLV)
+#
+# The proxy has two layers of retry for remote upstream requests:
+#
+# Tier 1 — Per-stream retries (proxy_remote.py:_handle_remote_streaming)
+#   - Fires on upstream stall (idle timeout) or httpx ReadTimeout
+#   - Bounded exponential backoff: base_delay * 2^attempt, capped at max_delay
+#   - Configurable via server.upstream_retry_* config keys
+#   - After max_attempts exhausted, yields finish_reason:error and the
+#     caller (provider.py fallback chain) routes to the next provider
+#   - Total max wait time approximates: sum of capped backoff delays
+#
+# Tier 2 — Provider-level cooldown (provider.py)
+#   - Applied after a provider fails (Tier 1 exhausted or other failure)
+#   - Provider is marked unavailable for cooldown_seconds
+#   - Uses its own exponential backoff via _provider_failure_count
+#   - Configurable via server.provider_cooldown_seconds
+#
+# Interaction:
+#   Tier 1 retries fire first for streaming connections that stall.
+#   If Tier 1 exhausts (max retries reached), the stream falls through
+#   to the fallback provider chain (provider.py). The failed provider
+#   is then marked in cooldown (Tier 2) for the configured duration,
+#   preventing immediate retry by subsequent requests.
+#   For non-streaming errors (e.g., HTTP 4xx/5xx), Tier 1 is bypassed
+#   and Tier 2 cooldown applies directly.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Cache-invalidation state for smart routing (LP-0MRCSSBTM002NK3B)
 # ---------------------------------------------------------------------------
 

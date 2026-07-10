@@ -368,9 +368,31 @@ async def _handle_remote_streaming(
         except Exception:
             upstream_retry_connect_timeout_seconds = 30.0
 
-    max_retries = 3
-    retry_base_delay = 1.0
-    retry_max_delay = 4.0
+    # Read retry config from server settings (LP-0MRE8G94H005ZBLV)
+    try:
+        max_retries = int(
+            _srv().config.get("server", {}).get(
+                "upstream_retry_max_attempts", 3
+            ) or 3
+        )
+    except Exception:
+        max_retries = 3
+    try:
+        retry_base_delay = float(
+            _srv().config.get("server", {}).get(
+                "upstream_retry_base_delay_seconds", 2.0
+            ) or 2.0
+        )
+    except Exception:
+        retry_base_delay = 2.0
+    try:
+        retry_max_delay = float(
+            _srv().config.get("server", {}).get(
+                "upstream_retry_max_delay_seconds", 60.0
+            ) or 60.0
+        )
+    except Exception:
+        retry_max_delay = 60.0
 
     # We need to manage client/context manager lifecycle for retries.
     # Use the shared pool client or create a fallback if unavailable.
