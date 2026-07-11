@@ -596,3 +596,83 @@ async def release_lease(request: Request):
         )
 
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# /v1/audio/speech  —  TTS (Speech Synthesis)
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/audio/speech")
+async def create_speech(request: Request):
+    """Generate speech from text using the local TTS server backend.
+
+    OpenAI-compatible endpoint that forwards requests to the qwentts.cpp
+    ``tts-server`` (which should be running alongside the proxy).
+
+    Request body (JSON)::
+
+        {
+            "model": "qwen3-tts",
+            "input": "Text to convert to speech",
+            "voice": "default",
+            "response_format": "wav"
+        }
+
+    Returns audio content with ``Content-Type: audio/wav`` on success.
+    Returns ``400 Bad Request`` for invalid/missing parameters.
+    Returns ``502 Bad Gateway`` when the tts-server is unreachable.
+    """
+    srv = _srv()
+    server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+
+    # Parse request body
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Validate required parameters
+    model = body.get("model")
+    input_text = body.get("input")
+
+    if not model or not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="model is required and must be a string")
+
+    if not isinstance(input_text, str) or not input_text.strip():
+        raise HTTPException(status_code=400, detail="input is required and must be a non-empty string")
+
+    # Optional parameters with defaults
+    voice = body.get("voice", "default")
+    response_format = body.get("response_format", "wav")
+
+    # Input length guard
+    if len(input_text) > 10000:
+        raise HTTPException(status_code=400, detail="input exceeds maximum length of 10000 characters")
+
+    # Build tts-server URL from config
+    tts_host = server_cfg.get("tts_server_host", "localhost")
+    tts_port = server_cfg.get("tts_server_port", 8081)
+    tts_url = f"http://{tts_host}:{tts_port}/v1/audio/speech"
+
+    # Forward request to tts-server
+    forward_body = {
+        "model": model,
+        "input": input_text,
+        "voice": voice,
+        "response_format": response_format,
+    }
+
+    try:
+        client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        if getattr(client, "__aenter__", None):
+            async with client as c:
+                resp = await c.post(tts_url, json=forward_body, timeout=30.0)
+        else:
+            resp = await client.post(tts_url, json=forward_body, timeout=30.0)
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        logger.error("TTS server unreachable at %s: %s", tts_url, e)
+        raise HTTPException(status_code=502, detail=f"TTS server unreachable: {e}")
+
+    # Return the audio response from tts-server
+    content_type = resp.headers.get("content-type", "audio/wav")
+    return Response(content=resp.content, media_type=content_type)
