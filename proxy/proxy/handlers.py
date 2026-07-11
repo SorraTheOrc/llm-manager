@@ -267,15 +267,8 @@ async def get_llama_local_status():
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
             llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
             client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-            slots_url = f"http://localhost:{llama_port}/slots"
-            slots_resp = await asyncio.wait_for(client.get(slots_url), timeout=2.0)
-            if slots_resp.status_code == 200:
-                slots_data = slots_resp.json()
-                if isinstance(slots_data, list):
-                    total_slots = len(slots_data)
-                    available_slots = sum(
-                        1 for s in slots_data if not s.get("is_processing", True)
-                    )
+            from proxy.observability import _query_slots
+            available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0)
         except Exception:
             # slots query is best-effort; default to 0 on failure
             pass

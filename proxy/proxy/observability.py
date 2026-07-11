@@ -7,6 +7,23 @@ exception classification for observability.
 
 Uses a lazy server import (_srv()) to access module-level state without
 circular import issues.
+
+Shared HTTP helpers for llama-server queries
+--------------------------------------------
+
+The module exposes several helpers that were extracted from the duplicated
+HTTP JSON parsing and URL building patterns found in both
+``query_llama_status()`` (here) and ``get_llama_local_status()``
+(``handlers.py``):
+
+- ``_safe_parse_json_response(response)`` — Defensive JSON parsing with
+  async/sync ``.json()`` → ``.text`` → ``json.loads()`` fallback.
+- ``_build_llama_url(llama_port, endpoint)`` — URL builder for llama-server
+  endpoints.
+- ``_query_slots(client, llama_port, timeout)`` — Query the ``/slots``
+  endpoint, returning ``(available_slots, total_slots)``.
+
+See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
 
 import asyncio
@@ -62,6 +79,75 @@ def _classify_backend_exception(exc: Exception) -> str:
     if isinstance(exc, (httpx.ReadTimeout, httpx.TimeoutException)):
         return "timeout_failures"
     return "other_failures"
+
+
+# ===================================================================
+# Shared HTTP helpers for llama-server queries
+# ===================================================================
+
+async def _safe_parse_json_response(response) -> Any:
+    """Parse JSON from an HTTP response, handling async/sync variants and text fallback.
+
+    Uses the pattern from ``query_llama_status()``:
+    ``.json()`` (async/sync) → ``.text`` (async/sync) → ``json.loads()``
+    with full exception safety.
+
+    Returns the parsed data (dict, list, etc.) or ``None`` if all parse paths
+    fail.
+    """
+    data = None
+    if hasattr(response, "json"):
+        try:
+            maybe = response.json()
+            data = await maybe if asyncio.iscoroutine(maybe) else maybe
+        except Exception:
+            data = None
+    if data is None and hasattr(response, "text"):
+        try:
+            txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
+            data = json.loads(txt)
+        except Exception:
+            data = None
+    return data
+
+
+def _build_llama_url(llama_port: int, endpoint: str) -> str:
+    """Build a URL for a llama-server endpoint.
+
+    Args:
+        llama_port: The port llama-server is listening on.
+        endpoint: The API path (e.g. ``"/slots"``). A leading slash is
+            added if missing.
+    """
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+    return f"http://localhost:{llama_port}{endpoint}"
+
+
+async def _query_slots(client, llama_port: int, timeout: float = 2.0) -> tuple:
+    """Query the llama-server ``/slots`` endpoint.
+
+    Returns a ``(available_slots, total_slots)`` tuple.  Both default to
+    ``0`` on any failure (HTTP error, connection error, timeout, or
+    unexpected response shape).
+
+    The 2.0-second default timeout matches the original inline query in
+    ``get_llama_local_status()``.
+    """
+    try:
+        url = _build_llama_url(llama_port, "/slots")
+        slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
+        if slots_resp.status_code == 200:
+            slots_data = await _safe_parse_json_response(slots_resp)
+            if isinstance(slots_data, list):
+                total_slots = len(slots_data)
+                available_slots = sum(
+                    1 for s in slots_data if not s.get("is_processing", True)
+                )
+                return available_slots, total_slots
+    except Exception:
+        pass
+    return 0, 0
 
 
 # ===================================================================
@@ -349,7 +435,7 @@ async def query_llama_status() -> dict:
             found_kv = None
             for endpoint in endpoints:
                 try:
-                    url = f"http://localhost:{llama_port}{endpoint}"
+                    url = _build_llama_url(llama_port, endpoint)
                     resp = await client.get(url, timeout=5.0)
                     if getattr(resp, 'status_code', None) == 200:
                         # remember endpoint
@@ -358,19 +444,7 @@ async def query_llama_status() -> dict:
                         srv._llama_status_endpoint_failures.pop(endpoint, None)
 
                         # attempt to parse JSON/text for n_ctx / kv fields
-                        data = None
-                        if hasattr(resp, 'json'):
-                            try:
-                                maybe = resp.json()
-                                data = await maybe if asyncio.iscoroutine(maybe) else maybe
-                            except Exception:
-                                data = None
-                        if data is None and hasattr(resp, 'text'):
-                            try:
-                                txt = resp.text if not asyncio.iscoroutine(resp.text) else await resp.text
-                                data = json.loads(txt)
-                            except Exception:
-                                data = None
+                        data = await _safe_parse_json_response(resp)
 
                         if isinstance(data, dict):
                             if found_n is None:
@@ -406,22 +480,10 @@ async def query_llama_status() -> dict:
         # If we have a cached endpoint, try it first
         if srv._llama_status_endpoint_cache:
             try:
-                url = f"http://localhost:{llama_port}{srv._llama_status_endpoint_cache}"
+                url = _build_llama_url(llama_port, srv._llama_status_endpoint_cache)
                 response = await client.get(url, timeout=5.0)
                 if getattr(response, 'status_code', None) == 200:
-                    data = None
-                    if hasattr(response, 'json'):
-                        try:
-                            maybe = response.json()
-                            data = await maybe if asyncio.iscoroutine(maybe) else maybe
-                        except Exception:
-                            data = None
-                    if data is None and hasattr(response, 'text'):
-                        try:
-                            txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
-                            data = json.loads(txt)
-                        except Exception:
-                            data = None
+                    data = await _safe_parse_json_response(response)
 
                     if isinstance(data, dict):
                         if result["n_ctx"] is None:
@@ -442,22 +504,10 @@ async def query_llama_status() -> dict:
 
         # As a fallback, check /props to detect router mode
         try:
-            props_url = f"http://localhost:{llama_port}/props"
+            props_url = _build_llama_url(llama_port, "/props")
             response = await client.get(props_url, timeout=5.0)
             if getattr(response, "status_code", None) == 200:
-                props = None
-                if hasattr(response, "json"):
-                    try:
-                        maybe = response.json()
-                        props = await maybe if asyncio.iscoroutine(maybe) else maybe
-                    except Exception:
-                        props = None
-                if props is None and hasattr(response, "text"):
-                    try:
-                        txt = response.text if not asyncio.iscoroutine(response.text) else await response.text
-                        props = json.loads(txt)
-                    except Exception:
-                        props = None
+                props = await _safe_parse_json_response(response)
                 if isinstance(props, dict):
                     result["router_mode"] = True
         except Exception:
