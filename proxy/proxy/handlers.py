@@ -550,3 +550,56 @@ async def reload_config():
         return {"status": "success", "message": "Configuration reloaded"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# /v1/leases/release  —  Proactive lease release (LP-0MRFOF7XO003T7CT)
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/leases/release")
+async def release_lease(request: Request):
+    """Explicitly release the dispatch lease for the caller's session.
+
+    Accepts a JSON body with a ``session_id`` field and removes the
+    corresponding dispatch record from ``local_dispatch_records``,
+    allowing other sessions to acquire the local backend immediately.
+
+    The endpoint is idempotent: calling it with a session_id that has
+    no matching lease returns ``200 OK`` with ``{"status": "ok"}``.
+
+    Returns ``400 Bad Request`` when ``session_id`` is missing, empty,
+    or ``null``.
+    """
+    srv = _srv()
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON body",
+        )
+
+    session_id = body.get("session_id")
+    if not session_id or not isinstance(session_id, str) or not session_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="session_id is required",
+        )
+
+    session_id = session_id.strip()
+
+    try:
+        from proxy.router_helpers import _release_local_dispatch
+        await _release_local_dispatch(srv, session_id)
+    except Exception as e:
+        logger.exception(
+            "Failed to release dispatch lease for session %s",
+            session_id[:8] if session_id else "unknown",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+    return {"status": "ok"}

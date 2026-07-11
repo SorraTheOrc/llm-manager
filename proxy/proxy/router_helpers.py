@@ -693,6 +693,36 @@ async def _try_acquire_local_dispatch(
         return (True, None, 0, 1.0)
 
 
+async def _release_local_dispatch(srv, session_id: str) -> bool:
+    """Explicitly release the dispatch lease for *session_id*.
+
+    Removes the dispatch record from ``local_dispatch_records`` under
+    the existing lock. Returns ``True`` if a record was removed, or
+    ``False`` if no matching record existed (idempotent no-op).
+
+    This is the programmatic equivalent of what the
+    ``POST /v1/leases/release`` endpoint provides, allowing callers
+    (e.g. other internal components) to proactively release a lease
+    without going through the HTTP layer.
+    """
+    removed = False
+    try:
+        async with srv.local_dispatch_records_lock:
+            if session_id in srv.local_dispatch_records:
+                del srv.local_dispatch_records[session_id]
+                removed = True
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=explicit_release",
+                        session_id[:8] if session_id else "unknown",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        raise
+    return removed
+
+
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
