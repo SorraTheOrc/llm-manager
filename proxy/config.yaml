@@ -165,6 +165,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
+        forward_session_headers: false
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -202,6 +203,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
+        forward_session_headers: false
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
