@@ -569,6 +569,201 @@ async def test_remote_model_loading_503_does_not_poison_provider_cooldown(single
 
 
 # ===================================================================
+# FreeUsageLimitError tests
+# ===================================================================
+
+
+def test_is_free_usage_limit_error_detection():
+    """_is_free_usage_limit_error should detect FreeUsageLimitError in 429 responses."""
+    # FreeUsageLimitError response body (observed upstream format)
+    body = json.dumps({
+        "type": "error",
+        "error": {
+            "type": "FreeUsageLimitError",
+            "message": "Rate limit exceeded. Please try again later.",
+        },
+        "metadata": {},
+    })
+    resp = Response(status_code=429, content=body.encode())
+    assert provider._is_free_usage_limit_error(resp, body) is True
+
+    # Non-429 status should not match
+    resp_503 = Response(status_code=503, content=body.encode())
+    assert provider._is_free_usage_limit_error(resp_503, body) is False
+
+    # 429 without FreeUsageLimitError body should not match
+    body_other = json.dumps({"error": {"type": "rate_limit_error"}})
+    resp_other = Response(status_code=429, content=body_other.encode())
+    assert provider._is_free_usage_limit_error(resp_other, body_other) is False
+
+    # Empty body should not match
+    resp_empty = Response(status_code=429, content=b"")
+    assert provider._is_free_usage_limit_error(resp_empty, "") is False
+
+    # Model_loading error should not match
+    body_ml = json.dumps({"error": {"type": "model_loading", "code": "model_loading"}})
+    resp_ml = Response(status_code=503, content=body_ml.encode())
+    assert provider._is_free_usage_limit_error(resp_ml, body_ml) is False
+
+    # Case insensitive match
+    body_upper = json.dumps({"error": {"type": "FREEUSAGELIMITERROR"}})
+    resp_upper = Response(status_code=429, content=body_upper.encode())
+    assert provider._is_free_usage_limit_error(resp_upper, body_upper) is True
+
+    # Nested structure: the upstream wraps in {"type": "error", "error": {...}}
+    body_nested = json.dumps({
+        "type": "error",
+        "error": {"type": "FreeUsageLimitError", "message": "Quota exceeded"},
+    })
+    resp_nested = Response(status_code=429, content=body_nested.encode())
+    assert provider._is_free_usage_limit_error(resp_nested, body_nested) is True
+
+    # Missing error key should not match
+    body_no_error = json.dumps({"type": "error"})
+    resp_no_error = Response(status_code=429, content=body_no_error.encode())
+    assert provider._is_free_usage_limit_error(resp_no_error, body_no_error) is False
+
+    # Invalid JSON should not match
+    resp_invalid = Response(status_code=429, content=b"not-json")
+    assert provider._is_free_usage_limit_error(resp_invalid, "not-json") is False
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_free_usage_limit_uses_3h_cooldown(sample_model_config):
+    """FreeUsageLimitError should apply a 3-hour cooldown and skip to next provider."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First provider returns FreeUsageLimitError
+            return Response(
+                status_code=429,
+                content=json.dumps({
+                    "type": "error",
+                    "error": {
+                        "type": "FreeUsageLimitError",
+                        "message": "Rate limit exceeded. Please try again later.",
+                    },
+                    "metadata": {},
+                }).encode("utf-8"),
+                media_type="application/json",
+            )
+        # Second provider succeeds
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2  # First failed with FreeUsageLimitError, second succeeded
+
+    # The first provider should have a 3-hour cooldown
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("remote-primary")
+    assert expiry is not None, "remote-primary should have a cooldown expiry"
+    cooldown_seconds = expiry - now
+    assert cooldown_seconds >= 10700, (
+        f"Expected ~10800s cooldown, got {cooldown_seconds:.1f}s"
+    )
+    assert cooldown_seconds <= 10900, (
+        f"Cooldown too large: {cooldown_seconds:.1f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_free_usage_limit_does_not_affect_other_errors(sample_model_config):
+    """Non-FreeUsageLimitError 429 should use normal cooldown, not 3h."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return Response(
+            status_code=429,
+            content=json.dumps({
+                "error": {"type": "rate_limit_error", "message": "Too fast"},
+            }).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    # 429 rates are returned as-is when all providers hit the same error
+    assert result.status_code == 429
+
+    # The provider should have a normal (short) cooldown, not 3h
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("remote-primary")
+    assert expiry is not None
+    cooldown_seconds = expiry - now
+    assert cooldown_seconds < 100, (
+        f"Expected short cooldown (<100s) for non-FreeUsageLimitError, got {cooldown_seconds:.1f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_free_usage_limit_in_proxy_with_fallback(sample_model_config):
+    """FreeUsageLimitError in proxy_with_fallback should also apply 3h cooldown."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First provider returns FreeUsageLimitError
+            return Response(
+                status_code=429,
+                content=json.dumps({
+                    "type": "error",
+                    "error": {
+                        "type": "FreeUsageLimitError",
+                        "message": "Rate limit exceeded",
+                    },
+                    "metadata": {},
+                }).encode("utf-8"),
+                media_type="application/json",
+            )
+        # Second provider succeeds
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", sample_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2  # First FreeUsageLimitError, second succeeds
+
+    # remote-primary should have 3h cooldown
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("remote-primary")
+    assert expiry is not None, "remote-primary should have a cooldown expiry"
+    cooldown_seconds = expiry - now
+    assert cooldown_seconds >= 10700, (
+        f"Expected ~10800s cooldown, got {cooldown_seconds:.1f}s"
+    )
+
+
+# ===================================================================
 # Local-to-remote fallback tests
 # ===================================================================
 

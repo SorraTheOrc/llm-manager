@@ -39,6 +39,11 @@ _provider_failure_count: Dict[str, int] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
+# FreeUsageLimitError cooldown: 3 hours (10800 seconds)
+# Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
+# See LP-0MRGU0I91006ODFD for details.
+_FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+
 # ---------------------------------------------------------------------------
 # Three-tier retry system (LP-0MRE8G94H005ZBLV, LP-0MRFEXXVC001RYKB)
 #
@@ -997,6 +1002,43 @@ def _is_model_loading_response(response: Response, body_text: str) -> bool:
     return False
 
 
+def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
+    """Return True when a 429 response is a FreeUsageLimitError.
+
+    Detects upstream quota-exhaustion responses where the JSON body contains
+    ``error.type = "FreeUsageLimitError"`` (case-insensitive).  When detected,
+    the proxy applies a 3-hour cooldown on the affected provider entry so the
+    fallback chain routes to paid alternatives instead of repeatedly retrying
+    the exhausted free tier.
+
+    Expected upstream format (observed from opencode.ai/zen):
+        HTTP 429
+        Body: {"type": "error", "error": {"type": "FreeUsageLimitError", ...}}
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            err_type = str(error.get("type", "")).strip().lower()
+            if err_type == "freeusagelimiterror":
+                return True
+
+    # Fallback: check raw body text for the error type string
+    lowered_body = (body_text or "").strip().lower()
+    if "freeusagelimiterror" in lowered_body:
+        return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Shared fallback primitives (extracted from proxy_with_remote_fallback and
 # proxy_with_fallback to eliminate duplicated state-machine logic)
@@ -1381,6 +1423,25 @@ async def proxy_with_remote_fallback(
                         status="model_loading",
                         status_code=int(response.status_code),
                         body_snippet=(body_text[:512] if body_text else None),
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
+                # FreeUsageLimitError: apply 3-hour cooldown on affected provider
+                # so the fallback chain routes to paid alternatives instead of
+                # repeatedly retrying the exhausted free tier.
+                if _is_free_usage_limit_error(response, body_text):
+                    fallback_reason = "free_usage_limit"
+                    prev_provider = provider_name
+                    mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="free_usage_limit",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                        cooldown_seconds=_FREE_USAGE_LIMIT_COOLDOWN_SECONDS,
                     )
                     all_slot_exhaustion = False
                     continue
@@ -1877,6 +1938,25 @@ async def proxy_with_fallback(
                             status="http_error_no_cooldown",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
+                    # FreeUsageLimitError: apply 3-hour cooldown on affected provider
+                    # so the fallback chain routes to paid alternatives instead of
+                    # repeatedly retrying the exhausted free tier.
+                    if _is_free_usage_limit_error(response, body_text):
+                        fallback_reason = "free_usage_limit"
+                        prev_provider = provider_name
+                        mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="free_usage_limit",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            cooldown_seconds=_FREE_USAGE_LIMIT_COOLDOWN_SECONDS,
                         )
                         all_slot_exhaustion = False
                         continue
