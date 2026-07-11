@@ -2771,6 +2771,124 @@ async def test_cache_cold_bypass_first_request_after_restart(mixed_model_config)
     )
 
 
+@pytest.mark.asyncio
+async def test_warm_cache_large_context_bypass(mixed_model_config):
+    """Warm cache with very large context should bypass local.
+
+    AC 1 (LP-0MRE4NBQ5009V5BX): When the model's cache is warm and
+    estimated_tokens > warm_cache_threshold, the request should be routed
+    to the next remote provider.
+    """
+    provider._model_cache_cold.clear()
+    # Do NOT mark cache cold — test warm-cache behavior
+
+    large_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
+        b'test message content for token estimation ' * 11000 + \
+        b'"}],"stream":false}'
+    request = _DummyRequest(body=large_body)
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "local_large_context_cold_cache_threshold": 40000,
+        "local_large_context_warm_cache_threshold": 60000,
+    }
+
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-llama")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200, (
+        f"Expected 200, got {result.status_code}: {result.body.decode()}"
+    )
+    # Should have been routed to remote even though cache is warm,
+    # because estimated_tokens > warm_cache_threshold (60K)
+    assert call_log == ["remote-fallback"], (
+        f"Expected remote-provider call for warm-cache large context, got: {call_log}"
+    )
+    assert result.headers.get("X-Provider") == "remote-fallback"
+
+
+@pytest.mark.asyncio
+async def test_warm_cache_moderate_context_routes_local(mixed_model_config):
+    """Warm cache with moderate context should route to local.
+
+    AC 2 (LP-0MRE4NBQ5009V5BX): When the model's cache is warm and
+    estimated_tokens <= warm_cache_threshold, the request should route
+    to local as normal.
+    """
+    provider._model_cache_cold.clear()
+    # Do NOT mark cache cold — test warm-cache behavior
+
+    moderate_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
+        b'test message content ' * 3000 + \
+        b'"}],"stream":false}'
+    request = _DummyRequest(body=moderate_body)
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "local_large_context_cold_cache_threshold": 40000,
+        "local_large_context_warm_cache_threshold": 60000,
+    }
+
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-llama")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200, (
+        f"Expected 200, got {result.status_code}: {result.body.decode()}"
+    )
+    # Should have been routed to local because moderate context
+    # is below warm_cache_threshold (60K)
+    assert call_log == ["local-llama"], (
+        f"Expected local provider call, got: {call_log}"
+    )
+    assert result.headers.get("X-Provider") == "local-llama"
+
+
 # ===================================================================
 # Parity tests for shared fallback primitives
 # ===================================================================

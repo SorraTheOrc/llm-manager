@@ -244,18 +244,46 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         return max(1, total_bytes // 1)
 
 
-def _get_large_context_fallback_threshold(config: dict) -> int:
-    """Read the large-context fallback threshold from config.
+def _get_large_context_cold_cache_threshold(config: dict) -> int:
+    """Read the large-context cold-cache fallback threshold from config.
 
-    Supports both nested (``config["server"]["local_large_context_fallback_threshold"]``)
-    and flat (``config["local_large_context_fallback_threshold"]``) keys for
-    production and test compatibility.
+    Supports both nested and flat config keys for production and test
+    compatibility.  Also supports the legacy key name
+    ``local_large_context_fallback_threshold`` for backward compatibility
+    during the transition period.
 
     Returns 0 when not configured (disabled).
     """
-    val = config.get("local_large_context_fallback_threshold")
+    # New key first (preferred)
+    val = config.get("local_large_context_cold_cache_threshold")
+    if val is None:
+        val = config.get("server", {}).get("local_large_context_cold_cache_threshold")
+    # Fall back to legacy key
+    if val is None:
+        val = config.get("local_large_context_fallback_threshold")
     if val is None:
         val = config.get("server", {}).get("local_large_context_fallback_threshold", 0)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _get_large_context_warm_cache_threshold(config: dict) -> int:
+    """Read the large-context warm-cache bypass threshold from config.
+
+    When the model cache is warm and estimated prompt tokens exceed this
+    value, the local provider is bypassed and the request routes to the
+    next remote provider.  A value of 0 disables warm-cache bypass.
+
+    Defaults to 60000 when not configured.
+
+    Supports both nested and flat config keys for production and test
+    compatibility.
+    """
+    val = config.get("local_large_context_warm_cache_threshold")
+    if val is None:
+        val = config.get("server", {}).get("local_large_context_warm_cache_threshold", 60000)
     try:
         return max(0, int(val or 0))
     except (ValueError, TypeError):
@@ -320,26 +348,31 @@ async def _estimate_effective_prompt_tokens_for_routing(
 def _should_skip_local(
     cache_cold: bool,
     body_json: dict,
-    threshold: int,
+    cold_cache_threshold: int,
+    warm_cache_threshold: int = 0,
     estimated_tokens: Optional[int] = None,
 ) -> bool:
-    """Determine whether a local provider should be skipped due to cold cache.
+    """Determine whether a local provider should be skipped due to large context.
 
-    Local is skipped when ALL of the following are true:
-    - The model's slot cache is cold (invalidated)
-    - The threshold is non-zero (feature is enabled)
-    - The estimated prompt tokens exceed the threshold
+    When the cache is cold (expensive full re-prefill), uses
+    *cold_cache_threshold*.  When the cache is warm (cached prefix, cheaper),
+    uses *warm_cache_threshold*.  A threshold of 0 disables the corresponding
+    bypass.
 
     Args:
         cache_cold: Whether the model's cache is marked as invalidated.
         body_json: The parsed request body.
-        threshold: Token count threshold. 0 means disabled.
+        cold_cache_threshold: Token threshold for cold-cache bypass. 0 = disabled.
+        warm_cache_threshold: Token threshold for warm-cache bypass. 0 means
+            disabled (default).
         estimated_tokens: Optional pre-computed estimate.
 
     Returns:
         True if local should be skipped, False for normal local routing.
     """
-    if not cache_cold or threshold <= 0:
+    # Select the appropriate threshold based on cache state
+    threshold = cold_cache_threshold if cache_cold else warm_cache_threshold
+    if threshold <= 0:
         return False
     if estimated_tokens is None:
         estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
@@ -1557,8 +1590,12 @@ async def proxy_with_fallback(
                 # Smart routing: skip local when cache is cold and request is large
                 # (LP-0MRCSSBTM002NK3B). This avoids expensive full re-prefill of
                 # large contexts when the slot cache is invalidated.
+                # Extended with dual-threshold (LP-0MRE4NBQ5009V5BX): when cache is
+                # warm but the request is extremely large, also bypass local using
+                # the warm-cache threshold.
                 _llama_model = provider_cfg.get("llama_model", "")
-                _threshold = _get_large_context_fallback_threshold(config)
+                _cold_threshold = _get_large_context_cold_cache_threshold(config)
+                _warm_threshold = _get_large_context_warm_cache_threshold(config)
                 _cache_is_cold = is_model_cache_cold(_llama_model)
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
@@ -1566,27 +1603,31 @@ async def proxy_with_fallback(
                 )
                 logger.info(
                     "routing_check provider=%s model=%s cache_cold=%s "
-                    "estimated_tokens=%d threshold=%d messages=%d",
+                    "estimated_tokens=%d cold_threshold=%d warm_threshold=%d messages=%d",
                     provider_name,
                     _llama_model or "unknown",
                     _cache_is_cold,
                     _estimated_tokens,
-                    _threshold,
+                    _cold_threshold,
+                    _warm_threshold,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                 )
                 if _should_skip_local(
                     _cache_is_cold,
                     body_json,
-                    _threshold,
+                    _cold_threshold,
+                    warm_cache_threshold=_warm_threshold,
                     estimated_tokens=_estimated_tokens,
                 ):
                     logger.info(
-                        "cache_cold_bypass provider=%s model=%s estimated_tokens=%d threshold=%d "
+                        "cache_cold_bypass provider=%s model=%s estimated_tokens=%d "
+                        "cold_threshold=%d warm_threshold=%d "
                         "→ skipping local, routing to next remote provider",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
-                        _threshold,
+                        _cold_threshold,
+                        _warm_threshold,
                     )
                     _record_attempt(
                         attempts,
@@ -1594,7 +1635,7 @@ async def proxy_with_fallback(
                         type=provider_type,
                         status="cache_cold_skip",
                         estimated_tokens=_estimated_tokens,
-                        threshold=_threshold,
+                        threshold=_cold_threshold if _cache_is_cold else _warm_threshold,
                     )
                     fallback_reason = "cache_cold_large_context"
                     prev_provider = provider_name

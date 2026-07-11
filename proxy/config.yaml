@@ -257,11 +257,17 @@ server:
   # Falls back to the local values above when not configured.
   llama_remote_request_timeout_base_seconds: 60
   llama_remote_request_timeout_per_token_seconds: 0.015
-  # Large-context fallback threshold (LP-0MRCSSBTM002NK3B).
-  # When the slot cache is invalidated and estimated prompt tokens exceed this
-  # value, local routing is bypassed and the request falls through to the next
-  # remote provider immediately. Set to 0 to disable this behavior.
-  local_large_context_fallback_threshold: 40000
+  # Large-context cold-cache fallback threshold (LP-0MRCSSBTM002NK3B).
+  # When the slot cache is cold (invalidated) and estimated prompt tokens exceed
+  # this value, local routing is bypassed and the request falls through to the
+  # next remote provider immediately. Set to 0 to disable.
+  local_large_context_cold_cache_threshold: 40000
+
+  # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
+  # When the slot cache is warm (cached prefix) but estimated prompt tokens
+  # exceed this value, local routing is bypassed to avoid GPU prefill contention
+  # on very large contexts. Set to 0 to disable. Default: 60000.
+  local_large_context_warm_cache_threshold: 60000
   llama_router_mode: true
   max_concurrent_queries: 16
   # Local-model concurrency limit (LP-0MR5MAJNM005R905).

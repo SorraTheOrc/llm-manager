@@ -242,29 +242,59 @@ class TestEstimatePromptTokensForRouting:
 class TestSmartRoutingThresholdConfig:
     """Tests for the threshold configuration parsing."""
 
-    def test_threshold_disabled_when_zero(self):
-        """Threshold of 0 should disable smart routing."""
-        from proxy.provider import _get_large_context_fallback_threshold
-        config = {"server": {"local_large_context_fallback_threshold": 0}}
-        assert _get_large_context_fallback_threshold(config) == 0
+    def test_cold_cache_threshold_disabled_when_zero(self):
+        """Cold-cache threshold of 0 should disable smart routing."""
+        from proxy.provider import _get_large_context_cold_cache_threshold
+        config = {"server": {"local_large_context_cold_cache_threshold": 0}}
+        assert _get_large_context_cold_cache_threshold(config) == 0
 
-    def test_threshold_disabled_when_absent(self):
-        """Missing threshold config should disable smart routing (returns 0)."""
-        from proxy.provider import _get_large_context_fallback_threshold
+    def test_cold_cache_threshold_disabled_when_absent(self):
+        """Missing cold-cache threshold config should disable smart routing (returns 0)."""
+        from proxy.provider import _get_large_context_cold_cache_threshold
         config = {"server": {}}
-        assert _get_large_context_fallback_threshold(config) == 0
+        assert _get_large_context_cold_cache_threshold(config) == 0
 
-    def test_threshold_at_40000(self):
-        """Threshold of 40000 should be parsed correctly."""
-        from proxy.provider import _get_large_context_fallback_threshold
-        config = {"server": {"local_large_context_fallback_threshold": 40000}}
-        assert _get_large_context_fallback_threshold(config) == 40000
+    def test_cold_cache_threshold_at_40000(self):
+        """Cold-cache threshold of 40000 should be parsed correctly."""
+        from proxy.provider import _get_large_context_cold_cache_threshold
+        config = {"server": {"local_large_context_cold_cache_threshold": 40000}}
+        assert _get_large_context_cold_cache_threshold(config) == 40000
 
-    def test_threshold_flat_config(self):
+    def test_cold_cache_threshold_flat_config(self):
         """Flat (non-nested) config should also work for test compatibility."""
-        from proxy.provider import _get_large_context_fallback_threshold
-        config = {"local_large_context_fallback_threshold": 40000}
-        assert _get_large_context_fallback_threshold(config) == 40000
+        from proxy.provider import _get_large_context_cold_cache_threshold
+        config = {"local_large_context_cold_cache_threshold": 40000}
+        assert _get_large_context_cold_cache_threshold(config) == 40000
+
+    def test_cold_cache_threshold_legacy_key(self):
+        """Legacy key (local_large_context_fallback_threshold) should still work."""
+        from proxy.provider import _get_large_context_cold_cache_threshold
+        config = {"server": {"local_large_context_fallback_threshold": 40000}}
+        assert _get_large_context_cold_cache_threshold(config) == 40000
+
+    def test_warm_cache_threshold_default(self):
+        """Warm-cache threshold should default to 60000."""
+        from proxy.provider import _get_large_context_warm_cache_threshold
+        config = {"server": {}}
+        assert _get_large_context_warm_cache_threshold(config) == 60000
+
+    def test_warm_cache_threshold_explicit(self):
+        """Warm-cache threshold should be parsed correctly when set."""
+        from proxy.provider import _get_large_context_warm_cache_threshold
+        config = {"server": {"local_large_context_warm_cache_threshold": 80000}}
+        assert _get_large_context_warm_cache_threshold(config) == 80000
+
+    def test_warm_cache_threshold_zero_disables(self):
+        """Warm-cache threshold of 0 should disable bypass."""
+        from proxy.provider import _get_large_context_warm_cache_threshold
+        config = {"server": {"local_large_context_warm_cache_threshold": 0}}
+        assert _get_large_context_warm_cache_threshold(config) == 0
+
+    def test_warm_cache_threshold_flat_config(self):
+        """Flat (non-nested) config should work for test compatibility."""
+        from proxy.provider import _get_large_context_warm_cache_threshold
+        config = {"local_large_context_warm_cache_threshold": 50000}
+        assert _get_large_context_warm_cache_threshold(config) == 50000
 
 
 class TestSmartRoutingDecision:
@@ -286,13 +316,50 @@ class TestSmartRoutingDecision:
         should_skip = _should_skip_local(cache_cold, body, threshold)
         assert should_skip is False
 
-    def test_warm_cache_large_request_routes_local(self):
-        """AC 1 & 4: Warm cache + >40K tokens → routes local (normal)."""
+    def test_warm_cache_large_request_routes_local_with_default_warm_threshold(self):
+        """Warm cache + >40K tokens → routes local when warm_cache_threshold not set (default 0 = disabled)."""
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
-        threshold = 40000
+        cold_threshold = 40000
         cache_cold = False
-        should_skip = _should_skip_local(cache_cold, body, threshold)
+        should_skip = _should_skip_local(cache_cold, body, cold_threshold)
+        assert should_skip is False
+
+    def test_warm_cache_large_request_skips_local_with_warm_threshold(self):
+        """AC 1: Warm cache + >60K tokens → skips local when warm_cache_threshold is set."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 10500}]}  # ~63K tokens
+        warm_threshold = 60000
+        cache_cold = False
+        should_skip = _should_skip_local(cache_cold, body, 40000, warm_cache_threshold=warm_threshold)
+        assert should_skip is True
+
+    def test_warm_cache_moderate_request_routes_local_with_warm_threshold(self):
+        """AC 2: Warm cache + <=60K tokens → routes local when warm_cache_threshold is 60000."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
+        warm_threshold = 60000
+        cache_cold = False
+        should_skip = _should_skip_local(cache_cold, body, 40000, warm_cache_threshold=warm_threshold)
+        assert should_skip is False
+
+    def test_warm_cache_disabled_via_zero_threshold(self):
+        """Warm cache + >60K tokens → routes local when warm_cache_threshold=0 (disabled)."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 10500}]}  # ~63K tokens
+        warm_threshold = 0
+        cache_cold = False
+        should_skip = _should_skip_local(cache_cold, body, 40000, warm_cache_threshold=warm_threshold)
+        assert should_skip is False
+
+    def test_warm_cache_exact_threshold_does_not_skip(self):
+        """Warm cache + tokens below 60K → does NOT skip local (must be strictly greater)."""
+        phrase = "test message content for token estimation "
+        # ~57K tokens - safely below 60K threshold (7000 reps ≈ 42K)
+        body = {"messages": [{"role": "user", "content": phrase * 9500}]}
+        warm_threshold = 60000
+        cache_cold = False
+        should_skip = _should_skip_local(cache_cold, body, 40000, warm_cache_threshold=warm_threshold)
         assert should_skip is False
 
     def test_cold_cache_small_request_routes_local(self):
