@@ -240,6 +240,74 @@ INI
 }
 
 # ---------------------------------------------------------------
+# Test: models.ini has [global] section with ngl
+# ---------------------------------------------------------------
+test_global_ngl_from_models_ini() {
+    echo "Test: [global] ngl is parsed from models.ini"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    # Create a test models.ini with [global] section
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[global]
+ngl = 99
+ctx-size = 8192
+slot-save-path = /tmp/slot-cache
+
+[mxbai-embed]
+hf-repo = magicunicorn/mxbai-embed-large-v1-Q8_0-GGUF:Q8_0
+ctx-size = 2048
+INI
+
+    # Use awk to parse [global] ngl
+    local result
+    result=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "global") found=1 }
+    found && /^ngl/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$TESTS_TMPDIR/models.ini")
+
+    [ "$result" = "99" ] && pass "[global] ngl parsed as 99 (got: $result)" || fail "expected [global] ngl=99, got: $result"
+
+    cleanup_tmp
+}
+
+test_global_ngl_defaults_to_99() {
+    echo "Test: Production models.ini [global] ngl is set to 99"
+
+    local result
+    result=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "global") found=1 }
+    found && /^ngl/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$MODELS_INI")
+
+    [ "$result" = "99" ] && pass "Production [global] ngl is 99 (got: $result)" || fail "expected [global] ngl=99, got: $result"
+
+    cleanup_tmp
+}
+
+test_global_ngl_zero_disables_gpu() {
+    echo "Test: [global] ngl=0 disables GPU offload"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[global]
+ngl = 0
+ctx-size = 8192
+INI
+
+    local result
+    result=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "global") found=1 }
+    found && /^ngl/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$TESTS_TMPDIR/models.ini")
+
+    [ "$result" = "0" ] && pass "[global] ngl=0 parsed correctly (got: $result)" || fail "expected [global] ngl=0, got: $result"
+
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
 # Test: Script exists and is executable
 # ---------------------------------------------------------------
 test_script_exists() {
@@ -256,6 +324,9 @@ echo "start-llama.sh models.ini configuration tests"
 echo "=========================================="
 
 test_script_exists
+test_global_ngl_from_models_ini
+test_global_ngl_defaults_to_99
+test_global_ngl_zero_disables_gpu
 test_get_quantization
 test_get_quantization_no_suffix
 test_ctx_override_from_models_ini

@@ -62,9 +62,46 @@ if podman container exists "$container" >/dev/null 2>&1; then
 fi
 
 # Ensure the container is running
-running=$(podman inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
-if [ "$running" != "true" ]; then
+# Get the full container state; valid startable states are: created, exited
+# States like "stopping" or "paused" cannot be started and require recreation.
+container_status=$(podman inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "")
+
+if [ -z "$container_status" ]; then
+  # Container doesn't exist or inspect failed; will be handled by creation logic
+  true
+elif [ "$container_status" = "running" ]; then
+  # Already running, nothing to do
+  true
+elif [ "$container_status" = "created" ] || [ "$container_status" = "exited" ]; then
+  # Valid startable state
   echo "Starting container $container"
+  podman start "$container"
+else
+  # Improper state (e.g. stopping, paused) — force-remove and recreate
+  echo "WARNING: Container '$container' is in state '$container_status' which is not startable. Force-removing and recreating." >&2
+  podman rm -f "$container"
+
+  # Recreate the container (reuses the same logic as initial creation)
+  host_hf_cache="${LLAMA_HOST_HF_CACHE:-${HOME}/.cache/huggingface/hub}"
+  hf_mount_args=()
+  if [ -n "$host_hf_cache" ]; then
+    if [ -d "$host_hf_cache" ]; then
+      hf_mount_args+=( -v "$host_hf_cache":/root/.cache/huggingface/hub:rw )
+    else
+      echo "Host HF cache not found at $host_hf_cache; creating"
+      mkdir -p "$host_hf_cache" || true
+      hf_mount_args+=( -v "$host_hf_cache":/root/.cache/huggingface/hub:rw )
+    fi
+  fi
+
+  podman create --name "$container" \
+    --device /dev/kfd --device /dev/dri --security-opt label=disable \
+    --network host \
+    -v "$host_repo":/work:rw \
+    "${hf_mount_args[@]}" \
+    "$image" sleep infinity
+
+  echo "Starting recreated container $container"
   podman start "$container"
 fi
 

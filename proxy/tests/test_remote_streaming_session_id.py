@@ -257,3 +257,145 @@ def test_handle_remote_streaming_session_id_default_is_none():
     sig = inspect.signature(_handle_remote_streaming)
     param = sig.parameters["session_id"]
     assert param.default is None, "session_id must default to None"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session header forwarding (LP-0MRE8GD1H0028CGN)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_mock_request_with_session_headers(headers_dict):
+    """Create a mock FastAPI Request with specific headers."""
+    req = MagicMock(spec=Request)
+    req.method = "POST"
+    req.url.path = "/v1/chat/completions"
+    req.headers = headers_dict
+    req.body = AsyncMock(return_value=b'{"model":"test","messages":[]}')
+    return req
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_forward_session_headers_default():
+    """By default (forward_session_headers not set), session affinity headers
+    are NOT stripped from outgoing requests.
+
+    AC1: Default behavior preserves session affinity headers for upstream.
+    """
+    import proxy.proxy_remote as pr
+
+    mock_req = _make_mock_request_with_session_headers({
+        "x-session-id": "sess-test-123",
+        "content-type": "application/json",
+        "x-client-request-id": "req-456",
+    })
+
+    model_config = {
+        "endpoint": "https://api.example.com/v1",
+        "type": "remote",
+        "name": "test-provider",
+    }
+
+    captured_headers = {}
+
+    mock_client = MagicMock()
+    async def _capture_post(url, **kwargs):
+        captured_headers.update(kwargs.get("headers", {}))
+        return _make_buffered_response()
+    mock_client.post = AsyncMock(side_effect=_capture_post)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(pr, "_srv") as mock_srv:
+        mock_srv.return_value.config = {"server": {}}
+        mock_srv.return_value.logger = MagicMock()
+        mock_srv.return_value.current_model = "test"
+        # Ensure pooling is skipped (no _remote_http_client) so the test
+        # exercises the per-request AsyncClient path (LP-0MRE8G3JK0099Y4J).
+        mock_srv.return_value._remote_http_client = None
+
+        with patch.object(pr, "normalize_upstream_request_headers", return_value=dict(mock_req.headers)):
+            with patch.object(pr, "log_request"):
+                with patch.object(pr, "log_response"):
+                    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=mock_client):
+                        await pr.proxy_to_remote(
+                            request=mock_req,
+                            path="v1/chat/completions",
+                            model_config=model_config,
+                        )
+
+    # x-session-id should be present in forwarded headers (not stripped)
+    assert any("session-id" in k.lower() or "session_id" in k.lower() or "client-request" in k.lower()
+               for k in captured_headers.keys()), (
+        f"Session headers should be forwarded, got: {list(captured_headers.keys())}"
+    )
+
+
+def _make_buffered_response(status_code=200):
+    """Create a mock Response for non-streaming path."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = {"content-type": "application/json"}
+    resp.content = b'{"ok":true}'
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_strip_session_headers_when_disabled():
+    """When forward_session_headers is False, session affinity headers
+    ARE stripped from outgoing requests.
+
+    AC2: forward_session_headers: false strips session headers.
+    """
+    import proxy.proxy_remote as pr
+
+    mock_req = _make_mock_request_with_session_headers({
+        "x-session-id": "sess-test-123",
+        "content-type": "application/json",
+    })
+
+    model_config = {
+        "endpoint": "https://api.example.com/v1",
+        "type": "remote",
+        "name": "test-provider",
+        "forward_session_headers": False,
+    }
+
+    captured_headers = {}
+
+    mock_client = MagicMock()
+    async def _capture_post(url, **kwargs):
+        captured_headers.update(kwargs.get("headers", {}))
+        return _make_buffered_response()
+    mock_client.post = AsyncMock(side_effect=_capture_post)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(pr, "_srv") as mock_srv:
+        mock_srv.return_value.config = {"server": {}}
+        mock_srv.return_value.logger = MagicMock()
+        mock_srv.return_value.current_model = "test"
+        # Ensure pooling is skipped (no _remote_http_client) so the test
+        # exercises the per-request AsyncClient path (LP-0MRE8G3JK0099Y4J).
+        mock_srv.return_value._remote_http_client = None
+
+        with patch.object(pr, "normalize_upstream_request_headers", return_value=dict(mock_req.headers)):
+            with patch.object(pr, "log_request"):
+                with patch.object(pr, "log_response"):
+                    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=mock_client):
+                        await pr.proxy_to_remote(
+                            request=mock_req,
+                            path="v1/chat/completions",
+                            model_config=model_config,
+                        )
+
+    # x-session-id should NOT be present in forwarded headers
+    session_headers_found = [
+        k for k in captured_headers.keys()
+        if any(s in k.lower() for s in ["session-id", "session_id", "client-request"])
+    ]
+    assert not session_headers_found, (
+        f"Session headers should be stripped, found: {session_headers_found}"
+    )
+
+
+
