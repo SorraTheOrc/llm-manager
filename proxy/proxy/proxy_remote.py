@@ -269,6 +269,25 @@ async def proxy_to_remote(
 
     server_config = _srv().config.get("server", {})
     remote_timeout = _compute_request_timeout(server_config, body_json, remote=True)
+
+    # Apply upstream request-level timeout cap (LP-0MRF77A0E0026B9T).
+    # If configured, cap the read timeout to prevent 15+ minute silent hangs
+    # when the upstream is slow to respond. This is different from the
+    # per-chunk idle timeout (upstream_idle_timeout_seconds) which detects
+    # mid-stream stalls.
+    _upstream_request_timeout = float(
+        server_config.get("upstream_request_timeout_seconds", 120) or 120
+    )
+    if isinstance(remote_timeout, httpx.Timeout):
+        _capped_read = remote_timeout.read
+        if _capped_read is not None and _capped_read > _upstream_request_timeout:
+            remote_timeout = httpx.Timeout(
+                connect=remote_timeout.connect,
+                read=_upstream_request_timeout,
+                write=remote_timeout.write,
+                pool=remote_timeout.pool,
+            )
+
     is_streaming = body_json.get("stream", False)
 
     # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header
@@ -483,12 +502,28 @@ async def _handle_remote_streaming(
     if resolved_model:
         outgoing_headers["X-Resolved-Model"] = resolved_model
 
+    # Read empty-response retry config (LP-0MRF77A0E0026B9T)
+    try:
+        empty_max_attempts = int(
+            _srv().config.get("server", {}).get("upstream_empty_retry_max_attempts", 1) or 1
+        )
+    except Exception:
+        empty_max_attempts = 1
+    try:
+        empty_base_delay = float(
+            _srv().config.get("server", {}).get("upstream_empty_retry_base_delay_seconds", 0.5) or 0.5
+        )
+    except Exception:
+        empty_base_delay = 0.5
+
     media_type = response.headers.get("content-type", "text/event-stream")
     key = f"{request.method.upper()} {request.url.path} -> remote"
 
     async def stream_generator():
         saw_done = False
         saw_finish = False
+        # Content tracking for empty-response detection (LP-0MRF77A0E0026B9T)
+        _has_content = False
         # Client disconnect detection (LP-0MQTHP828000JYM6)
         disconnected = False
         _disconnect_check_count = 0
@@ -510,14 +545,116 @@ async def _handle_remote_streaming(
 
         # Per-chunk idle timeout and retry state (LP-0MRE52D3C001KP1H)
         _retry_count = 0
+        # Empty-response retry state (LP-0MRF77A0E0026B9T)
+        _empty_retry_count = 0
+        _should_empty_retry = False
         _current_client = client
         _current_cm = cm
         _current_response = response
         _should_retry = False
 
         # Outer loop: retry on stall/ReadTimeout (initial attempt counts as
-        # iteration 0; retries are iterations 1..max_retries)
+        # iteration 0; retries are iterations 1..max_retries) or
+        # empty-response retry (LP-0MRF77A0E0026B9T).
         while True:
+            if _should_empty_retry:
+                _should_empty_retry = False
+                _empty_retry_count += 1
+                try:
+                    _srv().logger.info(
+                        "Empty response detected on stream attempt %s/%s, "
+                        "retrying in %.2fs (provider=%s model=%s)",
+                        _empty_retry_count,
+                        empty_max_attempts + 1,
+                        empty_base_delay,
+                        provider or "remote",
+                        model_name,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(empty_base_delay)
+                # Create fresh stream connection for empty retry
+                try:
+                    _current_client = _pool_client
+                    _current_cm = _pool_client.stream(
+                        request.method,
+                        target_url,
+                        headers=headers,
+                        content=body,
+                        timeout=remote_timeout,
+                    )
+                    _current_response = await asyncio.wait_for(
+                        _current_cm.__aenter__(),
+                        timeout=upstream_retry_connect_timeout_seconds,
+                    )
+                    _empty_upstream_status = _current_response.status_code
+                    _empty_upstream_ct = _current_response.headers.get("content-type", "")
+
+                    if _empty_upstream_status >= 400 or "text/event-stream" not in _empty_upstream_ct.lower():
+                        # Retry returned a non-streaming response — don't retry further
+                        try:
+                            await _current_cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        # Yield error and exit
+                        _final_error_obj = {
+                            "choices": [
+                                {"delta": {}, "finish_reason": "error", "index": 0}
+                            ]
+                        }
+                        _final_error_bytes = (
+                            f"data: {json.dumps(_final_error_obj)}\n\n"
+                        ).encode("utf-8")
+                        if collected_chunks is not None:
+                            collected_chunks.append(_final_error_bytes)
+                        yield _final_error_bytes
+                        log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        break
+
+                    # Reset stream state for the new connection
+                    _has_content = False
+                    saw_done = False
+                    saw_finish = False
+                    continue
+                except Exception:
+                    # Connection failed on empty retry — continue to next retry
+                    # or fall through to exhaustion
+                    if _empty_retry_count > empty_max_attempts:
+                        pass  # Will be caught below
+                    else:
+                        continue
+
+            # Empty-response retry exhaustion (LP-0MRF77A0E0026B9T)
+            # Check if we've exhausted empty retries and need to yield an error.
+            # This can happen when:
+            #   - All retries returned empty responses (no content chunks)
+            #   - Empty retry connection failed (exception case above)
+            if _empty_retry_count > empty_max_attempts:
+                try:
+                    _srv().logger.warning(
+                        "Empty upstream response: max retries exhausted "
+                        "session=%s provider=%s model=%s retries=%d",
+                        session_id or "unknown",
+                        provider or "remote",
+                        model_name,
+                        _empty_retry_count,
+                    )
+                except Exception:
+                    pass
+                _final_error_obj = {
+                    "choices": [
+                        {"delta": {}, "finish_reason": "error", "index": 0}
+                    ]
+                }
+                _final_error_bytes = (
+                    f"data: {json.dumps(_final_error_obj)}\n\n"
+                ).encode("utf-8")
+                if collected_chunks is not None:
+                    collected_chunks.append(_final_error_bytes)
+                yield _final_error_bytes
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                break
+
             if _retry_count >= max_retries:
                 # Max retries exhausted — yield synthetic finish_reason: error
                 # and stop. The caller (provider.py fallback chain) will see
@@ -673,7 +810,10 @@ async def _handle_remote_streaming(
                                 for choice in j.get("choices", []):
                                     delta = choice.get("delta", {})
                                     if isinstance(delta, dict) and "content" in delta:
-                                        texts.append(str(delta.get("content", "")))
+                                        d_content = delta.get("content")
+                                        if d_content is not None and d_content != "":
+                                            _has_content = True
+                                            texts.append(str(d_content))
                             except Exception:
                                 texts.append(payload)
                         if texts:
@@ -707,7 +847,30 @@ async def _handle_remote_streaming(
                     break
 
                 if saw_done or saw_finish:
-                    # Stream completed normally on this attempt — stop outer loop
+                    # Stream completed normally. Check for empty response
+                    # (no content chunks received). Retry if configurable
+                    # empty-retry attempts remain (LP-0MRF77A0E0026B9T).
+                    if not _has_content and _empty_retry_count < empty_max_attempts:
+                        # Empty response detected — retry with empty-retry backoff
+                        _should_empty_retry = True
+                        continue
+                    # If no content and retries exhausted, yield synthetic error
+                    # so the caller (provider.py fallback chain) can route to
+                    # the next provider.
+                    if not _has_content:
+                        _final_empty_error_obj = {
+                            "choices": [
+                                {"delta": {}, "finish_reason": "error", "index": 0}
+                            ]
+                        }
+                        _final_empty_error_bytes = (
+                            f"data: {json.dumps(_final_empty_error_obj)}\n\n"
+                        ).encode("utf-8")
+                        if collected_chunks is not None:
+                            collected_chunks.append(_final_empty_error_bytes)
+                        yield _final_empty_error_bytes
+                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                    # Has content (with or without retries) or retries exhausted — stop outer loop
                     break
 
                 # If we break out of the inner loop without saw_done/saw_finish
@@ -717,20 +880,43 @@ async def _handle_remote_streaming(
 
             except StopAsyncIteration:
                 # Normal exhaustion of the upstream iterator (no [DONE] received).
-                # Synthesize final stop event as in the original code, then stop.
+                # Synthesize final stop event as in the original code.
                 if not saw_done and not saw_finish:
-                    _final_stop_obj = {
-                        "choices": [
-                            {"delta": {}, "finish_reason": "stop", "index": 0}
-                        ]
-                    }
-                    _final_stop_bytes = (
-                        f"data: {json.dumps(_final_stop_obj)}\n\n"
-                    ).encode("utf-8")
-                    if collected_chunks is not None:
-                        collected_chunks.append(_final_stop_bytes)
-                    yield _final_stop_bytes
-                    log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                    # Check for empty response (no content received)
+                    # and retry if configurable retries remain (LP-0MRF77A0E0026B9T).
+                    if not _has_content and _empty_retry_count < empty_max_attempts:
+                        _should_empty_retry = True
+                        continue
+
+                    # If no content (and retries exhausted/exhausted above), yield
+                    # synthetic error so the fallback chain can activate.
+                    if not _has_content:
+                        _final_empty_error_obj = {
+                            "choices": [
+                                {"delta": {}, "finish_reason": "error", "index": 0}
+                            ]
+                        }
+                        _final_empty_error_bytes = (
+                            f"data: {json.dumps(_final_empty_error_obj)}\n\n"
+                        ).encode("utf-8")
+                        if collected_chunks is not None:
+                            collected_chunks.append(_final_empty_error_bytes)
+                        yield _final_empty_error_bytes
+                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                    else:
+                        # Stream had content but ended without [DONE] — yield stop
+                        _final_stop_obj = {
+                            "choices": [
+                                {"delta": {}, "finish_reason": "stop", "index": 0}
+                            ]
+                        }
+                        _final_stop_bytes = (
+                            f"data: {json.dumps(_final_stop_obj)}\n\n"
+                        ).encode("utf-8")
+                        if collected_chunks is not None:
+                            collected_chunks.append(_final_stop_bytes)
+                        yield _final_stop_bytes
+                        log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
                 break
             except httpx.ReadTimeout:
                 # httpx ReadTimeout before idle timeout (edge case) — retry
@@ -783,7 +969,7 @@ async def _handle_remote_streaming(
                 # in the outer finally block; close() is idempotent.
                 if not (_retry_count >= max_retries and not _should_retry):
                     # Only clean up if we might retry; final cleanup is in outer finally
-                    if _should_retry or saw_done or saw_finish or disconnected:
+                    if _should_retry or _should_empty_retry or saw_done or saw_finish or disconnected:
                         try:
                             await _current_cm.__aexit__(None, None, None)
                         except Exception:
@@ -796,7 +982,10 @@ async def _handle_remote_streaming(
                                 pass
 
             if saw_done or saw_finish or disconnected:
-                break
+                # Don't break if we're about to handle an empty-response retry;
+                # the outer loop will reconnect (LP-0MRF77A0E0026B9T).
+                if not _should_empty_retry:
+                    break
 
             # If _should_retry is True, the outer loop will handle backoff
             # and reconnect on next iteration.
@@ -835,6 +1024,66 @@ async def _handle_remote_streaming(
     )
 
 
+def _is_empty_remote_response(resp_json: dict) -> bool:
+    """Check if a remote upstream response is semantically empty.
+
+    Detects the specific pattern observed when free-tier upstream LLMs
+    return a well-formed 200 OK with no usable content:
+      - choices[0].message.content is empty (``[]``, ``""``, or absent)
+      - choices[0].message.stopReason or finish_reason is ``stop``
+      - choices[0].usage.total_tokens is 0 (or usage absent)
+
+    This is used for retry-on-empty logic in the remote provider path.
+    It differs from ``_is_empty_response`` in ``utils.py`` which targets
+    the local llama-server path and its reasoning_content extraction.
+
+    Args:
+        resp_json: Parsed JSON body of the upstream response.
+
+    Returns:
+        True if the response is semantically empty (retry-eligible).
+    """
+    if not isinstance(resp_json, dict):
+        return False
+    try:
+        choices = resp_json.get("choices", [])
+        if not choices or not isinstance(choices, list):
+            return False
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return False
+
+        message = choice.get("message", {})
+        if not isinstance(message, dict):
+            return False
+
+        # Check content: must be empty (None, [], "", or absent)
+        content = message.get("content")
+        _is_content_empty = (
+            content is None
+            or (isinstance(content, list) and len(content) == 0)
+            or (isinstance(content, str) and content.strip() == "")
+        )
+        if not _is_content_empty:
+            return False
+
+        # Check stopReason / finish_reason is "stop"
+        stop_reason = message.get("stopReason") or choice.get("finish_reason")
+        if stop_reason != "stop":
+            return False
+
+        # Check usage: total_tokens is 0 or absent
+        usage = resp_json.get("usage", {})
+        if isinstance(usage, dict):
+            total = usage.get("total_tokens") or usage.get("total")
+            if total is not None and total != 0:
+                return False
+
+        return True
+    except Exception:
+        return False
+
+
 async def _handle_remote_non_streaming(
     request: Request,
     target_url: str,
@@ -846,54 +1095,126 @@ async def _handle_remote_non_streaming(
     session_id: Optional[str] = None,
     pool_client: Optional[httpx.AsyncClient] = None,
 ) -> Response:
-    """Handle non-streaming remote proxy request."""
+    """Handle non-streaming remote proxy request with empty-response retry.
+
+    Features:
+    - Detects semantically empty upstream responses (empty content,
+      stopReason: stop, total_tokens: 0) and retries the same provider
+      with a configurable number of attempts and base delay.
+    - After retries exhausted, returns the last response as-is so the
+      caller (``proxy_with_fallback`` in provider.py) can route to the
+      next provider in the fallback chain.
+    - Non-empty responses pass through unchanged (no retry).
+    """
     key = f"{request.method.upper()} {request.url.path} -> remote"
-    
-    if pool_client is not None:
-        method = request.method.lower()
-        response = await getattr(pool_client, method)(
-            target_url,
-            headers=headers,
-            content=body,
-            timeout=remote_timeout,
+
+    # Read empty-response retry config from server settings
+    server_config = _srv().config.get("server", {})
+    try:
+        empty_max_attempts = int(
+            server_config.get("upstream_empty_retry_max_attempts", 1) or 1
         )
-    else:
-        async with httpx.AsyncClient(timeout=remote_timeout) as client:
+    except Exception:
+        empty_max_attempts = 1
+    try:
+        empty_base_delay = float(
+            server_config.get("upstream_empty_retry_base_delay_seconds", 0.5) or 0.5
+        )
+    except Exception:
+        empty_base_delay = 0.5
+
+    async def _do_request() -> httpx.Response:
+        """Make one upstream request and return the response."""
+        if pool_client is not None:
             method = request.method.lower()
-            response = await getattr(client, method)(
+            return await getattr(pool_client, method)(
                 target_url,
                 headers=headers,
                 content=body,
+                timeout=remote_timeout,
             )
+        else:
+            async with httpx.AsyncClient(timeout=remote_timeout) as client:
+                method = request.method.lower()
+                return await getattr(client, method)(
+                    target_url,
+                    headers=headers,
+                    content=body,
+                )
 
-        # Non-streaming: count tokens in response
+    last_response = None
+    for attempt in range(empty_max_attempts + 1):
+        response = await _do_request()
+        last_response = response
+
+        # Parse response body to check for emptiness
         try:
             resp_text = response.content.decode("utf-8", errors="replace")
-            recv_tokens = count_text_tokens(resp_text, model_name)
-            await _schedule_recv_token_increment(key, recv_tokens)
+            resp_json = json.loads(resp_text) if resp_text else {}
         except Exception:
-            pass
+            # Not valid JSON — no retry, use as-is
+            break
 
-        log_response(response.status_code, response.content)
+        if _is_empty_remote_response(resp_json):
+            if attempt < empty_max_attempts:
+                try:
+                    _srv().logger.info(
+                        "Empty upstream response detected on attempt %s/%s, "
+                        "retrying in %.2fs (model=%s)",
+                        attempt + 1,
+                        empty_max_attempts + 1,
+                        empty_base_delay,
+                        model_name,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(empty_base_delay)
+            else:
+                try:
+                    _srv().logger.warning(
+                        "Empty upstream response persisted after %s/%s retries, "
+                        "returning empty response for fallback (model=%s)",
+                        attempt + 1,
+                        empty_max_attempts + 1,
+                        model_name,
+                    )
+                except Exception:
+                    pass
+        else:
+            # Non-empty response — no further retry
+            break
 
-        # Record provider->client response (fire-and-forget)
-        if session_id:
-            _schedule_traffic_recording(
-                session_id=session_id,
-                response_payload=response.content,
-                model=model_name,
-                provider="remote",
-            )
+    # Log and return the last response
+    response = last_response
 
-        _ns_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
-        # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
-        if resolved_model:
-            _ns_headers["X-Resolved-Model"] = resolved_model
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers=_ns_headers,
+    # Non-streaming: count tokens in response
+    try:
+        resp_text = response.content.decode("utf-8", errors="replace")
+        recv_tokens = count_text_tokens(resp_text, model_name)
+        await _schedule_recv_token_increment(key, recv_tokens)
+    except Exception:
+        pass
+
+    log_response(response.status_code, response.content)
+
+    # Record provider->client response (fire-and-forget)
+    if session_id:
+        _schedule_traffic_recording(
+            session_id=session_id,
+            response_payload=response.content,
+            model=model_name,
+            provider="remote",
         )
+
+    _ns_headers = _normalize_outgoing_headers(dict(response.headers), buffered=True)
+    # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
+    if resolved_model:
+        _ns_headers["X-Resolved-Model"] = resolved_model
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=_ns_headers,
+    )
 
 
 
