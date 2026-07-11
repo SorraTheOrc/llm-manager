@@ -867,6 +867,98 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     return (cur_active, max_local)
 
 
+async def _release_session_slot_for_cache_cold_bypass(
+    request,
+    llama_model: str,
+    fallback_reason: str,
+) -> None:
+    """Release the scheduler slot for a session being routed to remote fallback.
+
+    When the cache_cold_bypass mechanism routes a session from a local provider
+    to a remote fallback (e.g., because the conversation context exceeds the
+    warm threshold), the local model's slot is held until idle timeout unless
+    we release it here.
+
+    This function:
+    1. Resolves the session_id from the request headers
+    2. Gets the JobScheduler (if active)
+    3. If the session has an active slot, releases it via the scheduler
+    4. Marks the model's cache as cold (for warm-cache bypass)
+    5. Logs the release
+
+    Args:
+        request: The incoming FastAPI Request.
+        llama_model: The llama_model name of the local provider being bypassed.
+        fallback_reason: The reason for fallback (used in the log message).
+    """
+    import logging as _logging
+    _log = _logging.getLogger("llama-proxy.provider")
+
+    # Resolve session_id from request headers
+    try:
+        from proxy.session import _resolve_session_id_header
+        session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
+    except Exception:
+        session_id = None
+
+    if not session_id:
+        return
+
+    # Get the scheduler
+    try:
+        from proxy.router import _get_job_scheduler
+        scheduler = _get_job_scheduler()
+    except Exception:
+        scheduler = None
+
+    if scheduler is None:
+        return
+
+    # Check if the session has an active scheduler slot
+    try:
+        if session_id in scheduler.active_jobs:
+            slot_id = scheduler.active_jobs[session_id]
+            # Release via scheduler.remove_job which handles both slot release and queue cancel
+            released = await scheduler.remove_job(session_id)
+            if released:
+                _log.info(
+                    "lease_released session=%s slot=%s reason=%s",
+                    session_id[:8],
+                    slot_id,
+                    fallback_reason,
+                )
+    except Exception:
+        _log.exception("Failed to release scheduler slot for session=%s", session_id[:8])
+
+    # Also clean up local_dispatch_records for this session
+    try:
+        import proxy.server as _srv_module
+        srv = getattr(_srv_module, "server", None)
+        if srv is not None:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None and hasattr(srv, "local_dispatch_records"):
+                async with lock:
+                    if session_id in srv.local_dispatch_records:
+                        del srv.local_dispatch_records[session_id]
+                        _log.info(
+                            "lease_released session=%s reason=%s",
+                            session_id[:8],
+                            fallback_reason,
+                        )
+    except Exception:
+        pass
+
+    # Mark the model's cache as cold so subsequent large-context
+    # requests also bypass local (LP-0MRCSSBTM002NK3B)
+    if llama_model and not is_model_cache_cold(llama_model):
+        mark_model_cache_cold(llama_model)
+        _log.info(
+            "model_cache_marked_cold model=%s reason=%s",
+            llama_model,
+            fallback_reason,
+        )
+
+
 def _parse_slot_exhaustion(response):
     """Parse a slot-exhaustion response and return slot info.
 
@@ -1697,6 +1789,13 @@ async def proxy_with_fallback(
                     fallback_reason = "cache_cold_large_context"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
+                    # Release the session's scheduler slot so other sessions
+                    # can use it instead of waiting for idle timeout (LP-0MRGUJ3QR002K18G)
+                    await _release_session_slot_for_cache_cold_bypass(
+                        request,
+                        _llama_model,
+                        fallback_reason,
+                    )
                     continue
 
                 response = await ptr_local(request, path)

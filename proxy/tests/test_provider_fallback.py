@@ -2967,6 +2967,194 @@ async def test_cache_cold_bypass_first_request_after_restart(mixed_model_config)
 
 
 @pytest.mark.asyncio
+async def test_cache_cold_bypass_releases_scheduler_slot(mixed_model_config):
+    """Cache-cold bypass should release the session's scheduler slot.
+
+    AC 1 (LP-0MRGUJ3QR002K18G): When a session is routed from a local provider
+    to a remote fallback via cache_cold_bypass, the local model slot is released
+    immediately.
+    """
+    provider._model_cache_cold.clear()
+    provider.mark_model_cache_cold("Qwen3")
+
+    session_id = "test-session-with-slot"
+    request = _DummyRequest(
+        body=b'{"model":"hybrid","messages":[{"role":"user","content":"'
+        + b'test message content for token estimation ' * 7000
+        + b'"}],"stream":false}'
+    )
+    request.headers = {"x-session-id": session_id}
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "local_large_context_fallback_threshold": 40000,
+    }
+
+    call_log = []
+    remove_job_called = False
+
+    # Create a mock scheduler with the session in active_jobs
+    class _MockScheduler:
+        active_jobs = {session_id: 0}  # session -> slot_id
+
+        async def remove_job(self, sid):
+            nonlocal remove_job_called
+            remove_job_called = True
+            call_log.append(("remove_job", sid))
+            self.active_jobs.pop(sid, None)
+            return True
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router._get_job_scheduler", return_value=_MockScheduler()),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "remote-fallback"
+    assert call_log == [("remove_job", session_id), ("remote", "remote-fallback")], (
+        f"Expected remove_job + remote call, got: {call_log}"
+    )
+    assert remove_job_called, "scheduler.remove_job should have been called"
+
+
+@pytest.mark.asyncio
+async def test_cache_cold_bypass_no_slot_no_error(mixed_model_config):
+    """Cache-cold bypass with no scheduler slot should not error.
+
+    When the session does NOT have a scheduler slot (e.g., first request or
+    hash-based slot assignment), the cache_cold_bypass should proceed normally
+    without any errors.
+    """
+    provider._model_cache_cold.clear()
+    provider.mark_model_cache_cold("Qwen3")
+
+    request = _DummyRequest(
+        body=b'{"model":"hybrid","messages":[{"role":"user","content":"'
+        + b'test message content for token estimation ' * 7000
+        + b'"}],"stream":false}'
+    )
+    request.headers = {"x-session-id": "session-no-slot"}
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "local_large_context_fallback_threshold": 40000,
+    }
+
+    call_log = []
+
+    # Mock scheduler with empty active_jobs (session has no slot)
+    class _EmptyMockScheduler:
+        active_jobs = {}
+
+        async def remove_job(self, sid):
+            call_log.append(("remove_job", sid))
+            return False
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router._get_job_scheduler", return_value=_EmptyMockScheduler()),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "remote-fallback"
+    # remove_job should have been called but returned False (no slot to release)
+    # remove_job should NOT be called because session has no active slot
+    assert call_log == [("remote", "remote-fallback")], (
+        f"Expected only remote call (no slot to release), got: {call_log}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_config):
+    """Warm-cache large context bypass should release the slot and mark cache cold.
+
+    AC 3 (LP-0MRGUJ3QR002K18G): The model's cache is marked as cold after
+    release, so subsequent large-context requests also bypass local.
+    """
+    provider._model_cache_cold.clear()
+    provider._cache_cold_initialized()
+    # Do NOT mark cache cold — test warm-cache behavior marks it cold
+    assert not provider.is_model_cache_cold("Qwen3"), "Cache should be warm initially"
+
+    session_id = "test-session-warm-bypass"
+    large_body = (
+        b'{"model":"hybrid","messages":[{"role":"user","content":"'
+        + b'test message content for token estimation ' * 11000
+        + b'"}],"stream":false}'
+    )
+    request = _DummyRequest(body=large_body)
+    request.headers = {"x-session-id": session_id}
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "local_large_context_cold_cache_threshold": 40000,
+        "local_large_context_warm_cache_threshold": 60000,
+    }
+
+    call_log = []
+
+    class _MockScheduler:
+        active_jobs = {session_id: 0}
+
+        async def remove_job(self, sid):
+            call_log.append(("remove_job", sid))
+            self.active_jobs.pop(sid, None)
+            return True
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router._get_job_scheduler", return_value=_MockScheduler()),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "remote-fallback"
+    assert call_log == [("remove_job", session_id), ("remote", "remote-fallback")]
+    # Cache should now be cold after warm-cache bypass
+    assert provider.is_model_cache_cold("Qwen3"), (
+        "Model cache should have been marked cold after warm-cache bypass"
+    )
+
+
+@pytest.mark.asyncio
 async def test_warm_cache_large_context_bypass(mixed_model_config):
     """Warm cache with very large context should bypass local.
 
