@@ -240,6 +240,25 @@ async def proxy_to_remote(
 
     body = json.dumps(body_json).encode("utf-8")
 
+    # DEBUG: Log exact outgoing request for opencode troubleshooting
+    # (LP-0MRFEXXVC001RYKB follow-up — remove after root cause identified)
+    _endpoint_host = endpoint.replace("https://", "").replace("http://", "").split("/")[0] if endpoint else ""
+    if "opencode" in _endpoint_host or "opencode" in str(model_config.get("provider", "")):
+        try:
+            _masked_auth = (headers.get("Authorization", "") or "")[:25] + "..."
+            _srv().logger.info(
+                "[remote] DEBUG outgoing provider=%s url=%s auth=%s headers_count=%d body_len=%d body_json_keys=%s model_field=%s",
+                model_config.get("provider", "?"),
+                target_url,
+                _masked_auth,
+                len(headers),
+                len(body),
+                sorted(body_json.keys()),
+                body_json.get("model", "(missing)"),
+            )
+        except Exception:
+            pass
+
     # Determine model name for attribution (may be provided in body)
     model_name = None
     try:
