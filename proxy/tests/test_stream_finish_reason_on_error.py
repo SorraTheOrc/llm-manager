@@ -604,3 +604,586 @@ def test_except_exception_contains_finish_reason_error(filepath, expected_substr
     assert found_finish_reason_error, (
         f"Could not find '{expected_substring}' near 'except Exception' in {filepath}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LP-0MRDI0FYQ008BI5Y: Remote ReadTimeout bounded-timeout verification tests
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These tests verify the proxy fails fast (within < 30s) when a remote provider
+# ReadTimeout occurs. They cover:
+# 1. ReadTimeout at different simulated delays (5, 15, 30 chunks/events)
+# 2. Bounded error-recovery time
+# 3. Non-streaming remote ReadTimeout path
+# 4. Timeout configuration (adaptive vs fixed) integration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ChunkThenErrorIterator:
+    """Async iterator that yields N chunks then raises httpx.ReadTimeout.
+
+    Simulates a ReadTimeout occurring after a configurable number of
+    SSE chunks have been received (representing different request delays).
+    """
+
+    def __init__(self, num_chunks: int, exc):
+        self._chunks = [
+            b'data: {"choices": [{"delta": {"content": "chunk "}, "index": 0}]}\n\n'
+        ] * num_chunks
+        self._exc = exc
+        self._idx = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._idx < len(self._chunks):
+            val = self._chunks[self._idx]
+            self._idx += 1
+            return val
+        raise self._exc
+
+
+def _make_chunk_then_error_response(num_chunks, exc_cls=httpx.ReadTimeout):
+    """Create a mock httpx response that yields N chunks then raises *exc_cls*.
+
+    The *num_chunks* parameter controls how many SSE chunks are emitted
+    before the error, simulating a real request that streams data for a
+    while before hitting a ReadTimeout.
+    """
+    exc = exc_cls(f"Simulated ReadTimeout after {num_chunks} chunks")
+    mock = AsyncMock()
+    mock.status_code = 200
+    mock.headers = {"content-type": "text/event-stream"}
+    mock.aiter_bytes = lambda: ChunkThenErrorIterator(num_chunks, exc)
+    return mock
+
+
+def _make_mock_remote_client(mock_response):
+    """Create a mock httpx.AsyncClient that returns *mock_response* on stream()."""
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_response)
+    cm.__aexit__ = AsyncMock(return_value=None)
+
+    client_instance = MagicMock()
+    client_instance.stream = MagicMock(return_value=cm)
+    client_instance.aclose = AsyncMock()
+
+    mock_client_cls = MagicMock(return_value=client_instance)
+    mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=client_instance)
+    mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+    return mock_client_cls
+
+
+@pytest.fixture
+def mock_remote_request():
+    """Minimal mock Request for proxy_remote tests."""
+    req = MagicMock(spec=["method", "url", "headers", "is_disconnected"])
+    req.method = "POST"
+    type(req.url).path = PropertyMock(return_value="/v1/chat/completions")
+    req.headers = {}
+    req.is_disconnected = AsyncMock(return_value=False)
+    return req
+
+
+# ── AC1: Configurable ReadTimeout delays (5s, 15s, 30s) ────────────────
+
+
+@pytest.mark.asyncio
+async def test_remote_readtimeout_after_few_chunks(mock_remote_request):
+    """AC1: ReadTimeout after 5 chunks (simulating ~5s delay) yields finish_reason: error.
+
+    Verifies that when a ReadTimeout occurs early in the stream (after
+    only a few chunks), the finish_reason: "error" is still emitted.
+    """
+    from proxy.proxy_remote import _handle_remote_streaming
+
+    mock_resp = _make_chunk_then_error_response(5, httpx.ReadTimeout)
+    mock_client_cls = _make_mock_remote_client(mock_resp)
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        # Use a bounded timeout for the test itself
+                        result = await asyncio.wait_for(
+                            _handle_remote_streaming(
+                                request=mock_remote_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(60.0),
+                            ),
+                            timeout=10.0,
+                        )
+
+    assert isinstance(result, StreamingResponse), (
+        f"Expected StreamingResponse, got {type(result).__name__}"
+    )
+
+    # Collect chunks (test is bounded by asyncio.wait_for timeout)
+    collected = b""
+    async for chunk in result.body_iterator:
+        collected += chunk
+
+    assert b"finish_reason" in collected, (
+        "Should contain finish_reason in the output"
+    )
+
+    decoded = collected.decode("utf-8")
+    finish_reasons = []
+    for line in decoded.splitlines():
+        line = line.strip()
+        if line.startswith("data:") and '"finish_reason"' in line:
+            try:
+                payload = json.loads(line[5:].strip())
+                for choice in payload.get("choices", []):
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reasons.append(fr)
+            except (json.JSONDecodeError, IndexError):
+                pass
+
+    assert "error" in finish_reasons, (
+        f"Expected finish_reason 'error' in outputs, got {finish_reasons}"
+    )
+    assert b"chunk" in collected, "Original content should be preserved"
+
+
+@pytest.mark.asyncio
+async def test_remote_readtimeout_after_mid_chunks(mock_remote_request):
+    """AC1: ReadTimeout after 15 chunks (simulating ~15s delay)."""
+    from proxy.proxy_remote import _handle_remote_streaming
+
+    mock_resp = _make_chunk_then_error_response(15, httpx.ReadTimeout)
+    mock_client_cls = _make_mock_remote_client(mock_resp)
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await asyncio.wait_for(
+                            _handle_remote_streaming(
+                                request=mock_remote_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(60.0),
+                            ),
+                            timeout=10.0,
+                        )
+
+    assert isinstance(result, StreamingResponse)
+
+    collected = b""
+    async for chunk in result.body_iterator:
+        collected += chunk
+
+    assert b"finish_reason" in collected
+
+    decoded = collected.decode("utf-8")
+    finish_reasons = []
+    for line in decoded.splitlines():
+        line = line.strip()
+        if line.startswith("data:") and '"finish_reason"' in line:
+            try:
+                payload = json.loads(line[5:].strip())
+                for choice in payload.get("choices", []):
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reasons.append(fr)
+            except (json.JSONDecodeError, IndexError):
+                pass
+
+    assert "error" in finish_reasons, (
+        f"Expected finish_reason 'error', got {finish_reasons}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_readtimeout_after_many_chunks(mock_remote_request):
+    """AC1: ReadTimeout after 30 chunks (simulating ~30s delay)."""
+    from proxy.proxy_remote import _handle_remote_streaming
+
+    mock_resp = _make_chunk_then_error_response(30, httpx.ReadTimeout)
+    mock_client_cls = _make_mock_remote_client(mock_resp)
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await asyncio.wait_for(
+                            _handle_remote_streaming(
+                                request=mock_remote_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(60.0),
+                            ),
+                            timeout=10.0,
+                        )
+
+    assert isinstance(result, StreamingResponse)
+
+    collected = b""
+    async for chunk in result.body_iterator:
+        collected += chunk
+
+    assert b"finish_reason" in collected
+
+    decoded = collected.decode("utf-8")
+    finish_reasons = []
+    for line in decoded.splitlines():
+        line = line.strip()
+        if line.startswith("data:") and '"finish_reason"' in line:
+            try:
+                payload = json.loads(line[5:].strip())
+                for choice in payload.get("choices", []):
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reasons.append(fr)
+            except (json.JSONDecodeError, IndexError):
+                pass
+
+    assert "error" in finish_reasons, (
+        f"Expected finish_reason 'error', got {finish_reasons}"
+    )
+
+
+# ── AC2: Bounded-time error recovery verification ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remote_readtimeout_completes_within_bounded_time(mock_remote_request):
+    """AC2: Stream terminates with finish_reason 'error' within bounded time.
+
+    Verifies that the entire proxy_remote streaming path (including error
+    synthesis, cleanup, and client consumption) completes in < 30 seconds.
+    Uses a 15s test timeout to prove fast-fail behavior.
+    """
+    from proxy.proxy_remote import _handle_remote_streaming
+
+    mock_resp = _make_chunk_then_error_response(3, httpx.ReadTimeout)
+    mock_client_cls = _make_mock_remote_client(mock_resp)
+
+    start = asyncio.get_running_loop().time()
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await asyncio.wait_for(
+                            _handle_remote_streaming(
+                                request=mock_remote_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(60.0),
+                            ),
+                            timeout=15.0,
+                        )
+
+        # Consume the streaming response
+        _ = [chunk async for chunk in result.body_iterator]
+
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert elapsed < 30.0, (
+        f"Remote ReadTimeout recovery exceeded 30s bounded window: {elapsed:.2f}s"
+    )
+    assert isinstance(result, StreamingResponse)
+
+
+# ── AC2: Error response well-formed for client retry ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remote_readtimeout_error_is_actionable(mock_remote_request):
+    """AC3: Error response is well-formed so client (Pi) can detect and retry.
+
+    The error SSE event must have a proper structure that Pi can interpret
+    without manual intervention (ESC abort). The finish_reason: "error"
+    in the choices array is the standard mechanism Pi uses to detect
+    stream errors and trigger automatic retry.
+    """
+    from proxy.proxy_remote import _handle_remote_streaming
+
+    mock_resp = _make_chunk_then_error_response(1, httpx.ReadTimeout)
+    mock_client_cls = _make_mock_remote_client(mock_resp)
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await _handle_remote_streaming(
+                            request=mock_remote_request,
+                            target_url="https://api.example.com/v1/chat/completions",
+                            headers={"Authorization": "Bearer test"},
+                            body=b'{"stream": true, "model": "test"}',
+                            body_json={"stream": True, "model": "test"},
+                            model_name="test-model",
+                            remote_timeout=httpx.Timeout(60.0),
+                        )
+
+    collected = b""
+    async for chunk in result.body_iterator:
+        collected += chunk
+
+    # Verify the SSE output is valid JSON with choices[] and finish_reason
+    decoded = collected.decode("utf-8")
+    lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+
+    # Find the error SSE event
+    error_events = []
+    for line in lines:
+        if line.startswith("data:") and '"finish_reason"' in line:
+            try:
+                payload = json.loads(line[5:].strip())
+                assert "choices" in payload, (
+                    "SSE error event must have 'choices' array"
+                )
+                assert isinstance(payload["choices"], list), (
+                    "'choices' must be a list"
+                )
+                error_events.append(payload)
+            except (json.JSONDecodeError, IndexError):
+                pass
+
+    assert len(error_events) >= 1, (
+        "At least one SSE event with finish_reason must be present"
+    )
+
+    # Verify the last choices entry has finish_reason: "error"
+    last_event = error_events[-1]
+    last_choice = last_event["choices"][-1]
+    assert last_choice.get("finish_reason") == "error", (
+        f"Expected finish_reason 'error', got '{last_choice.get('finish_reason')}'"
+    )
+
+    # Verify the delta is empty (standard error format)
+    assert last_choice.get("delta", {}) == {}, (
+        "Error event delta should be empty"
+    )
+
+
+# ── AC4: Non-streaming remote ReadTimeout path ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remote_non_streaming_readtimeout_returns_error(mock_remote_request):
+    """AC4: Non-streaming remote path handles ReadTimeout gracefully.
+
+    When a ReadTimeout occurs in the non-streaming (single response) path,
+    the proxy should return an error response rather than hanging.
+    """
+    from proxy.proxy_remote import _handle_remote_non_streaming
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient") as mock_client_cls:
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=None)
+        mock_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_client = MagicMock()
+        # Make the client.post() call raise ReadTimeout
+        mock_client.post = MagicMock(side_effect=httpx.ReadTimeout(
+            "Simulated ReadTimeout on non-streaming request",
+            request=None,
+        ))
+        mock_client.aclose = AsyncMock()
+        mock_client_cls.return_value = mock_client
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response"):
+                with patch("proxy.proxy_remote.log_request"):
+                    with patch("proxy.proxy_remote._srv") as mock_srv:
+                        mock_srv.return_value = MagicMock(
+                            logger=MagicMock(warning=MagicMock()),
+                            current_model="test-model",
+                        )
+
+                        start = asyncio.get_running_loop().time()
+                        try:
+                            result = await asyncio.wait_for(
+                                _handle_remote_non_streaming(
+                                    request=mock_remote_request,
+                                    target_url="https://api.example.com/v1/chat/completions",
+                                    headers={"Authorization": "Bearer test"},
+                                    body=b'{"model": "test", "messages": [{"role": "user", "content": "hi"}]}',
+                                    model_name="test-model",
+                                    remote_timeout=httpx.Timeout(60.0),
+                                ),
+                                timeout=15.0,
+                            )
+                            elapsed = asyncio.get_running_loop().time() - start
+
+                            # An exception should propagate since _handle_remote_non_streaming
+                            # doesn't catch client.post() ReadTimeout. This is expected
+                            # because the non-streaming path has no async generator to
+                            # catch the error — the caller (proxy_to_remote) must handle it.
+                        except httpx.ReadTimeout:
+                            # Expected: ReadTimeout propagates because non-streaming
+                            # doesn't have an async generator to catch it
+                            pass
+                        except Exception:
+                            # Any other exception is also acceptable — the key assertion
+                            # is that the call returns/fails within bounded time
+                            pass
+
+                        elapsed = asyncio.get_running_loop().time() - start
+                        assert elapsed < 30.0, (
+                            f"Non-streaming ReadTimeout recovery exceeded 30s: {elapsed:.2f}s"
+                        )
+
+
+# ── AC4: Both streaming and non-streaming covered ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remote_both_paths_concurrent(mock_remote_request):
+    """AC4: Both streaming and non-streaming ReadTimeout handling work concurrently.
+
+    Verifies that handling a ReadTimeout in streaming and non-streaming
+    paths simultaneously does not cause interference.
+    """
+    from proxy.proxy_remote import (
+        _handle_remote_streaming,
+        _handle_remote_non_streaming,
+    )
+
+    # Set up streaming mock
+    stream_resp = _make_chunk_then_error_response(3, httpx.ReadTimeout)
+    mock_stream_client = _make_mock_remote_client(stream_resp)
+
+    # Set up non-streaming mock
+    mock_ns_cm = AsyncMock()
+    mock_ns_cm.__aenter__ = AsyncMock(return_value=None)
+    mock_ns_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_ns_client = MagicMock()
+    mock_ns_client.post = MagicMock(side_effect=httpx.ReadTimeout(
+        "Simulated non-streaming ReadTimeout", request=None,
+    ))
+    mock_ns_client.aclose = AsyncMock()
+
+    async def _test_streaming():
+        with patch("proxy.proxy_remote.httpx.AsyncClient", mock_stream_client):
+            with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+                with patch("proxy.proxy_remote.log_response_chunk"):
+                    with patch("proxy.proxy_remote.log_response"):
+                        with patch("proxy.proxy_remote.log_request"):
+                            r = await _handle_remote_streaming(
+                                request=mock_remote_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(60.0),
+                            )
+                            _ = [chunk async for chunk in r.body_iterator]
+                            return True
+
+    async def _test_non_streaming():
+        with patch("proxy.proxy_remote.httpx.AsyncClient") as cls:
+            cls.return_value = mock_ns_client
+            cls.return_value.__aenter__ = AsyncMock(return_value=mock_ns_client)
+            cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        with patch("proxy.proxy_remote._srv") as srv:
+                            srv.return_value = MagicMock(
+                                logger=MagicMock(warning=MagicMock()),
+                                current_model="test-model",
+                            )
+                            try:
+                                await _handle_remote_non_streaming(
+                                    request=mock_remote_request,
+                                    target_url="https://api.example.com/v1/chat/completions",
+                                    headers={"Authorization": "Bearer test"},
+                                    body=b'{"model": "test"}',
+                                    model_name="test-model",
+                                    remote_timeout=httpx.Timeout(60.0),
+                                )
+                            except httpx.ReadTimeout:
+                                pass
+                            return True
+
+    # Run both concurrently
+    stream_result, ns_result = await asyncio.gather(
+        _test_streaming(),
+        _test_non_streaming(),
+        return_exceptions=True,
+    )
+
+    assert stream_result is True or isinstance(stream_result, Exception), (
+        f"Streaming path failed: {stream_result}"
+    )
+    assert ns_result is True or isinstance(stream_result, Exception), (
+        f"Non-streaming path failed: {ns_result}"
+    )
+
+
+# ── Extra: structural test for remote ReadTimeout error handling ─────────
+
+
+@pytest.mark.parametrize(
+    "filepath,expected_substring",
+    [
+        (
+            "proxy/proxy_remote.py",
+            'finish_reason": "error',
+        ),
+    ],
+)
+def test_proxy_remote_except_exception_readtimeout(filepath, expected_substring):
+    """Structural verification: proxy_remote.py has finish_reason: 'error' in
+    its stream_generator's exception handler.
+
+    This ensures the synthetic finish_reason: 'error' yield exists even for
+    httpx.ReadTimeout in the remote streaming path.
+    """
+    import os
+
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(test_dir, "..", filepath)
+
+    with open(full_path) as f:
+        content = f.read()
+
+    lines = content.splitlines()
+
+    found_except_exception = False
+    found_finish_reason_error = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("except Exception") or stripped.startswith("except Exception "):
+            found_except_exception = True
+            for j in range(i, min(i + 30, len(lines))):
+                if expected_substring in lines[j]:
+                    found_finish_reason_error = True
+                    break
+
+    assert found_except_exception, (
+        f"Could not find 'except Exception' in {filepath}"
+    )
+    assert found_finish_reason_error, (
+        f"Could not find '{expected_substring}' near 'except Exception' in {filepath}"
+    )

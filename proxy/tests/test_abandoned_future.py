@@ -12,6 +12,7 @@ Verifies that:
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -358,6 +359,204 @@ async def test_idle_timeout_cleans_up_pending_future(monkeypatch):
 
     # Clean up the hanging event
     _hang_event.set()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lease_refreshed_during_streaming(monkeypatch):
+    """The dispatch lease expires_at should be refreshed on each data chunk.
+
+    LP-0MRDKV44T003FRBP: When a streaming response delivers real data,
+    the dispatch record's expires_at must be extended so long-running
+    streams (> local_dispatch_lease_timeout_seconds) do not lose their
+    lease mid-stream.
+    """
+    from proxy.router import proxy_to_local
+
+    # Set up dispatch tracking on server state
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+
+    async def _aiter():
+        yield b'data: {"choices": [{"delta": {"content": "Hello"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {"content": " world"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    cm, resp = _make_mock_cm(_aiter)
+    monkeypatch.setattr(
+        "proxy.router._call_with_backend_retries",
+        AsyncMock(return_value=(cm, resp)),
+    )
+
+    # Use an explicit session so the dispatch lease path is exercised
+    monkeypatch.setattr(
+        "proxy.router._handle_session",
+        AsyncMock(
+            return_value={
+                "session_id": "test-session-lease-refresh",
+                "session_id_header": "test-session-lease-refresh",
+                "session_explicit": True,
+                "session_created": False,
+                "is_delta_request": False,
+                "session_fallback_reason": None,
+                "delta_messages": [],
+                "original_message_count": 1,
+                "body_override": None,
+                "body_json": None,
+            }
+        ),
+    )
+
+    monkeypatch.setattr(
+        "proxy.router._build_slot_context",
+        MagicMock(return_value=(None, None, 3.0)),
+    )
+    monkeypatch.setattr(
+        "proxy.router._check_slot_availability",
+        AsyncMock(return_value=None),
+    )
+
+    response = await proxy_to_local(
+        _dummy_request(
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            stream=True,
+        ),
+        "v1/chat/completions",
+    )
+
+    # Consume the first chunk (triggers lease refresh in stream_generator)
+    gen = response.body_iterator.__aiter__()
+    chunk1 = await gen.__anext__()
+    assert chunk1 is not None
+
+    # After consuming one chunk, the dispatch record should exist and have
+    # a future expires_at (refreshed when _has_actual_data was True).
+    assert "test-session-lease-refresh" in server.local_dispatch_records, (
+        "Dispatch record should exist for the explicit session"
+    )
+    record = server.local_dispatch_records["test-session-lease-refresh"]
+    assert record["expires_at"] > time.monotonic(), (
+        f"Dispatch lease expires_at ({record['expires_at']}) should be in the "
+        f"future, but time.monotonic()={time.monotonic()}"
+    )
+
+    # Consume remaining chunks (clean shutdown)
+    try:
+        while True:
+            await gen.__anext__()
+    except StopAsyncIteration:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lease_adaptive_timeout_large_prompt(monkeypatch):
+    """The dispatch lease initial timeout should be extended for large prompts.
+
+    LP-0MRDUQ9QC003LDDP: Large-context requests with cache prefill >180s must
+    have an extended initial lease timeout so the lease covers the prefill phase
+    before any data chunks arrive. For a ~48K-token prompt, the extension is
+    approximately 48K * 0.015s = 720s, giving a total lease of ~900s.
+    """
+    from proxy.router_helpers import _try_acquire_local_dispatch, _get_lease_timeout_seconds
+
+    # Set up dispatch tracking on server state
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+
+    # Configure server with base 180s lease timeout
+    monkeypatch.setattr(
+        server, "config",
+        {"server": {"local_dispatch_lease_timeout_seconds": 180}},
+    )
+    monkeypatch.setattr(server, "logger", MagicMock())
+
+    # Large prompt (~48K tokens: 48000 * 4 chars/token = 192000 chars)
+    large_body = {
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "hello " * 48000},
+        ],
+    }
+
+    acquired, owner, count, retry = await _try_acquire_local_dispatch(
+        server,
+        max_local=1,
+        session_key="test-large-prompt",
+        backend="local",
+        body_json=large_body,
+    )
+
+    assert acquired is True
+    record = server.local_dispatch_records["test-large-prompt"]
+
+    base_timeout = _get_lease_timeout_seconds(server)
+    actual_lease = record["expires_at"] - record["started_at"]
+
+    # For a 48K-token prompt: base=180s, extension ~720s => ~900s total
+    # The lease should be significantly longer than the base 180s
+    assert actual_lease > base_timeout + 300, (
+        f"Expected lease extended for large prompt (48K tokens), "
+        f"got {actual_lease:.0f}s (base={base_timeout}s)"
+    )
+    # But it shouldn't exceed the max (1500s)
+    assert actual_lease <= 1500, (
+        f"Expected lease capped at 1500s max, got {actual_lease:.0f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lease_adaptive_timeout_small_prompt(monkeypatch):
+    """Small prompts should use the base lease timeout without significant extension.
+
+    LP-0MRDUQ9QC003LDDP: For small requests (<180s), the lease timeout
+    should remain at the base 180s without significant adaptive extension.
+    """
+    from proxy.router_helpers import _try_acquire_local_dispatch, _get_lease_timeout_seconds
+
+    # Set up dispatch tracking on server state
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+
+    monkeypatch.setattr(
+        server, "config",
+        {"server": {"local_dispatch_lease_timeout_seconds": 180}},
+    )
+    monkeypatch.setattr(server, "logger", MagicMock())
+
+    # Small prompt (~10 tokens)
+    small_body = {
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "Hello, how are you?"},
+        ],
+    }
+
+    acquired, owner, count, retry = await _try_acquire_local_dispatch(
+        server,
+        max_local=1,
+        session_key="test-small-prompt",
+        backend="local",
+        body_json=small_body,
+    )
+
+    assert acquired is True
+    record = server.local_dispatch_records["test-small-prompt"]
+
+    base_timeout = _get_lease_timeout_seconds(server)
+    actual_lease = record["expires_at"] - record["started_at"]
+
+    # For a small prompt, the lease should be close to the base timeout
+    # (extension is negligible: ~10 tokens * 0.015 = 0.15s)
+    assert abs(actual_lease - base_timeout) < 10, (
+        f"Expected lease close to base timeout for small prompt, "
+        f"got {actual_lease:.0f}s (base={base_timeout}s)"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

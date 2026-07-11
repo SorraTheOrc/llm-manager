@@ -10,6 +10,37 @@ if [[ -z "${model}" || "${model}" == "router" ]]; then
 fi
 
 ##
+# Helper: read global ngl (GPU layers) from models.ini [global] section
+# Usage: get_global_ngl [models-ini-path]
+# Returns the ngl value as a string (e.g., "99"), or empty string if not found.
+##
+get_global_ngl() {
+  local ini_file="${1:-models.ini}"
+
+  if [[ ! -f "$ini_file" ]]; then
+    return 1
+  fi
+
+  # Use awk to find the [global] section and extract ngl
+  awk 'BEGIN { found=0; val="" }
+  /^\[/ {
+    gsub(/\[|\]/, "")
+    if (tolower($0) == "global") {
+      found=1
+    } else {
+      found=0
+    }
+  }
+  found && /^ngl[ \t]*=/ {
+    gsub(/.*=/, "")
+    gsub(/^[ \t]+|[ \t]+$/, "")
+    val=$0
+    exit
+  }
+  END { if (val != "") print val }' "$ini_file"
+}
+
+##
 # Helper: read ctx-size from models.ini for a given model name
 # Usage: get_ctx_size <model-name> [models-ini-path]
 ##
@@ -112,6 +143,13 @@ if [[ "$router_mode" -eq 1 ]]; then
 
   echo "Using llama-server binary: $LLAMA_BIN"
 
+  # Read GPU offload level from models.ini [global] ngl.
+  # Supports LLAMA_NGL env var override for CPU-only rollback (LLAMA_NGL=0).
+  # Falls back to ngl=0 (CPU-only) when models.ini is absent or lacks [global] ngl.
+  GLOBAL_NGL="${LLAMA_NGL:-$(get_global_ngl "$MODELS_INI")}"
+  : "${GLOBAL_NGL:=0}"
+  echo "GPU layers (ngl): $GLOBAL_NGL"
+
   # Default parallelism. Can be overridden via LLAMA_PARALLEL env var (set
   # by the proxy lifecycle from server.session_slot_pool_size in config.yaml).
   # Keeping these values aligned is critical: mismatch causes slot exhaustion
@@ -125,6 +163,7 @@ if [[ "$router_mode" -eq 1 ]]; then
     --parallel "$LLAMA_PARALLEL"
     --host 0.0.0.0
     --no-mmap
+    -ngl "$GLOBAL_NGL"
     --port $PORT
   )
 
@@ -172,7 +211,7 @@ case "$model" in
     # forces weights to be loaded into memory which often improves throughput.
     EXTRA_CMD_SWITCHES="--gpt-oss-120b-default --no-mmap"
     ;;
-  qwen3|qwen3-next)
+  qwen3)
     REPOID=unsloth
     MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
     QUANTIZATION=Q8_0
@@ -186,7 +225,7 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj"
+    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj --jinja"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   mxbai-embed)

@@ -45,6 +45,7 @@ from proxy.session import (  # noqa: E402
     _record_restore_success,
     evaluate_stream_guardrail,
     _should_invalidate_on_guardrail,
+    extract_streamed_assistant_message_from_sse,
     merge_session_history_for_update,
     session_single_flight_coordinator,
     slot_lock_coordinator,
@@ -84,6 +85,7 @@ from .router_helpers import (  # noqa: E402
     _schedule_recv_token_increment,
     _schedule_token_increment,
     _try_acquire_local_dispatch,
+    _get_lease_timeout_seconds,
     _call_with_backend_retries,
     _call_with_empty_retry,
     normalize_upstream_request_headers,
@@ -316,6 +318,9 @@ async def _update_session_and_slot(
             if collected_content is not None and collected_content:
                 full_response = "".join(collected_content)
                 assistant_content = _extract_assistant_content_from_sse(full_response)
+                assistant_message = extract_streamed_assistant_message_from_sse(
+                    full_response
+                )
                 existing_messages = []
                 if is_delta_request and delta_messages:
                     session_obj = await srv.session_manager.get(session_id)
@@ -327,6 +332,7 @@ async def _update_session_and_slot(
                     delta_messages=delta_messages,
                     is_delta_request=is_delta_request,
                     assistant_content=assistant_content,
+                    assistant_message=assistant_message,
                 )
                 await srv.session_manager.update_messages(session_id, full_messages)
             elif hasattr(response, "content") and isinstance(getattr(response, 'content', None), (bytes, str)):
@@ -334,6 +340,13 @@ async def _update_session_and_slot(
                 resp_content = response.content.decode("utf-8", errors="replace")
                 resp_json = json.loads(resp_content) if resp_content else {}
                 assistant_content = _extract_assistant_content(resp_json)
+                assistant_message = None
+                if isinstance(resp_json, dict):
+                    choices = resp_json.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        maybe_message = choices[0].get("message")
+                        if isinstance(maybe_message, dict):
+                            assistant_message = maybe_message
                 existing_messages = []
                 if is_delta_request and delta_messages:
                     session_obj = await srv.session_manager.get(session_id)
@@ -345,6 +358,7 @@ async def _update_session_and_slot(
                     delta_messages=delta_messages,
                     is_delta_request=is_delta_request,
                     assistant_content=assistant_content,
+                    assistant_message=assistant_message,
                 )
                 await srv.session_manager.update_messages(session_id, full_messages)
             else:
@@ -662,6 +676,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             max_local=local_max,
             session_key=session_id,
             backend="local",
+            body_json=body_json if isinstance(body_json, dict) else None,
         )
         if not acquired:
             srv.logger.info(
@@ -961,7 +976,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 _stream_aiter.__anext__()
                             )
                             _heartbeat_interval = stream_heartbeat_interval
-                            _heartbeat_bytes = b"data: {\"type\":\"heartbeat\"}\n\n"
                             remaining_budget = runtime_budget
                             while True:
                                 _hb_task = asyncio.ensure_future(
@@ -988,7 +1002,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         )
                                         break
                                     remaining_budget -= _heartbeat_interval
-                                    yield _heartbeat_bytes
+                                    # Build heartbeat JSON with token progress (LP-0MRDFUHMP005SFU2)
+                                    _pct = (
+                                        round(completion_tokens_total / max_completion_tokens * 100, 1)
+                                        if max_completion_tokens > 0
+                                        else 0.0
+                                    )
+                                    _hb = (
+                                        'data: {"type":"heartbeat",'
+                                        f'"tokens":{completion_tokens_total},'
+                                        f'"max_tokens":{max_completion_tokens},'
+                                        f'"pct":{_pct}}}' + '\n\n'
+                                    ).encode("utf-8")
+                                    yield _hb
                                     continue
 
                                 # A chunk arrived — cancel the heartbeat task
@@ -1091,6 +1117,25 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                                 if _has_actual_data:
                                     remaining_budget = float(stream_idle_timeout)
+
+                                # Refresh dispatch lease expiry for long-running
+                                # streams (LP-0MRDKV44T003FRBP).  Extend the lease
+                                # whenever real data arrives, not on heartbeats,
+                                # so that streams lasting longer than
+                                # local_dispatch_lease_timeout_seconds do not lose
+                                # their lease mid-stream.
+                                if _has_actual_data and session_id and session_explicit:
+                                    try:
+                                        _lease_lock = getattr(srv, 'local_dispatch_records_lock', None)
+                                        if _lease_lock is not None:
+                                            _lease_timeout = _get_lease_timeout_seconds(srv)
+                                            async with _lease_lock:
+                                                if session_id in srv.local_dispatch_records:
+                                                    srv.local_dispatch_records[session_id]['expires_at'] = (
+                                                        time.monotonic() + _lease_timeout
+                                                    )
+                                    except Exception:
+                                        pass
 
                                 # guardrail check
                                 if not guardrail_reason:
@@ -1241,12 +1286,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 llama_log_offset=llama_log_offset,
                             )
 
+                            # Wrap both cm.__aexit__ and client.aclose() with a
+                            # configurable timeout so that an unresponsive upstream
+                            # (llama-server stalled mid-stream) does not block the
+                            # generator cleanup, which would prevent session counter
+                            # and scheduler slot release (LP-0MRE7CMVZ002D2QU).
+                            disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
                             try:
-                                await cm.__aexit__(None, None, None)
-                            except Exception:
+                                await asyncio.wait_for(
+                                    cm.__aexit__(None, None, None),
+                                    timeout=disconnect_cleanup_timeout,
+                                )
+                            except (asyncio.TimeoutError, Exception):
                                 pass
                             try:
-                                disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (asyncio.TimeoutError, Exception):
                                 pass

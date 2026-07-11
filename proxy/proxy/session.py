@@ -275,6 +275,7 @@ def _resolve_log_path(source: str = "proxy") -> Path:
 # Content extraction from SSE chunks
 # ===================================================================
 
+
 def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
     """Extract concatenated delta.content and delta.reasoning_content strings
     from an SSE chunk.
@@ -336,6 +337,98 @@ def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def extract_streamed_assistant_message_from_sse(
+    sse_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Reconstruct an assistant message from streaming SSE text.
+
+    Collects ``content``, ``reasoning_content``, and streamed ``tool_calls``
+    deltas so the persisted session history retains the same token-bearing
+    fields that were present in the upstream response.
+    """
+    if not sse_text:
+        return None
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls_by_index: dict[int, Dict[str, Any]] = {}
+
+    def _merge_tool_call(target: Dict[str, Any], delta: Dict[str, Any]) -> None:
+        if not isinstance(delta, dict):
+            return
+        if delta.get("id") and not target.get("id"):
+            target["id"] = str(delta["id"])
+        if delta.get("type") and not target.get("type"):
+            target["type"] = str(delta["type"])
+        function_delta = delta.get("function")
+        if isinstance(function_delta, dict):
+            function_target = target.setdefault("function", {})
+            name = function_delta.get("name")
+            if isinstance(name, str) and name and not function_target.get("name"):
+                function_target["name"] = name
+            arguments = function_delta.get("arguments")
+            if arguments is not None:
+                function_target["arguments"] = str(function_target.get("arguments", "")) + str(arguments)
+
+    try:
+        for line in sse_text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                j = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(j, dict):
+                continue
+            for choice in j.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                if content is not None:
+                    content_parts.append(str(content))
+                reasoning = delta.get("reasoning_content")
+                if reasoning is not None:
+                    reasoning_parts.append(str(reasoning))
+                tool_calls = delta.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for fallback_index, tool_call in enumerate(tool_calls):
+                        if not isinstance(tool_call, dict):
+                            continue
+                        raw_index = tool_call.get("index", fallback_index)
+                        try:
+                            tool_index = int(raw_index)
+                        except Exception:
+                            tool_index = fallback_index
+                        target = tool_calls_by_index.setdefault(
+                            tool_index,
+                            {"function": {}},
+                        )
+                        _merge_tool_call(target, tool_call)
+    except Exception:
+        return None
+
+    if not (content_parts or reasoning_parts or tool_calls_by_index):
+        return None
+
+    assistant_message: Dict[str, Any] = {"role": "assistant"}
+    if content_parts:
+        assistant_message["content"] = "".join(content_parts)
+    if reasoning_parts:
+        assistant_message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls_by_index:
+        assistant_message["tool_calls"] = [
+            tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
+        ]
+    return assistant_message
 
 
 # ===================================================================
@@ -602,6 +695,22 @@ async def _invalidate_session_and_slot(
                         pass
         except Exception:
             pass
+    # Mark the model's cache as cold for smart routing (LP-0MRCSSBTM002NK3B).
+    # When cache is invalidated, large-context requests should be routed to
+    # remote fallback instead of attempting expensive full re-prefill.
+    try:
+        srv = _srv()
+        if srv.current_model:
+            from proxy.provider import mark_model_cache_cold
+            mark_model_cache_cold(srv.current_model)
+            srv.logger.info(
+                "model_cache_marked_cold model=%s reason=%s",
+                srv.current_model,
+                reason or "invalidation",
+            )
+    except Exception:
+        pass
+
     if reason:
         _record_session_invalidation(reason)
     if slot_filename:
@@ -890,14 +999,21 @@ def merge_session_history_for_update(
     delta_messages: Optional[List[Dict[str, Any]]],
     is_delta_request: bool,
     assistant_content: Optional[str],
+    assistant_message: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if is_delta_request and delta_messages:
         merged = list(existing_messages) + list(delta_messages)
     else:
         merged = list(request_messages)
 
-    if assistant_content:
-        if not merged or merged[-1].get("role") != "assistant" or merged[-1].get("content") != assistant_content:
+    if assistant_message is not None:
+        merged.append(dict(assistant_message))
+    elif assistant_content:
+        if (
+            not merged
+            or merged[-1].get("role") != "assistant"
+            or merged[-1].get("content") != assistant_content
+        ):
             merged.append({"role": "assistant", "content": assistant_content})
     return merged
 

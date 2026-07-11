@@ -536,6 +536,29 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
   unavailable until the cooldown expires. Multi-worker deployments (multiple
   proxy processes) have independent cooldown state per worker.
 
+##### Cross-Request Stall Circuit Breaker (Tier 3)
+
+In addition to the per-failure cooldown above (Tier 2), the proxy includes a
+cross-request stall circuit breaker (Tier 3) that tracks stall frequency per
+provider within a sliding time window. When a provider exceeds the stall
+threshold within the window, it is marked unavailable via the same cooldown
+mechanism, affecting subsequent requests immediately.
+
+This prevents unreliable providers from stalling on every request, since the
+per-stream retry count resets between requests. A provider that stalls
+repeatedly across requests is quarantined after the threshold is exceeded.
+
+- **Sliding window**: 300 seconds (default)
+- **Stall threshold**: 3 stalls (default) within window triggers cooldown
+- **Cooldown duration**: 180 seconds (default) — separate from provider_cooldown_seconds
+- **Configuration keys** (optional, defaults apply when absent):
+  - `server.upstream_stall_window_seconds` (default: 300)
+  - `server.upstream_stall_threshold` (default: 3)
+  - `server.upstream_stall_cooldown_seconds` (default: 180)
+- **State**: In-memory only, resets on proxy restart. Shared across all sessions.
+- **Integration**: Uses the same `mark_provider_unavailable()` mechanism as Tier 2.
+  Stalls during cooldown are recorded but do not extend the cooldown.
+
 #### All Providers Exhausted
 
 When all providers are exhausted:
@@ -695,6 +718,44 @@ localhost (127.0.0.1).
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
+
+### Upstream Timeout Configuration
+
+The proxy uses two separate timeout values for upstream remote connections:
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `server.upstream_idle_timeout_seconds` | `30` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. Reduced from 60s to 30s for faster stall detection (LP-0MRFEXXVC001RYKB). Operators with long-thinking models may increase this value. |
+| `server.upstream_retry_connect_timeout_seconds` | `30` | Timeout for establishing a retry connection after a stall. Decoupled from the idle timeout so operators can tune retry connection timeouts independently (typically shorter). |
+| `server.upstream_retry_max_attempts` | `3` | Maximum number of retry attempts (initial attempt + retries) for a stalled upstream stream. Aligned with Pi's default maxRetries=3. |
+| `server.upstream_retry_base_delay_seconds` | `2.0` | Base delay for exponential backoff between retries. The actual delay is `min(base_delay * 2^attempt, max_delay)`. Aligned with Pi's default maxRetryDelayMs=60000. |
+| `server.upstream_retry_max_delay_seconds` | `60.0` | Maximum delay between retries (cap on exponential backoff). |
+| `server.upstream_request_timeout_seconds` | `120` | Upstream request-level timeout (LP-0MRF77A0E0026B9T). Caps the read timeout for the initial HTTP response from the upstream provider. Prevents 15+ minute silent hangs when the upstream is slow to respond or silently returns empty content. Different from the per-chunk idle timeout (`upstream_idle_timeout_seconds`) which detects mid-stream stalls. |
+| `server.upstream_empty_retry_max_attempts` | `1` | Maximum number of additional attempts when an upstream returns a semantically empty response (no content, stopReason: stop, total_tokens: 0). Default: 1 retry. |
+| `server.upstream_empty_retry_base_delay_seconds` | `2.0` | Base delay (in seconds) before retrying on empty response. |
+| `server.upstream_stall_window_seconds` | `300` | Sliding window duration (seconds) for the cross-request stall circuit breaker (Tier 3). Stalls older than this are ignored when counting toward the threshold. |
+| `server.upstream_stall_threshold` | `3` | Number of stalls within the sliding window that triggers the circuit breaker to mark the provider unavailable for the cooldown duration. |
+| `server.upstream_stall_cooldown_seconds` | `180` | Cooldown duration (seconds) applied when the stall circuit breaker threshold is exceeded. Separate from `provider_cooldown_seconds` (Tier 2 cooldown). |
+
+The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
+
+### Remote HTTP Client Configuration
+
+The proxy uses a shared, pooled `httpx.AsyncClient` for all remote upstream requests, replacing per-request client creation. This enables connection reuse (TCP/TLS keepalive) and configurable connection-level timeouts.
+
+Configuration is under `server.remote_http_client`:
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `server.remote_http_client.connect_timeout_seconds` | `30` | Timeout for establishing new connections to upstream providers. |
+| `server.remote_http_client.read_timeout_seconds` | `300` | Read timeout for the entire response. Set generously to avoid interfering with per-request adaptive timeouts. |
+| `server.remote_http_client.pool_connections` | `50` | Maximum number of connections in the pool. |
+| `server.remote_http_client.pool_keepalive_connections` | `10` | Maximum number of idle keepalive connections to maintain. |
+| `server.remote_http_client.keepalive_seconds` | `60` | Time in seconds before an idle keepalive connection is closed. |
+
+The pool is initialized at server startup and closed on shutdown. Per-request adaptive timeouts (see Adaptive Timeouts) still apply via the `timeout` parameter passed to each request, independent of the pool's connection-level timeouts.
+
+Retry behavior uses bounded exponential backoff: `delay = min(base_delay * 2^attempt, max_delay)`. After all retry attempts are exhausted, the provider-level cooldown (see Provider Fallback) applies separately, preventing immediate retry by subsequent requests.
 
 ### Development Mode
 
@@ -916,6 +977,37 @@ curl http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+#### Lease Release
+
+Proactively release the dispatch lease for the caller's session, allowing other
+sessions to acquire the local backend without waiting for the idle timeout
+(default 180s) or disconnect detection.
+
+```bash
+curl -X POST http://localhost:8000/v1/leases/release \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "sess-abc123"}'
+```
+
+Response (200 — lease released or no matching lease):
+```json
+{"status": "ok"}
+```
+
+Response (400 — missing/empty `session_id`):
+```json
+{"detail": "session_id is required"}
+```
+
+The endpoint is **idempotent**: calling it with a `session_id` that has no
+matching lease returns `200 OK` (no-op). This is useful for automated
+workflows that want to clean up after completing a task without knowing
+whether the lease is still active.
+
+**Important:** This endpoint only releases the dispatch lease record from
+`local_dispatch_records`. It does **not** release the scheduler slot (job
+ownership), which is managed separately via disconnect detection or timeout.
 
 ### Admin Endpoints
 

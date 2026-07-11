@@ -159,12 +159,14 @@ models:
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
+        forward_session_headers: false
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
+        forward_session_headers: false
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -179,7 +181,7 @@ models:
     providers:
       - name: local-qwen3-next
         type: local
-        llama_model: Qwen3-Next
+        llama_model: Qwen3
     aliases:
     - qwen3-next
     - qwen3-coder-next
@@ -189,19 +191,21 @@ models:
     providers:
       - name: local-qwen3-next
         type: local
-        llama_model: Qwen3-Next
+        llama_model: Qwen3
       - name: opencode-deepseek-free
         type: remote
         provider: opencode
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
+        forward_session_headers: false
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
+        forward_session_headers: false
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -245,7 +249,25 @@ server:
   # Adaptive timeout: base + per_token * prompt_tokens
   llama_adaptive_timeout_enabled: true
   llama_adaptive_timeout_base_seconds: 60
-  llama_adaptive_timeout_per_token_seconds: 0.01
+  llama_adaptive_timeout_per_token_seconds: 0.015
+  # Remote-specific adaptive timeout overrides (optional).
+  # When set, these values are used instead of the local adaptive timeout
+  # parameters for remote provider requests. Remote providers may have
+  # different latency characteristics requiring shorter timeouts.
+  # Falls back to the local values above when not configured.
+  llama_remote_request_timeout_base_seconds: 60
+  llama_remote_request_timeout_per_token_seconds: 0.015
+  # Large-context cold-cache fallback threshold (LP-0MRCSSBTM002NK3B).
+  # When the slot cache is cold (invalidated) and estimated prompt tokens exceed
+  # this value, local routing is bypassed and the request falls through to the
+  # next remote provider immediately. Set to 0 to disable.
+  local_large_context_cold_cache_threshold: 20000
+
+  # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
+  # When the slot cache is warm (cached prefix) but estimated prompt tokens
+  # exceed this value, local routing is bypassed to avoid GPU prefill contention
+  # on very large contexts. Set to 0 to disable. Default: 60000.
+  local_large_context_warm_cache_threshold: 30000
   llama_router_mode: true
   max_concurrent_queries: 16
   # Local-model concurrency limit (LP-0MR5MAJNM005R905).
@@ -258,6 +280,13 @@ server:
   # last request completes, preventing other sessions from acquiring the
   # local backend.  The lease is released when the timeout expires,
   # allowing other sessions to use the local backend.
+  #
+  # local_dispatch_lease_per_token_seconds: Additional lease time (seconds)
+  #   added per estimated prompt token for large-context requests, reused from
+  #   llama_adaptive_timeout_per_token_seconds (0.015) if not explicitly set.
+  #   This prevents mid-stream lease expiry during cache prefill.
+  # local_dispatch_lease_max_seconds: Hard upper bound for the adaptive lease
+  #   timeout, defaults to 1500 (same as default llama_request_timeout).
   local_dispatch_lease_timeout_seconds: 180
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
@@ -286,6 +315,85 @@ server:
   # chunk before synthesising a final finish_reason:stop event and ending
   # the stream.  Default: 30 seconds.
   stream_idle_timeout_seconds: 30
+
+  # Upstream stall idle timeout (LP-0MRE52D3C001KP1H).
+  # When the remote upstream stops sending data mid-stream without closing
+  # the connection or sending a finish_reason, the proxy waits this long
+  # for the next chunk before detecting a stall, closing the connection,
+  # and retrying with bounded exponential backoff.
+  # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
+  # Reduced from 60s to 30s for faster stall detection (LP-0MRFEXXVC001RYKB).
+  # Operators with long-thinking models may increase this value.
+  # Default: 30 seconds.
+  upstream_idle_timeout_seconds: 30
+
+  # Cross-request stall circuit breaker (LP-0MRFEXXVC001RYKB).
+  # Tracks stall frequency per provider within a sliding time window.
+  # When the stall count exceeds the threshold within the window, the
+  # provider is marked unavailable for the cooldown duration, causing
+  # subsequent requests to skip directly to the next provider.
+  #
+  # This is Tier 3 of the retry system (complementing Tier 1 per-stream
+  # retries and Tier 2 provider cooldown). All keys are optional; defaults
+  # apply silently when absent.
+  # Sliding window duration in seconds. Stalls older than this are ignored.
+  upstream_stall_window_seconds: 300
+  # Stall count threshold within window before triggering cooldown.
+  upstream_stall_threshold: 3
+  # Cooldown duration in seconds for providers exceeding threshold.
+  upstream_stall_cooldown_seconds: 180
+
+  # Upstream retry connection timeout (LP-0MRE8FYKV008WOTB).
+  # When the proxy retries a stalled upstream connection, this timeout
+  # controls how long to wait for the retry connection to be established.
+  # Decoupled from upstream_idle_timeout_seconds so operators can tune
+  # retry connection timeouts independently (typically shorter).
+  # Default: 30 seconds.
+  upstream_retry_connect_timeout_seconds: 30
+
+  # Remote HTTP client configuration (LP-0MRE8G3JK0099Y4J).
+  # Controls connection pooling and timeouts for remote upstream requests.
+  # The shared pool replaces per-request httpx.AsyncClient() creation.
+  remote_http_client:
+    # Connection-level timeout for establishing new connections.
+    connect_timeout_seconds: 30
+    # Read timeout for the entire response (generous to not interfere
+    # with per-request adaptive timeouts).
+    read_timeout_seconds: 300
+    # Maximum number of connections in the pool.
+    pool_connections: 50
+    # Maximum number of keepalive connections to maintain.
+    pool_keepalive_connections: 10
+    # Time in seconds before an idle keepalive connection is closed.
+    keepalive_seconds: 60
+
+  # Upstream retry configuration (LP-0MRE8G94H005ZBLV).
+  # Controls per-stream retry behavior for remote upstream connections.
+  # Aligned with Pi's default retry settings (maxRetries=3, maxRetryDelayMs=60000).
+  # Note: these are per-stream retries; after they exhaust, the provider-level
+  # cooldown in provider.py applies separately.
+  upstream_retry_max_attempts: 3
+  upstream_retry_base_delay_seconds: 2.0
+  upstream_retry_max_delay_seconds: 60.0
+
+  # Upstream request-level timeout (LP-0MRF77A0E0026B9T).
+  # How long to wait for the initial HTTP response from the upstream provider.
+  # Prevents 15+ minute silent hangs when the upstream is slow to respond or
+  # silently returns empty content. This is different from the per-chunk idle
+  # timeout (upstream_idle_timeout_seconds) which detects mid-stream stalls.
+  # Default: 120 seconds.
+  upstream_request_timeout_seconds: 120
+
+  # Empty-response retry configuration (LP-0MRF77A0E0026B9T).
+  # When an upstream returns a complete but semantically empty response
+  # (no content, stopReason: stop, total_tokens: 0), retry with the same
+  # model up to this many additional attempts before falling through to
+  # the next provider in the fallback chain.
+  # Default: 1 retry (1 additional attempt).
+  upstream_empty_retry_max_attempts: 1
+  # Base delay (in seconds) before retrying on empty response.
+  # Default: 2.0 seconds.
+  upstream_empty_retry_base_delay_seconds: 2.0
 
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy

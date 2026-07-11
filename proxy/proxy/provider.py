@@ -39,6 +39,341 @@ _provider_failure_count: Dict[str, int] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
+# ---------------------------------------------------------------------------
+# Three-tier retry system (LP-0MRE8G94H005ZBLV, LP-0MRFEXXVC001RYKB)
+#
+# The proxy has three layers of retry for remote upstream requests:
+#
+# Tier 1 — Per-stream retries (proxy_remote.py:_handle_remote_streaming)
+#   - Fires on upstream stall (idle timeout) or httpx ReadTimeout
+#   - Bounded exponential backoff: base_delay * 2^attempt, capped at max_delay
+#   - Configurable via server.upstream_retry_* config keys
+#   - After max_attempts exhausted, yields finish_reason:error and the
+#     caller (provider.py fallback chain) routes to the next provider
+#   - Total max wait time approximates: sum of capped backoff delays
+#
+# Tier 2 — Provider-level cooldown (provider.py)
+#   - Applied after a provider fails (Tier 1 exhausted or other failure)
+#   - Provider is marked unavailable for cooldown_seconds
+#   - Uses its own exponential backoff via _provider_failure_count
+#   - Configurable via server.provider_cooldown_seconds
+#
+# Tier 3 — Cross-request stall circuit breaker
+#           (stall_circuit_breaker.py:_check_stall_circuit_breaker)
+#   - Tracks stall frequency per provider within a sliding time window
+#   - When stall count exceeds threshold within window, marks provider
+#     unavailable via the same Tier 2 cooldown mechanism
+#   - Configurable via server.upstream_stall_window_seconds,
+#     server.upstream_stall_threshold, server.upstream_stall_cooldown_seconds
+#   - Default: 3 stalls within 300s window triggers 180s cooldown
+#
+# Interaction:
+#   Tier 1 retries fire first for streaming connections that stall.
+#   If Tier 1 exhausts (max retries reached), the stall circuit breaker
+#   (Tier 3) records the stall. If the threshold is exceeded across
+#   requests, the provider is marked unavailable via Tier 2 cooldown.
+#   For non-streaming errors (e.g., HTTP 4xx/5xx), Tier 1 is bypassed
+#   and Tier 2 cooldown applies directly.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Cache-invalidation state for smart routing (LP-0MRCSSBTM002NK3B)
+# ---------------------------------------------------------------------------
+
+# Set of model names whose slot cache is currently invalidated (cold).
+# When the slot cache for a model is cold, large-context requests may be
+# routed directly to remote fallback to avoid expensive full re-prefill.
+# Models whose slot cache is currently cold (invalidated or just started).
+# Sentinel: True until initialize_cache_cold_from_config runs.
+# This prevents a race between proxy restart (where the OLD process handles
+# requests before the NEW process's lifespan startup executes). Without this,
+# _model_cache_cold is an empty set() and all models appear warm.
+_model_cache_cold_uninitialized: bool = True
+
+# Set of model names whose slot cache is currently cold.
+# Populated by initialize_cache_cold_from_config at startup.
+_model_cache_cold: set[str] = set()
+
+def _cache_cold_initialized() -> None:
+    """Mark the cache-cold state as fully initialized."""
+    global _model_cache_cold_uninitialized
+    _model_cache_cold_uninitialized = False
+
+def mark_model_cache_cold(model_name: str) -> None:
+    """Mark a model's slot cache as invalidated (cold).
+
+    This causes large-context requests for this model to skip local routing
+    and fall through to the next remote provider in the chain.
+    """
+    if model_name:
+        _model_cache_cold.add(model_name)
+
+def clear_model_cache_cold(model_name: str) -> None:
+    """Clear a model's cache-cold flag, restoring normal local routing."""
+    if model_name:
+        _model_cache_cold.discard(model_name)
+
+def is_model_cache_cold(model_name: str) -> bool:
+    """Check if a model's slot cache is currently marked as cold.
+
+    Before initialize_cache_cold_from_config has been called, ALL models are
+    assumed cold to prevent a race between proxy process restarts.
+    After initialization, returns True only for explicitly-cold models.
+    """
+    if _model_cache_cold_uninitialized:
+        return bool(model_name)
+    return model_name in _model_cache_cold if model_name else False
+
+
+def initialize_cache_cold_from_config(config: dict) -> None:
+    """Mark all local models' caches as cold at startup.
+
+    Scans the config for models with local providers and adds their
+    ``llama_model`` names to the cache-cold set. This ensures that after
+    proxy restart or model reload, large-context requests are routed to
+    remote fallback instead of attempting expensive full re-prefill.
+
+    Safe to call multiple times — clears any existing state first.
+    """
+    _cache_cold_initialized()
+    _model_cache_cold.clear()
+    models = config.get("models", {})
+    if not isinstance(models, dict):
+        return
+    for model_name, model_cfg in models.items():
+        if not isinstance(model_cfg, dict):
+            continue
+        providers = model_cfg.get("providers", [])
+        if not isinstance(providers, list):
+            continue
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            if provider.get("type") == "local":
+                llama_model = provider.get("llama_model")
+                if llama_model:
+                    _model_cache_cold.add(str(llama_model))
+    import logging as _logging
+    _logging.getLogger("llama-proxy.provider").info(
+        "cache_cold_initialized models=%s uninitialized_sentinel_cold_until=%s",
+        sorted(_model_cache_cold) if _model_cache_cold else "(none)",
+        _model_cache_cold_uninitialized,
+    )
+
+
+def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
+    """Estimate prompt token count for smart-routing decisions.
+
+    Concatenates all non-system message content (including reasoning_content
+    and tool_calls) and uses tiktoken (via ``count_text_tokens``) for
+    accurate token counting.  Falls back to a conservative byte-based
+    heuristic (1 byte per token) when tiktoken is unavailable.
+
+    System prompts are excluded as they are typically small and not the
+    driver of large-context timeouts.
+
+    Using tiktoken guarantees correct routing decisions regardless of
+    content density — the previous byte heuristic with ``// 2`` could
+    underestimate by 2× for very dense content (hex, compact JSON with
+    bpt ~1.2), causing the cache-cold bypass to miss requests with 70K+
+    actual tokens.
+    """
+    if not isinstance(body_json, dict):
+        return 0
+    messages = body_json.get("messages", [])
+    if not messages:
+        return 0
+
+    parts: list[str] = []
+    total_bytes = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        # Count content field (system messages included — LP-0MRGT35H1003D1PM)
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+            total_bytes += len(content.encode("utf-8"))
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    text = str(item["text"])
+                    parts.append(text)
+                    total_bytes += len(text.encode("utf-8"))
+        # Count reasoning_content (assistant messages with long reasoning)
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str):
+            parts.append(reasoning)
+            total_bytes += len(reasoning.encode("utf-8"))
+        # Count tool_calls (function names and arguments)
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_func = tc.get("function")
+                if isinstance(tc_func, dict):
+                    name = tc_func.get("name", "")
+                    if isinstance(name, str):
+                        parts.append(name)
+                        total_bytes += len(name.encode("utf-8"))
+                    args = tc_func.get("arguments", "")
+                    if isinstance(args, str):
+                        parts.append(args)
+                        total_bytes += len(args.encode("utf-8"))
+
+    if not parts:
+        return 0
+
+    # Primary path: use tiktoken for accurate token counting.
+    # This correctly handles all content densities (code, JSON, text).
+    try:
+        from proxy.utils import count_text_tokens
+        text = " ".join(parts)
+        return count_text_tokens(text)
+    except Exception:
+        # Fallback: ultra-conservative byte-based heuristic (~1 byte per
+        # token).  This overestimates for all content types (code bpt ~3,
+        # JSON ~4, text ~4) guaranteeing the bypass always fires for large
+        # requests even when tiktoken is unavailable.
+        return max(1, total_bytes // 1)
+
+
+def _get_large_context_cold_cache_threshold(config: dict) -> int:
+    """Read the large-context cold-cache fallback threshold from config.
+
+    Supports both nested and flat config keys for production and test
+    compatibility.  Also supports the legacy key name
+    ``local_large_context_fallback_threshold`` for backward compatibility
+    during the transition period.
+
+    Returns 0 when not configured (disabled).
+    """
+    # New key first (preferred)
+    val = config.get("local_large_context_cold_cache_threshold")
+    if val is None:
+        val = config.get("server", {}).get("local_large_context_cold_cache_threshold")
+    # Fall back to legacy key
+    if val is None:
+        val = config.get("local_large_context_fallback_threshold")
+    if val is None:
+        val = config.get("server", {}).get("local_large_context_fallback_threshold", 0)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _get_large_context_warm_cache_threshold(config: dict) -> int:
+    """Read the large-context warm-cache bypass threshold from config.
+
+    When the model cache is warm and estimated prompt tokens exceed this
+    value, the local provider is bypassed and the request routes to the
+    next remote provider.  A value of 0 disables warm-cache bypass.
+
+    Defaults to 60000 when not configured.
+
+    Supports both nested and flat config keys for production and test
+    compatibility.
+    """
+    val = config.get("local_large_context_warm_cache_threshold")
+    if val is None:
+        val = config.get("server", {}).get("local_large_context_warm_cache_threshold", 60000)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+async def _estimate_effective_prompt_tokens_for_routing(
+    request,
+    body_json: dict,
+) -> int:
+    """Estimate prompt tokens for routing, including active session history.
+
+    ``proxy_with_fallback`` runs before local session handling has a chance to
+    compute/forward deltas. For long-running sessions, the incoming request
+    body may be small while the active session history is very large.
+
+    To avoid missing cache-cold large-context bypass in that case, this helper
+    takes the max of:
+
+    - incoming request token estimate
+    - existing session history token estimate (if a session header resolves)
+    """
+    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
+        if not session_id:
+            return estimated_tokens
+
+        import proxy.server as _srv
+
+        session_manager = getattr(_srv, "session_manager", None)
+        if session_manager is None:
+            return estimated_tokens
+
+        session = await session_manager.get(session_id)
+        if session is None:
+            return estimated_tokens
+
+        session_messages = getattr(session, "messages", None)
+        if not isinstance(session_messages, list) or not session_messages:
+            return estimated_tokens
+
+        session_tokens = _estimate_prompt_tokens_for_routing(
+            {"messages": session_messages}
+        )
+        if session_tokens > estimated_tokens:
+            logger.info(
+                "routing_estimate_session session=%s request_tokens=%d session_tokens=%d",
+                session_id[:8],
+                estimated_tokens,
+                session_tokens,
+            )
+
+        return max(estimated_tokens, session_tokens)
+    except Exception:
+        return estimated_tokens
+
+
+def _should_skip_local(
+    cache_cold: bool,
+    body_json: dict,
+    cold_cache_threshold: int,
+    warm_cache_threshold: int = 0,
+    estimated_tokens: Optional[int] = None,
+) -> bool:
+    """Determine whether a local provider should be skipped due to large context.
+
+    When the cache is cold (expensive full re-prefill), uses
+    *cold_cache_threshold*.  When the cache is warm (cached prefix, cheaper),
+    uses *warm_cache_threshold*.  A threshold of 0 disables the corresponding
+    bypass.
+
+    Args:
+        cache_cold: Whether the model's cache is marked as invalidated.
+        body_json: The parsed request body.
+        cold_cache_threshold: Token threshold for cold-cache bypass. 0 = disabled.
+        warm_cache_threshold: Token threshold for warm-cache bypass. 0 means
+            disabled (default).
+        estimated_tokens: Optional pre-computed estimate.
+
+    Returns:
+        True if local should be skipped, False for normal local routing.
+    """
+    # Select the appropriate threshold based on cache state
+    threshold = cold_cache_threshold if cache_cold else warm_cache_threshold
+    if threshold <= 0:
+        return False
+    if estimated_tokens is None:
+        estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+    return estimated_tokens > threshold
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -317,8 +652,11 @@ def _response_body_text(response: Response) -> str:
 
 
 def _add_provider_header(response: Response, provider_name: str) -> Response:
-    """Add X-Provider header to a response."""
-    response.headers.append("X-Provider", provider_name)
+    """Add X-Provider header to a response.
+
+    Uses set (not append) to prevent duplicate headers on fallback responses.
+    """
+    response.headers["X-Provider"] = provider_name
     return response
 
 
@@ -1172,6 +1510,15 @@ async def proxy_with_fallback(
     ptr_remote = _get_proxy_to_remote()
     ptr_local = _get_proxy_to_local()
 
+    # Read request body for smart-routing decisions (LP-0MRCSSBTM002NK3B).
+    # The body is cached by Starlette/FastAPI after the first read, so this
+    # is safe to call before dispatching to local/remote.
+    _raw_body = await request.body()
+    try:
+        body_json = json.loads(_raw_body) if _raw_body else {}
+    except Exception:
+        body_json = {}
+
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
@@ -1236,6 +1583,61 @@ async def proxy_with_fallback(
                     prev_provider = provider_name
                     continue
 
+                # Smart routing: skip local when cache is cold and request is large
+                # (LP-0MRCSSBTM002NK3B). This avoids expensive full re-prefill of
+                # large contexts when the slot cache is invalidated.
+                # Extended with dual-threshold (LP-0MRE4NBQ5009V5BX): when cache is
+                # warm but the request is extremely large, also bypass local using
+                # the warm-cache threshold.
+                _llama_model = provider_cfg.get("llama_model", "")
+                _cold_threshold = _get_large_context_cold_cache_threshold(config)
+                _warm_threshold = _get_large_context_warm_cache_threshold(config)
+                _cache_is_cold = is_model_cache_cold(_llama_model)
+                _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
+                    request,
+                    body_json,
+                )
+                logger.info(
+                    "routing_check provider=%s model=%s cache_cold=%s "
+                    "estimated_tokens=%d cold_threshold=%d warm_threshold=%d messages=%d",
+                    provider_name,
+                    _llama_model or "unknown",
+                    _cache_is_cold,
+                    _estimated_tokens,
+                    _cold_threshold,
+                    _warm_threshold,
+                    len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
+                )
+                if _should_skip_local(
+                    _cache_is_cold,
+                    body_json,
+                    _cold_threshold,
+                    warm_cache_threshold=_warm_threshold,
+                    estimated_tokens=_estimated_tokens,
+                ):
+                    logger.info(
+                        "cache_cold_bypass provider=%s model=%s estimated_tokens=%d "
+                        "cold_threshold=%d warm_threshold=%d "
+                        "→ skipping local, routing to next remote provider",
+                        provider_name,
+                        _llama_model or "unknown",
+                        _estimated_tokens,
+                        _cold_threshold,
+                        _warm_threshold,
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="cache_cold_skip",
+                        estimated_tokens=_estimated_tokens,
+                        threshold=_cold_threshold if _cache_is_cold else _warm_threshold,
+                    )
+                    fallback_reason = "cache_cold_large_context"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+
                 response = await ptr_local(request, path)
             else:
                 # Proactive rate-limit check for remote providers
@@ -1271,6 +1673,13 @@ async def proxy_with_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                # LP-0MRDE669Y003V1SO: On successful local response, mark
+                # cache as warm so subsequent requests route locally.
+                if provider_type == "local":
+                    try:
+                        clear_model_cache_cold(_llama_model)
+                    except Exception:
+                        pass
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 return stream_result
@@ -1570,6 +1979,13 @@ async def proxy_with_fallback(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MRDE669Y003V1SO: On successful local response, mark cache
+            # as warm so subsequent requests route locally.
+            if provider_type == "local":
+                try:
+                    clear_model_cache_cold(_llama_model)
+                except Exception:
+                    pass
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result

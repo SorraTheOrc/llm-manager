@@ -272,7 +272,15 @@ async def _attempt_router_self_heal() -> bool:
 # ===================================================================
 
 async def _backend_watchdog_loop() -> None:
-    """Watch local backend process and trigger best-effort recovery."""
+    """Watch local backend process and trigger best-effort recovery.
+
+    In router mode, when ``backend_ready`` is False but the backend
+    (llama-server) is actually reachable on its port, this function
+    resets ``backend_ready`` to True without requiring a full process
+    restart. This handles the case where ``stop_llama_server`` or a
+    transient failure sets ``backend_ready=False`` while the independent
+    host llama-server remains healthy (LP-0MRCQW0HC000J4F9).
+    """
     srv = _srv()
 
     while True:
@@ -287,15 +295,34 @@ async def _backend_watchdog_loop() -> None:
 
             proc = srv.llama_process
 
-            # LP-0MQ4GQ2LO005PZPY: If process is None (crashed or never
-            # started), attempt restart in router mode instead of skipping.
+            # LP-0MRCQW0HC000J4F9: Probe backend before attempting restart.
+            # In router mode the llama-server may be running independently
+            # on the host, not as a proxy-managed process. When the process
+            # is None or has exited, first check if the backend is actually
+            # reachable before attempting a full restart.
+            router_mode = bool(
+                srv.config.get("server", {}).get("llama_router_mode", False)
+            )
+            server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+            llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+
             if proc is None:
-                router_mode = bool(
-                    srv.config.get("server", {}).get("llama_router_mode", False)
-                )
                 if router_mode and not srv.backend_ready:
+                    # Probe the backend before attempting restart
+                    reachable = await srv._probe_backend_reachable(llama_port)
+                    if reachable:
+                        srv.logger.info(
+                            "watchdog: llama_process is None but backend is reachable on port %d, "
+                            "resetting backend_ready to True",
+                            llama_port,
+                        )
+                        srv.backend_ready = True
+                        srv.backend_recovery_state["last_failure"] = None
+                        continue
+
                     srv.logger.warning(
-                        "watchdog: llama_process is None, attempting restart"
+                        "watchdog: llama_process is None and backend unreachable, "
+                        "attempting restart"
                     )
                     recovered = await srv._attempt_router_self_heal()
                     srv.logger.info(
@@ -315,9 +342,6 @@ async def _backend_watchdog_loop() -> None:
                 if not worker_unhealthy:
                     continue
 
-            router_mode = bool(
-                srv.config.get("server", {}).get("llama_router_mode", False)
-            )
             if code is None and worker_unhealthy:
                 srv.logger.error(
                     "watchdog detected unhealthy worker while main process "
@@ -335,6 +359,24 @@ async def _backend_watchdog_loop() -> None:
                     code,
                     srv.current_model,
                 )
+
+            # LP-0MRCQW0HC000J4F9: Before marking backend_ready=False and
+            # triggering full restart, probe whether the backend is still
+            # reachable (independent host llama-server in router mode).
+            if router_mode:
+                reachable = await srv._probe_backend_reachable(llama_port)
+                if reachable:
+                    srv.logger.info(
+                        "watchdog: process exited but backend reachable on port %d, "
+                        "resetting backend_ready to True (process exited code=%s)",
+                        llama_port,
+                        code,
+                    )
+                    srv.backend_ready = True
+                    srv.llama_process = None
+                    srv.current_model = None
+                    srv.backend_recovery_state["last_failure"] = None
+                    continue
 
             srv.backend_ready = False
             srv._record_backend_signal("other_failures")

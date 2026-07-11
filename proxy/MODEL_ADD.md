@@ -230,6 +230,26 @@ comments and follow best practices.
 
 - If the proxy returns 404 for a model: check the model config and alias mapping.
 - If the embeddings response is empty or the wrong dimension: verify the llama-server exposes the expected embedding dimension and that the model supports embeddings.
+- If a remote provider returns HTTP 500 despite working when called directly via curl:
+  - Check whether the provider is receiving unexpected headers from the proxy.
+  - The most common culprit is the `session_id` header, which certain providers
+    (notably OpenCode's endpoints) reject with HTTP 500. The proxy forwards
+    session affinity headers (`session_id`, `x-client-request-id`,
+    `x-session-affinity`) by default for session locality, but some upstreams
+    do not support them.
+  - **Fix**: Add `forward_session_headers: false` to the remote provider config
+    in the model's `providers` list. This strips session headers before
+    forwarding the request upstream.
+    ```yaml
+    - name: my-remote-provider
+      type: remote
+      endpoint: https://api.example.com/v1
+      model: my-model
+      forward_session_headers: false   # <-- add this
+    ```
+  - To verify, check the proxy log for `[remote] upstream error status=500`
+    for the provider, and confirm the `session_id` header is being stripped
+    after adding the config key.
 
 ## Worked example (mxbai-embed-large-v1)
 

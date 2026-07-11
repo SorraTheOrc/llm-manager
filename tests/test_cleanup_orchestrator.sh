@@ -73,24 +73,28 @@ test_calls_all_scripts() {
 
     make_mock_script "$mock_dir/cleanup-model-cache.sh" "model-cache"
     make_mock_script "$mock_dir/cleanup-container-images.sh" "container-images"
+    make_mock_script "$mock_dir/cleanup-stopped-containers.sh" "stopped-containers"
     make_mock_script "$mock_dir/cleanup-pi-sessions.sh" "pi-sessions"
 
-    # Set PATH so the orchestrator finds our mocks
     local output
-    output=$(PATH="$mock_dir:$PATH" CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
+    output=$(PATH="$mock_dir:$PATH" \
+             CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
              CLEANUP_CONTAINER_IMAGES="$mock_dir/cleanup-container-images.sh" \
+             CLEANUP_STOPPED_CONTAINERS="$mock_dir/cleanup-stopped-containers.sh" \
              CLEANUP_PI_SESSIONS="$mock_dir/cleanup-pi-sessions.sh" \
              bash "$SCRIPT" 2>&1 || true)
 
     [ -f "$TESTS_TMPDIR/invocations.txt" ] && pass "invocations recorded" || fail "no invocations recorded"
 
-    local model_count container_count pi_count
+    local model_count container_count stopped_count pi_count
     model_count=$(grep -c "cleanup-model-cache.sh" "$TESTS_TMPDIR/invocations.txt" 2>/dev/null || echo 0)
     container_count=$(grep -c "cleanup-container-images.sh" "$TESTS_TMPDIR/invocations.txt" 2>/dev/null || echo 0)
+    stopped_count=$(grep -c "cleanup-stopped-containers.sh" "$TESTS_TMPDIR/invocations.txt" 2>/dev/null || echo 0)
     pi_count=$(grep -c "cleanup-pi-sessions.sh" "$TESTS_TMPDIR/invocations.txt" 2>/dev/null || echo 0)
 
     [ "$model_count" -ge 1 ] && pass "model-cache script called" || fail "model-cache not called"
     [ "$container_count" -ge 1 ] && pass "container-images script called" || fail "container-images not called"
+    [ "$stopped_count" -ge 1 ] && pass "stopped-containers script called" || fail "stopped-containers not called"
     [ "$pi_count" -ge 1 ] && pass "pi-sessions script called" || fail "pi-sessions not called"
 
     cleanup_tmp
@@ -107,18 +111,20 @@ test_dry_run_propagation() {
 
     make_mock_script "$mock_dir/cleanup-model-cache.sh" "model-cache"
     make_mock_script "$mock_dir/cleanup-container-images.sh" "container-images"
+    make_mock_script "$mock_dir/cleanup-stopped-containers.sh" "stopped-containers"
     make_mock_script "$mock_dir/cleanup-pi-sessions.sh" "pi-sessions"
 
     local output
     output=$(PATH="$mock_dir:$PATH" \
              CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
              CLEANUP_CONTAINER_IMAGES="$mock_dir/cleanup-container-images.sh" \
+             CLEANUP_STOPPED_CONTAINERS="$mock_dir/cleanup-stopped-containers.sh" \
              CLEANUP_PI_SESSIONS="$mock_dir/cleanup-pi-sessions.sh" \
              bash "$SCRIPT" --dry-run 2>&1 || true)
 
     local dry_run_count
     dry_run_count=$(grep -c -- "--dry-run" "$TESTS_TMPDIR/invocations.txt" 2>/dev/null || echo 0)
-    [ "$dry_run_count" -ge 3 ] && pass "--dry-run propagated to all 3 scripts (found $dry_run_count)" || fail "--dry-run not propagated to all scripts (found $dry_run_count)"
+    [ "$dry_run_count" -ge 4 ] && pass "--dry-run propagated to all 4 scripts (found $dry_run_count)" || fail "--dry-run not propagated to all scripts (found $dry_run_count)"
 
     cleanup_tmp
 }
@@ -134,12 +140,14 @@ test_child_failure() {
 
     make_mock_script "$mock_dir/cleanup-model-cache.sh" "model-cache"
     make_failing_mock "$mock_dir/cleanup-container-images.sh" "container-images"
+    make_mock_script "$mock_dir/cleanup-stopped-containers.sh" "stopped-containers"
     make_mock_script "$mock_dir/cleanup-pi-sessions.sh" "pi-sessions"
 
     local rc=0
     PATH="$mock_dir:$PATH" \
     CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
     CLEANUP_CONTAINER_IMAGES="$mock_dir/cleanup-container-images.sh" \
+    CLEANUP_STOPPED_CONTAINERS="$mock_dir/cleanup-stopped-containers.sh" \
     CLEANUP_PI_SESSIONS="$mock_dir/cleanup-pi-sessions.sh" \
     bash "$SCRIPT" 2>&1 || rc=$?
 
@@ -159,12 +167,14 @@ test_idempotent() {
 
     make_mock_script "$mock_dir/cleanup-model-cache.sh" "model-cache"
     make_mock_script "$mock_dir/cleanup-container-images.sh" "container-images"
+    make_mock_script "$mock_dir/cleanup-stopped-containers.sh" "stopped-containers"
     make_mock_script "$mock_dir/cleanup-pi-sessions.sh" "pi-sessions"
 
     local output1 output2
     output1=$(PATH="$mock_dir:$PATH" \
               CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
               CLEANUP_CONTAINER_IMAGES="$mock_dir/cleanup-container-images.sh" \
+              CLEANUP_STOPPED_CONTAINERS="$mock_dir/cleanup-stopped-containers.sh" \
               CLEANUP_PI_SESSIONS="$mock_dir/cleanup-pi-sessions.sh" \
               bash "$SCRIPT" --dry-run 2>&1 || true)
     local rc1=$?
@@ -172,6 +182,7 @@ test_idempotent() {
     output2=$(PATH="$mock_dir:$PATH" \
               CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
               CLEANUP_CONTAINER_IMAGES="$mock_dir/cleanup-container-images.sh" \
+              CLEANUP_STOPPED_CONTAINERS="$mock_dir/cleanup-stopped-containers.sh" \
               CLEANUP_PI_SESSIONS="$mock_dir/cleanup-pi-sessions.sh" \
               bash "$SCRIPT" --dry-run 2>&1 || true)
     local rc2=$?
@@ -192,12 +203,14 @@ test_dry_run_json() {
 
     make_mock_script "$mock_dir/cleanup-model-cache.sh" "model-cache"
     make_mock_script "$mock_dir/cleanup-container-images.sh" "container-images"
+    make_mock_script "$mock_dir/cleanup-stopped-containers.sh" "stopped-containers"
     make_mock_script "$mock_dir/cleanup-pi-sessions.sh" "pi-sessions"
 
     local output
     output=$(PATH="$mock_dir:$PATH" \
              CLEANUP_MODEL_CACHE="$mock_dir/cleanup-model-cache.sh" \
              CLEANUP_CONTAINER_IMAGES="$mock_dir/cleanup-container-images.sh" \
+             CLEANUP_STOPPED_CONTAINERS="$mock_dir/cleanup-stopped-containers.sh" \
              CLEANUP_PI_SESSIONS="$mock_dir/cleanup-pi-sessions.sh" \
              bash "$SCRIPT" --dry-run --json 2>&1 || true)
 

@@ -493,8 +493,51 @@ def _get_lease_timeout_seconds(srv) -> float:
         return float(
             server_cfg.get("local_dispatch_lease_timeout_seconds", 180) or 180
         )
-    except (ValueError, TypeError):
+    except Exception:
         return 180.0
+
+
+def _get_adaptive_lease_timeout_seconds(
+    srv,
+    body_json: Optional[dict] = None,
+) -> float:
+    """Return an adaptive lease timeout based on estimated prompt tokens.
+
+    For large-context requests, the base lease timeout (default 180s) may
+    be insufficient to cover the cache prefill phase where no data chunks
+    arrive to refresh the lease. This function extends the lease timeout
+    based on estimated prompt tokens using the same per-token multiplier
+    as the request timeout computation.
+
+    Formula:
+        adaptive_timeout = min(base_timeout + tokens * per_token_secs, max_lease)
+
+    When *body_json* is not provided or the adaptive timeout is not enabled,
+    the base lease timeout is returned unchanged (LP-0MRDUQ9QC003LDDP).
+    """
+    base_timeout = _get_lease_timeout_seconds(srv)
+
+    if body_json is None:
+        return base_timeout
+
+    try:
+        from proxy.lifecycle import _estimate_prompt_tokens
+
+        server_cfg = srv.config.get("server", {})
+        per_token_seconds = float(
+            server_cfg.get(
+                "local_dispatch_lease_per_token_seconds",
+                server_cfg.get("llama_adaptive_timeout_per_token_seconds", 0.015),
+            )
+        )
+        max_lease = float(
+            server_cfg.get("local_dispatch_lease_max_seconds", 1500)
+        )
+        estimated_tokens = _estimate_prompt_tokens(body_json)
+        adaptive = base_timeout + (estimated_tokens * per_token_seconds)
+        return min(adaptive, max_lease)
+    except Exception:
+        return base_timeout
 
 
 async def _decrement_local_active_queries(
@@ -566,6 +609,7 @@ async def _try_acquire_local_dispatch(
     max_local: int,
     session_key: str,
     backend: str,
+    body_json: Optional[dict] = None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -581,6 +625,11 @@ async def _try_acquire_local_dispatch(
     acquire the local backend while an unexpired lease exists, even if
     the owner has no active request in flight.
 
+    When *body_json* is provided, the lease timeout is extended adaptively
+    based on the estimated prompt token count. This prevents mid-stream
+    lease expiry during the cache prefill phase for large-context requests
+    (LP-0MRDUQ9QC003LDDP).
+
     If the server does not have *local_dispatch_records* or
     *local_dispatch_records_lock* attributes (legacy state), the function
     silently returns ``(True, None, 0, 1.0)`` to allow the request.
@@ -589,7 +638,7 @@ async def _try_acquire_local_dispatch(
     if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
         return (True, None, 0, 1.0)
 
-    lease_timeout = _get_lease_timeout_seconds(srv)
+    lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
     now = time.monotonic()
 
     try:
@@ -644,6 +693,36 @@ async def _try_acquire_local_dispatch(
         return (True, None, 0, 1.0)
 
 
+async def _release_local_dispatch(srv, session_id: str) -> bool:
+    """Explicitly release the dispatch lease for *session_id*.
+
+    Removes the dispatch record from ``local_dispatch_records`` under
+    the existing lock. Returns ``True`` if a record was removed, or
+    ``False`` if no matching record existed (idempotent no-op).
+
+    This is the programmatic equivalent of what the
+    ``POST /v1/leases/release`` endpoint provides, allowing callers
+    (e.g. other internal components) to proactively release a lease
+    without going through the HTTP layer.
+    """
+    removed = False
+    try:
+        async with srv.local_dispatch_records_lock:
+            if session_id in srv.local_dispatch_records:
+                del srv.local_dispatch_records[session_id]
+                removed = True
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=explicit_release",
+                        session_id[:8] if session_id else "unknown",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        raise
+    return removed
+
+
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
@@ -683,14 +762,44 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 # Header normalization helpers
 # ===================================================================
 
+# Upstream response headers that MUST NOT be forwarded to downstream clients.
+# These are either set automatically by uvicorn/Starlette (date, server),
+# are hop-by-hop (connection), or are incorrect after httpx auto-decompression
+# (content-encoding). Forwarding them causes duplicate headers, violated RFCs,
+# or downstream decompression failures.
+_OUTGOING_STRIPPED_HEADERS = {
+    "content-encoding",
+    "date",
+    "server",
+    "connection",
+}
+
+
 def _normalize_outgoing_headers(
     headers: dict, buffered: bool = False
 ) -> dict:
     """Normalize outgoing response headers.
-    
-    Removes content-length when transfer-encoding is present (for streaming).
+
+    Strips upstream headers that should not be forwarded to the downstream
+    client:
+
+    - ``content-encoding`` — httpx auto-decompresses upstream bodies;
+      forwarding the encoding header causes downstream clients to attempt
+      double-decompression and fail.
+    - ``date``, ``server`` — uvicorn/Starlette set these automatically;
+      forwarding them creates duplicate RFC-violating headers.
+    - ``connection`` — hop-by-hop header managed by the HTTP stack.
+    - ``content-length`` — removed when ``transfer-encoding`` is present
+      (for streaming).
     """
     result = dict(headers)
+
+    # Always strip headers that uvicorn/Starlette set or that are incorrect
+    # after httpx processing
+    for k in list(result.keys()):
+        if k.lower() in _OUTGOING_STRIPPED_HEADERS:
+            del result[k]
+
     if buffered:
         pass
     else:
@@ -1079,26 +1188,64 @@ async def _check_slot_availability(
 def _compute_request_timeout(
     server_config: dict,
     body_json: dict,
+    remote: bool = False,
 ) -> httpx.Timeout:
-    """Compute the request timeout, using adaptive timeout if enabled."""
+    """Compute the request timeout, using adaptive timeout if enabled.
+
+    Parameters
+    ----------
+    server_config : dict
+        The server configuration dictionary.
+    body_json : dict
+        The parsed request body, used to estimate prompt tokens.
+    remote : bool, optional
+        When True, use remote-specific timeout override keys
+        (``llama_remote_request_timeout_base_seconds`` and
+        ``llama_remote_request_timeout_per_token_seconds``) if
+        configured. Falls back to the local keys when remote-specific
+        keys are not set.  Defaults to False (local path).
+
+    Returns
+    -------
+    httpx.Timeout
+        The computed timeout value.
+    """
     from proxy.lifecycle import _compute_adaptive_timeout, _estimate_prompt_tokens
-    
+
     adaptive_enabled = server_config.get("llama_adaptive_timeout_enabled", False)
     if adaptive_enabled and body_json:
-        base_timeout = float(
-            server_config.get("llama_adaptive_timeout_base_seconds", 60)
-        )
-        per_token_timeout = float(
-            server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01)
-        )
+        # Resolve base and per-token timeout: use remote-specific keys when
+        # *remote=True* and they are explicitly configured; otherwise fall
+        # back to the local/default keys for backward compatibility.
+        if remote:
+            base_timeout = float(
+                server_config.get(
+                    "llama_remote_request_timeout_base_seconds",
+                    server_config.get("llama_adaptive_timeout_base_seconds", 60),
+                )
+            )
+            per_token_timeout = float(
+                server_config.get(
+                    "llama_remote_request_timeout_per_token_seconds",
+                    server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01),
+                )
+            )
+        else:
+            base_timeout = float(
+                server_config.get("llama_adaptive_timeout_base_seconds", 60)
+            )
+            per_token_timeout = float(
+                server_config.get("llama_adaptive_timeout_per_token_seconds", 0.01)
+            )
         max_timeout = float(server_config.get("llama_request_timeout", 1800))
         timeout_seconds = _compute_adaptive_timeout(
             body_json, base_timeout, per_token_timeout, max_timeout
         )
         _srv().logger.debug(
-            "Adaptive timeout: tokens=%d timeout=%.1fs",
+            "Adaptive timeout: tokens=%d timeout=%.1fs%s",
             _estimate_prompt_tokens(body_json),
             timeout_seconds,
+            " remote=True" if remote else "",
         )
     else:
         timeout_seconds = server_config.get("llama_request_timeout", 1800)
