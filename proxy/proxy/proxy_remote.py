@@ -246,12 +246,13 @@ async def proxy_to_remote(
     if "opencode" in _endpoint_host or "opencode" in str(model_config.get("provider", "")):
         try:
             _masked_auth = (headers.get("Authorization", "") or "")[:25] + "..."
+            _header_keys = sorted(headers.keys())
             _srv().logger.info(
-                "[remote] DEBUG outgoing provider=%s url=%s auth=%s headers_count=%d body_len=%d body_json_keys=%s model_field=%s",
+                "[remote] DEBUG outgoing provider=%s url=%s auth=%s headers=%s body_len=%d body_json_keys=%s model_field=%s",
                 model_config.get("provider", "?"),
                 target_url,
                 _masked_auth,
-                len(headers),
+                _header_keys,
                 len(body),
                 sorted(body_json.keys()),
                 body_json.get("model", "(missing)"),
