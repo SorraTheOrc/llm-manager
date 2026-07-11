@@ -309,6 +309,9 @@ async def test_proxy_to_remote_forward_session_headers_default():
         mock_srv.return_value.config = {"server": {}}
         mock_srv.return_value.logger = MagicMock()
         mock_srv.return_value.current_model = "test"
+        # Ensure pooling is skipped (no _remote_http_client) so the test
+        # exercises the per-request AsyncClient path (LP-0MRE8G3JK0099Y4J).
+        mock_srv.return_value._remote_http_client = None
 
         with patch.object(pr, "normalize_upstream_request_headers", return_value=dict(mock_req.headers)):
             with patch.object(pr, "log_request"):
@@ -371,6 +374,9 @@ async def test_proxy_to_remote_strip_session_headers_when_disabled():
         mock_srv.return_value.config = {"server": {}}
         mock_srv.return_value.logger = MagicMock()
         mock_srv.return_value.current_model = "test"
+        # Ensure pooling is skipped (no _remote_http_client) so the test
+        # exercises the per-request AsyncClient path (LP-0MRE8G3JK0099Y4J).
+        mock_srv.return_value._remote_http_client = None
 
         with patch.object(pr, "normalize_upstream_request_headers", return_value=dict(mock_req.headers)):
             with patch.object(pr, "log_request"):

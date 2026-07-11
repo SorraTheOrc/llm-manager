@@ -978,6 +978,37 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+#### Lease Release
+
+Proactively release the dispatch lease for the caller's session, allowing other
+sessions to acquire the local backend without waiting for the idle timeout
+(default 180s) or disconnect detection.
+
+```bash
+curl -X POST http://localhost:8000/v1/leases/release \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "sess-abc123"}'
+```
+
+Response (200 — lease released or no matching lease):
+```json
+{"status": "ok"}
+```
+
+Response (400 — missing/empty `session_id`):
+```json
+{"detail": "session_id is required"}
+```
+
+The endpoint is **idempotent**: calling it with a `session_id` that has no
+matching lease returns `200 OK` (no-op). This is useful for automated
+workflows that want to clean up after completing a task without knowing
+whether the lease is still active.
+
+**Important:** This endpoint only releases the dispatch lease record from
+`local_dispatch_records`. It does **not** release the scheduler slot (job
+ownership), which is managed separately via disconnect detection or timeout.
+
 ### Admin Endpoints
 
 #### Reload Configuration

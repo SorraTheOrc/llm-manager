@@ -108,22 +108,21 @@ class TestEstimatePromptTokensForRouting:
         tokens = _estimate_prompt_tokens_for_routing(body)
         assert tokens < 40_000
 
-    def test_system_message_ignored(self):
-        """System messages should NOT be counted in routing estimate.
+    def test_system_message_counted(self):
+        """System messages SHOULD be counted in routing estimate.
 
-        The routing estimate is for the user/assistant context messages only,
-        as system prompts are typically small and not the driver of large-context
-        timeouts.
+        System prompts were previously excluded but are now included
+        (LP-0MRGT35H1003D1PM) to avoid underestimating large contexts.
         """
         body = {
             "messages": [
-                {"role": "system", "content": "x" * 100_000},  # 25K tokens system
+                {"role": "system", "content": "x" * 100_000},  # ~25K tokens system
                 {"role": "user", "content": "Hello"},
             ]
         }
         tokens = _estimate_prompt_tokens_for_routing(body)
-        # Should be small (just "Hello"), not large (system is excluded)
-        assert 1 <= tokens <= 10
+        # Should be large (system content is now counted)
+        assert tokens >= 10000
 
     def test_combined_user_assistant_messages_counted(self):
         """Both user and assistant messages should be counted."""

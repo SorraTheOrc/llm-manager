@@ -190,11 +190,7 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role", "")
-        # Skip system messages — they are not the driver of large-context
-        # timeouts and should not trigger cache-cold bypass.
-        if role == "system":
-            continue
-        # Count content field
+        # Count content field (system messages included — LP-0MRGT35H1003D1PM)
         content = msg.get("content", "")
         if isinstance(content, str):
             parts.append(content)
