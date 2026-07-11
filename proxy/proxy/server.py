@@ -278,24 +278,46 @@ async def _capture_rocm_version() -> str:
     return "unknown"
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    global config, logger, llama_process, _http_client, _remote_http_client, backend_watchdog_task, model_health_task, backend_ready, backend_recovery_state, _dispatch_cleanup_task
-    
-    # Startup
+# ---------------------------------------------------------------------------
+# Extracted startup phase helpers
+# ---------------------------------------------------------------------------
+
+
+def _startup_config_logging():
+    """Load configuration and set up logging.
+
+    Sets global ``config`` and ``logger``.
+    Returns ``(config, logger)`` for convenience.
+    """
+    global config, logger
     config = load_config()
     logger = setup_logging(config)
     logger.info("Starting LLama Proxy Server")
+    return config, logger
 
-    # LP-0MRDE669Y003V1SO: Mark all local model caches as cold on startup.
-    # This ensures large-context requests are routed to remote fallback
-    # immediately after restart, rather than attempting expensive full re-prefill.
+
+def _startup_initialize_cache_cold_start():
+    """Mark all local model caches as cold on startup.
+
+    Corresponds to LP-0MRDE669Y003V1SO — ensures large-context requests
+    are routed to remote fallback immediately after restart, rather than
+    attempting expensive full re-prefill.
+    """
     try:
         from proxy.provider import initialize_cache_cold_from_config as _init_cache
         _init_cache(config)
     except Exception:
         pass
+
+
+def _startup_initialize_backend_state():
+    """Initialize backend-ready flag and recovery state dict.
+
+    Sets ``backend_ready = False`` and builds ``backend_recovery_state``
+    from the current config (with sensible defaults).
+    Returns the new recovery state dict.
+    """
+    global backend_ready, backend_recovery_state
     backend_ready = False
     backend_recovery_state = {
         "in_progress": False,
@@ -305,13 +327,30 @@ async def lifespan(app: FastAPI):
         "retry_after_seconds": int(config.get("server", {}).get("llama_self_heal_retry_after_seconds", 30) or 30),
         "last_failure": None,
     }
+    return backend_recovery_state
 
+
+def _startup_create_http_client(config: dict) -> httpx.AsyncClient:
+    """Create the local ``_http_client`` for internal operations.
+
+    Uses a 5-second timeout and connection-pool limits.
+    Returns the created client.
+    """
+    global _http_client
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(5.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
     )
+    return _http_client
 
-    # Initialize shared remote HTTP client with connection pooling (LP-0MRE8G3JK0099Y4J)
+
+def _startup_create_remote_http_client(config: dict) -> httpx.AsyncClient:
+    """Create the remote ``_remote_http_client`` for upstream requests (LP-0MRE8G3JK0099Y4J).
+
+    Reads timeouts and pool limits from ``config["server"]["remote_http_client"]``.
+    Returns the created client.
+    """
+    global _remote_http_client
     _remote_client_config = config.get("server", {}).get("remote_http_client", {})
     _remote_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(
@@ -326,10 +365,16 @@ async def lifespan(app: FastAPI):
             keepalive_expiry=float(_remote_client_config.get("keepalive_expiry", 60) or 60),
         ),
     )
+    return _remote_http_client
 
-    # Capture llama-server and ROCm versions asynchronously at startup.
-    # These are best-effort, non-blocking captures. If either command fails
-    # or is unavailable, the version remains "unknown" and the server continues.
+
+def _startup_launch_version_capture() -> asyncio.Task:
+    """Spawn a background task to capture llama-server and ROCm versions.
+
+    The captured values are stored in the module-level globals
+    ``llama_server_version`` and ``rocm_version``.
+    Returns the created task.
+    """
     loop = asyncio.get_running_loop()
 
     async def _capture_versions():
@@ -341,26 +386,23 @@ async def lifespan(app: FastAPI):
             llama_server_version, rocm_version
         )
 
-    loop.create_task(_capture_versions())
+    task = loop.create_task(_capture_versions())
+    return task
 
-    # One-time podman rootless state reset. After a reboot, crash-loop, or
-    # when the service was previously run under incompatible systemd sandbox
-    # settings, stale catatonit pause processes accumulate and leave podman
-    # unable to create user namespaces ("invalid internal status",
-    # "newuidmap: write to uid_map failed: Operation not permitted").
-    #
-    # The fix is to: (1) kill any stale pause processes, (2) run
-    # `podman system migrate` to clean up internal state.
-    # NOTE: this stops all running containers, so it must only run once here,
-    # never inside the retry loop of start_llama_server.
+
+def _startup_podman_migrate():
+    """Run one-time podman rootless state reset.
+
+    Kills stale catatonit pause processes, runs ``podman system migrate``,
+    and logs the result. Errors are caught and logged — startup continues
+    regardless of the outcome.
+    """
     try:
-        # Kill stale catatonit pause processes that accumulate during
-        # crash-loop restarts and poison podman's namespace state.
         subprocess.run(
             ["pkill", "-9", "catatonit"],
             capture_output=True, timeout=5
         )
-        time.sleep(1)  # let kernel clean up namespaces
+        time.sleep(1)
         migrate_result = subprocess.run(
             ["podman", "system", "migrate"],
             capture_output=True, text=True, timeout=30
@@ -377,12 +419,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"podman system migrate failed: {e}")
 
-    # Load the default model in a background task so uvicorn can finish
-    # startup and begin accepting connections immediately. This avoids
-    # blocking systemd (which waits for the lifespan to complete) for the
-    # full model-load time (potentially 5+ minutes) and also handles the
-    # boot-order race where podman isn't ready yet.
-    # Read default_model from config; default to gemma4 if not present
+
+def _startup_launch_default_model_loader() -> asyncio.Task:
+    """Spawn a background task to load the default model with retries.
+
+    Reads ``default_model`` and router-mode settings from the current
+    module-level ``config``. The task re-attempts loading up to 6 times
+    with an increasing delay schedule.
+    Returns the created task.
+    """
+    loop = asyncio.get_running_loop()
+
     default_model = config.get("default_model", "gemma4")
     router_mode = config.get("server", {}).get("llama_router_mode", False)
     router_preload = config.get("server", {}).get("llama_router_preload", [])
@@ -397,7 +444,7 @@ async def lifespan(app: FastAPI):
         """Load the default model with retries, running in the background."""
         global current_model, llama_process, backend_ready
         max_attempts = 6
-        retry_delays = [0, 30, 60, 120, 240, 300]  # first attempt immediate
+        retry_delays = [0, 30, 60, 120, 240, 300]
         for attempt, delay in enumerate(retry_delays[:max_attempts], 1):
             if delay > 0:
                 logger.info(
@@ -405,7 +452,6 @@ async def lifespan(app: FastAPI):
                     f"default model '{default_model}' in {delay}s"
                 )
                 await asyncio.sleep(delay)
-            # If something else loaded a model while we were waiting, stop
             if current_model is not None and not router_mode:
                 logger.info("Model already loaded by another request, stopping background loader")
                 return
@@ -441,71 +487,116 @@ async def lifespan(app: FastAPI):
             f"Model will be loaded on first matching request."
         )
 
-    loop = asyncio.get_running_loop()
-    loop.create_task(_load_default_model())
+    task = loop.create_task(_load_default_model())
+    return task
 
+
+def _startup_launch_watchdog_tasks():
+    """Spawn the backend watchdog and model health background loops.
+
+    Skips creation if either task is already set (guards against
+    double-initialization).
+    """
+    global backend_watchdog_task, model_health_task
+    loop = asyncio.get_running_loop()
     if backend_watchdog_task is None:
         backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
-
     if model_health_task is None:
         model_health_task = loop.create_task(_router_model_health_loop())
 
-    # Load persisted request counts and token counts
+
+def _startup_launch_persistence_tasks():
+    """Load persisted counts and spawn background persist/broadcast loops."""
+    global counts_persist_task, tokens_persist_task, periodic_broadcast_task
     load_counts()
     load_token_counts()
-    # Start background persist loops
     try:
         loop = asyncio.get_running_loop()
-        global counts_persist_task, tokens_persist_task
         if counts_persist_task is None:
             counts_persist_task = loop.create_task(_counts_persist_loop())
         if tokens_persist_task is None:
             tokens_persist_task = loop.create_task(_tokens_persist_loop())
-        global periodic_broadcast_task
         if periodic_broadcast_task is None:
             periodic_broadcast_task = loop.create_task(_periodic_broadcast_loop())
     except RuntimeError:
         pass
 
-    # Start session manager cleanup task
+
+def _startup_start_session_cleanup():
+    """Start the session manager's periodic cleanup task."""
     try:
         session_manager.start_cleanup_task()
     except Exception as e:
         logger.warning(f"Failed to start session cleanup task: {e}")
 
-    # Start dispatch lease cleanup task
+
+def _startup_start_dispatch_cleanup():
+    """Start the dispatch lease cleanup background task.
+
+    Skips creation if ``_dispatch_cleanup_task`` is already set.
+    """
+    global _dispatch_cleanup_task
     if _dispatch_cleanup_task is None:
         try:
+            loop = asyncio.get_running_loop()
             _dispatch_cleanup_task = loop.create_task(_dispatch_cleanup_loop())
             logger.info("Dispatch lease cleanup task started")
         except Exception as e:
             logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
 
-    # Initialize session recorder and register admin routes
+
+def _startup_register_session_routes(app):
+    """Register session recording admin routes on the FastAPI app.
+
+    Errors are caught and logged — startup continues even if route
+    registration fails.
+    """
     try:
         from proxy.ui import list_session_recording_routes
         list_session_recording_routes(app)
     except Exception as e:
         logger.warning(f"Failed to register session recording routes: {e}")
 
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down LLama Proxy Server")
-    # Stop session manager cleanup task
+
+# ---------------------------------------------------------------------------
+# Extracted shutdown phase helpers
+# ---------------------------------------------------------------------------
+
+
+def _shutdown_stop_session_cleanup():
+    """Stop the session manager's periodic cleanup task."""
     try:
         session_manager.stop_cleanup_task()
     except Exception:
         pass
 
-    # Stop dispatch lease cleanup task
+
+async def _shutdown_cleanup_tasks():
+    """Cancel and await the dispatch lease cleanup and watchdog tasks.
+
+    Sets each task reference to ``None`` after completion.
+    """
+    global _dispatch_cleanup_task, backend_watchdog_task
     if _dispatch_cleanup_task is not None:
         _dispatch_cleanup_task.cancel()
         try:
             await _dispatch_cleanup_task
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
         _dispatch_cleanup_task = None
+
+    if backend_watchdog_task is not None:
+        backend_watchdog_task.cancel()
+        try:
+            await backend_watchdog_task
+        except (Exception, asyncio.CancelledError):
+            pass
+        backend_watchdog_task = None
+
+
+async def _shutdown_http_client():
+    """Close both HTTP clients and clear their references."""
+    global _http_client, _remote_http_client
     if _http_client is not None:
         try:
             await _http_client.aclose()
@@ -519,16 +610,50 @@ async def lifespan(app: FastAPI):
             pass
         _remote_http_client = None
 
-    if backend_watchdog_task is not None:
-        backend_watchdog_task.cancel()
-        try:
-            await backend_watchdog_task
-        except Exception:
-            pass
-        backend_watchdog_task = None
 
+def _shutdown_llama_server():
+    """Reset backend-ready flag and stop the local llama-server process."""
+    global backend_ready
     backend_ready = False
     stop_llama_server()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler.
+
+    High-level orchestration that delegates startup/shutdown phases to
+    extracted helper functions for clarity and maintainability.
+    """
+    global llama_process
+
+    # ------------------------------------------------------------------ #
+    # Startup phase
+    # ------------------------------------------------------------------ #
+    _startup_config_logging()
+    _startup_initialize_cache_cold_start()
+    _startup_initialize_backend_state()
+    _startup_create_http_client(config)
+    _startup_create_remote_http_client(config)
+    _startup_launch_version_capture()
+    _startup_podman_migrate()
+    _startup_launch_default_model_loader()
+    _startup_launch_watchdog_tasks()
+    _startup_launch_persistence_tasks()
+    _startup_start_session_cleanup()
+    _startup_start_dispatch_cleanup()
+    _startup_register_session_routes(app)
+
+    yield
+
+    # ------------------------------------------------------------------ #
+    # Shutdown phase
+    # ------------------------------------------------------------------ #
+    logger.info("Shutting down LLama Proxy Server")
+    _shutdown_stop_session_cleanup()
+    await _shutdown_cleanup_tasks()
+    await _shutdown_http_client()
+    _shutdown_llama_server()
 
 
 app = FastAPI(
