@@ -493,7 +493,7 @@ def _get_lease_timeout_seconds(srv) -> float:
         return float(
             server_cfg.get("local_dispatch_lease_timeout_seconds", 180) or 180
         )
-    except (ValueError, TypeError):
+    except Exception:
         return 180.0
 
 

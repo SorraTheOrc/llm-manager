@@ -128,8 +128,8 @@ async def _dispatch_cleanup_loop() -> None:
     calls ``_cleanup_stale_local_dispatch`` on the server state to
     evict inactive lease records whose *expires_at* has passed.
     """
-    try:
-        while True:
+    while True:
+        try:
             await asyncio.sleep(10.0)
             from proxy.router_helpers import _cleanup_stale_local_dispatch
             # Import via _srv() to get the current module state
@@ -143,10 +143,13 @@ async def _dispatch_cleanup_loop() -> None:
                     )
                 except Exception:
                     pass
-    except asyncio.CancelledError:
-        logger.info("Dispatch lease cleanup task cancelled")
-    except Exception:
-        logger.exception("Unexpected error in dispatch lease cleanup loop")
+        except asyncio.CancelledError:
+            logger.info("Dispatch lease cleanup task cancelled")
+            return
+        except Exception:
+            logger.exception(
+                "Unexpected error in dispatch lease cleanup loop, continuing..."
+            )
 
 # Backend resilience/observability signals
 # Health/readiness signal for local backend
