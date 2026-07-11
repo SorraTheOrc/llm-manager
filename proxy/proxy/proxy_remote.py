@@ -194,6 +194,20 @@ async def proxy_to_remote(
     if _forward_session_headers is None:
         _forward_session_headers = True
 
+    # DEBUG: check forward_session_headers value for opencode
+    _endpoint_host_dbg = (model_config.get("endpoint", "") or "").replace("https://", "").replace("http://", "").split("/")[0]
+    if "opencode" in _endpoint_host_dbg or "opencode" in str(model_config.get("provider", "")):
+        try:
+            _srv().logger.info(
+                "[remote] DEBUG fwd_session provider=%s value=%s type=%s cfg_keys=%s",
+                model_config.get("provider", "?"),
+                _forward_session_headers,
+                type(_forward_session_headers).__name__,
+                sorted(model_config.keys()),
+            )
+        except Exception:
+            pass
+
     # Remove local/proxy auth/session headers before forwarding.
     # In particular, prevent duplicate Authorization variants
     # (e.g. "authorization" + "Authorization") which can trigger
