@@ -732,7 +732,7 @@ The proxy uses two separate timeout values for upstream remote connections:
 | `server.upstream_retry_max_delay_seconds` | `60.0` | Maximum delay between retries (cap on exponential backoff). |
 | `server.upstream_request_timeout_seconds` | `120` | Upstream request-level timeout (LP-0MRF77A0E0026B9T). Caps the read timeout for the initial HTTP response from the upstream provider. Prevents 15+ minute silent hangs when the upstream is slow to respond or silently returns empty content. Different from the per-chunk idle timeout (`upstream_idle_timeout_seconds`) which detects mid-stream stalls. |
 | `server.upstream_empty_retry_max_attempts` | `1` | Maximum number of additional attempts when an upstream returns a semantically empty response (no content, stopReason: stop, total_tokens: 0). Default: 1 retry. |
-| `server.upstream_empty_retry_base_delay_seconds` | `0.5` | Base delay (in seconds) before retrying on empty response. |
+| `server.upstream_empty_retry_base_delay_seconds` | `2.0` | Base delay (in seconds) before retrying on empty response. |
 | `server.upstream_stall_window_seconds` | `300` | Sliding window duration (seconds) for the cross-request stall circuit breaker (Tier 3). Stalls older than this are ignored when counting toward the threshold. |
 | `server.upstream_stall_threshold` | `3` | Number of stalls within the sliding window that triggers the circuit breaker to mark the provider unavailable for the cooldown duration. |
 | `server.upstream_stall_cooldown_seconds` | `180` | Cooldown duration (seconds) applied when the stall circuit breaker threshold is exceeded. Separate from `provider_cooldown_seconds` (Tier 2 cooldown). |

@@ -392,8 +392,8 @@ server:
   # Default: 1 retry (1 additional attempt).
   upstream_empty_retry_max_attempts: 1
   # Base delay (in seconds) before retrying on empty response.
-  # Default: 0.5 seconds.
-  upstream_empty_retry_base_delay_seconds: 0.5
+  # Default: 2.0 seconds.
+  upstream_empty_retry_base_delay_seconds: 2.0
 
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
