@@ -408,6 +408,179 @@ async def view_logs(request: Request):
     return HTMLResponse(content=html)
 
 
+# ---------------------------------------------------------------------------
+# Shared local-model dispatch orchestration
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch_local_model_load(
+    request: Request,
+    srv,
+    model_cfg: dict,
+    model_name: str,
+    endpoint_path: str,
+    *,
+    enable_grace_window: bool = False,
+    grace_window_seconds: float = 0.75,
+):
+    """Shared local-model load orchestration for embeddings and chat handlers.
+
+    Handles the decision flow common to both endpoints:
+    1. Active model fast path
+    2. Router loaded-check fast path
+    3. Background load scheduling
+    4. Grace window (optional, used by chat but not embeddings)
+    5. Session/slot restore detection (scheduler reenter + slot file)
+    6. Remote provider fallback
+    7. Final model_loading response
+
+    Args:
+        request: The incoming request.
+        srv: The server module (from _srv()).
+        model_cfg: The model configuration dict.
+        model_name: The resolved model name from the request body.
+        endpoint_path: The endpoint path (e.g. "v1/embeddings", "v1/chat/completions").
+        enable_grace_window: Whether to enable the router-mode grace window.
+        grace_window_seconds: Maximum seconds to wait for model in grace window.
+
+    Returns:
+        A Response (either direct proxy response or model_loading 503).
+    """
+    server_config = srv.config.get("server", {})
+    router_mode = server_config.get("llama_router_mode", False)
+
+    llama_model = get_local_model_name_from_providers(model_cfg)
+    if not isinstance(llama_model, str) or not llama_model:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Local model configuration missing llama_model for: {model_name}",
+        )
+    llama_model_str: str = llama_model
+
+    # If model already active and process running, proceed immediately
+    if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
+        if _has_fallback_providers(model_cfg):
+            from proxy.provider import proxy_with_fallback
+            return await proxy_with_fallback(request, endpoint_path, model_cfg, srv.config)
+        return await srv.proxy_to_local(request, endpoint_path)
+
+    # Try a fast router-mode check: model may already be loaded in router
+    if router_mode:
+        try:
+            if await srv.router_is_model_loaded(llama_model_str):
+                srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
+                srv.current_model = llama_model_str
+                if _has_fallback_providers(model_cfg):
+                    from proxy.provider import proxy_with_fallback
+                    return await proxy_with_fallback(request, endpoint_path, model_cfg, srv.config)
+                return await srv.proxy_to_local(request, endpoint_path)
+        except Exception:
+            srv.logger.debug("Fast router check failed; scheduling background load")
+
+    # Schedule background load
+    target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
+    scheduled = srv.schedule_background_load(target_model)
+    srv.logger.info(f"Scheduled background load for request: model={target_model} scheduled={scheduled}")
+
+    # In router mode, allow a short grace window for transient model-state lag
+    if enable_grace_window and router_mode:
+        grace_seconds = float(server_config.get("model_loading_local_grace_seconds", grace_window_seconds) or grace_window_seconds)
+        grace_seconds = max(0.0, grace_seconds)
+        if grace_seconds > 0:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + grace_seconds
+            while loop.time() < deadline:
+                try:
+                    model_ready = await srv.router_is_model_loaded(llama_model_str)
+                    if not model_ready:
+                        try:
+                            model_ready = await srv.router_load_model(llama_model_str)
+                        except Exception:
+                            model_ready = False
+
+                    if model_ready:
+                        srv.logger.info(
+                            f"Router model {llama_model_str} became available during grace window; serving locally",
+                        )
+                        srv.current_model = llama_model_str
+                        if _has_fallback_providers(model_cfg):
+                            from proxy.provider import proxy_with_fallback
+                            return await proxy_with_fallback(request, endpoint_path, model_cfg, srv.config)
+                        return await srv.proxy_to_local(request, endpoint_path)
+                except Exception:
+                    srv.logger.debug("Grace-window router check failed; retrying", exc_info=True)
+                await asyncio.sleep(0.1)
+
+    # Session restore detection
+    try:
+        from proxy.session import _resolve_session_id_header, _build_slot_context
+        session_id_header, _ = _resolve_session_id_header(request.headers)
+        # First try scheduler.reenter_job to detect existing slot ownership
+        try:
+            from proxy.router import _get_job_scheduler
+            scheduler = _get_job_scheduler()
+            if scheduler is not None and session_id_header:
+                slot_reenter = await scheduler.reenter_job(session_id_header)
+                if slot_reenter is not None:
+                    return srv._model_loading_response(
+                        requested_model=model_name if isinstance(model_name, str) else None,
+                        target_model=target_model,
+                        scheduled=scheduled,
+                        endpoint=f"/{endpoint_path}",
+                    )
+        except Exception:
+            srv.logger.debug("Scheduler reenter check failed; falling back to slot-file check", exc_info=True)
+
+        slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
+        if slot_filename and slot_filename != "" and Path(slot_filename).exists():
+            return srv._model_loading_response(
+                requested_model=model_name if isinstance(model_name, str) else None,
+                target_model=target_model,
+                scheduled=scheduled,
+                endpoint=f"/{endpoint_path}",
+            )
+    except Exception:
+        srv.logger.debug("Session/slot detection failed; will attempt remote fallback before returning model_loading", exc_info=True)
+
+    # Try configured remote providers first
+    try:
+        providers = model_cfg.get("providers") or []
+        remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
+        if remote_providers:
+            remote_cfg = {"providers": remote_providers}
+            from proxy.provider import proxy_with_remote_fallback
+            try:
+                resp = await proxy_with_remote_fallback(request, endpoint_path, remote_cfg, srv.config)
+                if resp.status_code >= 400:
+                    srv.logger.warning(
+                        f"Remote fallback returned error for model={model_name} status={resp.status_code}; "
+                        "returning model_loading response",
+                    )
+                    return srv._model_loading_response(
+                        requested_model=model_name if isinstance(model_name, str) else None,
+                        target_model=target_model,
+                        scheduled=scheduled,
+                        endpoint=f"/{endpoint_path}",
+                    )
+                return resp
+            except Exception:
+                srv.logger.exception("Remote fallback attempt raised exception; returning model_loading response")
+                return srv._model_loading_response(
+                    requested_model=model_name if isinstance(model_name, str) else None,
+                    target_model=target_model,
+                    scheduled=scheduled,
+                    endpoint=f"/{endpoint_path}",
+                )
+    except Exception:
+        srv.logger.exception("Failed while attempting remote fallback; returning model_loading response")
+
+    return srv._model_loading_response(
+        requested_model=model_name if isinstance(model_name, str) else None,
+        target_model=target_model,
+        scheduled=scheduled,
+        endpoint=f"/{endpoint_path}",
+    )
+
 
 async def create_embeddings(request: Request):
     """
@@ -487,130 +660,15 @@ async def create_embeddings(request: Request):
         )
     
     if get_model_type(model_cfg) == "local":
-        server_config = srv.config.get("server", {})
-        router_mode = server_config.get("llama_router_mode", False)
-        # Check if we need to switch models
-        llama_model = get_local_model_name_from_providers(model_cfg)
-        if not isinstance(llama_model, str) or not llama_model:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Local model configuration missing llama_model for: {model_name}"
-            )
-        llama_model_str: str = llama_model
+        return await _dispatch_local_model_load(request, srv, model_cfg, model_name, "v1/embeddings")
 
-        # If model already active and process running, proceed immediately
-        if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
-            if _has_fallback_providers(model_cfg):
-                from proxy.provider import proxy_with_fallback
-                return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
-            return await srv.proxy_to_local(request, "v1/embeddings")
-
-        # Try a fast router-mode check: model may already be loaded in router
-        if router_mode:
-            try:
-                if await srv.router_is_model_loaded(llama_model_str):
-                    srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
-                    srv.current_model = llama_model_str
-                    if _has_fallback_providers(model_cfg):
-                        from proxy.provider import proxy_with_fallback
-                        return await proxy_with_fallback(request, "v1/embeddings", model_cfg, srv.config)
-                    return await srv.proxy_to_local(request, "v1/embeddings")
-            except Exception:
-                # Non-fatal: fall through to scheduling background load
-                srv.logger.debug("Fast router check failed; scheduling background load")
-
-        # Otherwise, schedule a background load. If this request is restoring
-        # a session slot we must return model_loading. Otherwise, attempt remote
-        # providers (if configured) before returning model_loading so clients
-        # can be served by remotes when appropriate.
-        target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
-        scheduled = srv.schedule_background_load(target_model)
-        srv.logger.info(f"Scheduled background load for embeddings request: {target_model} scheduled={scheduled}")
-
-        # If the request is attempting a session restore (slot file exists),
-        # return the model_loading response so the local restore can proceed.
-        try:
-            from proxy.session import _resolve_session_id_header, _build_slot_context
-            session_id_header, _ = _resolve_session_id_header(request.headers)
-            # Prefer checking the scheduler for an existing slot assignment (reenter)
-            try:
-                from proxy.router import _get_job_scheduler
-                scheduler = _get_job_scheduler()
-                if scheduler is not None and session_id_header:
-                    slot_reenter = await scheduler.reenter_job(session_id_header)
-                    if slot_reenter is not None:
-                        # Job already owns a slot — must proceed with local restore/loading
-                        return srv._model_loading_response(
-                            requested_model=model_name if isinstance(model_name, str) else None,
-                            target_model=target_model,
-                            scheduled=scheduled,
-                            endpoint="/v1/embeddings",
-                        )
-            except Exception:
-                # Best-effort scheduler check failed; fall back to slot file heuristic
-                srv.logger.debug("Scheduler reenter check failed for embeddings; falling back to slot-file check", exc_info=True)
-
-            slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
-            if slot_filename and slot_filename != "" and Path(slot_filename).exists():
-                return srv._model_loading_response(
-                    requested_model=model_name if isinstance(model_name, str) else None,
-                    target_model=target_model,
-                    scheduled=scheduled,
-                    endpoint="/v1/embeddings",
-                )
-        except Exception:
-            srv.logger.debug("Session/slot detection failed for embeddings; will attempt remote fallback", exc_info=True)
-
-        # Try remote providers first if any are configured for this model
-        try:
-            providers = model_cfg.get("providers") or []
-            remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
-            if remote_providers:
-                remote_cfg = {"providers": remote_providers}
-                from proxy.provider import proxy_with_remote_fallback
-                try:
-                    resp = await proxy_with_remote_fallback(request, "v1/embeddings", remote_cfg, srv.config)
-                    # remote fallback may return an error response (503) when all
-                    # remote providers are exhausted — don't propagate this;
-                    # return model_loading so the client waits for the local model.
-                    if resp.status_code >= 400:
-                        srv.logger.warning(
-                            "Remote fallback returned error for model=%s status=%s; "
-                            "returning model_loading response",
-                            model_name, resp.status_code,
-                        )
-                        return srv._model_loading_response(
-                            requested_model=model_name if isinstance(model_name, str) else None,
-                            target_model=target_model,
-                            scheduled=scheduled,
-                            endpoint="/v1/embeddings",
-                        )
-                    return resp
-                except Exception:
-                    srv.logger.exception("Remote embeddings fallback raised exception; returning model_loading response")
-                    return srv._model_loading_response(
-                        requested_model=model_name if isinstance(model_name, str) else None,
-                        target_model=target_model,
-                        scheduled=scheduled,
-                        endpoint="/v1/embeddings",
-                    )
-        except Exception:
-            srv.logger.exception("Failed while attempting remote embeddings fallback; returning model_loading response")
-
-        return srv._model_loading_response(
-            requested_model=model_name if isinstance(model_name, str) else None,
-            target_model=target_model,
-            scheduled=scheduled,
-            endpoint="/v1/embeddings",
-        )
-    
     elif get_model_type(model_cfg) == "remote":
         providers = model_cfg.get("providers")
         if providers:
             from proxy.provider import proxy_with_remote_fallback
             return await proxy_with_remote_fallback(request, "v1/embeddings", model_cfg, srv.config)
         return await srv.proxy_to_remote(request, "v1/embeddings", model_cfg)
-    
+
     raise HTTPException(
         status_code=500,
         detail=f"Invalid model configuration for: {model_name}"
@@ -700,154 +758,11 @@ async def _do_proxy_openai_api(
         )
     
     if get_model_type(model_cfg) == "local":
-        server_config = srv.config.get("server", {})
-        router_mode = server_config.get("llama_router_mode", False)
-        # Check if we need to switch models
-        llama_model = get_local_model_name_from_providers(model_cfg)
-        if not isinstance(llama_model, str) or not llama_model:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Local model configuration missing llama_model for: {model_name}"
-            )
-        llama_model_str: str = llama_model
-
-        # If model already active and process running, proceed immediately
-        if srv.current_model == llama_model_str and srv.llama_process is not None and (srv.llama_process.poll() is None):
-            if _has_fallback_providers(model_cfg):
-                from proxy.provider import proxy_with_fallback
-                return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
-            return await srv.proxy_to_local(request, f"v1/{path}")
-
-        # Try a fast router-mode check: model may already be loaded in router
-        if router_mode:
-            try:
-                if await srv.router_is_model_loaded(llama_model_str):
-                    srv.logger.info(f"Router reports model {llama_model_str} already loaded; serving request immediately")
-                    srv.current_model = llama_model_str
-                    if _has_fallback_providers(model_cfg):
-                        from proxy.provider import proxy_with_fallback
-                        return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
-                    return await srv.proxy_to_local(request, f"v1/{path}")
-            except Exception:
-                srv.logger.debug("Fast router check failed; scheduling background load")
-
-        # Otherwise, schedule background load. If this request is restoring a session
-        # slot we must return model_loading. Otherwise, attempt remote providers
-        # before returning model_loading so clients can be served by remotes when possible.
-        target_model: str = model_name if isinstance(model_name, str) and model_name else llama_model_str
-        scheduled = srv.schedule_background_load(target_model)
-        srv.logger.info(f"Scheduled background load for request: model={target_model} scheduled={scheduled}")
-
-        # In router mode, allow a short grace window for transient model-state
-        # lag (e.g. /models briefly reports "loading" while requests are already
-        # serviceable). If the target model becomes visible during this window,
-        # serve locally before attempting remote fallback.
-        if router_mode:
-            grace_seconds = float(server_config.get("model_loading_local_grace_seconds", 0.75) or 0.75)
-            grace_seconds = max(0.0, grace_seconds)
-            if grace_seconds > 0:
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + grace_seconds
-                while loop.time() < deadline:
-                    try:
-                        model_ready = await srv.router_is_model_loaded(llama_model_str)
-                        if not model_ready:
-                            # Some router builds may still report "loading" in
-                            # /models even when /models/load returns already-loaded.
-                            # Treat a successful router_load_model() call as an
-                            # availability hint for this grace-window check.
-                            try:
-                                model_ready = await srv.router_load_model(llama_model_str)
-                            except Exception:
-                                model_ready = False
-
-                        if model_ready:
-                            srv.logger.info(
-                                "Router model %s became available during grace window; serving locally",
-                                llama_model_str,
-                            )
-                            srv.current_model = llama_model_str
-                            if _has_fallback_providers(model_cfg):
-                                from proxy.provider import proxy_with_fallback
-                                return await proxy_with_fallback(request, f"v1/{path}", model_cfg, srv.config)
-                            return await srv.proxy_to_local(request, f"v1/{path}")
-                    except Exception:
-                        srv.logger.debug("Grace-window router check failed; retrying", exc_info=True)
-                    await asyncio.sleep(0.1)
-
-        try:
-            from proxy.session import _resolve_session_id_header, _build_slot_context
-            session_id_header, _ = _resolve_session_id_header(request.headers)
-            # First try scheduler.reenter_job to detect existing slot ownership (non-invasive)
-            try:
-                from proxy.router import _get_job_scheduler
-                scheduler = _get_job_scheduler()
-                if scheduler is not None and session_id_header:
-                    slot_reenter = await scheduler.reenter_job(session_id_header)
-                    if slot_reenter is not None:
-                        return srv._model_loading_response(
-                            requested_model=model_name if isinstance(model_name, str) else None,
-                            target_model=target_model,
-                            scheduled=scheduled,
-                            endpoint=f"/v1/{path}",
-                        )
-            except Exception:
-                srv.logger.debug("Scheduler reenter check failed; falling back to slot-file check", exc_info=True)
-
-            slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
-            if slot_filename and slot_filename != "" and Path(slot_filename).exists():
-                return srv._model_loading_response(
-                    requested_model=model_name if isinstance(model_name, str) else None,
-                    target_model=target_model,
-                    scheduled=scheduled,
-                    endpoint=f"/v1/{path}",
-                )
-        except Exception:
-            srv.logger.debug("Session/slot detection failed; will attempt remote fallback before returning model_loading", exc_info=True)
-
-        # Try configured remote providers first
-        try:
-            providers = model_cfg.get("providers") or []
-            remote_providers = [p for p in providers if isinstance(p, dict) and p.get("type") == "remote"]
-            if remote_providers:
-                remote_cfg = {"providers": remote_providers}
-                from proxy.provider import proxy_with_remote_fallback
-                try:
-                    resp = await proxy_with_remote_fallback(request, f"v1/{path}", remote_cfg, srv.config)
-                    # remote fallback may return an error response (503) when all
-                    # remote providers are exhausted — don't propagate this;
-                    # return model_loading so the client waits for the local model.
-                    if resp.status_code >= 400:
-                        srv.logger.warning(
-                            "Remote fallback returned error for model=%s status=%s; "
-                            "returning model_loading response",
-                            model_name, resp.status_code,
-                        )
-                        return srv._model_loading_response(
-                            requested_model=model_name if isinstance(model_name, str) else None,
-                            target_model=target_model,
-                            scheduled=scheduled,
-                            endpoint=f"/v1/{path}",
-                        )
-                    return resp
-                except Exception:
-                    srv.logger.exception("Remote fallback attempt raised exception; returning model_loading response")
-                    return srv._model_loading_response(
-                        requested_model=model_name if isinstance(model_name, str) else None,
-                        target_model=target_model,
-                        scheduled=scheduled,
-                        endpoint=f"/v1/{path}",
-                    )
-        except Exception:
-            srv.logger.exception("Failed while attempting remote fallback; returning model_loading response")
-
-        return srv._model_loading_response(
-            requested_model=model_name if isinstance(model_name, str) else None,
-            target_model=target_model,
-            scheduled=scheduled,
-            endpoint=f"/v1/{path}",
+        return await _dispatch_local_model_load(
+            request, srv, model_cfg, model_name, f"v1/{path}",
+            enable_grace_window=True,
         )
-    
+
     elif get_model_type(model_cfg) == "remote":
         providers = model_cfg.get("providers")
         if providers:
