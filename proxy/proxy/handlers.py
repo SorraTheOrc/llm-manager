@@ -641,8 +641,8 @@ async def create_speech(request: Request):
     if not isinstance(input_text, str) or not input_text.strip():
         raise HTTPException(status_code=400, detail="input is required and must be a non-empty string")
 
-    # Optional parameters with defaults
-    voice = body.get("voice", "default")
+    # Optional parameters
+    voice = body.get("voice", "")
     response_format = body.get("response_format", "wav")
 
     # Input length guard
@@ -654,24 +654,38 @@ async def create_speech(request: Request):
     tts_port = server_cfg.get("tts_server_port", 8081)
     tts_url = f"http://{tts_host}:{tts_port}/v1/audio/speech"
 
-    # Forward request to tts-server
+    # Forward request to tts-server (omit voice when empty)
     forward_body = {
         "model": model,
         "input": input_text,
-        "voice": voice,
         "response_format": response_format,
     }
+    if voice:
+        forward_body["voice"] = voice
 
     try:
-        client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=httpx.Timeout(30.0))
-        if getattr(client, "__aenter__", None):
-            async with client as c:
+        client = srv._http_client if srv._http_client else None
+        if client is None:
+            # No shared client — create a temporary one
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
                 resp = await c.post(tts_url, json=forward_body, timeout=30.0)
         else:
-            resp = await client.post(tts_url, json=forward_body, timeout=30.0)
-    except (httpx.ConnectError, httpx.TimeoutException) as e:
+            try:
+                # Use shared client directly without entering/closing it
+                resp = await client.post(tts_url, json=forward_body, timeout=30.0)
+            except RuntimeError:
+                # Shared client was closed by another handler — fall back to temp
+                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
+                    resp = await c.post(tts_url, json=forward_body, timeout=30.0)
+    except httpx.ConnectError as e:
         logger.error("TTS server unreachable at %s: %s", tts_url, e)
         raise HTTPException(status_code=502, detail=f"TTS server unreachable: {e}")
+    except httpx.TimeoutException as e:
+        logger.error("TTS server timeout at %s: %s", tts_url, e)
+        raise HTTPException(status_code=502, detail=f"TTS server timeout: {e}")
+    except Exception as e:
+        logger.exception("Unexpected error forwarding TTS request to %s", tts_url)
+        raise HTTPException(status_code=502, detail=f"TTS server error: {e}")
 
     # Return the audio response from tts-server
     content_type = resp.headers.get("content-type", "audio/wav")

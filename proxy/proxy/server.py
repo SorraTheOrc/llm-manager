@@ -656,6 +656,12 @@ def _shutdown_llama_server():
     stop_llama_server()
 
 
+def _shutdown_tts_server():
+    """Stop the qwentts TTS server process."""
+    from .lifecycle import stop_tts_server
+    stop_tts_server()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler.
