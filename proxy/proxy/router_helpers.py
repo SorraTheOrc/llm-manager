@@ -629,9 +629,18 @@ async def _try_acquire_local_dispatch(
       acquisition (or 0 if denied).
     - *retry_after* is a suggested retry delay in seconds (minimum 1).
 
-    The no-preemption policy means that a non-owner session cannot
-    acquire the local backend while an unexpired lease exists, even if
-    the owner has no active request in flight.
+    N-aware dispatch: allows up to *max_local* concurrent sessions to hold
+    dispatch leases. When fewer than *max_local* leases are held by *other*
+    sessions, a new session can acquire. Same-session re-acquisition is
+    always permitted.
+
+    The no-preemption policy means that an inactive lease (post-request
+    cooldown) reserves its slot for the owning session. Other sessions are
+    blocked only when the total number of occupied slots (active + inactive
+    unexpired leases from other sessions) reaches *max_local*.
+
+    Expired lease records (inactive and past their *expires_at* threshold)
+    are cleaned before the occupancy check, freeing their slots.
 
     When *body_json* is provided, the lease timeout is extended adaptively
     based on the estimated prompt token count. This prevents mid-stream
@@ -651,28 +660,57 @@ async def _try_acquire_local_dispatch(
 
     try:
         async with srv.local_dispatch_records_lock:
-            # Check for existing leases from other sessions
+            # ---------------------------------------------------------------
+            # 1. Clean ALL expired lease records (not just same-session).
+            #    This ensures stale records from crashed/abandoned sessions
+            #    do not permanently occupy slots.
+            # ---------------------------------------------------------------
             for existing_key, record in list(srv.local_dispatch_records.items()):
-                if existing_key == session_key:
-                    # Same session -- check if previous lease expired
-                    if not record.get("active") and record.get("expires_at", 0) <= now:
-                        # Lease expired, remove old record and allow re-acquisition
-                        del srv.local_dispatch_records[existing_key]
+                if not record.get("active") and record.get("expires_at", 0) <= now:
+                    del srv.local_dispatch_records[existing_key]
+
+            # ---------------------------------------------------------------
+            # 2. Check: does the requesting session already hold a valid lease?
+            #    Same-session re-acquisition is always permitted regardless of
+            #    how many other sessions hold leases.
+            # ---------------------------------------------------------------
+            own_record = srv.local_dispatch_records.get(session_key)
+            own_has_lease = (
+                own_record is not None
+                and (
+                    own_record.get("active")
+                    or own_record.get("expires_at", 0) > now
+                )
+            )
+
+            # ---------------------------------------------------------------
+            # 3. For new sessions (not re-acquiring), count occupied slots
+            #    from OTHER sessions. Only deny when occupied >= max_local.
+            # ---------------------------------------------------------------
+            if not own_has_lease:
+                occupied_by_others = 0
+                first_occupied_owner = None
+                for existing_key, record in srv.local_dispatch_records.items():
+                    if existing_key == session_key:
                         continue
-                    # Same session with valid lease -- allow
-                    continue
+                    if record.get("active") or record.get("expires_at", 0) > now:
+                        occupied_by_others += 1
+                        if first_occupied_owner is None:
+                            first_occupied_owner = existing_key
 
-                # Different session -- check whether it blocks acquisition
-                if record.get("active") or record.get("expires_at", 0) > now:
-                    # Owner session has an active or unexpired lease
-                    owner = existing_key
+                if occupied_by_others >= max_local:
+                    # All N slots are occupied by other sessions
                     active_count = getattr(srv, "local_active_queries", 0)
-                    retry_after = max(1.0, record.get("expires_at", now) - now)
-                    return (False, owner, active_count, retry_after)
+                    retry_after = max(1.0, lease_timeout)
+                    return (False, first_occupied_owner, active_count, retry_after)
 
-            # No blocking lease -- check concurrency cap
+            # ---------------------------------------------------------------
+            # 4. Check active-query concurrency cap.
+            #    Same-session re-acquisition skips the cap check since the
+            #    session's previous request already decremented the counter.
+            # ---------------------------------------------------------------
             async with srv.local_active_queries_lock:
-                if srv.local_active_queries >= max_local:
+                if srv.local_active_queries >= max_local and not own_has_lease:
                     # At concurrency limit -- find the owner of the active request
                     active_owner = None
                     for ek, er in srv.local_dispatch_records.items():
@@ -686,9 +724,12 @@ async def _try_acquire_local_dispatch(
                         max(1.0, lease_timeout),
                     )
 
-                # Acquire: increment counter and create dispatch record
+                # Acquire: increment active-query counter
                 srv.local_active_queries += 1
 
+            # ---------------------------------------------------------------
+            # 5. Create or update the dispatch lease record.
+            # ---------------------------------------------------------------
             srv.local_dispatch_records[session_key] = {
                 "backend": backend,
                 "started_at": now,

@@ -274,6 +274,11 @@ server:
   # Limits concurrent requests to local providers. Remote providers
   # continue to use max_concurrent_queries. When this limit is reached,
   # requests with fallback providers skip to the next provider immediately.
+  #
+  # NOTE: This value is now derived from `session_slot_pool_size` by default.
+  # The `local_max_concurrent_queries` key is preserved for explicit override
+  # only. In normal operation, change `session_slot_pool_size` to control the
+  # number of parallel dispatch leases.
   local_max_concurrent_queries: 1
   # Local dispatch lease timeout in seconds.
   # An idle session holds an inactive lease for this duration after its
@@ -295,13 +300,30 @@ server:
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
-  # Number of slots (GPU contexts) available for hash-based session slot assignment.
+  # Number of parallel sessions (GPU contexts) for local dispatch.
+  # Controls how many concurrent Pi agent sessions can hold dispatch leases
+  # and process requests through the local llama-server simultaneously.
+  #
   # MUST match llama-server's --parallel / -np flag passed in start-llama.sh.
   # Mismatch causes slot exhaustion or restore failures:
   #   - pool_size < --parallel → some server slots go unused
   #   - pool_size > --parallel → sessions map to slot IDs that do not exist
-  # The start script reads LLAMA_PARALLEL env var (set by lifecycle from this value)
-  # to automatically keep them aligned.
+  # The start script reads LLAMA_PARALLEL env var (set by lifecycle from this
+  # value) to automatically keep them aligned.
+  #
+  # The dispatch lease system (``_try_acquire_local_dispatch``) allows up to N
+  # concurrent sessions, where N = session_slot_pool_size. When a session holds
+  # an active or inactive (post-request cooldown) lease, its slot is reserved.
+  # Other sessions are blocked only when all N slots are occupied.
+  #
+  # Relationship to slot_management.slot_pool_size:
+  #   slot_management.slot_pool_size (default 4) is a separate admission-queuing
+  #   layer for multi-turn conversation slot ownership. It allows up to M sessions
+  #   to be tracked/admitted, but only N of those M admitted sessions can process
+  #   simultaneously at the dispatch level. With N=2 and pool_size=4, up to 4
+  #   sessions can be admitted with 2 processing and 2 queued at the dispatch level.
+  #
+  # Server restart required to change this value (no hot reload).
   session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
