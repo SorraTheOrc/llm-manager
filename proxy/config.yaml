@@ -448,8 +448,9 @@ server:
   tts_server_port: 8081
   # Path to the tts-server binary start script.
   tts_start_script: proxy/scripts/start-qwentts.sh
-  # Optional explicit model/codec paths (auto-detected from qwentts.cpp/models/ if omitted).
-  # tts_model_path: qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf
-  # tts_codec_path: qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf
+  # Talker LM GGUF model path. When unset, auto-detected from qwentts.cpp/models/.
+  tts_model_path: ""
+  # Codec (tokenizer) GGUF model path. When unset, auto-detected from qwentts.cpp/models/.
+  tts_codec_path: ""
   # Set to false to skip TTS server startup entirely.
   tts_enabled: true
