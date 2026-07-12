@@ -491,3 +491,190 @@ async def test_cross_session_handoff_after_lease_release():
     assert acquired_after is True, (
         "Session B should be able to acquire after Session A's lease is released"
     )
+
+
+# ---------------------------------------------------------------------------
+# N-aware dispatch lease tests (LP-0MRI8J7WR0035ZE1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_n2_allows_two_concurrent_sessions():
+    """With N=2, two different sessions can concurrently hold active dispatch leases."""
+    from proxy.router_helpers import _try_acquire_local_dispatch
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    # Session A acquires
+    acquired_a, owner_a, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-a", backend="local",
+    )
+    assert acquired_a is True
+    assert owner_a is None
+
+    # Session B acquires (should succeed with N=2)
+    acquired_b, owner_b, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-b", backend="local",
+    )
+    assert acquired_b is True, "Session B should be allowed with N=2"
+    assert owner_b is None
+
+
+@pytest.mark.asyncio
+async def test_n2_blocks_third_session():
+    """With N=2 and two active leases held, a third session is denied."""
+    from proxy.router_helpers import _try_acquire_local_dispatch
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    # Session A acquires
+    await _try_acquire_local_dispatch(srv, max_local=2, session_key="sess-a", backend="local")
+    # Session B acquires
+    await _try_acquire_local_dispatch(srv, max_local=2, session_key="sess-b", backend="local")
+
+    # Session C tries - should be denied
+    acquired_c, owner_c, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-c", backend="local",
+    )
+    assert acquired_c is False, "Session C should be denied when 2 slots occupied"
+    assert owner_c in ("sess-a", "sess-b")
+
+
+@pytest.mark.asyncio
+async def test_n1_backward_compatible():
+    """With N=1, behaviour is identical to the current single-session dispatch."""
+    from proxy.router_helpers import _try_acquire_local_dispatch
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    # Session A acquires
+    acquired_a, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-a", backend="local",
+    )
+    assert acquired_a is True
+
+    # Session B tries - should be denied (backward compat)
+    acquired_b, owner_b, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-b", backend="local",
+    )
+    assert acquired_b is False
+    assert owner_b == "sess-a"
+
+
+@pytest.mark.asyncio
+async def test_n3_inactive_lease_reserves_slot():
+    """No-preemption policy preserved: inactive leases reserve their slot.
+
+    With N=3, session A has an inactive lease, sessions B and C fill
+    the remaining slots, session D is blocked.
+    """
+    from proxy.router_helpers import _try_acquire_local_dispatch, _decrement_local_active_queries
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    # Session A acquires and finishes (inactive lease)
+    await _try_acquire_local_dispatch(srv, max_local=3, session_key="sess-a", backend="local")
+    await _decrement_local_active_queries(srv, session_key="sess-a")
+    assert srv.local_dispatch_records["sess-a"]["active"] is False
+
+    # Session B acquires (active)
+    acquired_b, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=3, session_key="sess-b", backend="local",
+    )
+    assert acquired_b is True
+
+    # Session C acquires (active) - fills the third slot
+    acquired_c, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=3, session_key="sess-c", backend="local",
+    )
+    assert acquired_c is True
+
+    # Session D tries - should be denied (all 3 slots occupied by A, B, C)
+    acquired_d, owner_d, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=3, session_key="sess-d", backend="local",
+    )
+    assert acquired_d is False, "Session D should be denied when all N=3 slots occupied"
+    assert owner_d is not None
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_frees_slot():
+    """Expired leases are cleaned and their slots become available for other sessions."""
+    from proxy.router_helpers import _try_acquire_local_dispatch
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-expired": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 0.0,  # already expired
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    acquired, owner, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-new", backend="local",
+    )
+    assert acquired is True, "New session should acquire after expired lease is cleaned"
+    assert "sess-expired" not in srv.local_dispatch_records, (
+        "Expired lease should have been removed"
+    )
+    assert "sess-new" in srv.local_dispatch_records
+
+
+@pytest.mark.asyncio
+async def test_get_local_max_concurrent_queries_reads_session_slot_pool_size():
+    """_get_local_max_concurrent_queries reads from session_slot_pool_size."""
+    from proxy.router import _get_local_max_concurrent_queries
+
+    # session_slot_pool_size should take precedence
+    result = _get_local_max_concurrent_queries({
+        "session_slot_pool_size": 3,
+        "local_max_concurrent_queries": 1,
+    })
+    assert result == 3, f"Expected 3, got {result}"
+
+    # without session_slot_pool_size, fall back to local_max_concurrent_queries
+    result = _get_local_max_concurrent_queries({
+        "local_max_concurrent_queries": 2,
+    })
+    assert result == 2, f"Expected 2, got {result}"
+
+    # with neither, default to 1
+    result = _get_local_max_concurrent_queries({})
+    assert result == 1, f"Expected 1, got {result}"
+
+    # session_slot_pool_size=1 should still work
+    result = _get_local_max_concurrent_queries({
+        "session_slot_pool_size": 1,
+    })
+    assert result == 1, f"Expected 1, got {result}"
