@@ -32,19 +32,27 @@ read_config_start_script() {
     return
   fi
 
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
+
   # Try to parse proxy/config.yaml for llama_start_script
   if [[ -f "$CONFIG_FILE" ]]; then
     # crude YAML parse: look for the first occurrence of "llama_start_script" and extract the value
     local val
     val=$(awk -F ':' '/llama_start_script/ { $1=""; sub(/^[: \t]+/, "", $0); print $0; exit }' "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//') || true
     if [[ -n "$val" ]]; then
-      echo "$val"
+      # If the value is a relative path, resolve it against the repo root
+      if [[ "$val" != /* ]]; then
+        echo "${repo_root}/${val}"
+      else
+        echo "$val"
+      fi
       return
     fi
   fi
 
   # Fallback to top-level start script
-  echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)/start-llama.sh"
+  echo "${repo_root}/start-llama.sh"
 }
 
 is_running() {
@@ -68,7 +76,7 @@ cmd_start() {
     ensure_dev_dirs
     if pid=$(is_running "$DEV_PID_FILE"); then
       echo "proxy dev already running (PID $pid)"
-      exit 0
+      return 0
     fi
 
     # Dev mode: set dev defaults (overridable via env vars)
@@ -78,9 +86,9 @@ cmd_start() {
     export PORT="$LLAMA_SERVER_PORT"
 
     start_script=$(read_config_start_script)
-    if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+    if [[ ! -f "$start_script" || ! -x "$start_script" ]]; then
       echo "Start script not found: $start_script" >&2
-      exit 2
+      return 2
     fi
 
     echo "Starting proxy in dev mode (web: http://localhost:${PROXY_PORT}, backend: http://localhost:${LLAMA_SERVER_PORT})"
@@ -104,7 +112,7 @@ cmd_start() {
       (source "$venv_activate" && exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug) > "$DEV_LOG_FILE" 2>&1 &
     else
       echo "Warning: virtualenv not found at $venv_activate, running without it" >&2
-      exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug > "$DEV_LOG_FILE" 2>&1 &
+      exec python3 -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug > "$DEV_LOG_FILE" 2>&1 &
     fi
     local pid=$!
     echo "$pid" > "$DEV_PID_FILE"
@@ -114,13 +122,13 @@ cmd_start() {
     ensure_dirs
     if pid=$(is_running); then
       echo "proxy already running (PID $pid)"
-      exit 0
+      return 0
     fi
 
     start_script=$(read_config_start_script)
-    if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+    if [[ ! -f "$start_script" || ! -x "$start_script" ]]; then
       echo "Start script not found: $start_script" >&2
-      exit 2
+      return 2
     fi
 
     echo "Starting proxy using: $start_script"
@@ -141,8 +149,14 @@ cmd_stop() {
   fi
 
   if ! pid=$(is_running "$pid_file"); then
-    echo "proxy not running"
-    exit 0
+    if [[ -f "$pid_file" ]]; then
+      # Stale PID file; clean it up
+      rm -f "$pid_file"
+      echo "proxy not running (stale PID file cleaned up)"
+    else
+      echo "proxy not running"
+    fi
+    return 0
   fi
   echo "Stopping proxy (PID $pid)"
   kill -TERM "$pid" 2>/dev/null || true
@@ -177,10 +191,10 @@ cmd_status() {
         echo "Started: $start_time"
       fi
     fi
-    exit 0
+    return 0
   else
     echo "proxy not running"
-    exit 3
+    return 3
   fi
 }
 
@@ -204,7 +218,7 @@ cmd_logs() {
 
   if [[ ! -f "$log_file" ]]; then
     echo "Logfile does not exist yet: $log_file"
-    exit 1
+    return 1
   fi
   tail -n +1 -f "$log_file"
 }
@@ -264,12 +278,12 @@ main() {
   set -- "${dev_args[@]+${dev_args[@]}}"
 
   case "$cmd" in
-    start) cmd_start "$DEV_MODE" ;;
-    stop) cmd_stop "$DEV_MODE" ;;
-    restart) cmd_restart "$DEV_MODE" ;;
-    status) cmd_status "$DEV_MODE" ;;
-    logs) cmd_logs "$DEV_MODE" ;;
-    help|-h|--help) usage ;;
+    start) cmd_start "$DEV_MODE"; exit $? ;;
+    stop) cmd_stop "$DEV_MODE"; exit $? ;;
+    restart) cmd_restart "$DEV_MODE"; exit $? ;;
+    status) cmd_status "$DEV_MODE"; exit $? ;;
+    logs) cmd_logs "$DEV_MODE"; exit $? ;;
+    help|-h|--help) usage; exit 0 ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
   esac
 }
