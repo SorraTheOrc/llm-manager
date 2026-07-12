@@ -678,3 +678,286 @@ async def test_get_local_max_concurrent_queries_reads_session_slot_pool_size():
         "session_slot_pool_size": 1,
     })
     assert result == 1, f"Expected 1, got {result}"
+
+
+# ---------------------------------------------------------------------------
+# N=2 concurrent dispatch integration tests (LP-0MRI8JB6W0022XT9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypatch):
+    """With N=2 and two active sessions, a third is blocked via proxy_to_local."""
+    from proxy import server as srv
+    from proxy.router import proxy_to_local, _get_local_max_concurrent_queries
+
+    # Config: N=2 via session_slot_pool_size (also set local_max_concurrent_queries
+    # for backward compat so tests work with both old and new code)
+    monkeypatch.setattr(
+        srv,
+        "config",
+        {
+            "server": {
+                "llama_server_port": 8080,
+                "session_slot_pool_size": 2,
+                "local_max_concurrent_queries": 2,
+                "max_concurrent_queries": 16,
+            }
+        },
+    )
+    proc = MagicMock()
+    proc.poll.return_value = None
+    monkeypatch.setattr(srv, "llama_process", proc)
+    monkeypatch.setattr(srv, "backend_ready", True)
+    monkeypatch.setattr(srv, "current_model", "Qwen3")
+    monkeypatch.setattr(srv, "active_queries", 0)
+    monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
+    # Simulate 2 active local queries (sess-a and sess-b)
+    monkeypatch.setattr(srv, "local_active_queries", 2)
+    monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        srv,
+        "local_dispatch_records",
+        {
+            "sess-a": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+            "sess-b": {
+                "backend": "local",
+                "started_at": 2.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+        },
+    )
+    monkeypatch.setattr(srv, "local_dispatch_records_lock", asyncio.Lock())
+
+    import proxy.router as router_mod
+
+    monkeypatch.setattr(router_mod, "_is_self_healing_active", lambda: False)
+    monkeypatch.setattr(
+        router_mod,
+        "_handle_session",
+        AsyncMock(
+            return_value={
+                "session_id": "sess-c",
+                "session_id_header": "sess-c",
+                "session_explicit": True,
+                "session_created": False,
+                "is_delta_request": False,
+                "session_fallback_reason": None,
+                "delta_messages": None,
+                "original_message_count": 1,
+                "body_json": {
+                    "model": "plan",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                "body_override": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
+    monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
+    monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
+    monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
+
+    req = _DummyRequest(
+        body=json.dumps(
+            {
+                "model": "plan",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            }
+        ).encode("utf-8")
+    )
+
+    resp = await proxy_to_local(req, "v1/chat/completions")
+
+    assert resp.status_code == 503
+    payload = json.loads(resp.body)
+    assert payload["error"]["code"] == "no_slots_available"
+    assert payload["local_owner_session_id"] in ("sess-a", "sess-b")
+
+
+@pytest.mark.asyncio
+async def test_n2_integration_release_then_retry(monkeypatch):
+    """After one session completes, a blocked session can acquire on retry."""
+    from proxy import server as srv
+    from proxy.router import proxy_to_local, _get_local_max_concurrent_queries
+
+    monkeypatch.setattr(
+        srv,
+        "config",
+        {
+            "server": {
+                "llama_server_port": 8080,
+                "session_slot_pool_size": 2,
+                "local_max_concurrent_queries": 2,
+                "max_concurrent_queries": 16,
+            }
+        },
+    )
+    proc = MagicMock()
+    proc.poll.return_value = None
+    monkeypatch.setattr(srv, "llama_process", proc)
+    monkeypatch.setattr(srv, "backend_ready", True)
+    monkeypatch.setattr(srv, "current_model", "Qwen3")
+    monkeypatch.setattr(srv, "active_queries", 0)
+    monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
+    # Simulate 1 active local query (sess-a) after sess-b's lease was released
+    monkeypatch.setattr(srv, "local_active_queries", 1)
+    monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        srv,
+        "local_dispatch_records",
+        {
+            "sess-a": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+            # sess-b's lease has been released
+        },
+    )
+    monkeypatch.setattr(srv, "local_dispatch_records_lock", asyncio.Lock())
+
+    import proxy.router as router_mod
+
+    monkeypatch.setattr(router_mod, "_is_self_healing_active", lambda: False)
+    monkeypatch.setattr(
+        router_mod,
+        "_handle_session",
+        AsyncMock(
+            return_value={
+                "session_id": "sess-c",
+                "session_id_header": "sess-c",
+                "session_explicit": True,
+                "session_created": False,
+                "is_delta_request": False,
+                "session_fallback_reason": None,
+                "delta_messages": None,
+                "original_message_count": 1,
+                "body_json": {
+                    "model": "plan",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                "body_override": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
+    monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
+    monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
+    monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
+
+    req = _DummyRequest(
+        body=json.dumps(
+            {
+                "model": "plan",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            }
+        ).encode("utf-8")
+    )
+
+    resp = await proxy_to_local(req, "v1/chat/completions")
+
+    # With only 1 active lease (sess-a), sess-c should be allowed through
+    # the dispatch gate. Note: this test verifies dispatch gate passes, but
+    # the actual backend call may fail — we only check that it's NOT a 503
+    # from the dispatch gate.
+    assert resp.status_code != 503, (
+        "Session should not receive 503 when only 1 of N=2 slots is occupied"
+    )
+
+
+@pytest.mark.asyncio
+async def test_n1_backward_compat_integration(monkeypatch):
+    """N=1 backward compat: single session proceeds, second session blocked."""
+    from proxy import server as srv
+    from proxy.router import proxy_to_local
+
+    monkeypatch.setattr(
+        srv,
+        "config",
+        {
+            "server": {
+                "llama_server_port": 8080,
+                "session_slot_pool_size": 1,
+                "local_max_concurrent_queries": 1,
+                "max_concurrent_queries": 16,
+            }
+        },
+    )
+    proc = MagicMock()
+    proc.poll.return_value = None
+    monkeypatch.setattr(srv, "llama_process", proc)
+    monkeypatch.setattr(srv, "backend_ready", True)
+    monkeypatch.setattr(srv, "current_model", "Qwen3")
+    monkeypatch.setattr(srv, "active_queries", 0)
+    monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_active_queries", 1)
+    monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        srv,
+        "local_dispatch_records",
+        {
+            "sess-a": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+        },
+    )
+    monkeypatch.setattr(srv, "local_dispatch_records_lock", asyncio.Lock())
+
+    import proxy.router as router_mod
+
+    monkeypatch.setattr(router_mod, "_is_self_healing_active", lambda: False)
+    monkeypatch.setattr(
+        router_mod,
+        "_handle_session",
+        AsyncMock(
+            return_value={
+                "session_id": "sess-b",
+                "session_id_header": "sess-b",
+                "session_explicit": True,
+                "session_created": False,
+                "is_delta_request": False,
+                "session_fallback_reason": None,
+                "delta_messages": None,
+                "original_message_count": 1,
+                "body_json": {
+                    "model": "plan",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                "body_override": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
+    monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
+    monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
+    monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
+
+    req = _DummyRequest(
+        body=json.dumps(
+            {
+                "model": "plan",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            }
+        ).encode("utf-8")
+    )
+
+    resp = await proxy_to_local(req, "v1/chat/completions")
+
+    assert resp.status_code == 503
+    payload = json.loads(resp.body)
+    assert payload["error"]["code"] == "no_slots_available"
+    assert payload["local_owner_session_id"] == "sess-a"
