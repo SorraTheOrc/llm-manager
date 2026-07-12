@@ -45,7 +45,7 @@ def cleanup_background_processes():
 
 
 
-def run_proxyctl(*args, env=None, cwd=None):
+def run_proxyctl(*args, env=None, cwd=None, timeout=15):
     """Run proxyctl and return CompletedProcess."""
     cmd = [str(PROXYCTL)] + list(args)
     proc_env = os.environ.copy()
@@ -57,7 +57,7 @@ def run_proxyctl(*args, env=None, cwd=None):
         text=True,
         cwd=cwd or str(REPO_ROOT),
         env=proc_env,
-        timeout=15,
+        timeout=timeout,
     )
     return result
 
@@ -204,6 +204,49 @@ class TestStart:
             os.kill(pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+
+    def test_start_foreground_blocks(self, tmp_path):
+        """Start --foreground should run in foreground (block until killed)."""
+        start_script = tmp_path / "foreground.sh"
+        # Use a short sleep so the test doesn't hang
+        start_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            echo "foreground running"
+            sleep 3
+            echo "foreground done"
+        """))
+        start_script.chmod(0o755)
+
+        env = {"LLAMA_START_SCRIPT": str(start_script)}
+
+        # Foreground should block until the script exits
+        result = run_proxyctl("start", "--foreground", env=env, timeout=15)
+        assert result.returncode == 0
+        assert "foreground running" in result.stdout
+        assert "foreground done" in result.stdout
+
+    def test_start_with_wait_accepts_flag(self, tmp_path):
+        """Start --wait should be accepted (health polling is best-effort)."""
+        start_script = tmp_path / "wait-test.sh"
+        start_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            while true; do sleep 1; done
+        """))
+        start_script.chmod(0o755)
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        env = {
+            "LLAMA_START_SCRIPT": str(start_script),
+            "XDG_STATE_HOME": str(state_dir),
+        }
+
+        # --wait should not cause start to fail (health check is best-effort)
+        result = run_proxyctl("start", "--wait", env=env)
+        assert result.returncode == 0
+
+        # Cleanup
+        run_proxyctl("stop", env=env)
 
 
 # ============================================================================
