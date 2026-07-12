@@ -122,6 +122,28 @@ provider_fallback_count: dict = {}
 _dispatch_cleanup_task: Optional[asyncio.Task] = None
 
 
+async def _release_lease_on_session_eviction(session_id: str) -> None:
+    """Callback invoked when a session is evicted from the session manager.
+
+    Releases the local dispatch lease for the evicted session so that
+    other sessions can acquire the local backend immediately, rather
+    than waiting for the lease timeout (LP-0MRHV4UYE0013F6P).
+    """
+    try:
+        from proxy.router_helpers import _release_local_dispatch
+        import proxy.server as _srv
+        await _release_local_dispatch(_srv, session_id)
+        logger.info(
+            "lease_released session=%s reason=session_evicted",
+            session_id[:8] if session_id else "unknown",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to release dispatch lease on session eviction for %s",
+            session_id[:8] if session_id else "unknown",
+        )
+
+
 async def _dispatch_cleanup_loop() -> None:
     """Background task that periodically removes stale dispatch leases.
 
@@ -561,7 +583,14 @@ def _startup_launch_persistence_tasks():
 
 
 def _startup_start_session_cleanup():
-    """Start the session manager's periodic cleanup task."""
+    """Start the session manager's periodic cleanup task
+    and register the session-eviction → lease-release callback."""
+    try:
+        # Register eviction callback so dispatch leases are released
+        # when sessions expire/are evicted (LP-0MRHV4UYE0013F6P).
+        session_manager.set_eviction_callback(_release_lease_on_session_eviction)
+    except Exception as e:
+        logger.warning(f"Failed to register eviction callback: {e}")
     try:
         session_manager.start_cleanup_task()
     except Exception as e:

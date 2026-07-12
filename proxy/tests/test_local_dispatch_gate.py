@@ -367,3 +367,127 @@ async def test_cleanup_stale_preserves_active_unexpired_lease():
     )
     assert removed == 0, "No leases should have been removed"
     assert srv.local_dispatch_records["sess-active"]["active"] is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-session handoff tests (LP-0MRHV4UYE0013F6P)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reduced_default_timeout_is_60_seconds():
+    """The default lease timeout should be 60s (reduced from 180s)."""
+    from proxy.router_helpers import _get_lease_timeout_seconds
+
+    srv = SimpleNamespace(
+        config={"server": {}},
+    )
+
+    timeout = _get_lease_timeout_seconds(srv)
+    assert timeout == 60.0, f"Expected 60.0, got {timeout}"
+
+
+@pytest.mark.asyncio
+async def test_configurable_timeout_still_respected():
+    """A config-specified timeout should still override the default."""
+    from proxy.router_helpers import _get_lease_timeout_seconds
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 300}},
+    )
+
+    timeout = _get_lease_timeout_seconds(srv)
+    assert timeout == 300.0, f"Expected 300.0, got {timeout}"
+
+
+@pytest.mark.asyncio
+async def test_release_local_dispatch_on_session_eviction():
+    """_release_local_dispatch should remove the dispatch record for an evicted session.
+
+    This replicates the core action of the eviction callback — when a
+    session is evicted from the session manager, its dispatch lease
+    should be released so another session can acquire it.
+    """
+    from proxy.router_helpers import _release_local_dispatch, _increment_local_active_queries
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=MagicMock(),
+    )
+
+    # Create a dispatch record for session "sess-a"
+    await _increment_local_active_queries(srv, session_key="sess-a", backend="local")
+    assert "sess-a" in srv.local_dispatch_records
+
+    # Simulate stream finish (mark inactive)
+    from proxy.router_helpers import _decrement_local_active_queries
+    await _decrement_local_active_queries(srv, session_key="sess-a")
+    assert srv.local_dispatch_records["sess-a"]["active"] is False
+    assert "sess-a" in srv.local_dispatch_records  # lease persists
+
+    # Now release the lease (like the eviction callback would do)
+    removed = await _release_local_dispatch(srv, "sess-a")
+    assert removed is True
+    assert "sess-a" not in srv.local_dispatch_records, (
+        "Dispatch record should be removed on explicit release"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cross_session_handoff_after_lease_release():
+    """After lease release, a different session can acquire the local backend.
+
+    This simulates:
+    1. Session A acquires the local backend and finishes.
+    2. The lease is explicitly released (via eviction callback or /v1/leases/release).
+    3. Session B can immediately acquire the local backend.
+    """
+    from proxy.router_helpers import (
+        _try_acquire_local_dispatch,
+        _increment_local_active_queries,
+        _release_local_dispatch,
+    )
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=MagicMock(),
+    )
+
+    # 1. Session A acquires the local backend
+    await _increment_local_active_queries(srv, session_key="sess-a", backend="local")
+    assert srv.local_active_queries == 1
+
+    # 2. Session A finishes its stream (mark inactive, lease remains)
+    from proxy.router_helpers import _decrement_local_active_queries
+    await _decrement_local_active_queries(srv, session_key="sess-a")
+    assert srv.local_active_queries == 0
+    assert "sess-a" in srv.local_dispatch_records  # lease persists
+
+    # 3. Before handoff: Session B tries to acquire — should be denied
+    acquired_before, owner, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-b", backend="local",
+    )
+    assert acquired_before is False, (
+        "Session B should be denied while Session A's lease is held"
+    )
+    assert owner == "sess-a"
+
+    # 4. Release Sesion A's lease (simulating eviction callback)
+    await _release_local_dispatch(srv, "sess-a")
+    assert "sess-a" not in srv.local_dispatch_records
+
+    # 5. After release: Session B tries to acquire — should succeed
+    acquired_after, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-b", backend="local",
+    )
+    assert acquired_after is True, (
+        "Session B should be able to acquire after Session A's lease is released"
+    )

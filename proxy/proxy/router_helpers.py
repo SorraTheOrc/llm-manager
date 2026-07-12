@@ -491,10 +491,10 @@ def _get_lease_timeout_seconds(srv) -> float:
     try:
         server_cfg = srv.config.get("server", {})
         return float(
-            server_cfg.get("local_dispatch_lease_timeout_seconds", 180) or 180
+            server_cfg.get("local_dispatch_lease_timeout_seconds", 60) or 60
         )
     except Exception:
-        return 180.0
+        return 60.0
 
 
 def _get_adaptive_lease_timeout_seconds(
@@ -567,6 +567,14 @@ async def _decrement_local_active_queries(
                         srv.local_dispatch_records[session_key]["expires_at"] = (
                             time.monotonic() + lease_timeout
                         )
+                        try:
+                            srv.logger.info(
+                                "lease_renewed session=%s timeout=%.0fs",
+                                session_key[:8] if session_key else "unknown",
+                                lease_timeout,
+                            )
+                        except Exception:
+                            pass
         except Exception:
             pass
 
