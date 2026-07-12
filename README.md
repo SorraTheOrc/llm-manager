@@ -66,7 +66,7 @@ Existing session slot settings (used when `slot_management` is absent):
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `session_slot_pool_size` | `1` | Number of slots for hash-based assignment. |
+| `session_slot_pool_size` | `1` | Number of parallel dispatch sessions. Controls how many concurrent Pi agent sessions can hold dispatch leases simultaneously. Also sets llama-server's `--parallel` flag. |
 | `session_slot_save_path` | `./slot-cache` | Directory for KV cache snapshots. |
 | `session_slot_timeout_seconds` | `3.0` | Slot save/restore timeout in seconds. |
 
