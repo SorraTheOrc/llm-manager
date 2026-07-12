@@ -101,8 +101,9 @@ class TestConfigDetection:
         state_dir.mkdir()
         env = {"XDG_STATE_HOME": str(state_dir)}
         result = run_proxyctl("logs", env=env)
+        output = result.stdout + result.stderr
         assert result.returncode == 1
-        assert "Logfile does not exist" in result.stdout
+        assert "Logfile does not exist" in output
 
 
 # ============================================================================
@@ -442,8 +443,57 @@ class TestLogs:
             "XDG_STATE_HOME": str(state_dir),
         }
         result = run_proxyctl("logs", env=env)
+        # stderr or stdout depending on code path
+        output = result.stdout + result.stderr
         assert result.returncode == 1
-        assert "Logfile does not exist" in result.stdout
+        assert "Logfile does not exist" in output
+
+    def test_logs_file_flag(self, tmp_path):
+        """Logs --file should tail a specified file."""
+        log_file = tmp_path / "custom.log"
+        log_file.write_text("custom log line 1\ncustom log line 2\n")
+
+        result = run_proxyctl("logs", "--file", str(log_file), "--no-follow")
+        assert result.returncode == 0
+        assert "custom log line 1" in result.stdout
+        assert "custom log line 2" in result.stdout
+
+    def test_logs_file_flag_missing(self, tmp_path):
+        """Logs --file should fail on missing file."""
+        result = run_proxyctl("logs", "--file", str(tmp_path / "nonexistent.log"), "--no-follow")
+        assert result.returncode == 1
+
+    def test_logs_lines_flag(self, tmp_path):
+        """Logs --lines N should show only the last N lines."""
+        log_file = tmp_path / "lines.log"
+        log_file.write_text("line 1\nline 2\nline 3\n")
+
+        result = run_proxyctl("logs", "--file", str(log_file), "--lines", "2", "--no-follow")
+        assert result.returncode == 0
+        assert "line 1" not in result.stdout
+        assert "line 2" in result.stdout
+        assert "line 3" in result.stdout
+
+    def test_logs_cat_does_not_block(self, tmp_path):
+        """Logs --no-follow should print and exit without blocking."""
+        log_file = tmp_path / "cat.log"
+        log_file.write_text("cat line 1\n")
+
+        result = run_proxyctl("logs", "--file", str(log_file), "--no-follow")
+        assert result.returncode == 0
+        assert "cat line 1" in result.stdout
+
+    def test_logs_dev_mode_no_file(self, tmp_path):
+        """Logs --dev should fail when no dev log exists."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        env = {
+            "XDG_STATE_HOME": str(state_dir),
+        }
+        result = run_proxyctl("logs", "--dev", env=env)
+        output = result.stdout + result.stderr
+        assert result.returncode == 1
+        assert "Logfile does not exist" in output
 
     def test_logs_tails_existing_file(self, tmp_path):
         """Logs should tail an existing log file."""
@@ -459,8 +509,27 @@ class TestLogs:
             "XDG_STATE_HOME": str(state_dir),
         }
 
-        # logs tail with timeout to avoid hanging (tail -f blocks)
-        cmd = [str(PROXYCTL), "logs"]
+        # use --cat to avoid blocking
+        result = run_proxyctl("logs", "--cat", env=env)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "test log line 1" in result.stdout
+        assert "test log line 2" in result.stdout
+
+    def test_logs_follow_flag(self, tmp_path):
+        """Logs --follow should keep following (blocks), verify with timeout."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        log_dir = state_dir / "llama-proxy" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "proxy.log"
+        log_file.write_text("initial line\n")
+
+        env = {
+            "XDG_STATE_HOME": str(state_dir),
+        }
+
+        cmd = [str(PROXYCTL), "logs", "--follow"]
         import signal as sig
         proc = subprocess.Popen(
             cmd,
@@ -472,11 +541,10 @@ class TestLogs:
             preexec_fn=os.setsid,
         )
         import time as _time
-        _time.sleep(1)  # Let tail output initial content
+        _time.sleep(1)
         os.killpg(os.getpgid(proc.pid), sig.SIGTERM)
         stdout, stderr = proc.communicate(timeout=5)
-        assert "test log line 1" in stdout
-        assert "test log line 2" in stdout
+        assert "initial line" in stdout
 
 
 # ============================================================================

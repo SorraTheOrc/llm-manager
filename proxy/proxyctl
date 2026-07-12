@@ -205,22 +205,95 @@ cmd_restart() {
   cmd_start "$dev_mode"
 }
 
+read_config_log_dir() {
+  # Try to parse proxy/config.yaml for logging.directory
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local val
+    val=$(awk -F ':' '/logging:/ { found=1; next } found && /directory/ { $1=""; sub(/^[: \t]+/, "", $0); print $0; exit }' "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//') || true
+    if [[ -n "$val" ]]; then
+      echo "$val"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 cmd_logs() {
   local dev_mode="$1"
-  local log_file="$LOG_FILE"
+  shift || true
+  local log_file=""
+  local lines="+1"
+  local follow=1
+
+  # Parse remaining args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file)
+        if [[ -z "${2:-}" ]]; then
+          echo "Error: --file requires a path argument" >&2
+          return 1
+        fi
+        log_file="$2"
+        shift 2
+        ;;
+      --lines)
+        if [[ -z "${2:-}" ]]; then
+          echo "Error: --lines requires a number argument" >&2
+          return 1
+        fi
+        # Accept positive integer or "+N" syntax
+        if [[ "$2" =~ ^[0-9]+$ ]]; then
+          lines="-$2"
+        elif [[ "$2" =~ ^\+[0-9]+$ ]]; then
+          lines="$2"
+        else
+          echo "Error: --lines requires a number (e.g., 50 or +1)" >&2
+          return 1
+        fi
+        shift 2
+        ;;
+      --follow|--tail)
+        follow=1
+        shift
+        ;;
+      --no-follow|--cat)
+        follow=0
+        shift
+        ;;
+      *)
+        echo "Unknown logs option: $1" >&2
+        return 1
+        ;;
+    esac
+  done
 
   if [[ "$dev_mode" -eq 1 ]]; then
     ensure_dev_dirs
-    log_file="$DEV_LOG_FILE"
+    if [[ -z "$log_file" ]]; then
+      log_file="$DEV_LOG_FILE"
+    fi
   else
     ensure_dirs
+    if [[ -z "$log_file" ]]; then
+      log_file="$LOG_FILE"
+    fi
   fi
 
   if [[ ! -f "$log_file" ]]; then
-    echo "Logfile does not exist yet: $log_file"
+    echo "Logfile does not exist: $log_file" >&2
     return 1
   fi
-  tail -n +1 -f "$log_file"
+
+  if [[ ! -r "$log_file" ]]; then
+    echo "Logfile is not readable: $log_file" >&2
+    return 1
+  fi
+
+  if [[ "$follow" -eq 1 ]]; then
+    tail -n "$lines" -f "$log_file"
+  else
+    tail -n "$lines" "$log_file"
+  fi
 }
 
 usage() {
@@ -235,7 +308,8 @@ Commands:
   stop [--dev]         Stop the running proxy (SIGTERM then SIGKILL)
   restart [--dev]      Stop then start
   status [--dev]       Show running status, PID and start time
-  logs [--dev]         Tail the proxy log produced by $SCRIPT_NAME
+  logs [--dev] [options]  View/tail proxy logs
+                         Options: --file <path>, --lines N, --follow/--no-follow
   help                 Show this message
 
 Environment:
@@ -250,6 +324,12 @@ Dev Mode:
   When --dev is used, the proxy starts on port 8001 with DEBUG logging and
   auto-reload enabled. A separate PID file (proxy.dev.pid) and log directory
   are used to avoid conflicts with production instances.
+
+Logs Options:
+  --file <path>        Tail a specific log file instead of auto-detecting
+  --lines N            Show last N lines (default: all lines)
+  --follow             Keep following the log (default)
+  --no-follow, --cat   Print log contents and exit without following
 
 Install:
   Copy this file to a location on PATH and make it executable, e.g.
@@ -282,7 +362,7 @@ main() {
     stop) cmd_stop "$DEV_MODE"; exit $? ;;
     restart) cmd_restart "$DEV_MODE"; exit $? ;;
     status) cmd_status "$DEV_MODE"; exit $? ;;
-    logs) cmd_logs "$DEV_MODE"; exit $? ;;
+    logs) cmd_logs "$DEV_MODE" "$@"; exit $? ;;
     help|-h|--help) usage; exit 0 ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
   esac
