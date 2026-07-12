@@ -439,3 +439,17 @@ server:
     slot_job_timeout_seconds: 300.0
     # Seconds in the Retry-After header when the queue is full.
     slot_queue_overflow_retry_after: 900
+
+  # -----------------------------------------------------------------------
+  # TTS (Text-to-Speech) server configuration
+  # -----------------------------------------------------------------------
+  # Host and port for the qwentts.cpp TTS server.
+  tts_server_host: localhost
+  tts_server_port: 8081
+  # Path to the tts-server binary start script.
+  tts_start_script: proxy/scripts/start-qwentts.sh
+  # Optional explicit model/codec paths (auto-detected from qwentts.cpp/models/ if omitted).
+  # tts_model_path: qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf
+  # tts_codec_path: qwentts.cpp/models/qwen-tokenizer-12hz-Q8_0.gguf
+  # Set to false to skip TTS server startup entirely.
+  tts_enabled: true

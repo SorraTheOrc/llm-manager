@@ -1006,6 +1006,129 @@ def stop_llama_server():
        srv.llama_log_file = None
 
 
+# ---------------------------------------------------------------------------
+# TTS server lifecycle
+# ---------------------------------------------------------------------------
+
+
+def start_tts_server() -> Optional[subprocess.Popen]:
+    """Start the qwentts TTS server using the configured start script.
+
+    Returns a subprocess.Popen when successful, None on failure.
+    """
+    srv = _srv()
+
+    server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+    script_path = server_cfg.get(
+        "tts_start_script",
+        str(Path(__file__).parent.parent / "scripts" / "start-qwentts.sh")
+    )
+    tts_port = int(server_cfg.get("tts_server_port", 8081))
+    tts_model_path = str(server_cfg.get("tts_model_path", ""))
+    tts_codec_path = str(server_cfg.get("tts_codec_path", ""))
+
+    if not os.path.isfile(script_path):
+        srv.logger.warning(f"TTS start script not found: {script_path}")
+        return None
+
+    env = os.environ.copy()
+    env["QWTTS_PORT"] = str(tts_port)
+    if tts_model_path:
+        env["QWTTS_MODEL"] = tts_model_path
+    if tts_codec_path:
+        env["QWTTS_CODEC"] = tts_codec_path
+
+    cmd = [script_path]
+    cmd.extend(["--port", str(tts_port)])
+    if tts_model_path and os.path.isfile(tts_model_path):
+        cmd.extend(["--model", tts_model_path])
+    if tts_codec_path and os.path.isfile(tts_codec_path):
+        cmd.extend(["--codec", tts_codec_path])
+
+    srv.logger.info(f"Starting TTS server: {' '.join(cmd)}")
+
+    try:
+        proc = subprocess.Popen(cmd, env=env)
+    except FileNotFoundError:
+        srv.logger.warning(f"Command not found: {cmd[0]}")
+        return None
+    except Exception as e:
+        srv.logger.error(f"Failed to start TTS server: {e}")
+        return None
+
+    srv.logger.info(f"Started TTS server (PID: {proc.pid})")
+    return proc
+
+
+def stop_tts_server():
+    """Stop the currently running qwentts TTS server."""
+    srv = _srv()
+
+    if srv.tts_process is not None:
+        pid = getattr(srv.tts_process, 'pid', 'N/A')
+        srv.logger.info(f"Stopping TTS server (PID: {pid})")
+        is_real_process = hasattr(srv.tts_process, 'terminate') or hasattr(srv.tts_process, 'kill')
+        if is_real_process:
+            srv.tts_process.terminate()
+            try:
+                srv.tts_process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                srv.logger.warning("TTS server did not terminate gracefully, killing...")
+                if hasattr(srv.tts_process, 'kill'):
+                    srv.tts_process.kill()
+                if hasattr(srv.tts_process, 'wait'):
+                    srv.tts_process.wait()
+            srv.tts_process = None
+            srv.logger.info("TTS server stopped")
+        else:
+            srv.tts_process = None
+            srv.logger.info("TTS server stop skipped (no valid process)")
+    else:
+        srv.logger.info("TTS server not running, nothing to stop")
+
+
+async def wait_for_tts_server(tts_port: int = 8081, timeout: int = 30) -> bool:
+    """Wait for the TTS server to become ready by polling its health endpoint."""
+    srv = _srv()
+    health_url = f"http://localhost:{tts_port}/v1/audio/speech"
+
+    start_time = time.time()
+    client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    try:
+        while time.time() - start_time < timeout:
+            # Check if tts process died
+            if srv.tts_process is not None and hasattr(srv.tts_process, 'poll') and srv.tts_process.poll() is not None:
+                exit_code = srv.tts_process.returncode
+                srv.logger.error(f"TTS server process exited with code {exit_code}")
+                return False
+
+            try:
+                response = await client.get(health_url, timeout=5)
+                # Any response (including 4xx) means the server is running
+                if int(getattr(response, 'status_code', 0) or 0) > 0:
+                    srv.logger.info(f"TTS server is ready on port {tts_port}")
+                    return True
+            except asyncio.CancelledError:
+                srv.logger.info("Wait for TTS server cancelled")
+                raise
+            except Exception:
+                pass
+
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                srv.logger.info("Wait for TTS server cancelled")
+                raise
+    finally:
+        if not srv._http_client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    srv.logger.error(f"TTS server failed to start within {timeout} seconds")
+    return False
+
 
 async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
     srv = _srv()

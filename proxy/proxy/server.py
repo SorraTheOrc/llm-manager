@@ -39,6 +39,7 @@ from proxy.metrics import record_http_error
 
 # Global state
 llama_process: Optional[subprocess.Popen] = None
+tts_process: Optional[subprocess.Popen] = None
 llama_log_file: Optional[Any] = None
 current_model: Optional[str] = None
 last_start_failure: Optional[str] = None
@@ -491,6 +492,43 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
     return task
 
 
+def _startup_launch_tts_server():
+    """Start the qwentts TTS server in the background.
+
+    Uses the configured tts_start_script (default proxy/scripts/start-qwentts.sh)
+    to launch the tts-server binary. The server is started asynchronously and
+    health-check is performed by the caller.
+    """
+    global tts_process
+    from .lifecycle import start_tts_server, wait_for_tts_server
+    loop = asyncio.get_running_loop()
+
+    async def _launch():
+        global tts_process
+        try:
+            server_cfg = config.get("server", {})
+            tts_enabled = server_cfg.get("tts_enabled", True)
+            if not tts_enabled:
+                logger.info("TTS server is disabled via config (tts_enabled=false)")
+                return
+
+            tts_process = start_tts_server()
+            if tts_process is None:
+                logger.warning("TTS server failed to start")
+                return
+
+            tts_port = int(server_cfg.get("tts_server_port", 8081))
+            if await wait_for_tts_server(tts_port, timeout=30):
+                logger.info(f"TTS server is ready on port {tts_port}")
+            else:
+                logger.warning(f"TTS server did not become ready on port {tts_port} within timeout")
+        except Exception:
+            logger.exception("Exception during TTS server startup")
+
+    task = loop.create_task(_launch())
+    return task
+
+
 def _startup_launch_watchdog_tasks():
     """Spawn the backend watchdog and model health background loops.
 
@@ -638,6 +676,7 @@ async def lifespan(app: FastAPI):
     _startup_launch_version_capture()
     _startup_podman_migrate()
     _startup_launch_default_model_loader()
+    _startup_launch_tts_server()
     _startup_launch_watchdog_tasks()
     _startup_launch_persistence_tasks()
     _startup_start_session_cleanup()
@@ -652,6 +691,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down LLama Proxy Server")
     _shutdown_stop_session_cleanup()
     await _shutdown_cleanup_tasks()
+    _shutdown_tts_server()
     await _shutdown_http_client()
     _shutdown_llama_server()
 
