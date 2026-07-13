@@ -11,6 +11,20 @@ format) and verify that the proxy route:
 All tests run within the existing pytest-asyncio framework without requiring
 a running tts-server. A mock httpx client is used to simulate the tts-server
 backend.
+
+Structured error format (all 502 responses follow the same pattern):
+
+.. code-block:: json
+
+    {
+        "error": {
+            "type": "tts_error",
+            "code": "tts_server_unreachable",
+            "message": "User-friendly description with actionable guidance"
+        },
+        "status": 502,
+        "path": "/v1/audio/speech"
+    }
 """
 
 from unittest.mock import AsyncMock
@@ -254,8 +268,8 @@ class TestTtsRouteErrors:
             f"Expected 400, got {resp.status_code}: {resp.text}"
 
     @pytest.mark.asyncio
-    async def test_tts_server_unreachable_returns_502(self, monkeypatch):
-        """When tts-server is unreachable, proxy returns 502 Bad Gateway."""
+    async def test_tts_server_unreachable_returns_structured_502(self, monkeypatch):
+        """When tts-server is unreachable, proxy returns structured 502 error."""
         from proxy.server import app
 
         transport = httpx.ASGITransport(app=app)
@@ -284,6 +298,105 @@ class TestTtsRouteErrors:
 
         assert resp.status_code == 502, \
             f"Expected 502, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert "error" in data, "Expected 'error' key in structured response"
+        assert data["error"]["type"] == "tts_error"
+        assert data["error"]["code"] == "tts_server_unreachable"
+        msg = data["error"]["message"]
+        assert "unreachable" in msg.lower() or "connect" in msg.lower(), \
+            f"Message should mention unreachable/connect: {msg}"
+        assert data["status"] == 502
+        assert data["path"] == "/v1/audio/speech"
+
+    @pytest.mark.asyncio
+    async def test_tts_server_timeout_returns_structured_502(self, monkeypatch):
+        """When tts-server times out, proxy returns structured 502 with
+        timeout duration."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = AsyncMock(
+            side_effect=httpx.TimeoutException(
+                "Timed out after 30 seconds",
+                request=httpx.Request("POST",
+                                      "http://localhost:8081/v1/audio/speech"),
+            )
+        )
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "test",
+                },
+            )
+
+        assert resp.status_code == 502, \
+            f"Expected 502, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert "error" in data, "Expected 'error' key in structured response"
+        assert data["error"]["type"] == "tts_error"
+        assert data["error"]["code"] == "tts_server_timeout"
+        msg = data["error"]["message"]
+        assert "timeout" in msg.lower(), \
+            f"Message should mention timeout: {msg}"
+        assert "30" in msg, \
+            f"Message should include timeout duration: {msg}"
+        assert data["status"] == 502
+        assert data["path"] == "/v1/audio/speech"
+
+    @pytest.mark.asyncio
+    async def test_tts_server_http_error_returns_structured_502(self, monkeypatch):
+        """When tts-server returns an HTTP error, proxy returns structured
+        502 with the backend's response body as root-cause context."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+
+        # Simulate tts-server returning a 502 with its own error body
+        backend_body = b'{"error":"internal timeout"}'
+        mock_resp = _make_tts_response(
+            status_code=502,
+            content=backend_body,
+            headers={"content-type": "application/json"},
+        )
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "test",
+                },
+            )
+
+        assert resp.status_code == 502, \
+            f"Expected 502, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert "error" in data, "Expected 'error' key in structured response"
+        assert data["error"]["type"] == "tts_error"
+        assert data["error"]["code"] == "tts_server_error"
+        msg = data["error"]["message"]
+        assert "error" in msg.lower() or "TTS" in msg, \
+            f"Message should mention error/TTS: {msg}"
+        assert "root_cause" in data, \
+            "Expected 'root_cause' field with tts-server's response body"
+        assert data["status"] == 502
+        assert data["path"] == "/v1/audio/speech"
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self):

@@ -480,3 +480,5 @@ server:
   tts_codec_path: ""
   # Set to false to skip TTS server startup entirely.
   tts_enabled: true
+  # Timeout in seconds for TTS server requests. Default: 30.
+  tts_timeout_seconds: 30

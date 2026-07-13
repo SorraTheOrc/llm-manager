@@ -1635,7 +1635,31 @@ Content-Type: application/json
 **Response**  
 - **Success (200):** Audio file with `Content-Type: audio/wav` (24 kHz, mono, 16-bit PCM WAV).
 - **Error (400):** Missing or empty `input`, missing `model`, or empty body.
-- **Error (502):** TTS server is unreachable or returned an error.
+- **Error (502):** TTS server is unreachable, timed out, or returned an HTTP error.
+  All 502 responses use a structured JSON error format:
+
+  .. code-block:: json
+
+      {
+          "error": {
+              "type": "tts_error",
+              "code": "tts_server_unreachable",
+              "message": "User-friendly description with actionable guidance."
+          },
+          "status": 502,
+          "path": "/v1/audio/speech"
+      }
+
+  Error codes:
+
+  - ``tts_server_unreachable`` — The TTS server process is not running or
+    not accessible on the configured host/port.
+  - ``tts_server_timeout`` — The TTS server did not respond within
+    ``tts_timeout_seconds``.  The message includes the timeout duration
+    and suggests next steps.
+  - ``tts_server_error`` — The TTS server returned an HTTP error response.
+    When available, the payload includes a ``root_cause`` field with the
+    backend's own error body for debugging.
 
 ### Curl Examples
 
@@ -1673,6 +1697,7 @@ The TTS server is configured under the `server:` section of `config.yaml`:
 | `tts_model_path` | `""` (auto-detect) | Talker LM GGUF path |
 | `tts_codec_path` | `""` (auto-detect) | Codec / tokenizer GGUF path |
 | `tts_enabled` | `true` | Set to `false` to skip TTS server startup |
+| `tts_timeout_seconds` | `30` | Timeout in seconds for TTS server requests |
 
 ### Lifecycle
 
