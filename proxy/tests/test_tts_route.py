@@ -94,6 +94,80 @@ def tts_server_config(monkeypatch):
     yield
 
 
+def _make_voices_response(status_code: int = 200):
+    """Create a mock httpx.Response for the /v1/voices endpoint."""
+    import json
+    content = json.dumps({
+        "voices": [
+            {"name": "serena", "kind": "speaker"},
+            {"name": "vivian", "kind": "speaker"},
+            {"name": "uncle_fu", "kind": "speaker"},
+            {"name": "ryan", "kind": "speaker"},
+            {"name": "aiden", "kind": "speaker"},
+            {"name": "ono_anna", "kind": "speaker"},
+            {"name": "sohee", "kind": "speaker"},
+            {"name": "eric", "kind": "speaker"},
+            {"name": "dylan", "kind": "speaker"},
+        ]
+    }).encode()
+    resp = httpx.Response(status_code=status_code, content=content)
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# /v1/voices tests
+# ---------------------------------------------------------------------------
+
+class TestVoicesRoute:
+    """Verify the /v1/voices GET endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_list_voices_returns_voices(self, monkeypatch):
+        """GET /v1/voices returns the list of available voices."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_voices_response()
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.get("/v1/voices")
+
+        assert resp.status_code == 200, \
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert "voices" in data, "Expected 'voices' key in response"
+        assert len(data["voices"]) == 9, "Expected 9 voices"
+        assert data["voices"][0]["name"] == "serena"
+
+    @pytest.mark.asyncio
+    async def test_list_voices_when_tts_unreachable(self, monkeypatch):
+        """GET /v1/voices returns 502 when tts-server is unreachable."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.get("/v1/voices")
+
+        assert resp.status_code == 502, \
+            f"Expected 502, got {resp.status_code}: {resp.text}"
+        assert "TTS server unreachable" in resp.text
+
+
 # ---------------------------------------------------------------------------
 # Contract tests
 # ---------------------------------------------------------------------------
@@ -123,7 +197,7 @@ class TestTtsRouteContract:
                 json={
                     "model": "qwen3-tts",
                     "input": "Hello, this is a test of the TTS system.",
-                    "voice": "default",
+                    "voice": "serena",
                     "response_format": "wav",
                 },
             )
@@ -164,7 +238,7 @@ class TestTtsRouteContract:
                 json={
                     "model": "qwen3-tts",
                     "input": "Forward test",
-                    "voice": "default",
+                    "voice": "serena",
                     "response_format": "wav",
                 },
             )
@@ -173,7 +247,7 @@ class TestTtsRouteContract:
             "Handler did not forward any body to tts-server"
         assert sent_body.get("model") == "qwen3-tts"
         assert sent_body.get("input") == "Forward test"
-        assert sent_body.get("voice") == "default"
+        assert sent_body.get("voice") == "serena"
         assert sent_body.get("response_format") == "wav"
 
     @pytest.mark.asyncio

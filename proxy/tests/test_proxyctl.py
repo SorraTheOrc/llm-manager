@@ -6,6 +6,7 @@ and configuration resolution (env vars, config.yaml, fallbacks).
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import textwrap
@@ -49,6 +50,9 @@ def run_proxyctl(*args, env=None, cwd=None, timeout=15):
     """Run proxyctl and return CompletedProcess."""
     cmd = [str(PROXYCTL)] + list(args)
     proc_env = os.environ.copy()
+    # Unset XDG_RUNTIME_DIR by default so PID_DIR falls back to XDG_STATE_HOME.
+    # Tests that want XDG_RUNTIME_DIR behavior should set it explicitly in env.
+    proc_env.pop("XDG_RUNTIME_DIR", None)
     if env:
         proc_env.update(env)
     result = subprocess.run(
@@ -60,6 +64,16 @@ def run_proxyctl(*args, env=None, cwd=None, timeout=15):
         timeout=timeout,
     )
     return result
+
+
+def copy_proxyctl_and_make_fake_proxy(tmp_path):
+    """Copy proxyctl to a temporary proxy/ dir and return the path to the copy."""
+    tmp_proxy = tmp_path / "proxy"
+    tmp_proxy.mkdir()
+    dst = tmp_proxy / "proxyctl"
+    shutil.copy2(str(PROXYCTL), str(dst))
+    dst.chmod(0o755)
+    return dst, tmp_proxy
 
 
 # ============================================================================
@@ -79,7 +93,7 @@ class TestConfigDetection:
         assert str(tmp_path / "my-start.sh") in result.stderr
 
     def test_fallback_to_repo_root(self, tmp_path):
-        """When no env var and no config key match, fallback to repo root start-llama.sh."""
+        """When no env var and no config key match, fallback to proxy/scripts/start-proxy.sh."""
         state_dir = tmp_path / "state"
         state_dir.mkdir()
         env = {"XDG_STATE_HOME": str(state_dir)}
@@ -97,10 +111,23 @@ class TestConfigDetection:
 
     def test_logs_no_log_file(self, tmp_path):
         """Logs should fail with helpful message when no log file exists."""
+        dst, tmp_proxy = copy_proxyctl_and_make_fake_proxy(tmp_path)
+        # Omit logging.directory so resolve_log_dir falls back to default LOG_DIR
+        config = tmp_proxy / "config.yaml"
+        config.write_text(textwrap.dedent("""\
+            server:
+              port: 8080
+        """))
         state_dir = tmp_path / "state"
         state_dir.mkdir()
-        env = {"XDG_STATE_HOME": str(state_dir)}
-        result = run_proxyctl("logs", env=env)
+        env = os.environ.copy()
+        env.pop("XDG_RUNTIME_DIR", None)
+        env.update({"XDG_STATE_HOME": str(state_dir)})
+        result = subprocess.run(
+            [str(dst), "logs"],
+            capture_output=True, text=True,
+            cwd=str(tmp_path), env=env, timeout=15,
+        )
         output = result.stdout + result.stderr
         assert result.returncode == 1
         assert "Logfile does not exist" in output
@@ -286,6 +313,45 @@ class TestStop:
         result = run_proxyctl("stop", env=env)
         assert result.returncode == 0
         assert "Stopped" in result.stdout
+        # PID file should be removed
+        assert not pid_file.exists()
+        # Process should not be running
+        assert not os.path.exists(f"/proc/{pid}"), f"Process {pid} still running"
+
+    def test_stop_forced_kill(self, tmp_path):
+        """Stop should escalate to SIGKILL and return non-zero when process ignores SIGTERM."""
+        start_script = tmp_path / "ignore-term.sh"
+        start_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            # Ignore SIGTERM; only SIGKILL can stop this process
+            trap '' TERM
+            while true; do sleep 1; done
+        """))
+        start_script.chmod(0o755)
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        pid_file = state_dir / "llama-proxy" / "proxy.pid"
+
+        env = {
+            "LLAMA_START_SCRIPT": str(start_script),
+            "XDG_STATE_HOME": str(state_dir),
+        }
+
+        # Start the process
+        result = run_proxyctl("start", env=env)
+        assert result.returncode == 0
+        assert pid_file.exists()
+
+        pid = int(pid_file.read_text().strip())
+        assert os.path.exists(f"/proc/{pid}"), f"Process {pid} not running"
+
+        # Stop the process (it ignores SIGTERM, so SIGKILL should be used)
+        result = run_proxyctl("stop", env=env)
+        # Should return non-zero to indicate forced kill
+        assert result.returncode != 0, f"Expected non-zero exit code, got 0. stdout: {result.stdout}"
+        assert "Process did not exit, sending SIGKILL" in result.stdout
+        assert "Stopped (forced)" in result.stdout or "Stopped" in result.stdout
         # PID file should be removed
         assert not pid_file.exists()
         # Process should not be running
@@ -480,13 +546,23 @@ class TestLogs:
 
     def test_logs_no_file(self, tmp_path):
         """Logs should fail when log file does not exist."""
+        dst, tmp_proxy = copy_proxyctl_and_make_fake_proxy(tmp_path)
+        # Omit logging.directory so resolve_log_dir falls back to default LOG_DIR
+        config = tmp_proxy / "config.yaml"
+        config.write_text(textwrap.dedent("""\
+            server:
+              port: 8080
+        """))
         state_dir = tmp_path / "state"
         state_dir.mkdir()
-        env = {
-            "XDG_STATE_HOME": str(state_dir),
-        }
-        result = run_proxyctl("logs", env=env)
-        # stderr or stdout depending on code path
+        env = os.environ.copy()
+        env.pop("XDG_RUNTIME_DIR", None)
+        env.update({"XDG_STATE_HOME": str(state_dir)})
+        result = subprocess.run(
+            [str(dst), "logs"],
+            capture_output=True, text=True,
+            cwd=str(tmp_path), env=env, timeout=15,
+        )
         output = result.stdout + result.stderr
         assert result.returncode == 1
         assert "Logfile does not exist" in output
@@ -540,6 +616,7 @@ class TestLogs:
 
     def test_logs_tails_existing_file(self, tmp_path):
         """Logs should tail an existing log file."""
+        dst, tmp_proxy = copy_proxyctl_and_make_fake_proxy(tmp_path)
         state_dir = tmp_path / "state"
         state_dir.mkdir()
 
@@ -548,18 +625,57 @@ class TestLogs:
         log_file = log_dir / "proxy.log"
         log_file.write_text("test log line 1\ntest log line 2\n")
 
-        env = {
-            "XDG_STATE_HOME": str(state_dir),
-        }
+        # Point logging.directory to the same path so logs finds it
+        config = tmp_proxy / "config.yaml"
+        config.write_text(textwrap.dedent(f"""\
+            logging:
+              directory: {log_dir}
+        """))
 
-        # use --cat to avoid blocking
-        result = run_proxyctl("logs", "--cat", env=env)
-        assert result.returncode == 0, f"stderr: {result.stderr}"
+        env = os.environ.copy()
+        env.pop("XDG_RUNTIME_DIR", None)
+        env.update({"XDG_STATE_HOME": str(state_dir)})
+
+        result = subprocess.run(
+            [str(dst), "logs", "--cat"],
+            capture_output=True, text=True,
+            cwd=str(tmp_path), env=env, timeout=15,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}, stderr: {result.stderr}"
         assert "test log line 1" in result.stdout
         assert "test log line 2" in result.stdout
 
+    def test_logs_respects_config_log_dir(self, tmp_path):
+        """Logs without --file should read from configured logging.directory in config.yaml."""
+        dst, tmp_proxy = copy_proxyctl_and_make_fake_proxy(tmp_path)
+        # Create custom log directory and a log file
+        log_dir = tmp_path / "custom-logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "proxy.log"
+        log_file.write_text("config-driven log line 1\nconfig-driven log line 2\n")
+        # Write config.yaml pointing to custom log directory
+        config = tmp_proxy / "config.yaml"
+        config.write_text(textwrap.dedent(f"""\
+            logging:
+              directory: {log_dir}
+        """))
+        env = os.environ.copy()
+        env.update({
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+        })
+        result = subprocess.run(
+            [str(dst), "logs", "--cat"],
+            capture_output=True, text=True,
+            cwd=str(tmp_path), env=env, timeout=15,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}, stderr: {result.stderr}"
+        assert "config-driven log line 1" in result.stdout
+        assert "config-driven log line 2" in result.stdout
+
     def test_logs_follow_flag(self, tmp_path):
         """Logs --follow should keep following (blocks), verify with timeout."""
+        dst, tmp_proxy = copy_proxyctl_and_make_fake_proxy(tmp_path)
         state_dir = tmp_path / "state"
         state_dir.mkdir()
 
@@ -568,19 +684,26 @@ class TestLogs:
         log_file = log_dir / "proxy.log"
         log_file.write_text("initial line\n")
 
-        env = {
-            "XDG_STATE_HOME": str(state_dir),
-        }
+        # Point logging.directory to the same path so logs --follow finds it
+        config = tmp_proxy / "config.yaml"
+        config.write_text(textwrap.dedent(f"""\
+            logging:
+              directory: {log_dir}
+        """))
 
-        cmd = [str(PROXYCTL), "logs", "--follow"]
+        env = os.environ.copy()
+        env.pop("XDG_RUNTIME_DIR", None)
+        env.update({"XDG_STATE_HOME": str(state_dir)})
+
+        cmd = [str(dst), "logs", "--follow"]
         import signal as sig
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(REPO_ROOT),
-            env={**os.environ, **env},
+            cwd=str(tmp_path),
+            env=env,
             preexec_fn=os.setsid,
         )
         import time as _time

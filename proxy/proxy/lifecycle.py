@@ -1044,6 +1044,7 @@ def start_tts_server() -> Optional[subprocess.Popen]:
         cmd.extend(["--model", tts_model_path])
     if tts_codec_path and os.path.isfile(tts_codec_path):
         cmd.extend(["--codec", tts_codec_path])
+    cmd.extend(["--lang", "english"])
 
     srv.logger.info(f"Starting TTS server: {' '.join(cmd)}")
 

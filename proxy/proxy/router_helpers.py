@@ -843,6 +843,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Abandoned/orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # Decrement local_active_queries for orphaned records
+                    # that never completed through the normal request path
+                    # (LP-0MRKVN93I000XXXX: cleanup orphaned active queries)
+                    try:
+                        srv.local_active_queries = max(
+                            0, int(getattr(srv, 'local_active_queries', 0) or 0) - 1
+                        )
+                    except Exception:
+                        pass
                     try:
                         srv.logger.warning(
                             "lease_released session=%s reason=orphan_cleanup "
