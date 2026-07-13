@@ -66,12 +66,15 @@ cmd_debug_resolve() {
   # Print all resolved paths in key=value format for test assertions
   local start_script
   start_script=$(read_config_start_script)
+  local resolved_log_dir
+  resolved_log_dir=$(resolve_log_dir)
   echo "start_script=$start_script"
   echo "pid_file=$PID_FILE"
   echo "log_file=$LOG_FILE"
   echo "config_file=$CONFIG_FILE"
   echo "pid_dir=$PID_DIR"
   echo "log_dir=$LOG_DIR"
+  echo "resolved_log_dir=$resolved_log_dir"
   echo "dev_pid_file=$DEV_PID_FILE"
   echo "dev_log_file=$DEV_LOG_FILE"
 }
