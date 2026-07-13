@@ -32,19 +32,27 @@ read_config_start_script() {
     return
   fi
 
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
+
   # Try to parse proxy/config.yaml for llama_start_script
   if [[ -f "$CONFIG_FILE" ]]; then
     # crude YAML parse: look for the first occurrence of "llama_start_script" and extract the value
     local val
     val=$(awk -F ':' '/llama_start_script/ { $1=""; sub(/^[: \t]+/, "", $0); print $0; exit }' "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//') || true
     if [[ -n "$val" ]]; then
-      echo "$val"
+      # If the value is a relative path, resolve it against the repo root
+      if [[ "$val" != /* ]]; then
+        echo "${repo_root}/${val}"
+      else
+        echo "$val"
+      fi
       return
     fi
   fi
 
   # Fallback to top-level start script
-  echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)/start-llama.sh"
+  echo "${repo_root}/start-llama.sh"
 }
 
 is_running() {
@@ -60,15 +68,106 @@ is_running() {
   return 1
 }
 
+read_config_value() {
+  # Parse a YAML key (support nested keys like 'server.llama_startup_timeout')
+  local key="$1"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    return 1
+  fi
+  # For simple top-level keys
+  if [[ "$key" != *\.* ]]; then
+    local val
+    val=$(awk -F ':' "/^${key}:/ { \$1=\"\"; sub(/^[: \\t]+/, \"\", \$0); print \$0; exit }" "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//') || true
+    if [[ -n "$val" ]]; then
+      echo "$val"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+health_poll() {
+  # Poll the llama-server health endpoint until ready or timeout
+  # Returns 0 if the backend becomes ready, 1 on timeout.
+  # This is best-effort: if the poll fails on the first attempt,
+  # it assumes the backend is starting and continues polling.
+  local host="${1:-127.0.0.1}"
+  local port="${2:-8080}"
+  local timeout="${3:-60}"
+  local url="http://${host}:${port}/health"
+  local waited=0
+  local poll_interval=2
+  local max_timeout="$timeout"
+
+  # Cap at a reasonable maximum
+  if [[ "$max_timeout" -gt 120 ]]; then
+    max_timeout=120
+  fi
+
+  # Quick first check - if the backend responds immediately, great
+  if python3 -c "
+import urllib.request, sys, ssl
+try:
+  ctx = ssl._create_unverified_context()
+  req = urllib.request.Request('${url}')
+  resp = urllib.request.urlopen(req, timeout=2, context=ctx)
+  if resp.status == 200:
+    sys.exit(0)
+  sys.exit(1)
+except Exception:
+  sys.exit(2)
+" 2>/dev/null; then
+    echo "Backend is ready"
+    return 0
+  fi
+
+  echo "Waiting for backend at ${url}..."
+  while [[ "$waited" -lt "$max_timeout" ]]; do
+    sleep "$poll_interval"
+    waited=$((waited + poll_interval))
+    if python3 -c "
+import urllib.request, sys, ssl
+try:
+  ctx = ssl._create_unverified_context()
+  req = urllib.request.Request('${url}')
+  resp = urllib.request.urlopen(req, timeout=2, context=ctx)
+  if resp.status == 200:
+    sys.exit(0)
+  sys.exit(1)
+except Exception:
+  sys.exit(2)
+" 2>/dev/null; then
+      echo "Backend is ready (${waited}s)"
+      return 0
+    fi
+  done
+
+  echo "Warning: Backend health check did not succeed within ${max_timeout}s" >&2
+  return 1
+}
+
 cmd_start() {
   local dev_mode="$1"
+  shift || true
+  local foreground=0
   local start_script
+
+  local wait_for_health=0
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --foreground) foreground=1; shift ;;
+      --wait) wait_for_health=1; shift ;;
+      *) echo "Unknown start option: $1" >&2; return 2 ;;
+    esac
+  done
 
   if [[ "$dev_mode" -eq 1 ]]; then
     ensure_dev_dirs
     if pid=$(is_running "$DEV_PID_FILE"); then
       echo "proxy dev already running (PID $pid)"
-      exit 0
+      return 0
     fi
 
     # Dev mode: set dev defaults (overridable via env vars)
@@ -78,57 +177,97 @@ cmd_start() {
     export PORT="$LLAMA_SERVER_PORT"
 
     start_script=$(read_config_start_script)
-    if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+    if [[ ! -f "$start_script" || ! -x "$start_script" ]]; then
       echo "Start script not found: $start_script" >&2
-      exit 2
+      return 2
     fi
 
     echo "Starting proxy in dev mode (web: http://localhost:${PROXY_PORT}, backend: http://localhost:${LLAMA_SERVER_PORT})"
     echo "Dev log directory: $DEV_LOG_DIR"
 
-    # In dev mode, launch via proxy server directly with uvicorn for auto-reload
-    # First start llama-server backend in the background
-    nohup bash "$start_script" > "$DEV_LOG_DIR/llama-server-dev.log" 2>&1 &
-    local llama_pid=$!
-    echo "Started llama-server backend (PID $llama_pid)"
-
-    # Wait briefly for llama-server to initialize
-    sleep 2
-
-    # Then start the proxy server with uvicorn, --reload, and debug logging
-    local proxy_dir
-    proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local venv_activate="$proxy_dir/.venv/bin/activate"
-
-    if [[ -f "$venv_activate" ]]; then
-      (source "$venv_activate" && exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug) > "$DEV_LOG_FILE" 2>&1 &
+    if [[ "$foreground" -eq 1 ]]; then
+      # Foreground mode: exec the start script directly with uvicorn
+      local proxy_dir
+      proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      local venv_activate="$proxy_dir/.venv/bin/activate"
+      echo "Starting in foreground mode..."
+      # Start llama-server backend in background first
+      nohup bash "$start_script" > "$DEV_LOG_DIR/llama-server-dev.log" 2>&1 &
+      local llama_pid=$!
+      echo "Started llama-server backend (PID $llama_pid)"
+      sleep 2
+      # Run uvicorn in foreground (this blocks)
+      if [[ -f "$venv_activate" ]]; then
+        source "$venv_activate"
+        exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug
+      else
+        echo "Warning: virtualenv not found at $venv_activate" >&2
+        exec python3 -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug
+      fi
     else
-      echo "Warning: virtualenv not found at $venv_activate, running without it" >&2
-      exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug > "$DEV_LOG_FILE" 2>&1 &
+      # Background mode
+      nohup bash "$start_script" > "$DEV_LOG_DIR/llama-server-dev.log" 2>&1 &
+      local llama_pid=$!
+      echo "Started llama-server backend (PID $llama_pid)"
+      sleep 2
+
+      local proxy_dir
+      proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      local venv_activate="$proxy_dir/.venv/bin/activate"
+
+      if [[ -f "$venv_activate" ]]; then
+        (source "$venv_activate" && exec python -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug) > "$DEV_LOG_FILE" 2>&1 &
+      else
+        echo "Warning: virtualenv not found at $venv_activate, running without it" >&2
+        exec python3 -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PROXY_PORT" --reload --log-level debug > "$DEV_LOG_FILE" 2>&1 &
+      fi
+      local pid=$!
+      echo "$pid" > "$DEV_PID_FILE"
+      echo "Started dev proxy (PID $pid). Logs: $DEV_LOG_FILE"
+
+      # Health polling for dev mode (only with --wait)
+      if [[ "$wait_for_health" -eq 1 ]]; then
+        health_poll "127.0.0.1" "$PROXY_PORT" 30 || true
+      fi
     fi
-    local pid=$!
-    echo "$pid" > "$DEV_PID_FILE"
-    echo "Started dev proxy (PID $pid). Logs: $DEV_LOG_FILE"
   else
-    # Production mode (unchanged)
+    # Production mode
     ensure_dirs
     if pid=$(is_running); then
       echo "proxy already running (PID $pid)"
-      exit 0
+      return 0
     fi
 
     start_script=$(read_config_start_script)
-    if [[ ! -x "$start_script" && ! -f "$start_script" ]]; then
+    if [[ ! -f "$start_script" || ! -x "$start_script" ]]; then
       echo "Start script not found: $start_script" >&2
-      exit 2
+      return 2
     fi
 
     echo "Starting proxy using: $start_script"
-    # Run in background, redirecting output to log file.
-    nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$PID_FILE"
-    echo "Started (PID $pid). Logs: $LOG_FILE"
+
+    if [[ "$foreground" -eq 1 ]]; then
+      # Run in foreground (blocks)
+      exec bash "$start_script"
+    else
+      # Background mode
+      nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+      local pid=$!
+      echo "$pid" > "$PID_FILE"
+      echo "Started (PID $pid). Logs: $LOG_FILE"
+
+      # Health polling (only with --wait)
+      if [[ "$wait_for_health" -eq 1 ]]; then
+        local llm_port="${LLAMA_SERVER_PORT:-8080}"
+        local startup_timeout=60
+        local cfg_timeout
+        cfg_timeout=$(read_config_value "llama_startup_timeout" || true)
+        if [[ -n "$cfg_timeout" ]] && [[ "$cfg_timeout" =~ ^[0-9]+$ ]]; then
+          startup_timeout="$cfg_timeout"
+        fi
+        health_poll "127.0.0.1" "$llm_port" "$startup_timeout" || true
+      fi
+    fi
   fi
 }
 
@@ -141,8 +280,14 @@ cmd_stop() {
   fi
 
   if ! pid=$(is_running "$pid_file"); then
-    echo "proxy not running"
-    exit 0
+    if [[ -f "$pid_file" ]]; then
+      # Stale PID file; clean it up
+      rm -f "$pid_file"
+      echo "proxy not running (stale PID file cleaned up)"
+    else
+      echo "proxy not running"
+    fi
+    return 0
   fi
   echo "Stopping proxy (PID $pid)"
   kill -TERM "$pid" 2>/dev/null || true
@@ -177,10 +322,10 @@ cmd_status() {
         echo "Started: $start_time"
       fi
     fi
-    exit 0
+    return 0
   else
     echo "proxy not running"
-    exit 3
+    return 3
   fi
 }
 
@@ -191,22 +336,95 @@ cmd_restart() {
   cmd_start "$dev_mode"
 }
 
+read_config_log_dir() {
+  # Try to parse proxy/config.yaml for logging.directory
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local val
+    val=$(awk -F ':' '/logging:/ { found=1; next } found && /directory/ { $1=""; sub(/^[: \t]+/, "", $0); print $0; exit }' "$CONFIG_FILE" | sed -e 's/^\s*"\?//; s/"\?\s*$//') || true
+    if [[ -n "$val" ]]; then
+      echo "$val"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 cmd_logs() {
   local dev_mode="$1"
-  local log_file="$LOG_FILE"
+  shift || true
+  local log_file=""
+  local lines="+1"
+  local follow=1
+
+  # Parse remaining args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file)
+        if [[ -z "${2:-}" ]]; then
+          echo "Error: --file requires a path argument" >&2
+          return 1
+        fi
+        log_file="$2"
+        shift 2
+        ;;
+      --lines)
+        if [[ -z "${2:-}" ]]; then
+          echo "Error: --lines requires a number argument" >&2
+          return 1
+        fi
+        # Accept positive integer or "+N" syntax
+        if [[ "$2" =~ ^[0-9]+$ ]]; then
+          lines="-$2"
+        elif [[ "$2" =~ ^\+[0-9]+$ ]]; then
+          lines="$2"
+        else
+          echo "Error: --lines requires a number (e.g., 50 or +1)" >&2
+          return 1
+        fi
+        shift 2
+        ;;
+      --follow|--tail)
+        follow=1
+        shift
+        ;;
+      --no-follow|--cat)
+        follow=0
+        shift
+        ;;
+      *)
+        echo "Unknown logs option: $1" >&2
+        return 1
+        ;;
+    esac
+  done
 
   if [[ "$dev_mode" -eq 1 ]]; then
     ensure_dev_dirs
-    log_file="$DEV_LOG_FILE"
+    if [[ -z "$log_file" ]]; then
+      log_file="$DEV_LOG_FILE"
+    fi
   else
     ensure_dirs
+    if [[ -z "$log_file" ]]; then
+      log_file="$LOG_FILE"
+    fi
   fi
 
   if [[ ! -f "$log_file" ]]; then
-    echo "Logfile does not exist yet: $log_file"
-    exit 1
+    echo "Logfile does not exist: $log_file" >&2
+    return 1
   fi
-  tail -n +1 -f "$log_file"
+
+  if [[ ! -r "$log_file" ]]; then
+    echo "Logfile is not readable: $log_file" >&2
+    return 1
+  fi
+
+  if [[ "$follow" -eq 1 ]]; then
+    tail -n "$lines" -f "$log_file"
+  else
+    tail -n "$lines" "$log_file"
+  fi
 }
 
 usage() {
@@ -216,12 +434,15 @@ $SCRIPT_NAME - manage local llama proxy
 Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
-  start [--dev]        Start the proxy (uses config or start-llama.sh)
+  start [--dev] [--foreground]
+                       Start the proxy (uses config or start-llama.sh)
                        --dev  Run in development mode (port 8001, debug logging, auto-reload)
+                       --foreground  Run in foreground (blocks)
   stop [--dev]         Stop the running proxy (SIGTERM then SIGKILL)
   restart [--dev]      Stop then start
   status [--dev]       Show running status, PID and start time
-  logs [--dev]         Tail the proxy log produced by $SCRIPT_NAME
+  logs [--dev] [options]  View/tail proxy logs
+                         Options: --file <path>, --lines N, --follow/--no-follow
   help                 Show this message
 
 Environment:
@@ -236,6 +457,12 @@ Dev Mode:
   When --dev is used, the proxy starts on port 8001 with DEBUG logging and
   auto-reload enabled. A separate PID file (proxy.dev.pid) and log directory
   are used to avoid conflicts with production instances.
+
+Logs Options:
+  --file <path>        Tail a specific log file instead of auto-detecting
+  --lines N            Show last N lines (default: all lines)
+  --follow             Keep following the log (default)
+  --no-follow, --cat   Print log contents and exit without following
 
 Install:
   Copy this file to a location on PATH and make it executable, e.g.
@@ -264,12 +491,12 @@ main() {
   set -- "${dev_args[@]+${dev_args[@]}}"
 
   case "$cmd" in
-    start) cmd_start "$DEV_MODE" ;;
-    stop) cmd_stop "$DEV_MODE" ;;
-    restart) cmd_restart "$DEV_MODE" ;;
-    status) cmd_status "$DEV_MODE" ;;
-    logs) cmd_logs "$DEV_MODE" ;;
-    help|-h|--help) usage ;;
+    start) cmd_start "$DEV_MODE" "$@"; exit $? ;;
+    stop) cmd_stop "$DEV_MODE"; exit $? ;;
+    restart) cmd_restart "$DEV_MODE"; exit $? ;;
+    status) cmd_status "$DEV_MODE"; exit $? ;;
+    logs) cmd_logs "$DEV_MODE" "$@"; exit $? ;;
+    help|-h|--help) usage; exit 0 ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
   esac
 }

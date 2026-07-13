@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import json
 
 logger = logging.getLogger("llama-proxy")
@@ -77,10 +77,37 @@ class SessionManager:
         # Metrics
         self._sessions_created: int = 0
         self._sessions_expired: int = 0
+        # Optional callback fired when a session is evicted (expired/invalidated/removed)
+        # Signature: async def callback(session_id: str) -> None
+        self._eviction_callback: Optional[Callable[[str], Awaitable[None]]] = None
 
     # ----------------------------------------------------------------
     # Session lifecycle
     # ----------------------------------------------------------------
+
+    def set_eviction_callback(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Register a callback invoked when a session is evicted (expired/removed).
+
+        The callback receives the evicted session_id and is fire-and-forget
+        (exceptions are logged but not propagated).
+        """
+        self._eviction_callback = callback
+
+    async def _fire_eviction_callback(self, session_id: str) -> None:
+        """Fire the eviction callback for the given session_id (fire-and-forget).
+
+        Exceptions are caught and logged so they do not propagate to the caller.
+        """
+        cb = self._eviction_callback
+        if cb is None:
+            return
+        try:
+            await cb(session_id)
+        except Exception:
+            logger.exception(
+                "Eviction callback failed for session %s",
+                session_id[:8] if session_id else "unknown",
+            )
 
     async def get_or_create(
         self, session_id: Optional[str] = None
@@ -95,6 +122,7 @@ class SessionManager:
             A tuple ``(session, created)`` where *created* is True when
             a new session was created.
         """
+        evicted_id = None
         async with self._lock:
             if session_id is not None:
                 existing = self._sessions.get(session_id)
@@ -103,6 +131,7 @@ class SessionManager:
                         # Session expired – evict and create fresh
                         del self._sessions[session_id]
                         self._sessions_expired += 1
+                        evicted_id = session_id
                         logger.info(
                             f"Session {session_id} expired (idle "
                             f"{existing.idle_seconds:.0f}s), evicting"
@@ -112,6 +141,7 @@ class SessionManager:
                         # remove and create fresh
                         del self._sessions[session_id]
                         self._sessions_expired += 1
+                        evicted_id = session_id
                         logger.info(
                             f"Session {session_id} invalidated, creating new"
                         )
@@ -126,7 +156,12 @@ class SessionManager:
             self._sessions[new_id] = session
             self._sessions_created += 1
             logger.info(f"Created new session {new_id[:8]}...")
-            return session, True
+
+        # Fire callback after lock release
+        if evicted_id is not None:
+            await self._fire_eviction_callback(evicted_id)
+
+        return session, True
 
     async def get(self, session_id: str) -> Optional[Session]:
         """Return a session by ID without creating one.
@@ -134,6 +169,7 @@ class SessionManager:
         Returns None if the session does not exist or has expired.
         Expired sessions are evicted.
         """
+        evicted = False
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -141,9 +177,16 @@ class SessionManager:
             if session.is_expired(self.ttl_seconds) or session.invalidated:
                 del self._sessions[session_id]
                 self._sessions_expired += 1
-                return None
-            session.touch()
-            return session
+                evicted = True
+                session = None
+            else:
+                session.touch()
+
+        # Fire callback after lock release
+        if evicted:
+            await self._fire_eviction_callback(session_id)
+
+        return session
 
     async def invalidate(self, session_id: str) -> bool:
         """Mark a session as invalidated so the next request creates a fresh one.
@@ -161,13 +204,21 @@ class SessionManager:
     async def remove(self, session_id: str) -> bool:
         """Remove a session from the registry.
 
-        Returns True if the session existed and was removed.
+        Returns True if the session existed and was removed.  The eviction
+        callback (e.g. dispatch lease release) is fired after the lock is
+        released.
         """
         async with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
-                return True
-            return False
+                _to_notify = session_id
+            else:
+                _to_notify = None
+
+        if _to_notify is not None:
+            await self._fire_eviction_callback(_to_notify)
+
+        return _to_notify is not None
 
     async def list_sessions(self) -> List[Dict[str, Any]]:
         """Return all active session IDs with their metadata.
@@ -370,7 +421,9 @@ class SessionManager:
     async def cleanup_expired(self) -> int:
         """Evict all expired and invalidated sessions.
 
-        Returns the number of sessions evicted.
+        Returns the number of sessions evicted.  Eviction callbacks
+        (e.g. dispatch lease release) are fired after the lock is
+        released so the callback does not prolong lock contention.
         """
         async with self._lock:
             expired_ids = [
@@ -385,7 +438,14 @@ class SessionManager:
                 logger.info(
                     f"Evicted {len(expired_ids)} expired/invalidated session(s)"
                 )
-            return len(expired_ids)
+            # Collect IDs to fire callbacks for (after lock release)
+            _to_notify = list(expired_ids) if self._eviction_callback else []
+
+        # Fire callbacks outside the lock to avoid deadlocks
+        for sid in _to_notify:
+            await self._fire_eviction_callback(sid)
+
+        return len(expired_ids)
 
     async def _cleanup_loop(self) -> None:
         """Background task that periodically evicts expired sessions."""

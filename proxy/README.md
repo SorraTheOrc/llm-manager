@@ -1009,6 +1009,29 @@ whether the lease is still active.
 `local_dispatch_records`. It does **not** release the scheduler slot (job
 ownership), which is managed separately via disconnect detection or timeout.
 
+#### Automatic Counter Recovery
+
+The proxy includes an automatic recovery mechanism for the `local_active_queries`
+counter, which tracks the number of in-flight requests to the local backend.
+
+Every 10 seconds (as part of `_dispatch_cleanup_loop`), the recovery check runs:
+
+1. If `local_active_queries > 0` and **no** active dispatch records exist, the
+   counter is considered **stuck** (e.g., from a swallowed exception in
+   `_decrement_local_active_queries`). It is reset to `0` and a WARNING-level
+   log is emitted:
+   `"local_active_queries counter recovered: reset from %d to 0 (no active dispatch records)"`
+
+2. If active dispatch records exist (legitimate in-flight requests), the counter
+   is **not** reset.
+
+3. In legacy mode (no `local_dispatch_records`), the counter is reset whenever
+   it is > 0, since there is no dispatch-record-based way to distinguish a
+   stuck counter from legitimate in-flight requests.
+
+This ensures the proxy self-recovers from a leaked `local_active_queries`
+counter within seconds, without requiring a proxy restart.
+
 ### Admin Endpoints
 
 #### Reload Configuration
@@ -1602,6 +1625,165 @@ tail -f /var/log/llama-proxy/llama-server.log
 journalctl -u llama-proxy -f
 ```
 
+## TTS (Text-to-Speech) /v1/audio/speech
+
+The proxy supports text-to-speech synthesis via the OpenAI-compatible
+`/v1/audio/speech` endpoint.  Requests are forwarded to a local
+[qwentts.cpp](https://github.com/ServeurpersoCom/qwentts.cpp) TTS server that
+uses a quantised Qwen3-TTS model for inference on AMD ROCm / HIP hardware.
+
+### Endpoint
+
+```
+POST /v1/audio/speech
+Content-Type: application/json
+
+{
+  "model": "qwen3-tts",
+  "input": "Text to convert to speech.",
+  "voice": "default",
+  "response_format": "wav"
+}
+```
+
+**Request fields**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `model` | Yes | Model identifier (passed through to tts-server) |
+| `input` | Yes | Text to synthesise (must be non-empty) |
+| `voice` | No | Speaker voice (base model has no pre-registered speakers; omit or leave empty) |
+| `response_format` | No | Output format (currently only `wav` is supported) |
+
+**Response**  
+- **Success (200):** Audio file with `Content-Type: audio/wav` (24 kHz, mono, 16-bit PCM WAV).
+- **Error (400):** Missing or empty `input`, missing `model`, or empty body.
+- **Error (502):** TTS server is unreachable, timed out, or returned an HTTP error.
+  All 502 responses use a structured JSON error format:
+
+  .. code-block:: json
+
+      {
+          "error": {
+              "type": "tts_error",
+              "code": "tts_server_unreachable",
+              "message": "User-friendly description with actionable guidance."
+          },
+          "status": 502,
+          "path": "/v1/audio/speech"
+      }
+
+  Error codes:
+
+  - ``tts_server_unreachable`` — The TTS server process is not running or
+    not accessible on the configured host/port.
+  - ``tts_server_timeout`` — The TTS server did not respond within
+    ``tts_timeout_seconds``.  The message includes the timeout duration
+    and suggests next steps.
+  - ``tts_server_error`` — The TTS server returned an HTTP error response.
+    When available, the payload includes a ``root_cause`` field with the
+    backend's own error body for debugging.
+
+### Curl Examples
+
+```bash
+# Basic usage
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-tts",
+    "input": "Hello, this is a test of the text-to-speech system."
+  }' \
+  --output speech.wav
+
+# With explicit voice parameter (may fail on base model)
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-tts",
+    "input": "The quick brown fox jumps over the lazy dog.",
+    "voice": "default",
+    "response_format": "wav"
+  }' \
+  --output fox.wav
+```
+
+### Configuration
+
+The TTS server is configured under the `server:` section of `config.yaml`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `tts_server_host` | `localhost` | Host the tts-server listens on |
+| `tts_server_port` | `8081` | Port the tts-server listens on |
+| `tts_start_script` | `proxy/scripts/start-qwentts.sh` | Path to the startup script |
+| `tts_model_path` | `""` (auto-detect) | Talker LM GGUF path |
+| `tts_codec_path` | `""` (auto-detect) | Codec / tokenizer GGUF path |
+| `tts_enabled` | `true` | Set to `false` to skip TTS server startup |
+| `tts_timeout_seconds` | `30` | Timeout in seconds for TTS server requests |
+
+### Lifecycle
+
+The TTS server lifecycle is managed by the proxy:
+
+- **Startup:** Started asynchronously alongside llama-server during proxy
+  `lifespan()` startup.  The proxy waits up to 30 seconds for the TTS server
+  to become reachable on its configured port.
+- **Shutdown:** Stopped gracefully (SIGTERM, 30 s timeout, then SIGKILL) during
+  proxy shutdown, before llama-server is stopped.
+- **Health checks:** Probed automatically on the configured port before
+  marking the server as ready.
+
+### Building the TTS Server
+
+The TTS server is built from the `qwentts.cpp` submodule:
+
+```bash
+# Prerequisites — ROCm / HIP SDK installed, gfx1151-capable GPU
+cd qwentts.cpp
+cmake -B build \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS=gfx1151
+cmake --build build -j$(nproc)
+
+# Binaries are placed in build/bin/
+ls build/bin/tts-server  # the server binary
+```
+
+*See `qwentts.cpp/BUILD_NOTES.md` for the exact build flags used on this machine.*
+
+### Models
+
+GGUF-quantised models are downloaded from
+[Serveurperso/Qwen3-TTS-GGUF](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF)
+and placed in `qwentts.cpp/models/`:
+
+- **Talker LM:** `qwen-talker-1.7b-base-Q8_0.gguf` (~2.0 GB, 1.7B params, Q8_0 quant)
+- **Codec / Tokenizer:** `qwen-tokenizer-12hz-Q8_0.gguf` (~278 MB)
+
+The startup script auto-detects model files in `qwentts.cpp/models/` unless
+`tts_model_path` / `tts_codec_path` are explicitly set in `config.yaml`.
+
+### Integration Tests
+
+End-to-end integration tests that exercise a live tts-server are located in:
+
+```
+pytest proxy/tests/test_tts_integration.py -v
+```
+
+These tests are **automatically skipped** when the tts-server is not running
+(default port `localhost:8081`).  To run them:
+
+1. Start the proxy (which starts the tts-server): `proxyctl start`
+2. In another terminal: `pytest proxy/tests/test_tts_integration.py -v`
+
+Alternatively, start the tts-server directly:
+
+```bash
+bash proxy/scripts/start-qwentts.sh --port 8081
+```
+
 ## Troubleshooting
 
 ### Server won't start
@@ -1618,6 +1800,27 @@ journalctl -u llama-proxy -f
 1. Verify API key is set: `echo $OPENAI_API_KEY`
 2. Check endpoint URL in config
 3. Review proxy logs for error details
+
+### TTS server won't start
+1. Check the TTS server port: `lsof -i :8081`
+2. Verify the tts-server binary exists: `ls -la qwentts.cpp/tts-server`
+3. Start the TTS server manually and check output:
+   ```bash
+   bash proxy/scripts/start-qwentts.sh --port 8081
+   ```
+4. Verify GPU is accessible: `rocm-smi` (should list gfx1151)
+5. Review proxy logs for TTS-specific errors: `tail -f ./logs/proxy.log | grep -i tts`
+
+### TTS server starts but health check fails
+1. Verify correct port: `curl -X POST http://localhost:8081/v1/audio/speech -H "Content-Type: application/json" -d '{"model":"test","input":"ping"}'`
+2. Check for port conflicts with other services (llama-server uses :8080)
+3. Increase `startup_timeout` if the model takes longer than 30 s to load on GPU
+
+### Audio response is garbled or silent
+1. Verify WAV header: `head -c 44 speech.wav | xxd | head -5` (should start with `RIFF`)
+2. Ensure the output file is opened in binary mode: `--output speech.wav`
+3. Base model has no pre-registered speakers — omit `voice` parameter (use empty string if needed)
+4. Check sample rate: `ffprobe speech.wav` (expected: 24000 Hz, mono, 16-bit PCM)
 
 ## Testing
 

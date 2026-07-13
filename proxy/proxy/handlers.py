@@ -267,15 +267,8 @@ async def get_llama_local_status():
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
             llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
             client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-            slots_url = f"http://localhost:{llama_port}/slots"
-            slots_resp = await asyncio.wait_for(client.get(slots_url), timeout=2.0)
-            if slots_resp.status_code == 200:
-                slots_data = slots_resp.json()
-                if isinstance(slots_data, list):
-                    total_slots = len(slots_data)
-                    available_slots = sum(
-                        1 for s in slots_data if not s.get("is_processing", True)
-                    )
+            from proxy.observability import _query_slots
+            available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0)
         except Exception:
             # slots query is best-effort; default to 0 on failure
             pass
@@ -603,3 +596,180 @@ async def release_lease(request: Request):
         )
 
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# /v1/audio/speech  —  TTS (Speech Synthesis)
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/audio/speech")
+async def create_speech(request: Request):
+    """Generate speech from text using the local TTS server backend.
+
+    OpenAI-compatible endpoint that forwards requests to the qwentts.cpp
+    ``tts-server`` (which should be running alongside the proxy).
+
+    Request body (JSON)::
+
+        {
+            "model": "qwen3-tts",
+            "input": "Text to convert to speech",
+            "voice": "default",
+            "response_format": "wav"
+        }
+
+    Returns audio content with ``Content-Type: audio/wav`` on success.
+    Returns ``400 Bad Request`` for invalid/missing parameters.
+    Returns ``502 Bad Gateway`` when the tts-server is unreachable, times out,
+    or returns an HTTP error.  All 502 responses use a structured JSON error
+    format with ``error.type``, ``error.code``, ``error.message``, ``status``,
+    and ``path`` fields.  When the tts-server returns an HTTP error, the
+    response includes a ``root_cause`` field with the backend's payload.
+
+    Timeout is configurable via the ``tts_timeout_seconds`` server config
+    option (default: 30).
+    """
+    srv = _srv()
+    server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+
+    # Resolve configurable timeout (default 30 seconds)
+    tts_timeout = float(server_cfg.get("tts_timeout_seconds", 30) or 30)
+
+    # Parse request body
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Validate required parameters
+    model = body.get("model")
+    input_text = body.get("input")
+
+    if not model or not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="model is required and must be a string")
+
+    if not isinstance(input_text, str) or not input_text.strip():
+        raise HTTPException(status_code=400, detail="input is required and must be a non-empty string")
+
+    # Optional parameters
+    voice = body.get("voice", "")
+    response_format = body.get("response_format", "wav")
+
+    # Input length guard
+    if len(input_text) > 10000:
+        raise HTTPException(status_code=400, detail="input exceeds maximum length of 10000 characters")
+
+    # Build tts-server URL from config
+    tts_host = server_cfg.get("tts_server_host", "localhost")
+    tts_port = server_cfg.get("tts_server_port", 8081)
+    tts_url = f"http://{tts_host}:{tts_port}/v1/audio/speech"
+
+    # Forward request to tts-server (omit voice when empty)
+    forward_body = {
+        "model": model,
+        "input": input_text,
+        "response_format": response_format,
+    }
+    if voice:
+        forward_body["voice"] = voice
+
+    try:
+        client = srv._http_client if srv._http_client else None
+        if client is None:
+            # No shared client — create a temporary one
+            async with httpx.AsyncClient(timeout=httpx.Timeout(tts_timeout)) as c:
+                resp = await c.post(tts_url, json=forward_body, timeout=tts_timeout)
+        else:
+            try:
+                # Use shared client directly without entering/closing it
+                resp = await client.post(tts_url, json=forward_body, timeout=tts_timeout)
+            except RuntimeError:
+                # Shared client was closed by another handler — fall back to temp
+                async with httpx.AsyncClient(timeout=httpx.Timeout(tts_timeout)) as c:
+                    resp = await c.post(tts_url, json=forward_body, timeout=tts_timeout)
+
+        # Check for HTTP error responses from the tts-server (e.g. 502 Bad Gateway)
+        if resp.status_code >= 400:
+            logger.error(
+                "TTS server returned HTTP %d at %s: %s",
+                resp.status_code, tts_url, resp.text[:500],
+            )
+            # Attempt to decode the tts-server's own error body as root cause
+            try:
+                root_cause = resp.json()
+            except Exception:
+                root_cause = resp.text[:1000]
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "type": "tts_error",
+                        "code": "tts_server_error",
+                        "message": (
+                            "The TTS server returned an error. "
+                            "Please check the TTS server health and try again."
+                        ),
+                    },
+                    "status": 502,
+                    "path": "/v1/audio/speech",
+                    "root_cause": root_cause,
+                },
+            )
+
+    except httpx.ConnectError as e:
+        logger.error("TTS server unreachable at %s: %s", tts_url, e)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_unreachable",
+                    "message": (
+                        "The TTS server is unreachable. "
+                        "Please verify that the TTS server process is running "
+                        f"and accessible at {tts_host}:{tts_port}."
+                    ),
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
+    except httpx.TimeoutException as e:
+        logger.error("TTS server timeout at %s: %s", tts_url, e)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_timeout",
+                    "message": (
+                        f"The TTS server did not respond within {int(tts_timeout)} seconds. "
+                        "Please check the TTS server health, shorten the input text, "
+                        "or increase the 'tts_timeout_seconds' configuration value."
+                    ),
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
+    except Exception as e:
+        logger.exception("Unexpected error forwarding TTS request to %s", tts_url)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_error",
+                    "message": (
+                        "An unexpected error occurred while communicating with "
+                        "the TTS server. Please try again later."
+                    ),
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
+
+    # Return the audio response from tts-server
+    content_type = resp.headers.get("content-type", "audio/wav")
+    return Response(content=resp.content, media_type=content_type)
