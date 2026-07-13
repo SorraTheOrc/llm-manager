@@ -287,10 +287,11 @@ async def test_try_acquire_allows_new_owner_after_lease_expiry():
 
 
 @pytest.mark.asyncio
-async def test_cleanup_stale_removes_expired_active_lease():
+async def test_cleanup_stale_preserves_expired_active_lease():
     """
-    _cleanup_stale_local_dispatch should remove expired lease records
-    even when they have active=True (abandoned/crashed requests).
+    _cleanup_stale_local_dispatch must NOT remove active lease records
+    even when their expires_at has passed.  Active records represent
+    in-flight requests that may take longer than the 60s lease timeout.
     """
     from proxy.router_helpers import _cleanup_stale_local_dispatch
 
@@ -299,7 +300,7 @@ async def test_cleanup_stale_removes_expired_active_lease():
         local_active_queries=0,
         local_active_queries_lock=asyncio.Lock(),
         local_dispatch_records={
-            # Expired active lease — should be cleaned
+            # Expired active lease — should NOT be cleaned (in-flight)
             "sess-stuck": {
                 "backend": "local",
                 "started_at": 1.0,
@@ -313,7 +314,7 @@ async def test_cleanup_stale_removes_expired_active_lease():
                 "active": False,
                 "expires_at": 10**12,  # far in the future
             },
-            # Expired inactive lease — should be cleaned (existing behaviour)
+            # Expired inactive lease — should be cleaned
             "sess-expired-inactive": {
                 "backend": "local",
                 "started_at": 1.0,
@@ -326,15 +327,15 @@ async def test_cleanup_stale_removes_expired_active_lease():
 
     removed = await _cleanup_stale_local_dispatch(srv)
 
-    # The expired active lease should be removed
-    assert "sess-stuck" not in srv.local_dispatch_records, (
-        "Expired active lease should have been cleaned up"
+    # The expired active lease must be PRESERVED (in-flight request)
+    assert "sess-stuck" in srv.local_dispatch_records, (
+        "Expired active lease must be preserved (in-flight request)"
     )
-    # The expired inactive lease should be removed (existing behaviour)
+    # The expired inactive lease should be removed
     assert "sess-expired-inactive" not in srv.local_dispatch_records
     # The valid future lease should still exist
     assert "sess-valid" in srv.local_dispatch_records
-    assert removed == 2, "Expected 2 leases removed (stuck + expired-inactive)"
+    assert removed == 1, "Expected 1 lease removed (expired-inactive only)"
 
 
 @pytest.mark.asyncio

@@ -775,11 +775,17 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    A record is stale when its *expires_at* timestamp has passed
-    (``time.monotonic() > expires_at``), regardless of whether it is
-    *active* or *inactive*.  This ensures abandoned/crashed requests
-    (where *active* stays ``True`` permanently) are eventually cleaned.
-    Each removed record is logged with its session ID and reason.
+    A record is stale when it is *inactive* and its *expires_at* timestamp
+    has passed (``time.monotonic() > expires_at``).  Active in-flight
+    requests are never cleaned by this function — their *expires_at* is
+    a cooldown timeout for the inactive lease, not a hard deadline for
+    the active request.
+
+    For abandoned/crashed requests where *active* stays ``True``
+    permanently, the adaptive lease timeout in ``_try_acquire_local_dispatch``
+    provides an eventual upper bound via ``local_dispatch_lease_max_seconds``
+    (default 1500).  The periodic slot-save timeout in llama-server also
+    releases orphaned slots independently.
 
     Returns the number of records removed.
     """
@@ -790,7 +796,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             stale_ids = [
                 sid
                 for sid, record in srv.local_dispatch_records.items()
-                if record.get("expires_at", 0) <= now
+                if not record.get("active") and record.get("expires_at", 0) <= now
             ]
             for sid in stale_ids:
                 del srv.local_dispatch_records[sid]
