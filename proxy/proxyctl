@@ -492,7 +492,7 @@ Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
   start [--dev] [--foreground]
-                       Start the proxy (uses config or start-llama.sh)
+                       Start the proxy (uses config or start-proxy.sh)
                        --dev  Run in development mode (port 8001, debug logging, auto-reload)
                        --foreground  Run in foreground (blocks)
   stop [--dev]         Stop the running proxy (SIGTERM then SIGKILL)

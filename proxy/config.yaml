@@ -448,8 +448,8 @@ server:
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
   # Must be an absolute path or a script resolvable from PATH.
-  # The host-based start-llama.sh is at the repo root.
-  llama_start_script: /home/rgardler/projects/llm/start-llama.sh
+  # The host-based start-proxy.sh is at proxy/scripts/start-proxy.sh.
+  llama_start_script: proxy/scripts/start-proxy.sh
   llama_startup_timeout: 300
   port: 8000
 
