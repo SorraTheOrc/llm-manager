@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.5 (2026-07-13)
+### Features
+- proxyctl: core CLI (LP-0MPY3DFYD008M75U)
+- proxyctl: docs and install (LP-0MPY3DGY2009CTP0)
+### Bug Fixes
+- Wire resolve_log_dir into proxyctl logs command for config-driven auto-detection (LP-0MRJDPZ6B0076HC4)
+- Extend backend_ready recovery for healthy-workers-with-stale-false case (LP-0MRJGE7SQ003NXC3)
+### Other
+- proxyctl: test config detection (LP-0MPY3DEZ8006V4MV)
+- Create test_proxyctl_config.py with comprehensive config-detection tests (LP-0MRJ744OB009YDW9)
+- Add cmd_debug_resolve, XDG_RUNTIME_DIR support, and fix fallback path in proxyctl (LP-0MRJ744O6009MNGB)
+- Wire up config-driven log directory detection in proxyctl (LP-0MRJ744O9006MCGB)
+- proxyctl: test stop (LP-0MPY3DFB0000XLHN)
+- proxyctl: test status (LP-0MPY3DFMH003RUUY)
+- proxyctl: test logs (LP-0MPY3DFSB006VE2I)
+- Fix proxyctl: use start-proxy.sh as default start script (LP-0MQ1LZCM90088U5E)
+
 ## v0.1.4 (2026-07-13)
 ### Features
 - proxyctl: docs and install (LP-0MPY3DGY2009CTP0)
