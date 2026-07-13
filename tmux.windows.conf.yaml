@@ -8,5 +8,5 @@ windows:
         focus: true
       - cmd: "clear"
         split:
-          dir: vertical
+          dir: horizontal
           size_pct: 30

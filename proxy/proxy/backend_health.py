@@ -340,6 +340,18 @@ async def _backend_watchdog_loop() -> None:
             if code is None:
                 worker_unhealthy = srv._worker_process_unhealthy(proc)
                 if not worker_unhealthy:
+                    # LP-0MRCQW0HC000J4F9: Worker is healthy but backend_ready may
+                    # still be False from a prior failure. Reset if backend reachable.
+                    if router_mode and not srv.backend_ready:
+                        reachable = await srv._probe_backend_reachable(llama_port)
+                        if reachable:
+                            srv.logger.info(
+                                "watchdog: worker healthy but backend_ready=False, "
+                                "backend reachable on port %d, resetting backend_ready to True",
+                                llama_port,
+                            )
+                            srv.backend_ready = True
+                            srv.backend_recovery_state["last_failure"] = None
                     continue
 
             if code is None and worker_unhealthy:

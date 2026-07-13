@@ -144,7 +144,7 @@ sudo journalctl -u llama-proxy.service -f
 
 - Python 3.10+
 - Podman with a container image containing llama-server (llama.cpp)
-- `/home/rgardler/projects/llm/start-llama.sh` script for starting llama-server
+- `proxy/scripts/start-proxy.sh` script for starting llama-server
 
 See `../LLAMA_README.md` for build and setup instructions.
 
@@ -220,7 +220,7 @@ sudo install -m 0755 proxy/proxyctl /usr/local/bin/proxyctl
 Usage examples:
 
 ```sh
-proxyctl start              # start using proxy/config.yaml llama_start_script or start-llama.sh
+proxyctl start              # start using proxy/config.yaml llama_start_script or proxy/scripts/start-proxy.sh
 proxyctl start --dev        # start dev instance (port 8001, DEBUG logging, auto-reload)
 proxyctl status             # show running status and PID
 proxyctl status --dev       # show dev instance status
@@ -241,7 +241,7 @@ Edit `config.yaml` to configure the server:
 server:
   host: "0.0.0.0"
   port: 8000
-  llama_start_script: "/home/rgardler/projects/llm/start-llama.sh"
+  llama_start_script: "proxy/scripts/start-proxy.sh"
   llama_router_mode: true
   llama_router_preload:
     - "embeddings"
@@ -1148,7 +1148,7 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 
 - **KV cache ownership**: The proxy never stores or mutates KV tensors; llama-server owns the cache. The proxy only passes session metadata and deltas so llama-server can restore/cache internally.
 - **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
-- **Context window limits**: llama-server's KV cache has finite capacity. The Qwen3 model is configured with a **128k (131,072) token context window**. Very long conversations may exceed this limit. The context window size is set in [`models.ini`](../models.ini) (router mode) and [`start-llama.sh`](../start-llama.sh) (single-model mode).
+- **Context window limits**: llama-server's KV cache has finite capacity. The Qwen3 model is configured with a **128k (131,072) token context window**. Very long conversations may exceed this limit. The context window size is set in [`models.ini`](../models.ini) (router mode) and [`proxy/scripts/start-proxy.sh`](proxy/scripts/start-proxy.sh) (single-model mode).
 
   > **Resource note**: A 128k context window increases RAM usage for llama-server. On GPU with 64 GB+ VRAM, running Qwen3.6-35B-A3B at 128k context is feasible but may require disabling mmap (`--no-mmap`) and using an appropriate quantization (Q5_K_M or lower). For hosts with less memory, consider reducing the context size or switching to a smaller model. The canonical size can be adjusted by changing `ctx-size` in `models.ini` and `CONTEXT` in `start-llama.sh`.
 - **Ephemeral sessions**: Sessions are held in memory and are lost when the proxy restarts. Cross-restart persistence is not supported in this version.
@@ -1641,7 +1641,7 @@ Content-Type: application/json
 {
   "model": "qwen3-tts",
   "input": "Text to convert to speech.",
-  "voice": "default",
+  "voice": "serena",
   "response_format": "wav"
 }
 ```
@@ -1652,8 +1652,80 @@ Content-Type: application/json
 |-------|----------|-------------|
 | `model` | Yes | Model identifier (passed through to tts-server) |
 | `input` | Yes | Text to synthesise (must be non-empty) |
-| `voice` | No | Speaker voice (base model has no pre-registered speakers; omit or leave empty) |
+| `voice` | No | Speaker voice (see pre-registered voices below; omit for default) |
 | `response_format` | No | Output format (currently only `wav` is supported) |
+
+**Pre-registered voices**
+
+The proxy uses the **custom_voice** variant of the Qwen3-TTS model,
+which includes 9 built-in speakers:
+
+| Voice | Dialect |
+|---|---|
+| `serena` | standard |
+| `vivian` | standard |
+| `uncle_fu` | standard |
+| `ryan` | standard |
+| `aiden` | standard |
+| `ono_anna` | standard |
+| `sohee` | standard |
+| `eric` | sichuan_dialect |
+| `dylan` | beijing_dialect |
+
+List available voices at any time via the proxy:
+
+```bash
+curl http://localhost:8000/v1/voices
+```
+
+This returns:
+
+```json
+{
+  "voices": [
+    {"name": "serena", "kind": "speaker"},
+    {"name": "vivian", "kind": "speaker"},
+    ...
+  ]
+}
+```
+
+**Creating new voices (voice cloning)**
+
+The custom_voice model does not support registering new voices via API —
+the 9 pre-registered speakers above are fixed. To clone a voice from a
+reference audio clip, you need to switch to the **base** variant of the
+model instead. The base model supports zero-shot voice cloning via the
+`qwen-tts` CLI:
+
+```bash
+# Clone a voice from a reference WAV + transcript
+cd qwentts.cpp
+./qwen-tts \
+  --model models/qwen-talker-1.7b-base-Q8_0.gguf \
+  --codec models/qwen-tokenizer-12hz-Q8_0.gguf \
+  --ref-wav /path/to/reference.wav \
+  --ref-text /path/to/transcript.txt \
+  --lang English \
+  -o cloned.wav < prompt.txt
+```
+
+For the proxy route, if you need voice cloning, swap the model in
+`config.yaml` (`tts_model_path`) to the base variant and the tts-server
+will accept new voice registrations via:
+
+```bash
+POST /v1/voices
+Content-Type: application/json
+
+{
+  "name": "my_cloned_voice",
+  "wav_b64": "<base64-encoded WAV>",
+  "text": "Transcript of the reference audio"
+}
+```
+
+Then use it like any other voice: `"voice": "my_cloned_voice"`.
 
 **Response**  
 - **Success (200):** Audio file with `Content-Type: audio/wav` (24 kHz, mono, 16-bit PCM WAV).
@@ -1692,17 +1764,18 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-tts",
-    "input": "Hello, this is a test of the text-to-speech system."
+    "input": "Hello, this is a test of the text-to-speech system.",
+    "voice": "serena"
   }' \
   --output speech.wav
 
-# With explicit voice parameter (may fail on base model)
+# With different voice
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-tts",
     "input": "The quick brown fox jumps over the lazy dog.",
-    "voice": "default",
+    "voice": "dylan",
     "response_format": "wav"
   }' \
   --output fox.wav
@@ -1758,7 +1831,7 @@ GGUF-quantised models are downloaded from
 [Serveurperso/Qwen3-TTS-GGUF](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF)
 and placed in `qwentts.cpp/models/`:
 
-- **Talker LM:** `qwen-talker-1.7b-base-Q8_0.gguf` (~2.0 GB, 1.7B params, Q8_0 quant)
+- **Talker LM:** `qwen-talker-1.7b-customvoice-Q8_0.gguf` (~1.9 GB, 1.7B params, Q8_0 quant)
 - **Codec / Tokenizer:** `qwen-tokenizer-12hz-Q8_0.gguf` (~278 MB)
 
 The startup script auto-detects model files in `qwentts.cpp/models/` unless
@@ -1819,7 +1892,7 @@ bash proxy/scripts/start-qwentts.sh --port 8081
 ### Audio response is garbled or silent
 1. Verify WAV header: `head -c 44 speech.wav | xxd | head -5` (should start with `RIFF`)
 2. Ensure the output file is opened in binary mode: `--output speech.wav`
-3. Base model has no pre-registered speakers — omit `voice` parameter (use empty string if needed)
+3. Custom_voice model has 9 pre-registered speakers (`serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`) — pass `voice` to select one.
 4. Check sample rate: `ffprobe speech.wav` (expected: 24000 Hz, mono, 16-bit PCM)
 
 ## Testing

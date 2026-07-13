@@ -6,7 +6,12 @@ SCRIPT_NAME="proxyctl"
 # Global flags
 DEV_MODE=0
 
-PID_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy"
+# Prefer XDG_RUNTIME_DIR for pid files (runtime state), fallback to XDG_STATE_HOME
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  PID_DIR="${XDG_RUNTIME_DIR}/llama-proxy"
+else
+  PID_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy"
+fi
 PID_FILE="$PID_DIR/proxy.pid"
 DEV_PID_FILE="$PID_DIR/proxy.dev.pid"
 LOG_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/llama-proxy/logs"
@@ -51,8 +56,27 @@ read_config_start_script() {
     fi
   fi
 
-  # Fallback to top-level start script
-  echo "${repo_root}/start-llama.sh"
+  # Fallback to proxy/scripts/start-proxy.sh
+  local proxy_dir
+  proxy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+  echo "$proxy_dir/scripts/start-proxy.sh"
+}
+
+cmd_debug_resolve() {
+  # Print all resolved paths in key=value format for test assertions
+  local start_script
+  start_script=$(read_config_start_script)
+  local resolved_log_dir
+  resolved_log_dir=$(resolve_log_dir)
+  echo "start_script=$start_script"
+  echo "pid_file=$PID_FILE"
+  echo "log_file=$LOG_FILE"
+  echo "config_file=$CONFIG_FILE"
+  echo "pid_dir=$PID_DIR"
+  echo "log_dir=$LOG_DIR"
+  echo "resolved_log_dir=$resolved_log_dir"
+  echo "dev_pid_file=$DEV_PID_FILE"
+  echo "dev_log_file=$DEV_LOG_FILE"
 }
 
 is_running() {
@@ -232,7 +256,10 @@ cmd_start() {
     fi
   else
     # Production mode
-    ensure_dirs
+    local effective_log_dir
+    effective_log_dir=$(resolve_log_dir)
+    mkdir -p "$effective_log_dir"
+    mkdir -p "$PID_DIR"
     if pid=$(is_running); then
       echo "proxy already running (PID $pid)"
       return 0
@@ -251,10 +278,10 @@ cmd_start() {
       exec bash "$start_script"
     else
       # Background mode
-      nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+      nohup bash "$start_script" > "$effective_log_dir/proxy.log" 2>&1 &
       local pid=$!
       echo "$pid" > "$PID_FILE"
-      echo "Started (PID $pid). Logs: $LOG_FILE"
+      echo "Started (PID $pid). Logs: $effective_log_dir/proxy.log"
 
       # Health polling (only with --wait)
       if [[ "$wait_for_health" -eq 1 ]]; then
@@ -274,6 +301,7 @@ cmd_start() {
 cmd_stop() {
   local dev_mode="$1"
   local pid_file="$PID_FILE"
+  local forced=0
 
   if [[ "$dev_mode" -eq 1 ]]; then
     pid_file="$DEV_PID_FILE"
@@ -299,10 +327,15 @@ cmd_stop() {
     if [[ $t -ge 10 ]]; then
       echo "Process did not exit, sending SIGKILL"
       kill -KILL "$pid" 2>/dev/null || true
+      forced=1
       break
     fi
   done
   rm -f "$pid_file"
+  if [[ "$forced" -eq 1 ]]; then
+    echo "Stopped (forced)"
+    return 1
+  fi
   echo "Stopped"
 }
 
@@ -347,6 +380,29 @@ read_config_log_dir() {
     fi
   fi
   return 1
+}
+
+resolve_log_dir() {
+  # Use configured logging.directory from config.yaml if available and writable.
+  # Fall back to repo-local logs/ dir, then to default LOG_DIR.
+  local configured_dir
+  configured_dir=$(read_config_log_dir || true)
+  if [[ -n "$configured_dir" ]]; then
+    if mkdir -p "$configured_dir" 2>/dev/null && [[ -w "$configured_dir" ]]; then
+      echo "$configured_dir"
+      return
+    fi
+    echo "Warning: Configured log directory '$configured_dir' is not writable, trying fallback" >&2
+    # Try repo-local logs/ directory
+    local repo_log_dir
+    repo_log_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)/logs"
+    if mkdir -p "$repo_log_dir" 2>/dev/null && [[ -w "$repo_log_dir" ]]; then
+      echo "$repo_log_dir"
+      return
+    fi
+    echo "Warning: Fallback log directory '$repo_log_dir' is not writable either, using default" >&2
+  fi
+  echo "$LOG_DIR"
 }
 
 cmd_logs() {
@@ -404,9 +460,10 @@ cmd_logs() {
       log_file="$DEV_LOG_FILE"
     fi
   else
-    ensure_dirs
     if [[ -z "$log_file" ]]; then
-      log_file="$LOG_FILE"
+      local resolved_log_dir
+      resolved_log_dir=$(resolve_log_dir)
+      log_file="$resolved_log_dir/proxy.log"
     fi
   fi
 
@@ -435,7 +492,7 @@ Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
   start [--dev] [--foreground]
-                       Start the proxy (uses config or start-llama.sh)
+                       Start the proxy (uses config or start-proxy.sh)
                        --dev  Run in development mode (port 8001, debug logging, auto-reload)
                        --foreground  Run in foreground (blocks)
   stop [--dev]         Stop the running proxy (SIGTERM then SIGKILL)
@@ -443,6 +500,7 @@ Commands:
   status [--dev]       Show running status, PID and start time
   logs [--dev] [options]  View/tail proxy logs
                          Options: --file <path>, --lines N, --follow/--no-follow
+  debug-resolve          Print resolved paths for tests (start_script, pid_file, log_file, config_file, pid_dir, log_dir)
   help                 Show this message
 
 Environment:
@@ -496,6 +554,7 @@ main() {
     restart) cmd_restart "$DEV_MODE"; exit $? ;;
     status) cmd_status "$DEV_MODE"; exit $? ;;
     logs) cmd_logs "$DEV_MODE" "$@"; exit $? ;;
+    debug-resolve) cmd_debug_resolve; exit $? ;;
     help|-h|--help) usage; exit 0 ;;
     *) echo "Unknown command: $cmd"; usage; exit 2 ;;
   esac
