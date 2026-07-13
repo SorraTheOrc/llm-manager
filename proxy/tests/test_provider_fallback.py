@@ -3947,3 +3947,37 @@ async def test_cross_session_cooldown_does_not_affect_available_providers(mixed_
         "Remote provider should not have been called - it's in cooldown "
         "and local provider succeeded."
     )
+
+
+# ===================================================================
+# Unit tests for _get_local_concurrency_info
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_local_concurrency_info_reads_session_slot_pool_size():
+    """_get_local_concurrency_info reads from session_slot_pool_size primarily."""
+    from proxy.provider import _get_local_concurrency_info
+
+    # session_slot_pool_size should take precedence
+    result = _get_local_concurrency_info({
+        "session_slot_pool_size": 3,
+        "local_max_concurrent_queries": 1,
+    })
+    assert result == (0, 3), f"Expected (0, 3), got {result}"
+
+    # without session_slot_pool_size, fall back to local_max_concurrent_queries
+    result = _get_local_concurrency_info({
+        "local_max_concurrent_queries": 2,
+    })
+    assert result == (0, 2), f"Expected (0, 2), got {result}"
+
+    # with neither, default to 1
+    result = _get_local_concurrency_info({})
+    assert result == (0, 1), f"Expected (0, 1), got {result}"
+
+    # session_slot_pool_size=1 should still work
+    result = _get_local_concurrency_info({
+        "session_slot_pool_size": 1,
+    })
+    assert result == (0, 1), f"Expected (0, 1), got {result}"

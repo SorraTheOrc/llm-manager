@@ -850,7 +850,10 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     """Lazily import and return (current_local_active, max_local) from config.
 
     Returns the current local active query count and the configured
-    local_max_concurrent_queries limit.  Defaults to (0, 1) on error.
+    local concurrency limit.  Uses ``session_slot_pool_size`` as the
+    primary config key (same value that controls ``--parallel`` in
+    llama-server). Falls back to the legacy ``local_max_concurrent_queries``
+    key for backward compatibility.  Defaults to (0, 1) on error.
     """
     cur_active = 0
     max_local = 1
@@ -861,7 +864,12 @@ def _get_local_concurrency_info(config: dict) -> tuple:
         pass
     try:
         server_cfg = config.get("server", config)
-        max_local = max(1, int(server_cfg.get("local_max_concurrent_queries", 1) or 1))
+        # Primary: session_slot_pool_size (same as router._get_local_max_concurrent_queries)
+        val = server_cfg.get("session_slot_pool_size", None)
+        if val is None:
+            # Fallback: local_max_concurrent_queries for backward compatibility
+            val = server_cfg.get("local_max_concurrent_queries", 1)
+        max_local = max(1, int(val or 1))
     except (ValueError, TypeError):
         pass
     return (cur_active, max_local)
@@ -1720,7 +1728,7 @@ async def proxy_with_fallback(
                     continue
 
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
-                # if local_max_concurrent_queries is exceeded, skip to next
+                # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
                 # provider without marking local as unavailable.
                 cur_local, max_local = _get_local_concurrency_info(config)
                 if cur_local >= max_local:
