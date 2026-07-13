@@ -1009,6 +1009,29 @@ whether the lease is still active.
 `local_dispatch_records`. It does **not** release the scheduler slot (job
 ownership), which is managed separately via disconnect detection or timeout.
 
+#### Automatic Counter Recovery
+
+The proxy includes an automatic recovery mechanism for the `local_active_queries`
+counter, which tracks the number of in-flight requests to the local backend.
+
+Every 10 seconds (as part of `_dispatch_cleanup_loop`), the recovery check runs:
+
+1. If `local_active_queries > 0` and **no** active dispatch records exist, the
+   counter is considered **stuck** (e.g., from a swallowed exception in
+   `_decrement_local_active_queries`). It is reset to `0` and a WARNING-level
+   log is emitted:
+   `"local_active_queries counter recovered: reset from %d to 0 (no active dispatch records)"`
+
+2. If active dispatch records exist (legitimate in-flight requests), the counter
+   is **not** reset.
+
+3. In legacy mode (no `local_dispatch_records`), the counter is reset whenever
+   it is > 0, since there is no dispatch-record-based way to distinguish a
+   stuck counter from legitimate in-flight requests.
+
+This ensures the proxy self-recovers from a leaked `local_active_queries`
+counter within seconds, without requiring a proxy restart.
+
 ### Admin Endpoints
 
 #### Reload Configuration

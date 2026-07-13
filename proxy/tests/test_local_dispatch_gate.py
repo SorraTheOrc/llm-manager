@@ -1183,3 +1183,259 @@ async def test_n1_backward_compat_integration(monkeypatch):
     payload = json.loads(resp.body)
     assert payload["error"]["code"] == "no_slots_available"
     assert payload["local_owner_session_id"] == "sess-a"
+
+
+# ---------------------------------------------------------------------------
+# Decrement hardening and counter recovery tests (LP-0MRIL2L3E0080OGC)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_decrement_logs_warning_on_exception():
+    """_decrement_local_active_queries must log a WARNING (not pass) on exception.
+
+    When the decrement operation encounters an exception, a warning must be
+    logged with the exception type and message, rather than silently passing.
+    """
+    from proxy.router_helpers import _decrement_local_active_queries
+
+    logger = MagicMock()
+
+    # A lock that raises on __aenter__ to simulate a decrement failure
+    class _BrokenLock:
+        async def __aenter__(self):
+            raise RuntimeError("test lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    srv = SimpleNamespace(
+        local_active_queries=5,
+        local_active_queries_lock=_BrokenLock(),
+        logger=logger,
+    )
+
+    await _decrement_local_active_queries(srv, session_key="sess-test")
+
+    # Verify a WARNING was logged
+    warning_calls = logger.warning.call_args_list
+    assert len(warning_calls) >= 1, "Expected at least 1 WARNING log on decrement failure"
+
+    # Verify the warning contains exception info
+    warning_msg = str(warning_calls[0])
+    assert "RuntimeError" in warning_msg, "Warning should contain exception type"
+    assert "test lock failure" in warning_msg, "Warning should contain exception message"
+    assert "sess-tes" in warning_msg, "Warning should contain session context (truncated to 8 chars)"
+
+
+@pytest.mark.asyncio
+async def test_decrement_logs_warning_on_exception_without_session():
+    """_decrement_local_active_queries logs WARNING on exception even without session."""
+    from proxy.router_helpers import _decrement_local_active_queries
+
+    logger = MagicMock()
+
+    class _BrokenLock:
+        async def __aenter__(self):
+            raise RuntimeError("test lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    srv = SimpleNamespace(
+        local_active_queries=5,
+        local_active_queries_lock=_BrokenLock(),
+        logger=logger,
+    )
+
+    await _decrement_local_active_queries(srv)
+
+    warning_calls = logger.warning.call_args_list
+    assert len(warning_calls) >= 1, "Expected at least 1 WARNING log on decrement failure"
+    warning_msg = str(warning_calls[0])
+    assert "RuntimeError" in warning_msg, "Warning should contain exception type"
+    assert "test lock failure" in warning_msg, "Warning should contain exception message"
+
+
+@pytest.mark.asyncio
+async def test_recover_resets_stuck_counter_when_no_active_records():
+    """_recover_stuck_local_active_queries resets counter to 0 when no active dispatch records exist.
+
+    If local_active_queries > 0 and there are no active dispatch records,
+    the counter is likely stuck and should be reset to 0.
+    """
+    from proxy.router_helpers import _recover_stuck_local_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        local_active_queries=3,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            # Only inactive (finished) records exist - no active ones
+            "sess-finished": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 10**12,
+            },
+        },
+        logger=logger,
+    )
+
+    await _recover_stuck_local_active_queries(srv)
+
+    assert srv.local_active_queries == 0, (
+        "Stuck counter should be reset to 0 when no active dispatch records exist"
+    )
+
+    # Verify a WARNING was logged about the recovery
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "local_active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 1, (
+        "Expected a WARNING log about counter recovery"
+    )
+    warning_msg = str(warning_calls[0])
+    assert "3" in warning_msg, "Warning should include the previous counter value"
+
+
+@pytest.mark.asyncio
+async def test_recover_does_not_reset_when_active_records_exist():
+    """_recover_stuck_local_active_queries must NOT reset counter when active dispatch records exist.
+
+    Active dispatch records indicate legitimate in-flight requests; the
+    counter should not be reset to avoid terminating active requests.
+    """
+    from proxy.router_helpers import _recover_stuck_local_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        local_active_queries=2,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-active": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+            "sess-finished": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 10**12,
+            },
+        },
+        logger=logger,
+    )
+
+    await _recover_stuck_local_active_queries(srv)
+
+    # Counter should NOT be reset - there are active requests
+    assert srv.local_active_queries == 2, (
+        "Counter must NOT be reset when active dispatch records exist"
+    )
+
+    # No recovery warning should be logged
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "local_active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 0, (
+        "No recovery WARNING should be logged when active records exist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_resets_stuck_counter_legacy_mode_no_dispatch_records():
+    """_recover_stuck_local_active_queries resets counter in legacy mode
+    (no local_dispatch_records attribute)."""
+    from proxy.router_helpers import _recover_stuck_local_active_queries
+
+    logger = MagicMock()
+    # Simulate a server that doesn't have local_dispatch_records at all
+    srv = SimpleNamespace(
+        local_active_queries=3,
+        local_active_queries_lock=asyncio.Lock(),
+        logger=logger,
+    )
+
+    await _recover_stuck_local_active_queries(srv)
+
+    assert srv.local_active_queries == 0, (
+        "Stuck counter should be reset to 0 in legacy mode"
+    )
+
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "local_active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 1, (
+        "Expected a WARNING log about counter recovery in legacy mode"
+    )
+    assert "legacy" in str(warning_calls[0]).lower(), (
+        "Warning should indicate legacy mode recovery"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_does_not_reset_counter_at_zero():
+    """_recover_stuck_local_active_queries does nothing when counter is already 0."""
+    from proxy.router_helpers import _recover_stuck_local_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        logger=logger,
+    )
+
+    await _recover_stuck_local_active_queries(srv)
+
+    assert srv.local_active_queries == 0, "Counter should remain 0"
+
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "local_active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 0, "No recovery WARNING should be logged when counter is 0"
+
+
+@pytest.mark.asyncio
+async def test_decrement_logs_warning_on_session_key_exception():
+    """_decrement_local_active_queries logs WARNING when the session-key block fails."""
+    from proxy.router_helpers import _decrement_local_active_queries
+
+    logger = MagicMock()
+
+    class _BrokenDispatchLock:
+        async def __aenter__(self):
+            raise RuntimeError("dispatch lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    srv = SimpleNamespace(
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=_BrokenDispatchLock(),
+        logger=logger,
+    )
+
+    await _decrement_local_active_queries(srv, session_key="sess-test")
+
+    # Verify a WARNING was logged about the dispatch record failure
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "Failed to mark dispatch record inactive" in str(call)
+    ]
+    assert len(warning_calls) >= 1, (
+        "Expected a WARNING log on dispatch record failure"
+    )
+    warning_msg = str(warning_calls[0])
+    assert "RuntimeError" in warning_msg, "Warning should contain exception type"
+    assert "dispatch lock failure" in warning_msg, "Warning should contain exception message"
+    assert "sess-tes" in warning_msg, "Warning should contain session context (truncated to 8 chars)"

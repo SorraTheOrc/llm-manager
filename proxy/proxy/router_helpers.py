@@ -553,8 +553,17 @@ async def _decrement_local_active_queries(
     try:
         async with srv.local_active_queries_lock:
             srv.local_active_queries = max(0, srv.local_active_queries - 1)
-    except Exception:
-        pass
+    except Exception as exc:
+        session_hint = f" session={session_key[:8]}" if session_key else ""
+        try:
+            srv.logger.warning(
+                "Failed to decrement local_active_queries: %s: %s%s",
+                type(exc).__name__,
+                exc,
+                session_hint,
+            )
+        except Exception:
+            pass
 
     if session_key is not None:
         try:
@@ -573,10 +582,26 @@ async def _decrement_local_active_queries(
                                 session_key[:8] if session_key else "unknown",
                                 lease_timeout,
                             )
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                        except Exception as exc:
+                            try:
+                                srv.logger.warning(
+                                    "Failed to log lease_renewed for session=%s: %s: %s",
+                                    session_key[:8] if session_key else "unknown",
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                            except Exception:
+                                pass
+        except Exception as exc:
+            try:
+                srv.logger.warning(
+                    "Failed to mark dispatch record inactive for session=%s: %s: %s",
+                    session_key[:8] if session_key else "unknown",
+                    type(exc).__name__,
+                    exc,
+                )
+            except Exception:
+                pass
 
 
 async def _increment_local_active_queries(
@@ -833,6 +858,64 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     except Exception:
         pass
     return removed
+
+
+async def _recover_stuck_local_active_queries(srv) -> None:
+    """Detect and reset a stuck ``local_active_queries`` counter.
+
+    If ``local_active_queries > 0`` and **no** active dispatch records
+    exist, the counter is likely stuck (e.g., from a swallowed exception
+    in ``_decrement_local_active_queries``). Resets to 0 and logs a
+    WARNING-level message.
+
+    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
+    after ``_cleanup_stale_local_dispatch``, providing a periodic
+    self-recovery mechanism that runs every 10 seconds.
+
+    In legacy mode (no ``local_dispatch_records`` attribute), the counter
+    is reset whenever it is > 0, since there is no dispatch-record-based
+    way to distinguish a stuck counter from legitimate in-flight requests.
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is not None:
+            async with srv.local_active_queries_lock:
+                if srv.local_active_queries > 0:
+                    # Read the records snapshot (not holding records_lock).
+                    # This is a self-correcting check that runs every 10s,
+                    # so a slightly stale snapshot is acceptable.
+                    has_active = any(
+                        r.get("active", False) for r in records.values()
+                    )
+                    if not has_active:
+                        prev = srv.local_active_queries
+                        srv.local_active_queries = 0
+                        try:
+                            srv.logger.warning(
+                                "local_active_queries counter recovered: "
+                                "reset from %d to 0 (no active dispatch "
+                                "records)",
+                                prev,
+                            )
+                        except Exception:
+                            pass
+        else:
+            # Legacy mode: no dispatch records system
+            async with srv.local_active_queries_lock:
+                if srv.local_active_queries > 0:
+                    prev = srv.local_active_queries
+                    srv.local_active_queries = 0
+                    try:
+                        srv.logger.warning(
+                            "local_active_queries counter recovered: "
+                            "reset from %d to 0 (legacy mode, no "
+                            "dispatch records)",
+                            prev,
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 # ===================================================================
