@@ -491,10 +491,10 @@ def _get_lease_timeout_seconds(srv) -> float:
     try:
         server_cfg = srv.config.get("server", {})
         return float(
-            server_cfg.get("local_dispatch_lease_timeout_seconds", 180) or 180
+            server_cfg.get("local_dispatch_lease_timeout_seconds", 60) or 60
         )
     except Exception:
-        return 180.0
+        return 60.0
 
 
 def _get_adaptive_lease_timeout_seconds(
@@ -553,8 +553,17 @@ async def _decrement_local_active_queries(
     try:
         async with srv.local_active_queries_lock:
             srv.local_active_queries = max(0, srv.local_active_queries - 1)
-    except Exception:
-        pass
+    except Exception as exc:
+        session_hint = f" session={session_key[:8]}" if session_key else ""
+        try:
+            srv.logger.warning(
+                "Failed to decrement local_active_queries: %s: %s%s",
+                type(exc).__name__,
+                exc,
+                session_hint,
+            )
+        except Exception:
+            pass
 
     if session_key is not None:
         try:
@@ -567,8 +576,32 @@ async def _decrement_local_active_queries(
                         srv.local_dispatch_records[session_key]["expires_at"] = (
                             time.monotonic() + lease_timeout
                         )
-        except Exception:
-            pass
+                        try:
+                            srv.logger.info(
+                                "lease_renewed session=%s timeout=%.0fs",
+                                session_key[:8] if session_key else "unknown",
+                                lease_timeout,
+                            )
+                        except Exception as exc:
+                            try:
+                                srv.logger.warning(
+                                    "Failed to log lease_renewed for session=%s: %s: %s",
+                                    session_key[:8] if session_key else "unknown",
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                            except Exception:
+                                pass
+        except Exception as exc:
+            try:
+                srv.logger.warning(
+                    "Failed to mark dispatch record inactive for session=%s: %s: %s",
+                    session_key[:8] if session_key else "unknown",
+                    type(exc).__name__,
+                    exc,
+                )
+            except Exception:
+                pass
 
 
 async def _increment_local_active_queries(
@@ -621,9 +654,18 @@ async def _try_acquire_local_dispatch(
       acquisition (or 0 if denied).
     - *retry_after* is a suggested retry delay in seconds (minimum 1).
 
-    The no-preemption policy means that a non-owner session cannot
-    acquire the local backend while an unexpired lease exists, even if
-    the owner has no active request in flight.
+    N-aware dispatch: allows up to *max_local* concurrent sessions to hold
+    dispatch leases. When fewer than *max_local* leases are held by *other*
+    sessions, a new session can acquire. Same-session re-acquisition is
+    always permitted.
+
+    The no-preemption policy means that an inactive lease (post-request
+    cooldown) reserves its slot for the owning session. Other sessions are
+    blocked only when the total number of occupied slots (active + inactive
+    unexpired leases from other sessions) reaches *max_local*.
+
+    Expired lease records (inactive and past their *expires_at* threshold)
+    are cleaned before the occupancy check, freeing their slots.
 
     When *body_json* is provided, the lease timeout is extended adaptively
     based on the estimated prompt token count. This prevents mid-stream
@@ -643,28 +685,57 @@ async def _try_acquire_local_dispatch(
 
     try:
         async with srv.local_dispatch_records_lock:
-            # Check for existing leases from other sessions
+            # ---------------------------------------------------------------
+            # 1. Clean ALL expired lease records (not just same-session).
+            #    This ensures stale records from crashed/abandoned sessions
+            #    do not permanently occupy slots.
+            # ---------------------------------------------------------------
             for existing_key, record in list(srv.local_dispatch_records.items()):
-                if existing_key == session_key:
-                    # Same session -- check if previous lease expired
-                    if not record.get("active") and record.get("expires_at", 0) <= now:
-                        # Lease expired, remove old record and allow re-acquisition
-                        del srv.local_dispatch_records[existing_key]
+                if not record.get("active") and record.get("expires_at", 0) <= now:
+                    del srv.local_dispatch_records[existing_key]
+
+            # ---------------------------------------------------------------
+            # 2. Check: does the requesting session already hold a valid lease?
+            #    Same-session re-acquisition is always permitted regardless of
+            #    how many other sessions hold leases.
+            # ---------------------------------------------------------------
+            own_record = srv.local_dispatch_records.get(session_key)
+            own_has_lease = (
+                own_record is not None
+                and (
+                    own_record.get("active")
+                    or own_record.get("expires_at", 0) > now
+                )
+            )
+
+            # ---------------------------------------------------------------
+            # 3. For new sessions (not re-acquiring), count occupied slots
+            #    from OTHER sessions. Only deny when occupied >= max_local.
+            # ---------------------------------------------------------------
+            if not own_has_lease:
+                occupied_by_others = 0
+                first_occupied_owner = None
+                for existing_key, record in srv.local_dispatch_records.items():
+                    if existing_key == session_key:
                         continue
-                    # Same session with valid lease -- allow
-                    continue
+                    if record.get("active") or record.get("expires_at", 0) > now:
+                        occupied_by_others += 1
+                        if first_occupied_owner is None:
+                            first_occupied_owner = existing_key
 
-                # Different session -- check whether it blocks acquisition
-                if record.get("active") or record.get("expires_at", 0) > now:
-                    # Owner session has an active or unexpired lease
-                    owner = existing_key
+                if occupied_by_others >= max_local:
+                    # All N slots are occupied by other sessions
                     active_count = getattr(srv, "local_active_queries", 0)
-                    retry_after = max(1.0, record.get("expires_at", now) - now)
-                    return (False, owner, active_count, retry_after)
+                    retry_after = max(1.0, lease_timeout)
+                    return (False, first_occupied_owner, active_count, retry_after)
 
-            # No blocking lease -- check concurrency cap
+            # ---------------------------------------------------------------
+            # 4. Check active-query concurrency cap.
+            #    Same-session re-acquisition skips the cap check since the
+            #    session's previous request already decremented the counter.
+            # ---------------------------------------------------------------
             async with srv.local_active_queries_lock:
-                if srv.local_active_queries >= max_local:
+                if srv.local_active_queries >= max_local and not own_has_lease:
                     # At concurrency limit -- find the owner of the active request
                     active_owner = None
                     for ek, er in srv.local_dispatch_records.items():
@@ -678,9 +749,12 @@ async def _try_acquire_local_dispatch(
                         max(1.0, lease_timeout),
                     )
 
-                # Acquire: increment counter and create dispatch record
+                # Acquire: increment active-query counter
                 srv.local_active_queries += 1
 
+            # ---------------------------------------------------------------
+            # 5. Create or update the dispatch lease record.
+            # ---------------------------------------------------------------
             srv.local_dispatch_records[session_key] = {
                 "backend": backend,
                 "started_at": now,
@@ -726,11 +800,21 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    A record is stale when its *expires_at* timestamp has passed
-    (``time.monotonic() > expires_at``), regardless of whether it is
-    *active* or *inactive*.  This ensures abandoned/crashed requests
-    (where *active* stays ``True`` permanently) are eventually cleaned.
-    Each removed record is logged with its session ID and reason.
+    Two categories of stale records are cleaned:
+
+    1. **Inactive records** whose *expires_at* has passed — these represent
+       sessions that finished their request but whose idle lease timeout
+       has expired. Logged at INFO level with ``reason=idle_timeout``.
+
+    2. **Active records** whose *expires_at* has passed — these represent
+       abandoned/orphaned streams where the stream was started but never
+       finished (no *active=False* transition). Logged at WARNING level
+       with ``reason=orphan_cleanup`` distinct from normal idle-timeout
+       release, plus an INFO-level ``lease_released reason=orphan_cleanup``
+       for parity with existing log consumers.
+
+    Active records whose *expires_at* is still in the future are preserved
+    (legitimate in-flight requests).
 
     Returns the number of records removed.
     """
@@ -738,24 +822,100 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     removed = 0
     try:
         async with srv.local_dispatch_records_lock:
-            stale_ids = [
-                sid
-                for sid, record in srv.local_dispatch_records.items()
-                if record.get("expires_at", 0) <= now
-            ]
-            for sid in stale_ids:
-                del srv.local_dispatch_records[sid]
-                removed += 1
-                try:
-                    srv.logger.info(
-                        "lease_released session=%s reason=idle_timeout",
-                        sid[:8] if sid else "unknown",
-                    )
-                except Exception:
-                    pass
+            for sid, record in list(srv.local_dispatch_records.items()):
+                expires_at = record.get("expires_at", 0)
+                if expires_at > now:
+                    continue  # still within valid window
+
+                active = record.get("active", False)
+                if not active:
+                    # Normal idle timeout for inactive records
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        srv.logger.info(
+                            "lease_released session=%s reason=idle_timeout",
+                            sid[:8] if sid else "unknown",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Abandoned/orphaned active record past its expires_at
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        srv.logger.warning(
+                            "lease_released session=%s reason=orphan_cleanup "
+                            "stream_abandoned=True",
+                            sid[:8] if sid else "unknown",
+                        )
+                        srv.logger.info(
+                            "lease_released session=%s reason=orphan_cleanup",
+                            sid[:8] if sid else "unknown",
+                        )
+                    except Exception:
+                        pass
     except Exception:
         pass
     return removed
+
+
+async def _recover_stuck_local_active_queries(srv) -> None:
+    """Detect and reset a stuck ``local_active_queries`` counter.
+
+    If ``local_active_queries > 0`` and **no** active dispatch records
+    exist, the counter is likely stuck (e.g., from a swallowed exception
+    in ``_decrement_local_active_queries``). Resets to 0 and logs a
+    WARNING-level message.
+
+    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
+    after ``_cleanup_stale_local_dispatch``, providing a periodic
+    self-recovery mechanism that runs every 10 seconds.
+
+    In legacy mode (no ``local_dispatch_records`` attribute), the counter
+    is reset whenever it is > 0, since there is no dispatch-record-based
+    way to distinguish a stuck counter from legitimate in-flight requests.
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is not None:
+            async with srv.local_active_queries_lock:
+                if srv.local_active_queries > 0:
+                    # Read the records snapshot (not holding records_lock).
+                    # This is a self-correcting check that runs every 10s,
+                    # so a slightly stale snapshot is acceptable.
+                    has_active = any(
+                        r.get("active", False) for r in records.values()
+                    )
+                    if not has_active:
+                        prev = srv.local_active_queries
+                        srv.local_active_queries = 0
+                        try:
+                            srv.logger.warning(
+                                "local_active_queries counter recovered: "
+                                "reset from %d to 0 (no active dispatch "
+                                "records)",
+                                prev,
+                            )
+                        except Exception:
+                            pass
+        else:
+            # Legacy mode: no dispatch records system
+            async with srv.local_active_queries_lock:
+                if srv.local_active_queries > 0:
+                    prev = srv.local_active_queries
+                    srv.local_active_queries = 0
+                    try:
+                        srv.logger.warning(
+                            "local_active_queries counter recovered: "
+                            "reset from %d to 0 (legacy mode, no "
+                            "dispatch records)",
+                            prev,
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 # ===================================================================

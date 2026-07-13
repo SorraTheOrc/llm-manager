@@ -274,6 +274,11 @@ server:
   # Limits concurrent requests to local providers. Remote providers
   # continue to use max_concurrent_queries. When this limit is reached,
   # requests with fallback providers skip to the next provider immediately.
+  #
+  # NOTE: This value is now derived from `session_slot_pool_size` by default.
+  # The `local_max_concurrent_queries` key is preserved for explicit override
+  # only. In normal operation, change `session_slot_pool_size` to control the
+  # number of parallel dispatch leases.
   local_max_concurrent_queries: 1
   # Local dispatch lease timeout in seconds.
   # An idle session holds an inactive lease for this duration after its
@@ -287,17 +292,38 @@ server:
   #   This prevents mid-stream lease expiry during cache prefill.
   # local_dispatch_lease_max_seconds: Hard upper bound for the adaptive lease
   #   timeout, defaults to 1500 (same as default llama_request_timeout).
-  local_dispatch_lease_timeout_seconds: 180
+  # Reduced from 180s to 60s to prevent long cross-session blocking.
+  # The previous 180s timeout was conservative for inter-tool-call gaps
+  # (observed max ~60s). 60s safely covers those gaps while reducing
+  # cross-session blocking from 3 minutes to 1 minute (LP-0MRHV4UYE0013F6P).
+  local_dispatch_lease_timeout_seconds: 60
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
-  # Number of slots (GPU contexts) available for hash-based session slot assignment.
+  # Number of parallel sessions (GPU contexts) for local dispatch.
+  # Controls how many concurrent Pi agent sessions can hold dispatch leases
+  # and process requests through the local llama-server simultaneously.
+  #
   # MUST match llama-server's --parallel / -np flag passed in start-llama.sh.
   # Mismatch causes slot exhaustion or restore failures:
   #   - pool_size < --parallel → some server slots go unused
   #   - pool_size > --parallel → sessions map to slot IDs that do not exist
-  # The start script reads LLAMA_PARALLEL env var (set by lifecycle from this value)
-  # to automatically keep them aligned.
+  # The start script reads LLAMA_PARALLEL env var (set by lifecycle from this
+  # value) to automatically keep them aligned.
+  #
+  # The dispatch lease system (``_try_acquire_local_dispatch``) allows up to N
+  # concurrent sessions, where N = session_slot_pool_size. When a session holds
+  # an active or inactive (post-request cooldown) lease, its slot is reserved.
+  # Other sessions are blocked only when all N slots are occupied.
+  #
+  # Relationship to slot_management.slot_pool_size:
+  #   slot_management.slot_pool_size (default 4) is a separate admission-queuing
+  #   layer for multi-turn conversation slot ownership. It allows up to M sessions
+  #   to be tracked/admitted, but only N of those M admitted sessions can process
+  #   simultaneously at the dispatch level. With N=2 and pool_size=4, up to 4
+  #   sessions can be admitted with 2 processing and 2 queued at the dispatch level.
+  #
+  # Server restart required to change this value (no hot reload).
   session_slot_pool_size: 1
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
@@ -421,7 +447,7 @@ server:
   - Qwen3
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
-  llama_start_script: /home/rgardler/projects/llm/scripts/podman_start_llama.sh
+  llama_start_script: start-llama.sh
   llama_startup_timeout: 300
   port: 8000
 
@@ -439,3 +465,20 @@ server:
     slot_job_timeout_seconds: 300.0
     # Seconds in the Retry-After header when the queue is full.
     slot_queue_overflow_retry_after: 900
+
+  # -----------------------------------------------------------------------
+  # TTS (Text-to-Speech) server configuration
+  # -----------------------------------------------------------------------
+  # Host and port for the qwentts.cpp TTS server.
+  tts_server_host: localhost
+  tts_server_port: 8081
+  # Path to the tts-server binary start script.
+  tts_start_script: proxy/scripts/start-qwentts.sh
+  # Talker LM GGUF model path. When unset, auto-detected from qwentts.cpp/models/.
+  tts_model_path: ""
+  # Codec (tokenizer) GGUF model path. When unset, auto-detected from qwentts.cpp/models/.
+  tts_codec_path: ""
+  # Set to false to skip TTS server startup entirely.
+  tts_enabled: true
+  # Timeout in seconds for TTS server requests. Default: 30.
+  tts_timeout_seconds: 30

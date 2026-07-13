@@ -39,6 +39,11 @@ _provider_failure_count: Dict[str, int] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
+# FreeUsageLimitError cooldown: 3 hours (10800 seconds)
+# Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
+# See LP-0MRGU0I91006ODFD for details.
+_FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+
 # ---------------------------------------------------------------------------
 # Three-tier retry system (LP-0MRE8G94H005ZBLV, LP-0MRFEXXVC001RYKB)
 #
@@ -845,7 +850,10 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     """Lazily import and return (current_local_active, max_local) from config.
 
     Returns the current local active query count and the configured
-    local_max_concurrent_queries limit.  Defaults to (0, 1) on error.
+    local concurrency limit.  Uses ``session_slot_pool_size`` as the
+    primary config key (same value that controls ``--parallel`` in
+    llama-server). Falls back to the legacy ``local_max_concurrent_queries``
+    key for backward compatibility.  Defaults to (0, 1) on error.
     """
     cur_active = 0
     max_local = 1
@@ -856,10 +864,107 @@ def _get_local_concurrency_info(config: dict) -> tuple:
         pass
     try:
         server_cfg = config.get("server", config)
-        max_local = max(1, int(server_cfg.get("local_max_concurrent_queries", 1) or 1))
+        # Primary: session_slot_pool_size (same as router._get_local_max_concurrent_queries)
+        val = server_cfg.get("session_slot_pool_size", None)
+        if val is None:
+            # Fallback: local_max_concurrent_queries for backward compatibility
+            val = server_cfg.get("local_max_concurrent_queries", 1)
+        max_local = max(1, int(val or 1))
     except (ValueError, TypeError):
         pass
     return (cur_active, max_local)
+
+
+async def _release_session_slot_for_cache_cold_bypass(
+    request,
+    llama_model: str,
+    fallback_reason: str,
+) -> None:
+    """Release the scheduler slot for a session being routed to remote fallback.
+
+    When the cache_cold_bypass mechanism routes a session from a local provider
+    to a remote fallback (e.g., because the conversation context exceeds the
+    warm threshold), the local model's slot is held until idle timeout unless
+    we release it here.
+
+    This function:
+    1. Resolves the session_id from the request headers
+    2. Gets the JobScheduler (if active)
+    3. If the session has an active slot, releases it via the scheduler
+    4. Marks the model's cache as cold (for warm-cache bypass)
+    5. Logs the release
+
+    Args:
+        request: The incoming FastAPI Request.
+        llama_model: The llama_model name of the local provider being bypassed.
+        fallback_reason: The reason for fallback (used in the log message).
+    """
+    import logging as _logging
+    _log = _logging.getLogger("llama-proxy.provider")
+
+    # Resolve session_id from request headers
+    try:
+        from proxy.session import _resolve_session_id_header
+        session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
+    except Exception:
+        session_id = None
+
+    if not session_id:
+        return
+
+    # Get the scheduler
+    try:
+        from proxy.router import _get_job_scheduler
+        scheduler = _get_job_scheduler()
+    except Exception:
+        scheduler = None
+
+    if scheduler is None:
+        return
+
+    # Check if the session has an active scheduler slot
+    try:
+        if session_id in scheduler.active_jobs:
+            slot_id = scheduler.active_jobs[session_id]
+            # Release via scheduler.remove_job which handles both slot release and queue cancel
+            released = await scheduler.remove_job(session_id)
+            if released:
+                _log.info(
+                    "lease_released session=%s slot=%s reason=%s",
+                    session_id[:8],
+                    slot_id,
+                    fallback_reason,
+                )
+    except Exception:
+        _log.exception("Failed to release scheduler slot for session=%s", session_id[:8])
+
+    # Also clean up local_dispatch_records for this session
+    try:
+        import proxy.server as _srv_module
+        srv = getattr(_srv_module, "server", None)
+        if srv is not None:
+            lock = getattr(srv, "local_dispatch_records_lock", None)
+            if lock is not None and hasattr(srv, "local_dispatch_records"):
+                async with lock:
+                    if session_id in srv.local_dispatch_records:
+                        del srv.local_dispatch_records[session_id]
+                        _log.info(
+                            "lease_released session=%s reason=%s",
+                            session_id[:8],
+                            fallback_reason,
+                        )
+    except Exception:
+        pass
+
+    # Mark the model's cache as cold so subsequent large-context
+    # requests also bypass local (LP-0MRCSSBTM002NK3B)
+    if llama_model and not is_model_cache_cold(llama_model):
+        mark_model_cache_cold(llama_model)
+        _log.info(
+            "model_cache_marked_cold model=%s reason=%s",
+            llama_model,
+            fallback_reason,
+        )
 
 
 def _parse_slot_exhaustion(response):
@@ -992,6 +1097,43 @@ def _is_model_loading_response(response: Response, body_text: str) -> bool:
     if "model_loading" in lowered_body:
         return True
     if "model" in lowered_body and "loading" in lowered_body:
+        return True
+
+    return False
+
+
+def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
+    """Return True when a 429 response is a FreeUsageLimitError.
+
+    Detects upstream quota-exhaustion responses where the JSON body contains
+    ``error.type = "FreeUsageLimitError"`` (case-insensitive).  When detected,
+    the proxy applies a 3-hour cooldown on the affected provider entry so the
+    fallback chain routes to paid alternatives instead of repeatedly retrying
+    the exhausted free tier.
+
+    Expected upstream format (observed from opencode.ai/zen):
+        HTTP 429
+        Body: {"type": "error", "error": {"type": "FreeUsageLimitError", ...}}
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            err_type = str(error.get("type", "")).strip().lower()
+            if err_type == "freeusagelimiterror":
+                return True
+
+    # Fallback: check raw body text for the error type string
+    lowered_body = (body_text or "").strip().lower()
+    if "freeusagelimiterror" in lowered_body:
         return True
 
     return False
@@ -1385,6 +1527,25 @@ async def proxy_with_remote_fallback(
                     all_slot_exhaustion = False
                     continue
 
+                # FreeUsageLimitError: apply 3-hour cooldown on affected provider
+                # so the fallback chain routes to paid alternatives instead of
+                # repeatedly retrying the exhausted free tier.
+                if _is_free_usage_limit_error(response, body_text):
+                    fallback_reason = "free_usage_limit"
+                    prev_provider = provider_name
+                    mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="free_usage_limit",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                        cooldown_seconds=_FREE_USAGE_LIMIT_COOLDOWN_SECONDS,
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
                 # Shared primitive: HTTP error with cooldown
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
@@ -1567,7 +1728,7 @@ async def proxy_with_fallback(
                     continue
 
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
-                # if local_max_concurrent_queries is exceeded, skip to next
+                # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
                 # provider without marking local as unavailable.
                 cur_local, max_local = _get_local_concurrency_info(config)
                 if cur_local >= max_local:
@@ -1636,6 +1797,13 @@ async def proxy_with_fallback(
                     fallback_reason = "cache_cold_large_context"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
+                    # Release the session's scheduler slot so other sessions
+                    # can use it instead of waiting for idle timeout (LP-0MRGUJ3QR002K18G)
+                    await _release_session_slot_for_cache_cold_bypass(
+                        request,
+                        _llama_model,
+                        fallback_reason,
+                    )
                     continue
 
                 response = await ptr_local(request, path)
@@ -1877,6 +2045,25 @@ async def proxy_with_fallback(
                             status="http_error_no_cooldown",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
+                    # FreeUsageLimitError: apply 3-hour cooldown on affected provider
+                    # so the fallback chain routes to paid alternatives instead of
+                    # repeatedly retrying the exhausted free tier.
+                    if _is_free_usage_limit_error(response, body_text):
+                        fallback_reason = "free_usage_limit"
+                        prev_provider = provider_name
+                        mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="free_usage_limit",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            cooldown_seconds=_FREE_USAGE_LIMIT_COOLDOWN_SECONDS,
                         )
                         all_slot_exhaustion = False
                         continue

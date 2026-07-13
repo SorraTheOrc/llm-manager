@@ -474,7 +474,23 @@ With `pool_size=4` and 4 sessions:
    problem)
 4. **No ordering guarantee** — pool_size doesn't add reservation/affinity
 
-### 8.4 Recommended Approach to pool_size
+### 8.4 Relationship to Parallel Session Count (`session_slot_pool_size`)
+
+`session_slot_pool_size` (the proxy's N parallel sessions) and
+`slot_management.slot_pool_size` are separate, orthogonal layers:
+
+| Layer | Purpose | Default |
+|-------|---------|---------|
+| `session_slot_pool_size` (N) | Dispatch-level concurrency — how many sessions can hold dispatch leases simultaneously. Controls `--parallel` in llama-server. | 1 |
+| `slot_management.slot_pool_size` (M) | Admission-queuing — how many sessions can be tracked/admitted for multi-turn conversation slot ownership. | 4 |
+
+With N=2 and M=4, up to 4 sessions can be admitted (tracked by the JobScheduler),
+but only 2 can process simultaneously at the dispatch level. The remaining 2 are
+queued at the dispatch level. This is correct behaviour: the slot management
+system owns the conversation-tracking capacity, while `session_slot_pool_size`
+controls the GPU-level parallelism.
+
+### 8.5 Recommended Approach to pool_size
 
 - **Keep `pool_size=1`** as the default
 - **Do not increase pool_size** as a primary solution — it's a partial fix

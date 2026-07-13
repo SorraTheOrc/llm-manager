@@ -548,6 +548,122 @@ class TestSessionManagerCleanupTask:
 
 
 # ---------------------------------------------------------------------------
+# Eviction callback (LP-0MRHV4UYE0013F6P)
+# ---------------------------------------------------------------------------
+
+class TestSessionManagerEvictionCallback:
+    """Tests for the eviction callback that releases dispatch leases."""
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_fired_on_cleanup_expired(self):
+        """cleanup_expired should fire the callback for each evicted session."""
+        mgr = SessionManager(ttl_seconds=0.01)
+        await mgr.get_or_create("s1")
+        await mgr.get_or_create("s2")
+        await asyncio.sleep(0.05)
+
+        evicted_ids = []
+        async def _cb(sid: str):
+            evicted_ids.append(sid)
+        mgr.set_eviction_callback(_cb)
+
+        evicted = await mgr.cleanup_expired()
+        assert evicted == 2
+        assert sorted(evicted_ids) == ["s1", "s2"]
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_fired_on_remove(self):
+        """remove() should fire the callback for the removed session."""
+        mgr = SessionManager()
+        await mgr.get_or_create("s1")
+
+        evicted_ids = []
+        async def _cb(sid: str):
+            evicted_ids.append(sid)
+        mgr.set_eviction_callback(_cb)
+
+        removed = await mgr.remove("s1")
+        assert removed is True
+        assert evicted_ids == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_not_fired_on_remove_nonexistent(self):
+        """remove() should NOT fire callback when session doesn't exist."""
+        mgr = SessionManager()
+
+        evicted_ids = []
+        async def _cb(sid: str):
+            evicted_ids.append(sid)
+        mgr.set_eviction_callback(_cb)
+
+        removed = await mgr.remove("nonexistent")
+        assert removed is False
+        assert evicted_ids == []
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_fired_on_get_or_create_expired(self):
+        """get_or_create should fire callback when an expired session is replaced."""
+        mgr = SessionManager(ttl_seconds=0.01)
+        await mgr.get_or_create("s1")
+        await asyncio.sleep(0.05)
+
+        evicted_ids = []
+        async def _cb(sid: str):
+            evicted_ids.append(sid)
+        mgr.set_eviction_callback(_cb)
+
+        session, created = await mgr.get_or_create("s1")
+        assert created is True
+        assert evicted_ids == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_fired_on_get_expired(self):
+        """get() should fire callback when an expired session is evicted."""
+        mgr = SessionManager(ttl_seconds=0.01)
+        await mgr.get_or_create("s1")
+        await asyncio.sleep(0.05)
+
+        evicted_ids = []
+        async def _cb(sid: str):
+            evicted_ids.append(sid)
+        mgr.set_eviction_callback(_cb)
+
+        result = await mgr.get("s1")
+        assert result is None  # session was expired
+        assert evicted_ids == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_not_fired_for_active_sessions(self):
+        """Active sessions should NOT trigger the callback."""
+        mgr = SessionManager(ttl_seconds=3600)
+        await mgr.get_or_create("s1")
+
+        evicted_ids = []
+        async def _cb(sid: str):
+            evicted_ids.append(sid)
+        mgr.set_eviction_callback(_cb)
+
+        evicted = await mgr.cleanup_expired()
+        assert evicted == 0
+        assert evicted_ids == []
+
+    @pytest.mark.asyncio
+    async def test_eviction_callback_error_does_not_propagate(self):
+        """A failing eviction callback should not propagate the exception."""
+        mgr = SessionManager(ttl_seconds=0.01)
+        await mgr.get_or_create("s1")
+        await asyncio.sleep(0.05)
+
+        async def _failing_cb(sid: str):
+            raise RuntimeError(f"Intentional failure for {sid}")
+        mgr.set_eviction_callback(_failing_cb)
+
+        # Should not raise despite callback failure
+        evicted = await mgr.cleanup_expired()
+        assert evicted == 1
+
+
+# ---------------------------------------------------------------------------
 # Fallback to full history for expired/invalid sessions
 # ---------------------------------------------------------------------------
 

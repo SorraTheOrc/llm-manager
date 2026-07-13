@@ -169,12 +169,22 @@ def _get_local_max_concurrent_queries(server_config: dict) -> int:
     """
     Read the local-model concurrency limit from config.
 
-    Returns the configured ``local_max_concurrent_queries`` value
-    (default 1). This limit is separate from the global
-    ``max_concurrent_queries`` which applies to remote providers.
+    Returns the configured parallel session count, which determines how
+    many concurrent sessions can hold local dispatch leases simultaneously.
+
+    The primary config key is ``session_slot_pool_size`` (same value that
+    controls ``--parallel`` in llama-server). If not set, falls back to
+    the legacy ``local_max_concurrent_queries`` key.  Defaults to 1.
+
+    This limit is separate from the global ``max_concurrent_queries``
+    which applies to remote providers.
     """
     try:
-        val = server_config.get("local_max_concurrent_queries", 1)
+        # Primary: session_slot_pool_size (configurable parallel session count)
+        val = server_config.get("session_slot_pool_size", None)
+        if val is None:
+            # Fallback: local_max_concurrent_queries for backward compatibility
+            val = server_config.get("local_max_concurrent_queries", 1)
         return max(1, int(val or 1))
     except (ValueError, TypeError):
         return 1
