@@ -287,20 +287,24 @@ async def test_try_acquire_allows_new_owner_after_lease_expiry():
 
 
 @pytest.mark.asyncio
-async def test_cleanup_stale_preserves_expired_active_lease():
+async def test_cleanup_stale_removes_expired_active_orphan():
     """
-    _cleanup_stale_local_dispatch must NOT remove active lease records
-    even when their expires_at has passed.  Active records represent
-    in-flight requests that may take longer than the 60s lease timeout.
+    _cleanup_stale_local_dispatch must remove active lease records
+    whose expires_at has passed (abandoned/orphaned streams).
+
+    Active records with expires_at in the past represent streams that
+    were started but never finished — they should be cleaned up as
+    orphans with a WARNING-level log.
     """
     from proxy.router_helpers import _cleanup_stale_local_dispatch
 
+    logger = MagicMock()
     srv = SimpleNamespace(
         config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
         local_active_queries=0,
         local_active_queries_lock=asyncio.Lock(),
         local_dispatch_records={
-            # Expired active lease — should NOT be cleaned (in-flight)
+            # Expired active lease — should be cleaned (orphan/abandoned)
             "sess-stuck": {
                 "backend": "local",
                 "started_at": 1.0,
@@ -314,7 +318,7 @@ async def test_cleanup_stale_preserves_expired_active_lease():
                 "active": False,
                 "expires_at": 10**12,  # far in the future
             },
-            # Expired inactive lease — should be cleaned
+            # Expired inactive lease — should be cleaned (normal idle timeout)
             "sess-expired-inactive": {
                 "backend": "local",
                 "started_at": 1.0,
@@ -323,19 +327,37 @@ async def test_cleanup_stale_preserves_expired_active_lease():
             },
         },
         local_dispatch_records_lock=asyncio.Lock(),
+        logger=logger,
     )
 
     removed = await _cleanup_stale_local_dispatch(srv)
 
-    # The expired active lease must be PRESERVED (in-flight request)
-    assert "sess-stuck" in srv.local_dispatch_records, (
-        "Expired active lease must be preserved (in-flight request)"
+    # The expired active lease must be REMOVED (orphan cleanup)
+    assert "sess-stuck" not in srv.local_dispatch_records, (
+        "Expired active lease must be removed (orphan cleanup)"
     )
     # The expired inactive lease should be removed
     assert "sess-expired-inactive" not in srv.local_dispatch_records
     # The valid future lease should still exist
     assert "sess-valid" in srv.local_dispatch_records
-    assert removed == 1, "Expected 1 lease removed (expired-inactive only)"
+    assert removed == 2, "Expected 2 leases removed (orphan + expired-inactive)"
+
+    # Verify WARNING-level log was emitted for the orphan
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert len(warning_calls) == 1, (
+        f"Expected 1 WARNING for orphan cleanup, got {len(warning_calls)}"
+    )
+    warning_msg = str(warning_calls[0])
+    # Session ID is truncated to 8 chars: "sess-stu" from "sess-stuck"
+    assert "sess-stu" in warning_msg, (
+        "Orphan cleanup WARNING should include the truncated session ID"
+    )
+    assert "reason=orphan_cleanup" in warning_msg, (
+        "Orphan cleanup WARNING should contain reason=orphan_cleanup"
+    )
 
 
 @pytest.mark.asyncio
@@ -368,6 +390,205 @@ async def test_cleanup_stale_preserves_active_unexpired_lease():
     )
     assert removed == 0, "No leases should have been removed"
     assert srv.local_dispatch_records["sess-active"]["active"] is True
+
+
+# ---------------------------------------------------------------------------
+# Orphan detection and cleanup tests (LP-0MRHU4PX0001X8WX)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_removes_only_expired_active_leases():
+    """Orphan cleanup removes only active leases past expires_at.
+
+    Active leases still within their expires_at window must be preserved
+    (legitimate in-flight requests).
+    """
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    logger = MagicMock()
+    far_future = 10**12
+    now = 500.0
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            # Active lease still within window - preserve
+            "sess-active-valid": {
+                "backend": "local",
+                "started_at": now - 30,
+                "active": True,
+                "expires_at": far_future,
+            },
+            # Active lease past expires_at - clean as orphan
+            "sess-orphan": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 0.0,
+            },
+            # Inactive past expires_at - clean as idle timeout
+            "sess-idle-expired": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 0.0,
+            },
+            # Inactive within window - preserve
+            "sess-idle-valid": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": far_future,
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=logger,
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    # Orphan removed
+    assert "sess-orphan" not in srv.local_dispatch_records
+    # Idle expired removed
+    assert "sess-idle-expired" not in srv.local_dispatch_records
+    # Active valid preserved
+    assert "sess-active-valid" in srv.local_dispatch_records
+    # Idle valid preserved
+    assert "sess-idle-valid" in srv.local_dispatch_records
+    assert removed == 2, "Expected 2 leases removed (orphan + idle-expired)"
+
+    # Verify orphan WARNING log
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert len(warning_calls) == 1
+
+    # Verify orphan INFO log (same as idle_timeout for backward compat)
+    info_calls = [
+        call for call in logger.info.call_args_list
+        if "lease_released" in str(call)
+    ]
+    assert len(info_calls) == 2, (
+        f"Expected 2 lease_released INFO logs (orphan + idle), got {len(info_calls)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_emits_warning_for_abandoned_stream():
+    """Orphan cleanup must emit a WARNING-level log with session ID
+    when cleaning up an abandoned active stream."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-orphan": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 0.0,
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=logger,
+    )
+
+    await _cleanup_stale_local_dispatch(srv)
+
+    # Verify orphan WARNING was logged
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert len(warning_calls) == 1
+
+    # Verify the WARNING contains the session ID (truncated to 8 chars)
+    warning_msg = str(warning_calls[0][0])
+    assert "sess-orp" in warning_msg, (
+        "Orphan cleanup WARNING should contain truncated session ID"
+    )
+    assert "reason=orphan_cleanup" in warning_msg, (
+        "Orphan cleanup WARNING should contain reason=orphan_cleanup"
+    )
+
+    # Verify an INFO-level lease_released log is ALSO emitted
+    info_calls = [
+        call for call in logger.info.call_args_list
+        if "lease_released" in str(call)
+    ]
+    assert len(info_calls) == 1, (
+        "Orphan cleanup should also emit INFO lease_released log"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_abandoned_stream_integration():
+    """Integration test: abandoned stream is detected and lease cleaned up.
+
+    Reproduces the abandoned-stream scenario (AC #3):
+    1. Start a local stream (create active dispatch lease).
+    2. Simulate abnormal termination (no Stream finished event → active stays True).
+    3. Run the cleanup loop after expires_at passes.
+    4. Verify the lease is cleaned up.
+    5. Verify a new session can acquire the lease.
+    """
+    from proxy.router_helpers import (
+        _cleanup_stale_local_dispatch,
+        _try_acquire_local_dispatch,
+    )
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 60}},
+        local_active_queries=1,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-abandoned": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,  # never set to False (abandoned)
+                "expires_at": 0.0,  # past expiry
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=logger,
+    )
+
+    # 3. Run cleanup — should remove the orphan
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 1, f"Expected 1 orphan removed, got {removed}"
+    assert "sess-abandoned" not in srv.local_dispatch_records, (
+        "Abandoned stream lease should be removed"
+    )
+
+    # Verify WARNING was logged
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert len(warning_calls) == 1, (
+        "Expected WARNING log for orphan cleanup"
+    )
+
+    # 5. Verify a new session can now acquire the lease
+    srv.local_active_queries = 0
+    acquired, owner, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-new", backend="local",
+    )
+    assert acquired is True, (
+        "New session should acquire lease after orphan cleanup"
+    )
+    assert owner is None, (
+        "No owner should be reported after orphan cleanup"
+    )
 
 
 # ---------------------------------------------------------------------------

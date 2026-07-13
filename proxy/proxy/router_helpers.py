@@ -775,17 +775,21 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    A record is stale when it is *inactive* and its *expires_at* timestamp
-    has passed (``time.monotonic() > expires_at``).  Active in-flight
-    requests are never cleaned by this function — their *expires_at* is
-    a cooldown timeout for the inactive lease, not a hard deadline for
-    the active request.
+    Two categories of stale records are cleaned:
 
-    For abandoned/crashed requests where *active* stays ``True``
-    permanently, the adaptive lease timeout in ``_try_acquire_local_dispatch``
-    provides an eventual upper bound via ``local_dispatch_lease_max_seconds``
-    (default 1500).  The periodic slot-save timeout in llama-server also
-    releases orphaned slots independently.
+    1. **Inactive records** whose *expires_at* has passed — these represent
+       sessions that finished their request but whose idle lease timeout
+       has expired. Logged at INFO level with ``reason=idle_timeout``.
+
+    2. **Active records** whose *expires_at* has passed — these represent
+       abandoned/orphaned streams where the stream was started but never
+       finished (no *active=False* transition). Logged at WARNING level
+       with ``reason=orphan_cleanup`` distinct from normal idle-timeout
+       release, plus an INFO-level ``lease_released reason=orphan_cleanup``
+       for parity with existing log consumers.
+
+    Active records whose *expires_at* is still in the future are preserved
+    (legitimate in-flight requests).
 
     Returns the number of records removed.
     """
@@ -793,21 +797,39 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     removed = 0
     try:
         async with srv.local_dispatch_records_lock:
-            stale_ids = [
-                sid
-                for sid, record in srv.local_dispatch_records.items()
-                if not record.get("active") and record.get("expires_at", 0) <= now
-            ]
-            for sid in stale_ids:
-                del srv.local_dispatch_records[sid]
-                removed += 1
-                try:
-                    srv.logger.info(
-                        "lease_released session=%s reason=idle_timeout",
-                        sid[:8] if sid else "unknown",
-                    )
-                except Exception:
-                    pass
+            for sid, record in list(srv.local_dispatch_records.items()):
+                expires_at = record.get("expires_at", 0)
+                if expires_at > now:
+                    continue  # still within valid window
+
+                active = record.get("active", False)
+                if not active:
+                    # Normal idle timeout for inactive records
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        srv.logger.info(
+                            "lease_released session=%s reason=idle_timeout",
+                            sid[:8] if sid else "unknown",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Abandoned/orphaned active record past its expires_at
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        srv.logger.warning(
+                            "lease_released session=%s reason=orphan_cleanup "
+                            "stream_abandoned=True",
+                            sid[:8] if sid else "unknown",
+                        )
+                        srv.logger.info(
+                            "lease_released session=%s reason=orphan_cleanup",
+                            sid[:8] if sid else "unknown",
+                        )
+                    except Exception:
+                        pass
     except Exception:
         pass
     return removed
