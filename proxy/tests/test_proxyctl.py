@@ -49,6 +49,9 @@ def run_proxyctl(*args, env=None, cwd=None, timeout=15):
     """Run proxyctl and return CompletedProcess."""
     cmd = [str(PROXYCTL)] + list(args)
     proc_env = os.environ.copy()
+    # Unset XDG_RUNTIME_DIR by default so PID_DIR falls back to XDG_STATE_HOME.
+    # Tests that want XDG_RUNTIME_DIR behavior should set it explicitly in env.
+    proc_env.pop("XDG_RUNTIME_DIR", None)
     if env:
         proc_env.update(env)
     result = subprocess.run(
@@ -79,7 +82,7 @@ class TestConfigDetection:
         assert str(tmp_path / "my-start.sh") in result.stderr
 
     def test_fallback_to_repo_root(self, tmp_path):
-        """When no env var and no config key match, fallback to repo root start-llama.sh."""
+        """When no env var and no config key match, fallback to proxy/scripts/start-proxy.sh."""
         state_dir = tmp_path / "state"
         state_dir.mkdir()
         env = {"XDG_STATE_HOME": str(state_dir)}
