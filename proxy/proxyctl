@@ -253,7 +253,10 @@ cmd_start() {
     fi
   else
     # Production mode
-    ensure_dirs
+    local effective_log_dir
+    effective_log_dir=$(resolve_log_dir)
+    mkdir -p "$effective_log_dir"
+    mkdir -p "$PID_DIR"
     if pid=$(is_running); then
       echo "proxy already running (PID $pid)"
       return 0
@@ -272,10 +275,10 @@ cmd_start() {
       exec bash "$start_script"
     else
       # Background mode
-      nohup bash "$start_script" > "$LOG_FILE" 2>&1 &
+      nohup bash "$start_script" > "$effective_log_dir/proxy.log" 2>&1 &
       local pid=$!
       echo "$pid" > "$PID_FILE"
-      echo "Started (PID $pid). Logs: $LOG_FILE"
+      echo "Started (PID $pid). Logs: $effective_log_dir/proxy.log"
 
       # Health polling (only with --wait)
       if [[ "$wait_for_health" -eq 1 ]]; then
@@ -370,6 +373,29 @@ read_config_log_dir() {
   return 1
 }
 
+resolve_log_dir() {
+  # Use configured logging.directory from config.yaml if available and writable.
+  # Fall back to repo-local logs/ dir, then to default LOG_DIR.
+  local configured_dir
+  configured_dir=$(read_config_log_dir || true)
+  if [[ -n "$configured_dir" ]]; then
+    if mkdir -p "$configured_dir" 2>/dev/null && [[ -w "$configured_dir" ]]; then
+      echo "$configured_dir"
+      return
+    fi
+    echo "Warning: Configured log directory '$configured_dir' is not writable, trying fallback" >&2
+    # Try repo-local logs/ directory
+    local repo_log_dir
+    repo_log_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)/logs"
+    if mkdir -p "$repo_log_dir" 2>/dev/null && [[ -w "$repo_log_dir" ]]; then
+      echo "$repo_log_dir"
+      return
+    fi
+    echo "Warning: Fallback log directory '$repo_log_dir' is not writable either, using default" >&2
+  fi
+  echo "$LOG_DIR"
+}
+
 cmd_logs() {
   local dev_mode="$1"
   shift || true
@@ -425,7 +451,6 @@ cmd_logs() {
       log_file="$DEV_LOG_FILE"
     fi
   else
-    ensure_dirs
     if [[ -z "$log_file" ]]; then
       log_file="$LOG_FILE"
     fi
