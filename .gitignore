@@ -42,3 +42,4 @@ logs/
 __pycache__/
 *.pyc
 proxy/session-recordings/
+qwentts.cpp/models/
