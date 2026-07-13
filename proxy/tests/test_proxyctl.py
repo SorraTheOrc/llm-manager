@@ -294,6 +294,45 @@ class TestStop:
         # Process should not be running
         assert not os.path.exists(f"/proc/{pid}"), f"Process {pid} still running"
 
+    def test_stop_forced_kill(self, tmp_path):
+        """Stop should escalate to SIGKILL and return non-zero when process ignores SIGTERM."""
+        start_script = tmp_path / "ignore-term.sh"
+        start_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            # Ignore SIGTERM; only SIGKILL can stop this process
+            trap '' TERM
+            while true; do sleep 1; done
+        """))
+        start_script.chmod(0o755)
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        pid_file = state_dir / "llama-proxy" / "proxy.pid"
+
+        env = {
+            "LLAMA_START_SCRIPT": str(start_script),
+            "XDG_STATE_HOME": str(state_dir),
+        }
+
+        # Start the process
+        result = run_proxyctl("start", env=env)
+        assert result.returncode == 0
+        assert pid_file.exists()
+
+        pid = int(pid_file.read_text().strip())
+        assert os.path.exists(f"/proc/{pid}"), f"Process {pid} not running"
+
+        # Stop the process (it ignores SIGTERM, so SIGKILL should be used)
+        result = run_proxyctl("stop", env=env)
+        # Should return non-zero to indicate forced kill
+        assert result.returncode != 0, f"Expected non-zero exit code, got 0. stdout: {result.stdout}"
+        assert "Process did not exit, sending SIGKILL" in result.stdout
+        assert "Stopped (forced)" in result.stdout or "Stopped" in result.stdout
+        # PID file should be removed
+        assert not pid_file.exists()
+        # Process should not be running
+        assert not os.path.exists(f"/proc/{pid}"), f"Process {pid} still running"
+
     def test_stop_not_running(self, tmp_path):
         """Stop should return 0 when proxy is not running."""
         state_dir = tmp_path / "state"

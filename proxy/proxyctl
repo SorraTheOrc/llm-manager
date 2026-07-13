@@ -301,6 +301,7 @@ cmd_start() {
 cmd_stop() {
   local dev_mode="$1"
   local pid_file="$PID_FILE"
+  local forced=0
 
   if [[ "$dev_mode" -eq 1 ]]; then
     pid_file="$DEV_PID_FILE"
@@ -326,10 +327,15 @@ cmd_stop() {
     if [[ $t -ge 10 ]]; then
       echo "Process did not exit, sending SIGKILL"
       kill -KILL "$pid" 2>/dev/null || true
+      forced=1
       break
     fi
   done
   rm -f "$pid_file"
+  if [[ "$forced" -eq 1 ]]; then
+    echo "Stopped (forced)"
+    return 1
+  fi
   echo "Stopped"
 }
 
