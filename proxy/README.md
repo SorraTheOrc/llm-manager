@@ -1641,7 +1641,7 @@ Content-Type: application/json
 {
   "model": "qwen3-tts",
   "input": "Text to convert to speech.",
-  "voice": "default",
+  "voice": "serena",
   "response_format": "wav"
 }
 ```
@@ -1652,8 +1652,80 @@ Content-Type: application/json
 |-------|----------|-------------|
 | `model` | Yes | Model identifier (passed through to tts-server) |
 | `input` | Yes | Text to synthesise (must be non-empty) |
-| `voice` | No | Speaker voice (base model has no pre-registered speakers; omit or leave empty) |
+| `voice` | No | Speaker voice (see pre-registered voices below; omit for default) |
 | `response_format` | No | Output format (currently only `wav` is supported) |
+
+**Pre-registered voices**
+
+The proxy uses the **custom_voice** variant of the Qwen3-TTS model,
+which includes 9 built-in speakers:
+
+| Voice | Dialect |
+|---|---|
+| `serena` | standard |
+| `vivian` | standard |
+| `uncle_fu` | standard |
+| `ryan` | standard |
+| `aiden` | standard |
+| `ono_anna` | standard |
+| `sohee` | standard |
+| `eric` | sichuan_dialect |
+| `dylan` | beijing_dialect |
+
+List available voices at any time via the proxy:
+
+```bash
+curl http://localhost:8000/v1/voices
+```
+
+This returns:
+
+```json
+{
+  "voices": [
+    {"name": "serena", "kind": "speaker"},
+    {"name": "vivian", "kind": "speaker"},
+    ...
+  ]
+}
+```
+
+**Creating new voices (voice cloning)**
+
+The custom_voice model does not support registering new voices via API —
+the 9 pre-registered speakers above are fixed. To clone a voice from a
+reference audio clip, you need to switch to the **base** variant of the
+model instead. The base model supports zero-shot voice cloning via the
+`qwen-tts` CLI:
+
+```bash
+# Clone a voice from a reference WAV + transcript
+cd qwentts.cpp
+./qwen-tts \
+  --model models/qwen-talker-1.7b-base-Q8_0.gguf \
+  --codec models/qwen-tokenizer-12hz-Q8_0.gguf \
+  --ref-wav /path/to/reference.wav \
+  --ref-text /path/to/transcript.txt \
+  --lang English \
+  -o cloned.wav < prompt.txt
+```
+
+For the proxy route, if you need voice cloning, swap the model in
+`config.yaml` (`tts_model_path`) to the base variant and the tts-server
+will accept new voice registrations via:
+
+```bash
+POST /v1/voices
+Content-Type: application/json
+
+{
+  "name": "my_cloned_voice",
+  "wav_b64": "<base64-encoded WAV>",
+  "text": "Transcript of the reference audio"
+}
+```
+
+Then use it like any other voice: `"voice": "my_cloned_voice"`.
 
 **Response**  
 - **Success (200):** Audio file with `Content-Type: audio/wav` (24 kHz, mono, 16-bit PCM WAV).
@@ -1692,17 +1764,18 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-tts",
-    "input": "Hello, this is a test of the text-to-speech system."
+    "input": "Hello, this is a test of the text-to-speech system.",
+    "voice": "serena"
   }' \
   --output speech.wav
 
-# With explicit voice parameter (may fail on base model)
+# With different voice
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-tts",
     "input": "The quick brown fox jumps over the lazy dog.",
-    "voice": "default",
+    "voice": "dylan",
     "response_format": "wav"
   }' \
   --output fox.wav
@@ -1758,7 +1831,7 @@ GGUF-quantised models are downloaded from
 [Serveurperso/Qwen3-TTS-GGUF](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF)
 and placed in `qwentts.cpp/models/`:
 
-- **Talker LM:** `qwen-talker-1.7b-base-Q8_0.gguf` (~2.0 GB, 1.7B params, Q8_0 quant)
+- **Talker LM:** `qwen-talker-1.7b-customvoice-Q8_0.gguf` (~1.9 GB, 1.7B params, Q8_0 quant)
 - **Codec / Tokenizer:** `qwen-tokenizer-12hz-Q8_0.gguf` (~278 MB)
 
 The startup script auto-detects model files in `qwentts.cpp/models/` unless
@@ -1819,7 +1892,7 @@ bash proxy/scripts/start-qwentts.sh --port 8081
 ### Audio response is garbled or silent
 1. Verify WAV header: `head -c 44 speech.wav | xxd | head -5` (should start with `RIFF`)
 2. Ensure the output file is opened in binary mode: `--output speech.wav`
-3. Base model has no pre-registered speakers — omit `voice` parameter (use empty string if needed)
+3. Custom_voice model has 9 pre-registered speakers (`serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`) — pass `voice` to select one.
 4. Check sample rate: `ffprobe speech.wav` (expected: 24000 Hz, mono, 16-bit PCM)
 
 ## Testing

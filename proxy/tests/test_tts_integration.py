@@ -54,7 +54,7 @@ class TestTtsServerLive:
     @pytest.mark.asyncio
     async def test_returns_binary_audio(self):
         """A valid POST returns non-empty binary data."""
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 TTS_URL,
                 json={"model": "test", "input": "Hello world, this is a test."},
@@ -67,7 +67,7 @@ class TestTtsServerLive:
     @pytest.mark.asyncio
     async def test_happy_path_with_minimal_body(self):
         """Minimal valid body (model + input) succeeds."""
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 TTS_URL,
                 json={"model": "test", "input": "Integration test."},

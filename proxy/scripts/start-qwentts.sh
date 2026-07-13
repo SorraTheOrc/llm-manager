@@ -6,6 +6,7 @@
 #   --port <port>         Listen port (default: 8081)
 #   --model <path>        Talker LM GGUF path
 #   --codec <path>        Codec GGUF path
+#   --lang <name>         Language label (default: auto)
 #   --help                Show this help
 set -euo pipefail
 
@@ -17,6 +18,7 @@ TT_SERVER="${REPO_ROOT}/qwentts.cpp/tts-server"
 PORT="${QWTTS_PORT:-8081}"
 MODEL="${QWTTS_MODEL:-}"
 CODEC="${QWTTS_CODEC:-}"
+LANG="${QWTTS_LANG:-}"
 
 # ---- Parse arguments ----------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -33,6 +35,10 @@ while [[ $# -gt 0 ]]; do
       CODEC="$2"; shift 2 ;;
     --codec=*)
       CODEC="${1#*=}"; shift ;;
+    --lang)
+      LANG="$2"; shift 2 ;;
+    --lang=*)
+      LANG="${1#*=}"; shift ;;
     --help|-h)
       head -15 "$0"
       exit 0 ;;
@@ -46,8 +52,10 @@ done
 if [ -z "$MODEL" ]; then
   # Try build output directory first (local dev), then installed models
   for candidate in \
+    "${REPO_ROOT}/qwentts.cpp/models/qwen-talker-1.7b-customvoice-Q8_0.gguf" \
     "${REPO_ROOT}/qwentts.cpp/models/qwen-talker-1.7b-base-Q8_0.gguf" \
-    "${REPO_ROOT}/qwentts.cpp/models/qwen-talker-0.6b-base-Q8_0.gguf"; do
+    "${REPO_ROOT}/qwentts.cpp/models/qwen-talker-0.6b-base-Q8_0.gguf" \
+    "${REPO_ROOT}/qwentts.cpp/models/qwen-talker-0.6b-customvoice-Q8_0.gguf"; do
     if [ -f "$candidate" ]; then
       MODEL="$candidate"
       break
@@ -102,8 +110,10 @@ echo "=== Starting qwentts TTS server ==="
 echo "Port:  $PORT"
 echo "Model: $MODEL"
 echo "Codec: $CODEC"
+echo "Lang:  ${LANG:-auto}"
 
 exec "$TT_SERVER" \
   --model "$MODEL" \
   --codec "$CODEC" \
-  --port "$PORT"
+  --port "$PORT" \
+  ${LANG:+--lang "$LANG"}

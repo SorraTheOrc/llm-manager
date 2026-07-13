@@ -32,8 +32,38 @@ Downloaded from [Serveurperso/Qwen3-TTS-GGUF](https://huggingface.co/Serveurpers
 
 | Model | Path | Size |
 |---|---|---|
-| qwen-talker-1.7b-base-Q8_0.gguf | `models/qwen-talker-1.7b-base-Q8_0.gguf` | 1983 MB |
+| qwen-talker-1.7b-customvoice-Q8_0.gguf | `models/qwen-talker-1.7b-customvoice-Q8_0.gguf` | ~1.9 GB |
 | qwen-tokenizer-12hz-Q8_0.gguf | `models/qwen-tokenizer-12hz-Q8_0.gguf` | 278 MB |
+
+The base model (`qwen-talker-1.7b-base-Q8_0.gguf`) has been replaced with the
+`custom_voice` variant which supports speaker voice selection and voice cloning.
+
+## Pre-registered Voices
+
+The custom_voice model includes 9 pre-registered speakers:
+
+| Voice | Dialect |
+|---|---|
+| `serena` | standard |
+| `vivian` | standard |
+| `uncle_fu` | standard |
+| `ryan` | standard |
+| `aiden` | standard |
+| `ono_anna` | standard |
+| `sohee` | standard |
+| `eric` | sichuan_dialect |
+| `dylan` | beijing_dialect |
+
+Use the `voice` parameter to select one, e.g.:
+
+```bash
+curl -X POST http://localhost:8081/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3-tts", "input": "Hello world", "voice": "serena", "response_format": "wav"}' \
+  -o output.wav
+```
+
+New voices can be registered via POST `/v1/voices/<name>` with a reference audio file.
 
 ## Smoke Test Result
 
@@ -46,10 +76,6 @@ curl -X POST http://localhost:8081/v1/audio/speech \
 
 Result: 128 KB valid WAV file, 24 kHz mono 16-bit PCM.
 Performance: 1010.7 ms for 2.72 seconds of audio (RTF 0.372).
-
-**Note:** The `voice` parameter must be omitted or empty for the base model.
-The `"default"` voice is rejected because the base model variant has no
-pre-registered speakers. Voice cloning requires a prior POST to `/v1/voices`.
 
 ## Proxy Integration
 
