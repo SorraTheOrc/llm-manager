@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.6 (2026-07-14)
+### Features
+- Implement incremental session-based prompt ingestion for llama-server (LP-0MO6DJP0P006WCHA)
+- Prometheus alert rule for 5xx spikes (LP-0MQ53BRAU000FY39)
+### Other
+- Session ID generation and management core (LP-0MO6EWJ5K0088CBS)
+- Proxy: add dev mode to allow simultaneous use and development (LP-0MQ1GFV8B001V0L6)
+- Split logging web UI: proxy + llama-server tail (LP-0MNWAC6PM007BFWQ)
+
 ## v0.1.5 (2026-07-13)
 ### Features
 - proxyctl: core CLI (LP-0MPY3DFYD008M75U)
