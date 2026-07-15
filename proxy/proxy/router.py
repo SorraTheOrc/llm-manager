@@ -814,7 +814,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                     except Exception:
                         srv.backend_ready = False
-                        await _decrement_active_queries(srv)
+                        await _release_scheduler_and_decrement(
+                            srv, scheduler, session_id, slot_id,
+                            decrement_local=True,
+                            session_explicit=session_explicit,
+                        )
                         try:
                             await client.aclose()
                         except Exception:
@@ -868,7 +872,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 is_delta_request, session_fallback_reason,
                             )
                         )
-                        await _decrement_active_queries(srv)
+                        await _release_scheduler_and_decrement(
+                            srv, scheduler, session_id, slot_id,
+                            decrement_local=True,
+                            session_explicit=session_explicit,
+                        )
                         return Response(
                             content=body_bytes,
                             status_code=upstream_status,
