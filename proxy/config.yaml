@@ -267,7 +267,7 @@ server:
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
   # exceed this value, local routing is bypassed to avoid GPU prefill contention
   # on very large contexts. Set to 0 to disable. Default: 60000.
-  local_large_context_warm_cache_threshold: 40000
+  local_large_context_warm_cache_threshold: 100000
   llama_router_mode: true
   max_concurrent_queries: 16
   # Local-model concurrency limit (LP-0MR5MAJNM005R905).
@@ -448,8 +448,8 @@ server:
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
   # Must be an absolute path or a script resolvable from PATH.
-  # The host-based start-proxy.sh is at proxy/scripts/start-proxy.sh.
-  llama_start_script: proxy/scripts/start-proxy.sh
+  # The host-based start-llama.sh is at the project root.
+  llama_start_script: start-llama.sh
   llama_startup_timeout: 300
   port: 8000
 

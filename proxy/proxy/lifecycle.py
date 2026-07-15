@@ -827,7 +827,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # Default to the repository root `start-llama.sh` if not specified in srv.config
     script_path = server_config.get(
        "llama_start_script",
-       str(Path(__file__).parent.parent / "start-llama.sh")
+       str(Path(__file__).parent.parent.parent / "start-llama.sh")
     )
     llama_port = server_config.get("llama_server_port", 8080)
 
@@ -894,7 +894,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # Host-first startup: if llama_allow_host_fallback is enabled AND the
     # configured start script is different from the default start-llama.sh,
     # attempt one host-start before falling back to the configured script.
-    host_start_script = str(Path(__file__).parent.parent / "start-llama.sh")
+    host_start_script = str(Path(__file__).parent.parent.parent / "start-llama.sh")
     allow_host_fallback = bool(server_config.get("llama_allow_host_fallback", False))
 
     if allow_host_fallback and script_path != host_start_script:

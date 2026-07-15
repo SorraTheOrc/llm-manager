@@ -36,7 +36,7 @@ SWEEP_NGPU=(99 80 60)
 SWEEP_THREADS=(16 12 8)
 SWEEP_BATCH=(4096 2048 1024)
 SWEEP_UBATCH=(512 256)
-SWEEP_FA=(1 0)
+SWEEP_FA=(1)
 SWEEP_CTK=("f16" "q8_0")
 SWEEP_CTV=("f16" "q8_0")
 SWEEP_N_PROMPT=(512 1024)
@@ -116,6 +116,7 @@ discover_models() {
     # Discover from HF cache (snapshots directory structure)
     if [ -d "$HF_HUB_CACHE" ]; then
         # Look for GGUF files in models--*/snapshots/*/ directories (standard HF cache)
+        # Use -o -type l to handle symlinks (HF cache snapshots are symlinks to blobs)
         while IFS= read -r -d '' gguf; do
             local name
             name=$(basename "$gguf" .gguf)
@@ -136,7 +137,7 @@ discover_models() {
                 seen_names+=("$name")
                 models+=("$gguf")
             fi
-        done < <(find "$HF_HUB_CACHE" -type f -name "*.gguf" -not -name "*.downloadInProgress" -print0 2>/dev/null)
+        done < <(find "$HF_HUB_CACHE" \( -type f -o -type l \) -name "*.gguf" -not -name "*.downloadInProgress" -print0 2>/dev/null)
     fi
 
     # Discover from llama.cpp local cache
@@ -156,7 +157,7 @@ discover_models() {
                 seen_names+=("$name")
                 models+=("$gguf")
             fi
-        done < <(find "$LLAMACPP_CACHE" -type f -name "*.gguf" -print0 2>/dev/null)
+        done < <(find "$LLAMACPP_CACHE" \( -type f -o -type l \) -name "*.gguf" -print0 2>/dev/null)
     fi
 
     # Check for incomplete downloads (multi-file models with missing parts)
