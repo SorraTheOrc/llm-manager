@@ -432,8 +432,29 @@ async def _release_scheduler_and_decrement(
     if decrement_local:
         await _decrement_local_active_queries(
             srv,
-            session_key=session_id if session_explicit else None,
+            session_key=session_id,
         )
+        # For non-explicit sessions (no session affinity), immediately
+        # remove the dispatch record instead of letting it linger with
+        # a 60-second inactive lease — these one-shot sessions won't
+        # return, so accumulating inactive records would block slots.
+        if not session_explicit and session_id:
+            try:
+                lock = getattr(srv, "local_dispatch_records_lock", None)
+                if lock is not None:
+                    async with lock:
+                        records = getattr(srv, "local_dispatch_records", {})
+                        if session_id in records:
+                            del records[session_id]
+                            try:
+                                srv.logger.info(
+                                    "lease_released session=%s reason=non_explicit",
+                                    session_id[:8] if session_id else "unknown",
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
     # On client disconnect, immediately remove the dispatch lease record
     if disconnected and session_id:
@@ -730,7 +751,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not (session_id and session_explicit):
         await _increment_local_active_queries(
             srv,
-            session_key=session_id if session_explicit else None,
+            session_key=session_id,
             backend="local",
         )
 
