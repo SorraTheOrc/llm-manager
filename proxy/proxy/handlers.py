@@ -743,14 +743,70 @@ async def create_speech(request: Request):
                     resp = await c.post(tts_url, json=forward_body, timeout=180.0)
     except httpx.ConnectError as e:
         logger.error("TTS server unreachable at %s: %s", tts_url, e)
-        raise HTTPException(status_code=502, detail=f"TTS server unreachable: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_unreachable",
+                    "message": f"TTS server unreachable: {e}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
     except httpx.TimeoutException as e:
         logger.error("TTS server timeout at %s: %s", tts_url, e)
-        raise HTTPException(status_code=502, detail=f"TTS server timeout: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_timeout",
+                    "message": f"TTS server timeout: {e}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
     except Exception as e:
         logger.exception("Unexpected error forwarding TTS request to %s", tts_url)
-        raise HTTPException(status_code=502, detail=f"TTS server error: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_error",
+                    "message": f"TTS server error: {e}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
+
+    # Check for backend HTTP errors (>=400) and return structured 502
+    if resp.status_code >= 400:
+        try:
+            root_body = json.loads(resp.content.decode("utf-8", errors="replace"))
+        except Exception:
+            root_body = resp.content.decode("utf-8", errors="replace")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_error",
+                    "message": f"TTS server returned HTTP {resp.status_code}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+                "root_cause": {
+                    "backend_status_code": resp.status_code,
+                    "backend_body": root_body,
+                },
+            },
+        )
 
     # Return the audio response from tts-server
     content_type = resp.headers.get("content-type", "audio/wav")
-    return Response(content=resp.content, media_type=content_type)
+    return Response(content=resp.content, media_type=content_type, status_code=resp.status_code)

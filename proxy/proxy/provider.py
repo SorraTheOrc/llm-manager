@@ -1742,6 +1742,7 @@ async def proxy_with_fallback(
                     )
                     fallback_reason = "local_concurrency_limit"
                     prev_provider = provider_name
+                    all_slot_exhaustion = False
                     continue
 
                 # Smart routing: skip local when cache is cold and request is large
@@ -1758,6 +1759,13 @@ async def proxy_with_fallback(
                     request,
                     body_json,
                 )
+                # Apply model-level token estimate multiplier to account for
+                # tokenizer mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
+                # can differ by ~13-15%).  Configurable via token_estimate_multiplier
+                # on the model entry in config.yaml.
+                _multiplier = float(model_config.get("token_estimate_multiplier", 1.0))
+                if _multiplier != 1.0:
+                    _estimated_tokens = int(_estimated_tokens * _multiplier)
                 logger.info(
                     "routing_check provider=%s model=%s cache_cold=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d messages=%d",
