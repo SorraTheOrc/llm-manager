@@ -980,3 +980,121 @@ async def test_streaming_429_does_not_block_concurrent_request(monkeypatch):
     response2 = await server.proxy_to_local(DummyRequest(), "v1/chat/completions")
     assert response2.status_code == 429  # Still 429 from upstream, but NOT 503
     assert server.active_queries == 0, "active_queries leaked after second 429"
+
+
+@pytest.mark.asyncio
+async def test_streaming_backend_error_does_not_leak_local_active_queries(monkeypatch):
+    """AC3: Simulate a backend error during streaming and verify
+    local_active_queries returns to 0."""
+
+    class DummyRequest:
+        headers = {}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/chat/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+    async def fail_call(*_args, **_kwargs):
+        raise httpx.ConnectError(
+            "connect failed", request=httpx.Request("POST", "http://test")
+        )
+
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "local_max_concurrent_queries": 1,
+                "llama_request_timeout": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(
+        server, "llama_process",
+        type("P", (), {"poll": lambda s: None, "pid": 1})(),
+    )
+    monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
+
+    response = await server.proxy_to_local(
+        DummyRequest(), "v1/chat/completions"
+    )
+
+    assert (
+        server.local_active_queries == 0
+    ), "local_active_queries leaked after streaming backend error"
+    assert (
+        server.active_queries == 0
+    ), "active_queries leaked after streaming backend error"
+
+
+@pytest.mark.asyncio
+async def test_streaming_upstream_error_does_not_leak_local_active_queries(monkeypatch):
+    """AC3: Simulate an upstream >=400 error during streaming and verify
+    local_active_queries returns to 0."""
+
+    class MockResponse:
+        status_code = 502
+        headers = {"content-type": "text/plain"}
+
+        async def aread(self):
+            return b'{"error":"upstream failed"}'
+
+    class MockCM:
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_call(*_args, **_kwargs):
+        return MockCM(), MockResponse()
+
+    class DummyRequest:
+        headers = {}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/chat/completions"})
+
+        async def body(self):
+            return b'{"model":"qwen3","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "max_concurrent_queries": 4,
+                "local_max_concurrent_queries": 1,
+                "llama_request_timeout": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "backend_ready", True)
+    monkeypatch.setattr(
+        server, "llama_process",
+        type("P", (), {"poll": lambda s: None, "pid": 1})(),
+    )
+    monkeypatch.setattr(server, "_call_with_backend_retries", mock_call)
+
+    response = await server.proxy_to_local(
+        DummyRequest(), "v1/chat/completions"
+    )
+
+    assert (
+        response.status_code == 502
+    ), f"Expected 502 upstream error, got {response.status_code}"
+    assert (
+        server.local_active_queries == 0
+    ), "local_active_queries leaked after streaming upstream error"
+    assert (
+        server.active_queries == 0
+    ), "active_queries leaked after streaming upstream error"
