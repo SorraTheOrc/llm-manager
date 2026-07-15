@@ -44,11 +44,11 @@ def _srv():
 # Progress parsing helpers
 # ---------------------------------------------------------------------------
 
-def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
-    """Extract ``n_tokens`` and ``progress`` from llama-server stdout progress lines.
+def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, int, float]]:
+    """Extract ``slot_id``, ``n_tokens`` and ``progress`` from llama-server stdout progress lines.
 
-    Returns a tuple (n_tokens: int, progress: float) or None if the line does
-    not contain valid progress data.
+    Returns a tuple (slot_id: int, n_tokens: int, progress: float) or None if the line does
+    not contain valid progress data. When slot ID is not found, defaults to 0.
     """
     if not isinstance(line, str):
         return None
@@ -60,13 +60,15 @@ def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
     if ',' not in text:
         return None
     try:
+        m_slot = re.search(r'\bslot\s+(\d+)\b', text, flags=re.IGNORECASE)
         m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
         m_progress = re.search(r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b', text, flags=re.IGNORECASE)
         if not m_tokens or not m_progress:
             return None
+        slot_id = int(m_slot.group(1)) if m_slot else 0
         n_tokens = int(m_tokens.group(1))
         progress = float(m_progress.group(1))
-        return (n_tokens, progress)
+        return (slot_id, n_tokens, progress)
     except Exception:
         return None
 
@@ -162,8 +164,18 @@ def start_slot_polling(model: str, llama_port: int, interval: float = 0.5) -> No
         t.start()
 
 
-def format_progress(n_tokens: int, total_tokens: int, progress: float) -> str:
-    """Return a formatted, ANSI-dimmed, in-place-updating progress string."""
+def format_progress(
+    n_tokens: int,
+    total_tokens: int,
+    progress: float,
+    model_name: str = "unknown",
+    slot_id: int = 0,
+    tokens_per_sec: Optional[float] = None,
+) -> str:
+    """Return a formatted, ANSI-dimmed, in-place-updating progress string.
+
+    Includes model/slot prefix and tokens-per-second rate when available.
+    """
     try:
         pct = int(max(0, min(100, int(progress * 100))))
     except Exception:
@@ -174,7 +186,14 @@ def format_progress(n_tokens: int, total_tokens: int, progress: float) -> str:
     pct = int(max(0, min(100, int(progress * 100)))) if isinstance(progress, (int, float)) else pct
     dim = "\x1b[2m"
     reset = "\x1b[0m"
-    body = f"Processing {n_tokens}/{total_tokens} tokens ({pct}%)"
+
+    # Build TPS suffix
+    if tokens_per_sec is not None:
+        tps_str = f" @ {tokens_per_sec:.1f} tok/s"
+    else:
+        tps_str = " @ --.- tok/s"
+
+    body = f"[slot:{slot_id} {model_name}] Processing {n_tokens}/{total_tokens} tokens ({pct}%){tps_str}"
     return f"\r{dim}{body}{reset}"
 
 

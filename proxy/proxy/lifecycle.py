@@ -723,8 +723,16 @@ def spawn_and_capture(
     env: dict,
     log_file,
     logger: logging.Logger,
+    model_name: str = "unknown",
 ) -> tuple:
     """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
+
+    Args:
+        cmd: Command list to execute.
+        env: Environment variables.
+        log_file: File-like object for streaming output.
+        logger: Logger instance.
+        model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
 
     Returns a tuple (Popen|None, captured_output_str|None).
     """
@@ -750,15 +758,22 @@ def spawn_and_capture(
     except subprocess.TimeoutExpired:
         try:
             if log_file and proc.stdout:
-                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file), daemon=True)
+                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file, model_name), daemon=True)
                 t.start()
         except Exception:
             pass
         return proc, None
 
 
-def _stream_output(src, dst):
-    """Stream lines from src to dst, parsing prompt progress for console display."""
+def _stream_output(src, dst, model_name: str = "unknown"):
+    """Stream lines from src to dst, parsing prompt progress for console display.
+
+    Args:
+        src: Source stream (e.g. subprocess stdout).
+        dst: Destination stream (e.g. log file).
+        model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+    """
+    first_progress_time = None
     try:
         for line in src:
             dst.write(line)
@@ -769,9 +784,25 @@ def _stream_output(src, dst):
                 if 'prompt processing' in line_str.lower():
                     parsed = extract_progress_data(line_str)
                     if parsed:
-                        n_tokens, progress = parsed
+                        slot_id, n_tokens, progress = parsed
                         total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
-                        progress_str = format_progress(n_tokens, total_tokens, progress)
+
+                        # Track elapsed time for average tokens/sec calculation
+                        now = time.monotonic()
+                        if first_progress_time is None:
+                            first_progress_time = now
+                        elapsed = now - first_progress_time
+                        if elapsed < 0.5:
+                            tokens_per_sec = None
+                        else:
+                            tokens_per_sec = n_tokens / elapsed
+
+                        progress_str = format_progress(
+                            n_tokens, total_tokens, progress,
+                            model_name=model_name,
+                            slot_id=slot_id,
+                            tokens_per_sec=tokens_per_sec,
+                        )
                         sys.stderr.write(progress_str)
                         if progress >= 0.999:
                             sys.stderr.write('\n')
@@ -876,7 +907,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
             host_cmd.append("router")
 
         srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
-        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger)
+        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger, model_name=model or "unknown")
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
@@ -893,7 +924,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger)
+       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger, model_name=model or "unknown")
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
