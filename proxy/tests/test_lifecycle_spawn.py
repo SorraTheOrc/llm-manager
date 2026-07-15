@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import importlib
 lifecycle = importlib.import_module("proxy.lifecycle")
+from proxy.handlers import format_progress
 
 
 class FakeProc:
@@ -220,3 +221,157 @@ class TestSpawnAndCapture:
 
         assert proc is not None
         # Should not crash even though proc.stdout is None
+
+
+# ---------------------------------------------------------------------------
+# Helper classes for display_name and dynamic resolution tests
+# ---------------------------------------------------------------------------
+
+
+class _DummySrv:
+    """Minimal server state for start_llama_server tests."""
+    def __init__(self, current_model=None):
+        cfg = {"server": {"llama_allow_host_fallback": True}}
+        self.config = cfg
+        self.logger = logging.getLogger("dummy")
+        self.log_dir = None
+        self.llama_log_file = None
+        self.last_start_failure = None
+        self.current_model = current_model
+        self.backend_ready = False
+        self.llama_process = None
+    def rotate_llama_logs(self, *a, **kw):
+        pass
+    def broadcast_status_sync(self, *a, **kw):
+        pass
+
+
+class _FakeProc:
+    """Fake subprocess.Popen that simulates a long-running process."""
+    def __init__(self):
+        self.returncode = None
+        self.stdout = io.StringIO()
+    def communicate(self, timeout=None):
+        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+    def poll(self):
+        return None
+    def terminate(self):
+        self.returncode = -1
+    def wait(self, timeout=None):
+        return 0
+
+
+class TestStartLlamaServerDisplayName:
+    """Tests for start_llama_server's display_name parameter."""
+
+    def test_display_name_used_for_progress(self, monkeypatch):
+        """When display_name is provided, it is used for progress display instead of model name."""
+        captured_kwargs = {}
+
+        def fake_spawn_and_capture(cmd, env, log_file, logger, model_name="unknown"):
+            captured_kwargs["model_name"] = model_name
+            return (_FakeProc(), None)
+
+        monkeypatch.setattr(lifecycle, "spawn_and_capture", fake_spawn_and_capture)
+        monkeypatch.setattr(lifecycle, "_srv", lambda: _DummySrv())
+        monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+        proc = lifecycle.start_llama_server("Qwen3-0.6B-Q4_K_M.gguf", display_name="Qwen3")
+        assert proc is not None
+        assert captured_kwargs.get("model_name") == "Qwen3", \
+            f"Expected 'Qwen3' but got {captured_kwargs.get('model_name')}"
+
+    def test_display_name_fallback_to_model(self, monkeypatch):
+        """When display_name is None, falls back to model name."""
+        captured_kwargs = {}
+
+        def fake_spawn_and_capture(cmd, env, log_file, logger, model_name="unknown"):
+            captured_kwargs["model_name"] = model_name
+            return (_FakeProc(), None)
+
+        monkeypatch.setattr(lifecycle, "spawn_and_capture", fake_spawn_and_capture)
+        monkeypatch.setattr(lifecycle, "_srv", lambda: _DummySrv(current_model="Qwen3"))
+        monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+        proc = lifecycle.start_llama_server("test-model", display_name=None)
+        assert proc is not None
+        assert captured_kwargs.get("model_name") == "test-model", \
+            f"Expected 'test-model' but got {captured_kwargs.get('model_name')}"
+
+    def test_display_name_router_mode_fallback(self, monkeypatch):
+        """In router mode with display_name=None, falls back to current_model from server state."""
+        captured_kwargs = {}
+
+        def fake_spawn_and_capture(cmd, env, log_file, logger, model_name="unknown"):
+            captured_kwargs["model_name"] = model_name
+            return (_FakeProc(), None)
+
+        monkeypatch.setattr(lifecycle, "spawn_and_capture", fake_spawn_and_capture)
+        monkeypatch.setattr(lifecycle, "_srv", lambda: _DummySrv(current_model="Qwen3"))
+        monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+        proc = lifecycle.start_llama_server(None, display_name=None)
+        assert proc is not None
+        assert captured_kwargs.get("model_name") == "Qwen3", \
+            f"Expected 'Qwen3' (from current_model) but got {captured_kwargs.get('model_name')}"
+
+    def test_display_name_router_mode_no_current_model(self, monkeypatch):
+        """In router mode with neither display_name nor current_model set, falls back to 'unknown'."""
+        captured_kwargs = {}
+
+        def fake_spawn_and_capture(cmd, env, log_file, logger, model_name="unknown"):
+            captured_kwargs["model_name"] = model_name
+            return (_FakeProc(), None)
+
+        monkeypatch.setattr(lifecycle, "spawn_and_capture", fake_spawn_and_capture)
+        monkeypatch.setattr(lifecycle, "_srv", lambda: _DummySrv(current_model=None))
+        monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+        proc = lifecycle.start_llama_server(None)
+        assert proc is not None
+        assert captured_kwargs.get("model_name") == "unknown", \
+            f"Expected 'unknown' but got {captured_kwargs.get('model_name')}"
+
+
+class TestStreamOutputDynamicModel:
+    """Tests for _stream_output's dynamic model name resolution."""
+
+    def test_dynamic_resolution_from_current_model(self, monkeypatch):
+        """When model_name is 'unknown', resolves from current_model dynamically."""
+        # Track the model_name passed to format_progress
+        captured = {}
+
+        def fake_format_progress(n_tokens, total_tokens, progress, model_name="unknown",
+                                  slot_id=0, tokens_per_sec=None):
+            captured["model_name"] = model_name
+            return f"[slot:{slot_id} {model_name}] Processing {n_tokens}/{total_tokens} tokens"
+
+        monkeypatch.setattr(lifecycle, "format_progress", fake_format_progress)
+        monkeypatch.setattr(lifecycle, "_srv", lambda: _DummySrv(current_model="Qwen3"))
+
+        src = io.StringIO("slot 1 : prompt processing progress, n_tokens = 100, progress = 0.50\n")
+        dst = io.StringIO()
+
+        lifecycle._stream_output(src, dst, model_name="unknown")
+
+        assert captured.get("model_name") == "Qwen3", \
+            f"Expected 'Qwen3' (from current_model) but got {captured.get('model_name')}"
+
+    def test_passes_through_explicit_model_name(self, monkeypatch):
+        """When model_name is not 'unknown', the provided name is used as-is."""
+        captured = {}
+
+        def fake_format_progress(n_tokens, total_tokens, progress, model_name="unknown",
+                                  slot_id=0, tokens_per_sec=None):
+            captured["model_name"] = model_name
+            return f"[slot:{slot_id} {model_name}] Processing {n_tokens}/{total_tokens} tokens"
+
+        monkeypatch.setattr(lifecycle, "format_progress", fake_format_progress)
+
+        src = io.StringIO("slot 1 : prompt processing progress, n_tokens = 100, progress = 0.50\n")
+        dst = io.StringIO()
+
+        lifecycle._stream_output(src, dst, model_name="gemma4")
+
+        assert captured.get("model_name") == "gemma4", \
+            f"Expected 'gemma4' but got {captured.get('model_name')}"

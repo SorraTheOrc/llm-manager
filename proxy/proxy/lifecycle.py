@@ -772,6 +772,8 @@ def _stream_output(src, dst, model_name: str = "unknown"):
         src: Source stream (e.g. subprocess stdout).
         dst: Destination stream (e.g. log file).
         model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+            When ``"unknown"`` (router mode with no initial model), the function
+            will dynamically look up ``srv.current_model`` from server state.
     """
     first_progress_time = None
     try:
@@ -797,9 +799,20 @@ def _stream_output(src, dst, model_name: str = "unknown"):
                         else:
                             tokens_per_sec = n_tokens / elapsed
 
+                        # Dynamically resolve model name for router mode
+                        # When model_name is "unknown", check current_model from server state
+                        resolved_name = model_name
+                        if resolved_name == "unknown":
+                            try:
+                                srv = _srv()
+                                if getattr(srv, 'current_model', None):
+                                    resolved_name = srv.current_model
+                            except Exception:
+                                pass
+
                         progress_str = format_progress(
                             n_tokens, total_tokens, progress,
-                            model_name=model_name,
+                            model_name=resolved_name,
                             slot_id=slot_id,
                             tokens_per_sec=tokens_per_sec,
                         )
@@ -813,15 +826,21 @@ def _stream_output(src, dst, model_name: str = "unknown"):
         pass
 
 
-def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
+def start_llama_server(model: Optional[str], display_name: Optional[str] = None) -> Optional[subprocess.Popen]:
     """Start the llama-server with the specified model.
 
-    Starts llama-server via the configured `llama_start_script`
-    (default: `scripts/podman_start_llama.sh`).
+    Args:
+        model: Model name for the start script command (llama model name or None for router mode).
+        display_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+            When not provided, falls back to ``model``, then ``srv.current_model``,
+            then ``"unknown"``.
+
     Returns a subprocess.Popen object when a long-running process is started,
     or None when startup failed after retries.
     """
     srv = _srv()
+    # Resolve the display name for progress output
+    _display = display_name or model or getattr(srv, 'current_model', None) or "unknown"
 
     server_config = srv.config.get("server", {})
     # Default to the repository root `start-llama.sh` if not specified in srv.config
@@ -907,7 +926,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
             host_cmd.append("router")
 
         srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
-        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger, model_name=model or "unknown")
+        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
@@ -924,7 +943,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger, model_name=model or "unknown")
+       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
@@ -1214,10 +1233,10 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            if router_mode:
                if srv.llama_process is None or srv.llama_process.poll() is not None:
                    try:
-                       srv.llama_process = srv.start_llama_server(None)
+                       srv.llama_process = srv.start_llama_server(None, display_name=requested_model)
                    except TypeError:
                        # Backwards-compatible call for older test monkeypatches
-                       srv.llama_process = srv.start_llama_server(None)
+                       srv.llama_process = srv.start_llama_server(None, display_name=requested_model)
 
                    if srv.llama_process is None:
                        srv.logger.error("start_llama_server failed to spawn router process")
@@ -1280,9 +1299,9 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
            # Start llama-server via the configured start script
            try:
-               srv.llama_process = srv.start_llama_server(llama_model)
+               srv.llama_process = srv.start_llama_server(llama_model, display_name=requested_model)
            except TypeError:
-               srv.llama_process = srv.start_llama_server(llama_model)
+               srv.llama_process = srv.start_llama_server(llama_model, display_name=requested_model)
 
            # If starting the process failed immediately (start_llama_server returns None),
            # fail fast instead of waiting the full timeout. start_llama_server already
