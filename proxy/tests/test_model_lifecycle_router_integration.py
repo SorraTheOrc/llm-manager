@@ -8,6 +8,27 @@ import proxy.server as server
 pytestmark = pytest.mark.refactor_parity
 
 
+@pytest.fixture(autouse=True)
+def reset_server_state(monkeypatch):
+    """Reset mutable global server state between tests.
+
+    Prevents test-ordering pollution from preceding tests that directly
+    modify shared module-level state (e.g. current_model, llama_process)
+    without restoring it.
+    """
+    monkeypatch.setattr(server, 'background_loads', {})
+    monkeypatch.setattr(server, 'model_last_used', {})
+    monkeypatch.setattr(server, 'llama_process', None)
+    server.current_model = None
+    server.last_start_failure = None
+    server.backend_ready = False
+    try:
+        server.model_switch_refcount = 0
+    except Exception:
+        pass
+    yield
+
+
 @pytest.mark.asyncio
 @pytest.mark.slow
 async def test_stub_router_integration(monkeypatch):
@@ -82,3 +103,21 @@ async def test_stub_router_integration(monkeypatch):
     assert ok is True
     assert server.current_model == 'mxbai-embed'
     assert 'mxbai-embed' in loaded
+
+
+@pytest.mark.asyncio
+async def test_stub_router_fixture_resets_polluted_state(monkeypatch):
+    """Regression test: verify the reset_server_state fixture handles polluted state.
+
+    Even when preceding tests (e.g. test_switching_sse.py, test_alias_plan_code_integration)
+    leave shared server state dirty, the autouse fixture restores it so
+    ensure_model_loaded works reliably.
+    """
+    from proxy import server as srv
+
+    # Verify fixture reset server_state already cleared these.
+    # Without the fixture, these would be polluted by preceding tests.
+    assert srv.current_model is None
+    assert srv.llama_process is None
+    assert srv.last_start_failure is None
+    assert srv.backend_ready is False
