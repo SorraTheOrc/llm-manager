@@ -613,6 +613,32 @@ def _startup_start_dispatch_cleanup():
             logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
 
 
+def _startup_start_scheduler():
+    """Initialize and start the JobScheduler background timeout check.
+
+    The JobScheduler's ``_periodic_timeout_check`` task (runs every 10s)
+    releases scheduler slots that have been idle longer than
+    ``slot_job_timeout_seconds``.  Without this task, slots transition to
+    ``Owned`` when a job is admitted but never return to ``Idle``,
+    permanently exhausting the scheduler pool and causing all subsequent
+    local dispatch attempts to fall through to remote providers with
+    ``slot_busy_skip_queue``.
+    """
+    try:
+        from proxy.router import _get_job_scheduler
+        scheduler = _get_job_scheduler()
+        if scheduler is not None:
+            loop = asyncio.get_running_loop()
+            loop.create_task(scheduler.start())
+            logger.info(
+                "scheduler timeout check started pool_size=%s job_timeout=%s",
+                len(scheduler.slots),
+                scheduler.job_timeout,
+            )
+    except Exception as e:
+        logger.warning(f"scheduler start failed: {e}")
+
+
 def _startup_register_session_routes(app):
     """Register session recording admin routes on the FastAPI app.
 
@@ -717,6 +743,7 @@ async def lifespan(app: FastAPI):
     _startup_launch_persistence_tasks()
     _startup_start_session_cleanup()
     _startup_start_dispatch_cleanup()
+    _startup_start_scheduler()
     _startup_register_session_routes(app)
 
     yield
