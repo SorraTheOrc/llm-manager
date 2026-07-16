@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import HTTPException, Response
@@ -99,34 +99,59 @@ _model_cache_cold_uninitialized: bool = True
 # Populated by initialize_cache_cold_from_config at startup.
 _model_cache_cold: set[str] = set()
 
+# Per-session cache-cold state: (model_name, session_id) -> cold (True) / warm (False).
+# When a session has no entry, it defaults to cold (conservative).
+# This provides per-session isolation so that cache warmth from one session
+# does not affect bypass decisions for other sessions (LP-0MRMMBZ7T007ER59).
+_session_cache_cold: dict[Tuple[str, str], bool] = {}
+
 def _cache_cold_initialized() -> None:
     """Mark the cache-cold state as fully initialized."""
     global _model_cache_cold_uninitialized
     _model_cache_cold_uninitialized = False
 
-def mark_model_cache_cold(model_name: str) -> None:
+def mark_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> None:
     """Mark a model's slot cache as invalidated (cold).
 
-    This causes large-context requests for this model to skip local routing
-    and fall through to the next remote provider in the chain.
+    When *session_id* is provided, only that session's cache for this model
+    is marked as cold (per-session isolation). Otherwise, the model-level
+    fallback is used.
+
+    This causes large-context requests for this model/session to skip local
+    routing and fall through to the next remote provider in the chain.
     """
-    if model_name:
+    if session_id:
+        _session_cache_cold[(model_name, session_id)] = True
+    elif model_name:
         _model_cache_cold.add(model_name)
 
-def clear_model_cache_cold(model_name: str) -> None:
-    """Clear a model's cache-cold flag, restoring normal local routing."""
-    if model_name:
+def clear_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> None:
+    """Clear a model's cache-cold flag, restoring normal local routing.
+
+    When *session_id* is provided, only that session's cache for this model
+    is cleared (per-session isolation). The session is explicitly marked warm.
+    Otherwise, the model-level fallback is used.
+    """
+    if session_id:
+        _session_cache_cold[(model_name, session_id)] = False
+    elif model_name:
         _model_cache_cold.discard(model_name)
 
-def is_model_cache_cold(model_name: str) -> bool:
+def is_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> bool:
     """Check if a model's slot cache is currently marked as cold.
+
+    When *session_id* is provided, checks session-level state first.
+    If no session-level entry exists, the session is considered cold
+    (conservative default).
+    Without *session_id*, falls back to model-level state.
 
     Before initialize_cache_cold_from_config has been called, ALL models are
     assumed cold to prevent a race between proxy process restarts.
-    After initialization, returns True only for explicitly-cold models.
     """
     if _model_cache_cold_uninitialized:
         return bool(model_name)
+    if session_id:
+        return _session_cache_cold.get((model_name, session_id), True)
     return model_name in _model_cache_cold if model_name else False
 
 
@@ -164,6 +189,16 @@ def initialize_cache_cold_from_config(config: dict) -> None:
         sorted(_model_cache_cold) if _model_cache_cold else "(none)",
         _model_cache_cold_uninitialized,
     )
+
+
+def on_slot_save_success(model_name: str, session_id: str) -> None:
+    """Called by router.py after a successful slot save.
+
+    Marks the (model, session_id) pair as warm so that subsequent
+    bypass decisions use the warm threshold for this session.
+    """
+    if model_name and session_id:
+        clear_model_cache_cold(model_name, session_id)
 
 
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
@@ -957,14 +992,26 @@ async def _release_session_slot_for_cache_cold_bypass(
         pass
 
     # Mark the model's cache as cold so subsequent large-context
-    # requests also bypass local (LP-0MRCSSBTM002NK3B)
-    if llama_model and not is_model_cache_cold(llama_model):
-        mark_model_cache_cold(llama_model)
+    # requests also bypass local (LP-0MRCSSBTM002NK3B).
+    # Use session-level marking when session_id is available (LP-0MRMMBZ7T007ER59).
+    # Also mark model-level for backward compatibility (conservative fallback).
+    if llama_model:
+        mark_model_cache_cold(llama_model, session_id=session_id)
         _log.info(
-            "model_cache_marked_cold model=%s reason=%s",
+            "session_cache_marked_cold model=%s session=%s reason=%s",
             llama_model,
+            session_id[:8] if session_id else "none",
             fallback_reason,
         )
+        # Also mark model-level so that sessions without session_id
+        # still benefit from conservative cold-cache bypass
+        if not is_model_cache_cold(llama_model):
+            mark_model_cache_cold(llama_model)
+            _log.info(
+                "model_cache_marked_cold model=%s reason=%s (bypass)",
+                llama_model,
+                fallback_reason,
+            )
 
 
 def _parse_slot_exhaustion(response):
@@ -1680,6 +1727,14 @@ async def proxy_with_fallback(
     except Exception:
         body_json = {}
 
+    # Resolve session_id for per-session cache state tracking (LP-0MRMMBZ7T007ER59)
+    _session_id: Optional[str] = None
+    try:
+        from proxy.session import _resolve_session_id_header
+        _session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
+    except Exception:
+        pass
+
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: List[Dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
@@ -1754,7 +1809,7 @@ async def proxy_with_fallback(
                 _llama_model = provider_cfg.get("llama_model", "")
                 _cold_threshold = _get_large_context_cold_cache_threshold(config)
                 _warm_threshold = _get_large_context_warm_cache_threshold(config)
-                _cache_is_cold = is_model_cache_cold(_llama_model)
+                _cache_is_cold = is_model_cache_cold(_llama_model, session_id=_session_id)
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,
@@ -1849,9 +1904,13 @@ async def proxy_with_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
-                # LP-0MRDE669Y003V1SO: On successful local response, mark
-                # cache as warm so subsequent requests route locally.
-                if provider_type == "local":
+                # LP-0MRDE669Y003V1SO + LP-0MRMMBZ7T007ER59: On successful
+                # local streaming response, mark cache as warm.
+                # When session_id is available, per-session warming is deferred
+                # to router.py which fires after the actual slot-save succeeds
+                # (slot save must complete before cache is considered warm).
+                # When no session_id, use model-level fallback (existing behavior).
+                if provider_type == "local" and not _session_id:
                     try:
                         clear_model_cache_cold(_llama_model)
                     except Exception:
@@ -2174,11 +2233,12 @@ async def proxy_with_fallback(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
-            # LP-0MRDE669Y003V1SO: On successful local response, mark cache
-            # as warm so subsequent requests route locally.
+            # LP-0MRDE669Y003V1SO + LP-0MRMMBZ7T007ER59: On successful local
+            # non-streaming response, mark cache as warm.
+            # Pass session_id for per-session isolation when available.
             if provider_type == "local":
                 try:
-                    clear_model_cache_cold(_llama_model)
+                    clear_model_cache_cold(_llama_model, session_id=_session_id)
                 except Exception:
                     pass
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension

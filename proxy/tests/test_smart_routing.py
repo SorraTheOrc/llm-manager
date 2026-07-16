@@ -63,6 +63,113 @@ class TestModelCacheColdTracking:
         assert is_model_cache_cold("gemma4") is False
 
 
+class TestSessionCacheColdTracking:
+    """Tests for per-session cache cold tracking.
+
+    Each session has its own cache-cold state per model, independent of
+    other sessions and of the model-level fallback.
+    """
+
+    def setup_method(self):
+        _cache_cold_initialized()
+        _model_cache_cold.clear()
+        # Clear session-level state
+        from proxy.provider import _session_cache_cold
+        _session_cache_cold.clear()
+
+    def test_session_new_is_cold_by_default(self):
+        """AC 1: A new session (no entry) is cold by default."""
+        assert is_model_cache_cold("Qwen3", session_id="sess_new") is True
+
+    def test_session_warm_after_clear(self):
+        """AC 2: Clearing cache cold for a session makes it warm."""
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False
+
+    def test_session_mark_cold(self):
+        """Marking a session cold is reflected in is_model_cache_cold."""
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False
+        mark_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is True
+
+    def test_per_session_isolation_different_sessions(self):
+        """AC 2: Two sessions on the same model are independent."""
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is True  # cold by default
+        assert is_model_cache_cold("Qwen3", session_id="sess_b") is True  # cold by default
+
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False  # warm
+        assert is_model_cache_cold("Qwen3", session_id="sess_b") is True   # still cold
+
+    def test_per_session_isolation_different_models(self):
+        """Session state is tracked per (model, session) pair."""
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False   # warm
+        # Same session, different model
+        assert is_model_cache_cold("gemma4", session_id="sess_a") is True   # cold
+
+    def test_session_fallback_to_model_level_without_session_id(self):
+        """Without session_id, model-level fallback is used."""
+        mark_model_cache_cold("Qwen3")
+        assert is_model_cache_cold("Qwen3") is True
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is True  # new session still cold
+        clear_model_cache_cold("Qwen3")
+        assert is_model_cache_cold("Qwen3") is False
+        # New session still defaults to cold even when model-level is warm
+        assert is_model_cache_cold("Qwen3", session_id="sess_b") is True
+
+    def test_clear_without_session_id_uses_model_level(self):
+        """clear_model_cache_cold without session_id clears model-level only."""
+        mark_model_cache_cold("Qwen3")
+        clear_model_cache_cold("Qwen3")
+        assert is_model_cache_cold("Qwen3") is False
+
+    def test_mark_without_session_id_uses_model_level(self):
+        """mark_model_cache_cold without session_id marks model-level only."""
+        mark_model_cache_cold("Qwen3")
+        assert is_model_cache_cold("Qwen3") is True
+        # Session should still be cold by default
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is True
+
+    def test_clear_session_does_not_affect_model_level(self):
+        """Clearing a session's cache should not affect model-level state."""
+        mark_model_cache_cold("Qwen3")
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        # Session is warm
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False
+        # Model-level is still cold
+        assert is_model_cache_cold("Qwen3") is True
+
+    def test_mark_session_does_not_affect_model_level(self):
+        """Marking a session cold should not affect model-level state."""
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False  # warm
+        # Model-level remains unchanged (no entry)
+        assert is_model_cache_cold("Qwen3") is False
+
+    def test_mixed_sessions_warm_and_cold(self):
+        """AC: Mixed warm and cold sessions get correct thresholds independently."""
+        # Session A: warm (cleared)
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        # Session B: cold (default)
+        # Session C: cold (default)
+
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False   # warm
+        assert is_model_cache_cold("Qwen3", session_id="sess_b") is True    # cold
+        assert is_model_cache_cold("Qwen3", session_id="sess_c") is True    # cold
+
+    def test_slot_eviction_resets_to_cold(self):
+        """AC 3: After invalidation (slot eviction), session returns to cold."""
+        # Start warm
+        clear_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is False
+
+        # Slot evicted - mark cold
+        mark_model_cache_cold("Qwen3", session_id="sess_a")
+        assert is_model_cache_cold("Qwen3", session_id="sess_a") is True
+
+
 class TestEstimatePromptTokensForRouting:
     """Tests for _estimate_prompt_tokens_for_routing function."""
 

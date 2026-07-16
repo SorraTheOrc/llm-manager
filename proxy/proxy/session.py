@@ -698,14 +698,17 @@ async def _invalidate_session_and_slot(
     # Mark the model's cache as cold for smart routing (LP-0MRCSSBTM002NK3B).
     # When cache is invalidated, large-context requests should be routed to
     # remote fallback instead of attempting expensive full re-prefill.
+    # Per-session tracking: pass session_id for session-level isolation
+    # (LP-0MRMMBZ7T007ER59).
     try:
         srv = _srv()
         if srv.current_model:
             from proxy.provider import mark_model_cache_cold
-            mark_model_cache_cold(srv.current_model)
+            mark_model_cache_cold(srv.current_model, session_id=session_id)
             srv.logger.info(
-                "model_cache_marked_cold model=%s reason=%s",
+                "session_cache_marked_cold model=%s session=%s reason=%s",
                 srv.current_model,
+                session_id[:8] if session_id else "none",
                 reason or "invalidation",
             )
     except Exception:
