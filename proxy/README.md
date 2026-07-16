@@ -1148,6 +1148,12 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 
 - **KV cache ownership**: The proxy never stores or mutates KV tensors; llama-server owns the cache. The proxy only passes session metadata and deltas so llama-server can restore/cache internally.
 - **Editing earlier messages invalidates the KV cache**: If a client modifies any earlier message in the conversation, the proxy detects the mismatch and falls back to sending the full history, invalidating the previous session and creating a new one.
+- **Cache-aware large-context routing**: The proxy tracks KV cache warmth per-session
+  (not just per-model) to avoid expensive full re-prefill when a session's backend
+  slot has been evicted or reassigned. New sessions default to **cold** (bypass
+  threshold: 30K tokens by default); sessions with confirmed cache persistence are
+  **warm** (bypass threshold: 100K tokens). See
+  [Large-Context Routing](#large-context-routing-cache-aware-bypass) for details.
 - **Context window limits**: llama-server's KV cache has finite capacity. The Qwen3 model is configured with a **128k (131,072) token context window**. Very long conversations may exceed this limit. The context window size is set in [`models.ini`](../models.ini) (router mode) and [`proxy/scripts/start-proxy.sh`](proxy/scripts/start-proxy.sh) (single-model mode).
 
   > **Resource note**: A 128k context window increases RAM usage for llama-server. On GPU with 64 GB+ VRAM, running Qwen3.6-35B-A3B at 128k context is feasible but may require disabling mmap (`--no-mmap`) and using an appropriate quantization (Q5_K_M or lower). For hosts with less memory, consider reducing the context size or switching to a smaller model. The canonical size can be adjusted by changing `ctx-size` in `models.ini` and `CONTEXT` in `start-llama.sh`.
@@ -1264,6 +1270,56 @@ Important fields:
 - `guardrail_metrics` (cutoff + invalidation counters)
 - `backend_ready`
 - `backend_signals`
+
+### Large-Context Routing (Cache-Aware Bypass)
+
+The proxy uses a **dual-threshold** large-context routing mechanism to decide
+whether a local provider should be skipped in favor of a remote fallback. This
+avoids expensive full re-prefill of large prompts when the backend KV cache is
+cold (invalidated or uninitialized).
+
+#### Cache State
+
+Cache state is tracked **per-session** so that one session's warm cache does not
+contaminate another session's routing decisions:
+
+- **Cold** — The session's backend KV slot is invalidated or has never been
+  populated. Large-context requests bypass local at the **cold threshold**
+  (default: 30K tokens, configurable via
+  `local_large_context_cold_cache_threshold`).
+- **Warm** — The session has confirmed cache persistence. Large-context requests
+  bypass local only at the **warm threshold** (default: 100K tokens,
+  configurable via `local_large_context_warm_cache_threshold`).
+- **No session ID** — Falls back to model-level cache state (conservative).
+  Sessions without a session_id header default to the same cold behavior.
+
+#### Lifecycle
+
+| Event | Cache Effect |
+|-------|-------------|
+| New session (no prior activity) | Cold by default — uses cold threshold |
+| Successful slot save after a local response | Session becomes warm — uses warm threshold |
+| Slot eviction or session invalidation | Session resets to cold — uses cold threshold |
+| Proxy restart | All sessions cold (model-level re-initialized from config) |
+
+Cache-warm marking is tied to **slot-save success** (not just any HTTP response
+success). A response that does not save the slot (e.g., slot persistence
+disabled, non-streaming proxy-only mode) does **not** warm the cache.
+
+#### Configuration
+
+```yaml
+local_large_context_cold_cache_threshold: 30000   # tokens; 0 = disable cold bypass
+local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
+```
+
+When a threshold is set to `0`, the corresponding bypass is disabled entirely.
+
+#### Related Headers
+
+When the proxy bypasses local due to cache state, the response includes:
+- `X-Session-Fallback-Reason: cache_cold_large_context` — logged when a
+  cold/warm cache causes a local bypass.
 
 ### Single-flight + guardrails
 
