@@ -92,7 +92,7 @@ def mock_srv(monkeypatch, mock_config):
 
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, "start_llama_server", lambda model: fake_proc)
+    monkeypatch.setattr(server, "start_llama_server", lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, "wait_for_llama_server", AsyncMock(return_value=True))
     monkeypatch.setattr(server, "router_load_model", AsyncMock(return_value=True))
     monkeypatch.setattr(server, "router_wait_for_model", AsyncMock(return_value=True))

@@ -67,7 +67,7 @@ async def test_stub_router_integration(monkeypatch):
     # Simulate starting a router-mode llama-server process
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
 
     # Ensure initial state

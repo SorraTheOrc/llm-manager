@@ -1236,7 +1236,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                        srv.llama_process = srv.start_llama_server(None, display_name=requested_model)
                    except TypeError:
                        # Backwards-compatible call for older test monkeypatches
-                       srv.llama_process = srv.start_llama_server(None, display_name=requested_model)
+                       srv.llama_process = srv.start_llama_server(None)
 
                    if srv.llama_process is None:
                        srv.logger.error("start_llama_server failed to spawn router process")
@@ -1301,7 +1301,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            try:
                srv.llama_process = srv.start_llama_server(llama_model, display_name=requested_model)
            except TypeError:
-               srv.llama_process = srv.start_llama_server(llama_model, display_name=requested_model)
+               srv.llama_process = srv.start_llama_server(llama_model)
 
            # If starting the process failed immediately (start_llama_server returns None),
            # fail fast instead of waiting the full timeout. start_llama_server already

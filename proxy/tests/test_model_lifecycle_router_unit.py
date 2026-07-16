@@ -74,7 +74,7 @@ async def test_ensure_model_loaded_router_success(monkeypatch, mock_config):
 
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
     monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=True))
     monkeypatch.setattr(server, 'router_wait_for_model', AsyncMock(return_value=True))
@@ -145,7 +145,7 @@ async def test_failed_load_leaves_stable_error_state(monkeypatch, mock_config):
 
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
     monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=False))
 
@@ -172,7 +172,7 @@ async def test_ensure_model_loaded_refcount_and_loading_state(monkeypatch, mock_
 
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
     monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=True))
 
@@ -262,7 +262,7 @@ async def test_stop_server_and_background_load_clears_background_and_refcount(mo
     # Prepare deterministic router loading but block until we release
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
     monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=True))
 
@@ -363,7 +363,7 @@ async def test_background_load_failure_clears_background_and_decrements_refcount
 
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
     # Simulate router load failure
     monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=False))
@@ -408,7 +408,7 @@ async def test_background_load_failure_retains_previous_model_and_clears_markers
 
     fake_proc = MagicMock()
     fake_proc.poll.return_value = None
-    monkeypatch.setattr(server, 'start_llama_server', lambda model: fake_proc)
+    monkeypatch.setattr(server, 'start_llama_server', lambda model, **kwargs: fake_proc)
     monkeypatch.setattr(server, 'wait_for_llama_server', AsyncMock(return_value=True))
     # Simulate router load failure
     monkeypatch.setattr(server, 'router_load_model', AsyncMock(return_value=False))
