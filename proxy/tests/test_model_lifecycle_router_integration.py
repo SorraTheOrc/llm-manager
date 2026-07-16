@@ -19,6 +19,8 @@ def reset_server_state(monkeypatch):
     monkeypatch.setattr(server, 'background_loads', {})
     monkeypatch.setattr(server, 'model_last_used', {})
     monkeypatch.setattr(server, 'llama_process', None)
+    monkeypatch.setattr(server, '_http_client', None)
+    monkeypatch.setattr(server, '_remote_http_client', None)
     server.current_model = None
     server.last_start_failure = None
     server.backend_ready = False
@@ -115,9 +117,11 @@ async def test_stub_router_fixture_resets_polluted_state(monkeypatch):
     """
     from proxy import server as srv
 
-    # Verify fixture reset server_state already cleared these.
+    # Verify fixture reset_server_state already cleared these.
     # Without the fixture, these would be polluted by preceding tests.
     assert srv.current_model is None
     assert srv.llama_process is None
     assert srv.last_start_failure is None
     assert srv.backend_ready is False
+    assert srv._http_client is None
+    assert srv._remote_http_client is None
