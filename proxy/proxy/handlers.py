@@ -172,20 +172,16 @@ def format_progress(
     slot_id: int = 0,
     tokens_per_sec: Optional[float] = None,
 ) -> str:
-    """Return a formatted, ANSI-dimmed, in-place-updating progress string.
+    """Return a clean, log-friendly progress string without terminal control characters.
 
     Includes model/slot prefix and tokens-per-second rate when available.
+    Output is suitable for logging via the Python logging system (no ANSI
+    escape codes, no carriage returns).
     """
     try:
         pct = int(max(0, min(100, int(progress * 100))))
     except Exception:
-        try:
-            pct = int(max(0, min(100, int(float(progress) * 100))))
-        except Exception:
-            pct = 0
-    pct = int(max(0, min(100, int(progress * 100)))) if isinstance(progress, (int, float)) else pct
-    dim = "\x1b[2m"
-    reset = "\x1b[0m"
+        pct = 0
 
     # Build TPS suffix
     if tokens_per_sec is not None:
@@ -193,8 +189,7 @@ def format_progress(
     else:
         tps_str = " @ --.- tok/s"
 
-    body = f"[slot:{slot_id} {model_name}] Processing {n_tokens}/{total_tokens} tokens ({pct}%){tps_str}"
-    return f"\r{dim}{body}{reset}"
+    return f"[slot:{slot_id} {model_name}] Processing {n_tokens}/{total_tokens} tokens ({pct}%){tps_str}"
 
 
 # ---------------------------------------------------------------------------

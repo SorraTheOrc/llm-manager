@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -758,15 +757,23 @@ def spawn_and_capture(
     except subprocess.TimeoutExpired:
         try:
             if log_file and proc.stdout:
-                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file, model_name), daemon=True)
+                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file, model_name, logger), daemon=True)
                 t.start()
         except Exception:
             pass
         return proc, None
 
 
-def _stream_output(src, dst, model_name: str = "unknown"):
-    """Stream lines from src to dst, parsing prompt progress for console display.
+def _stream_output(src, dst, model_name: str = "unknown", logger: Optional[logging.Logger] = None):
+    """Stream lines from src to dst, logging prompt progress as timestamped INFO entries.
+
+    Instead of writing progress updates to stderr with carriage-return overwrites,
+    this function logs clean progress entries via the Python logging system at
+    each 10% progress milestone (10%, 20%, …, 100%) per slot.
+
+    Per-slot progress thresholds are tracked in-memory so each slot independently
+    triggers log entries only when crossing a new 10% boundary.  The state is
+    scoped to the lifetime of this thread (one per llama-server process).
 
     Args:
         src: Source stream (e.g. subprocess stdout).
@@ -774,13 +781,19 @@ def _stream_output(src, dst, model_name: str = "unknown"):
         model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
             When ``"unknown"`` (router mode with no initial model), the function
             will dynamically look up ``srv.current_model`` from server state.
+        logger: Logger instance for progress entries.  If ``None``, progress
+            entries are silently skipped (no-op).
     """
+    # Per-slot progress threshold tracking.
+    # Maps slot_id -> last logged 10%-bucket index (0-10, where 0 = 0%, 10 = 100%).
+    # A slot not in the dict has never been logged.
+    _last_logged_pct: Dict[int, int] = {}
     first_progress_time = None
     try:
         for line in src:
             dst.write(line)
             dst.flush()
-            # Display prompt processing progress to console
+            # Parse and log prompt processing progress
             try:
                 line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
                 if 'prompt processing' in line_str.lower():
@@ -800,7 +813,6 @@ def _stream_output(src, dst, model_name: str = "unknown"):
                             tokens_per_sec = n_tokens / elapsed
 
                         # Dynamically resolve model name for router mode
-                        # When model_name is "unknown", check current_model from server state
                         resolved_name = model_name
                         if resolved_name == "unknown":
                             try:
@@ -816,10 +828,27 @@ def _stream_output(src, dst, model_name: str = "unknown"):
                             slot_id=slot_id,
                             tokens_per_sec=tokens_per_sec,
                         )
-                        sys.stderr.write(progress_str)
-                        if progress >= 0.999:
-                            sys.stderr.write('\n')
-                        sys.stderr.flush()
+
+                        # Threshold-based logging: log at start, at each 10%
+                        # milestone, and at completion (progress >= 1.0).
+                        current_threshold = int(min(progress, 1.0) * 10)
+                        last = _last_logged_pct.get(slot_id)
+
+                        if last is None:
+                            # First progress data for this slot — always log.
+                            _last_logged_pct[slot_id] = current_threshold
+                            if logger:
+                                logger.info(progress_str)
+                        elif current_threshold > last:
+                            # Crossed a new 10% boundary.
+                            _last_logged_pct[slot_id] = current_threshold
+                            if logger:
+                                logger.info(progress_str)
+                        elif progress >= 1.0 and last < 10:
+                            # Final milestone (progress >= 100%) — ensure logged.
+                            _last_logged_pct[slot_id] = 10
+                            if logger:
+                                logger.info(progress_str)
             except Exception:
                 pass
     except Exception:
