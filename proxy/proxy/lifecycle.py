@@ -1316,6 +1316,19 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    metrics.record_model_loaded(llama_model)
                except Exception:
                    pass
+
+               # Mark the model's slot cache as warm so large-context
+               # requests do not bypass local routing (LP-0MRE4NBQ5009V5BX).
+               try:
+                   from proxy.provider import clear_model_cache_cold
+                   clear_model_cache_cold(llama_model)
+                   srv.logger.info(
+                       "cache_warmed model=%s reason=model_loaded",
+                       llama_model,
+                   )
+               except Exception:
+                   srv.logger.debug("clear_model_cache_cold failed", exc_info=True)
+
                await srv.broadcast_status("ready", {
                    "current_model": llama_model,
                    "llama_server_running": True

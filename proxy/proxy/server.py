@@ -497,6 +497,23 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                         logger.info(f"Router preload complete: {router_preload_list}")
                         if resolved:
                             current_model = resolved[0]
+
+                        # Mark all preloaded models' slot caches as warm so
+                        # large-context requests do not bypass local routing.
+                        try:
+                            from proxy.provider import clear_model_cache_cold
+                            for _model in resolved:
+                                clear_model_cache_cold(_model)
+                            logger.info(
+                                "cache_warmed models=%s reason=router_preload",
+                                resolved,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "clear_model_cache_cold failed during preload",
+                                exc_info=True,
+                            )
+
                     return
 
                 if await ensure_model_loaded(default_model):
