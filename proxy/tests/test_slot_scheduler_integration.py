@@ -39,11 +39,13 @@ def reset_scheduler_globals():
 def mock_server_config():
     """Create a mock server config with slot_management enabled."""
     return {
-        "slot_management": {
-            "slot_pool_size": 4,
-            "slot_queue_max_depth": 16,
-            "slot_job_timeout_seconds": 300.0,
-            "slot_queue_overflow_retry_after": 900,
+        "server": {
+            "slot_management": {
+                "slot_pool_size": 4,
+                "slot_queue_max_depth": 16,
+                "slot_job_timeout_seconds": 300.0,
+                "slot_queue_overflow_retry_after": 900,
+            }
         }
     }
 
@@ -73,7 +75,7 @@ class TestSchedulerInit:
         monkeypatch.setattr(
             "proxy.router._srv",
             lambda: type("Srv", (), {
-                "config": {"slot_management": {}},
+                "config": {"server": {"slot_management": {}}},
                 "logger": MagicMock(),
             })()
         )
@@ -85,7 +87,7 @@ class TestSchedulerInit:
         monkeypatch.setattr(
             "proxy.router._srv",
             lambda: type("Srv", (), {
-                "config": {"slot_management": {"slot_pool_size": 0}},
+                "config": {"server": {"slot_management": {"slot_pool_size": 0}}},
                 "logger": MagicMock(),
             })()
         )
@@ -98,11 +100,13 @@ class TestSchedulerInit:
             "proxy.router._srv",
             lambda: type("Srv", (), {
                 "config": {
-                    "slot_management": {
-                        "slot_pool_size": 4,
-                        "slot_queue_max_depth": 16,
-                        "slot_job_timeout_seconds": 300.0,
-                        "slot_queue_overflow_retry_after": 900,
+                    "server": {
+                        "slot_management": {
+                            "slot_pool_size": 4,
+                            "slot_queue_max_depth": 16,
+                            "slot_job_timeout_seconds": 300.0,
+                            "slot_queue_overflow_retry_after": 900,
+                        }
                     }
                 }
             })()
@@ -140,7 +144,7 @@ class TestSchedulerInit:
 
         mock_srv = MagicMock()
         mock_srv.config = {
-            "slot_management": {"slot_pool_size": 0},
+            "server": {"slot_management": {"slot_pool_size": 0}},
         }
         mock_srv.logger = MagicMock()
 
@@ -161,11 +165,13 @@ class TestSchedulerInit:
             "proxy.router._srv",
             lambda: type("Srv", (), {
                 "config": {
-                    "slot_management": {
-                        "slot_pool_size": 2,
-                        "slot_queue_max_depth": 5,
-                        "slot_job_timeout_seconds": 60.0,
-                        "slot_queue_overflow_retry_after": 900,
+                    "server": {
+                        "slot_management": {
+                            "slot_pool_size": 2,
+                            "slot_queue_max_depth": 5,
+                            "slot_job_timeout_seconds": 60.0,
+                            "slot_queue_overflow_retry_after": 900,
+                        }
                     }
                 }
             })()

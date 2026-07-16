@@ -118,7 +118,8 @@ def _get_job_scheduler() -> Optional[JobScheduler]:
 
     _job_scheduler_initialized = True
     srv = _srv()
-    slot_config = srv.config.get("slot_management", {})
+    server_config = srv.config.get("server", {})
+    slot_config = server_config.get("slot_management", {})
     if not slot_config:
         srv.logger.info(
             "scheduler not initialized: slot_management config missing, "
