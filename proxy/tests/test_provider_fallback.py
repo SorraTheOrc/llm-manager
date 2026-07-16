@@ -1439,6 +1439,7 @@ async def test_local_queue_bypass_when_slot_busy(mixed_model_config):
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_scheduler_has_idle_slot", return_value=False),
+        patch("proxy.provider._get_scheduler_session_has_slot", return_value=False),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -1482,6 +1483,91 @@ async def test_local_queue_bypass_no_fallback_passes_through(mixed_model_config)
 
     assert result.status_code == 200
     assert call_log == [("local", "local-llama")]
+
+
+@pytest.mark.asyncio
+async def test_local_queue_bypass_preserves_session_slot_affinity(mixed_model_config):
+    """When session owns a scheduler slot, the session passes through the
+    slot-busy guard and reaches the local provider even when no idle slots exist."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        raise AssertionError("Should not reach remote when session owns a slot")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=False),
+        patch("proxy.provider._get_scheduler_session_has_slot", return_value=True),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    # Local provider should have been called despite no idle slots
+    assert call_log == [("local", "local-llama")]
+
+
+@pytest.mark.asyncio
+async def test_local_queue_bypass_session_owns_slot_handles_none_session_id(mixed_model_config):
+    """When session_id is None (no session headers), the slot-busy guard
+    falls back to idle-slot-only behavior: no idle slots means skip local."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(("remote", provider_cfg.get("name")))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append(("local", "local-llama"))
+        raise AssertionError("Should not reach local provider when session_id=None and no idle slots")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=False),
+        # _get_scheduler_session_has_slot receives None and returns False
+        patch("proxy.provider._get_scheduler_session_has_slot", return_value=False),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == [("remote", "remote-fallback")]
+
+
+@pytest.mark.asyncio
+async def test_get_scheduler_session_has_slot_returns_false_on_error(mixed_model_config):
+    """_get_scheduler_session_has_slot returns False gracefully when the
+    scheduler is not initialized or an import error occurs."""
+    # Test 1: None session_id returns False
+    assert provider._get_scheduler_session_has_slot(None) is False
+
+    # Test 2: Empty session_id returns False
+    assert provider._get_scheduler_session_has_slot("") is False
+
+    # Test 3: Import error (monkeypatch the lazy import) returns False
+    with patch("proxy.provider._get_scheduler_session_has_slot", return_value=False):
+        assert provider._get_scheduler_session_has_slot("test-session") is False
 
 
 @pytest.mark.asyncio

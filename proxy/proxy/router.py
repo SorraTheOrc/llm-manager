@@ -166,6 +166,26 @@ def _scheduler_has_idle_slot() -> bool:
     return scheduler.has_idle_slot()
 
 
+def _scheduler_session_has_slot(session_id: str) -> bool:
+    """
+    Check whether a session already owns a scheduler slot.
+
+    A session that owns a slot can re-enter it via ``reenter_job`` even when
+    no idle slots exist. This is used to avoid incorrectly skipping the local
+    provider during the slot-save window between requests
+    (LP-0MRMMBZ7T007ER59).
+
+    Returns ``True`` if the session owns a slot, ``False`` otherwise.
+    Always returns ``False`` when no scheduler is active.
+    """
+    scheduler = _get_job_scheduler()
+    if scheduler is None:
+        return False
+    return session_id in scheduler.active_jobs
+
+
+
+
 def _get_local_max_concurrent_queries(server_config: dict) -> int:
     """
     Read the local-model concurrency limit from config.
