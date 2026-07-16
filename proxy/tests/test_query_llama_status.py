@@ -24,6 +24,21 @@ class MockAsyncClient:
         return MockResponse(404)
 
 
+@pytest.fixture(autouse=True)
+def reset_http_client():
+    """Reset the module-level _http_client before each test.
+
+    Without this, tests that mock ``httpx.AsyncClient`` via
+    ``patch('httpx.AsyncClient')`` silently bypass the mock when
+    ``proxy.server._http_client`` has been set to a non-None value by a
+    preceding test (in this file or another), because
+    ``query_llama_status()`` reuses the existing client instead of calling
+    the ``httpx.AsyncClient()`` constructor.
+    """
+    from proxy import server
+    server._http_client = None
+
+
 @pytest.fixture
 def mock_config():
     return {
