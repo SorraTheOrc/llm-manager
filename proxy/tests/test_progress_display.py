@@ -367,6 +367,195 @@ class TestProgressThresholdTracking:
         assert len(lines_logged) == 2, f"Expected 2 log entries, got {len(lines_logged)}: {lines_logged}"
         assert "100%" in lines_logged[1], f"Final entry should contain 100%: {lines_logged[1]}"
 
+    def test_interleaved_multi_slot_progress(self):
+        """Interleaved slot 0/slot 1 progress is logged independently for each slot.
+
+        Both slots progress through 0%, 10%, 50%, 100% with interleaved lines.
+        Each slot should independently log at its own threshold boundaries.
+        """
+        logger = logging.getLogger("test_interleaved_multi")
+        logger.setLevel(logging.INFO)
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.handlers.clear()
+        logger.addHandler(handler)
+
+        dst = io.StringIO()
+
+        # Interleave slot 0 and slot 1 progress at 0%, 10%, 50%, 100%
+        lines = [
+            "slot 0 : prompt processing, n_tokens=0, progress=0.00\n",   # slot 0 start -> log (0%)
+            "slot 1 : prompt processing, n_tokens=0, progress=0.00\n",   # slot 1 start -> log (0%)
+            "slot 0 : prompt processing, n_tokens=10, progress=0.10\n",  # slot 0 10% -> log
+            "slot 1 : prompt processing, n_tokens=10, progress=0.10\n",  # slot 1 10% -> log
+            "slot 0 : prompt processing, n_tokens=50, progress=0.50\n",  # slot 0 50% -> log
+            "slot 1 : prompt processing, n_tokens=50, progress=0.50\n",  # slot 1 50% -> log
+            "slot 0 : prompt processing, n_tokens=100, progress=1.00\n", # slot 0 100% -> log
+            "slot 1 : prompt processing, n_tokens=100, progress=1.00\n", # slot 1 100% -> log
+        ]
+        src = io.StringIO("".join(lines))
+
+        fake_time = [10.0, 10.1, 10.5, 10.6, 12.0, 12.1, 15.0, 15.1]
+        time_index = [0]
+        original_monotonic = lifecycle.time.monotonic
+
+        def fake_monotonic():
+            t = fake_time[time_index[0] % len(fake_time)]
+            time_index[0] += 1
+            return t
+
+        lifecycle.time.monotonic = fake_monotonic
+        try:
+            lifecycle._stream_output(src, dst, model_name="Qwen3", logger=logger)
+        finally:
+            lifecycle.time.monotonic = original_monotonic
+
+        log_output = buf.getvalue()
+        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+
+        # slot 0: 0%, 10%, 50%, 100% -> 4 entries
+        # slot 1: 0%, 10%, 50%, 100% -> 4 entries
+        # Total: 8 entries
+        assert len(lines_logged) == 8, (
+            f"Expected 8 log entries (4 per slot), got {len(lines_logged)}: {lines_logged}"
+        )
+
+        # Verify slot 0 and slot 1 are each represented
+        slot0_entries = [l for l in lines_logged if "[slot:0" in l]
+        slot1_entries = [l for l in lines_logged if "[slot:1" in l]
+        assert len(slot0_entries) == 4, f"Expected 4 slot 0 entries, got {len(slot0_entries)}: {slot0_entries}"
+        assert len(slot1_entries) == 4, f"Expected 4 slot 1 entries, got {len(slot1_entries)}: {slot1_entries}"
+
+        # Verify milestones are present for both slots
+        assert any("0%" in l for l in slot0_entries), f"Slot 0 should have 0% entry: {slot0_entries}"
+        assert any("100%" in l for l in slot0_entries), f"Slot 0 should have 100% entry: {slot0_entries}"
+        assert any("0%" in l for l in slot1_entries), f"Slot 1 should have 0% entry: {slot1_entries}"
+        assert any("100%" in l for l in slot1_entries), f"Slot 1 should have 100% entry: {slot1_entries}"
+
+    def test_different_completion_speeds(self):
+        """Slots completing at different speeds are independently tracked.
+
+        Slot 1 finishes (100%) while slot 0 is still at 50%.
+        Slot 0 later catches up to 100%.
+        """
+        logger = logging.getLogger("test_diff_speeds")
+        logger.setLevel(logging.INFO)
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.handlers.clear()
+        logger.addHandler(handler)
+
+        dst = io.StringIO()
+
+        lines = [
+            "slot 0 : prompt processing, n_tokens=0, progress=0.00\n",   # slot 0 start -> log
+            "slot 1 : prompt processing, n_tokens=0, progress=0.00\n",   # slot 1 start -> log
+            "slot 0 : prompt processing, n_tokens=25, progress=0.25\n",  # slot 0 25% -> log (crosses 20%)
+            "slot 1 : prompt processing, n_tokens=50, progress=0.50\n",  # slot 1 50% -> log
+            "slot 1 : prompt processing, n_tokens=100, progress=1.00\n", # slot 1 100% -> log (finishes first)
+            "slot 0 : prompt processing, n_tokens=50, progress=0.50\n",  # slot 0 50% -> log
+            "slot 0 : prompt processing, n_tokens=100, progress=1.00\n", # slot 0 100% -> log (finishes later)
+        ]
+        src = io.StringIO("".join(lines))
+
+        fake_time = [10.0, 10.1, 10.5, 11.0, 12.0, 13.0, 15.0]
+        time_index = [0]
+        original_monotonic = lifecycle.time.monotonic
+
+        def fake_monotonic():
+            t = fake_time[time_index[0] % len(fake_time)]
+            time_index[0] += 1
+            return t
+
+        lifecycle.time.monotonic = fake_monotonic
+        try:
+            lifecycle._stream_output(src, dst, model_name="Qwen3", logger=logger)
+        finally:
+            lifecycle.time.monotonic = original_monotonic
+
+        log_output = buf.getvalue()
+        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+
+        # slot 0: 0% (start), 25% (crosses 20%), 50%, 100% -> 4 entries
+        # slot 1: 0% (start), 50%, 100% -> 3 entries
+        # Total: 7 entries
+        assert len(lines_logged) == 7, (
+            f"Expected 7 log entries, got {len(lines_logged)}: {lines_logged}"
+        )
+
+        slot0_entries = [l for l in lines_logged if "[slot:0" in l]
+        slot1_entries = [l for l in lines_logged if "[slot:1" in l]
+        assert len(slot0_entries) == 4, f"Expected 4 slot 0 entries, got {len(slot0_entries)}: {slot0_entries}"
+        assert len(slot1_entries) == 3, f"Expected 3 slot 1 entries, got {len(slot1_entries)}: {slot1_entries}"
+
+        # Slot 1 should finish before slot 0
+        slot1_indices = [i for i, l in enumerate(lines_logged) if "[slot:1" in l]
+        slot0_100_idx = next(i for i, l in enumerate(lines_logged) if "[slot:0" in l and "100%" in l)
+        slot1_100_idx = next(i for i, l in enumerate(lines_logged) if "[slot:1" in l and "100%" in l)
+        assert slot1_100_idx < slot0_100_idx, (
+            f"Slot 1 should reach 100% before slot 0: idx {slot1_100_idx} vs {slot0_100_idx}"
+        )
+
+    def test_non_consecutive_slot_numbers(self):
+        """Non-consecutive slot numbers (e.g., 3 and 7) are tracked independently."""
+        logger = logging.getLogger("test_non_consecutive")
+        logger.setLevel(logging.INFO)
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.handlers.clear()
+        logger.addHandler(handler)
+
+        dst = io.StringIO()
+
+        lines = [
+            "slot 3 : prompt processing, n_tokens=0, progress=0.00\n",    # slot 3 start -> log
+            "slot 7 : prompt processing, n_tokens=0, progress=0.00\n",    # slot 7 start -> log
+            "slot 3 : prompt processing, n_tokens=30, progress=0.30\n",   # slot 3 30% -> log (crosses 30%)
+            "slot 7 : prompt processing, n_tokens=70, progress=0.70\n",   # slot 7 70% -> log (crosses 70%)
+            "slot 3 : prompt processing, n_tokens=100, progress=1.00\n",  # slot 3 100% -> log
+            "slot 7 : prompt processing, n_tokens=100, progress=1.00\n",  # slot 7 100% -> log
+        ]
+        src = io.StringIO("".join(lines))
+
+        fake_time = [10.0, 10.1, 10.5, 10.6, 12.0, 12.1]
+        time_index = [0]
+        original_monotonic = lifecycle.time.monotonic
+
+        def fake_monotonic():
+            t = fake_time[time_index[0] % len(fake_time)]
+            time_index[0] += 1
+            return t
+
+        lifecycle.time.monotonic = fake_monotonic
+        try:
+            lifecycle._stream_output(src, dst, model_name="Qwen3", logger=logger)
+        finally:
+            lifecycle.time.monotonic = original_monotonic
+
+        log_output = buf.getvalue()
+        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+
+        # slot 3: 0%, 30%, 100% -> 3 entries
+        # slot 7: 0%, 70%, 100% -> 3 entries
+        # Total: 6 entries
+        assert len(lines_logged) == 6, (
+            f"Expected 6 log entries, got {len(lines_logged)}: {lines_logged}"
+        )
+
+        slot3_entries = [l for l in lines_logged if "[slot:3" in l]
+        slot7_entries = [l for l in lines_logged if "[slot:7" in l]
+        assert len(slot3_entries) == 3, f"Expected 3 slot 3 entries, got {len(slot3_entries)}: {slot3_entries}"
+        assert len(slot7_entries) == 3, f"Expected 3 slot 7 entries, got {len(slot7_entries)}: {slot7_entries}"
+
+        # Verify milestones
+        assert any("0%" in l for l in slot3_entries), f"Slot 3 should have 0% entry: {slot3_entries}"
+        assert any("100%" in l for l in slot3_entries), f"Slot 3 should have 100% entry: {slot3_entries}"
+        assert any("0%" in l for l in slot7_entries), f"Slot 7 should have 0% entry: {slot7_entries}"
+        assert any("100%" in l for l in slot7_entries), f"Slot 7 should have 100% entry: {slot7_entries}"
+
 
 # ---------------------------------------------------------------------------
 # _stream_output integration tests (logger vs stderr behavior)
