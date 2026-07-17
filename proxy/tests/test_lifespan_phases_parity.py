@@ -100,44 +100,6 @@ class TestStartupConfigLogging:
         assert server.logger == mock_logger
 
 
-class TestStartupInitializeCacheColdStart:
-    """_startup_initialize_cache_cold_start() — model cache cold-start."""
-
-    def test_calls_init_cache(self, monkeypatch):
-        """Calls initialize_cache_cold_from_config with config."""
-        called_with = []
-        def fake_init_cache(cfg):
-            called_with.append(cfg)
-
-        monkeypatch.setattr(
-            server,
-            "config",
-            {"server": {"model": "test"}},
-        )
-        monkeypatch.setattr(
-            "proxy.provider.initialize_cache_cold_from_config",
-            fake_init_cache,
-        )
-
-        server._startup_initialize_cache_cold_start()
-
-        assert len(called_with) == 1
-        assert called_with[0] == {"server": {"model": "test"}}
-
-    def test_swallows_exceptions(self, monkeypatch):
-        """Exceptions during cache init are caught and logged."""
-        def failing_init(_):
-            raise RuntimeError("boom")
-
-        monkeypatch.setattr(
-            "proxy.provider.initialize_cache_cold_from_config",
-            failing_init,
-        )
-
-        # Should not raise
-        server._startup_initialize_cache_cold_start()
-
-
 class TestStartupInitializeBackendState:
     """_startup_initialize_backend_state() — backend_ready and recovery state."""
 
@@ -551,7 +513,6 @@ class TestLifespanOrchestration:
             return wrapper
 
         monkeypatch.setattr(server, "_startup_config_logging", track("config_logging"))
-        monkeypatch.setattr(server, "_startup_initialize_cache_cold_start", track("cache_cold"))
         monkeypatch.setattr(server, "_startup_initialize_backend_state", track("backend_state"))
         monkeypatch.setattr(server, "_startup_create_http_client", lambda c: track("http_client")() or httpx.AsyncClient())
         monkeypatch.setattr(server, "_startup_create_remote_http_client", lambda c: track("remote_client")() or httpx.AsyncClient())
@@ -566,7 +527,6 @@ class TestLifespanOrchestration:
 
         # Simulate startup sequence
         server._startup_config_logging()
-        server._startup_initialize_cache_cold_start()
         server._startup_initialize_backend_state()
         client = httpx.AsyncClient()
         server._http_client = client

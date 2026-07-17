@@ -82,135 +82,119 @@ _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Cache-invalidation state for smart routing (LP-0MRCSSBTM002NK3B)
+# Cached-tokens-based routing state for smart routing
+# (LP-0MRP44W7I0085I6N)
 # ---------------------------------------------------------------------------
 
-# Set of model names whose slot cache is currently invalidated (cold).
-# When the slot cache for a model is cold, large-context requests may be
-# routed directly to remote fallback to avoid expensive full re-prefill.
-# Models whose slot cache is currently cold (invalidated or just started).
-# Sentinel: True until initialize_cache_cold_from_config runs.
-# This prevents a race between proxy restart (where the OLD process handles
-# requests before the NEW process's lifespan startup executes). Without this,
-# _model_cache_cold is an empty set() and all models appear warm.
-_model_cache_cold_uninitialized: bool = True
+# Per-(model, session) cached-tokens ratio: (model_name, session_id) -> ratio.
+# The ratio is cached_tokens / prompt_tokens from the last local response.
+# A ratio of 1.0 means ALL tokens were cached (fully warm).
+# A ratio < 1 means at least some tokens needed recomputation (cache partially
+# or fully cold).
+# When no entry exists, defaults to 0.0 (cold - conservative).
+_last_cached_ratio: dict[tuple[str, str], float] = {}
 
-# Set of model names whose slot cache is currently cold.
-# Populated by initialize_cache_cold_from_config at startup.
-_model_cache_cold: set[str] = set()
+# Maximum number of entries in _last_cached_ratio to prevent unbounded growth.
+_MAX_CACHED_RATIO_ENTRIES = 1000
 
-# Per-session cache-cold state: (model_name, session_id) -> cold (True) / warm (False).
-# When a session has no entry, it defaults to cold (conservative).
-# This provides per-session isolation so that cache warmth from one session
-# does not affect bypass decisions for other sessions (LP-0MRMMBZ7T007ER59).
-_session_cache_cold: dict[tuple[str, str], bool] = {}
 
-def _cache_cold_initialized() -> None:
-    """Mark the cache-cold state as fully initialized."""
-    global _model_cache_cold_uninitialized
-    _model_cache_cold_uninitialized = False
+def update_cached_ratio(
+    model_name: str,
+    session_id: str | None,
+    cached_tokens: int,
+    prompt_tokens: int,
+) -> None:
+    """Update the cached-tokens ratio for a (model, session) pair.
 
-def mark_model_cache_cold(model_name: str, session_id: str | None = None) -> None:
-    """Mark a model's slot cache as invalidated (cold).
+    The ratio is computed as cached_tokens / prompt_tokens, with safe
+    handling for zero prompt_tokens (returns 0.0).
 
-    When *session_id* is provided, only that session's cache for this model
-    is marked as cold (per-session isolation). Otherwise, the model-level
-    fallback is used.
-
-    This causes large-context requests for this model/session to skip local
-    routing and fall through to the next remote provider in the chain.
+    To prevent unbounded memory growth, the dict is capped at
+    ``_MAX_CACHED_RATIO_ENTRIES``. When the cap is reached, the oldest
+    entry (first inserted) is evicted.
     """
-    if session_id:
-        _session_cache_cold[(model_name, session_id)] = True
-    elif model_name:
-        _model_cache_cold.add(model_name)
-
-def clear_model_cache_cold(model_name: str, session_id: str | None = None) -> None:
-    """Clear a model's cache-cold flag, restoring normal local routing.
-
-    When *session_id* is provided, only that session's cache for this model
-    is cleared (per-session isolation). The session is explicitly marked warm.
-    Otherwise, the model-level fallback is used.
-    """
-    if session_id:
-        _session_cache_cold[(model_name, session_id)] = False
-    elif model_name:
-        _model_cache_cold.discard(model_name)
-
-def is_model_cache_cold(model_name: str, session_id: str | None = None) -> bool:
-    """Check if a model's slot cache is currently marked as cold.
-
-    When *session_id* is provided, checks session-level state first.
-    If no session-level entry exists, the session is considered cold
-    (conservative default).
-    Without *session_id*, falls back to model-level state.
-
-    Before initialize_cache_cold_from_config has been called, ALL models are
-    assumed cold to prevent a race between proxy process restarts.
-    """
-    if _model_cache_cold_uninitialized:
-        return bool(model_name)
-    if session_id:
-        return _session_cache_cold.get((model_name, session_id), True)
-    return model_name in _model_cache_cold if model_name else False
-
-
-def initialize_cache_cold_from_config(config: dict) -> None:
-    """Mark all local models' caches as cold at startup.
-
-    Scans the config for models with local providers and adds their
-    ``llama_model`` names to the cache-cold set. This ensures that after
-    proxy restart or model reload, large-context requests are routed to
-    remote fallback instead of attempting expensive full re-prefill.
-
-    Safe to call multiple times — clears any existing state first.
-    """
-    _cache_cold_initialized()
-    _model_cache_cold.clear()
-    models = config.get("models", {})
-    if not isinstance(models, dict):
+    if not model_name or not session_id:
         return
-    for model_name, model_cfg in models.items():
-        if not isinstance(model_cfg, dict):
-            continue
-        providers = model_cfg.get("providers", [])
-        if not isinstance(providers, list):
-            continue
-        for provider in providers:
-            if not isinstance(provider, dict):
-                continue
-            if provider.get("type") == "local":
-                llama_model = provider.get("llama_model")
-                if llama_model:
-                    _model_cache_cold.add(str(llama_model))
-    import logging as _logging
-    _logging.getLogger("llama-proxy.provider").info(
-        "cache_cold_initialized models=%s uninitialized_sentinel_cold_until=%s",
-        sorted(_model_cache_cold) if _model_cache_cold else "(none)",
-        _model_cache_cold_uninitialized,
-    )
+    if prompt_tokens <= 0:
+        ratio = 0.0
+    else:
+        ratio = min(1.0, cached_tokens / prompt_tokens)
+    key = (model_name, session_id)
+    # Enforce cap: if adding a new entry would exceed the limit, evict oldest
+    if key not in _last_cached_ratio and len(_last_cached_ratio) >= _MAX_CACHED_RATIO_ENTRIES:
+        try:
+            # Evict oldest entry (dict maintains insertion order in Python 3.7+)
+            _last_cached_ratio.pop(next(iter(_last_cached_ratio)))
+        except (StopIteration, KeyError):
+            pass
+    _last_cached_ratio[key] = ratio
 
 
-def on_slot_save_success(model_name: str, session_id: str) -> None:
-    """Called by router.py after a successful slot save.
+def _get_cached_ratio(model_name: str, session_id: str | None) -> float:
+    """Get the cached-tokens ratio for a (model, session) pair.
 
-    Marks the (model, session_id) pair as warm so that subsequent
-    bypass decisions use the warm threshold for this session.
+    Returns 0.0 (cold) when no entry exists (conservative default).
     """
-    if model_name and session_id:
-        clear_model_cache_cold(model_name, session_id)
+    if not model_name or not session_id:
+        return 0.0
+    return _last_cached_ratio.get((model_name, session_id), 0.0)
+
+
+def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
+    """Extract cached_tokens from a usage dict.
+
+    Reads ``prompt_tokens_details.cached_tokens`` from the usage data
+    returned by llama.cpp in the SSE response. Returns 0 when the field
+    is missing or the dict is None.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    try:
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            return int(details.get("cached_tokens", 0) or 0)
+    except (ValueError, TypeError):
+        pass
+    return 0
+
+
+def _extract_cached_tokens_from_sse_text(sse_text: str) -> int:
+    """Extract cached_tokens from full SSE response text.
+
+    Parses each ``data:`` line looking for a ``usage`` field with
+    ``prompt_tokens_details.cached_tokens``. The usage event is typically
+    carried in the final chunk of an SSE stream alongside ``finish_reason``.
+
+    Returns 0 when no usage data is found.
+    """
+    if not sse_text:
+        return 0
+    import json
+    for line in sse_text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict) and "usage" in data:
+                cached = _extract_cached_tokens_from_usage(data.get("usage"))
+                if cached > 0:
+                    return cached
+        except (json.JSONDecodeError, Exception):
+            continue
+    return 0
 
 
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     """Estimate prompt token count for smart-routing decisions.
 
-    Concatenates all non-system message content (including reasoning_content
+    Concatenates all message content (including reasoning_content
     and tool_calls) and uses tiktoken (via ``count_text_tokens``) for
     accurate token counting.  Falls back to a conservative byte-based
     heuristic (1 byte per token) when tiktoken is unavailable.
-
-    System prompts are excluded as they are typically small and not the
-    driver of large-context timeouts.
 
     Using tiktoken guarantees correct routing decisions regardless of
     content density — the previous byte heuristic with ``// 2`` could
@@ -280,13 +264,12 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         return max(1, total_bytes // 1)
 
 
-def _get_large_context_cold_cache_threshold(config: dict) -> int:
-    """Read the large-context cold-cache fallback threshold from config.
+def _get_large_context_threshold(config: dict) -> int:
+    """Read the large-context fallback threshold from config.
 
     Supports both nested and flat config keys for production and test
     compatibility.  Also supports the legacy key name
-    ``local_large_context_fallback_threshold`` for backward compatibility
-    during the transition period.
+    ``local_large_context_fallback_threshold`` for backward compatibility.
 
     Returns 0 when not configured (disabled).
     """
@@ -299,27 +282,6 @@ def _get_large_context_cold_cache_threshold(config: dict) -> int:
         val = config.get("local_large_context_fallback_threshold")
     if val is None:
         val = config.get("server", {}).get("local_large_context_fallback_threshold", 0)
-    try:
-        return max(0, int(val or 0))
-    except (ValueError, TypeError):
-        return 0
-
-
-def _get_large_context_warm_cache_threshold(config: dict) -> int:
-    """Read the large-context warm-cache bypass threshold from config.
-
-    When the model cache is warm and estimated prompt tokens exceed this
-    value, the local provider is bypassed and the request routes to the
-    next remote provider.  A value of 0 disables warm-cache bypass.
-
-    Defaults to 60000 when not configured.
-
-    Supports both nested and flat config keys for production and test
-    compatibility.
-    """
-    val = config.get("local_large_context_warm_cache_threshold")
-    if val is None:
-        val = config.get("server", {}).get("local_large_context_warm_cache_threshold", 60000)
     try:
         return max(0, int(val or 0))
     except (ValueError, TypeError):
@@ -382,37 +344,47 @@ async def _estimate_effective_prompt_tokens_for_routing(
 
 
 def _should_skip_local(
-    cache_cold: bool,
+    model_name: str,
+    session_id: str | None,
     body_json: dict,
     cold_cache_threshold: int,
-    warm_cache_threshold: int = 0,
     estimated_tokens: int | None = None,
 ) -> bool:
     """Determine whether a local provider should be skipped due to large context.
 
-    When the cache is cold (expensive full re-prefill), uses
-    *cold_cache_threshold*.  When the cache is warm (cached prefix, cheaper),
-    uses *warm_cache_threshold*.  A threshold of 0 disables the corresponding
-    bypass.
+    Uses the cached-tokens ratio from the last local response for this
+    (model, session) pair. If the ratio is < 1 (cache not fully warm)
+    and estimated tokens exceed the threshold, the local provider is
+    bypassed and the request routes to the next remote provider.
+
+    A ratio of 0.0 (default for unknown sessions) means conservative
+    behavior: bypass if tokens exceed threshold.
+
+    A ratio of 1.0 means the cache was fully warm on the last request,
+    so the local provider is always used regardless of context size.
+
+    A threshold of 0 disables the bypass entirely.
 
     Args:
-        cache_cold: Whether the model's cache is marked as invalidated.
+        model_name: The llama_model name of the local provider.
+        session_id: The session ID (for per-session ratio tracking).
         body_json: The parsed request body.
-        cold_cache_threshold: Token threshold for cold-cache bypass. 0 = disabled.
-        warm_cache_threshold: Token threshold for warm-cache bypass. 0 means
-            disabled (default).
+        cold_cache_threshold: Token threshold for bypass. 0 = disabled.
         estimated_tokens: Optional pre-computed estimate.
 
     Returns:
         True if local should be skipped, False for normal local routing.
     """
-    # Select the appropriate threshold based on cache state
-    threshold = cold_cache_threshold if cache_cold else warm_cache_threshold
-    if threshold <= 0:
+    if cold_cache_threshold <= 0:
         return False
     if estimated_tokens is None:
         estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
-    return estimated_tokens > threshold
+    # If estimated tokens are below threshold, always route local
+    if estimated_tokens <= cold_cache_threshold:
+        return False
+    # Check cached-tokens ratio: only bypass if ratio < 1 (not fully warm)
+    ratio = _get_cached_ratio(model_name, session_id)
+    return ratio < 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -930,108 +902,7 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     return (cur_active, max_local)
 
 
-async def _release_session_slot_for_cache_cold_bypass(
-    request,
-    llama_model: str,
-    fallback_reason: str,
-) -> None:
-    """Release the scheduler slot for a session being routed to remote fallback.
 
-    When the cache_cold_bypass mechanism routes a session from a local provider
-    to a remote fallback (e.g., because the conversation context exceeds the
-    warm threshold), the local model's slot is held until idle timeout unless
-    we release it here.
-
-    This function:
-    1. Resolves the session_id from the request headers
-    2. Gets the JobScheduler (if active)
-    3. If the session has an active slot, releases it via the scheduler
-    4. Marks the model's cache as cold (for warm-cache bypass)
-    5. Logs the release
-
-    Args:
-        request: The incoming FastAPI Request.
-        llama_model: The llama_model name of the local provider being bypassed.
-        fallback_reason: The reason for fallback (used in the log message).
-    """
-    import logging as _logging
-    _log = _logging.getLogger("llama-proxy.provider")
-
-    # Resolve session_id from request headers
-    try:
-        from proxy.session import _resolve_session_id_header
-        session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
-    except Exception:
-        session_id = None
-
-    if not session_id:
-        return
-
-    # Get the scheduler
-    try:
-        from proxy.router import _get_job_scheduler
-        scheduler = _get_job_scheduler()
-    except Exception:
-        scheduler = None
-
-    if scheduler is None:
-        return
-
-    # Check if the session has an active scheduler slot
-    try:
-        if session_id in scheduler.active_jobs:
-            slot_id = scheduler.active_jobs[session_id]
-            # Release via scheduler.remove_job which handles both slot release and queue cancel
-            released = await scheduler.remove_job(session_id)
-            if released:
-                _log.info(
-                    "lease_released session=%s slot=%s reason=%s",
-                    session_id[:8],
-                    slot_id,
-                    fallback_reason,
-                )
-    except Exception:
-        _log.exception("Failed to release scheduler slot for session=%s", session_id[:8])
-
-    # Also clean up local_dispatch_records for this session
-    try:
-        import proxy.server as _srv_module
-        srv = getattr(_srv_module, "server", None)
-        if srv is not None:
-            lock = getattr(srv, "local_dispatch_records_lock", None)
-            if lock is not None and hasattr(srv, "local_dispatch_records"):
-                async with lock:
-                    if session_id in srv.local_dispatch_records:
-                        del srv.local_dispatch_records[session_id]
-                        _log.info(
-                            "lease_released session=%s reason=%s",
-                            session_id[:8],
-                            fallback_reason,
-                        )
-    except Exception:
-        pass
-
-    # Mark the model's cache as cold so subsequent large-context
-    # requests also bypass local (LP-0MRCSSBTM002NK3B).
-    # Use session-level marking when session_id is available (LP-0MRMMBZ7T007ER59).
-    # Also mark model-level for backward compatibility (conservative fallback).
-    if llama_model:
-        mark_model_cache_cold(llama_model, session_id=session_id)
-        _log.info(
-            "session_cache_marked_cold model=%s session=%s reason=%s",
-            llama_model,
-            session_id[:8] if session_id else "none",
-            fallback_reason,
-        )
-        # Also mark model-level so that sessions without session_id
-        # still benefit from conservative cold-cache bypass
-        if not is_model_cache_cold(llama_model):
-            mark_model_cache_cold(llama_model)
-            _log.info(
-                "model_cache_marked_cold model=%s reason=%s (bypass)",
-                llama_model,
-                fallback_reason,
-            )
 
 
 def _parse_slot_exhaustion(response):
@@ -1827,13 +1698,11 @@ async def proxy_with_fallback(
                 # Smart routing: skip local when cache is cold and request is large
                 # (LP-0MRCSSBTM002NK3B). This avoids expensive full re-prefill of
                 # large contexts when the slot cache is invalidated.
-                # Extended with dual-threshold (LP-0MRE4NBQ5009V5BX): when cache is
-                # warm but the request is extremely large, also bypass local using
-                # the warm-cache threshold.
+                # Smart routing: skip local when cache is cold and request is large
+                # (LP-0MRP44W7I0085I6N). Uses cached_tokens ratio from the last
+                # local response instead of inferred cache-cold state.
                 _llama_model = provider_cfg.get("llama_model", "")
-                _cold_threshold = _get_large_context_cold_cache_threshold(config)
-                _warm_threshold = _get_large_context_warm_cache_threshold(config)
-                _cache_is_cold = is_model_cache_cold(_llama_model, session_id=_session_id)
+                _cold_threshold = _get_large_context_threshold(config)
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,
@@ -1846,51 +1715,43 @@ async def proxy_with_fallback(
                 if _multiplier != 1.0:
                     _estimated_tokens = int(_estimated_tokens * _multiplier)
                 logger.info(
-                    "routing_check provider=%s model=%s cache_cold=%s "
-                    "estimated_tokens=%d cold_threshold=%d warm_threshold=%d messages=%d",
+                    "routing_check provider=%s model=%s "
+                    "estimated_tokens=%d threshold=%d messages=%d cached_ratio=%.2f",
                     provider_name,
                     _llama_model or "unknown",
-                    _cache_is_cold,
                     _estimated_tokens,
                     _cold_threshold,
-                    _warm_threshold,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
+                    _get_cached_ratio(_llama_model, _session_id),
                 )
                 if _should_skip_local(
-                    _cache_is_cold,
+                    _llama_model,
+                    _session_id,
                     body_json,
                     _cold_threshold,
-                    warm_cache_threshold=_warm_threshold,
                     estimated_tokens=_estimated_tokens,
                 ):
                     logger.info(
-                        "cache_cold_bypass provider=%s model=%s estimated_tokens=%d "
-                        "cold_threshold=%d warm_threshold=%d "
+                        "routing_skip_local provider=%s model=%s estimated_tokens=%d "
+                        "threshold=%d cached_ratio=%.2f "
                         "→ skipping local, routing to next remote provider",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
                         _cold_threshold,
-                        _warm_threshold,
+                        _get_cached_ratio(_llama_model, _session_id),
                     )
                     _record_attempt(
                         attempts,
                         provider=provider_name,
                         type=provider_type,
-                        status="cache_cold_skip",
+                        status="cached_tokens_skip",
                         estimated_tokens=_estimated_tokens,
-                        threshold=_cold_threshold if _cache_is_cold else _warm_threshold,
+                        threshold=_cold_threshold,
                     )
-                    fallback_reason = "cache_cold_large_context"
+                    fallback_reason = "large_context_bypass"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
-                    # Release the session's scheduler slot so other sessions
-                    # can use it instead of waiting for idle timeout (LP-0MRGUJ3QR002K18G)
-                    await _release_session_slot_for_cache_cold_bypass(
-                        request,
-                        _llama_model,
-                        fallback_reason,
-                    )
                     continue
 
                 response = await ptr_local(request, path)
@@ -1928,17 +1789,6 @@ async def proxy_with_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
-                # LP-0MRDE669Y003V1SO + LP-0MRMMBZ7T007ER59: On successful
-                # local streaming response, mark cache as warm.
-                # When session_id is available, per-session warming is deferred
-                # to router.py which fires after the actual slot-save succeeds
-                # (slot save must complete before cache is considered warm).
-                # When no session_id, use model-level fallback (existing behavior).
-                if provider_type == "local" and not _session_id:
-                    try:
-                        clear_model_cache_cold(_llama_model)
-                    except Exception:
-                        pass
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 return stream_result
@@ -2257,14 +2107,6 @@ async def proxy_with_fallback(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
-            # LP-0MRDE669Y003V1SO + LP-0MRMMBZ7T007ER59: On successful local
-            # non-streaming response, mark cache as warm.
-            # Pass session_id for per-session isolation when available.
-            if provider_type == "local":
-                try:
-                    clear_model_cache_cold(_llama_model, session_id=_session_id)
-                except Exception:
-                    pass
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result

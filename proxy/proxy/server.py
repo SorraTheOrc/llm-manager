@@ -305,20 +305,6 @@ def _startup_config_logging():
     return config, logger
 
 
-def _startup_initialize_cache_cold_start():
-    """Mark all local model caches as cold on startup.
-
-    Corresponds to LP-0MRDE669Y003V1SO — ensures large-context requests
-    are routed to remote fallback immediately after restart, rather than
-    attempting expensive full re-prefill.
-    """
-    try:
-        from proxy.provider import initialize_cache_cold_from_config as _init_cache
-        _init_cache(config)
-    except Exception:
-        pass
-
-
 def _startup_initialize_backend_state():
     """Initialize backend-ready flag and recovery state dict.
 
@@ -482,22 +468,6 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                         logger.info(f"Router preload complete: {router_preload_list}")
                         if resolved:
                             current_model = resolved[0]
-
-                        # Mark all preloaded models' slot caches as warm so
-                        # large-context requests do not bypass local routing.
-                        try:
-                            from proxy.provider import clear_model_cache_cold
-                            for _model in resolved:
-                                clear_model_cache_cold(_model)
-                            logger.info(
-                                "cache_warmed models=%s reason=router_preload",
-                                resolved,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "clear_model_cache_cold failed during preload",
-                                exc_info=True,
-                            )
 
                     return
 
@@ -733,7 +703,6 @@ async def lifespan(app: FastAPI):
     # Startup phase
     # ------------------------------------------------------------------ #
     _startup_config_logging()
-    _startup_initialize_cache_cold_start()
     _startup_initialize_backend_state()
     _startup_create_http_client(config)
     _startup_create_remote_http_client(config)

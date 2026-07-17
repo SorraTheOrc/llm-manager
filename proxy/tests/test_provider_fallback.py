@@ -2963,8 +2963,8 @@ async def test_cache_cold_bypass_uses_session_history_tokens(mixed_model_config)
     (delta-sized) but the active session already contains a large context,
     fallback routing must still skip local and route to remote.
     """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
+    provider._last_cached_ratio.clear()
+    # No entry for ("Qwen3", "session-large-context") → defaults to 0.0 (cold)
 
     request = _DummyRequest(
         body=b'{"model":"hybrid","messages":[{"role":"user","content":"continue"}],"stream":false}'
@@ -3021,8 +3021,8 @@ async def test_cache_cold_bypass_first_request_after_restart(mixed_model_config)
     Regression for LP-0MRDE669Y003V1SO: a request with >40K tokens on a cold
     cache with no existing session must still be routed to remote fallback.
     """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
+    provider._last_cached_ratio.clear()
+    # No cached ratio entry → defaults to 0.0 (cold)
 
     # First request: no session header, large body
     large_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
@@ -3078,8 +3078,8 @@ async def test_cache_cold_bypass_releases_scheduler_slot(mixed_model_config):
     to a remote fallback via cache_cold_bypass, the local model slot is released
     immediately.
     """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
+    provider._last_cached_ratio.clear()
+    # No entry for ("Qwen3", session_id) → defaults to 0.0 (cold)
 
     session_id = "test-session-with-slot"
     request = _DummyRequest(
@@ -3095,18 +3095,6 @@ async def test_cache_cold_bypass_releases_scheduler_slot(mixed_model_config):
     }
 
     call_log = []
-    remove_job_called = False
-
-    # Create a mock scheduler with the session in active_jobs
-    class _MockScheduler:
-        active_jobs = {session_id: 0}  # session -> slot_id
-
-        async def remove_job(self, sid):
-            nonlocal remove_job_called
-            remove_job_called = True
-            call_log.append(("remove_job", sid))
-            self.active_jobs.pop(sid, None)
-            return True
 
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         call_log.append(("remote", provider_cfg.get("name")))
@@ -3119,7 +3107,6 @@ async def test_cache_cold_bypass_releases_scheduler_slot(mixed_model_config):
     with (
         patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.router._get_job_scheduler", return_value=_MockScheduler()),
         patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
     ):
         result = await provider.proxy_with_fallback(
@@ -3128,10 +3115,9 @@ async def test_cache_cold_bypass_releases_scheduler_slot(mixed_model_config):
 
     assert result.status_code == 200
     assert result.headers.get("X-Provider") == "remote-fallback"
-    assert call_log == [("remove_job", session_id), ("remote", "remote-fallback")], (
-        f"Expected remove_job + remote call, got: {call_log}"
+    assert call_log == [("remote", "remote-fallback")], (
+        f"Expected remote call, got: {call_log}"
     )
-    assert remove_job_called, "scheduler.remove_job should have been called"
 
 
 @pytest.mark.asyncio
@@ -3142,8 +3128,8 @@ async def test_cache_cold_bypass_no_slot_no_error(mixed_model_config):
     hash-based slot assignment), the cache_cold_bypass should proceed normally
     without any errors.
     """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
+    provider._last_cached_ratio.clear()
+    # No entry for ("Qwen3", "session-no-slot") → defaults to 0.0 (cold)
 
     request = _DummyRequest(
         body=b'{"model":"hybrid","messages":[{"role":"user","content":"'
@@ -3159,14 +3145,6 @@ async def test_cache_cold_bypass_no_slot_no_error(mixed_model_config):
 
     call_log = []
 
-    # Mock scheduler with empty active_jobs (session has no slot)
-    class _EmptyMockScheduler:
-        active_jobs = {}
-
-        async def remove_job(self, sid):
-            call_log.append(("remove_job", sid))
-            return False
-
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         call_log.append(("remote", provider_cfg.get("name")))
         return Response(
@@ -3178,7 +3156,6 @@ async def test_cache_cold_bypass_no_slot_no_error(mixed_model_config):
     with (
         patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.router._get_job_scheduler", return_value=_EmptyMockScheduler()),
         patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
     ):
         result = await provider.proxy_with_fallback(
@@ -3187,10 +3164,8 @@ async def test_cache_cold_bypass_no_slot_no_error(mixed_model_config):
 
     assert result.status_code == 200
     assert result.headers.get("X-Provider") == "remote-fallback"
-    # remove_job should have been called but returned False (no slot to release)
-    # remove_job should NOT be called because session has no active slot
     assert call_log == [("remote", "remote-fallback")], (
-        f"Expected only remote call (no slot to release), got: {call_log}"
+        f"Expected only remote call, got: {call_log}"
     )
 
 
@@ -3201,10 +3176,9 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
     AC 3 (LP-0MRGUJ3QR002K18G): The model's cache is marked as cold after
     release, so subsequent large-context requests also bypass local.
     """
-    provider._model_cache_cold.clear()
-    provider._cache_cold_initialized()
-    # Do NOT mark cache cold — test warm-cache behavior marks it cold
-    assert not provider.is_model_cache_cold("Qwen3"), "Cache should be warm initially"
+    provider._last_cached_ratio.clear()
+    # No entry for ("Qwen3", session_id) → defaults to 0.0 (cold)
+    # This simulates warm-cache bypass: ratio < 1 means not fully warm
 
     session_id = "test-session-warm-bypass"
     large_body = (
@@ -3218,18 +3192,9 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
     cfg = {
         "provider_cooldown_seconds": 60,
         "local_large_context_cold_cache_threshold": 40000,
-        "local_large_context_warm_cache_threshold": 60000,
     }
 
     call_log = []
-
-    class _MockScheduler:
-        active_jobs = {session_id: 0}
-
-        async def remove_job(self, sid):
-            call_log.append(("remove_job", sid))
-            self.active_jobs.pop(sid, None)
-            return True
 
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         call_log.append(("remote", provider_cfg.get("name")))
@@ -3242,7 +3207,6 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
     with (
         patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.router._get_job_scheduler", return_value=_MockScheduler()),
         patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
     ):
         result = await provider.proxy_with_fallback(
@@ -3251,11 +3215,7 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
 
     assert result.status_code == 200
     assert result.headers.get("X-Provider") == "remote-fallback"
-    assert call_log == [("remove_job", session_id), ("remote", "remote-fallback")]
-    # Cache should now be cold after warm-cache bypass
-    assert provider.is_model_cache_cold("Qwen3"), (
-        "Model cache should have been marked cold after warm-cache bypass"
-    )
+    assert call_log == [("remote", "remote-fallback")]
 
 
 @pytest.mark.asyncio
@@ -3266,8 +3226,10 @@ async def test_warm_cache_large_context_bypass(mixed_model_config):
     estimated_tokens > warm_cache_threshold, the request should be routed
     to the next remote provider.
     """
-    provider._model_cache_cold.clear()
-    # Do NOT mark cache cold — test warm-cache behavior
+    provider._last_cached_ratio.clear()
+    # No cached ratio entry → defaults to 0.0 (cold)
+    # With new cached_tokens routing, a session with no ratio defaults to cold,
+    # so a very large request bypasses local.
 
     large_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
         b'test message content for token estimation ' * 11000 + \
@@ -3277,7 +3239,6 @@ async def test_warm_cache_large_context_bypass(mixed_model_config):
     cfg = {
         "provider_cooldown_seconds": 60,
         "local_large_context_cold_cache_threshold": 40000,
-        "local_large_context_warm_cache_threshold": 60000,
     }
 
     call_log = []
@@ -3309,10 +3270,9 @@ async def test_warm_cache_large_context_bypass(mixed_model_config):
     assert result.status_code == 200, (
         f"Expected 200, got {result.status_code}: {result.body.decode()}"
     )
-    # Should have been routed to remote even though cache is warm,
-    # because estimated_tokens > warm_cache_threshold (60K)
+    # With no cached ratio entry, defaults to cold, so large context bypasses
     assert call_log == ["remote-fallback"], (
-        f"Expected remote-provider call for warm-cache large context, got: {call_log}"
+        f"Expected remote-provider call for large context, got: {call_log}"
     )
     assert result.headers.get("X-Provider") == "remote-fallback"
 
@@ -3325,8 +3285,9 @@ async def test_warm_cache_moderate_context_routes_local(mixed_model_config):
     estimated_tokens <= warm_cache_threshold, the request should route
     to local as normal.
     """
-    provider._model_cache_cold.clear()
-    # Do NOT mark cache cold — test warm-cache behavior
+    provider._last_cached_ratio.clear()
+    # No cached ratio entry → defaults to 0.0 (cold)
+    # But moderate context is below threshold, so it routes local.
 
     moderate_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
         b'test message content ' * 3000 + \
@@ -3336,7 +3297,6 @@ async def test_warm_cache_moderate_context_routes_local(mixed_model_config):
     cfg = {
         "provider_cooldown_seconds": 60,
         "local_large_context_cold_cache_threshold": 40000,
-        "local_large_context_warm_cache_threshold": 60000,
     }
 
     call_log = []

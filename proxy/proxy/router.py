@@ -415,13 +415,7 @@ async def _update_session_and_slot(
                     session_id[:8] if session_id else "unknown",
                     slot_id,
                 )
-                # Signal that the session's cache is now warm (LP-0MRMMBZ7T007ER59)
-                if session_id and srv.current_model:
-                    try:
-                        from proxy.provider import on_slot_save_success
-                        on_slot_save_success(srv.current_model, session_id)
-                    except Exception:
-                        srv.logger.debug("on_slot_save_success failed", exc_info=True)
+
         except Exception:
             srv.logger.debug("slot_save failed", exc_info=True)
 
