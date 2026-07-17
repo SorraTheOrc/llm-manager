@@ -110,13 +110,20 @@ async def poll_slots_for_model(
                     data = None
                 if isinstance(data, list):
                     if data:
-                        slot = data[0]
-                        is_processing = bool(slot.get('is_processing', False))
-                        next_token = slot.get('next_token') if isinstance(slot.get('next_token'), dict) else None
-                        if next_token is not None and 'n_decoded' in next_token:
-                            n_decoded = next_token.get('n_decoded')
-                        else:
-                            n_decoded = slot.get('n_decoded')
+                        # Aggregate across ALL slots, not just data[0]
+                        is_processing = any(
+                            bool(slot.get('is_processing', False)) for slot in data
+                        )
+                        n_decoded = None
+                        for slot in data:
+                            next_token = slot.get('next_token') if isinstance(slot.get('next_token'), dict) else None
+                            if next_token is not None and 'n_decoded' in next_token:
+                                slot_n = next_token.get('n_decoded')
+                            else:
+                                slot_n = slot.get('n_decoded')
+                            if slot_n is not None:
+                                if n_decoded is None or slot_n > n_decoded:
+                                    n_decoded = slot_n
                 elif isinstance(data, dict):
                     is_processing = bool(data.get('is_processing', False))
                     next_token = data.get('next_token')
