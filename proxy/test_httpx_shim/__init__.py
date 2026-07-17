@@ -5,10 +5,8 @@ blocking fallbacks for simple requests. This file intentionally shadows
 the installed `httpx` package during tests so the test suite runs
 consistently across environments.
 """
-from typing import Any, Optional, Callable, Iterable, Mapping, Union
+from typing import Any, Optional, Callable, Mapping
 import asyncio
-import inspect
-import sys
 
 try:
     from starlette.testclient import TestClient as _StarletteTestClient

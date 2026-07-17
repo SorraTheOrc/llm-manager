@@ -962,8 +962,6 @@ from .lifecycle import (  # noqa: E402, F401
     rotate_llama_logs,
     stop_llama_server,
     ensure_model_loaded,
-    slot_polling_state,
-    _slot_polling_tasks,
 )
 from .session import (  # noqa: E402, F401
     session_restore_observability,

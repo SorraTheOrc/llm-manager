@@ -1616,10 +1616,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             return JSONResponse(status_code=429, content=payload)
 
 # Backward-compatibility re-exports for tests
-from .router_helpers import (  # noqa: E402, F401
-    log_request,
-    log_response,
-    log_response_chunk,
+from .router_helpers import (  # noqa: E402, F401, F811
+    log_request,  # noqa: F811
+    log_response,  # noqa: F811
+    log_response_chunk,  # noqa: F811
 )
 from .proxy_remote import (  # noqa: E402, F401
     proxy_to_remote,

@@ -38,15 +38,15 @@ def _srv():
 #   re-exports keep existing import chains (server.py, router.py) and
 #   test monkey-patches on server.* working without modification.
 # ===================================================================
-from .backend_health import (
-    _self_heal_retry_after_seconds,
-    _is_self_healing_active,
-    _self_healing_response,
-    _backend_recovery_snapshot,
-    _worker_process_unhealthy,
-    _prune_recovery_attempts,
-    _attempt_router_self_heal,
-    _backend_watchdog_loop,
+from .backend_health import (  # noqa: F401
+    _self_heal_retry_after_seconds,  # noqa: F401
+    _is_self_healing_active,  # noqa: F401
+    _self_healing_response,  # noqa: F401
+    _backend_recovery_snapshot,  # noqa: F401
+    _worker_process_unhealthy,  # noqa: F401
+    _prune_recovery_attempts,  # noqa: F401
+    _attempt_router_self_heal,  # noqa: F401
+    _backend_watchdog_loop,  # noqa: F401
 )  # noqa: F401
 
 
