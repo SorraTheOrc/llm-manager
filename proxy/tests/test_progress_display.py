@@ -166,7 +166,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # Should have logged at 0%, 10%, 20%, 30%, 50%, 70%, 100% (thresholds crossed)
         # 0%: progress=0.00
@@ -219,7 +219,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # Only 1 progress log expected (start at 0% threshold, then 30%)
         # Actually need to think about this: first line at 33% crosses 0 (start) and 30%
@@ -277,7 +277,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # Each line should produce a log entry (each crosses a new threshold for its slot)
         # slot 1: starts at 10% (first seen, log as 10%), then 20% (crosses 20)
@@ -319,7 +319,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # slot 1: 0% (start), 50% -> 2 entries
         # slot 5: 0% (start) -> 1 entry
@@ -359,7 +359,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # 50% (start), 100% (final)
         assert len(lines_logged) == 2, f"Expected 2 log entries, got {len(lines_logged)}: {lines_logged}"
@@ -410,7 +410,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # slot 0: 0%, 10%, 50%, 100% -> 4 entries
         # slot 1: 0%, 10%, 50%, 100% -> 4 entries
@@ -420,16 +420,16 @@ class TestProgressThresholdTracking:
         )
 
         # Verify slot 0 and slot 1 are each represented
-        slot0_entries = [l for l in lines_logged if "[slot:0" in l]
-        slot1_entries = [l for l in lines_logged if "[slot:1" in l]
+        slot0_entries = [line for line in lines_logged if "[slot:0" in line]
+        slot1_entries = [line for line in lines_logged if "[slot:1" in line]
         assert len(slot0_entries) == 4, f"Expected 4 slot 0 entries, got {len(slot0_entries)}: {slot0_entries}"
         assert len(slot1_entries) == 4, f"Expected 4 slot 1 entries, got {len(slot1_entries)}: {slot1_entries}"
 
         # Verify milestones are present for both slots
-        assert any("0%" in l for l in slot0_entries), f"Slot 0 should have 0% entry: {slot0_entries}"
-        assert any("100%" in l for l in slot0_entries), f"Slot 0 should have 100% entry: {slot0_entries}"
-        assert any("0%" in l for l in slot1_entries), f"Slot 1 should have 0% entry: {slot1_entries}"
-        assert any("100%" in l for l in slot1_entries), f"Slot 1 should have 100% entry: {slot1_entries}"
+        assert any("0%" in entry for entry in slot0_entries), f"Slot 0 should have 0% entry: {slot0_entries}"
+        assert any("100%" in entry for entry in slot0_entries), f"Slot 0 should have 100% entry: {slot0_entries}"
+        assert any("0%" in entry for entry in slot1_entries), f"Slot 1 should have 0% entry: {slot1_entries}"
+        assert any("100%" in entry for entry in slot1_entries), f"Slot 1 should have 100% entry: {slot1_entries}"
 
     def test_different_completion_speeds(self):
         """Slots completing at different speeds are independently tracked.
@@ -474,7 +474,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # slot 0: 0% (start), 25% (crosses 20%), 50%, 100% -> 4 entries
         # slot 1: 0% (start), 50%, 100% -> 3 entries
@@ -483,15 +483,15 @@ class TestProgressThresholdTracking:
             f"Expected 7 log entries, got {len(lines_logged)}: {lines_logged}"
         )
 
-        slot0_entries = [l for l in lines_logged if "[slot:0" in l]
-        slot1_entries = [l for l in lines_logged if "[slot:1" in l]
+        slot0_entries = [line for line in lines_logged if "[slot:0" in line]
+        slot1_entries = [line for line in lines_logged if "[slot:1" in line]
         assert len(slot0_entries) == 4, f"Expected 4 slot 0 entries, got {len(slot0_entries)}: {slot0_entries}"
         assert len(slot1_entries) == 3, f"Expected 3 slot 1 entries, got {len(slot1_entries)}: {slot1_entries}"
 
         # Slot 1 should finish before slot 0
-        slot1_indices = [i for i, l in enumerate(lines_logged) if "[slot:1" in l]
-        slot0_100_idx = next(i for i, l in enumerate(lines_logged) if "[slot:0" in l and "100%" in l)
-        slot1_100_idx = next(i for i, l in enumerate(lines_logged) if "[slot:1" in l and "100%" in l)
+        slot1_indices = [i for i, line in enumerate(lines_logged) if "[slot:1" in line]
+        slot0_100_idx = next(i for i, line in enumerate(lines_logged) if "[slot:0" in line and "100%" in line)
+        slot1_100_idx = next(i for i, line in enumerate(lines_logged) if "[slot:1" in line and "100%" in line)
         assert slot1_100_idx < slot0_100_idx, (
             f"Slot 1 should reach 100% before slot 0: idx {slot1_100_idx} vs {slot0_100_idx}"
         )
@@ -534,7 +534,7 @@ class TestProgressThresholdTracking:
             lifecycle.time.monotonic = original_monotonic
 
         log_output = buf.getvalue()
-        lines_logged = [l for l in log_output.split("\n") if l.strip()]
+        lines_logged = [line for line in log_output.split("\n") if line.strip()]
 
         # slot 3: 0%, 30%, 100% -> 3 entries
         # slot 7: 0%, 70%, 100% -> 3 entries
@@ -543,16 +543,16 @@ class TestProgressThresholdTracking:
             f"Expected 6 log entries, got {len(lines_logged)}: {lines_logged}"
         )
 
-        slot3_entries = [l for l in lines_logged if "[slot:3" in l]
-        slot7_entries = [l for l in lines_logged if "[slot:7" in l]
+        slot3_entries = [line for line in lines_logged if "[slot:3" in line]
+        slot7_entries = [line for line in lines_logged if "[slot:7" in line]
         assert len(slot3_entries) == 3, f"Expected 3 slot 3 entries, got {len(slot3_entries)}: {slot3_entries}"
         assert len(slot7_entries) == 3, f"Expected 3 slot 7 entries, got {len(slot7_entries)}: {slot7_entries}"
 
         # Verify milestones
-        assert any("0%" in l for l in slot3_entries), f"Slot 3 should have 0% entry: {slot3_entries}"
-        assert any("100%" in l for l in slot3_entries), f"Slot 3 should have 100% entry: {slot3_entries}"
-        assert any("0%" in l for l in slot7_entries), f"Slot 7 should have 0% entry: {slot7_entries}"
-        assert any("100%" in l for l in slot7_entries), f"Slot 7 should have 100% entry: {slot7_entries}"
+        assert any("0%" in entry for entry in slot3_entries), f"Slot 3 should have 0% entry: {slot3_entries}"
+        assert any("100%" in entry for entry in slot3_entries), f"Slot 3 should have 100% entry: {slot3_entries}"
+        assert any("0%" in entry for entry in slot7_entries), f"Slot 7 should have 0% entry: {slot7_entries}"
+        assert any("100%" in entry for entry in slot7_entries), f"Slot 7 should have 100% entry: {slot7_entries}"
 
 
 # ---------------------------------------------------------------------------

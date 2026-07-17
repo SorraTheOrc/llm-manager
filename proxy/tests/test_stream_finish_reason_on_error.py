@@ -945,7 +945,7 @@ async def test_remote_readtimeout_error_is_actionable(mock_remote_request):
 
     # Verify the SSE output is valid JSON with choices[] and finish_reason
     decoded = collected.decode("utf-8")
-    lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+    lines = [line.strip() for line in decoded.splitlines() if line.strip()]
 
     # Find the error SSE event
     error_events = []

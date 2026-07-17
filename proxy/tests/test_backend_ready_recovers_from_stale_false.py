@@ -267,7 +267,7 @@ async def test_no_excessive_log_spam_when_healthy(monkeypatch):
         pass
 
     # Count the relevant log lines (info about recovery, not asyncio noise)
-    recovery_logs = [l for l in log_lines if "recover" in str(l).lower() or "ready" in str(l).lower()]
+    recovery_logs = [line for line in log_lines if "recover" in str(line).lower() or "ready" in str(line).lower()]
 
     # There should be at most 1-2 log lines per cycle for recovery
     assert len(recovery_logs) <= 3, (
