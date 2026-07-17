@@ -1,13 +1,13 @@
 import os
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 proxy_dir = os.path.join(os.getcwd())
 if proxy_dir not in sys.path:
     sys.path.insert(0, proxy_dir)
 
 
-def _find_live_e2e_summary_data() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _find_live_e2e_summary_data() -> tuple[dict[str, Any] | None, str | None]:
     """Locate live E2E summary payload and best available text rendering."""
     module_names = (
         "tests.test_plan_fallback_live_e2e",

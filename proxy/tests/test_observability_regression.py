@@ -22,10 +22,9 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 import httpx
-
 import proxy.server as server
+import pytest
 
 pytestmark = pytest.mark.refactor_parity
 
@@ -391,7 +390,7 @@ class TestEventsEndpoint:
                 response.body_iterator.__anext__(),
                 timeout=3.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("event_generator did not yield initial chunk within 3s")
 
         raw = chunk if isinstance(chunk, str) else chunk.decode("utf-8")
@@ -440,7 +439,7 @@ class TestLogsTailEndpoint:
                 response.body_iterator.__anext__(),
                 timeout=3.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("tail_logs did not yield within 3s")
 
         raw = chunk if isinstance(chunk, str) else chunk.decode("utf-8")
@@ -464,7 +463,7 @@ class TestLogsTailEndpoint:
                 response.body_iterator.__anext__(),
                 timeout=3.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("tail_logs did not yield within 3s")
 
         raw = chunk if isinstance(chunk, str) else chunk.decode("utf-8")

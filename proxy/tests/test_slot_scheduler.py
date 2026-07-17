@@ -12,9 +12,7 @@ Tests cover:
 import asyncio
 
 import pytest
-
 from proxy.slot_scheduler import JobScheduler, SlotState
-
 
 # ===================================================================
 # Helpers

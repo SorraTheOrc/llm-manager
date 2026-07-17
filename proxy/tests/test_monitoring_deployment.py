@@ -15,7 +15,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -50,7 +49,7 @@ EXPECTED_ROCM_EXPORTER_METRICS = [
 def assert_valid_yaml(path: Path) -> dict:
     """Assert that *path* is valid YAML and return the parsed content."""
     assert path.exists(), f"Missing file: {path}"
-    with open(path, "r") as f:
+    with open(path) as f:
         data = yaml.safe_load(f)
     assert data is not None, f"Empty or invalid YAML in {path}"
     return data

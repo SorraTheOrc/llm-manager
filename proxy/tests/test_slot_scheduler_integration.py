@@ -13,10 +13,8 @@ import asyncio
 from unittest.mock import MagicMock
 
 import pytest
-
-from proxy.slot_scheduler import JobScheduler
 from proxy.router import _get_job_scheduler
-
+from proxy.slot_scheduler import JobScheduler
 
 # ===================================================================
 # Fixtures

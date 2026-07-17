@@ -16,7 +16,7 @@ across loaded models (documented). If prometheus_client is not installed the
 functions are no-ops and generate_metrics() returns an explanatory payload.
 """
 
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 _enabled = False
 Gauge = None
@@ -84,7 +84,7 @@ if _enabled:
         _enabled = False
 
 
-def update_metrics(process_rss: Optional[int], loaded_models: Optional[Iterable[str]]):
+def update_metrics(process_rss: int | None, loaded_models: Iterable[str] | None):
     """Update gauges for process RSS and per-model RSS.
 
     - process_rss: integer bytes or None

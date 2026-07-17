@@ -1,9 +1,9 @@
 import json
-import pytest
-import httpx
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import proxy.server as server
+import pytest
 
 pytestmark = pytest.mark.refactor_parity
 

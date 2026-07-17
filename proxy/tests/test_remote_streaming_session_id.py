@@ -15,9 +15,7 @@ import httpx
 import pytest
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
-
 from proxy.proxy_remote import _handle_remote_streaming
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

@@ -9,11 +9,10 @@ circular import issues.
 """
 
 import asyncio
-import httpx
 import subprocess
 import time
-from typing import Optional
 
+import httpx
 from fastapi.responses import JSONResponse
 
 
@@ -88,7 +87,7 @@ def _backend_recovery_snapshot() -> dict:
 # Worker-health helper
 # ===================================================================
 
-def _worker_process_unhealthy(proc: Optional[subprocess.Popen]) -> bool:
+def _worker_process_unhealthy(proc: subprocess.Popen | None) -> bool:
     """Detect unhealthy llama worker states (for example zombie children)."""
     srv = _srv()
     if proc is None or srv.psutil is None:
@@ -411,7 +410,7 @@ async def _backend_watchdog_loop() -> None:
 # Router model health monitoring
 # ===================================================================
 
-def _extract_model_port_from_args(args: list) -> Optional[int]:
+def _extract_model_port_from_args(args: list) -> int | None:
     """Extract the model instance port from its argument list.
 
     The args list comes from the router's /models endpoint status.args

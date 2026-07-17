@@ -13,18 +13,16 @@ Verifies that:
 import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+import proxy.provider as provider
 import pytest
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
-
-import proxy.provider as provider
-from proxy.router import proxy_to_local
-from proxy.proxy_remote import proxy_to_remote
 from proxy.provider import (
     proxy_with_fallback,
     proxy_with_remote_fallback,
 )
-
+from proxy.proxy_remote import proxy_to_remote
+from proxy.router import proxy_to_local
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -769,8 +767,8 @@ def test_add_provider_header_uses_set_not_append():
     """_add_provider_header sets the header (not appends) to prevent
     duplicate X-Provider header values on fallback responses.
     """
-    from proxy.provider import _add_provider_header
     from fastapi import Response as FastAPIResponse
+    from proxy.provider import _add_provider_header
 
     resp = FastAPIResponse(status_code=200)
     # First call should set the header

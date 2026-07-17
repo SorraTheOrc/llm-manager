@@ -16,11 +16,11 @@ import logging
 import re
 import threading
 import time
-from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+
 from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
@@ -43,7 +43,7 @@ def _srv():
 # Progress parsing helpers
 # ---------------------------------------------------------------------------
 
-def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, int, float]]:
+def extract_progress_data(line: str | None) -> tuple[int, int, float] | None:
     """Extract ``slot_id``, ``n_tokens`` and ``progress`` from llama-server stdout progress lines.
 
     Returns a tuple (slot_id: int, n_tokens: int, progress: float) or None if the line does
@@ -81,7 +81,7 @@ async def poll_slots_for_model(
     model: str,
     llama_port: int = 0,
     interval: float = 0.5,
-    max_polls: Optional[int] = None,
+    max_polls: int | None = None,
 ) -> None:
     """Poll the llama-server `/slots` endpoint for a given model and update
     ``slot_polling_state[model]``.
@@ -176,7 +176,7 @@ def format_progress(
     progress: float,
     model_name: str = "unknown",
     slot_id: int = 0,
-    tokens_per_sec: Optional[float] = None,
+    tokens_per_sec: float | None = None,
 ) -> str:
     """Return a clean, log-friendly progress string without terminal control characters.
 
@@ -241,7 +241,7 @@ async def get_llama_local_status():
     timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
     try:
         status = await asyncio.wait_for(srv.query_llama_status(), timeout=timeout)
-    except (asyncio.TimeoutError, Exception):
+    except (TimeoutError, Exception):
         status = {"llama_server_running": False, "n_ctx": None, "kv_cache_tokens": None, "router_mode": False}
 
     llama_running = bool(status.get("llama_server_running", False))

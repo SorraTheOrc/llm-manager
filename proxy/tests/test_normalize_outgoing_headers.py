@@ -9,7 +9,6 @@ Covers:
 """
 
 import pytest
-
 from proxy.router_helpers import _normalize_outgoing_headers as rh_normalize
 from proxy.utils import _normalize_outgoing_headers as utils_normalize
 

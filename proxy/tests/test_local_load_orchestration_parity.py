@@ -10,11 +10,10 @@ See work item LP-0MR6Y0VKF0068KK1.
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-from fastapi import Response, HTTPException
-
 import proxy.server as server
 import proxy.ui as ui
+import pytest
+from fastapi import HTTPException, Response
 from proxy.lifecycle import _model_loading_response as _real_model_loading_response
 from proxy.lifecycle import get_local_model_name as _real_get_local_model_name
 from proxy.ui import _dispatch_local_model_load

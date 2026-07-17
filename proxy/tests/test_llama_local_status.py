@@ -1,6 +1,7 @@
-import pytest
 from unittest.mock import patch
+
 import httpx
+import pytest
 
 pytestmark = pytest.mark.refactor_parity
 
@@ -32,8 +33,10 @@ async def test_llama_local_status_not_running():
 async def test_llama_local_status_shows_local_owner_when_lease_active():
     """When a local dispatch lease is active, status returns the owner session and remaining time."""
     import time
-    from proxy import server
+
     from proxy.server import app
+
+    from proxy import server
 
     async def fake_query():
         return {"llama_server_running": True}
@@ -83,8 +86,9 @@ async def test_llama_local_status_shows_local_owner_when_lease_active():
 @pytest.mark.asyncio
 async def test_llama_local_status_shows_no_local_owner_when_no_lease():
     """When no local dispatch lease is active, status returns null for owner fields."""
-    from proxy import server
     from proxy.server import app
+
+    from proxy import server
 
     async def fake_query():
         return {"llama_server_running": True}
@@ -122,8 +126,9 @@ async def test_llama_local_status_shows_no_local_owner_when_no_lease():
 
 @pytest.mark.asyncio
 async def test_llama_local_status_running_and_switch():
-    from proxy import server
     from proxy.server import app
+
+    from proxy import server
 
     async def fake_query():
         return {"llama_server_running": True}

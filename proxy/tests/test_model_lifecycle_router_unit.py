@@ -2,10 +2,9 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import proxy.server as server
 import pytest
 from fastapi import Response
-
-import proxy.server as server
 
 pytestmark = pytest.mark.refactor_parity
 

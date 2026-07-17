@@ -6,10 +6,10 @@ Tests cover:
 - Template injection of version placeholders in both index and view_logs pages
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
 from subprocess import TimeoutExpired
+from unittest.mock import MagicMock, patch
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # Tests for _capture_llama_server_version
@@ -177,8 +177,8 @@ async def test_server_has_version_variables():
 @pytest.mark.asyncio
 async def test_index_template_includes_version_footer():
     """Verify that the index page replaces __LLAMA_SERVER_VERSION__ and __ROCM_VERSION__."""
-    from proxy.server import app
     import httpx
+    from proxy.server import app
 
     transport = httpx.ASGITransport(app=app)
 
@@ -199,8 +199,8 @@ async def test_index_template_includes_version_footer():
 @pytest.mark.asyncio
 async def test_index_template_shows_unknown_when_not_captured():
     """When version data is 'unknown', the footer still renders."""
-    from proxy.server import app
     import httpx
+    from proxy.server import app
 
     transport = httpx.ASGITransport(app=app)
 
@@ -224,8 +224,8 @@ async def test_index_template_shows_unknown_when_not_captured():
 @pytest.mark.asyncio
 async def test_view_logs_template_includes_version_footer():
     """Verify that the view_logs page replaces __LLAMA_SERVER_VERSION__ and __ROCM_VERSION__."""
-    from proxy.server import app
     import httpx
+    from proxy.server import app
 
     transport = httpx.ASGITransport(app=app)
 
@@ -246,8 +246,8 @@ async def test_view_logs_template_includes_version_footer():
 @pytest.mark.asyncio
 async def test_view_logs_template_shows_unknown_when_not_captured():
     """When version data is 'unknown', the view_logs footer still renders."""
-    from proxy.server import app
     import httpx
+    from proxy.server import app
 
     transport = httpx.ASGITransport(app=app)
 

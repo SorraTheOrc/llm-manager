@@ -30,7 +30,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Dict, Optional
+from typing import Any
 
 import proxy.provider as provider_mod
 
@@ -116,7 +116,7 @@ class StallCircuitBreaker:
                 ``cooldown_seconds`` (from ``_get_circuit_breaker_config()``).
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         cfg = config or _get_circuit_breaker_config({})
         self._window_seconds: int = cfg.get("window_seconds", _DEFAULT_WINDOW_SECONDS)
         self._threshold: int = cfg.get("threshold", _DEFAULT_THRESHOLD)
@@ -124,7 +124,7 @@ class StallCircuitBreaker:
 
         # Per-provider deque of stall timestamps (seconds since epoch)
         # Key: provider_name (str), Value: deque of float timestamps
-        self._stall_timestamps: Dict[str, deque] = {}
+        self._stall_timestamps: dict[str, deque] = {}
 
         # asyncio lock for concurrent access safety
         self._lock = asyncio.Lock()

@@ -9,7 +9,6 @@ Covers:
 import sys
 from unittest.mock import patch
 
-
 import proxy.metrics as metrics
 
 

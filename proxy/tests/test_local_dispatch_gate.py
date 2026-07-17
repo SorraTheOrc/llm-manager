@@ -20,8 +20,9 @@ class _DummyRequest:
 @pytest.mark.asyncio
 async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
     """proxy_to_local should return 503 when another local request is active."""
-    from proxy import server as srv
     from proxy.router import proxy_to_local
+
+    from proxy import server as srv
 
     # Minimal server state
     monkeypatch.setattr(
@@ -110,8 +111,9 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
 @pytest.mark.asyncio
 async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(monkeypatch):
     """No-preemption policy should reject non-owner even when no active request exists."""
-    from proxy import server as srv
     from proxy.router import proxy_to_local
+
+    from proxy import server as srv
 
     monkeypatch.setattr(
         srv,
@@ -196,7 +198,7 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
 @pytest.mark.asyncio
 async def test_local_dispatch_tracking_helpers_keep_lease_between_turns():
     """Releasing active local request should keep an inactive lease for the owner session."""
-    from proxy.router_helpers import _increment_local_active_queries, _decrement_local_active_queries
+    from proxy.router_helpers import _decrement_local_active_queries, _increment_local_active_queries
 
     srv = SimpleNamespace(
         config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
@@ -630,7 +632,7 @@ async def test_release_local_dispatch_on_session_eviction():
     session is evicted from the session manager, its dispatch lease
     should be released so another session can acquire it.
     """
-    from proxy.router_helpers import _release_local_dispatch, _increment_local_active_queries
+    from proxy.router_helpers import _increment_local_active_queries, _release_local_dispatch
 
     srv = SimpleNamespace(
         config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
@@ -669,9 +671,9 @@ async def test_cross_session_handoff_after_lease_release():
     3. Session B can immediately acquire the local backend.
     """
     from proxy.router_helpers import (
-        _try_acquire_local_dispatch,
         _increment_local_active_queries,
         _release_local_dispatch,
+        _try_acquire_local_dispatch,
     )
 
     srv = SimpleNamespace(
@@ -808,7 +810,7 @@ async def test_n3_inactive_lease_reserves_slot():
     With N=3, session A has an inactive lease, sessions B and C fill
     the remaining slots, session D is blocked.
     """
-    from proxy.router_helpers import _try_acquire_local_dispatch, _decrement_local_active_queries
+    from proxy.router_helpers import _decrement_local_active_queries, _try_acquire_local_dispatch
 
     srv = SimpleNamespace(
         config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
@@ -910,8 +912,9 @@ async def test_get_local_max_concurrent_queries_reads_session_slot_pool_size():
 @pytest.mark.asyncio
 async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypatch):
     """With N=2 and two active sessions, a third is blocked via proxy_to_local."""
-    from proxy import server as srv
     from proxy.router import proxy_to_local
+
+    from proxy import server as srv
 
     # Config: N=2 via session_slot_pool_size (also set local_max_concurrent_queries
     # for backward compat so tests work with both old and new code)
@@ -1007,8 +1010,9 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
 @pytest.mark.asyncio
 async def test_n2_integration_release_then_retry(monkeypatch):
     """After one session completes, a blocked session can acquire on retry."""
-    from proxy import server as srv
     from proxy.router import proxy_to_local
+
+    from proxy import server as srv
 
     monkeypatch.setattr(
         srv,
@@ -1100,8 +1104,9 @@ async def test_n2_integration_release_then_retry(monkeypatch):
 @pytest.mark.asyncio
 async def test_n1_backward_compat_integration(monkeypatch):
     """N=1 backward compat: single session proceeds, second session blocked."""
-    from proxy import server as srv
     from proxy.router import proxy_to_local
+
+    from proxy import server as srv
 
     monkeypatch.setattr(
         srv,

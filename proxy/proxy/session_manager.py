@@ -10,13 +10,14 @@ and are evicted from memory by a background cleanup task.
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
-import json
+from datetime import UTC, datetime
+from typing import Any
 
 logger = logging.getLogger("llama-proxy")
 
@@ -33,7 +34,7 @@ class Session:
     last_activity_at: float = field(default_factory=time.monotonic)
     message_count: int = 0
     # Stores the list of messages (role, content) tuples for delta computation
-    messages: List[Dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     # Tracks whether the session has been invalidated (e.g. due to message edit)
     invalidated: bool = False
     # Set to True after explicit backend restore evidence is observed.
@@ -70,16 +71,16 @@ class SessionManager:
 
     def __init__(self, ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS, cleanup_interval_seconds: float = 300.0):
         self.ttl_seconds = ttl_seconds
-        self._sessions: Dict[str, Session] = {}
+        self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_task: asyncio.Task | None = None
         self._cleanup_interval_seconds: float = cleanup_interval_seconds
         # Metrics
         self._sessions_created: int = 0
         self._sessions_expired: int = 0
         # Optional callback fired when a session is evicted (expired/invalidated/removed)
         # Signature: async def callback(session_id: str) -> None
-        self._eviction_callback: Optional[Callable[[str], Awaitable[None]]] = None
+        self._eviction_callback: Callable[[str], Awaitable[None]] | None = None
 
     # ----------------------------------------------------------------
     # Session lifecycle
@@ -110,8 +111,8 @@ class SessionManager:
             )
 
     async def get_or_create(
-        self, session_id: Optional[str] = None
-    ) -> Tuple[Session, bool]:
+        self, session_id: str | None = None
+    ) -> tuple[Session, bool]:
         """Return an existing session or create a new one.
 
         Args:
@@ -163,7 +164,7 @@ class SessionManager:
 
         return session, True
 
-    async def get(self, session_id: str) -> Optional[Session]:
+    async def get(self, session_id: str) -> Session | None:
         """Return a session by ID without creating one.
 
         Returns None if the session does not exist or has expired.
@@ -220,7 +221,7 @@ class SessionManager:
 
         return _to_notify is not None
 
-    async def list_sessions(self) -> List[Dict[str, Any]]:
+    async def list_sessions(self) -> list[dict[str, Any]]:
         """Return all active session IDs with their metadata.
 
         Returns a list of dicts with session info including
@@ -234,7 +235,7 @@ class SessionManager:
         now = time.monotonic()
         wall_now = time.time()
         monotonic_offset = wall_now - now
-        sessions: List[Dict[str, Any]] = []
+        sessions: list[dict[str, Any]] = []
         async with self._lock:
             expired_ids = []
             for sid, session in self._sessions.items():
@@ -244,7 +245,7 @@ class SessionManager:
                     # Convert monotonic timestamps to wall-clock ISO8601 for sorting
                     wall_last = monotonic_offset + session.last_activity_at
                     _wall_created = monotonic_offset + session.created_at
-                    response_time_str = datetime.fromtimestamp(wall_last, tz=timezone.utc).isoformat(timespec="seconds")
+                    response_time_str = datetime.fromtimestamp(wall_last, tz=UTC).isoformat(timespec="seconds")
                     sessions.append({
                         "session_id": sid,
                         "created_at": session.created_at,
@@ -268,9 +269,9 @@ class SessionManager:
 
     def compute_delta(
         self,
-        existing_messages: List[Dict[str, Any]],
-        incoming_messages: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], bool]:
+        existing_messages: list[dict[str, Any]],
+        incoming_messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Compute the delta (new messages) between existing and incoming.
 
         The incoming message list must start with the same messages as the
@@ -315,9 +316,9 @@ class SessionManager:
 
     def compute_delta_metrics(
         self,
-        existing_messages: List[Dict[str, Any]],
-        incoming_messages: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        existing_messages: list[dict[str, Any]],
+        incoming_messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Return deterministic payload metrics for full vs delta ingestion.
 
         The output is intended for tests/diagnostics and can be used to
@@ -339,7 +340,7 @@ class SessionManager:
         if full_payload_bytes > 0:
             reduction_ratio = max(0.0, min(1.0, 1.0 - (delta_payload_bytes / full_payload_bytes)))
 
-        reason: Optional[str] = None
+        reason: str | None = None
         mode = "delta"
         if not history_matches:
             mode = "full"
@@ -368,7 +369,7 @@ class SessionManager:
     async def update_messages(
         self,
         session_id: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> bool:
         """Update the session's message history with the full message list.
 
@@ -399,7 +400,7 @@ class SessionManager:
     async def append_messages(
         self,
         session_id: str,
-        new_messages: List[Dict[str, Any]],
+        new_messages: list[dict[str, Any]],
     ) -> bool:
         """Append new messages to the session's history.
 
@@ -497,7 +498,7 @@ class SessionManager:
     def total_sessions_expired(self) -> int:
         return self._sessions_expired
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """Return session metrics as a dict for observability."""
         return {
             "sessions_active": self.active_session_count,
@@ -505,7 +506,7 @@ class SessionManager:
             "sessions_expired_total": self.total_sessions_expired,
         }
 
-    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_session_info(self, session_id: str) -> dict[str, Any] | None:
         """Return session info as a dict without creating it.
 
         Returns None if session not found.

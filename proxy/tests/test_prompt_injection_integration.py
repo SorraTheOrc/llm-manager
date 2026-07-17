@@ -9,10 +9,8 @@ import json
 from unittest.mock import MagicMock
 
 import httpx
-import pytest
-
 import proxy.server as server
-
+import pytest
 
 # ---------------------------------------------------------------------------
 # Integration test: override mode
@@ -77,8 +75,8 @@ async def test_override_mode_injects_system_prompt(monkeypatch, tmp_path):
     client = httpx.AsyncClient(transport=transport)
     monkeypatch.setattr(server, '_http_client', client)
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "assistant",
@@ -216,8 +214,8 @@ async def test_prepend_mode_injects_system_prompt(monkeypatch, tmp_path):
     client = httpx.AsyncClient(transport=transport)
     monkeypatch.setattr(server, '_http_client', client)
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "code",
@@ -337,8 +335,8 @@ async def test_no_system_prompt_passes_through(monkeypatch):
     client = httpx.AsyncClient(transport=transport)
     monkeypatch.setattr(server, '_http_client', client)
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     original_messages = [
         {"role": "system", "content": "Be helpful."},

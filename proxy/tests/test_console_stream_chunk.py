@@ -1,7 +1,6 @@
 import io
 import logging
 import re
-
 from pathlib import Path
 
 import proxy.server as server

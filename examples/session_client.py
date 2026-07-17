@@ -23,7 +23,6 @@ import argparse
 import json
 import sys
 import time
-from typing import Optional
 
 try:
     import httpx
@@ -36,7 +35,7 @@ def make_request(
     url: str,
     messages: list[dict],
     model: str,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     stream: bool = False,
 ) -> tuple[dict, dict, float]:
     """Send a chat completion request with optional session header.
@@ -79,7 +78,7 @@ def make_request(
 
 
 def run_session_conversation(
-    url: str, model: str, turns: int, session_id: Optional[str] = None
+    url: str, model: str, turns: int, session_id: str | None = None
 ) -> None:
     """Run a multi-turn conversation using session-based incremental ingestion.
 

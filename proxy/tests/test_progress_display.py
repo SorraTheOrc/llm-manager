@@ -1,11 +1,10 @@
 """Tests for progress formatting and threshold-based logging."""
 
-import logging
 import io
+import logging
 import sys
-from proxy import server
-from proxy import lifecycle
 
+from proxy import lifecycle, server
 
 # ---------------------------------------------------------------------------
 # format_progress tests – clean log-friendly output (no ANSI, no \r)

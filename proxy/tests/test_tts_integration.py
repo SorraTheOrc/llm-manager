@@ -11,7 +11,6 @@ To run manually when tts-server is running:
 
 import httpx
 import pytest
-
 from proxy.server import app
 
 pytestmark = pytest.mark.tts_integration

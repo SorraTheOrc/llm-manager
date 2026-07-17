@@ -7,10 +7,8 @@ Verifies gating, response format, and content preview behavior.
 import json
 from unittest.mock import MagicMock
 
-import pytest
-
 import proxy.server as server
-
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helper to build a mock Request

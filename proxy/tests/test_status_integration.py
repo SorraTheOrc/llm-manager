@@ -6,6 +6,7 @@ server state, simulating model-switch and active-query scenarios.
 import asyncio
 import logging
 from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
 
@@ -204,7 +205,7 @@ async def test_status_query_timeout_fallback(transport):
         with patch.object(
             srv_module, "query_llama_status", new_callable=AsyncMock
         ) as mock_qls:
-            mock_qls.side_effect = asyncio.TimeoutError("slow")
+            mock_qls.side_effect = TimeoutError("slow")
             resp = await ac.get("/llama/local/status")
 
         assert resp.status_code == 200

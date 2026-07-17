@@ -8,10 +8,10 @@ proxy/proxy/metrics.py and instrumentation will emit values during streaming.
 import sys
 from unittest.mock import patch
 
-import pytest
 import httpx
-
 import proxy.metrics as metrics
+import pytest
+
 from proxy import server as server_module
 
 
@@ -45,6 +45,7 @@ def test_metrics_noop_when_prometheus_unavailable(monkeypatch):
         # Force reload to pick up fallback path
         try:
             import importlib
+
             import proxy.metrics as pm
             importlib.reload(pm)
             assert pm._enabled is False

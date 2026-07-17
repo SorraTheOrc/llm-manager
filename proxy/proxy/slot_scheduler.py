@@ -35,8 +35,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional
-
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +51,11 @@ class SlotState:
 
     slot_id: int
     state: Literal["Idle", "Owned"] = "Idle"
-    job_id: Optional[str] = None
-    job_assigned_at: Optional[float] = None
-    job_last_request_at: Optional[float] = None
+    job_id: str | None = None
+    job_assigned_at: float | None = None
+    job_last_request_at: float | None = None
     active_requests: int = 0
-    request_started_at: Optional[float] = None
+    request_started_at: float | None = None
 
 
 @dataclass
@@ -74,9 +73,9 @@ class AdmitResult:
     """Result of admitting a job to the scheduler."""
 
     kind: str  # "ASSIGNED", "QUEUED", "REJECTED_503"
-    slot_id: Optional[int] = None
-    position: Optional[int] = None
-    retry_after: Optional[float] = None
+    slot_id: int | None = None
+    position: int | None = None
+    retry_after: float | None = None
 
 
 # ===================================================================
@@ -108,18 +107,18 @@ class JobScheduler:
         if max_queue_depth < 1:
             raise ValueError("max_queue_depth must be >= 1")
 
-        self.slots: Dict[int, SlotState] = {
+        self.slots: dict[int, SlotState] = {
             i: SlotState(slot_id=i) for i in range(pool_size)
         }
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_depth)
-        self.active_jobs: Dict[str, int] = {}  # session_id → slot_id
-        self.slot_to_job: Dict[int, str] = {}  # slot_id → session_id
+        self.active_jobs: dict[str, int] = {}  # session_id → slot_id
+        self.slot_to_job: dict[int, str] = {}  # slot_id → session_id
         self.job_timeout = job_timeout
         self.queue_overflow_retry_after = queue_overflow_retry_after
         self.max_request_duration = max_request_duration
-        self._timeout_check_task: Optional[asyncio.Task] = None
+        self._timeout_check_task: asyncio.Task | None = None
         # Tracking for queued job removal (LP-0MQTHP828000JYM6)
-        self._queued_jobs: Dict[str, QueuedJob] = {}  # session_id -> QueuedJob
+        self._queued_jobs: dict[str, QueuedJob] = {}  # session_id -> QueuedJob
         self._cancelled_jobs: set[str] = set()  # session_ids marked for removal
 
         logger.info(
@@ -207,7 +206,7 @@ class JobScheduler:
         )
         return AdmitResult(kind="QUEUED", position=position)
 
-    async def reenter_job(self, session_id: str) -> Optional[int]:
+    async def reenter_job(self, session_id: str) -> int | None:
         """
         Called for subsequent requests from an active job.
 

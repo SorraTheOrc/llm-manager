@@ -18,12 +18,10 @@ are equivalent.
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 import proxy.server as server
+import pytest
 from proxy.router import proxy_to_local
 from proxy.slot_scheduler import AdmitResult
-
 
 pytestmark = pytest.mark.refactor_parity
 

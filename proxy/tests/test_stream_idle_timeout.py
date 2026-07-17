@@ -9,11 +9,11 @@ Tests cover:
 
 import asyncio
 import json
-from typing import AsyncGenerator, List
+from collections.abc import AsyncGenerator
+from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 
 # ===================================================================
 # Mock helpers
@@ -26,7 +26,7 @@ _HANG_SENTINEL = object()
 class _HangAsyncIterator:
     """An async iterator that yields given items then hangs forever."""
 
-    def __init__(self, items: List[bytes]):
+    def __init__(self, items: list[bytes]):
         self._items = list(items)
 
     def __aiter__(self):
@@ -54,7 +54,7 @@ class _EmptyHangAsyncIterator:
 class _HangIterator:
     """Async iterator that yields given items, then blocks forever."""
 
-    def __init__(self, items: List[bytes], prefill_delay: float = 0.0):
+    def __init__(self, items: list[bytes], prefill_delay: float = 0.0):
         self._items = list(items)
         self._prefill_delay = prefill_delay
         self._done_prefill = False
@@ -78,7 +78,7 @@ class _HangIterator:
 class MockHangAfterChunksResponse:
     """aiter_bytes yields given chunks then hangs via custom iterator."""
 
-    def __init__(self, chunks: List[str], prefill_delay: float = 0.0):
+    def __init__(self, chunks: list[str], prefill_delay: float = 0.0):
         self.chunks = chunks
         self.prefill_delay = prefill_delay
         self.status_code = 200
@@ -100,7 +100,7 @@ class MockHangAfterChunksResponse:
 class MockNormalStreamResponse:
     """Simulates a normal httpx response that ends with [DONE]."""
 
-    def __init__(self, chunks: List[str]):
+    def __init__(self, chunks: list[str]):
         self.chunks = chunks
         self.status_code = 200
         self.headers = {"content-type": "text/event-stream"}
@@ -172,7 +172,7 @@ def _make_config(
     }
 
 
-async def _collect_stream(resp) -> List[str]:
+async def _collect_stream(resp) -> list[str]:
     """Collect all chunks from a streaming response as strings."""
     collected = []
     async for chunk in resp.body_iterator:
@@ -201,8 +201,9 @@ async def _make_mock_request(body: dict):
 
 def _setup_basic_mocks(monkeypatch):
     """Set up the common server state mocks needed for proxy_to_local."""
-    from proxy import server as srv_module
     import proxy.router as router_mod
+
+    from proxy import server as srv_module
 
     monkeypatch.setattr(srv_module, "llama_process", MagicMock())
     monkeypatch.setattr(srv_module, "backend_ready", True)

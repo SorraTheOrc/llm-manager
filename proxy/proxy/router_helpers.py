@@ -16,7 +16,8 @@ Includes:
 import asyncio
 import json
 import time
-from typing import Any, Dict, Optional, Mapping, Union
+from collections.abc import Mapping
+from typing import Any
 
 import httpx
 from fastapi import HTTPException, Request
@@ -35,7 +36,7 @@ def _srv():
 # Request/response logging helpers
 # ===================================================================
 
-def _get_request_preview(body_json: Optional[Union[dict, bytes]]) -> str:
+def _get_request_preview(body_json: dict | bytes | None) -> str:
     """Extract the first 80 characters of the first non-system user message.
 
     Parses the JSON body to find the first message whose ``role`` is not
@@ -119,8 +120,8 @@ def log_request(
     source: str,
     endpoint: str = "",
     *,
-    session_id: Optional[str] = None,
-    slot_id: Optional[str] = "none",
+    session_id: str | None = None,
+    slot_id: str | None = "none",
 ) -> None:
     """Log incoming request details.
 
@@ -202,10 +203,10 @@ def log_response(status_code: int, content: bytes) -> None:
 
 def log_response_chunk(
     chunk: bytes,
-    session_id: Optional[str] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    body_json: Optional[Union[dict, bytes]] = None,
+    session_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    body_json: dict | bytes | None = None,
 ) -> None:
     """Log streaming response chunk.
 
@@ -297,7 +298,7 @@ _HOP_BY_HOP_REQUEST_HEADERS = {
 }
 
 
-def normalize_upstream_request_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+def normalize_upstream_request_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """Normalize inbound headers before proxying to upstream/local backends.
 
     Removes hop-by-hop transport headers that can produce malformed upstream
@@ -319,7 +320,7 @@ def normalize_upstream_request_headers(headers: Mapping[str, str]) -> Dict[str, 
             except Exception:
                 pass
 
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for k, v in headers.items():
         lk = str(k).lower()
         if lk in ("host", "content-length"):
@@ -362,11 +363,11 @@ def _call_with_empty_retry(*args, **kwargs):
 def _build_backend_error_response(
     srv,
     path: str,
-    session_id: Optional[str],
+    session_id: str | None,
     session_created: bool,
     is_delta_request: bool,
-    session_fallback_reason: Optional[str],
-    retry_after: Optional[int] = None,
+    session_fallback_reason: str | None,
+    retry_after: int | None = None,
 ) -> JSONResponse:
     """Build a 503 error response with session information headers.
     
@@ -376,7 +377,7 @@ def _build_backend_error_response(
     if retry_after is None:
         from proxy.backend_health import _self_heal_retry_after_seconds
         retry_after = _self_heal_retry_after_seconds()
-    
+
     headers = {
         "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
@@ -387,7 +388,7 @@ def _build_backend_error_response(
         headers["X-Session-Delta"] = "true" if is_delta_request else "false"
         if session_fallback_reason:
             headers["X-Session-Fallback-Reason"] = session_fallback_reason
-    
+
     payload = {
         "error": {
             "type": "backend_error",
@@ -411,11 +412,11 @@ def _build_backend_unavailable_response(
     """
     from proxy.backend_health import _self_heal_retry_after_seconds
     from proxy.metrics import record_http_error
-    
+
     retry_after = _self_heal_retry_after_seconds()
     # Backend not ready or process missing — record 5xx with reason "backend_unavailable"
     record_http_error("v1/chat/completions", "5xx", "backend_unavailable")
-    
+
     return JSONResponse(
         status_code=503,
         content={
@@ -437,7 +438,7 @@ def _build_slot_exhaustion_response(
 ) -> JSONResponse:
     """Build a 503 response when all llama-server slots are busy."""
     from proxy.metrics import record_http_error
-    
+
     retry_after = int(
         server_config.get("slot_unavailable_retry_after", 5) or 5
     )
@@ -498,7 +499,7 @@ def _get_lease_timeout_seconds(srv) -> float:
 
 def _get_adaptive_lease_timeout_seconds(
     srv,
-    body_json: Optional[dict] = None,
+    body_json: dict | None = None,
 ) -> float:
     """Return an adaptive lease timeout based on estimated prompt tokens.
 
@@ -541,7 +542,7 @@ def _get_adaptive_lease_timeout_seconds(
 
 async def _decrement_local_active_queries(
     srv,
-    session_key: Optional[str] = None,
+    session_key: str | None = None,
 ) -> None:
     """Safely decrement the local-only active queries counter.
 
@@ -605,8 +606,8 @@ async def _decrement_local_active_queries(
 
 async def _increment_local_active_queries(
     srv,
-    session_key: Optional[str] = None,
-    backend: Optional[str] = None,
+    session_key: str | None = None,
+    backend: str | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
@@ -641,7 +642,7 @@ async def _try_acquire_local_dispatch(
     max_local: int,
     session_key: str,
     backend: str,
-    body_json: Optional[dict] = None,
+    body_json: dict | None = None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -995,15 +996,15 @@ async def _handle_session(
     session_fallback_reason, delta_messages, and updated body_json/body.
     """
     from proxy.session import (
-        _resolve_session_id_header,
-        _log_session_header_resolution,
+        _build_slot_context,
         _classify_delta_routing,
+        _invalidate_session_and_slot,
+        _log_session_header_resolution,
         _record_delta_payload_bytes,
         _record_restore_fallback,
-        _build_slot_context,
-        _invalidate_session_and_slot,
+        _resolve_session_id_header,
     )
-    
+
     result = {
         "session_id": None,
         "session_id_header": None,
@@ -1016,24 +1017,24 @@ async def _handle_session(
         "original_message_count": 0,
         "session_explicit": False,
     }
-    
+
     session_id_header, session_header_source = _resolve_session_id_header(
         request_headers
     )
     result["session_id_header"] = session_id_header
     result["session_explicit"] = session_id_header is not None
-    
+
     if isinstance(body_json, dict) and "messages" in body_json:
         result["original_message_count"] = len(body_json["messages"])
         _log_session_header_resolution(session_id_header, session_header_source)
-        
+
         try:
             session, session_created = await srv.session_manager.get_or_create(
                 session_id_header
             )
             result["session_id"] = session.session_id
             result["session_created"] = session_created
-            
+
             if not session_created and session.message_count > 0:
                 delta_messages, history_matches = srv.session_manager.compute_delta(
                     session.messages, body_json["messages"]
@@ -1052,7 +1053,7 @@ async def _handle_session(
                 result["is_delta_request"] = is_delta_request
                 result["session_fallback_reason"] = session_fallback_reason
                 result["delta_messages"] = delta_messages
-                
+
                 if is_delta_request:
                     body_json["messages"] = list(delta_messages)
                     try:
@@ -1095,7 +1096,7 @@ async def _handle_session(
                     )
             elif session_created:
                 result["session_fallback_reason"] = "no_existing_history"
-            
+
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True
             body_json["session_id"] = result["session_id"]
@@ -1110,7 +1111,7 @@ async def _handle_session(
             result["session_fallback_reason"] = "session_handling_error"
     else:
         result["session_id"] = None
-    
+
     return result
 
 
@@ -1136,7 +1137,7 @@ def _should_force_full_prompt_from_config(
 # ===================================================================
 
 def _estimate_tokens_sent(
-    body: bytes, body_json: dict, model_name: Optional[str]
+    body: bytes, body_json: dict, model_name: str | None
 ) -> dict:
     """Estimate tokens sent in the request body, broken down by category.
 
@@ -1304,17 +1305,17 @@ async def _check_slot_availability(
     srv,
     server_config: dict,
     llama_port: int,
-    slot_model_name: Optional[str],
-    model_name: Optional[str],
+    slot_model_name: str | None,
+    model_name: str | None,
     path: str,
-) -> Optional[JSONResponse]:
+) -> JSONResponse | None:
     """Check llama-server slot availability.
     
     Returns a 503 JSONResponse if no slots are available, None otherwise.
     """
     if not (path == "v1/chat/completions" or path.endswith("chat/completions")):
         return None
-    
+
     try:
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
@@ -1345,7 +1346,7 @@ async def _check_slot_availability(
         raise
     except Exception:
         pass  # best effort
-    
+
     return None
 
 
@@ -1427,11 +1428,11 @@ def _compute_request_timeout(
 
 def _schedule_traffic_recording(
     session_id: str,
-    client_payload: Optional[Any] = None,
-    proxy_payload: Optional[Any] = None,
-    response_payload: Optional[Any] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
+    client_payload: Any | None = None,
+    proxy_payload: Any | None = None,
+    response_payload: Any | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> None:
     """Schedule fire-and-forget recording of session traffic.
 

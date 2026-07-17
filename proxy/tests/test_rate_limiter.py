@@ -14,9 +14,7 @@ import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from proxy.rate_limiter import SlidingWindowRateLimiter, get_rate_limiter
-
 
 # ---------------------------------------------------------------------------
 # SlidingWindowRateLimiter unit tests

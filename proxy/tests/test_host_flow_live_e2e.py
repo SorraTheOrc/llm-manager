@@ -9,9 +9,9 @@ Run manually:
 """
 
 import os
+
 import pytest
 import requests
-
 
 pytestmark = [pytest.mark.integration, pytest.mark.live]
 

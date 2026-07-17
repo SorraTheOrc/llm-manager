@@ -27,11 +27,11 @@ Structured error format (all 502 responses follow the same pattern):
     }
 """
 
+import struct
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-import struct
 
 pytestmark = pytest.mark.refactor_parity
 

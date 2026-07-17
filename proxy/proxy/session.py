@@ -15,7 +15,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
 
@@ -177,7 +177,7 @@ def _detect_restore_signal_from_log_slice(
     if not log_path.exists():
         return False
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
             f.seek(max(0, int(start_offset)))
             data = f.read()
     except Exception:
@@ -199,8 +199,8 @@ def _detect_restore_signal_from_log_slice(
 
 
 def _detect_restore_signal_from_llama_log(
-    session_id: Optional[str],
-    log_path: Optional[Path] = None,
+    session_id: str | None,
+    log_path: Path | None = None,
     lookback_lines: int = 400,
 ) -> bool:
     """Best-effort compatibility signal from llama-server logs.
@@ -217,7 +217,7 @@ def _detect_restore_signal_from_llama_log(
         return False
 
     try:
-        with open(target_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(target_path, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()[-max(1, int(lookback_lines)):]
     except Exception:
         return False
@@ -276,7 +276,7 @@ def _resolve_log_path(source: str = "proxy") -> Path:
 # ===================================================================
 
 
-def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
+def extract_streamed_content_from_chunk(chunk_str: str) -> str | None:
     """Extract concatenated delta.content and delta.reasoning_content strings
     from an SSE chunk.
 
@@ -341,7 +341,7 @@ def extract_streamed_content_from_chunk(chunk_str: str) -> Optional[str]:
 
 def extract_streamed_assistant_message_from_sse(
     sse_text: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Reconstruct an assistant message from streaming SSE text.
 
     Collects ``content``, ``reasoning_content``, and streamed ``tool_calls``
@@ -353,9 +353,9 @@ def extract_streamed_assistant_message_from_sse(
 
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
-    tool_calls_by_index: dict[int, Dict[str, Any]] = {}
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
 
-    def _merge_tool_call(target: Dict[str, Any], delta: Dict[str, Any]) -> None:
+    def _merge_tool_call(target: dict[str, Any], delta: dict[str, Any]) -> None:
         if not isinstance(delta, dict):
             return
         if delta.get("id") and not target.get("id"):
@@ -419,7 +419,7 @@ def extract_streamed_assistant_message_from_sse(
     if not (content_parts or reasoning_parts or tool_calls_by_index):
         return None
 
-    assistant_message: Dict[str, Any] = {"role": "assistant"}
+    assistant_message: dict[str, Any] = {"role": "assistant"}
     if content_parts:
         assistant_message["content"] = "".join(content_parts)
     if reasoning_parts:
@@ -473,7 +473,7 @@ class ContentOnlyConsoleHandler(logging.StreamHandler):
 # ===================================================================
 
 
-def _ensure_slot_dir(slot_path: Optional[str]) -> Optional[Path]:
+def _ensure_slot_dir(slot_path: str | None) -> Path | None:
     if not slot_path:
         return None
     try:
@@ -484,7 +484,7 @@ def _ensure_slot_dir(slot_path: Optional[str]) -> Optional[Path]:
         return None
 
 
-def _slot_persistence_enabled(slot_path: Optional[Path | str], slot_pool_size: int) -> bool:
+def _slot_persistence_enabled(slot_path: Path | str | None, slot_pool_size: int) -> bool:
     return bool(slot_path and slot_pool_size > 0)
 
 
@@ -505,7 +505,7 @@ async def _call_slot_endpoint(
     action: str,
     filename: str,
     timeout: float,
-    model: Optional[str] = None,
+    model: str | None = None,
 ) -> bool:
     """Make a slot save/restore HTTP call to llama-server.
 
@@ -571,7 +571,7 @@ async def _restore_slot_snapshot(
     slot_id: int,
     filename: str,
     timeout: float,
-    model: Optional[str] = None,
+    model: str | None = None,
 ) -> bool:
     try:
         if not Path(filename).exists():
@@ -593,7 +593,7 @@ async def _save_slot_snapshot(
     slot_id: int,
     filename: str,
     timeout: float,
-    model: Optional[str] = None,
+    model: str | None = None,
 ) -> bool:
     return await _call_slot_endpoint(
         llama_port,
@@ -616,7 +616,7 @@ def _sanitize_session_id(session_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id)
 
 
-def _slot_id_for_session(session_id: str, pool_size: int) -> Optional[int]:
+def _slot_id_for_session(session_id: str, pool_size: int) -> int | None:
     if not session_id or pool_size <= 0:
         return None
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
@@ -630,8 +630,8 @@ def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
 
 def _build_slot_context(
     server_config: dict,
-    session_id: Optional[str],
-) -> tuple[Optional[int], Optional[str], float]:
+    session_id: str | None,
+) -> tuple[int | None, str | None, float]:
     slot_path = server_config.get("session_slot_save_path")
     slot_pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
     slot_timeout = float(server_config.get("session_slot_timeout_seconds", 3.0) or 3.0)
@@ -645,11 +645,11 @@ def _build_slot_context(
 
 
 async def _invalidate_session_and_slot(
-    session_id: Optional[str],
+    session_id: str | None,
     reason: str,
-    slot_filename: Optional[str],
-    scheduler: Optional[Any] = None,
-    scheduler_slot_id: Optional[int] = None,
+    slot_filename: str | None,
+    scheduler: Any | None = None,
+    scheduler_slot_id: int | None = None,
 ) -> None:
     """
     Invalidate a session, clean up its slot file, and optionally release
@@ -732,13 +732,13 @@ class SlotLockCoordinator:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._locks: dict[int, asyncio.Lock] = {}
-        self._scheduler: Optional[Any] = None
+        self._scheduler: Any | None = None
 
     def set_scheduler(self, scheduler: Any) -> None:
         """Inject a JobScheduler instance (called at startup)."""
         self._scheduler = scheduler
 
-    def acquire(self, slot_id: Optional[int]):
+    def acquire(self, slot_id: int | None):
         @asynccontextmanager
         async def _guard():
             if slot_id is None:
@@ -785,7 +785,7 @@ class SessionSingleFlightCoordinator:
                 self._states[session_id] = state
             return state
 
-    def acquire(self, session_id: Optional[str], mode: str, max_queue_depth: int):
+    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int):
         @asynccontextmanager
         async def _guard():
             if not session_id:
@@ -871,10 +871,10 @@ def _should_cutoff_for_repetition(
 
 
 def _evaluate_token_rate_guardrail(
-    chunk_history: List[Tuple[float, str]],
+    chunk_history: list[tuple[float, str]],
     max_token_rate: int,
     window_seconds: int,
-    model_name: Optional[str] = None,
+    model_name: str | None = None,
 ) -> bool:
     """Evaluate whether token generation rate exceeds threshold over a rolling window.
 
@@ -930,15 +930,15 @@ def evaluate_stream_guardrail(
     runtime_seconds: float,
     completion_tokens: int,
     response_text: str,
-    max_runtime_seconds: Optional[float],
-    max_completion_tokens: Optional[int],
+    max_runtime_seconds: float | None,
+    max_completion_tokens: int | None,
     repetition_min_pattern_chars: int,
     repetition_min_repeats: int,
     # Token-rate guardrail parameters (new in token-rate feature)
-    chunk_history: Optional[List[Tuple[float, str]]] = None,
+    chunk_history: list[tuple[float, str]] | None = None,
     max_token_rate: int = 0,
     token_rate_window_seconds: int = 5,
-) -> Optional[str]:
+) -> str | None:
     """Evaluate whether the stream should be stopped due to guardrail violations.
 
     Priority order:
@@ -965,7 +965,7 @@ def evaluate_stream_guardrail(
 
 
 def _should_invalidate_on_guardrail(
-    guardrail_reason: Optional[str],
+    guardrail_reason: str | None,
     invalidate_on_cutoff: bool,
     invalidate_on_repetition: bool,
 ) -> bool:
@@ -997,13 +997,13 @@ def _should_invalidate_on_guardrail(
 
 
 def merge_session_history_for_update(
-    existing_messages: List[Dict[str, Any]],
-    request_messages: List[Dict[str, Any]],
-    delta_messages: Optional[List[Dict[str, Any]]],
+    existing_messages: list[dict[str, Any]],
+    request_messages: list[dict[str, Any]],
+    delta_messages: list[dict[str, Any]] | None,
     is_delta_request: bool,
-    assistant_content: Optional[str],
-    assistant_message: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    assistant_content: str | None,
+    assistant_message: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if is_delta_request and delta_messages:
         merged = list(existing_messages) + list(delta_messages)
     else:
@@ -1032,7 +1032,7 @@ def _classify_delta_routing(
     restore_confirmed: bool,
     require_restore_signal: bool = True,
     force_full_prompt: bool = False,
-) -> Tuple[bool, Optional[str]]:
+) -> tuple[bool, str | None]:
     """Decide whether to use delta routing.
 
     When ``require_restore_signal`` is True, delta routing requires explicit
@@ -1068,8 +1068,8 @@ def _classify_delta_routing(
 
 
 def _has_explicit_restore_signal(
-    response_headers: Dict[str, str],
-    response_json: Optional[Dict[str, Any]] = None,
+    response_headers: dict[str, str],
+    response_json: dict[str, Any] | None = None,
 ) -> bool:
     """Return True only when explicit backend restore evidence is present."""
     header_candidates = {
@@ -1105,7 +1105,7 @@ def _has_explicit_restore_signal(
 
 def _resolve_session_id_header(
     headers: dict,
-) -> Tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """Resolve a session identifier from request headers.
 
     Priority order:
@@ -1124,8 +1124,8 @@ def _resolve_session_id_header(
 
 
 def _log_session_header_resolution(
-    session_id_header: Optional[str],
-    header_source: Optional[str],
+    session_id_header: str | None,
+    header_source: str | None,
 ) -> None:
     """Log whether a session header was provided on the request."""
     try:

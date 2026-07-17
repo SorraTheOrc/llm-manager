@@ -16,7 +16,6 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import httpx
 import pytest
 from fastapi.responses import StreamingResponse
-
 from proxy.slot_scheduler import JobScheduler
 
 

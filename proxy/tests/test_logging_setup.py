@@ -9,7 +9,6 @@ import logging
 from pathlib import Path
 
 
-
 def test_logging_fallback_path_resolves_to_proxy_logs():
     """When PermissionError occurs, fallback should resolve to proxy/logs,
     not proxy/proxy/logs (LP-0MRB2ABNX008SF9P)."""

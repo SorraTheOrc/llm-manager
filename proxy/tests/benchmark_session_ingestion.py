@@ -36,7 +36,7 @@ def send_chat_request(
     url: str,
     messages: list[dict],
     model: str,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     stream: bool = False,
 ) -> tuple[dict, dict, float]:
     """Send a chat completion request and measure elapsed time.

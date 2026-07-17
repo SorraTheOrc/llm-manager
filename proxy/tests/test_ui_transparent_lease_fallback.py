@@ -146,8 +146,8 @@ async def test_proxy_with_fallback_lease_active_routes_to_remote(monkeypatch):
     chain routes to the remote provider and returns its 200 response.
     """
     srv_module = _setup_server_state(monkeypatch)
-    from proxy.provider import proxy_with_fallback
     import proxy.router as router_mod
+    from proxy.provider import proxy_with_fallback
 
     _seed_other_session_lease(srv_module)
 
@@ -213,8 +213,8 @@ async def test_proxy_with_fallback_lease_active_no_remote_503(monkeypatch):
     remote providers configured, the response includes lease-active diagnostics.
     """
     srv_module = _setup_server_state(monkeypatch)
-    from proxy.provider import proxy_with_fallback
     import proxy.router as router_mod
+    from proxy.provider import proxy_with_fallback
 
     _seed_other_session_lease(srv_module)
 

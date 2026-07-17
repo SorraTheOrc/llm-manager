@@ -10,11 +10,9 @@ import json
 from unittest.mock import MagicMock
 
 import httpx
-import pytest
-
 import proxy.server as server
+import pytest
 from proxy.lifecycle import get_model_config
-
 
 # ---------------------------------------------------------------------------
 # Fixture: a minimal config that includes plan/code aliases on qwen3-next
@@ -267,8 +265,8 @@ async def test_plan_alias_routes_to_qwen3_next(monkeypatch, alias_config):
     import proxy.router as proxy_router
     monkeypatch.setattr(proxy_router, 'proxy_to_local', fake_proxy_to_local)
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "plan",
@@ -340,8 +338,8 @@ async def test_code_alias_routes_to_qwen3_next(monkeypatch, alias_config):
     import proxy.router as proxy_router
     monkeypatch.setattr(proxy_router, 'proxy_to_local', fake_proxy_to_local)
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "code",
@@ -414,8 +412,8 @@ async def test_plan_alias_resolves_model_name(monkeypatch, alias_config):
     import proxy.router as proxy_router
     monkeypatch.setattr(proxy_router, 'proxy_to_local', fake_proxy_to_local)
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "plan",

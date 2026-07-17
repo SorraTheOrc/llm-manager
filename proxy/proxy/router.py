@@ -14,11 +14,11 @@ Functions in this module:
 import asyncio
 import json
 import time
-from typing import Optional
 
 import httpx
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+
 
 # Lazy server import — avoids circular imports when server.py imports us
 def _srv():
@@ -26,11 +26,16 @@ def _srv():
     return _m
 
 # Imports from sibling extracted modules
+import proxy.metrics as metrics  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
-    _is_self_healing_active,
-    _self_healing_response,
-    _resolve_slot_model_name,
     _compute_adaptive_timeout,
+    _is_self_healing_active,
+    _resolve_slot_model_name,
+    _self_healing_response,
+)
+from proxy.observability import (  # noqa: E402
+    _increment_tokens,
+    _record_backend_signal,
 )
 from proxy.session import (  # noqa: E402
     SessionSingleFlightRejected,
@@ -38,25 +43,22 @@ from proxy.session import (  # noqa: E402
     _detect_restore_signal_from_llama_log,
     _detect_restore_signal_from_log_slice,
     _has_explicit_restore_signal,
-    _restore_slot_snapshot,
-    _save_slot_snapshot,
     _record_guardrail_cutoff,
     _record_restore_success,
-    evaluate_stream_guardrail,
+    _restore_slot_snapshot,
+    _save_slot_snapshot,
     _should_invalidate_on_guardrail,
+    evaluate_stream_guardrail,
     extract_streamed_assistant_message_from_sse,
     merge_session_history_for_update,
     session_single_flight_coordinator,
     slot_lock_coordinator,
 )
-from proxy.observability import (  # noqa: E402
-    _increment_tokens,
-    _record_backend_signal,
-)
-import proxy.metrics as metrics  # noqa: E402
+
 # legacy alias for convenience
 record_http_error = metrics.record_http_error
 
+from proxy.slot_scheduler import AdmitResult, JobScheduler  # noqa: E402
 from proxy.utils import (  # noqa: E402
     _extract_assistant_content,
     _extract_assistant_content_from_sse,
@@ -64,17 +66,18 @@ from proxy.utils import (  # noqa: E402
     count_text_tokens,
 )
 
-from proxy.slot_scheduler import JobScheduler, AdmitResult  # noqa: E402
-
 # Imports from sibling router helpers
-from .router_helpers import (  # noqa: E402
+from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _build_backend_error_response,
     _build_backend_unavailable_response,
+    _call_with_backend_retries,
+    _call_with_empty_retry,
     _check_slot_availability,
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
     _estimate_tokens_sent,
+    _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
@@ -82,30 +85,23 @@ from .router_helpers import (  # noqa: E402
     _normalize_outgoing_headers,
     _schedule_recv_token_increment,
     _schedule_token_increment,
+    _schedule_traffic_recording,
     _try_acquire_local_dispatch,
-    _get_lease_timeout_seconds,
-    _call_with_backend_retries,
-    _call_with_empty_retry,
-    normalize_upstream_request_headers,
     log_request,
     log_response,
     log_response_chunk,
+    normalize_upstream_request_headers,
 )
-
-from .router_helpers import (  # noqa: E402, F401
-    _schedule_traffic_recording,
-)
-
 
 # ===================================================================
 # Job-level slot scheduler (global, lazy-initialized from config)
 # ===================================================================
 
-_job_scheduler: Optional[JobScheduler] = None
+_job_scheduler: JobScheduler | None = None
 _job_scheduler_initialized: bool = False
 
 
-def _get_job_scheduler() -> Optional[JobScheduler]:
+def _get_job_scheduler() -> JobScheduler | None:
     """
     Return the global JobScheduler, initialising it from config on first call.
     Returns None if slot management is not configured.
@@ -227,10 +223,10 @@ def _get_local_active_count(srv) -> int:
 
 
 def _build_session_headers(
-    session_id: Optional[str],
+    session_id: str | None,
     session_created: bool,
     is_delta_request: bool,
-    session_fallback_reason: Optional[str],
+    session_fallback_reason: str | None,
 ) -> dict:
     """Build the X-Session-* response headers common to both paths."""
     headers = {}
@@ -283,21 +279,21 @@ def _get_guardrail_config(server_config: dict) -> dict:
 
 async def _update_session_and_slot(
     srv,
-    session_id: Optional[str],
+    session_id: str | None,
     body_json: dict,
     is_delta_request: bool,
     delta_messages: list,
     original_message_count: int,
     response,
     llama_port: int,
-    slot_id: Optional[str],
-    slot_filename: Optional[str],
+    slot_id: str | None,
+    slot_filename: str | None,
     slot_timeout: float,
-    slot_model_payload: Optional[str],
+    slot_model_payload: str | None,
     slot_enabled: bool,
     upstream_status: int,
     slot_save_allowed: bool = True,
-    collected_content: Optional[list] = None,
+    collected_content: list | None = None,
     llama_log_path=None,
     llama_log_offset: int = 0,
 ) -> None:
@@ -433,8 +429,8 @@ async def _update_session_and_slot(
 async def _release_scheduler_and_decrement(
     srv,
     scheduler,
-    session_id: Optional[str],
-    slot_id: Optional[int],
+    session_id: str | None,
+    slot_id: int | None,
     disconnected: bool = False,
     decrement_local: bool = True,
     session_explicit: bool = False,
@@ -788,7 +784,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
 
-    from proxy.session import _resolve_log_path  # noqa: E402
+    from proxy.session import _resolve_log_path
     llama_log_path = _resolve_log_path("llama")
     try:
         llama_log_offset = (
@@ -951,7 +947,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         "content-type", "text/event-stream"
                     )
 
-                    guardrail_reason: Optional[str] = None
+                    guardrail_reason: str | None = None
                     guardrail_response_text = ""
                     completion_tokens_total = 0
                     stream_start = time.monotonic()
@@ -1290,7 +1286,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 }
                                 final_bytes = (
                                     f"data: {json.dumps(final_obj)}\n\n"
-                                ).encode("utf-8")
+                                ).encode()
                                 yield final_bytes
                                 log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
@@ -1321,7 +1317,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             }
                             final_bytes = (
                                 f"data: {json.dumps(final_obj)}\n\n"
-                            ).encode("utf-8")
+                            ).encode()
                             yield final_bytes
                             log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
@@ -1362,11 +1358,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     cm.__aexit__(None, None, None),
                                     timeout=disconnect_cleanup_timeout,
                                 )
-                            except (asyncio.TimeoutError, Exception):
+                            except (TimeoutError, Exception):
                                 pass
                             try:
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
-                            except (asyncio.TimeoutError, Exception):
+                            except (TimeoutError, Exception):
                                 pass
                             # Clean up the pending _stream_iter future if the
                             # stream_generator used FIRST_COMPLETED waiting.
@@ -1616,11 +1612,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             return JSONResponse(status_code=429, content=payload)
 
 # Backward-compatibility re-exports for tests
-from .router_helpers import (  # noqa: E402, F401, F811
-    log_request,  # noqa: F811
-    log_response,  # noqa: F811
-    log_response_chunk,  # noqa: F811
-)
 from .proxy_remote import (  # noqa: E402, F401
     proxy_to_remote,
+)
+from .router_helpers import (  # noqa: E402, F811
+    log_request,
+    log_response,
+    log_response_chunk,
 )

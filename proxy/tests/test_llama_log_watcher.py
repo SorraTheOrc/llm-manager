@@ -1,16 +1,17 @@
 """Unit tests for the llama-server log watcher (unload_lru event monitoring)."""
 
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import importlib
+
 lifecycle = importlib.import_module("proxy.lifecycle")
 from proxy.lifecycle import (
+    _check_unload_lru_threshold,
     _parse_unload_lru,
     _UnloadLruTracker,
-    _check_unload_lru_threshold,
 )
 
 

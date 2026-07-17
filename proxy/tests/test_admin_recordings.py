@@ -10,11 +10,10 @@ Covers:
 """
 
 import json
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-
+import pytest
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Fixtures
@@ -282,14 +281,15 @@ class TestRouteRegistration:
 
     def test_handler_importable(self):
         """The admin recording handler functions are importable from ui.py."""
-        from proxy.ui import list_session_recordings, get_session_recording
+        from proxy.ui import get_session_recording, list_session_recordings
         assert callable(list_session_recordings)
         assert callable(get_session_recording)
 
     def test_handler_signatures_accept_session_id(self):
         """Handlers accept session_id (and optionally filename) parameters."""
         import inspect
-        from proxy.ui import list_session_recordings, get_session_recording
+
+        from proxy.ui import get_session_recording, list_session_recordings
 
         # list_session_recordings should accept session_id
         sig1 = inspect.signature(list_session_recordings)
@@ -313,12 +313,12 @@ class TestRouteRegistration:
 
     def test_response_return_type(self):
         """Handler return types are compatible with FastAPI JSONResponse."""
-        from proxy.ui import list_session_recordings
-
         # The handlers should be annotated or documented as returning JSONResponse
         # We verify by checking that a call would produce a JSONResponse-shaped result
         # (more detailed integration tests verify the actual response)
         import inspect
+
+        from proxy.ui import list_session_recordings
         return_annotation = inspect.signature(list_session_recordings).return_annotation
         # The annotation could be JSONResponse, dict, or unspecified
         # This is a soft check — the actual response type is verified in integration tests
@@ -360,7 +360,7 @@ class TestErrorHandling:
             recorder = SessionRecorder(recording_path=str(restricted))
             sessions = recorder.list_sessions()
             assert sessions == []
-    
+
             recordings = recorder.get_recordings_list("any-session")
             assert recordings == []
         finally:

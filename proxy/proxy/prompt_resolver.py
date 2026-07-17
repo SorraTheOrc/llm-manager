@@ -21,7 +21,6 @@ No caching: files are read on every resolve_system_prompt() call.
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("llama-proxy")
 
@@ -83,7 +82,7 @@ def validate_prompt_config(model_cfg: dict) -> None:
 def resolve_system_prompt(
     alias: str,
     model_cfg: dict,
-) -> Optional[dict]:
+) -> dict | None:
     """Resolve and load a system prompt for the given alias/model.
 
     Args:
@@ -197,7 +196,7 @@ def _resolve_candidates(
 
 def compose_messages(
     messages: list,
-    prompt_result: Optional[dict],
+    prompt_result: dict | None,
 ) -> list:
     """Apply a resolved system prompt to a list of chat messages.
 

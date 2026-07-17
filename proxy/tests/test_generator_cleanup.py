@@ -19,7 +19,6 @@ import httpx
 import pytest
 from fastapi.responses import StreamingResponse
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -356,6 +355,7 @@ async def test_router_proxy_aclose_cleanup_no_runtime_error():
     """
     import ast
     import inspect
+
     from proxy import router as router_mod
 
     # Read the source to verify no yield in finally in router.py

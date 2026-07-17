@@ -15,10 +15,8 @@ Tests cover:
 import asyncio
 import time
 
-import pytest
-
 import proxy.provider as provider_mod
-
+import pytest
 
 # ===================================================================
 # Test helpers
@@ -521,10 +519,9 @@ def test_stall_circuit_breaker_is_singleton(monkeypatch):
     instance on repeated access.
     """
     # First import
-    from proxy.stall_circuit_breaker import stall_circuit_breaker as cb1
-
     # Re-import should give same instance
     import proxy.stall_circuit_breaker as scb_mod
+    from proxy.stall_circuit_breaker import stall_circuit_breaker as cb1
     cb2 = scb_mod.stall_circuit_breaker
 
     assert cb1 is cb2, (

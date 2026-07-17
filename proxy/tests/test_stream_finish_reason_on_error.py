@@ -15,11 +15,9 @@ import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
+import proxy.server as server
 import pytest
 from fastapi.responses import StreamingResponse
-
-import proxy.server as server
-
 
 # ── Async iterator that raises after yielding chunks ───────────────────────
 
@@ -1062,8 +1060,8 @@ async def test_remote_both_paths_concurrent(mock_remote_request):
     paths simultaneously does not cause interference.
     """
     from proxy.proxy_remote import (
-        _handle_remote_streaming,
         _handle_remote_non_streaming,
+        _handle_remote_streaming,
     )
 
     # Set up streaming mock

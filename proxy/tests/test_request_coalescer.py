@@ -15,9 +15,7 @@ import json
 
 import pytest
 from fastapi import Response
-
 from proxy.request_coalescer import RequestCoalescer
-
 
 # ---------------------------------------------------------------------------
 # Helpers

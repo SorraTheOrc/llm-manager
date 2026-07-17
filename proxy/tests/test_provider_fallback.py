@@ -7,15 +7,13 @@ Tests for:
 """
 
 import json
-import pytest
 import time
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import HTTPException, Response
-
 import proxy.provider as provider
-
+import pytest
+from fastapi import HTTPException, Response
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1650,8 +1648,9 @@ async def test_local_concurrency_below_limit_calls_local(mixed_model_config):
 @pytest.mark.asyncio
 async def test_remote_model_with_providers_calls_fallback(monkeypatch):
     """proxy_openai_api should call proxy_with_remote_fallback for remote models with providers."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     # Set up config with a remote model that has providers
     server_module.config = {
@@ -1686,8 +1685,8 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
         )
 
     with patch("proxy.provider.proxy_with_remote_fallback", mock_fallback):
-        from proxy.ui import proxy_openai_api
         from fastapi import Request as FastAPIRequest
+        from proxy.ui import proxy_openai_api
 
         body = json.dumps({
             "model": "test-remote",
@@ -1714,8 +1713,9 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
 @pytest.mark.asyncio
 async def test_remote_model_without_providers_returns_error(monkeypatch):
     """Remote models WITHOUT a providers list should return an error (breaking change)."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
     from fastapi import HTTPException
 
     # Set up config with a remote model that has NO providers (legacy format)
@@ -1733,8 +1733,8 @@ async def test_remote_model_without_providers_returns_error(monkeypatch):
     server_module.llama_process = None
     server_module.backend_ready = True
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "test-remote",
@@ -1761,8 +1761,9 @@ async def test_remote_model_without_providers_returns_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_local_model_with_providers_calls_fallback(monkeypatch):
     """proxy_openai_api should call proxy_with_fallback for loaded local models with providers."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     # Set up config with a local model that has providers (local + remote)
     server_module.config = {
@@ -1798,8 +1799,8 @@ async def test_local_model_with_providers_calls_fallback(monkeypatch):
         )
 
     with patch("proxy.provider.proxy_with_fallback", mock_fallback):
-        from proxy.ui import proxy_openai_api
         from fastapi import Request as FastAPIRequest
+        from proxy.ui import proxy_openai_api
 
         body = json.dumps({
             "model": "test-local",
@@ -1865,9 +1866,10 @@ def test_normalize_upstream_request_headers_strips_hop_by_hop_headers():
 
 @pytest.mark.asyncio
 async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -1918,9 +1920,10 @@ async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
 async def test_proxy_to_remote_overrides_model_name_with_model_field():
     """When a remote provider config has a `model` field, proxy_to_remote
     should override the model name in the forwarded request body."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     # Minimal server config needed for timeout
     server_module.config = {
@@ -1964,9 +1967,10 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
 async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibility():
     """Unknown top-level chat fields should be removed before forwarding to
     remote providers to avoid provider-specific 4xx request-shape failures."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {"server": {"llama_request_timeout": 300}}
     server_module.current_model = None
@@ -2011,9 +2015,10 @@ async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibili
 async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
     """When a remote provider config has NO `model` field, proxy_to_remote
     should pass the original model name through unchanged."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2057,8 +2062,9 @@ async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_
     """When a local model with remote providers is NOT loaded and the remote
     fallback returns a 503 error, proxy_openai_api should return a model_loading
     response, not the 503 from the exhausted remote providers."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     # Set up config with a local model that has providers (local + remote)
     server_module.config = {
@@ -2113,8 +2119,8 @@ async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_
         # Also mock session/slot detection to skip (no session header)
         with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
             with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
-                from proxy.ui import proxy_openai_api
                 from fastapi import Request as FastAPIRequest
+                from proxy.ui import proxy_openai_api
 
                 body = json.dumps({
                     "model": "test-local",
@@ -2148,8 +2154,9 @@ async def test_router_transient_not_loaded_then_loaded_prefers_local_before_remo
     """When router briefly reports a local model as not loaded, a short grace
     window should allow local fallback path to recover before remote fallback.
     """
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     server_module.config = {
         "models": {
@@ -2213,8 +2220,8 @@ async def test_router_transient_not_loaded_then_loaded_prefers_local_before_remo
         with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
             with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
                 with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
-                    from proxy.ui import proxy_openai_api
                     from fastapi import Request as FastAPIRequest
+                    from proxy.ui import proxy_openai_api
 
                     body = json.dumps({
                         "model": "test-local",
@@ -2245,8 +2252,9 @@ async def test_router_loading_status_but_router_load_model_already_loaded_prefer
     """If router status lags as 'loading' but router_load_model reports already
     loaded, local path should be preferred before remote fallback.
     """
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     server_module.config = {
         "models": {
@@ -2311,8 +2319,8 @@ async def test_router_loading_status_but_router_load_model_already_loaded_prefer
         with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
             with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
                 with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
-                    from proxy.ui import proxy_openai_api
                     from fastapi import Request as FastAPIRequest
+                    from proxy.ui import proxy_openai_api
 
                     body = json.dumps({
                         "model": "test-local",
@@ -2443,9 +2451,10 @@ async def test_local_http_exception_triggers_fallback(mixed_model_config):
 async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
     """proxy_to_remote with the opencode-go-deepseek provider config must
     override the model name from the incoming request to 'deepseek-v4-flash'."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2489,9 +2498,10 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
 async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_authorization_header():
     """Incoming client Authorization header must be replaced (not duplicated)
     with the upstream OPENCODE API key header."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2540,9 +2550,10 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_autho
 async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
     """proxy_to_remote with the opencode-go-deepseek provider config must
     inject the Authorization header using the API key from the env var."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2589,9 +2600,10 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
 async def test_proxy_to_remote_falls_back_to_auth_json_when_env_var_not_set():
     """When api_key_env is set but the env var is NOT set, proxy_to_remote
     must fall back to resolving the key from ~/.pi/agent/auth.json."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2643,6 +2655,7 @@ def test_try_pi_auth_json_resolves_opencode_api_key(tmp_path):
     """_try_pi_auth_json must resolve OPENCODE_API_KEY to the opencode-go
     key from auth.json."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2671,6 +2684,7 @@ def test_try_pi_auth_json_falls_back_to_opencode_when_opencode_go_missing(tmp_pa
     """When opencode-go is not in auth.json, _try_pi_auth_json must fall
     back to opencode entry for OPENCODE_API_KEY."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2695,6 +2709,7 @@ def test_try_pi_auth_json_exact_match(tmp_path):
     """_try_pi_auth_json must return the key for an exact lowercase match
     when the auth.json key matches the lookup key directly."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2719,6 +2734,7 @@ def test_try_pi_auth_json_returns_none_when_file_missing():
     """_try_pi_auth_json must return None when auth.json does not exist."""
     from pathlib import Path
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=Path("/nonexistent/auth.json")):
@@ -2731,6 +2747,7 @@ def test_try_pi_auth_json_returns_none_for_unknown_key(tmp_path):
     """_try_pi_auth_json must return None when the key is not in auth.json
     and no fallback matches."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2752,6 +2769,7 @@ def test_try_pi_auth_json_returns_none_for_unknown_key(tmp_path):
 def test_try_pi_auth_json_strips_api_key_suffix(tmp_path):
     """_try_pi_auth_json must strip _api_key suffix and look up the stem."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {

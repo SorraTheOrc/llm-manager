@@ -17,9 +17,7 @@ import httpx
 import pytest
 from fastapi import Request
 from fastapi.responses import StreamingResponse
-
 from proxy.proxy_remote import _handle_remote_streaming
-
 
 # ===================================================================
 # Mock helpers (reused from test_upstream_stall_detection.py)

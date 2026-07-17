@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
 from fastapi import HTTPException, Response
@@ -29,11 +29,11 @@ logger = logging.getLogger("llama-proxy.provider")
 # ---------------------------------------------------------------------------
 
 # In-memory cooldown tracking: provider_name -> expiry_timestamp (seconds since epoch)
-_provider_unavailable_until: Dict[str, float] = {}
+_provider_unavailable_until: dict[str, float] = {}
 
 # Consecutive failure count for exponential backoff: provider_name -> count
 # Incremented on each failure, reset to 0 on success.
-_provider_failure_count: Dict[str, int] = {}
+_provider_failure_count: dict[str, int] = {}
 
 # Exponential backoff constants (remote providers only)
 _BACKOFF_BASE_SECONDS = 1.0
@@ -103,14 +103,14 @@ _model_cache_cold: set[str] = set()
 # When a session has no entry, it defaults to cold (conservative).
 # This provides per-session isolation so that cache warmth from one session
 # does not affect bypass decisions for other sessions (LP-0MRMMBZ7T007ER59).
-_session_cache_cold: dict[Tuple[str, str], bool] = {}
+_session_cache_cold: dict[tuple[str, str], bool] = {}
 
 def _cache_cold_initialized() -> None:
     """Mark the cache-cold state as fully initialized."""
     global _model_cache_cold_uninitialized
     _model_cache_cold_uninitialized = False
 
-def mark_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> None:
+def mark_model_cache_cold(model_name: str, session_id: str | None = None) -> None:
     """Mark a model's slot cache as invalidated (cold).
 
     When *session_id* is provided, only that session's cache for this model
@@ -125,7 +125,7 @@ def mark_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> 
     elif model_name:
         _model_cache_cold.add(model_name)
 
-def clear_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> None:
+def clear_model_cache_cold(model_name: str, session_id: str | None = None) -> None:
     """Clear a model's cache-cold flag, restoring normal local routing.
 
     When *session_id* is provided, only that session's cache for this model
@@ -137,7 +137,7 @@ def clear_model_cache_cold(model_name: str, session_id: Optional[str] = None) ->
     elif model_name:
         _model_cache_cold.discard(model_name)
 
-def is_model_cache_cold(model_name: str, session_id: Optional[str] = None) -> bool:
+def is_model_cache_cold(model_name: str, session_id: str | None = None) -> bool:
     """Check if a model's slot cache is currently marked as cold.
 
     When *session_id* is provided, checks session-level state first.
@@ -386,7 +386,7 @@ def _should_skip_local(
     body_json: dict,
     cold_cache_threshold: int,
     warm_cache_threshold: int = 0,
-    estimated_tokens: Optional[int] = None,
+    estimated_tokens: int | None = None,
 ) -> bool:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -421,8 +421,8 @@ def _should_skip_local(
 
 def resolve_provider(
     model_config: dict,
-    failed_provider: Optional[str] = None,
-) -> Optional[dict]:
+    failed_provider: str | None = None,
+) -> dict | None:
     """Get the next available provider for a model config.
 
     Iterates through the model's ordered `providers` list and returns the
@@ -440,7 +440,7 @@ def resolve_provider(
         A provider config dict (with keys ``name``, ``type``, etc.), or
         ``None`` if no provider is available.
     """
-    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
 
@@ -455,7 +455,7 @@ def resolve_provider(
     return None
 
 
-def get_model_type(model_config: dict) -> Optional[str]:
+def get_model_type(model_config: dict) -> str | None:
     """Determine the model type from the providers list.
 
     Returns ``"local"`` if the first provider is a local provider,
@@ -463,7 +463,7 @@ def get_model_type(model_config: dict) -> Optional[str]:
 
     This replaces the legacy ``model_config["type"]`` field.
     """
-    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
     first = providers[0]
@@ -473,7 +473,7 @@ def get_model_type(model_config: dict) -> Optional[str]:
     return None
 
 
-def get_local_model_name_from_providers(model_config: dict) -> Optional[str]:
+def get_local_model_name_from_providers(model_config: dict) -> str | None:
     """Extract the llama_model name from the providers list.
 
     Searches the ordered ``providers`` list for a local provider and
@@ -483,7 +483,7 @@ def get_local_model_name_from_providers(model_config: dict) -> Optional[str]:
 
     Returns ``None`` if no local provider is found.
     """
-    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
     for p in providers:
@@ -492,7 +492,7 @@ def get_local_model_name_from_providers(model_config: dict) -> Optional[str]:
     return None
 
 
-def get_remote_endpoint(model_config: dict) -> Optional[str]:
+def get_remote_endpoint(model_config: dict) -> str | None:
     """Extract the endpoint URL from the providers list.
 
     Searches the ordered ``providers`` list for a remote provider and
@@ -502,7 +502,7 @@ def get_remote_endpoint(model_config: dict) -> Optional[str]:
 
     Returns ``None`` if no remote provider is found.
     """
-    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
     for p in providers:
@@ -580,7 +580,7 @@ def _is_provider_unavailable(provider_name: str) -> bool:
     return True
 
 
-def _parse_retry_after(response: Response) -> Optional[float]:
+def _parse_retry_after(response: Response) -> float | None:
     """Parse Retry-After header from a response.
 
     Supports both integer seconds and HTTP-date formats.
@@ -700,7 +700,7 @@ def _add_provider_header(response: Response, provider_name: str) -> Response:
     return response
 
 
-def _build_resolved_model_value(provider_cfg: dict) -> Optional[str]:
+def _build_resolved_model_value(provider_cfg: dict) -> str | None:
     """Build the X-Resolved-Model header value from a provider config.
 
     Returns ``<provider-name>/<model-id>`` or ``None`` if the config
@@ -745,7 +745,7 @@ def _add_resolved_model_header(response: Response, provider_cfg: dict) -> Respon
     return response
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: Optional[dict] = None, diagnostics: Optional[List[Dict[str, Any]]] = None) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
@@ -761,7 +761,7 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     if all_local_slot_exhaustion:
         # total_slots may be 0 if unknown; still format per acceptance criteria
         return Response(
-            content=(f"Model server busy: 0/{int(total_slots)} slots available. Retry later.").encode("utf-8"),
+            content=(f"Model server busy: 0/{int(total_slots)} slots available. Retry later.").encode(),
             status_code=429,
             media_type="text/plain",
         )
@@ -881,7 +881,7 @@ def _get_scheduler_has_idle_slot():
         return True
 
 
-def _get_scheduler_session_has_slot(session_id: Optional[str]) -> bool:
+def _get_scheduler_session_has_slot(session_id: str | None) -> bool:
     """Lazily import and check whether a session owns a scheduler slot.
 
     A session that owns a slot can re-enter via ``reenter_job`` even when
@@ -1119,9 +1119,9 @@ def _is_local_lease_active_response(response) -> bool:
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
-) -> Optional[dict]:
+) -> dict | None:
     """Resolve next available provider while excluding names tried this request."""
-    providers: Optional[List[Dict[str, Any]]] = model_config.get("providers")
+    providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
 
@@ -1212,7 +1212,7 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _record_attempt(attempts: List[Dict[str, Any]], **fields) -> None:
+def _record_attempt(attempts: list[dict[str, Any]], **fields) -> None:
     """Append a diagnostic attempt entry to the attempts list.
 
     Each entry records which provider was tried, the outcome, and optional
@@ -1225,11 +1225,11 @@ def _handle_streaming_success(
     response: Response,
     provider_name: str,
     provider_type: str,
-    attempts: List[Dict[str, Any]],
-    prev_provider: Optional[str],
-    fallback_reason: Optional[str],
+    attempts: list[dict[str, Any]],
+    prev_provider: str | None,
+    fallback_reason: str | None,
     path: str,
-) -> Optional[Response]:
+) -> Response | None:
     """If *response* is a 2xx StreamingResponse, record the attempt, add
     the ``X-Provider`` header, log the fallback (if one occurred), and
     return the augmented response.
@@ -1261,9 +1261,9 @@ def _build_fallback_success_response(
     response: Response,
     provider_name: str,
     provider_type: str,
-    attempts: List[Dict[str, Any]],
-    prev_provider: Optional[str],
-    fallback_reason: Optional[str],
+    attempts: list[dict[str, Any]],
+    prev_provider: str | None,
+    fallback_reason: str | None,
     path: str,
     body_text: str = "",
     status_override: str = "success",
@@ -1301,7 +1301,7 @@ def _handle_connection_error_in_fallback(
     provider_name: str,
     provider_type: str,
     cooldown_seconds: float,
-    attempts: List[Dict[str, Any]],
+    attempts: list[dict[str, Any]],
 ) -> bool:
     """If *exc* is a connection error, mark the provider unavailable, record
     a diagnostic attempt entry, and return ``True`` (caller should ``continue``
@@ -1340,7 +1340,7 @@ def _handle_http_error_with_cooldown(
     provider_name: str,
     provider_type: str,
     cooldown_seconds: float,
-    attempts: List[Dict[str, Any]],
+    attempts: list[dict[str, Any]],
     body_text: str,
 ) -> float:
     """Handle an HTTP error response: compute effective cooldown, mark the
@@ -1388,7 +1388,7 @@ def _handle_empty_response_with_cooldown(
     provider_name: str,
     provider_type: str,
     cooldown_seconds: float,
-    attempts: List[Dict[str, Any]],
+    attempts: list[dict[str, Any]],
     body_text: str,
 ) -> float:
     """Handle an empty (non-reasoning) successful response: compute effective
@@ -1435,12 +1435,12 @@ def _resolve_reasoning_content_promotion(
     response: Response,
     provider_name: str,
     provider_type: str,
-    attempts: List[Dict[str, Any]],
-    prev_provider: Optional[str],
-    fallback_reason: Optional[str],
+    attempts: list[dict[str, Any]],
+    prev_provider: str | None,
+    fallback_reason: str | None,
     path: str,
     body_text: str,
-) -> Optional[Response]:
+) -> Response | None:
     """If the response body contains ``reasoning_content``, treat this
     empty-but-meaningful response as a success (promote it).  Records the
     attempt, adds the provider header, logs the fallback, and returns the
@@ -1474,11 +1474,11 @@ def _resolve_reasoning_content_promotion(
     return None
 
 
-def _log_exhausted_providers(model_config: dict, path: str) -> Dict[str, int]:
+def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
     """Log diagnostic details about which providers are in cooldown and return
     the mapping of provider name to remaining cooldown seconds.
     """
-    unavailable: Dict[str, int] = {}
+    unavailable: dict[str, int] = {}
     try:
         provider_names = [p.get("name") for p in model_config.get("providers", []) if isinstance(p, dict)]
         for n in provider_names:
@@ -1517,18 +1517,18 @@ async def proxy_with_remote_fallback(
     cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
-    prev_provider: Optional[str] = None
-    fallback_reason: Optional[str] = None
+    prev_provider: str | None = None
+    fallback_reason: str | None = None
 
     ptr = _get_proxy_to_remote()
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
-    attempts: List[Dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
 
     # Preserve first model-loading response so single-provider models
     # do not collapse into generic "All providers exhausted".
-    first_model_loading_response: Optional[Response] = None
+    first_model_loading_response: Response | None = None
 
     while True:
         provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
@@ -1722,8 +1722,8 @@ async def proxy_with_fallback(
     slot_unavailable_cooldown = _get_slot_unavailable_retry_after(config)
     all_slot_exhaustion = True
     any_provider_tried = False
-    prev_provider: Optional[str] = None
-    fallback_reason: Optional[str] = None
+    prev_provider: str | None = None
+    fallback_reason: str | None = None
 
     # Accumulate slot counts when local providers report slot exhaustion
     total_slots_sum = 0
@@ -1748,7 +1748,7 @@ async def proxy_with_fallback(
         body_json = {}
 
     # Resolve session_id for per-session cache state tracking (LP-0MRMMBZ7T007ER59)
-    _session_id: Optional[str] = None
+    _session_id: str | None = None
     try:
         from proxy.session import _resolve_session_id_header
         _session_id, _ = _resolve_session_id_header(getattr(request, "headers", {}))
@@ -1756,7 +1756,7 @@ async def proxy_with_fallback(
         pass
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
-    attempts: List[Dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
 
     while True:
@@ -2290,8 +2290,8 @@ async def proxy_with_fallback(
                 # brief concurrency spike right after restart). Retry local a
                 # few times before falling back to remote providers.
                 if provider_type == "local" and local_slot_retry_attempts > 0:
-                    retry_exc: Optional[Exception] = exc
-                    resolved_response: Optional[Response] = None
+                    retry_exc: Exception | None = exc
+                    resolved_response: Response | None = None
                     for retry_idx in range(1, local_slot_retry_attempts + 1):
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)

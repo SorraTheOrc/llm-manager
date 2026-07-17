@@ -11,16 +11,15 @@ circular import issues.
 import asyncio
 import logging
 import os
+import subprocess
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Dict, Optional
 
 import httpx
-import subprocess
-import traceback
-from fnmatch import fnmatch
 from fastapi.responses import JSONResponse
 
 
@@ -39,16 +38,15 @@ def _srv():
 #   test monkey-patches on server.* working without modification.
 # ===================================================================
 from .backend_health import (  # noqa: F401
-    _self_heal_retry_after_seconds,  # noqa: F401
-    _is_self_healing_active,  # noqa: F401
-    _self_healing_response,  # noqa: F401
-    _backend_recovery_snapshot,  # noqa: F401
-    _worker_process_unhealthy,  # noqa: F401
-    _prune_recovery_attempts,  # noqa: F401
-    _attempt_router_self_heal,  # noqa: F401
-    _backend_watchdog_loop,  # noqa: F401
-)  # noqa: F401
-
+    _attempt_router_self_heal,
+    _backend_recovery_snapshot,
+    _backend_watchdog_loop,
+    _is_self_healing_active,
+    _prune_recovery_attempts,
+    _self_heal_retry_after_seconds,
+    _self_healing_response,
+    _worker_process_unhealthy,
+)
 
 # ===================================================================
 # Model loading and lifecycle orchestration helpers
@@ -128,7 +126,7 @@ def schedule_background_load(model_name: str) -> bool:
 
     return True
 
-    
+
 # Functions extracted to handlers.py:
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
@@ -145,8 +143,8 @@ counts_lock = asyncio.Lock()
 counts_filename = "request_counts.json"
 # Dirty flags and persist tasks
 counts_dirty = False
-counts_persist_task: Optional[asyncio.Task] = None
-periodic_broadcast_task: Optional[asyncio.Task] = None
+counts_persist_task: asyncio.Task | None = None
+periodic_broadcast_task: asyncio.Task | None = None
 
 # Active local queries counter
 active_queries: int = 0
@@ -158,7 +156,7 @@ active_queries_lock = asyncio.Lock()
 
 
 
-def _model_loading_response(requested_model: Optional[str], target_model: str, scheduled: bool, endpoint: str) -> JSONResponse:
+def _model_loading_response(requested_model: str | None, target_model: str, scheduled: bool, endpoint: str) -> JSONResponse:
     """Build a consistent JSON 503 payload when a model is loading."""
     srv = _srv()
     retry_after = int(srv.config.get("server", {}).get("model_loading_retry_after", 30) or 30)
@@ -262,7 +260,7 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
     max_delay = float(server_cfg.get("backend_retry_max_delay_seconds", 2.0) or 2.0)
     jitter_ratio = float(server_cfg.get("backend_retry_jitter_ratio", 0.25) or 0.25)
 
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
        try:
            return await call_factory()
@@ -336,7 +334,7 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
 
 
 
-def get_model_config(model_name: Optional[str]) -> Optional[dict]:
+def get_model_config(model_name: str | None) -> dict | None:
     srv = _srv()
     """
     Get model configuration by name or alias.
@@ -353,15 +351,15 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
     """
     if model_name is None:
        return None
-    
+
     models = srv.config.get("models", {})
-    
+
     # Direct match
     if model_name in models:
        return models[model_name]
-    
+
     model_name_lower = model_name.lower()
-    
+
     # Check exact aliases first (higher priority)
     for name, model_cfg in models.items():
        aliases = model_cfg.get("aliases", [])
@@ -372,7 +370,7 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
                continue
            if model_name_lower == alias_lower:
                return model_cfg
-    
+
     # Check wildcard patterns
     for name, model_cfg in models.items():
        aliases = model_cfg.get("aliases", [])
@@ -382,19 +380,19 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
            if '*' in alias or '?' in alias or '[' in alias:
                if fnmatch(model_name_lower, alias_lower):
                    return model_cfg
-    
+
     return None
 
 
 
-def _should_force_full_prompt(model_cfg: Optional[dict]) -> bool:
+def _should_force_full_prompt(model_cfg: dict | None) -> bool:
     if not isinstance(model_cfg, dict):
        return False
     return bool(model_cfg.get("force_full_prompt") or model_cfg.get("disable_delta"))
 
 
 
-def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
+def get_local_model_name(model_name: str | None) -> str | None:
     """Get the llama model name for a given model.
 
     Supports both the legacy top-level ``type: local`` + ``llama_model`` and the
@@ -431,10 +429,10 @@ def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
 
 
 def _resolve_slot_model_name(
-    requested_model: Optional[str],
-    current_model: Optional[str],
+    requested_model: str | None,
+    current_model: str | None,
     server_config: dict,
-) -> Optional[str]:
+) -> str | None:
     """Resolve the llama model name used for slot endpoints in router mode."""
     srv = _srv()
     candidate = requested_model or current_model
@@ -455,7 +453,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
     server_config = srv.config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
     health_url = f"http://localhost:{llama_port}/health"
-    
+
     start_time = time.time()
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
     try:
@@ -465,7 +463,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
                exit_code = srv.llama_process.returncode
                srv.logger.error(f"llama-server process exited with code {exit_code}")
                return False
-           
+
            try:
                response = await client.get(health_url, timeout=5)
                if response.status_code == 200:
@@ -487,7 +485,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
                await client.aclose()
            except Exception:
                pass
-    
+
     srv.logger.error(f"llama-server failed to start within {timeout} seconds")
     return False
 
@@ -540,7 +538,7 @@ async def router_load_model(model_name: str) -> bool:
 
 
 
-async def router_list_models() -> Optional[dict]:
+async def router_list_models() -> dict | None:
     """List models from router-mode llama-server."""
     srv = _srv()
     server_config = srv.config.get("server", {})
@@ -566,7 +564,7 @@ async def router_list_models() -> Optional[dict]:
 
 
 
-def _extract_router_model_ids(router_models: Optional[dict]) -> list[str]:
+def _extract_router_model_ids(router_models: dict | None) -> list[str]:
     if not isinstance(router_models, dict):
        return []
     models_payload = router_models.get("data") or router_models.get("models") or []
@@ -757,7 +755,7 @@ def spawn_and_capture(
         return proc, None
 
 
-def _stream_output(src, dst, model_name: str = "unknown", logger: Optional[logging.Logger] = None):
+def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger | None = None):
     """Stream lines from src to dst, logging prompt progress as timestamped INFO entries.
 
     Instead of writing progress updates to stderr with carriage-return overwrites,
@@ -780,7 +778,7 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: Optional[loggi
     # Per-slot progress threshold tracking.
     # Maps slot_id -> last logged 10%-bucket index (0-10, where 0 = 0%, 10 = 100%).
     # A slot not in the dict has never been logged.
-    _last_logged_pct: Dict[int, int] = {}
+    _last_logged_pct: dict[int, int] = {}
     first_progress_time = None
     try:
         for line in src:
@@ -848,7 +846,7 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: Optional[loggi
         pass
 
 
-def start_llama_server(model: Optional[str], display_name: Optional[str] = None) -> Optional[subprocess.Popen]:
+def start_llama_server(model: str | None, display_name: str | None = None) -> subprocess.Popen | None:
     """Start the llama-server with the specified model.
 
     Args:
@@ -998,12 +996,12 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
     srv = _srv()
     if not current_log.exists():
        return
-    
+
     # Find existing rotated logs
     srv.log_dir = current_log.parent
     base_name = current_log.stem
     suffix = current_log.suffix
-    
+
     # Get all existing rotated logs sorted by number (descending)
     rotated_logs = []
     for f in srv.log_dir.glob(f"{base_name}.*{suffix}"):
@@ -1012,21 +1010,21 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
            rotated_logs.append((num, f))
        except ValueError:
            continue
-    
+
     rotated_logs.sort(key=lambda x: x[0], reverse=True)
-    
+
     # Delete logs beyond the keep limit (accounting for the new rotation)
     for num, f in rotated_logs:
        if num >= keep:
            f.unlink()
            srv.logger.debug(f"Deleted old llama-server log: {f}")
-    
+
     # Rotate existing logs (N -> N+1)
     for num, f in rotated_logs:
        if num < keep:
            new_name = srv.log_dir / f"{base_name}.{num + 1}{suffix}"
            f.rename(new_name)
-    
+
     # Rotate current log to .1
     if current_log.exists():
        current_log.rename(srv.log_dir / f"{base_name}.1{suffix}")
@@ -1036,7 +1034,7 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
 def stop_llama_server():
     """Stop the currently running llama-server."""
     srv = _srv()
-    
+
     if srv.llama_process is not None:
        pid = getattr(srv.llama_process, 'pid', 'N/A')
        srv.logger.info(f"Stopping llama-server wrapper (PID: {pid})")
@@ -1068,7 +1066,7 @@ def stop_llama_server():
            srv.llama_process = None
            srv.backend_ready = False
            srv.logger.info("llama-server stop skipped (no valid process)")
-    
+
     # Close log file if open
     if srv.llama_log_file is not None and srv.llama_log_file != subprocess.DEVNULL:
        try:
@@ -1083,7 +1081,7 @@ def stop_llama_server():
 # ---------------------------------------------------------------------------
 
 
-def start_tts_server() -> Optional[subprocess.Popen]:
+def start_tts_server() -> subprocess.Popen | None:
     """Start the qwentts TTS server using the configured start script.
 
     Returns a subprocess.Popen when successful, None on failure.
@@ -1203,7 +1201,7 @@ async def wait_for_tts_server(tts_port: int = 8081, timeout: int = 30) -> bool:
     return False
 
 
-async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
+async def ensure_model_loaded(requested_model: str | None) -> bool:
     srv = _srv()
     """
     Ensure the requested model is loaded in llama-server.
@@ -1385,8 +1383,8 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 # ---------------------------------------------------------------------------
 from .backend_health import (  # noqa: E402, F401
     _extract_model_port_from_args,
-    _router_model_health_loop,
     _probe_model_instance,
+    _router_model_health_loop,
 )
 
 

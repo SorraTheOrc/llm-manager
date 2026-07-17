@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -190,7 +189,7 @@ def test_local_override_by_alias(monkeypatch, tmp_path):
 
 def test_oversized_file_ignored(monkeypatch, tmp_path, caplog):
     """Files larger than MAX_PROMPT_SIZE (64KB) should be ignored."""
-    from proxy.prompt_resolver import resolve_system_prompt, MAX_PROMPT_SIZE
+    from proxy.prompt_resolver import MAX_PROMPT_SIZE, resolve_system_prompt
 
     repo_prompts = tmp_path / "proxy" / "prompts"
     oversized = _make_oversized_file(repo_prompts / "large.txt", MAX_PROMPT_SIZE + 1)

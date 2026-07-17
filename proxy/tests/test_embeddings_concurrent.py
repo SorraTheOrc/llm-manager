@@ -1,8 +1,8 @@
-import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
+import requests
 from requests.exceptions import RequestException
 
 

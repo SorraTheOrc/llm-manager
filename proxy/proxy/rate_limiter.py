@@ -13,7 +13,6 @@ import asyncio
 import logging
 import time
 from collections import defaultdict, deque
-from typing import Dict
 
 logger = logging.getLogger("llama-proxy.rate_limiter")
 
@@ -30,7 +29,7 @@ class SlidingWindowRateLimiter:
 
     def __init__(self) -> None:
         # key (str) -> deque of monotonic timestamps
-        self._windows: Dict[str, "deque[float]"] = defaultdict(deque)
+        self._windows: dict[str, deque[float]] = defaultdict(deque)
         self._lock = asyncio.Lock()
 
     async def check_and_increment(

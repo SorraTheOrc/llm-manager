@@ -29,7 +29,6 @@ import requests
 from requests import Response
 from requests.exceptions import RequestException
 
-
 pytestmark = [pytest.mark.integration, pytest.mark.e2e_live]
 
 if os.getenv("RUN_LIVE_PROXY_E2E", "0") != "1":
@@ -55,7 +54,7 @@ LOCAL_QWEN3_RETRY_ATTEMPTS = int(os.getenv("LIVE_E2E_LOCAL_RETRY_ATTEMPTS", "4")
 LOCAL_QWEN3_RETRY_DELAY_SECONDS = float(os.getenv("LIVE_E2E_LOCAL_RETRY_DELAY_SECONDS", "1.5"))
 
 
-_PHASE_STATE: Dict[str, Any] = {
+_PHASE_STATE: dict[str, Any] = {
     "phase_1_passed": False,
     "phase_2_passed": False,
     "phase_3_passed": False,
@@ -66,11 +65,11 @@ _PHASE_STATE: Dict[str, Any] = {
 }
 
 # End-of-run trace data used for final grouped summary output.
-_REQUEST_TRACES: List[Dict[str, Any]] = []
-_LATEST_SUMMARY_PAYLOAD: Optional[Dict[str, Any]] = None
+_REQUEST_TRACES: list[dict[str, Any]] = []
+_LATEST_SUMMARY_PAYLOAD: dict[str, Any] | None = None
 
 
-def _log(message: str, *, payload: Optional[Dict[str, Any]] = None) -> None:
+def _log(message: str, *, payload: dict[str, Any] | None = None) -> None:
     if payload is None:
         LOGGER.info(message)
         print(f"[plan-live-e2e] {message}")
@@ -103,7 +102,7 @@ def _require_local_proxy() -> None:
     _log("Proxy health check passed", payload={"status_code": response.status_code})
 
 
-def _admin_metrics() -> Dict[str, Any]:
+def _admin_metrics() -> dict[str, Any]:
     url = f"{BASE_URL}/admin/metrics"
     _log(f"Fetching admin metrics: {url}")
     response = requests.get(url, timeout=10)
@@ -120,7 +119,7 @@ def _admin_metrics() -> Dict[str, Any]:
     return data
 
 
-def _extract_response_text(body: Dict[str, Any]) -> str:
+def _extract_response_text(body: dict[str, Any]) -> str:
     """Extract human-usable text from OpenAI-style responses.
 
     Accepts standard assistant.content and, when empty, reasoning_content as a
@@ -168,7 +167,7 @@ def _clip_text(value: str, limit: int = 500) -> str:
     return value[:limit] + f" … [truncated {len(value) - limit} chars]"
 
 
-def _response_text_for_summary(body: Dict[str, Any]) -> str:
+def _response_text_for_summary(body: dict[str, Any]) -> str:
     text = _extract_response_text(body)
     if text.strip():
         return text
@@ -180,9 +179,9 @@ def _response_text_for_summary(body: Dict[str, Any]) -> str:
 
 def _record_request_trace(
     *,
-    requested_session_id: Optional[str],
+    requested_session_id: str | None,
     response: Response,
-    body: Dict[str, Any],
+    body: dict[str, Any],
     prompt: str,
     elapsed: float,
 ) -> None:
@@ -209,7 +208,7 @@ def _record_request_trace(
     )
 
 
-def _build_summary_payload() -> Dict[str, Any]:
+def _build_summary_payload() -> dict[str, Any]:
     if not _REQUEST_TRACES:
         return {
             "base_url": BASE_URL,
@@ -217,12 +216,12 @@ def _build_summary_payload() -> Dict[str, Any]:
             "sessions": {},
         }
 
-    sessions: Dict[str, List[Dict[str, Any]]] = {}
+    sessions: dict[str, list[dict[str, Any]]] = {}
     for trace in _REQUEST_TRACES:
         sid = str(trace.get("session_id") or "no-session")
         sessions.setdefault(sid, []).append(trace)
 
-    summary_payload: Dict[str, Any] = {
+    summary_payload: dict[str, Any] = {
         "base_url": BASE_URL,
         "total_requests": len(_REQUEST_TRACES),
         "sessions": {},
@@ -245,8 +244,8 @@ def _build_summary_payload() -> Dict[str, Any]:
     return summary_payload
 
 
-def _render_summary_text(payload: Dict[str, Any]) -> str:
-    lines: List[str] = []
+def _render_summary_text(payload: dict[str, Any]) -> str:
+    lines: list[str] = []
     lines.append(f"Base URL: {payload.get('base_url', BASE_URL)}")
     lines.append(f"Total requests: {payload.get('total_requests', 0)}")
 
@@ -299,7 +298,7 @@ def _session_id_from_response(response: Response, fallback: str) -> str:
     return (response.headers.get("X-Session-Id") or fallback).strip()
 
 
-def _response_has_restore_signal(response: Response, body: Dict[str, Any]) -> bool:
+def _response_has_restore_signal(response: Response, body: dict[str, Any]) -> bool:
     header_candidates = [
         "X-Llama-Session-Restored",
         "X-Session-Restored",
@@ -320,7 +319,7 @@ def _response_has_restore_signal(response: Response, body: Dict[str, Any]) -> bo
     return False
 
 
-def _wait_for_restore_success_increment(before: int, timeout_seconds: float = 12.0) -> Tuple[bool, int]:
+def _wait_for_restore_success_increment(before: int, timeout_seconds: float = 12.0) -> tuple[bool, int]:
     _log(
         "Polling /admin/metrics for restore_success_total increment",
         payload={"before": before, "timeout_seconds": timeout_seconds},
@@ -348,7 +347,7 @@ def _wait_for_restore_success_increment(before: int, timeout_seconds: float = 12
     return False, current
 
 
-def _is_local_qwen3_response(response: Response, body: Dict[str, Any]) -> Tuple[bool, str, str]:
+def _is_local_qwen3_response(response: Response, body: dict[str, Any]) -> tuple[bool, str, str]:
     provider = _provider_from_response(response)
     model_field = str(body.get("model", "")).strip().lower()
     looks_local_qwen3 = (
@@ -359,7 +358,7 @@ def _is_local_qwen3_response(response: Response, body: Dict[str, Any]) -> Tuple[
     return looks_local_qwen3, provider, model_field
 
 
-def _assert_local_qwen3(response: Response, body: Dict[str, Any], *, phase: str) -> None:
+def _assert_local_qwen3(response: Response, body: dict[str, Any], *, phase: str) -> None:
     looks_local_qwen3, provider, model_field = _is_local_qwen3_response(response, body)
 
     _log(
@@ -380,10 +379,10 @@ def _chat_until_local_qwen3(
     max_tokens: int,
     attempts: int = LOCAL_QWEN3_RETRY_ATTEMPTS,
     delay_seconds: float = LOCAL_QWEN3_RETRY_DELAY_SECONDS,
-) -> Tuple[Response, Dict[str, Any], float, str]:
+) -> tuple[Response, dict[str, Any], float, str]:
     """Retry phase request until local qwen3 answers or attempts exhausted."""
     attempts = max(1, int(attempts))
-    last_observation: Dict[str, Any] = {}
+    last_observation: dict[str, Any] = {}
 
     for attempt in range(1, attempts + 1):
         candidate_session_id = _new_session_id(f"{phase}-session")
@@ -435,13 +434,13 @@ def _assert_remote_provider(response: Response, *, phase: str) -> str:
 def _chat(
     *,
     prompt: str,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     max_tokens: int = 160,
     temperature: float = 0.0,
     timeout: float = DEFAULT_TIMEOUT,
-    payload_override: Optional[Dict[str, Any]] = None,
-    extra_headers: Optional[Dict[str, str]] = None,
-) -> Tuple[Response, Dict[str, Any], float]:
+    payload_override: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[Response, dict[str, Any], float]:
     url = f"{BASE_URL}/v1/chat/completions"
     payload = payload_override or {
         "model": "plan",
@@ -491,7 +490,7 @@ def _chat(
     # Populate response.content so downstream asserts/messages can use response.text/body.
     response._content = decoded_bytes  # type: ignore[attr-defined]
 
-    body: Dict[str, Any]
+    body: dict[str, Any]
     try:
         body = json.loads(decoded_bytes.decode("utf-8")) if decoded_bytes else {}
     except Exception:
@@ -527,7 +526,7 @@ def _chat(
     return response, body, elapsed
 
 
-def _assert_ok_with_content(response: Response, body: Dict[str, Any], *, phase: str) -> None:
+def _assert_ok_with_content(response: Response, body: dict[str, Any], *, phase: str) -> None:
     assert response.status_code == 200, (
         f"{phase}: expected HTTP 200, got {response.status_code} body={response.text}"
     )
@@ -1002,7 +1001,7 @@ def test_phase_7_simultaneous_local_then_remote_fallback() -> None:
         "temperature": 0.0,
     }
 
-    results: Dict[str, Any] = {}
+    results: dict[str, Any] = {}
 
     def _local_call() -> None:
         resp, body, elapsed = _chat(
@@ -1027,8 +1026,8 @@ def test_phase_7_simultaneous_local_then_remote_fallback() -> None:
         payload={"local_session": local_session, "remote_session": remote_session},
     )
 
-    local_provider_seen: List[str] = []
-    remote_provider_seen: List[str] = []
+    local_provider_seen: list[str] = []
+    remote_provider_seen: list[str] = []
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         local_future = executor.submit(_local_call)

@@ -11,9 +11,7 @@ Uses patterns from test_slot_polling.py and test_slot_scheduler.py.
 import asyncio
 
 import pytest
-
 from proxy.slot_scheduler import JobScheduler
-
 
 # ===================================================================
 # Helpers

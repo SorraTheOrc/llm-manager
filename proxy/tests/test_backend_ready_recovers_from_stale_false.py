@@ -8,9 +8,8 @@ without requiring a full process restart.
 
 import asyncio
 
-import pytest
-
 import proxy.server as server
+import pytest
 
 pytestmark = pytest.mark.refactor_parity
 

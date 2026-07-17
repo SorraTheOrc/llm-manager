@@ -1,6 +1,7 @@
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
 
@@ -35,10 +36,10 @@ def temp_log_dir():
 async def test_resolve_log_path():
     """Test the _resolve_log_path helper function."""
     from proxy.server import _resolve_log_path
-    
+
     proxy_path = _resolve_log_path("proxy")
     assert "proxy.log" in str(proxy_path)
-    
+
     llama_path = _resolve_log_path("llama")
     assert "llama-server.log" in str(llama_path)
 
@@ -47,7 +48,7 @@ async def test_resolve_log_path():
 async def test_resolve_log_path_default():
     """Test that default source is proxy."""
     from proxy.server import _resolve_log_path
-    
+
     # Invalid source should default to proxy
     default_path = _resolve_log_path("invalid")
     assert "proxy.log" in str(default_path)
@@ -109,7 +110,7 @@ async def test_log_tail_missing_file_returns_error(transport):
 
 async def _collect_sse_first_chunk(handler, request, lines=2, source="proxy"):
     """Call an SSE handler directly and collect the first chunk."""
-    
+
     response = await handler(request, lines=lines, source=source)
     try:
         async for chunk in response.body_iterator:
@@ -138,6 +139,7 @@ async def _make_starlette_request():
 async def test_log_tail_proxy_source_returns_initial(temp_log_dir):
     """GET /logs/tail?lines=2&source=proxy returns initial SSE with proxy log lines."""
     from proxy.ui import tail_logs
+
     from proxy import server as srv_module
 
     request = await _make_starlette_request()
@@ -158,6 +160,7 @@ async def test_log_tail_proxy_source_returns_initial(temp_log_dir):
 async def test_log_tail_llama_source_returns_initial(temp_log_dir):
     """GET /logs/tail?lines=1&source=llama returns initial SSE with llama log lines."""
     from proxy.ui import tail_logs
+
     from proxy import server as srv_module
 
     request = await _make_starlette_request()
@@ -177,6 +180,7 @@ async def test_log_tail_llama_source_returns_initial(temp_log_dir):
 async def test_log_tail_invalid_source_defaults_to_proxy(temp_log_dir):
     """Invalid source parameter defaults to 'proxy'."""
     from proxy.ui import tail_logs
+
     from proxy import server as srv_module
 
     request = await _make_starlette_request()

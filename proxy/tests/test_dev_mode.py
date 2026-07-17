@@ -42,8 +42,9 @@ class TestDevModeLogging:
         xdg_home = str(tmp_path / "state")
         monkeypatch.setenv("LLAMA_PROXY_DEV", "1")
         monkeypatch.setenv("XDG_STATE_HOME", xdg_home)
-        from proxy import server
         from proxy.server import setup_logging
+
+        from proxy import server
         config = {
             "logging": {
                 "directory": "/var/log/llama-proxy",
@@ -61,8 +62,9 @@ class TestDevModeLogging:
         log_dir = str(tmp_path / "prod-logs")
         # Make sure LLAMA_PROXY_DEV is NOT set
         monkeypatch.delenv("LLAMA_PROXY_DEV", raising=False)
-        from proxy import server
         from proxy.server import setup_logging
+
+        from proxy import server
         config = {
             "logging": {
                 "directory": log_dir,

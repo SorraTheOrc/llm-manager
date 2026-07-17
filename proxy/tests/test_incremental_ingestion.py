@@ -8,9 +8,9 @@ without requiring a running llama-server instance.
 
 import asyncio
 import logging
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from proxy.session_manager import SessionManager
 
 pytestmark = pytest.mark.refactor_parity
@@ -335,10 +335,10 @@ class TestRestoreObservability:
 
     def test_restore_observability_counters(self):
         from proxy.server import (
-            session_restore_observability,
-            _record_restore_success,
-            _record_restore_fallback,
             _record_delta_payload_bytes,
+            _record_restore_fallback,
+            _record_restore_success,
+            session_restore_observability,
         )
 
         session_restore_observability["restore_success_total"] = 0

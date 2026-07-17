@@ -9,13 +9,13 @@ import asyncio
 import json
 from pathlib import Path
 
+from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi import HTTPException
 
-from proxy.prompt_resolver import compose_messages, resolve_system_prompt
-from proxy.provider import get_model_type, get_local_model_name_from_providers, get_remote_endpoint
 from proxy.lifecycle import _extract_router_model_ids
+from proxy.prompt_resolver import compose_messages, resolve_system_prompt
+from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ async def index(request: Request):
         aliases = ", ".join(cfg.get("aliases", [])) or "—"
         endpoint = get_remote_endpoint(cfg) if model_type == "remote" else "Local llama-server"
         type_badge = '<span class="badge badge-local">Local</span>' if model_type == "local" else ('<span class="badge badge-remote">Remote</span>' if model_type == "remote" else '<span class="badge badge-unknown">Unknown</span>')
-        
+
         # Build model dropdown options
         # Consider both the config key (name) and the underlying llama_model when
         # deciding which option is selected so UIs that compare against the
@@ -73,7 +73,7 @@ async def index(request: Request):
             selected = "selected" if name == srv.current_model else ""
         type_label = "Local" if model_type == "local" else "Remote"
         model_options += f'<option value="{name}" {selected}>{name} ({type_label})</option>'
-        
+
         # Add switch button for local models that aren't currently loaded
         action_cell = ""
         if model_type == "local":
@@ -87,7 +87,7 @@ async def index(request: Request):
                 model_buttons += f'<button class="btn-switch btn-model" onclick="switchModel(\'{name}\')">Load {name}</button>'
             else:
                 action_cell = '<span class="badge badge-active">Active</span>'
-        
+
         models_rows += f"""
         <tr>
             <td><code>{name}</code></td>
@@ -162,7 +162,7 @@ async def status_events():
             llama_status = await srv.query_llama_status()
             total_sent = srv.token_counts.get("total_sent", 0)
             total_recv = srv.token_counts.get("total_recv", 0)
-            
+
             loaded_models = None
             if llama_status.get("router_mode"):
                 router_models = await srv.router_list_models()
@@ -184,7 +184,7 @@ async def status_events():
                 try:
                     message = await asyncio.wait_for(queue.get(), timeout=30.0)
                     yield message
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # keepalive comment
                     yield ": keepalive\n\n"
         finally:
@@ -220,7 +220,7 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
     srv = _srv()
     if source not in ("proxy", "llama"):
         source = "proxy"
-    
+
     log_path = srv._resolve_log_path(source)
 
     async def event_generator():
@@ -280,7 +280,7 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
                     if _local_counts_queue is not None:
                         try:
                             update = await asyncio.wait_for(_local_counts_queue.get(), timeout=0.25)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             update = None
                     else:
                         await asyncio.sleep(0.25)
@@ -309,7 +309,7 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
 
                 if cur_size > last_pos:
                     # Read new data
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    with open(log_path, encoding="utf-8", errors="replace") as f:
                         f.seek(last_pos)
                         new = f.read()
                     last_pos = cur_size
@@ -512,7 +512,7 @@ async def _dispatch_local_model_load(
 
     # Session restore detection
     try:
-        from proxy.session import _resolve_session_id_header, _build_slot_context
+        from proxy.session import _build_slot_context, _resolve_session_id_header
         session_id_header, _ = _resolve_session_id_header(request.headers)
         # First try scheduler.reenter_job to detect existing slot ownership
         try:
@@ -601,7 +601,7 @@ async def create_embeddings(request: Request):
             status_code=400,
             detail="Request body is required"
         )
-    
+
     try:
         body_json = json.loads(body)
     except json.JSONDecodeError:
@@ -609,21 +609,21 @@ async def create_embeddings(request: Request):
             status_code=400,
             detail="Invalid JSON in request body"
         )
-    
+
     # Validate required fields
     if "input" not in body_json:
         raise HTTPException(
             status_code=400,
             detail="'input' field is required for embeddings requests"
         )
-    
+
     input_value = body_json["input"]
     if not isinstance(input_value, (str, list)):
         raise HTTPException(
             status_code=400,
             detail="'input' must be a string or an array of strings"
         )
-    
+
     if isinstance(input_value, list):
         if len(input_value) == 0:
             raise HTTPException(
@@ -635,29 +635,29 @@ async def create_embeddings(request: Request):
                 status_code=400,
                 detail="'input' array elements must be strings, integers, or arrays"
             )
-    
+
     # Resolve model
     model_name = body_json.get("model")
     if not model_name and srv.current_model:
         model_name = srv.current_model
-    
+
     model_cfg = srv.get_model_config(model_name) if model_name else None
-    
+
     if model_cfg is None:
         # Check if default remote is enabled
         default_remote = srv.config.get("default_remote", {})
         if default_remote.get("enabled", False):
             return await srv.proxy_to_remote(request, "v1/embeddings", default_remote)
-        
+
         # If we have a current model loaded, try local
         if srv.current_model:
             return await srv.proxy_to_local(request, "v1/embeddings")
-        
+
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model: {model_name}. No default remote configured."
         )
-    
+
     if get_model_type(model_cfg) == "local":
         return await _dispatch_local_model_load(request, srv, model_cfg, model_name, "v1/embeddings")
 
@@ -712,21 +712,21 @@ async def _do_proxy_openai_api(
     # Get the request body to determine the model
     body_json = {}
     model_name = None
-    
+
     if body:
         try:
             body_json = json.loads(body)
             model_name = body_json.get("model")
         except json.JSONDecodeError:
             pass
-    
+
     # If no model specified, use the currently loaded model
     if not model_name and srv.current_model:
         model_name = srv.current_model
-    
+
     # Get model configuration
     model_cfg = srv.get_model_config(model_name) if model_name else None
-    
+
     # Apply system prompt if configured
     if model_cfg is not None and "messages" in body_json and isinstance(body_json.get("messages"), list):
         prompt_result = resolve_system_prompt(model_name, model_cfg) if model_name else None
@@ -740,22 +740,22 @@ async def _do_proxy_openai_api(
                 "Applied system_prompt mode=%s to %s messages (was %d, now %d)",
                 prompt_result["mode"], model_name, original_count, len(body_json["messages"]),
             )
-    
+
     if model_cfg is None:
         # Check if default remote is enabled
         default_remote = srv.config.get("default_remote", {})
         if default_remote.get("enabled", False):
             return await srv.proxy_to_remote(request, f"v1/{path}", default_remote)
-        
+
         # If we have a current model loaded, use that
         if srv.current_model:
             return await srv.proxy_to_local(request, f"v1/{path}")
-        
+
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model: {model_name}. No default remote configured."
         )
-    
+
     if get_model_type(model_cfg) == "local":
         return await _dispatch_local_model_load(
             request, srv, model_cfg, model_name, f"v1/{path}",
@@ -768,7 +768,7 @@ async def _do_proxy_openai_api(
             from proxy.provider import proxy_with_remote_fallback
             return await proxy_with_remote_fallback(request, f"v1/{path}", model_cfg, srv.config)
         return await srv.proxy_to_remote(request, f"v1/{path}", model_cfg)
-    
+
     raise HTTPException(
         status_code=500,
         detail=f"Invalid model configuration for: {model_name}"
@@ -783,16 +783,16 @@ async def switch_model(model_name: str):
     """Manually switch to a different model."""
     srv = _srv()
     model_cfg = srv.get_model_config(model_name)
-    
+
     if model_cfg is None:
         raise HTTPException(status_code=404, detail=f"Unknown model: {model_name}")
-    
+
     if get_model_type(model_cfg) != "local":
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Model {model_name} is not a local model"
         )
-    
+
     srv.logger.info(f"Admin switch-model requested: {model_name}; current_model before: {srv.current_model}; llama_running: {srv.llama_process is not None and srv.llama_process.poll() is None}")
     if await srv.ensure_model_loaded(model_name):
         srv.logger.info(f"Admin switch-model succeeded: requested={model_name} current_model after: {srv.current_model}")

@@ -15,8 +15,6 @@ Acceptance criteria (from LP-0MQJGVH9Q003MTAQ):
 from typing import List, Tuple
 from unittest.mock import patch
 
-
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -26,7 +24,7 @@ def _make_chunks(
     interval_seconds: float = 0.1,
     text_length: int = 200,  # ~50 tokens at 4 bytes/token
     count: int = 10,
-) -> List[Tuple[float, str]]:
+) -> list[tuple[float, str]]:
     """Build a list of (timestamp, chunk_text) pairs with controlled spacing."""
     chunks = []
     for i in range(count):
@@ -259,7 +257,7 @@ class TestTokenRateAlgorithmDetail:
         # - Old burst at t=1000 to t=1002 (very high rate, 500 t/s)
         # - Normal rate at t=1002 to t=1008 (low rate, 50 t/s)
         # With window=5s at t=1008, old burst (t=1000-1002) should be out of window
-        chunks: List[Tuple[float, str]] = []
+        chunks: list[tuple[float, str]] = []
         # Old burst (t=1000 to t=1002): high rate
         for i in range(20):
             t = 1000.0 + i * 0.1

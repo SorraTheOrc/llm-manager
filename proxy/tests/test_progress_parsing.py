@@ -8,7 +8,6 @@ log lines in the format::
 
 from proxy.server import extract_progress_data
 
-
 # ---------------------------------------------------------------------------
 # Valid format tests
 # ---------------------------------------------------------------------------

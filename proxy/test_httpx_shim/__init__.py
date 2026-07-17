@@ -5,8 +5,9 @@ blocking fallbacks for simple requests. This file intentionally shadows
 the installed `httpx` package during tests so the test suite runs
 consistently across environments.
 """
-from typing import Any, Optional, Callable, Mapping
 import asyncio
+from collections.abc import Callable, Mapping
+from typing import Any, Optional
 
 try:
     from starlette.testclient import TestClient as _StarletteTestClient
@@ -18,7 +19,7 @@ from requests import Response as _RequestsResponse
 
 
 class Response:
-    def __init__(self, status_code: int = 200, content: bytes = b"", headers: Optional[dict] = None, json_data: Any = None):
+    def __init__(self, status_code: int = 200, content: bytes = b"", headers: dict | None = None, json_data: Any = None):
         self.status_code = status_code
         self._content = content
         self._headers = headers or {}
@@ -154,7 +155,7 @@ class _ASGIClient:
     def post(self, url: str, json=None, data=None, **kwargs):
         return self._request("POST", url, json=json, data=data, **kwargs)
 
-    def request(self, method: str, url: str, headers: Optional[Mapping] = None, json: Any = None, data: Any = None, **kwargs):
+    def request(self, method: str, url: str, headers: Mapping | None = None, json: Any = None, data: Any = None, **kwargs):
         return self._request(method, url, headers=headers, json=json, data=data, **kwargs)
 
     async def _asgi_handle(self, scope):
@@ -189,7 +190,7 @@ class _ASGIClient:
             headers=response_headers[0],
         )
 
-    def _request(self, method: str, url: str, headers: Optional[Mapping] = None, json: Any = None, data: Any = None, **kwargs):
+    def _request(self, method: str, url: str, headers: Mapping | None = None, json: Any = None, data: Any = None, **kwargs):
         if headers is None:
             headers = {}
         path = url.split("?")[0]

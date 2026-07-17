@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Import the server module to access extracted helpers and globals
 import proxy.server as server
 
-
 pytestmark = pytest.mark.refactor_parity
 
 
