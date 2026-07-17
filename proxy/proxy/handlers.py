@@ -16,12 +16,11 @@ import logging
 import re
 import threading
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")

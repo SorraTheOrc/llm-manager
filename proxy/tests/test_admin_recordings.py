@@ -10,12 +10,10 @@ Covers:
 """
 
 import json
-import os
 import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
-from fastapi import FastAPI
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -67,7 +65,6 @@ def mock_server(temp_recording_dir):
 @pytest.fixture
 def app(temp_recording_dir):
     """Create a FastAPI app with recording endpoint routes registered."""
-    from proxy.session_recorder import SessionRecorder
     from proxy.server import app
 
     # We need to register the routes - this is more of an integration test
@@ -309,7 +306,6 @@ class TestRouteRegistration:
         """The route registration functions produce callable endpoint wrappers."""
         # This tests that the registration pattern works: we just verify
         # the registration function can be called without error
-        from proxy.server import app
         from proxy.ui import list_session_recording_routes
 
         # The registration function should add routes to the given app
@@ -317,8 +313,7 @@ class TestRouteRegistration:
 
     def test_response_return_type(self):
         """Handler return types are compatible with FastAPI JSONResponse."""
-        from fastapi.responses import JSONResponse
-        from proxy.ui import list_session_recordings, get_session_recording
+        from proxy.ui import list_session_recordings
 
         # The handlers should be annotated or documented as returning JSONResponse
         # We verify by checking that a call would produce a JSONResponse-shaped result

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import httpx
 import pytest
 from fastapi import Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from proxy.proxy_remote import (
     _handle_remote_non_streaming,

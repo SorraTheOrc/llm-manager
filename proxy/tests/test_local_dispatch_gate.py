@@ -911,7 +911,7 @@ async def test_get_local_max_concurrent_queries_reads_session_slot_pool_size():
 async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypatch):
     """With N=2 and two active sessions, a third is blocked via proxy_to_local."""
     from proxy import server as srv
-    from proxy.router import proxy_to_local, _get_local_max_concurrent_queries
+    from proxy.router import proxy_to_local
 
     # Config: N=2 via session_slot_pool_size (also set local_max_concurrent_queries
     # for backward compat so tests work with both old and new code)
@@ -1008,7 +1008,7 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
 async def test_n2_integration_release_then_retry(monkeypatch):
     """After one session completes, a blocked session can acquire on retry."""
     from proxy import server as srv
-    from proxy.router import proxy_to_local, _get_local_max_concurrent_queries
+    from proxy.router import proxy_to_local
 
     monkeypatch.setattr(
         srv,

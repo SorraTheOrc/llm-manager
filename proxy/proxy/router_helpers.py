@@ -15,9 +15,8 @@ Includes:
 
 import asyncio
 import json
-import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Mapping, Union
+from typing import Any, Dict, Optional, Mapping, Union
 
 import httpx
 from fastapi import HTTPException, Request

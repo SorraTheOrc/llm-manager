@@ -7,35 +7,20 @@ or remote API services based on configuration.
 """
 
 import asyncio
-import hashlib
-import json
 import logging
-import os
-import re
-import signal
 import subprocess
-import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from fnmatch import fnmatch
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import httpx
-import shutil
-import io
-import traceback
 import threading
-from datetime import timedelta
-import yaml
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from proxy.session_manager import SessionManager, DEFAULT_SESSION_TTL_SECONDS
-import proxy.metrics as metrics
-from proxy.metrics import record_http_error
+import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
 
 # Global state
 llama_process: Optional[subprocess.Popen] = None

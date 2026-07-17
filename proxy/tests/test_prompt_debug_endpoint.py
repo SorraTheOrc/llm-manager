@@ -5,7 +5,7 @@ Verifies gating, response format, and content preview behavior.
 """
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

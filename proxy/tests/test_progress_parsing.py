@@ -6,7 +6,6 @@ log lines in the format::
     slot N : prompt processing progress, n_tokens = 26988, progress = 0.658083
 """
 
-import pytest
 from proxy.server import extract_progress_data
 
 

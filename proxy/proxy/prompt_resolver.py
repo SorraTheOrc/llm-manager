@@ -21,7 +21,7 @@ No caching: files are read on every resolve_system_prompt() call.
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger("llama-proxy")
 

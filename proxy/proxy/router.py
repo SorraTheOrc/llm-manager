@@ -31,7 +31,6 @@ from proxy.lifecycle import (  # noqa: E402
     _self_healing_response,
     _resolve_slot_model_name,
     _compute_adaptive_timeout,
-    get_model_config,
 )
 from proxy.session import (  # noqa: E402
     SessionSingleFlightRejected,
@@ -72,7 +71,6 @@ from .router_helpers import (  # noqa: E402
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _check_slot_availability,
-    _cleanup_stale_local_dispatch,
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
@@ -606,7 +604,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             elif admit_result.kind == "REJECTED_503":
                 raise HTTPException(
                     status_code=503,
-                    detail=f"Queue full. Try again later.",
+                    detail="Queue full. Try again later.",
                     headers={
                         "Retry-After": str(
                             int(admit_result.retry_after)

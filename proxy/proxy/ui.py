@@ -8,7 +8,6 @@ Uses lazy server import (_srv()) to avoid circular imports.
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -57,7 +56,7 @@ async def index(request: Request):
         model_type = get_model_type(cfg) or "unknown"
         aliases = ", ".join(cfg.get("aliases", [])) or "—"
         endpoint = get_remote_endpoint(cfg) if model_type == "remote" else "Local llama-server"
-        type_badge = f'<span class="badge badge-local">Local</span>' if model_type == "local" else (f'<span class="badge badge-remote">Remote</span>' if model_type == "remote" else '<span class="badge badge-unknown">Unknown</span>')
+        type_badge = '<span class="badge badge-local">Local</span>' if model_type == "local" else ('<span class="badge badge-remote">Remote</span>' if model_type == "remote" else '<span class="badge badge-unknown">Unknown</span>')
         
         # Build model dropdown options
         # Consider both the config key (name) and the underlying llama_model when

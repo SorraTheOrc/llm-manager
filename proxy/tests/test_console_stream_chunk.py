@@ -1,7 +1,5 @@
 import io
 import logging
-import json
-import pytest
 import re
 
 from pathlib import Path

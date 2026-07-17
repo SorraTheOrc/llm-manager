@@ -13,7 +13,6 @@ waste when the router loaded both. This test suite verifies:
 import configparser
 import os
 
-import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODELS_INI_PATH = os.path.join(REPO_ROOT, "models.ini")

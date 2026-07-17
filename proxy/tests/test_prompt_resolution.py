@@ -7,7 +7,6 @@ precedence, size and encoding handling, and config validation for missing
 mode.
 """
 
-import os
 import logging
 from pathlib import Path
 

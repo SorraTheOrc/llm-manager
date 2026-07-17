@@ -1,6 +1,5 @@
 import asyncio
 import time
-import threading
 import pytest
 
 from proxy import server

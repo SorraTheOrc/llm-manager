@@ -8,8 +8,6 @@ Verifies that:
 - LLAMA_PARALLEL env var is forwarded from lifecycle to start script
 """
 
-import logging
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

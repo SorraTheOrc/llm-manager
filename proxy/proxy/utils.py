@@ -13,7 +13,7 @@ import os
 import re
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
 import yaml

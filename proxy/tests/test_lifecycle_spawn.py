@@ -4,7 +4,6 @@ import io
 import logging
 import subprocess
 import threading
-import types
 import sys
 from pathlib import Path
 
@@ -12,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import importlib
 lifecycle = importlib.import_module("proxy.lifecycle")
-from proxy.handlers import format_progress
 
 
 class FakeProc:

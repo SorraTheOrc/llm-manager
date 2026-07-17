@@ -358,7 +358,7 @@ def generate_report(
     print("=" * 72)
     print("SLOT THRASHING REPRODUCTION REPORT")
     print("=" * 72)
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Pool size:                     {pool_size}")
     print(f"  Sessions:                      {num_sessions}")
     print(f"  Turns per session:             {num_turns}")
@@ -371,7 +371,7 @@ def generate_report(
     total_steals = len(windows)
     steal_rate = (total_steals / total_turns * 100) if total_turns > 0 else 0.0
 
-    print(f"=== RESULTS ===")
+    print("=== RESULTS ===")
     print(f"  Total turns completed:         {total_turns}")
     print(f"  Inter-session steals detected: {total_steals}")
     print(f"  Steal rate (per turn):         {steal_rate:.1f}%")
@@ -384,14 +384,14 @@ def generate_report(
         avg_gap = sum(gap_durations) / len(gap_durations)
         median_gap = sorted(gap_durations)[len(gap_durations) // 2]
 
-        print(f"  Gap window analysis (time between release and next acquire):")
+        print("  Gap window analysis (time between release and next acquire):")
         print(f"    Min gap:   {min_gap*1000:.4f}ms")
         print(f"    Max gap:   {max_gap*1000:.4f}ms")
         print(f"    Avg gap:   {avg_gap*1000:.4f}ms")
         print(f"    Median gap: {median_gap*1000:.4f}ms")
         print()
 
-        print(f"  Steal events (first 20):")
+        print("  Steal events (first 20):")
         print(f"    {'Slot':<6} {'From Session':<28} {'Turn':<6} {'To Session':<28} {'Turn':<6} {'Gap (ms)':<10}")
         print(f"    {'-'*6} {'-'*28} {'-'*6} {'-'*28} {'-'*6} {'-'*10}")
         for w in windows[:20]:
@@ -400,13 +400,13 @@ def generate_report(
             print(f"    ... ({len(windows) - 20} more events)")
         print()
     else:
-        print(f"  NO INTER-SESSION STEALING DETECTED")
+        print("  NO INTER-SESSION STEALING DETECTED")
         print()
 
     # Lock hold time statistics
     all_holds = [h for holds in hold_times.values() for h in holds]
     if all_holds:
-        print(f"  Lock hold time per turn:")
+        print("  Lock hold time per turn:")
         print(f"    Min hold:   {min(all_holds)*1000:.2f}ms")
         print(f"    Max hold:   {max(all_holds)*1000:.2f}ms")
         print(f"    Avg hold:   {sum(all_holds)/len(all_holds)*1000:.2f}ms")
@@ -431,7 +431,7 @@ def generate_report(
     total_think = sum(tl.total_thinking_time for tl in timelines)
     total_resp = sum(tl.total_response_time for tl in timelines)
 
-    print(f"  Aggregate Overhead Analysis:")
+    print("  Aggregate Overhead Analysis:")
     print(f"    Total save cost:       {total_save*1000:.1f}ms ({total_save:.3f}s)")
     print(f"    Total restore cost:    {total_restore*1000:.1f}ms ({total_restore:.3f}s)")
     print(f"    Total save+restore:    {total_overhead*1000:.1f}ms ({total_overhead:.3f}s)")
@@ -445,7 +445,7 @@ def generate_report(
     for w in windows:
         stolen_from[w.stolen_from_session] = stolen_from.get(w.stolen_from_session, 0) + 1
 
-    print(f"  Per-Session Cache Losses (slot stolen between turns):")
+    print("  Per-Session Cache Losses (slot stolen between turns):")
     for tl in timelines:
         losses = stolen_from.get(tl.session_id, 0)
         turnover = losses / num_turns * 100 if num_turns > 0 else 0

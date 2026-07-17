@@ -7,12 +7,10 @@ and can be run without a live proxy backend.
 """
 
 import json
-import time
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
-from fnmatch import fnmatch
 
 import proxy.server as server
 from proxy.lifecycle import get_model_config

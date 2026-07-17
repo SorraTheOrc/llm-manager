@@ -1,9 +1,7 @@
 """Tests for progress formatting and threshold-based logging."""
 
 import logging
-import re
 import io
-import threading
 import sys
 from proxy import server
 from proxy import lifecycle

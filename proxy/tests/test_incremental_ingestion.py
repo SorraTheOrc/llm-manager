@@ -7,12 +7,11 @@ without requiring a running llama-server instance.
 """
 
 import asyncio
-import json
 import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from proxy.session_manager import SessionManager, Session
+from proxy.session_manager import SessionManager
 
 pytestmark = pytest.mark.refactor_parity
 

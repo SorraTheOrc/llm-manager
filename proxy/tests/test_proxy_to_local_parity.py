@@ -16,12 +16,9 @@ are equivalent.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
 
 import proxy.server as server
 from proxy.router import proxy_to_local

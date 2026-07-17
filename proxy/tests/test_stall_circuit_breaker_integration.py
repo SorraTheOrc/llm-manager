@@ -11,7 +11,6 @@ fire in scenarios where stalls should not be recorded.
 """
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx

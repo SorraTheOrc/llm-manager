@@ -1,6 +1,5 @@
 """Tests for adaptive timeout calculation in the proxy server."""
 
-import pytest
 import proxy.server as server
 
 

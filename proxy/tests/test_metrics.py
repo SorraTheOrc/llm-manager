@@ -6,11 +6,9 @@ Covers:
 - Best-effort no-op fallback when prometheus_client is unavailable
 """
 
-import importlib
 import sys
 from unittest.mock import patch
 
-import pytest
 
 import proxy.metrics as metrics
 

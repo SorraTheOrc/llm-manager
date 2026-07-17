@@ -5,7 +5,7 @@ server state, simulating model-switch and active-query scenarios.
 """
 import asyncio
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 

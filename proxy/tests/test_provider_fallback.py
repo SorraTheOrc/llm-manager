@@ -12,7 +12,7 @@ import time
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import HTTPException, Request, Response
+from fastapi import HTTPException, Response
 
 import proxy.provider as provider
 
@@ -1651,7 +1651,7 @@ async def test_local_concurrency_below_limit_calls_local(mixed_model_config):
 async def test_remote_model_with_providers_calls_fallback(monkeypatch):
     """proxy_openai_api should call proxy_with_remote_fallback for remote models with providers."""
     import proxy.server as server_module
-    from unittest.mock import MagicMock, AsyncMock
+    from unittest.mock import MagicMock
 
     # Set up config with a remote model that has providers
     server_module.config = {
@@ -1920,7 +1920,7 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
     should override the model name in the forwarded request body."""
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import MagicMock, patch as mock_patch
+    from unittest.mock import patch as mock_patch
 
     # Minimal server config needed for timeout
     server_module.config = {
@@ -2013,7 +2013,7 @@ async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
     should pass the original model name through unchanged."""
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import MagicMock, patch as mock_patch
+    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2590,7 +2590,7 @@ async def test_proxy_to_remote_falls_back_to_auth_json_when_env_var_not_set():
     """When api_key_env is set but the env var is NOT set, proxy_to_remote
     must fall back to resolving the key from ~/.pi/agent/auth.json."""
     import proxy.server as server_module
-    from proxy.proxy_remote import proxy_to_remote, _try_pi_auth_json
+    from proxy.proxy_remote import proxy_to_remote
     from unittest.mock import patch as mock_patch
 
     server_module.config = {
@@ -2643,7 +2643,7 @@ def test_try_pi_auth_json_resolves_opencode_api_key(tmp_path):
     """_try_pi_auth_json must resolve OPENCODE_API_KEY to the opencode-go
     key from auth.json."""
     from unittest.mock import patch as mock_patch
-    from proxy.proxy_remote import _try_pi_auth_json, _get_auth_json_path
+    from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
         "opencode-go": {

@@ -10,8 +10,6 @@ Validates that:
 - Alert rule files (monitoring/*.yaml) are valid Prometheus rule files.
 """
 
-import os
-import sys
 from pathlib import Path
 
 import pytest

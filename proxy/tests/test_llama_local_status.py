@@ -31,7 +31,6 @@ async def test_llama_local_status_not_running():
 @pytest.mark.asyncio
 async def test_llama_local_status_shows_local_owner_when_lease_active():
     """When a local dispatch lease is active, status returns the owner session and remaining time."""
-    import asyncio
     import time
     from proxy import server
     from proxy.server import app

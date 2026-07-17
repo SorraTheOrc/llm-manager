@@ -9,15 +9,11 @@ and mock the backend llama-server with controlled SSE streaming.
 """
 
 import json
-import logging
-import time
 from typing import AsyncGenerator, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 
-from proxy.server import app as proxy_app
 
 
 # ===================================================================

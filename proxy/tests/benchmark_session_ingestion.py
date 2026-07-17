@@ -214,7 +214,7 @@ def run_benchmark(
 def print_results(results: dict) -> None:
     """Print benchmark results in a human-readable format."""
     print(f"\n{'='*60}")
-    print(f"Session Ingestion Benchmark Results")
+    print("Session Ingestion Benchmark Results")
     print(f"{'='*60}")
     print(f"URL: {results['metadata']['url']}")
     print(f"Model: {results['metadata']['model']}")
@@ -223,17 +223,17 @@ def print_results(results: dict) -> None:
 
     for detail in results["details"]:
         print(f"  Run {detail['run']}:")
-        print(f"    No session:")
+        print("    No session:")
         for t in detail["no_session"]:
             print(f"      Turn {t['turn']}: {t['elapsed_s']}s "
                   f"({t['messages_sent']} msgs, ~{t['approx_tokens_sent']} tokens)")
-        print(f"    With session:")
+        print("    With session:")
         for t in detail["session"]:
             print(f"      Turn {t['turn']}: {t['elapsed_s']}s "
                   f"(delta={t['delta']}, {t['messages_sent']} msgs, "
                   f"~{t['approx_tokens_sent']} tokens)")
 
-    print(f"\n  Aggregate:")
+    print("\n  Aggregate:")
     print(f"    Avg total (no session):  {results['avg_no_session_total_s']}s")
     print(f"    Avg total (with session): {results['avg_with_session_total_s']}s")
     print(f"    Total latency reduction:  {results['reduction_pct']}%")

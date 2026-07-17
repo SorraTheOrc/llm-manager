@@ -10,14 +10,12 @@ Tests cover:
 """
 
 import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
-from fastapi import HTTPException
 
-from proxy.slot_scheduler import JobScheduler, AdmitResult
-from proxy.router import _get_job_scheduler, _job_scheduler, _job_scheduler_initialized
+from proxy.slot_scheduler import JobScheduler
+from proxy.router import _get_job_scheduler
 
 
 # ===================================================================
@@ -121,7 +119,6 @@ class TestSchedulerInit:
 
     def test_no_slot_management_config_logs_message(self, monkeypatch):
         """When slot_management is absent, _get_job_scheduler() logs at INFO (AC 9)."""
-        import proxy.router as router_mod
 
         mock_srv = MagicMock()
         mock_srv.config = {"server": {}}
@@ -140,7 +137,6 @@ class TestSchedulerInit:
 
     def test_pool_size_zero_logs_message(self, monkeypatch):
         """When pool_size < 1, _get_job_scheduler() logs at INFO (AC 9)."""
-        import proxy.router as router_mod
 
         mock_srv = MagicMock()
         mock_srv.config = {

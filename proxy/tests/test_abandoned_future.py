@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from fastapi.responses import StreamingResponse
 
 import proxy.server as server
 

@@ -6,10 +6,7 @@ allows concurrent requests to complete without blocking each other.
 """
 import asyncio
 import pytest
-from concurrent.futures import ThreadPoolExecutor
 import threading
-import sys
-import os
 
 import httpx
 

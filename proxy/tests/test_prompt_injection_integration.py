@@ -12,7 +12,6 @@ import httpx
 import pytest
 
 import proxy.server as server
-from proxy.prompt_resolver import resolve_system_prompt
 
 
 # ---------------------------------------------------------------------------

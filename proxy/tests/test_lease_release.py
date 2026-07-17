@@ -9,7 +9,6 @@ Tests cover:
 - 500 Internal Server Error on unexpected errors
 """
 
-import asyncio
 import time
 from unittest.mock import patch
 

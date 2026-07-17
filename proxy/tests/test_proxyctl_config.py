@@ -11,7 +11,6 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-import pytest
 
 PYTEST_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PYTEST_DIR.parent.parent

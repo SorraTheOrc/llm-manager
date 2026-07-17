@@ -7,7 +7,6 @@ These tests verify that the proxyctl CLI and server support dev mode correctly:
 - Production mode is unaffected by dev mode changes
 """
 
-import os
 import subprocess
 from pathlib import Path
 

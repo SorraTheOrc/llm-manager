@@ -10,17 +10,13 @@ Verifies that:
 6. Non-fallback direct calls to proxy_to_local() also set the header
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
-import httpx
 import pytest
 from fastapi import Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
-import proxy.router as router
-import proxy.proxy_remote as proxy_remote
 import proxy.provider as provider
 from proxy.router import proxy_to_local
 from proxy.proxy_remote import proxy_to_remote

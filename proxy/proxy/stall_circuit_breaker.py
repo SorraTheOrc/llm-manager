@@ -30,7 +30,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import proxy.provider as provider_mod
 

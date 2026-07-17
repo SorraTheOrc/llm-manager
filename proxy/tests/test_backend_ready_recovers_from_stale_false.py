@@ -11,7 +11,6 @@ import asyncio
 import pytest
 
 import proxy.server as server
-import proxy.backend_health as backend_health
 
 pytestmark = pytest.mark.refactor_parity
 

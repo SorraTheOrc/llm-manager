@@ -10,11 +10,10 @@ Tests cover:
 """
 
 import asyncio
-import time
 
 import pytest
 
-from proxy.slot_scheduler import JobScheduler, AdmitResult, SlotState
+from proxy.slot_scheduler import JobScheduler, SlotState
 
 
 # ===================================================================
@@ -677,7 +676,6 @@ class TestSlotReleaseTimeLogging:
         s = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=300.0)
         await s.start()
         try:
-            import time
             await s.admit_job("session-a")
             slot_id = s.active_jobs["session-a"]
 

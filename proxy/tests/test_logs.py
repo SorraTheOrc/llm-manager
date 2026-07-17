@@ -1,8 +1,6 @@
-import asyncio
-import json
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
@@ -111,7 +109,6 @@ async def test_log_tail_missing_file_returns_error(transport):
 
 async def _collect_sse_first_chunk(handler, request, lines=2, source="proxy"):
     """Call an SSE handler directly and collect the first chunk."""
-    from starlette.requests import Request as StarletteRequest
     
     response = await handler(request, lines=lines, source=source)
     try:

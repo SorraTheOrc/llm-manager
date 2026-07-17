@@ -461,14 +461,14 @@ def _print_final_summary() -> None:
         _log(f"  Model:        {r.get('model')}")
         _log(f"  Session:      {r.get('session_id')}")
         _log(f"  Time (UTC):   {r.get('timestamp_utc')}")
-        _log(f"  Log analysis:")
+        _log("  Log analysis:")
 
         routing_events = r.get("routing_events", [])
         if routing_events:
             for event in routing_events:
                 _log(f"    [{event.get('timestamp')}] {event.get('kind')}: {event.get('details')}")
         else:
-            _log(f"    (no routing events found in log)")
+            _log("    (no routing events found in log)")
 
     # If first two are NOT served by Qwen3, trace back leases
     first_model = _REQUEST_RESULTS[0].get("model", "") if len(_REQUEST_RESULTS) > 0 else ""
@@ -671,7 +671,7 @@ def test_model_audit_plan_routing() -> None:
             # Broader search: look for ALL routing-related lines by
             # matching session_id or prompt text (since Fallback triggered
             # lines lack session IDs but are temporally correlated).
-            _log(f"  Broader search for routing events...")
+            _log("  Broader search for routing events...")
             all_log_lines = _read_proxy_log_since("")
             all_routing_events = _find_routing_lines(all_log_lines)
             prompt_text = r.get("prompt_truncated", "")[:60].rstrip(".")
@@ -735,10 +735,10 @@ def test_model_audit_plan_routing() -> None:
                 routing_analysis += f"Local dispatch denied: {ev['details']}. "
             elif ev["kind"] == "local_dispatch":
                 _log(f"  LOCAL DISPATCH: {ev['details']}")
-                routing_analysis += f"Routed to local backend."
+                routing_analysis += "Routed to local backend."
             elif ev["kind"] == "remote_dispatch":
                 _log(f"  REMOTE DISPATCH: {ev['details']}")
-                routing_analysis += f"Routed to remote backend."
+                routing_analysis += "Routed to remote backend."
             elif ev["kind"] == "fallback":
                 _log(f"  FALLBACK: {ev['details']}")
                 routing_analysis += f"Fallback: {ev['details']}. "
@@ -785,7 +785,7 @@ def test_model_audit_plan_routing() -> None:
             if ev["kind"] in ("lease_renewed", "lease_released", "dispatch_denied", "routing_check")
         ]
 
-        _log(f"\nAll lease/dispatch events in the test log window:")
+        _log("\nAll lease/dispatch events in the test log window:")
         for ev in lease_history:
             _log(f"  [{ev.get('timestamp')}] {ev.get('kind')}: {ev.get('details')}")
 
@@ -831,7 +831,7 @@ def test_model_audit_plan_routing() -> None:
                 if owner_session:
                     _log(f"  Lease owned by session: {owner_session}")
                 else:
-                    _log(f"  No lease owner identified (possibly cache_cold bypass or no active lease)")
+                    _log("  No lease owner identified (possibly cache_cold bypass or no active lease)")
     else:
         _log("Both first two requests were served by Qwen3. No backward lease trace needed.")
 

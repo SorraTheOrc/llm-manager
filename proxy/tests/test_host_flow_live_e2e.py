@@ -8,7 +8,6 @@ Run manually:
     RUN_LIVE_HOST_FLOW=1 pytest tests/test_host_flow_live_e2e.py -v
 """
 
-import json
 import os
 import pytest
 import requests

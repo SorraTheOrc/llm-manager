@@ -9,11 +9,9 @@ See work item LP-0MR6Y0VKF0068KK1.
 """
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
-from pathlib import Path
 
 import pytest
 from fastapi import Response, HTTPException
-from starlette.responses import JSONResponse
 
 import proxy.server as server
 import proxy.ui as ui

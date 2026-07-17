@@ -8,7 +8,6 @@ Tests cover:
 import logging
 from pathlib import Path
 
-import pytest
 
 
 def test_logging_fallback_path_resolves_to_proxy_logs():

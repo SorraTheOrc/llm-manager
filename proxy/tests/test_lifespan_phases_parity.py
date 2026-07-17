@@ -12,10 +12,8 @@ podman, model loading, or HTTP clients.
 
 import asyncio
 import logging
-import threading
 import sys
 from pathlib import Path
-from typing import Optional
 
 import httpx
 import pytest

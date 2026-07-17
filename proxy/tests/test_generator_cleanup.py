@@ -12,7 +12,6 @@ Acceptance criteria covered:
 - AC6: New disconnect cleanup test
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 

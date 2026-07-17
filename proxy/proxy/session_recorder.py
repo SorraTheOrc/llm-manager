@@ -20,7 +20,6 @@ timestamp) so files can be inspected individually without external context.
 import asyncio
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional

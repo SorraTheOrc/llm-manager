@@ -1,8 +1,6 @@
 """Tests for smart routing logic that bypasses local for large-context
 requests when the slot cache is invalidated (LP-0MRCSSBTM002NK3B)."""
 
-import pytest
-from unittest.mock import MagicMock, patch
 
 from proxy.provider import (
     _model_cache_cold,

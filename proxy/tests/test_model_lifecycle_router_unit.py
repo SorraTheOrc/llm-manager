@@ -3,7 +3,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import Response, HTTPException
+from fastapi import Response
 
 import proxy.server as server
 

@@ -5,7 +5,6 @@ metrics and their exposition on /metrics. The implementation is in
 proxy/proxy/metrics.py and instrumentation will emit values during streaming.
 """
 
-import importlib
 import sys
 from unittest.mock import patch
 

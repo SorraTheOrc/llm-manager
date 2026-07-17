@@ -12,7 +12,6 @@ import pytest
 from proxy.session_manager import (
     Session,
     SessionManager,
-    DEFAULT_SESSION_TTL_SECONDS,
 )
 from proxy.session import (
     extract_streamed_assistant_message_from_sse,

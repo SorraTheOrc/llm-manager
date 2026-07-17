@@ -1,11 +1,8 @@
 """Unit tests for the llama-server log watcher (unload_lru event monitoring)."""
 
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
-import pytest
 import sys
-from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import importlib

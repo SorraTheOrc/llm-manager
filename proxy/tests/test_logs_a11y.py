@@ -1,6 +1,5 @@
 import re
 from pathlib import Path
-import math
 
 
 def hex_to_rgb(hex_str: str):
