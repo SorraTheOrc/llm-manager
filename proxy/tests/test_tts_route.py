@@ -212,8 +212,8 @@ class TestTtsRouteContract:
 
     @pytest.mark.asyncio
     async def test_request_passthrough_forwards_all_params(self, monkeypatch):
-        """The proxy must forward model, input, voice, response_format to
-        tts-server."""
+        """The proxy must forward model, input, voice, response_format,
+        and instructions to tts-server."""
         from proxy.server import app
 
         transport = httpx.ASGITransport(app=app)
@@ -240,6 +240,7 @@ class TestTtsRouteContract:
                     "input": "Forward test",
                     "voice": "serena",
                     "response_format": "wav",
+                    "instructions": "Speak in a cheerful tone",
                 },
             )
 
@@ -249,6 +250,85 @@ class TestTtsRouteContract:
         assert sent_body.get("input") == "Forward test"
         assert sent_body.get("voice") == "serena"
         assert sent_body.get("response_format") == "wav"
+        assert sent_body.get("instructions") == "Speak in a cheerful tone", \
+            "instructions must be forwarded to tts-server"
+
+    @pytest.mark.asyncio
+    async def test_instructions_is_forwarded(self, monkeypatch):
+        """The proxy must forward the instructions field when provided."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "serena",
+                    "instructions": "Speak slowly and clearly",
+                },
+            )
+
+        assert sent_body is not None, \
+            "Handler did not forward any body to tts-server"
+        assert sent_body.get("instructions") == "Speak slowly and clearly", \
+            "instructions must be forwarded when provided"
+
+    @pytest.mark.asyncio
+    async def test_instructions_is_optional(self, monkeypatch):
+        """The proxy must handle requests without instructions
+        (backward compatible)."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "serena",
+                },
+            )
+
+        assert resp.status_code == 200, \
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert sent_body is not None, \
+            "Handler did not forward any body to tts-server"
+        # instructions should not be present in forward_body when not provided
+        assert "instructions" not in sent_body or not sent_body.get("instructions"), \
+            "instructions should not be forwarded when not provided"
 
     @pytest.mark.asyncio
     async def test_request_with_minimal_params_succeeds(self, monkeypatch):

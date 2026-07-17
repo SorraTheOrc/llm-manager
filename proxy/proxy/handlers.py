@@ -703,6 +703,7 @@ async def create_speech(request: Request):
     # Optional parameters
     voice = body.get("voice", "")
     response_format = body.get("response_format", "wav")
+    instructions = body.get("instructions", "")
 
     # Input length guard
     if len(input_text) > 10000:
@@ -713,7 +714,7 @@ async def create_speech(request: Request):
     tts_port = server_cfg.get("tts_server_port", 8081)
     tts_url = f"http://{tts_host}:{tts_port}/v1/audio/speech"
 
-    # Forward request to tts-server (omit voice when empty)
+    # Forward request to tts-server (omit empty optional fields)
     forward_body = {
         "model": model,
         "input": input_text,
@@ -721,6 +722,8 @@ async def create_speech(request: Request):
     }
     if voice:
         forward_body["voice"] = voice
+    if instructions:
+        forward_body["instructions"] = instructions
 
     try:
         client = srv._http_client if srv._http_client else None
