@@ -514,22 +514,6 @@ async def _dispatch_local_model_load(
     try:
         from proxy.session import _build_slot_context, _resolve_session_id_header
         session_id_header, _ = _resolve_session_id_header(request.headers)
-        # First try scheduler.reenter_job to detect existing slot ownership
-        try:
-            from proxy.router import _get_job_scheduler
-            scheduler = _get_job_scheduler()
-            if scheduler is not None and session_id_header:
-                slot_reenter = await scheduler.reenter_job(session_id_header)
-                if slot_reenter is not None:
-                    return srv._model_loading_response(
-                        requested_model=model_name if isinstance(model_name, str) else None,
-                        target_model=target_model,
-                        scheduled=scheduled,
-                        endpoint=f"/{endpoint_path}",
-                    )
-        except Exception:
-            srv.logger.debug("Scheduler reenter check failed; falling back to slot-file check", exc_info=True)
-
         slot_id, slot_filename, _ = _build_slot_context(srv.config.get("server", {}), session_id_header)
         if slot_filename and slot_filename != "" and Path(slot_filename).exists():
             return srv._model_loading_response(

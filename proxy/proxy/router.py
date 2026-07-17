@@ -58,7 +58,6 @@ from proxy.session import (  # noqa: E402
 # legacy alias for convenience
 record_http_error = metrics.record_http_error
 
-from proxy.slot_scheduler import AdmitResult, JobScheduler  # noqa: E402
 from proxy.utils import (  # noqa: E402
     _extract_assistant_content,
     _extract_assistant_content_from_sse,
@@ -92,92 +91,6 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     log_response_chunk,
     normalize_upstream_request_headers,
 )
-
-# ===================================================================
-# Job-level slot scheduler (global, lazy-initialized from config)
-# ===================================================================
-
-_job_scheduler: JobScheduler | None = None
-_job_scheduler_initialized: bool = False
-
-
-def _get_job_scheduler() -> JobScheduler | None:
-    """
-    Return the global JobScheduler, initialising it from config on first call.
-    Returns None if slot management is not configured.
-    """
-    global _job_scheduler, _job_scheduler_initialized
-    if _job_scheduler_initialized:
-        return _job_scheduler
-
-    _job_scheduler_initialized = True
-    srv = _srv()
-    server_config = srv.config.get("server", {})
-    slot_config = server_config.get("slot_management", {})
-    if not slot_config:
-        srv.logger.info(
-            "scheduler not initialized: slot_management config missing, "
-            "using hash-based slot assignment",
-        )
-        return None
-
-    pool_size = int(slot_config.get("slot_pool_size", 0) or 0)
-    if pool_size < 1:
-        srv.logger.info(
-            "scheduler not initialized: pool_size=%s < 1, "
-            "using hash-based slot assignment",
-            pool_size,
-        )
-        return None
-
-    _job_scheduler = JobScheduler(
-        pool_size=pool_size,
-        max_queue_depth=int(slot_config.get("slot_queue_max_depth", 16) or 16),
-        job_timeout=float(slot_config.get("slot_job_timeout_seconds", 300.0) or 300.0),
-        queue_overflow_retry_after=float(
-            slot_config.get("slot_queue_overflow_retry_after", 900) or 900
-        ),
-        max_request_duration=float(
-            slot_config.get("slot_max_request_duration_seconds", 600.0) or 600.0
-        ),
-    )
-    # Wire scheduler into SlotLockCoordinator
-    slot_lock_coordinator.set_scheduler(_job_scheduler)
-    return _job_scheduler
-
-
-def _scheduler_has_idle_slot() -> bool:
-    """
-    Check whether the JobScheduler has at least one idle slot.
-
-    Returns ``True`` if there is an idle slot (the request can be served),
-    ``False`` if all slots are busy (the request would be queued).
-    Returns ``True`` when no scheduler is active (no slot management).
-    """
-    scheduler = _get_job_scheduler()
-    if scheduler is None:
-        return True
-    return scheduler.has_idle_slot()
-
-
-def _scheduler_session_has_slot(session_id: str) -> bool:
-    """
-    Check whether a session already owns a scheduler slot.
-
-    A session that owns a slot can re-enter it via ``reenter_job`` even when
-    no idle slots exist. This is used to avoid incorrectly skipping the local
-    provider during the slot-save window between requests
-    (LP-0MRMMBZ7T007ER59).
-
-    Returns ``True`` if the session owns a slot, ``False`` otherwise.
-    Always returns ``False`` when no scheduler is active.
-    """
-    scheduler = _get_job_scheduler()
-    if scheduler is None:
-        return False
-    return session_id in scheduler.active_jobs
-
-
 
 
 def _get_local_max_concurrent_queries(server_config: dict) -> int:
@@ -420,16 +333,19 @@ async def _update_session_and_slot(
             srv.logger.debug("slot_save failed", exc_info=True)
 
 
-async def _release_scheduler_and_decrement(
+async def _cleanup_after_request(
     srv,
-    scheduler,
     session_id: str | None,
-    slot_id: int | None,
     disconnected: bool = False,
     decrement_local: bool = True,
     session_explicit: bool = False,
 ) -> None:
-    """Release scheduler slot and decrement active query counters.
+    """Decrement active query counters and clean up dispatch records.
+
+    The dispatch lease system (``_try_acquire_local_dispatch``) handles
+    concurrency gating, session ownership, and timeout-based release
+    independently. This cleanup ensures counters and lease records are
+    properly released after a request completes.
 
     When *disconnected* is True and *session_id* is known, any dispatch
     lease record for that session is also removed immediately (the client
@@ -439,11 +355,6 @@ async def _release_scheduler_and_decrement(
     corresponding dispatch record is marked as inactive with a future
     expires_at timestamp, keeping the lease alive for a returning session.
     """
-    if scheduler is not None:
-        if disconnected and session_id:
-            await scheduler.remove_job(session_id)
-        elif slot_id is not None:
-            await scheduler.mark_request_end(slot_id)
     await _decrement_active_queries(srv)
     if decrement_local:
         await _decrement_local_active_queries(
@@ -566,50 +477,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     slot_timeout = 3.0
     slot_enabled = False
 
-    # Try job-level scheduler (slot management) first
-    scheduler = _get_job_scheduler()
-    if scheduler is not None and session_id:
-        admit_result = await scheduler.reenter_job(session_id)
-        if admit_result is None:
-            admit_result = await scheduler.admit_job(session_id)
-        if isinstance(admit_result, AdmitResult):
-            if admit_result.kind == "ASSIGNED":
-                slot_id = admit_result.slot_id
-                # Job owns the slot — no save/restore needed
-                slot_enabled = False
-                srv.logger.debug(
-                    "scheduler assigned slot %s to session %s",
-                    slot_id, session_id[:8] if session_id else "unknown",
-                )
-                await scheduler.mark_request_start(slot_id)
-            elif admit_result.kind == "QUEUED":
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"Slot unavailable: session {session_id[:8]} queued "
-                        f"at position {admit_result.position}"
-                    ),
-                    headers={"Retry-After": "30"},
-                )
-            elif admit_result.kind == "REJECTED_503":
-                raise HTTPException(
-                    status_code=503,
-                    detail="Queue full. Try again later.",
-                    headers={
-                        "Retry-After": str(
-                            int(admit_result.retry_after)
-                            if admit_result.retry_after
-                            else 900
-                        )
-                    },
-                )
-
-    # Fall back to hash-based slot context if no scheduler assigned a slot
-    if slot_id is None:
-        slot_id, slot_filename, slot_timeout = _build_slot_context(
-            server_config, session_id
-        )
-        slot_enabled = slot_id is not None and slot_filename is not None
+    # Use hash-based slot context (dispatch lease system handles concurrency gating)
+    slot_id, slot_filename, slot_timeout = _build_slot_context(
+        server_config, session_id
+    )
+    slot_enabled = slot_id is not None and slot_filename is not None
 
     # Log request with resolved session_id and slot_id (LP-0MQQSM1V7004QOGL)
     log_request(
@@ -851,8 +723,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                     except Exception:
                         srv.backend_ready = False
-                        await _release_scheduler_and_decrement(
-                            srv, scheduler, session_id, slot_id,
+                        await _cleanup_after_request(
+                            srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
                         )
@@ -909,8 +781,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 is_delta_request, session_fallback_reason,
                             )
                         )
-                        await _release_scheduler_and_decrement(
-                            srv, scheduler, session_id, slot_id,
+                        await _cleanup_after_request(
+                            srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
                         )
@@ -1223,8 +1095,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                                 session_id,
                                                 f"guardrail_{guardrail_reason}",
                                                 slot_filename,
-                                                scheduler=scheduler,
-                                                scheduler_slot_id=slot_id,
                                             )
                                             slot_save_allowed = False
                                         break
@@ -1345,7 +1215,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # configurable timeout so that an unresponsive upstream
                             # (llama-server stalled mid-stream) does not block the
                             # generator cleanup, which would prevent session counter
-                            # and scheduler slot release (LP-0MRE7CMVZ002D2QU).
+                            # and dispatch lease release (LP-0MRE7CMVZ002D2QU).
                             disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
                             try:
                                 await asyncio.wait_for(
@@ -1395,8 +1265,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # has finished (LP-0MR96QL8400022BW: streaming path was
                             # not decrementing local_active_queries, causing subsequent
                             # requests to the same session to be rejected with 503).
-                            await _release_scheduler_and_decrement(
-                                srv, scheduler, session_id, slot_id,
+                            await _cleanup_after_request(
+                                srv, session_id,
                                 disconnected=disconnected,
                                 decrement_local=True,
                                 session_explicit=session_explicit,
@@ -1409,8 +1279,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         status_code=upstream_status,
                     )
         except SessionSingleFlightRejected as exc:
-            await _release_scheduler_and_decrement(
-                srv, scheduler, session_id, slot_id,
+            await _cleanup_after_request(
+                srv, session_id,
                 decrement_local=False,
             )
             # Clean up any dispatch record that was created before the rejection
@@ -1572,14 +1442,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 headers=resp_headers,
                             )
                     finally:
-                        await _release_scheduler_and_decrement(
-                            srv, scheduler, session_id, slot_id,
+                        await _cleanup_after_request(
+                            srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
                         )
         except SessionSingleFlightRejected as exc:
-            await _release_scheduler_and_decrement(
-                srv, scheduler, session_id, slot_id,
+            await _cleanup_after_request(
+                srv, session_id,
                 decrement_local=True,
             )
             # Clean up any dispatch record that was created before the rejection

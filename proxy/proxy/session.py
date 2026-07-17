@@ -648,30 +648,19 @@ async def _invalidate_session_and_slot(
     session_id: str | None,
     reason: str,
     slot_filename: str | None,
-    scheduler: Any | None = None,
-    scheduler_slot_id: int | None = None,
 ) -> None:
     """
-    Invalidate a session, clean up its slot file, and optionally release
-    the JobScheduler-owned slot.
+    Invalidate a session and clean up its slot file.
+
+    The dispatch lease system (``_try_acquire_local_dispatch``) handles
+    concurrency gating, session ownership, and timeout-based release
+    independently — no scheduler admission layer exists.
 
     Args:
         session_id: The session to invalidate.
         reason: Invalidation reason string.
         slot_filename: Path to the slot persistence file to remove.
-        scheduler: Optional JobScheduler instance. If provided together
-            with scheduler_slot_id, the scheduler slot is released before
-            session invalidation.
-        scheduler_slot_id: Slot ID to release via the JobScheduler.
     """
-    # Release scheduler-owned slot first (before session invalidation
-    # so queued jobs can be assigned promptly).
-    if scheduler is not None and scheduler_slot_id is not None:
-        try:
-            await scheduler.release_slot(scheduler_slot_id)
-        except Exception:
-            pass
-
     if session_id:
         try:
             srv = _srv()
@@ -713,12 +702,6 @@ class SlotLockCoordinator:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._locks: dict[int, asyncio.Lock] = {}
-        self._scheduler: Any | None = None
-
-    def set_scheduler(self, scheduler: Any) -> None:
-        """Inject a JobScheduler instance (called at startup)."""
-        self._scheduler = scheduler
-
     def acquire(self, slot_id: int | None):
         @asynccontextmanager
         async def _guard():

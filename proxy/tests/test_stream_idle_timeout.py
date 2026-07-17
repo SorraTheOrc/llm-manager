@@ -212,7 +212,6 @@ def _setup_basic_mocks(monkeypatch):
     monkeypatch.setattr(srv_module, "active_queries_lock", asyncio.Lock())
 
     monkeypatch.setattr(router_mod, "_is_self_healing_active", lambda: False)
-    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
 
     return srv_module, router_mod

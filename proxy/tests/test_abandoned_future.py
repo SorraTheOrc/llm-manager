@@ -102,8 +102,7 @@ def _reset_server_state(monkeypatch):
     monkeypatch.setattr(server, "session_manager", MagicMock())
     monkeypatch.setattr(server, "logger", MagicMock())
 
-    # Disable scheduler and self-healing
-    monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: None)
+    # Disable self-healing
     monkeypatch.setattr("proxy.router._is_self_healing_active", lambda: False)
 
     # Reset metrics

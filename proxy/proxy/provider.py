@@ -840,39 +840,6 @@ def _get_proxy_to_local():
     raise ImportError('No proxy_to_local implementation available')
 
 
-def _get_scheduler_has_idle_slot():
-    """Lazily import and check whether the JobScheduler has an idle slot.
-
-    Returns True if there is at least one idle slot, False if all slots
-    are busy, or True if no scheduler is active (no slot management).
-    """
-    try:
-        from proxy.router import _scheduler_has_idle_slot as _check
-        return _check()
-    except Exception:
-        return True
-
-
-def _get_scheduler_session_has_slot(session_id: str | None) -> bool:
-    """Lazily import and check whether a session owns a scheduler slot.
-
-    A session that owns a slot can re-enter via ``reenter_job`` even when
-    no idle slots exist. This prevents incorrectly skipping the local
-    provider during the slot-save window between requests
-    (LP-0MRMMBZ7T007ER59).
-
-    Returns True if the session owns a slot, False otherwise (including
-    when ``session_id`` is None or no scheduler is active).
-    """
-    if not session_id:
-        return False
-    try:
-        from proxy.router import _scheduler_session_has_slot as _check
-        return _check(session_id)
-    except Exception:
-        return False
-
-
 def _get_local_concurrency_info(config: dict) -> tuple:
     """Lazily import and return (current_local_active, max_local) from config.
 
@@ -1659,24 +1626,6 @@ async def proxy_with_fallback(
             # Mark attempt
             any_provider_tried = True
             if provider_type == "local":
-                # Queue bypass (LP-0MR5MAJNM005R905): if scheduler has no
-                # idle slots, skip local provider immediately without marking
-                # it as unavailable — the provider is busy, not failed.
-                #
-                # However, if the session already owns a scheduler slot, don't
-                # skip — the session can re-enter via reenter_job even when no
-                # idle slots are available (LP-0MRMMBZ7T007ER59).
-                if not _get_scheduler_has_idle_slot() and not _get_scheduler_session_has_slot(_session_id):
-                    _record_attempt(
-                        attempts,
-                        provider=provider_name,
-                        type=provider_type,
-                        status="slot_busy_skip_queue",
-                    )
-                    fallback_reason = "slot_busy_skip_queue"
-                    prev_provider = provider_name
-                    continue
-
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
                 # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
                 # provider without marking local as unavailable.

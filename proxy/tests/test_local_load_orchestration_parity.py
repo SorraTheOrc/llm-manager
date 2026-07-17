@@ -218,25 +218,24 @@ class TestLocalLoadOrchestrationParity:
         }
         request = DummyRequest(json.dumps({"model": "embed", "input": "test"}).encode())
 
-        with patch("proxy.router._get_job_scheduler", return_value=None):
-            with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
-                with patch("proxy.session._resolve_session_id_header", return_value=(None, {})):
+        with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
+            with patch("proxy.session._resolve_session_id_header", return_value=(None, {})):
 
-                    # Embeddings via shared helper (no grace window)
-                    resp_emb = await _dispatch_local_model_load(
-                        request, mock_srv, model_cfg, "embed", "v1/embeddings",
-                        enable_grace_window=False,
-                    )
-                    assert resp_emb.status_code == 503
-                    emb_content = json.loads(resp_emb.body)
+                # Embeddings via shared helper (no grace window)
+                resp_emb = await _dispatch_local_model_load(
+                    request, mock_srv, model_cfg, "embed", "v1/embeddings",
+                    enable_grace_window=False,
+                )
+                assert resp_emb.status_code == 503
+                emb_content = json.loads(resp_emb.body)
 
-                    # Chat via shared helper (with grace window)
-                    resp_chat = await _dispatch_local_model_load(
-                        request, mock_srv, model_cfg, "embed", "v1/chat/completions",
-                        enable_grace_window=True,
-                    )
-                    assert resp_chat.status_code == 503
-                    chat_content = json.loads(resp_chat.body)
+                # Chat via shared helper (with grace window)
+                resp_chat = await _dispatch_local_model_load(
+                    request, mock_srv, model_cfg, "embed", "v1/chat/completions",
+                    enable_grace_window=True,
+                )
+                assert resp_chat.status_code == 503
+                chat_content = json.loads(resp_chat.body)
 
         # Both should have the same structure
         for key in ("error", "status", "target_model", "scheduled", "current_model"):
@@ -274,19 +273,18 @@ class TestLocalLoadOrchestrationParity:
         import proxy.provider
         monkeypatch.setattr(proxy.provider, "proxy_with_remote_fallback", remote_fallback_error)
 
-        with patch("proxy.router._get_job_scheduler", return_value=None):
-            with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
-                with patch("proxy.session._resolve_session_id_header", return_value=(None, {})):
+        with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
+            with patch("proxy.session._resolve_session_id_header", return_value=(None, {})):
 
-                    # Embeddings
-                    body_emb = {"model": "embed", "input": "test"}
-                    resp_emb = await _call_create_embeddings(monkeypatch, body_emb, mock_srv)
-                    assert resp_emb.status_code == 503
+                # Embeddings
+                body_emb = {"model": "embed", "input": "test"}
+                resp_emb = await _call_create_embeddings(monkeypatch, body_emb, mock_srv)
+                assert resp_emb.status_code == 503
 
-                    # Chat
-                    body_chat = {"model": "embed", "messages": [{"role": "user", "content": "hi"}]}
-                    resp_chat = await _call_chat(monkeypatch, body_chat, "chat/completions", mock_srv)
-                    assert resp_chat.status_code == 503
+                # Chat
+                body_chat = {"model": "embed", "messages": [{"role": "user", "content": "hi"}]}
+                resp_chat = await _call_chat(monkeypatch, body_chat, "chat/completions", mock_srv)
+                assert resp_chat.status_code == 503
 
     @pytest.mark.asyncio
     async def test_success_path_when_router_reports_loaded_parity(self, monkeypatch, mock_srv):
@@ -307,29 +305,7 @@ class TestLocalLoadOrchestrationParity:
         assert resp_chat.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_scheduler_reenter_heuristic_parity(self, monkeypatch, mock_srv):
-        """Both endpoints return model_loading when scheduler detects existing slot."""
-        mock_srv.current_model = None
-        mock_srv.llama_process = None
-        mock_srv.router_is_model_loaded = AsyncMock(return_value=False)
-        # Prevent grace window from succeeding
-        mock_srv.router_load_model = AsyncMock(return_value=False)
 
-        # Mock scheduler to return a slot reenter result
-        fake_job_scheduler = MagicMock()
-        fake_job_scheduler.reenter_job = AsyncMock(return_value={"job_id": "test-job"})
-
-        with patch("proxy.router._get_job_scheduler", return_value=fake_job_scheduler):
-            with patch("proxy.session._resolve_session_id_header", return_value=("session-123", {})):
-                with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
-
-                    body_emb = {"model": "embed", "input": "test"}
-                    resp_emb = await _call_create_embeddings(monkeypatch, body_emb, mock_srv)
-                    assert resp_emb.status_code == 503
-
-                    body_chat = {"model": "embed", "messages": [{"role": "user", "content": "hi"}]}
-                    resp_chat = await _call_chat(monkeypatch, body_chat, "chat/completions", mock_srv)
-                    assert resp_chat.status_code == 503
 
     @pytest.mark.asyncio
     async def test_slot_file_heuristic_parity(self, monkeypatch, mock_srv, tmp_path):
@@ -344,10 +320,9 @@ class TestLocalLoadOrchestrationParity:
         slot_file.parent.mkdir(parents=True)
         slot_file.write_text("{}")
 
-        with patch("proxy.router._get_job_scheduler", return_value=None):
-            with patch("proxy.session._resolve_session_id_header", return_value=("session-123", {})):
-                with patch("proxy.session._build_slot_context",
-                           return_value=(None, str(slot_file), {})):
+        with patch("proxy.session._resolve_session_id_header", return_value=("session-123", {})):
+            with patch("proxy.session._build_slot_context",
+                       return_value=(None, str(slot_file), {})):
 
                     body_emb = {"model": "embed", "input": "test"}
                     resp_emb = await _call_create_embeddings(monkeypatch, body_emb, mock_srv)
@@ -385,9 +360,8 @@ class TestLocalLoadOrchestrationParity:
         import proxy.provider
         monkeypatch.setattr(proxy.provider, "proxy_with_remote_fallback", remote_raise)
 
-        with patch("proxy.router._get_job_scheduler", return_value=None):
-            with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
-                with patch("proxy.session._resolve_session_id_header", return_value=(None, {})):
+        with patch("proxy.session._build_slot_context", return_value=(None, "", None)):
+            with patch("proxy.session._resolve_session_id_header", return_value=(None, {})):
 
                     body_emb = {"model": "embed", "input": "test"}
                     resp_emb = await _call_create_embeddings(monkeypatch, body_emb, mock_srv)

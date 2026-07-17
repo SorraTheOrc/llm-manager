@@ -84,7 +84,6 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
             }
         ),
     )
-    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
     monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
 
@@ -174,7 +173,6 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
             }
         ),
     )
-    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
     monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
@@ -984,7 +982,6 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
             }
         ),
     )
-    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
     monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
@@ -1075,7 +1072,6 @@ async def test_n2_integration_release_then_retry(monkeypatch):
             }
         ),
     )
-    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
     monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
@@ -1167,7 +1163,6 @@ async def test_n1_backward_compat_integration(monkeypatch):
             }
         ),
     )
-    monkeypatch.setattr(router_mod, "_get_job_scheduler", lambda: None)
     monkeypatch.setattr(router_mod, "_build_slot_context", lambda *_: (None, None, 3.0))
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))

@@ -171,7 +171,6 @@ def _mock_server_state(monkeypatch):
     monkeypatch.setattr(server, "session_manager", MagicMock())
     monkeypatch.setattr(server, "logger", MagicMock())
 
-    monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: None)
     monkeypatch.setattr("proxy.router._is_self_healing_active", lambda: False)
     monkeypatch.setattr("proxy.router._restore_slot_snapshot", AsyncMock(return_value=False))
     monkeypatch.setattr("proxy.router._save_slot_snapshot", AsyncMock(return_value=False))
