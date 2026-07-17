@@ -234,7 +234,7 @@ async def test_query_llama_status_custom_port(mock_config):
     with patch('proxy.server.config', custom_config):
         with patch('proxy.server.llama_process', mock_process):
             with patch('httpx.AsyncClient', return_value=mock_client):
-                result = await query_llama_status()
+                _result = await query_llama_status()
                 
                 assert "localhost:9090" in mock_client.calls[0]
 

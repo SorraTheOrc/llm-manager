@@ -390,7 +390,7 @@ async def test_remote_fallback_tries_providers_in_order(sample_model_config):
         return Response(status_code=502, content=b"Bad gateway")
 
     with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
-        result = await provider.proxy_with_remote_fallback(
+        _result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
 
@@ -1674,7 +1674,7 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
 
     # Track that proxy_with_remote_fallback was called
     fallback_called = False
-    orig_fallback = provider.proxy_with_remote_fallback
+    _orig_fallback = provider.proxy_with_remote_fallback
 
     async def mock_fallback(request, path, model_config, config):
         nonlocal fallback_called

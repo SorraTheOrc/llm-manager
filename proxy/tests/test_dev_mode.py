@@ -57,7 +57,7 @@ class TestDevModeLogging:
 
     def test_production_mode_ignores_llama_proxy_dev(self, tmp_path, monkeypatch):
         """Production mode should not be affected by LLAMA_PROXY_DEV."""
-        xdg_home = str(tmp_path / "state")
+        _xdg_home = str(tmp_path / "state")
         log_dir = str(tmp_path / "prod-logs")
         # Make sure LLAMA_PROXY_DEV is NOT set
         monkeypatch.delenv("LLAMA_PROXY_DEV", raising=False)

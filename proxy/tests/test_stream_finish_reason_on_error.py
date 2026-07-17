@@ -1019,7 +1019,7 @@ async def test_remote_non_streaming_readtimeout_returns_error(mock_remote_reques
 
                         start = asyncio.get_running_loop().time()
                         try:
-                            result = await asyncio.wait_for(
+                            _result = await asyncio.wait_for(
                                 _handle_remote_non_streaming(
                                     request=mock_remote_request,
                                     target_url="https://api.example.com/v1/chat/completions",

@@ -238,7 +238,7 @@ async def test_remote_proxy_normal_completion_with_finish_marker(remote_setup):
         mock_client.aclose = AsyncMock()
         mock_client_cls.return_value = mock_client
 
-        with patch("proxy.proxy_remote.log_response_chunk") as mock_log:
+        with patch("proxy.proxy_remote.log_response_chunk") as _mock_log:
             result = await _handle_remote_streaming(
                 remote_setup,
                 "http://fake.api/v1/chat/completions",

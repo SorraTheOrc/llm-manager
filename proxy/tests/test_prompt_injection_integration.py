@@ -101,7 +101,6 @@ async def test_override_mode_injects_system_prompt(monkeypatch, tmp_path):
     mock_request.body = mock_body
 
     async def fake_proxy_to_local(request, path):
-        srv = server
         body_bytes = await request.body()
         body_json = json.loads(body_bytes) if body_bytes else {}
 
@@ -241,7 +240,6 @@ async def test_prepend_mode_injects_system_prompt(monkeypatch, tmp_path):
     mock_request.body = mock_body
 
     async def fake_proxy_to_local(request, path):
-        srv = server
         body_bytes = await request.body()
         body_json = json.loads(body_bytes) if body_bytes else {}
 
@@ -364,7 +362,6 @@ async def test_no_system_prompt_passes_through(monkeypatch):
     mock_request.body = mock_body
 
     async def fake_proxy_to_local(request, path):
-        srv = server
         body_bytes = await request.body()
         body_json = json.loads(body_bytes) if body_bytes else {}
 

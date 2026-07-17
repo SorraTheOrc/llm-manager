@@ -84,7 +84,7 @@ class TestHttpErrorsCounter:
 
     def test_record_http_error_different_endpoint(self):
         """Different endpoint labels are tracked independently."""
-        before_completions = metrics.proxy_http_errors_total.labels(
+        _before_completions = metrics.proxy_http_errors_total.labels(
             endpoint="v1/chat/completions",
             status="5xx",
             reason="backend_error",
@@ -107,7 +107,7 @@ class TestHttpErrorsCounter:
 
     def test_record_http_error_different_status(self):
         """Different status labels are tracked independently."""
-        before_5xx = metrics.proxy_http_errors_total.labels(
+        _before_5xx = metrics.proxy_http_errors_total.labels(
             endpoint="v1/chat/completions",
             status="5xx",
             reason="backend_error",

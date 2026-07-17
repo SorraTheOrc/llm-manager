@@ -229,7 +229,7 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role", "")
+        _role = msg.get("role", "")
         # Count content field (system messages included — LP-0MRGT35H1003D1PM)
         content = msg.get("content", "")
         if isinstance(content, str):

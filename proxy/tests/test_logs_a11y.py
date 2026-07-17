@@ -105,19 +105,6 @@ def extract_css_vars_from_server() -> dict:
 def test_log_badge_contrast():
     vars_map = extract_css_vars_from_server()
 
-    # resolve badge text color (default)
-    try:
-        badge_text = resolve_var(vars_map, vars_map.get('log-badge-color', 'var(--text-primary, #eee)'))
-    except Exception:
-        # fallback to text-primary
-        badge_text = resolve_var(vars_map, vars_map.get('text-primary', '#eee'))
-
-    # Ensure badge_text is rgb tuple
-    if isinstance(badge_text, tuple):
-        badge_text_rgb = badge_text
-    else:
-        badge_text_rgb = resolve_var(vars_map, badge_text)
-
     # Severities to check
     severities = {
         'error': 'log-error',

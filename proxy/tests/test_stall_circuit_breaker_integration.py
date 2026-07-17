@@ -228,7 +228,7 @@ async def test_circuit_breaker_called_with_provider_name(mock_request):
                                     provider="opencode-deepseek-free",
                                 )
 
-                                collected = [
+                                _collected = [
                                     chunk async for chunk in result.body_iterator
                                 ]
 
@@ -379,7 +379,7 @@ async def test_client_disconnect_does_not_trigger_cb(mock_request):
                                 # Collect only the first chunk to trigger generator
                                 # closure (simulating client disconnect)
                                 iterator = result.body_iterator.__aiter__()
-                                first_chunk = await iterator.__anext__()
+                                _first_chunk = await iterator.__anext__()
 
     # Circuit breaker should NOT have been called (GeneratorExit, not stall)
     assert mock_cb.call_count == 0, (
@@ -442,7 +442,7 @@ async def test_non_timeout_error_does_not_trigger_cb(mock_request):
                                     provider="opencode-deepseek-free",
                                 )
 
-                                collected = [
+                                _collected = [
                                     chunk async for chunk in result.body_iterator
                                 ]
 

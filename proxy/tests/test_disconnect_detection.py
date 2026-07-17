@@ -148,7 +148,7 @@ class TestRemoveJob:
         """After remove_job, same session can be re-admitted."""
         s = await self._make_scheduler()
         try:
-            result1 = await s.admit_job("session-a")
+            _result1 = await s.admit_job("session-a")
 
             await s.remove_job("session-a")
 

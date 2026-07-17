@@ -103,7 +103,7 @@ def test_repo_default_relative_path(monkeypatch, tmp_path):
 
     repo_root = tmp_path
     repo_prompts = repo_root / "proxy" / "prompts"
-    prompt_file = _make_prompt_file(repo_prompts / "code.txt", "You write code.")
+    _prompt_file = _make_prompt_file(repo_prompts / "code.txt", "You write code.")
 
     model_cfg = {
         "type": "local",

@@ -285,10 +285,10 @@ async def test_status_request_with_limited_connections_and_blocking_stream():
                 response = await client.get(f"http://localhost:{port}/stream")
                 return response.json()
             
-            streaming_task_1 = asyncio.create_task(make_streaming_request())
+            _streaming_task_1 = asyncio.create_task(make_streaming_request())
             await server_ready.wait()
             
-            streaming_task_2 = asyncio.create_task(make_streaming_request())
+            _streaming_task_2 = asyncio.create_task(make_streaming_request())
             await asyncio.sleep(0.1)
             
             status_task = asyncio.create_task(make_status_request())

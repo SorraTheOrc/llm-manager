@@ -344,7 +344,7 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
 async def view_logs(request: Request):
     """Simple web UI to view both proxy and llama-server logs using SSE from /logs/tail."""
     srv = _srv()
-    base = str(request.base_url).rstrip('/')
+    _base = str(request.base_url).rstrip('/')
     async def get_counts_html():
         items = []
         async with srv.counts_lock:
@@ -356,7 +356,7 @@ async def view_logs(request: Request):
             rows = '<div class="muted">No requests recorded yet.</div>'
         return rows
 
-    counts_html = await get_counts_html()
+    _counts_html = await get_counts_html()
     async def get_tokens_html():
         items = []
         async with srv.token_lock:
@@ -377,7 +377,7 @@ async def view_logs(request: Request):
             rows = '<div class="muted">No token stats yet.</div>'
         return rows
 
-    tokens_html = await get_tokens_html()
+    _tokens_html = await get_tokens_html()
 
     # Load template from external file
     _templates_dir = Path(__file__).parent.parent / "templates"

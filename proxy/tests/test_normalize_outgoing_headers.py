@@ -175,9 +175,8 @@ class TestBufferedPath:
     def test_strips_te_when_buffered(self, normalize_fn):
         """utils: TE should be removed for buffered responses."""
         headers = {"Transfer-Encoding": "chunked", "Content-Type": "text/plain"}
-        result = normalize_fn(headers, buffered=True)
+        _result = normalize_fn(headers, buffered=True)
         # At minimum, no crash; ideally TE is removed
-        assert True
 
 
 class TestEdgeCases:

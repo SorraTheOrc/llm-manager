@@ -1023,7 +1023,7 @@ async def test_streaming_backend_error_does_not_leak_local_active_queries(monkey
     )
     monkeypatch.setattr(server, "_call_with_backend_retries", fail_call)
 
-    response = await server.proxy_to_local(
+    _response = await server.proxy_to_local(
         DummyRequest(), "v1/chat/completions"
     )
 

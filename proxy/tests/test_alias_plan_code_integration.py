@@ -246,7 +246,6 @@ async def test_plan_alias_routes_to_qwen3_next(monkeypatch, alias_config):
 
     # Monkey-patch proxy_to_local so it forwards through our mock client
     async def fake_proxy_to_local(request, path):
-        srv = server
         body_bytes = await request.body()
         body_json = json.loads(body_bytes) if body_bytes else {}
         new_body = json.dumps(body_json).encode("utf-8")
@@ -320,7 +319,6 @@ async def test_code_alias_routes_to_qwen3_next(monkeypatch, alias_config):
     client = httpx.AsyncClient(transport=transport)
 
     async def fake_proxy_to_local(request, path):
-        srv = server
         body_bytes = await request.body()
         body_json = json.loads(body_bytes) if body_bytes else {}
         new_body = json.dumps(body_json).encode("utf-8")
@@ -395,7 +393,6 @@ async def test_plan_alias_resolves_model_name(monkeypatch, alias_config):
     client = httpx.AsyncClient(transport=transport)
 
     async def fake_proxy_to_local(request, path):
-        srv = server
         body_bytes = await request.body()
         body_json = json.loads(body_bytes) if body_bytes else {}
         new_body = json.dumps(body_json).encode("utf-8")

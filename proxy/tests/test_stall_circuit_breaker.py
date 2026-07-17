@@ -164,7 +164,7 @@ def test_stalls_outside_window_not_counted(monkeypatch):
     # Only 1 stall remains in the window, but we add 2 more
     cb.record_stall("provider-b")  # 3rd stall within window
     stepper.advance(10)
-    triggered = cb.record_stall("provider-b")  # 4th stall within window
+    _triggered = cb.record_stall("provider-b")  # 4th stall within window
 
     # Should have triggered on the 4th stall (3 within window: 3rd + 4th + one
     # of the earlier ones depends on timing — let's be more precise)

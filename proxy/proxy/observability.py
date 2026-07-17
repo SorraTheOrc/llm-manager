@@ -168,7 +168,6 @@ async def broadcast_status(event_type: str, data: dict):
     All events include a ``type`` field, an ISO8601 ``timestamp``,
     and any additional fields provided in *data*.
     """
-    srv = _srv()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     event_data = json.dumps({"type": event_type, "timestamp": now, **data})
     message = f"data: {event_data}\n\n"
@@ -189,7 +188,6 @@ async def broadcast_status(event_type: str, data: dict):
 
 def broadcast_status_sync(event_type: str, data: dict):
     """Synchronous wrapper to broadcast status (for use in sync code)."""
-    srv = _srv()
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(broadcast_status(event_type, data))
@@ -339,13 +337,11 @@ def save_token_counts_sync():
 
 
 async def save_token_counts():
-    srv = _srv()
     await asyncio.to_thread(save_token_counts_sync)
 
 
 
 async def save_counts():
-    srv = _srv()
     await asyncio.to_thread(save_counts_sync)
 
 

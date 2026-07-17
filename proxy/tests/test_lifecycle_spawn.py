@@ -55,7 +55,7 @@ class TestSpawnAndCapture:
 
         monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
         # Monkeypatch threading.Thread.start so it doesn't actually start a thread
-        original_thread = threading.Thread
+        _original_thread = threading.Thread
         started_threads = []
         class FakeThread:
             def __init__(self, target=None, args=(), daemon=None):

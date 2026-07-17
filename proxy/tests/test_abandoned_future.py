@@ -71,7 +71,6 @@ def _make_mock_cm(aiter_func):
     Returns (context_manager, response_object) matching the contract
     of _call_with_backend_retries in the streaming path.
     """
-    exc = None
 
     async def _aiter():
         async for chunk in aiter_func():

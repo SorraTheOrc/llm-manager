@@ -656,7 +656,7 @@ def test_model_audit_plan_routing() -> None:
 
     for idx, r in enumerate(_REQUEST_RESULTS):
         session_id = r["session_id"]
-        prompt_truncated = r["prompt_truncated"]
+        _prompt_truncated = r["prompt_truncated"]
 
         _log(f"\n--- Analysing routing for request {idx+1} ---")
         _log(f"  Session: {session_id}")

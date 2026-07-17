@@ -489,7 +489,7 @@ class TestProgressThresholdTracking:
         assert len(slot1_entries) == 3, f"Expected 3 slot 1 entries, got {len(slot1_entries)}: {slot1_entries}"
 
         # Slot 1 should finish before slot 0
-        slot1_indices = [i for i, line in enumerate(lines_logged) if "[slot:1" in line]
+        _slot1_indices = [i for i, line in enumerate(lines_logged) if "[slot:1" in line]
         slot0_100_idx = next(i for i, line in enumerate(lines_logged) if "[slot:0" in line and "100%" in line)
         slot1_100_idx = next(i for i, line in enumerate(lines_logged) if "[slot:1" in line and "100%" in line)
         assert slot1_100_idx < slot0_100_idx, (

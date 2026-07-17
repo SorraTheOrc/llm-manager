@@ -507,7 +507,7 @@ class TestStatus:
         state_dir = tmp_path / "state"
         state_dir.mkdir()
         pid_file = state_dir / "llama-proxy" / "proxy.pid"
-        dev_pid_file = state_dir / "llama-proxy" / "proxy.dev.pid"
+        _dev_pid_file = state_dir / "llama-proxy" / "proxy.dev.pid"
 
         env = {
             "LLAMA_START_SCRIPT": str(start_script),

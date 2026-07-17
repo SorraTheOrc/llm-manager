@@ -190,14 +190,12 @@ def _model_loading_response(requested_model: Optional[str], target_model: str, s
 
 def _is_retryable_backend_exception(exc: Exception) -> bool:
     """Return True when an exception is a retryable backend transport failure."""
-    srv = _srv()
     return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.ReadTimeout, httpx.TimeoutException))
 
 
 
 def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitter_ratio: float) -> float:
     """Compute bounded exponential backoff with jitter."""
-    srv = _srv()
     base = max(0.0, float(base_delay)) * (2 ** max(0, attempt - 1))
     delay = min(base, max(0.0, float(max_delay)))
     if jitter_ratio > 0 and delay > 0:
@@ -209,7 +207,6 @@ def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitt
 
 
 def _estimate_prompt_tokens(body_json: dict) -> int:
-    srv = _srv()
     """Estimate prompt token count from request body.
     
     Returns estimated token count based on message content length.
@@ -243,7 +240,6 @@ def _compute_adaptive_timeout(
     per_token_timeout: float,
     max_timeout: float,
 ) -> float:
-    srv = _srv()
     """Compute adaptive timeout based on prompt size.
     
     Timeout = min(base_timeout + per_token_timeout * estimated_tokens, max_timeout)
@@ -392,7 +388,6 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
 
 
 def _should_force_full_prompt(model_cfg: Optional[dict]) -> bool:
-    srv = _srv()
     if not isinstance(model_cfg, dict):
        return False
     return bool(model_cfg.get("force_full_prompt") or model_cfg.get("disable_delta"))
@@ -572,7 +567,6 @@ async def router_list_models() -> Optional[dict]:
 
 
 def _extract_router_model_ids(router_models: Optional[dict]) -> list[str]:
-    srv = _srv()
     if not isinstance(router_models, dict):
        return []
     models_payload = router_models.get("data") or router_models.get("models") or []

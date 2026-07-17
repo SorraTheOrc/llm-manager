@@ -243,7 +243,7 @@ class SessionManager:
                 else:
                     # Convert monotonic timestamps to wall-clock ISO8601 for sorting
                     wall_last = monotonic_offset + session.last_activity_at
-                    wall_created = monotonic_offset + session.created_at
+                    _wall_created = monotonic_offset + session.created_at
                     response_time_str = datetime.fromtimestamp(wall_last, tz=timezone.utc).isoformat(timespec="seconds")
                     sessions.append({
                         "session_id": sid,

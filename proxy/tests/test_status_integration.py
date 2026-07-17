@@ -172,7 +172,7 @@ async def test_status_server_not_running(transport):
     async with httpx.AsyncClient(
         transport=transport, base_url="http://test"
     ) as ac:
-        mock_lock = AsyncMock()
+        _mock_lock = AsyncMock()
 
         # The handler tries 'async with active_queries_lock'
         # and 'model_switch_lock.locked()'
