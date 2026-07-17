@@ -177,6 +177,35 @@ models:
     - plan*
     force_full_prompt: true
 
+  author:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+    aliases:
+    - author
+    force_full_prompt: true
+
   qwen3-next:
     providers:
       - name: local-qwen3-next
