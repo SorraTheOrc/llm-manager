@@ -684,6 +684,18 @@ async def _invalidate_session_and_slot(
                         pass
         except Exception:
             pass
+    # Clear cached ratio entries for this session (LP-0MRMMBZ7T007ER59)
+    if session_id:
+        try:
+            from proxy.provider import _last_cached_ratio
+            keys_to_delete = [
+                k for k in _last_cached_ratio if k[1] == session_id
+            ]
+            for k in keys_to_delete:
+                _last_cached_ratio.pop(k, None)
+        except Exception:
+            pass
+
     if reason:
         _record_session_invalidation(reason)
     if slot_filename:

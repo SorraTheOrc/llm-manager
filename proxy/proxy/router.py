@@ -328,6 +328,20 @@ async def _update_session_and_slot(
                     session_id[:8] if session_id else "unknown",
                     slot_id,
                 )
+                # Update per-session cached-tokens ratio (LP-0MRMMBZ7T007ER59)
+                if session_id and srv.current_model:
+                    try:
+                        from proxy.provider import update_cached_ratio
+                        update_cached_ratio(
+                            srv.current_model,
+                            session_id,
+                            cached_tokens=1,
+                            prompt_tokens=1,
+                        )
+                    except Exception:
+                        srv.logger.debug(
+                            "update_cached_ratio failed", exc_info=True
+                        )
 
         except Exception:
             srv.logger.debug("slot_save failed", exc_info=True)

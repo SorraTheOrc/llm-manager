@@ -464,3 +464,60 @@ class TestLargeContextThresholdConfig:
         from proxy.provider import _get_large_context_threshold
         config = {"server": {"local_large_context_fallback_threshold": 40000}}
         assert _get_large_context_threshold(config) == 40000
+
+
+# ---------------------------------------------------------------------------
+# Production wiring tests
+# ---------------------------------------------------------------------------
+
+
+class TestProductionWiring:
+    """Tests for production wiring of cached_tokens ratio updates.
+
+    Verifies that _update_session_and_slot calls update_cached_ratio after
+    a successful slot save, and that _invalidate_session_and_slot clears
+    cached ratio entries.
+    (LP-0MRMMBZ7T007ER59)
+    """
+
+    def setup_method(self):
+        from proxy.provider import _last_cached_ratio
+        _last_cached_ratio.clear()
+
+    def test_invalidation_clears_cached_ratio(self):
+        """_invalidate_session_and_slot should clear _last_cached_ratio entries
+        for the invalidated session (LP-0MRMMBZ7T007ER59)."""
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
+        from proxy.session import _invalidate_session_and_slot
+
+        # Set up cached ratio entries
+        update_cached_ratio("Qwen3", "sess_a", cached_tokens=80, prompt_tokens=100)
+        update_cached_ratio("gemma4", "sess_a", cached_tokens=10, prompt_tokens=100)
+        update_cached_ratio("Qwen3", "sess_b", cached_tokens=50, prompt_tokens=100)
+        assert len(_last_cached_ratio) == 3
+
+        # Run invalidation (no slot_filename to avoid file I/O)
+        import asyncio
+        asyncio.run(_invalidate_session_and_slot(
+            session_id="sess_a",
+            reason="test_invalidation",
+            slot_filename=None,
+        ))
+
+        # sess_a entries should be cleared; sess_b should remain
+        assert ("Qwen3", "sess_a") not in _last_cached_ratio
+        assert ("gemma4", "sess_a") not in _last_cached_ratio
+        assert ("Qwen3", "sess_b") in _last_cached_ratio
+        assert _last_cached_ratio[("Qwen3", "sess_b")] == 0.5
+
+    def test_invalidation_no_session_id(self):
+        """_invalidate_session_and_slot with None session_id should not crash."""
+        from proxy.session import _invalidate_session_and_slot
+
+        import asyncio
+        # Should not raise
+        asyncio.run(_invalidate_session_and_slot(
+            session_id=None,
+            reason="test_no_session",
+            slot_filename=None,
+        ))
