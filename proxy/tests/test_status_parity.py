@@ -14,6 +14,7 @@ tests below lock their behaviour so the extraction is safe.
 import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 pytestmark = pytest.mark.refactor_parity
@@ -337,9 +338,11 @@ class TestSlotsInHandler:
     @pytest.mark.asyncio
     async def test_handler_includes_slot_fields_when_server_running(self):
         """When llama is running, status includes slot fields (default 0 in test)."""
-        from proxy import server as srv_module
-        import httpx
         from unittest.mock import patch
+
+        import httpx
+
+        from proxy import server as srv_module
 
         app = srv_module.app
         transport = httpx.ASGITransport(app=app)

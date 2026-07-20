@@ -3,7 +3,7 @@ is not available in the test environment. This implements minimal Counter/Gauge
 behaviour required by the test-suite.
 """
 
-from typing import List, Optional
+
 
 class _Value:
     def __init__(self):
@@ -20,7 +20,7 @@ class _Label:
         self._value.v += int(n)
 
 class Counter:
-    def __init__(self, name: str, desc: str, labelnames: Optional[List[str]] = None):
+    def __init__(self, name: str, desc: str, labelnames: list[str] | None = None):
         self._name = name
         self._desc = desc
         self._labelnames = list(labelnames) if labelnames else []
@@ -34,7 +34,7 @@ class Counter:
         return self._store[key]
 
 class Gauge:
-    def __init__(self, name: str, desc: str, labelnames: Optional[List[str]] = None):
+    def __init__(self, name: str, desc: str, labelnames: list[str] | None = None):
         self._name = name
         self._desc = desc
         self._labelnames = list(labelnames) if labelnames else []

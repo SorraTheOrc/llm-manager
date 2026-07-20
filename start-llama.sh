@@ -216,7 +216,8 @@ case "$model" in
     MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
     QUANTIZATION=Q8_0
     CONTEXT=131072 # 128k context window (canonical size; max supported is 262144)
-    BATCH_SIZE=512
+    BATCH_SIZE=4096
+    UBATCH_SIZE=256
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
@@ -346,8 +347,9 @@ echo "Using llama-server binary: $LLAMA_BIN"
     -hf "$REPOID/$MODEL:$QUANTIZATION"
     --ctx-size "$CONTEXT"
     --batch-size $BATCH_SIZE
+    --ubatch-size ${UBATCH_SIZE:-$BATCH_SIZE}
     -np "$LLAMA_PARALLEL"
-    -ngl 99
+    -ngl "$GLOBAL_NGL"
     --no-mmap
     --parallel "$LLAMA_PARALLEL"
     $EXTRA_CMD_SWITCHES

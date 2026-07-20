@@ -15,11 +15,9 @@ import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
+import proxy.server as server
 import pytest
 from fastapi.responses import StreamingResponse
-
-import proxy.server as server
-
 
 # ── Async iterator that raises after yielding chunks ───────────────────────
 
@@ -386,8 +384,7 @@ def _reset_server_state(monkeypatch):
     monkeypatch.setattr(server, "session_manager", MagicMock())
     monkeypatch.setattr(server, "logger", MagicMock())
 
-    # Disable scheduler and self-healing
-    monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: None)
+    # Disable self-healing
     monkeypatch.setattr("proxy.router._is_self_healing_active", lambda: False)
 
     # Reset metrics
@@ -945,7 +942,7 @@ async def test_remote_readtimeout_error_is_actionable(mock_remote_request):
 
     # Verify the SSE output is valid JSON with choices[] and finish_reason
     decoded = collected.decode("utf-8")
-    lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+    lines = [line.strip() for line in decoded.splitlines() if line.strip()]
 
     # Find the error SSE event
     error_events = []
@@ -1019,7 +1016,7 @@ async def test_remote_non_streaming_readtimeout_returns_error(mock_remote_reques
 
                         start = asyncio.get_running_loop().time()
                         try:
-                            result = await asyncio.wait_for(
+                            _result = await asyncio.wait_for(
                                 _handle_remote_non_streaming(
                                     request=mock_remote_request,
                                     target_url="https://api.example.com/v1/chat/completions",
@@ -1062,8 +1059,8 @@ async def test_remote_both_paths_concurrent(mock_remote_request):
     paths simultaneously does not cause interference.
     """
     from proxy.proxy_remote import (
-        _handle_remote_streaming,
         _handle_remote_non_streaming,
+        _handle_remote_streaming,
     )
 
     # Set up streaming mock

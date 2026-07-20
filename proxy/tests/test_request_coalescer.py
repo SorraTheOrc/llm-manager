@@ -12,13 +12,10 @@ Tests cover:
 
 import asyncio
 import json
-import time
 
 import pytest
 from fastapi import Response
-
 from proxy.request_coalescer import RequestCoalescer
-
 
 # ---------------------------------------------------------------------------
 # Helpers

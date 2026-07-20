@@ -8,7 +8,6 @@ Verifies that:
 4. Error-path streaming with session_id also schedules recording.
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -16,9 +15,7 @@ import httpx
 import pytest
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
-
 from proxy.proxy_remote import _handle_remote_streaming
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -242,7 +239,7 @@ def test_handle_remote_streaming_signature_has_session_id():
     assert param.default is None, \
         f"session_id default should be None, got {param.default}"
     assert param.kind == param.KEYWORD_ONLY or param.kind == param.POSITIONAL_OR_KEYWORD, \
-        f"session_id should be a keyword argument"
+        "session_id should be a keyword argument"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

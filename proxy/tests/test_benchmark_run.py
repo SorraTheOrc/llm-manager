@@ -7,7 +7,6 @@ a running llama-server.
 """
 
 import json
-import os
 import tempfile
 from pathlib import Path
 

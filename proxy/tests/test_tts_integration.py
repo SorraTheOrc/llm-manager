@@ -11,7 +11,6 @@ To run manually when tts-server is running:
 
 import httpx
 import pytest
-
 from proxy.server import app
 
 pytestmark = pytest.mark.tts_integration
@@ -27,13 +26,21 @@ TTS_URL = f"http://{TTS_SERVER_HOST}:{TTS_SERVER_PORT}/v1/audio/speech"
 
 
 def have_tts_server() -> bool:
-    """Return True if the tts-server is reachable."""
+    """Return True if the tts-server is reachable and returns valid audio."""
     try:
-        httpx.post(
+        resp = httpx.post(
             TTS_URL,
             json={"model": "test", "input": "ping"},
             timeout=3.0,
         )
+        if resp.status_code != 200:
+            return False
+        content = resp.content
+        if len(content) <= 44:
+            return False
+        content_type = resp.headers.get("content-type", "")
+        if "audio/" not in content_type:
+            return False
         return True
     except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
         return False

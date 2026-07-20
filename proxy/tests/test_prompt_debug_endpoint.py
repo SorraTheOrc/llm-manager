@@ -5,12 +5,10 @@ Verifies gating, response format, and content preview behavior.
 """
 
 import json
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 import proxy.server as server
-
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helper to build a mock Request
@@ -76,7 +74,7 @@ async def test_debug_endpoint_requires_alias(monkeypatch):
     from proxy.server import debug_prompt
 
     mock_req = _make_mock_request()
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(Exception) as _exc_info:
         await debug_prompt(mock_req, alias="")
     # Should be HTTPException with 400
 

@@ -1,4 +1,3 @@
-import pytest
 from proxy.log_parser import detect_severity
 
 

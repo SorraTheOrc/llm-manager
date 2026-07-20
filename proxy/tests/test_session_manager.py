@@ -7,16 +7,15 @@ invalidation, and fallback to full history for expired/invalid sessions.
 import asyncio
 import json
 import time
-import pytest
 
-from proxy.session_manager import (
-    Session,
-    SessionManager,
-    DEFAULT_SESSION_TTL_SECONDS,
-)
+import pytest
 from proxy.session import (
     extract_streamed_assistant_message_from_sse,
     merge_session_history_for_update,
+)
+from proxy.session_manager import (
+    Session,
+    SessionManager,
 )
 
 pytestmark = pytest.mark.refactor_parity

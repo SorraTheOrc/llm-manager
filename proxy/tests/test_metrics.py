@@ -6,11 +6,8 @@ Covers:
 - Best-effort no-op fallback when prometheus_client is unavailable
 """
 
-import importlib
 import sys
 from unittest.mock import patch
-
-import pytest
 
 import proxy.metrics as metrics
 
@@ -86,7 +83,7 @@ class TestHttpErrorsCounter:
 
     def test_record_http_error_different_endpoint(self):
         """Different endpoint labels are tracked independently."""
-        before_completions = metrics.proxy_http_errors_total.labels(
+        _before_completions = metrics.proxy_http_errors_total.labels(
             endpoint="v1/chat/completions",
             status="5xx",
             reason="backend_error",
@@ -109,7 +106,7 @@ class TestHttpErrorsCounter:
 
     def test_record_http_error_different_status(self):
         """Different status labels are tracked independently."""
-        before_5xx = metrics.proxy_http_errors_total.labels(
+        _before_5xx = metrics.proxy_http_errors_total.labels(
             endpoint="v1/chat/completions",
             status="5xx",
             reason="backend_error",

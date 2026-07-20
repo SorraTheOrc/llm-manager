@@ -16,18 +16,11 @@ are equivalent.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
-
-import httpx
-import pytest
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from unittest.mock import AsyncMock, MagicMock
 
 import proxy.server as server
+import pytest
 from proxy.router import proxy_to_local
-from proxy.slot_scheduler import AdmitResult
-
-
 pytestmark = pytest.mark.refactor_parity
 
 
@@ -135,8 +128,6 @@ def _reset_server_state(monkeypatch):
     monkeypatch.setattr(server, "session_manager", MagicMock())
     monkeypatch.setattr(server, "logger", MagicMock())
 
-    # Disable scheduler by default
-    monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: None)
     # Disable self-healing
     monkeypatch.setattr("proxy.router._is_self_healing_active", lambda: False)
 
@@ -383,58 +374,6 @@ class TestActiveQueryParity:
 # ===================================================================
 # Test 4: Scheduler mark_request_start/end parity
 # ===================================================================
-
-
-class TestSchedulerParity:
-    """Scheduler lifecycle is respected equivalently for both paths."""
-
-    @pytest.fixture(autouse=True)
-    def _mock_scheduler(self, monkeypatch):
-        """Set up a mock scheduler for testing."""
-        scheduler_mock = MagicMock()
-        scheduler_mock.has_idle_slot = MagicMock(return_value=True)
-        scheduler_mock.mark_request_start = AsyncMock()
-        scheduler_mock.mark_request_end = AsyncMock()
-        scheduler_mock.remove_job = AsyncMock()
-        monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: scheduler_mock)
-
-        scheduler_mock.reenter_job = AsyncMock(return_value=None)
-        result = AdmitResult(kind="ASSIGNED", slot_id=0)
-        scheduler_mock.admit_job = AsyncMock(return_value=result)
-        return scheduler_mock
-
-    @pytest.mark.asyncio
-    async def test_scheduler_mark_start_end_for_buffered_path(self, monkeypatch, _mock_scheduler):
-        """Scheduler mark_request_start and mark_request_end called for buffered path."""
-        resp = _mock_upstream_response()
-        monkeypatch.setattr("proxy.router._call_with_backend_retries", AsyncMock(return_value=resp))
-        monkeypatch.setattr("proxy.router._call_with_empty_retry", AsyncMock(return_value=resp))
-
-        await proxy_to_local(
-            _dummy_request({"model": "test", "messages": [{"role": "user", "content": "hi"}]}, stream=False),
-            "v1/chat/completions",
-        )
-
-        _mock_scheduler.mark_request_start.assert_called_once()
-        _mock_scheduler.mark_request_end.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_scheduler_mark_start_end_for_streaming_path(self, monkeypatch, _mock_scheduler):
-        """Scheduler mark_request_start and mark_request_end called for streaming path."""
-        cm, sresp = _mock_streaming_upstream_response()
-        monkeypatch.setattr("proxy.router._call_with_backend_retries", AsyncMock(return_value=(cm, sresp)))
-
-        response = await proxy_to_local(
-            _dummy_request({"model": "test", "messages": [{"role": "user", "content": "hi"}]}, stream=True),
-            "v1/chat/completions",
-        )
-
-        # Drain generator to trigger cleanup
-        async for _ in response.body_iterator:
-            pass
-
-        _mock_scheduler.mark_request_start.assert_called_once()
-        _mock_scheduler.mark_request_end.assert_called_once()
 
 
 # ===================================================================

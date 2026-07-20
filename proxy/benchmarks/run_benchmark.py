@@ -29,10 +29,9 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 try:
     import httpx
@@ -76,8 +75,8 @@ class RequestResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     tokens_per_second: float = 0.0
-    time_to_first_token_seconds: Optional[float] = None
-    error: Optional[str] = None
+    time_to_first_token_seconds: float | None = None
+    error: str | None = None
 
     def to_dict(self):
         return {
@@ -111,7 +110,7 @@ class BenchmarkConfig:
     concurrency: int = DEFAULT_CONCURRENCY
     max_tokens: int = DEFAULT_MAX_TOKENS
     timeout: float = DEFAULT_TIMEOUT
-    snapshot_script: Optional[str] = None
+    snapshot_script: str | None = None
 
     def to_dict(self):
         return {
@@ -139,7 +138,7 @@ def _get_project_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def _parse_models_ini(config_path: Optional[str] = None) -> dict:
+def _parse_models_ini(config_path: str | None = None) -> dict:
     """Parse models.ini for quantization and ctx-size values.
 
     Returns a dict with model names as keys, each containing quantization
@@ -218,7 +217,7 @@ def _get_memory_snapshot() -> dict:
     return result
 
 
-def _run_prometheus_snapshot(script_path: str, output_dir: Path) -> Optional[Path]:
+def _run_prometheus_snapshot(script_path: str, output_dir: Path) -> Path | None:
     """Run the prometheus_snapshot.sh helper script.
 
     Returns the path to the snapshot file if successful, None otherwise.
@@ -409,7 +408,7 @@ async def run_benchmark_async(config: BenchmarkConfig) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Benchmark runner for KV quantization and config evaluation",
@@ -494,7 +493,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Main entry point for the benchmark runner."""
     args = parse_args(argv)
 

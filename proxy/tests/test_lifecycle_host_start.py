@@ -1,8 +1,6 @@
 import io
-import subprocess
-import threading
-import types
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,11 +9,11 @@ from pathlib import Path
 # (the project package root) so Python finds the nested `proxy` package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import pytest
 
 # Import the lifecycle module via the package path. Add the containing
 # `proxy/` directory to sys.path so the `proxy` package resolves correctly.
 import importlib
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Import as package.module so relative imports inside the package work.
 lifecycle = importlib.import_module("proxy.lifecycle")

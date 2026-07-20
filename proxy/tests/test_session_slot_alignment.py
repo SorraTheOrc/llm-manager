@@ -8,21 +8,17 @@ Verifies that:
 - LLAMA_PARALLEL env var is forwarded from lifecycle to start script
 """
 
-import logging
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from proxy.session import (
-    _slot_id_for_session,
     _build_slot_context,
-    _slot_persistence_enabled,
-    _slot_filename_for_session,
-    _save_slot_snapshot,
     _restore_slot_snapshot,
+    _save_slot_snapshot,
+    _slot_filename_for_session,
+    _slot_id_for_session,
+    _slot_persistence_enabled,
 )
-
 
 # ===================================================================
 # _slot_persistence_enabled

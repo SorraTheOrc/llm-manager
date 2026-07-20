@@ -9,20 +9,17 @@ circular import issues.
 """
 
 import asyncio
-import json
 import logging
 import os
-import sys
+import subprocess
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Callable, Awaitable, Dict, List, Optional, Tuple
 
 import httpx
-import subprocess
-import traceback
-from fnmatch import fnmatch
 from fastapi.responses import JSONResponse
 
 
@@ -40,17 +37,21 @@ def _srv():
 #   re-exports keep existing import chains (server.py, router.py) and
 #   test monkey-patches on server.* working without modification.
 # ===================================================================
-from .backend_health import (
-    _self_heal_retry_after_seconds,
-    _is_self_healing_active,
-    _self_healing_response,
-    _backend_recovery_snapshot,
-    _worker_process_unhealthy,
-    _prune_recovery_attempts,
+from .backend_health import (  # noqa: F401
     _attempt_router_self_heal,
+    _attempt_tts_self_heal,
+    _backend_recovery_snapshot,
     _backend_watchdog_loop,
-)  # noqa: F401
-
+    _get_tts_self_heal_max_attempts,
+    _get_tts_watchdog_interval,
+    _is_self_healing_active,
+    _prune_recovery_attempts,
+    _self_heal_retry_after_seconds,
+    _self_healing_response,
+    _tts_recovery_snapshot,
+    _tts_watchdog_loop,
+    _worker_process_unhealthy,
+)
 
 # ===================================================================
 # Model loading and lifecycle orchestration helpers
@@ -130,7 +131,7 @@ def schedule_background_load(model_name: str) -> bool:
 
     return True
 
-    
+
 # Functions extracted to handlers.py:
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
@@ -147,8 +148,8 @@ counts_lock = asyncio.Lock()
 counts_filename = "request_counts.json"
 # Dirty flags and persist tasks
 counts_dirty = False
-counts_persist_task: Optional[asyncio.Task] = None
-periodic_broadcast_task: Optional[asyncio.Task] = None
+counts_persist_task: asyncio.Task | None = None
+periodic_broadcast_task: asyncio.Task | None = None
 
 # Active local queries counter
 active_queries: int = 0
@@ -160,7 +161,7 @@ active_queries_lock = asyncio.Lock()
 
 
 
-def _model_loading_response(requested_model: Optional[str], target_model: str, scheduled: bool, endpoint: str) -> JSONResponse:
+def _model_loading_response(requested_model: str | None, target_model: str, scheduled: bool, endpoint: str) -> JSONResponse:
     """Build a consistent JSON 503 payload when a model is loading."""
     srv = _srv()
     retry_after = int(srv.config.get("server", {}).get("model_loading_retry_after", 30) or 30)
@@ -192,14 +193,12 @@ def _model_loading_response(requested_model: Optional[str], target_model: str, s
 
 def _is_retryable_backend_exception(exc: Exception) -> bool:
     """Return True when an exception is a retryable backend transport failure."""
-    srv = _srv()
     return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.ReadTimeout, httpx.TimeoutException))
 
 
 
 def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitter_ratio: float) -> float:
     """Compute bounded exponential backoff with jitter."""
-    srv = _srv()
     base = max(0.0, float(base_delay)) * (2 ** max(0, attempt - 1))
     delay = min(base, max(0.0, float(max_delay)))
     if jitter_ratio > 0 and delay > 0:
@@ -211,7 +210,6 @@ def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitt
 
 
 def _estimate_prompt_tokens(body_json: dict) -> int:
-    srv = _srv()
     """Estimate prompt token count from request body.
     
     Returns estimated token count based on message content length.
@@ -245,7 +243,6 @@ def _compute_adaptive_timeout(
     per_token_timeout: float,
     max_timeout: float,
 ) -> float:
-    srv = _srv()
     """Compute adaptive timeout based on prompt size.
     
     Timeout = min(base_timeout + per_token_timeout * estimated_tokens, max_timeout)
@@ -268,7 +265,7 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
     max_delay = float(server_cfg.get("backend_retry_max_delay_seconds", 2.0) or 2.0)
     jitter_ratio = float(server_cfg.get("backend_retry_jitter_ratio", 0.25) or 0.25)
 
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
        try:
            return await call_factory()
@@ -342,7 +339,7 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
 
 
 
-def get_model_config(model_name: Optional[str]) -> Optional[dict]:
+def get_model_config(model_name: str | None) -> dict | None:
     srv = _srv()
     """
     Get model configuration by name or alias.
@@ -359,15 +356,15 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
     """
     if model_name is None:
        return None
-    
+
     models = srv.config.get("models", {})
-    
+
     # Direct match
     if model_name in models:
        return models[model_name]
-    
+
     model_name_lower = model_name.lower()
-    
+
     # Check exact aliases first (higher priority)
     for name, model_cfg in models.items():
        aliases = model_cfg.get("aliases", [])
@@ -378,7 +375,7 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
                continue
            if model_name_lower == alias_lower:
                return model_cfg
-    
+
     # Check wildcard patterns
     for name, model_cfg in models.items():
        aliases = model_cfg.get("aliases", [])
@@ -388,20 +385,19 @@ def get_model_config(model_name: Optional[str]) -> Optional[dict]:
            if '*' in alias or '?' in alias or '[' in alias:
                if fnmatch(model_name_lower, alias_lower):
                    return model_cfg
-    
+
     return None
 
 
 
-def _should_force_full_prompt(model_cfg: Optional[dict]) -> bool:
-    srv = _srv()
+def _should_force_full_prompt(model_cfg: dict | None) -> bool:
     if not isinstance(model_cfg, dict):
        return False
     return bool(model_cfg.get("force_full_prompt") or model_cfg.get("disable_delta"))
 
 
 
-def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
+def get_local_model_name(model_name: str | None) -> str | None:
     """Get the llama model name for a given model.
 
     Supports both the legacy top-level ``type: local`` + ``llama_model`` and the
@@ -438,10 +434,10 @@ def get_local_model_name(model_name: Optional[str]) -> Optional[str]:
 
 
 def _resolve_slot_model_name(
-    requested_model: Optional[str],
-    current_model: Optional[str],
+    requested_model: str | None,
+    current_model: str | None,
     server_config: dict,
-) -> Optional[str]:
+) -> str | None:
     """Resolve the llama model name used for slot endpoints in router mode."""
     srv = _srv()
     candidate = requested_model or current_model
@@ -462,7 +458,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
     server_config = srv.config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
     health_url = f"http://localhost:{llama_port}/health"
-    
+
     start_time = time.time()
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
     try:
@@ -472,7 +468,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
                exit_code = srv.llama_process.returncode
                srv.logger.error(f"llama-server process exited with code {exit_code}")
                return False
-           
+
            try:
                response = await client.get(health_url, timeout=5)
                if response.status_code == 200:
@@ -494,7 +490,7 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
                await client.aclose()
            except Exception:
                pass
-    
+
     srv.logger.error(f"llama-server failed to start within {timeout} seconds")
     return False
 
@@ -547,7 +543,7 @@ async def router_load_model(model_name: str) -> bool:
 
 
 
-async def router_list_models() -> Optional[dict]:
+async def router_list_models() -> dict | None:
     """List models from router-mode llama-server."""
     srv = _srv()
     server_config = srv.config.get("server", {})
@@ -573,8 +569,7 @@ async def router_list_models() -> Optional[dict]:
 
 
 
-def _extract_router_model_ids(router_models: Optional[dict]) -> list[str]:
-    srv = _srv()
+def _extract_router_model_ids(router_models: dict | None) -> list[str]:
     if not isinstance(router_models, dict):
        return []
     models_payload = router_models.get("data") or router_models.get("models") or []
@@ -723,8 +718,16 @@ def spawn_and_capture(
     env: dict,
     log_file,
     logger: logging.Logger,
+    model_name: str = "unknown",
 ) -> tuple:
     """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
+
+    Args:
+        cmd: Command list to execute.
+        env: Environment variables.
+        log_file: File-like object for streaming output.
+        logger: Logger instance.
+        model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
 
     Returns a tuple (Popen|None, captured_output_str|None).
     """
@@ -750,53 +753,133 @@ def spawn_and_capture(
     except subprocess.TimeoutExpired:
         try:
             if log_file and proc.stdout:
-                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file), daemon=True)
+                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file, model_name, logger), daemon=True)
                 t.start()
         except Exception:
             pass
         return proc, None
 
 
-def _stream_output(src, dst):
-    """Stream lines from src to dst, parsing prompt progress for console display."""
+def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger | None = None):
+    """Stream lines from src to dst, logging prompt progress as timestamped INFO entries.
+
+    Instead of writing progress updates to stderr with carriage-return overwrites,
+    this function logs clean progress entries via the Python logging system at
+    each 10% progress milestone (10%, 20%, …, 100%) per slot.
+
+    Per-slot progress thresholds are tracked in-memory so each slot independently
+    triggers log entries only when crossing a new 10% boundary.  The state is
+    scoped to the lifetime of this thread (one per llama-server process).
+
+    Args:
+        src: Source stream (e.g. subprocess stdout).
+        dst: Destination stream (e.g. log file).
+        model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+            When ``"unknown"`` (router mode with no initial model), the function
+            will dynamically look up ``srv.current_model`` from server state.
+        logger: Logger instance for progress entries.  If ``None``, progress
+            entries are silently skipped (no-op).
+    """
+    # Per-slot progress threshold tracking.
+    # Maps slot_id -> last logged 10%-bucket index (0-10, where 0 = 0%, 10 = 100%).
+    # A slot not in the dict has never been logged.
+    _last_logged_pct: dict[int, int] = {}
+    first_progress_time = None
     try:
         for line in src:
             dst.write(line)
             dst.flush()
-            # Display prompt processing progress to console
+            # Parse and log prompt processing progress
             try:
                 line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
                 if 'prompt processing' in line_str.lower():
                     parsed = extract_progress_data(line_str)
                     if parsed:
-                        n_tokens, progress = parsed
+                        slot_id, n_tokens, progress = parsed
                         total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
-                        progress_str = format_progress(n_tokens, total_tokens, progress)
-                        sys.stderr.write(progress_str)
-                        if progress >= 0.999:
-                            sys.stderr.write('\n')
-                        sys.stderr.flush()
+
+                        # Track elapsed time for average tokens/sec calculation
+                        now = time.monotonic()
+                        if first_progress_time is None:
+                            first_progress_time = now
+                        elapsed = now - first_progress_time
+                        if elapsed < 0.5:
+                            tokens_per_sec = None
+                        else:
+                            tokens_per_sec = n_tokens / elapsed
+
+                        # Dynamically resolve model name for router mode
+                        resolved_name = model_name
+                        if resolved_name == "unknown":
+                            try:
+                                srv = _srv()
+                                if getattr(srv, 'current_model', None):
+                                    resolved_name = srv.current_model
+                            except Exception:
+                                pass
+
+                        progress_str = format_progress(
+                            n_tokens, total_tokens, progress,
+                            model_name=resolved_name,
+                            slot_id=slot_id,
+                            tokens_per_sec=tokens_per_sec,
+                        )
+
+                        # Threshold-based logging: log at start, at each 10%
+                        # milestone, and at completion (progress >= 1.0).
+                        current_threshold = int(min(progress, 1.0) * 10)
+                        last = _last_logged_pct.get(slot_id)
+
+                        if last is None:
+                            # First progress data for this slot — always log.
+                            _last_logged_pct[slot_id] = current_threshold
+                            if logger:
+                                logger.info(progress_str)
+                        elif current_threshold > last:
+                            # Crossed a new 10% boundary.
+                            _last_logged_pct[slot_id] = current_threshold
+                            if logger:
+                                logger.info(progress_str)
+                        elif progress >= 1.0 and last < 10:
+                            # Final milestone (progress >= 100%) — ensure logged.
+                            _last_logged_pct[slot_id] = 10
+                            if logger:
+                                logger.info(progress_str)
             except Exception:
-                pass
+                if logger:
+                    logger.exception("Error processing progress line in _stream_output")
+                else:
+                    import traceback
+                    traceback.print_exc()
     except Exception:
-        pass
+        if logger:
+            logger.exception("Fatal error in _stream_output thread")
+        else:
+            import traceback
+            traceback.print_exc()
 
 
-def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
+def start_llama_server(model: str | None, display_name: str | None = None) -> subprocess.Popen | None:
     """Start the llama-server with the specified model.
 
-    Starts llama-server via the configured `llama_start_script`
-    (default: `scripts/podman_start_llama.sh`).
+    Args:
+        model: Model name for the start script command (llama model name or None for router mode).
+        display_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+            When not provided, falls back to ``model``, then ``srv.current_model``,
+            then ``"unknown"``.
+
     Returns a subprocess.Popen object when a long-running process is started,
     or None when startup failed after retries.
     """
     srv = _srv()
+    # Resolve the display name for progress output
+    _display = display_name or model or getattr(srv, 'current_model', None) or "unknown"
 
     server_config = srv.config.get("server", {})
     # Default to the repository root `start-llama.sh` if not specified in srv.config
     script_path = server_config.get(
        "llama_start_script",
-       str(Path(__file__).parent.parent / "start-llama.sh")
+       str(Path(__file__).parent.parent.parent / "start-llama.sh")
     )
     llama_port = server_config.get("llama_server_port", 8080)
 
@@ -863,7 +946,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     # Host-first startup: if llama_allow_host_fallback is enabled AND the
     # configured start script is different from the default start-llama.sh,
     # attempt one host-start before falling back to the configured script.
-    host_start_script = str(Path(__file__).parent.parent / "start-llama.sh")
+    host_start_script = str(Path(__file__).parent.parent.parent / "start-llama.sh")
     allow_host_fallback = bool(server_config.get("llama_allow_host_fallback", False))
 
     if allow_host_fallback and script_path != host_start_script:
@@ -876,7 +959,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
             host_cmd.append("router")
 
         srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
-        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger)
+        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
@@ -893,7 +976,7 @@ def start_llama_server(model: Optional[str]) -> Optional[subprocess.Popen]:
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger)
+       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
@@ -926,12 +1009,12 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
     srv = _srv()
     if not current_log.exists():
        return
-    
+
     # Find existing rotated logs
     srv.log_dir = current_log.parent
     base_name = current_log.stem
     suffix = current_log.suffix
-    
+
     # Get all existing rotated logs sorted by number (descending)
     rotated_logs = []
     for f in srv.log_dir.glob(f"{base_name}.*{suffix}"):
@@ -940,21 +1023,21 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
            rotated_logs.append((num, f))
        except ValueError:
            continue
-    
+
     rotated_logs.sort(key=lambda x: x[0], reverse=True)
-    
+
     # Delete logs beyond the keep limit (accounting for the new rotation)
     for num, f in rotated_logs:
        if num >= keep:
            f.unlink()
            srv.logger.debug(f"Deleted old llama-server log: {f}")
-    
+
     # Rotate existing logs (N -> N+1)
     for num, f in rotated_logs:
        if num < keep:
            new_name = srv.log_dir / f"{base_name}.{num + 1}{suffix}"
            f.rename(new_name)
-    
+
     # Rotate current log to .1
     if current_log.exists():
        current_log.rename(srv.log_dir / f"{base_name}.1{suffix}")
@@ -964,7 +1047,7 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
 def stop_llama_server():
     """Stop the currently running llama-server."""
     srv = _srv()
-    
+
     if srv.llama_process is not None:
        pid = getattr(srv.llama_process, 'pid', 'N/A')
        srv.logger.info(f"Stopping llama-server wrapper (PID: {pid})")
@@ -996,7 +1079,7 @@ def stop_llama_server():
            srv.llama_process = None
            srv.backend_ready = False
            srv.logger.info("llama-server stop skipped (no valid process)")
-    
+
     # Close log file if open
     if srv.llama_log_file is not None and srv.llama_log_file != subprocess.DEVNULL:
        try:
@@ -1011,7 +1094,7 @@ def stop_llama_server():
 # ---------------------------------------------------------------------------
 
 
-def start_tts_server() -> Optional[subprocess.Popen]:
+def start_tts_server() -> subprocess.Popen | None:
     """Start the qwentts TTS server using the configured start script.
 
     Returns a subprocess.Popen when successful, None on failure.
@@ -1131,7 +1214,7 @@ async def wait_for_tts_server(tts_port: int = 8081, timeout: int = 30) -> bool:
     return False
 
 
-async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
+async def ensure_model_loaded(requested_model: str | None) -> bool:
     srv = _srv()
     """
     Ensure the requested model is loaded in llama-server.
@@ -1183,7 +1266,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
            if router_mode:
                if srv.llama_process is None or srv.llama_process.poll() is not None:
                    try:
-                       srv.llama_process = srv.start_llama_server(None)
+                       srv.llama_process = srv.start_llama_server(None, display_name=requested_model)
                    except TypeError:
                        # Backwards-compatible call for older test monkeypatches
                        srv.llama_process = srv.start_llama_server(None)
@@ -1237,6 +1320,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
                    metrics.record_model_loaded(llama_model)
                except Exception:
                    pass
+
                await srv.broadcast_status("ready", {
                    "current_model": llama_model,
                    "llama_server_running": True
@@ -1249,7 +1333,7 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 
            # Start llama-server via the configured start script
            try:
-               srv.llama_process = srv.start_llama_server(llama_model)
+               srv.llama_process = srv.start_llama_server(llama_model, display_name=requested_model)
            except TypeError:
                srv.llama_process = srv.start_llama_server(llama_model)
 
@@ -1300,8 +1384,8 @@ async def ensure_model_loaded(requested_model: Optional[str]) -> bool:
 # ---------------------------------------------------------------------------
 from .backend_health import (  # noqa: E402, F401
     _extract_model_port_from_args,
-    _router_model_health_loop,
     _probe_model_instance,
+    _router_model_health_loop,
 )
 
 

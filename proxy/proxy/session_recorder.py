@@ -20,10 +20,9 @@ timestamp) so files can be inspected individually without external context.
 import asyncio
 import json
 import logging
-import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger("llama-proxy.session_recorder")
 
@@ -106,9 +105,9 @@ class SessionRecorder:
         session_id: str,
         direction: str,
         payload: Any,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-    ) -> Optional[str]:
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> str | None:
         """Record a request payload to disk (non-blocking).
 
         Args:
@@ -130,9 +129,9 @@ class SessionRecorder:
         session_id: str,
         direction: str,
         payload: Any,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-    ) -> Optional[str]:
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> str | None:
         """Record a response payload to disk (non-blocking).
 
         Accepts only fully-assembled response payloads (not individual
@@ -159,9 +158,9 @@ class SessionRecorder:
         direction: str,
         payload: Any,
         suffix: str,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-    ) -> Optional[str]:
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> str | None:
         """Core recording method — serialize, build path, write to disk.
 
         Uses ``asyncio.to_thread`` to perform the synchronous file write
@@ -193,7 +192,7 @@ class SessionRecorder:
             return None
 
         # Build filename with timestamp
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        timestamp = datetime.now(UTC).isoformat(timespec="microseconds")
         filename = f"{timestamp}-{suffix}.json"
         filepath = session_dir / filename
 
@@ -240,7 +239,7 @@ class SessionRecorder:
     # Query / retrieval methods
     # ------------------------------------------------------------------
 
-    def get_recordings_list(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_recordings_list(self, session_id: str) -> list[dict[str, Any]]:
         """Return metadata for all recording files of a session.
 
         Returns a list of dicts, each containing:
@@ -260,7 +259,7 @@ class SessionRecorder:
             # Permission error or inaccessible directory
             return []
 
-        recordings: List[Dict[str, Any]] = []
+        recordings: list[dict[str, Any]] = []
         try:
             for entry in sorted(session_dir.iterdir()):
                 if not entry.is_file():
@@ -290,7 +289,7 @@ class SessionRecorder:
 
         return recordings
 
-    def get_recording(self, session_id: str, filename: str) -> Optional[Dict[str, Any]]:
+    def get_recording(self, session_id: str, filename: str) -> dict[str, Any] | None:
         """Retrieve the full content of a single recording file.
 
         Path traversal protection: rejects filenames containing path
@@ -363,7 +362,7 @@ class SessionRecorder:
         return text[:max_chars].rstrip() + "..."
 
     @staticmethod
-    def _extract_session_preview(session_dir: Path) -> Optional[Dict[str, Any]]:
+    def _extract_session_preview(session_dir: Path) -> dict[str, Any] | None:
         """Extract preview data for a session from its recording files.
 
         Finds the first ``provider_to_client`` response recording and
@@ -389,7 +388,7 @@ class SessionRecorder:
             recording files.
         """
         sid = session_dir.name
-        recordings: List[Dict[str, Any]] = []
+        recordings: list[dict[str, Any]] = []
         first_client_payload: Any = None
         try:
             for f in sorted(session_dir.iterdir()):
@@ -419,7 +418,7 @@ class SessionRecorder:
         first_resp = None
         first_req = None
         # Determine the latest recording timestamp across all files
-        last_timestamp: Optional[str] = None
+        last_timestamp: str | None = None
         for r in recordings:
             ts = r["timestamp"]
             if last_timestamp is None or ts > last_timestamp:
@@ -449,7 +448,7 @@ class SessionRecorder:
             "preview_text": preview_text,
         }
 
-    def list_sessions_by_model(self, model: str) -> List[Dict[str, Any]]:
+    def list_sessions_by_model(self, model: str) -> list[dict[str, Any]]:
         """Return session IDs that have recordings for a specific model.
 
         Scans session directories and returns preview data (first response
@@ -473,8 +472,8 @@ class SessionRecorder:
         if not base.is_dir():
             return []
 
-        model_sessions: List[Dict[str, Any]] = []
-        all_sessions: List[Dict[str, Any]] = []
+        model_sessions: list[dict[str, Any]] = []
+        all_sessions: list[dict[str, Any]] = []
         try:
             for entry in sorted(base.iterdir()):
                 if not entry.is_dir():
@@ -514,7 +513,7 @@ class SessionRecorder:
         all_sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
         return all_sessions
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(self) -> list[dict[str, Any]]:
         """Return all session IDs that have recording directories.
 
         Returns a list of dicts with ``session_id``, ``response_time``,
@@ -524,7 +523,7 @@ class SessionRecorder:
         if not base.is_dir():
             return []
 
-        sessions: List[Dict[str, Any]] = []
+        sessions: list[dict[str, Any]] = []
         try:
             for entry in sorted(base.iterdir()):
                 if not entry.is_dir():

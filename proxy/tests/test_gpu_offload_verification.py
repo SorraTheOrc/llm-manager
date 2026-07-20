@@ -23,13 +23,10 @@ Reference:
   - Router mode command (current): does NOT include -ngl
 """
 
-import asyncio
 import io
 import logging
-import os
 import subprocess
 import sys
-import unittest
 from pathlib import Path
 
 import pytest
@@ -38,6 +35,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import importlib
+
 lifecycle = importlib.import_module("proxy.lifecycle")
 
 
@@ -46,7 +44,7 @@ lifecycle = importlib.import_module("proxy.lifecycle")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_INI = REPO_ROOT / "models.ini"
 START_SCRIPT = REPO_ROOT / "start-llama.sh"
-EXPECTED_GLOBAL_NGL = 99
+EXPECTED_GLOBAL_NGL = 80
 
 # Environment variables that must be set for ROCm GPU offload
 REQUIRED_ROCM_ENV_VARS = [
@@ -503,22 +501,16 @@ class TestEmbeddingsGpuOffload:
         )
 
     def test_embeddings_single_model_also_has_gpu_offload(self):
-        """The single-model path for mxbai-embed includes -ngl 99 via the
-        shared command template (all single-model paths use -ngl 99)."""
+        """The single-model path for mxbai-embed includes -ngl via the
+        GLOBAL_NGL variable from models.ini."""
         content = START_SCRIPT.read_text()
-        # The -ngl 99 is in the shared command template, not in each
-        # case block. Verify the script contains -ngl 99 for single-model mode.
-        assert "-ngl 99" in content, (
-            "Single-model mode must include -ngl 99 for GPU offload"
+        # The -ngl is in the shared command template using GLOBAL_NGL
+        # (which comes from models.ini [global] ngl or LLAMA_NGL override).
+        assert '-ngl "$GLOBAL_NGL"' in content, (
+            "Single-model mode must include -ngl \"$GLOBAL_NGL\" for GPU offload"
         )
-        # Verify this is NOT in the router section (router uses get_global_ngl)
-        # by checking there's a -ngl 99 outside the router if block
-        lines = content.splitlines()
-        non_router_ngl = [
-            l.strip() for l in lines
-            if "-ngl" in l.strip() and "--models-preset" not in l
-        ]
-        assert any("-ngl 99" in l for l in non_router_ngl), (
-            "Single-model -ngl 99 must be present outside router section"
+        # Verify GLOBAL_NGL is derived from models.ini (not hardcoded)
+        assert 'GLOBAL_NGL="${LLAMA_NGL:-$(get_global_ngl' in content, (
+            "GLOBAL_NGL must be read from models.ini via get_global_ngl"
         )
 

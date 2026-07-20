@@ -13,8 +13,9 @@ until the streaming request finished.
 """
 import asyncio
 import time
-import pytest
+
 import httpx
+import pytest
 
 
 async def _run_slow_server(ready_event: asyncio.Event, port_holder: list):

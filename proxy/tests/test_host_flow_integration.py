@@ -16,12 +16,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 # Ensure the package path is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import importlib
+
 lifecycle = importlib.import_module("proxy.lifecycle")
 
 
@@ -184,16 +183,20 @@ class TestHostFlowMocked:
         assert dummy.llama_process is None
 
     def test_progress_logging_output(self):
-        """Verify progress parsing produces expected output format."""
+        """Verify progress parsing produces expected output format with model/slot prefix and TPS."""
         from proxy.handlers import extract_progress_data, format_progress
 
-        log_line = "prompt processing, n_tokens=100, progress=0.50"
+        log_line = "slot 3 : prompt processing, n_tokens=100, progress=0.50"
         parsed = extract_progress_data(log_line)
         assert parsed is not None
-        n_tokens, progress = parsed
+        slot_id, n_tokens, progress = parsed
+        assert slot_id == 3
         assert n_tokens == 100
         assert progress == 0.50
 
-        formatted = format_progress(n_tokens, 200, progress)
+        formatted = format_progress(n_tokens, 200, progress,
+                                     model_name="Qwen3", slot_id=slot_id, tokens_per_sec=45.2)
         assert "100" in formatted
         assert "200" in formatted
+        assert "[slot:3 Qwen3]" in formatted
+        assert "@ 45.2 tok/s" in formatted

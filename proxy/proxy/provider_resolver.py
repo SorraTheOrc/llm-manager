@@ -27,7 +27,7 @@ Canonical model IDs (discovered via ``pi --list-models``):
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger("llama-proxy.provider-resolver")
 
@@ -37,7 +37,7 @@ logger = logging.getLogger("llama-proxy.provider-resolver")
 
 # Counter for unresolved model name lookups.
 # Format: <short_name> -> count
-_unresolved_counts: Dict[str, int] = {}
+_unresolved_counts: dict[str, int] = {}
 
 
 def _record_unresolved(name: str) -> None:
@@ -45,7 +45,7 @@ def _record_unresolved(name: str) -> None:
     _unresolved_counts[name] = _unresolved_counts.get(name, 0) + 1
 
 
-def get_unresolved_counts() -> Dict[str, int]:
+def get_unresolved_counts() -> dict[str, int]:
     """Return a copy of the unresolved name counter map."""
     return dict(_unresolved_counts)
 
@@ -66,20 +66,20 @@ def get_unresolved_counts() -> Dict[str, int]:
 # combinations are added.
 
 
-def _resolve_opencode_go_candidates(name: str) -> List[str]:
+def _resolve_opencode_go_candidates(name: str) -> list[str]:
     """Resolve opencode-go specific names."""
     if "/" in name:
         return ["opencode-go/" + name.split("/", 1)[-1]]
     return ["opencode-go/" + name]
 
 
-def _resolve_opencode_candidates(name: str) -> List[str]:
+def _resolve_opencode_candidates(name: str) -> list[str]:
     """Resolve opencode specific names."""
     stripped = name.replace("opencode-", "").replace("opencode/", "")
     return ["opencode/" + stripped]
 
 
-_MODEL_RESOLVERS: List[tuple] = [
+_MODEL_RESOLVERS: list[tuple] = [
     # DeepSeek v4 flash — free / no-key tier
     (
         lambda name: name == "deepseek-v4-flash-free" or name == "deepseek-v4-flash-free*",
@@ -166,7 +166,7 @@ _MODEL_RESOLVERS: List[tuple] = [
 ]
 
 
-def resolve_name_to_ids(name: str) -> List[str]:
+def resolve_name_to_ids(name: str) -> list[str]:
     """Resolve a single short model name to a list of provider-prefixed IDs.
 
     Iterates through the static mapping table and returns the candidate
@@ -206,8 +206,8 @@ def resolve_name_to_ids(name: str) -> List[str]:
 
 def resolve_audit_model(
     name: str,
-    fallbacks: Optional[List[str]] = None,
-) -> List[str]:
+    fallbacks: list[str] | None = None,
+) -> list[str]:
     """Resolve an audit model name (with fallbacks) to provider-prefixed IDs.
 
     The primary *name* is resolved first.  If it resolves to zero candidates,
@@ -267,7 +267,7 @@ def resolve_audit_model(
 def validate_audit_models(
     config: dict,
     strict: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate audit model configuration at startup.
 
     Attempts to resolve the primary ``audit_model`` and all entries in
@@ -290,8 +290,8 @@ def validate_audit_models(
     """
     primary = config.get("audit_model", "")
     fallbacks = config.get("audit_model_fallbacks", []) or []
-    warnings: List[str] = []
-    resolved_ids: List[str] = []
+    warnings: list[str] = []
+    resolved_ids: list[str] = []
 
     if not primary:
         warnings.append("No audit_model configured in config.yaml")

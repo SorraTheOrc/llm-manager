@@ -32,6 +32,51 @@ Testing
   ```
   . .venv/bin/activate && python -m pytest -q
   ```
+
+Linting
+-------
+
+This project uses [ruff](https://docs.astral.sh/ruff/) for Python linting
+and formatting. Configuration is in `.ruff.toml` at the repo root.
+
+### Quick start
+
+.ruff.toml is auto-discovered from the repo root, so commands can be run from any location:
+
+```bash
+# Run all lint checks
+.venv/bin/ruff check .
+
+# Auto-fix fixable issues
+.venv/bin/ruff check --fix .
+```
+
+### Rule set
+
+| Category | Rules | Description |
+|----------|-------|-------------|
+| F (Pyflakes) | `F` | Logic errors, undefined names, unused imports |
+| E (Pycodestyle errors) | `E` | Formatting errors (except line length) |
+| W (Pycodestyle warnings) | `W` | Formatting warnings (blank line whitespace) |
+| I (isort) | `I` | Import ordering |
+| N (Naming) | `N` | PEP 8 naming conventions |
+| UP (pyupgrade) | `UP` | Modern Python idioms |
+| RUF100 | `RUF100` | Unused `# noqa` directives |
+
+Line length is set to **120** characters (project convention). The E501
+rule is disabled since line-length is advisory.
+
+### Test directory exceptions
+
+Test files in `tests/` and `proxy/tests/` allow `assert` statements,
+`print()` calls, and unused imports (common in test helpers). These
+exceptions are configured via `per-file-ignores` in `.ruff.toml`.
+
+### Remaining issues
+
+After auto-fix, the remaining warnings are non-auto-fixable issues that
+require manual attention. Run `ruff check .` to see the current count.
+
 - Playwright UI tests (requires Node/npm and browser install):
   ```
   npm i -D playwright && npx playwright install

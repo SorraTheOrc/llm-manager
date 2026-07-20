@@ -18,13 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import httpx
 import pytest
 from fastapi import Request
-from fastapi.responses import Response, StreamingResponse
-
+from fastapi.responses import StreamingResponse
 from proxy.proxy_remote import (
     _handle_remote_non_streaming,
     _handle_remote_streaming,
 )
-
 
 # ===================================================================
 # Async iterator helpers (reused from test_upstream_stall_detection.py)
@@ -518,7 +516,7 @@ async def test_empty_retry_config_keys_used_in_non_streaming(mock_request, mock_
 
     with patch("proxy.proxy_remote._srv", return_value=mock_srv):
         with patch("proxy.proxy_remote.log_response"):
-            result = await _handle_remote_non_streaming(
+            _result = await _handle_remote_non_streaming(
                 request=mock_request,
                 target_url="https://api.example.com/v1/chat/completions",
                 headers={"Authorization": "Bearer test"},

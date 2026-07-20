@@ -16,11 +16,8 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
-import pytest
-from fastapi.responses import StreamingResponse
-
 import proxy.server as server
-
+import pytest
 
 BASE_SERVER_CONFIG = {
     "server": {
@@ -72,7 +69,6 @@ def _make_mock_cm(aiter_func):
     Returns (context_manager, response_object) matching the contract
     of _call_with_backend_retries in the streaming path.
     """
-    exc = None
 
     async def _aiter():
         async for chunk in aiter_func():
@@ -106,8 +102,7 @@ def _reset_server_state(monkeypatch):
     monkeypatch.setattr(server, "session_manager", MagicMock())
     monkeypatch.setattr(server, "logger", MagicMock())
 
-    # Disable scheduler and self-healing
-    monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: None)
+    # Disable self-healing
     monkeypatch.setattr("proxy.router._is_self_healing_active", lambda: False)
 
     # Reset metrics
@@ -459,7 +454,7 @@ async def test_dispatch_lease_adaptive_timeout_large_prompt(monkeypatch):
     before any data chunks arrive. For a ~48K-token prompt, the extension is
     approximately 48K * 0.015s = 720s, giving a total lease of ~900s.
     """
-    from proxy.router_helpers import _try_acquire_local_dispatch, _get_lease_timeout_seconds
+    from proxy.router_helpers import _get_lease_timeout_seconds, _try_acquire_local_dispatch
 
     # Set up dispatch tracking on server state
     monkeypatch.setattr(server, "local_dispatch_records", {})
@@ -515,7 +510,7 @@ async def test_dispatch_lease_adaptive_timeout_small_prompt(monkeypatch):
     LP-0MRDUQ9QC003LDDP: For small requests (<180s), the lease timeout
     should remain at the base 180s without significant adaptive extension.
     """
-    from proxy.router_helpers import _try_acquire_local_dispatch, _get_lease_timeout_seconds
+    from proxy.router_helpers import _get_lease_timeout_seconds, _try_acquire_local_dispatch
 
     # Set up dispatch tracking on server state
     monkeypatch.setattr(server, "local_dispatch_records", {})

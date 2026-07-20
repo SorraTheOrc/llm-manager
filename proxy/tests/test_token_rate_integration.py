@@ -9,16 +9,11 @@ and mock the backend llama-server with controlled SSE streaming.
 """
 
 import json
-import logging
-import time
-from typing import AsyncGenerator, List, Optional
+from collections.abc import AsyncGenerator
+from typing import List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
-
-from proxy.server import app as proxy_app
-
 
 # ===================================================================
 # Mock helpers for the backend streaming response
@@ -28,7 +23,7 @@ from proxy.server import app as proxy_app
 class MockStreamResponse:
     """Simulates an httpx streaming response that yields SSE bytes."""
 
-    def __init__(self, chunks: List[str], status_code: int = 200):
+    def __init__(self, chunks: list[str], status_code: int = 200):
         """
         Args:
             chunks: List of SSE text chunks (each chunk is a full
@@ -76,7 +71,7 @@ class MockStreamingAsyncClient:
     Used to simulate the llama-server backend without a real connection.
     """
 
-    def __init__(self, chunks: List[str], **kwargs):
+    def __init__(self, chunks: list[str], **kwargs):
         self._chunks = chunks
         self._timeout = kwargs.get("timeout")
         self.calls: list = []
@@ -146,7 +141,7 @@ def _setup_server_state(monkeypatch):
     monkeypatch.setattr(srv_module, "session_manager", mock_sm)
 
 
-def _make_sse_chunk(delta_text: str, finish_reason: Optional[str] = None) -> str:
+def _make_sse_chunk(delta_text: str, finish_reason: str | None = None) -> str:
     """Build an SSE ``data:`` line for a chat completion chunk."""
     choice = {"index": 0, "delta": {"content": delta_text}}
     if finish_reason:
@@ -160,7 +155,7 @@ def _make_sse_chunk(delta_text: str, finish_reason: Optional[str] = None) -> str
 # ===================================================================
 
 
-def _fast_chunks(count: int = 60) -> List[str]:
+def _fast_chunks(count: int = 60) -> list[str]:
     """Build a sequence of SSE chunks that simulates a high token-rate stream.
 
     Each chunk contains varied non-repetitive text so it does not trigger
@@ -175,7 +170,7 @@ def _fast_chunks(count: int = 60) -> List[str]:
     return result
 
 
-def _slow_chunks(count: int = 10) -> List[str]:
+def _slow_chunks(count: int = 10) -> list[str]:
     """Build a sequence of SSE chunks that simulates normal-speed stream.
 
     Each chunk contains short, varied text (≈5 tokens via heuristic),
@@ -200,8 +195,8 @@ async def test_high_token_rate_triggers_cutoff(monkeypatch):
     The proxy should stop the streaming response when the token rate
     exceeds the configured threshold over the rolling window.
     """
-    from proxy.router import proxy_to_local
     from fastapi import Request as FastAPIRequest
+    from proxy.router import proxy_to_local
 
     # Build a request with streaming enabled
     body = json.dumps({
@@ -260,8 +255,8 @@ async def test_normal_speed_stream_not_affected(monkeypatch):
 
     With low token rate (below threshold), all chunks should be delivered.
     """
-    from proxy.router import proxy_to_local
     from fastapi import Request as FastAPIRequest
+    from proxy.router import proxy_to_local
 
     body = json.dumps({
         "model": "test-model",
@@ -306,9 +301,9 @@ async def test_session_preserved_after_token_rate_cutoff(monkeypatch):
     The session should not be invalidated by the token-rate guardrail,
     allowing the client to reuse the session for a follow-up request.
     """
+    from fastapi import Request as FastAPIRequest
     from proxy.router import proxy_to_local
     from proxy.server import session_manager
-    from fastapi import Request as FastAPIRequest
 
     # First request: high token rate → guardrail cutoff
     body1 = json.dumps({
@@ -394,9 +389,10 @@ async def test_guardrail_disabled_with_zero_threshold(monkeypatch):
     With the guardrail disabled, even extremely high token rates should
     not trigger cutoff — all chunks are delivered.
     """
-    from proxy import server as srv_module
-    from proxy.router import proxy_to_local
     from fastapi import Request as FastAPIRequest
+    from proxy.router import proxy_to_local
+
+    from proxy import server as srv_module
 
     # Set max_token_rate to 0 (disabled)
     srv_module.config["server"]["session_guardrail_max_token_rate"] = 0

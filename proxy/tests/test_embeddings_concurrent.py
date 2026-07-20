@@ -1,8 +1,8 @@
-import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
+import requests
 from requests.exceptions import RequestException
 
 
@@ -128,6 +128,7 @@ def test_concurrent_embeddings_and_chat():
                     "Server overloaded" in body
                     or "Model server busy" in body
                     or "model_loading" in body
+                    or "Queue full" in body
                 ), f"unexpected 503 body={body}"
 
         assert ok_count >= 1, "expected at least one successful request under concurrent load"

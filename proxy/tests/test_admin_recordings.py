@@ -10,13 +10,10 @@ Covers:
 """
 
 import json
-import os
-import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
-from fastapi import FastAPI
-
+import pytest
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Fixtures
@@ -67,7 +64,6 @@ def mock_server(temp_recording_dir):
 @pytest.fixture
 def app(temp_recording_dir):
     """Create a FastAPI app with recording endpoint routes registered."""
-    from proxy.session_recorder import SessionRecorder
     from proxy.server import app
 
     # We need to register the routes - this is more of an integration test
@@ -285,14 +281,15 @@ class TestRouteRegistration:
 
     def test_handler_importable(self):
         """The admin recording handler functions are importable from ui.py."""
-        from proxy.ui import list_session_recordings, get_session_recording
+        from proxy.ui import get_session_recording, list_session_recordings
         assert callable(list_session_recordings)
         assert callable(get_session_recording)
 
     def test_handler_signatures_accept_session_id(self):
         """Handlers accept session_id (and optionally filename) parameters."""
         import inspect
-        from proxy.ui import list_session_recordings, get_session_recording
+
+        from proxy.ui import get_session_recording, list_session_recordings
 
         # list_session_recordings should accept session_id
         sig1 = inspect.signature(list_session_recordings)
@@ -309,7 +306,6 @@ class TestRouteRegistration:
         """The route registration functions produce callable endpoint wrappers."""
         # This tests that the registration pattern works: we just verify
         # the registration function can be called without error
-        from proxy.server import app
         from proxy.ui import list_session_recording_routes
 
         # The registration function should add routes to the given app
@@ -317,13 +313,12 @@ class TestRouteRegistration:
 
     def test_response_return_type(self):
         """Handler return types are compatible with FastAPI JSONResponse."""
-        from fastapi.responses import JSONResponse
-        from proxy.ui import list_session_recordings, get_session_recording
-
         # The handlers should be annotated or documented as returning JSONResponse
         # We verify by checking that a call would produce a JSONResponse-shaped result
         # (more detailed integration tests verify the actual response)
         import inspect
+
+        from proxy.ui import list_session_recordings
         return_annotation = inspect.signature(list_session_recordings).return_annotation
         # The annotation could be JSONResponse, dict, or unspecified
         # This is a soft check — the actual response type is verified in integration tests
@@ -365,7 +360,7 @@ class TestErrorHandling:
             recorder = SessionRecorder(recording_path=str(restricted))
             sessions = recorder.list_sessions()
             assert sessions == []
-    
+
             recordings = recorder.get_recordings_list("any-session")
             assert recordings == []
         finally:

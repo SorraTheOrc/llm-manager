@@ -13,31 +13,30 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import httpx
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
+# Import utils functions used by this module
+from proxy.utils import count_text_tokens
+
 from .router_helpers import (
+    _compute_request_timeout,
     _get_request_preview,
+    _normalize_outgoing_headers,
+    _schedule_recv_token_increment,
+    _schedule_traffic_recording,
     _srv,
     log_request,
     log_response,
     log_response_chunk,
-    _compute_request_timeout,
-    _schedule_recv_token_increment,
-    _normalize_outgoing_headers,
     normalize_upstream_request_headers,
-    _schedule_traffic_recording,
 )
-
-# Import utils functions used by this module
-from proxy.utils import count_text_tokens  # noqa: E402
 
 # Import stall circuit breaker for Tier 3 cross-request stall tracking
 from .stall_circuit_breaker import _check_stall_circuit_breaker
-
 
 # ---------------------------------------------------------------------------
 # Auth.json fallback helpers
@@ -49,7 +48,7 @@ def _get_auth_json_path() -> Path:
     return Path.home() / ".pi" / "agent" / "auth.json"
 
 
-def _try_pi_auth_json(provider_name: str) -> Optional[str]:
+def _try_pi_auth_json(provider_name: str) -> str | None:
     """Attempt to resolve an API key from ~/.pi/agent/auth.json.
 
     Performs a case-insensitive lookup matching *provider_name* against
@@ -132,7 +131,7 @@ _REMOTE_CHAT_FIELD_ALLOWLIST = {
 }
 
 
-def _sanitize_remote_chat_payload(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_remote_chat_payload(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Sanitize chat-completions payload for remote providers.
 
     Keeps a conservative OpenAI-compatible field subset for
@@ -363,12 +362,12 @@ async def _handle_remote_streaming(
     body_json: dict,
     model_name: str,
     remote_timeout: httpx.Timeout,
-    resolved_model: Optional[str] = None,
-    session_id: Optional[str] = None,
-    provider: Optional[str] = None,
-    upstream_idle_timeout_seconds: Optional[float] = None,
-    upstream_retry_connect_timeout_seconds: Optional[float] = None,
-    pool_client: Optional[httpx.AsyncClient] = None,
+    resolved_model: str | None = None,
+    session_id: str | None = None,
+    provider: str | None = None,
+    upstream_idle_timeout_seconds: float | None = None,
+    upstream_retry_connect_timeout_seconds: float | None = None,
+    pool_client: httpx.AsyncClient | None = None,
 ) -> Response:
     """Handle streaming remote proxy request with upstream stall detection and retry.
 
@@ -604,7 +603,7 @@ async def _handle_remote_streaming(
                         }
                         _final_error_bytes = (
                             f"data: {json.dumps(_final_error_obj)}\n\n"
-                        ).encode("utf-8")
+                        ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_error_bytes)
                         yield _final_error_bytes
@@ -648,7 +647,7 @@ async def _handle_remote_streaming(
                 }
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
-                ).encode("utf-8")
+                ).encode()
                 if collected_chunks is not None:
                     collected_chunks.append(_final_error_bytes)
                 yield _final_error_bytes
@@ -690,7 +689,7 @@ async def _handle_remote_streaming(
                 }
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
-                ).encode("utf-8")
+                ).encode()
                 if collected_chunks is not None:
                     collected_chunks.append(_final_error_bytes)
                 yield _final_error_bytes
@@ -774,7 +773,7 @@ async def _handle_remote_streaming(
                             _aiter.__anext__(),
                             timeout=upstream_idle_timeout_seconds,
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Upstream stall detected — no data for
                         # upstream_idle_timeout_seconds. Break inner loop to
                         # trigger retry.
@@ -865,7 +864,7 @@ async def _handle_remote_streaming(
                         }
                         _final_empty_error_bytes = (
                             f"data: {json.dumps(_final_empty_error_obj)}\n\n"
-                        ).encode("utf-8")
+                        ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_empty_error_bytes)
                         yield _final_empty_error_bytes
@@ -898,7 +897,7 @@ async def _handle_remote_streaming(
                         }
                         _final_empty_error_bytes = (
                             f"data: {json.dumps(_final_empty_error_obj)}\n\n"
-                        ).encode("utf-8")
+                        ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_empty_error_bytes)
                         yield _final_empty_error_bytes
@@ -912,7 +911,7 @@ async def _handle_remote_streaming(
                         }
                         _final_stop_bytes = (
                             f"data: {json.dumps(_final_stop_obj)}\n\n"
-                        ).encode("utf-8")
+                        ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_stop_bytes)
                         yield _final_stop_bytes
@@ -957,7 +956,7 @@ async def _handle_remote_streaming(
                 }
                 _final_bytes = (
                     f"data: {json.dumps(_final_obj)}\n\n"
-                ).encode("utf-8")
+                ).encode()
                 if collected_chunks is not None:
                     collected_chunks.append(_final_bytes)
                 yield _final_bytes
@@ -978,7 +977,7 @@ async def _handle_remote_streaming(
                             try:
                                 disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
                                 await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
-                            except (asyncio.TimeoutError, Exception):
+                            except (TimeoutError, Exception):
                                 pass
 
             if saw_done or saw_finish or disconnected:
@@ -1003,7 +1002,7 @@ async def _handle_remote_streaming(
             try:
                 disconnect_cleanup_timeout = _srv().config.get("server", {}).get("disconnect_cleanup_timeout", 5.0)
                 await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
-            except (asyncio.TimeoutError, Exception):
+            except (TimeoutError, Exception):
                 pass
 
         # Record provider->client response for streaming path (fire-and-forget)
@@ -1091,9 +1090,9 @@ async def _handle_remote_non_streaming(
     body: bytes,
     model_name: str,
     remote_timeout: httpx.Timeout,
-    resolved_model: Optional[str] = None,
-    session_id: Optional[str] = None,
-    pool_client: Optional[httpx.AsyncClient] = None,
+    resolved_model: str | None = None,
+    session_id: str | None = None,
+    pool_client: httpx.AsyncClient | None = None,
 ) -> Response:
     """Handle non-streaming remote proxy request with empty-response retry.
 

@@ -1,6 +1,6 @@
 import asyncio
 import time
-import threading
+
 import pytest
 
 from proxy import server
@@ -150,6 +150,51 @@ async def test_poll_slots_dict_without_next_token():
     state = server.slot_polling_state["no-next-token"]
     assert state["is_processing"] is True
     assert state["n_decoded"] == 77
+
+
+@pytest.mark.asyncio
+async def test_poll_slots_multi_slot_list():
+    """Multi-slot list response should aggregate across all slots.
+
+    When data[0] has is_processing=False but data[1] has is_processing=True,
+    the aggregated is_processing should be True (any slot processing).
+    n_decoded should reflect the max across all slots.
+    """
+    responses = [
+        {
+            "status": 200,
+            "json": [
+                {"is_processing": False, "next_token": {"n_decoded": 5}},
+                {"is_processing": True, "next_token": {"n_decoded": 10}},
+            ],
+        },
+    ]
+    server._http_client = MockClient(responses)
+    await server.poll_slots_for_model("multi-slot", llama_port=1234, interval=0.01, max_polls=1)
+    assert "multi-slot" in server.slot_polling_state
+    state = server.slot_polling_state["multi-slot"]
+    # Any slot processing => is_processing True
+    assert state["is_processing"] is True, (
+        f"Expected is_processing=True (slot 1 is processing), got {state['is_processing']}"
+    )
+    # n_decoded should be max across slots (10, not 5)
+    assert state["n_decoded"] == 10, (
+        f"Expected n_decoded=10 (max across slots), got {state['n_decoded']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_slots_single_slot_still_works():
+    """Single-slot list response should still work as before (no regression)."""
+    responses = [
+        {"status": 200, "json": [{"is_processing": True, "next_token": {"n_decoded": 42}}]},
+    ]
+    server._http_client = MockClient(responses)
+    await server.poll_slots_for_model("single-slot", llama_port=1234, interval=0.01, max_polls=1)
+    assert "single-slot" in server.slot_polling_state
+    state = server.slot_polling_state["single-slot"]
+    assert state["is_processing"] is True
+    assert state["n_decoded"] == 42
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
-import subprocess
 import os
+import subprocess
 
 SCRIPT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'scripts', 'verify-upgrade.sh'))
 

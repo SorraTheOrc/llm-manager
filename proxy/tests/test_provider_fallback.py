@@ -7,15 +7,13 @@ Tests for:
 """
 
 import json
-import pytest
 import time
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import HTTPException, Request, Response
-
 import proxy.provider as provider
-
+import pytest
+from fastapi import HTTPException, Response
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -390,7 +388,7 @@ async def test_remote_fallback_tries_providers_in_order(sample_model_config):
         return Response(status_code=502, content=b"Bad gateway")
 
     with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
-        result = await provider.proxy_with_remote_fallback(
+        _result = await provider.proxy_with_remote_fallback(
             request, "v1/chat/completions", sample_model_config, cfg
         )
 
@@ -1416,75 +1414,6 @@ async def test_no_fallback_log_on_success(sample_model_config, caplog):
 
 
 @pytest.mark.asyncio
-async def test_local_queue_bypass_when_slot_busy(mixed_model_config):
-    """When scheduler has no idle slots and model has fallback providers,
-    skip the local provider immediately without marking it unavailable."""
-    request = _DummyRequest()
-    cfg = {"provider_cooldown_seconds": 60}
-    call_log = []
-
-    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
-        call_log.append(("remote", provider_cfg.get("name")))
-        return Response(
-            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
-            status_code=200,
-            media_type="application/json",
-        )
-
-    async def _mock_proxy_to_local(_req, _path):
-        call_log.append(("local", "local-llama"))
-        raise AssertionError("Should not reach local provider when slot is busy")
-
-    with (
-        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
-        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=False),
-    ):
-        result = await provider.proxy_with_fallback(
-            request, "v1/chat/completions", mixed_model_config, cfg
-        )
-
-    assert result.status_code == 200
-    # Local provider should NOT have been called; remote was used directly
-    assert call_log == [("remote", "remote-fallback")]
-    # Local provider should NOT be marked unavailable (slot busy, not failed)
-    assert "local-llama" not in provider._provider_unavailable_until
-
-
-@pytest.mark.asyncio
-async def test_local_queue_bypass_no_fallback_passes_through(mixed_model_config):
-    """When scheduler has idle slot, local provider is called normally
-    even when fallback providers exist."""
-    request = _DummyRequest()
-    cfg = {"provider_cooldown_seconds": 60}
-    call_log = []
-
-    async def _mock_proxy_to_local(_req, _path):
-        call_log.append(("local", "local-llama"))
-        return Response(
-            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
-            status_code=200,
-            media_type="application/json",
-        )
-
-    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
-        call_log.append(("remote", provider_cfg.get("name")))
-        raise AssertionError("Should not reach remote when local has idle slot")
-
-    with (
-        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
-        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
-    ):
-        result = await provider.proxy_with_fallback(
-            request, "v1/chat/completions", mixed_model_config, cfg
-        )
-
-    assert result.status_code == 200
-    assert call_log == [("local", "local-llama")]
-
-
-@pytest.mark.asyncio
 async def test_local_concurrency_limit_fallback(mixed_model_config):
     """When local concurrency limit is reached, skip to next provider
     without marking local as unavailable."""
@@ -1564,8 +1493,9 @@ async def test_local_concurrency_below_limit_calls_local(mixed_model_config):
 @pytest.mark.asyncio
 async def test_remote_model_with_providers_calls_fallback(monkeypatch):
     """proxy_openai_api should call proxy_with_remote_fallback for remote models with providers."""
+    from unittest.mock import MagicMock
+
     import proxy.server as server_module
-    from unittest.mock import MagicMock, AsyncMock
 
     # Set up config with a remote model that has providers
     server_module.config = {
@@ -1588,7 +1518,7 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
 
     # Track that proxy_with_remote_fallback was called
     fallback_called = False
-    orig_fallback = provider.proxy_with_remote_fallback
+    _orig_fallback = provider.proxy_with_remote_fallback
 
     async def mock_fallback(request, path, model_config, config):
         nonlocal fallback_called
@@ -1600,8 +1530,8 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
         )
 
     with patch("proxy.provider.proxy_with_remote_fallback", mock_fallback):
-        from proxy.ui import proxy_openai_api
         from fastapi import Request as FastAPIRequest
+        from proxy.ui import proxy_openai_api
 
         body = json.dumps({
             "model": "test-remote",
@@ -1628,8 +1558,9 @@ async def test_remote_model_with_providers_calls_fallback(monkeypatch):
 @pytest.mark.asyncio
 async def test_remote_model_without_providers_returns_error(monkeypatch):
     """Remote models WITHOUT a providers list should return an error (breaking change)."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
     from fastapi import HTTPException
 
     # Set up config with a remote model that has NO providers (legacy format)
@@ -1647,8 +1578,8 @@ async def test_remote_model_without_providers_returns_error(monkeypatch):
     server_module.llama_process = None
     server_module.backend_ready = True
 
-    from proxy.ui import proxy_openai_api
     from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
 
     body = json.dumps({
         "model": "test-remote",
@@ -1675,8 +1606,9 @@ async def test_remote_model_without_providers_returns_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_local_model_with_providers_calls_fallback(monkeypatch):
     """proxy_openai_api should call proxy_with_fallback for loaded local models with providers."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     # Set up config with a local model that has providers (local + remote)
     server_module.config = {
@@ -1712,8 +1644,8 @@ async def test_local_model_with_providers_calls_fallback(monkeypatch):
         )
 
     with patch("proxy.provider.proxy_with_fallback", mock_fallback):
-        from proxy.ui import proxy_openai_api
         from fastapi import Request as FastAPIRequest
+        from proxy.ui import proxy_openai_api
 
         body = json.dumps({
             "model": "test-local",
@@ -1779,9 +1711,10 @@ def test_normalize_upstream_request_headers_strips_hop_by_hop_headers():
 
 @pytest.mark.asyncio
 async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -1832,9 +1765,10 @@ async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
 async def test_proxy_to_remote_overrides_model_name_with_model_field():
     """When a remote provider config has a `model` field, proxy_to_remote
     should override the model name in the forwarded request body."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import MagicMock, patch as mock_patch
 
     # Minimal server config needed for timeout
     server_module.config = {
@@ -1878,9 +1812,10 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
 async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibility():
     """Unknown top-level chat fields should be removed before forwarding to
     remote providers to avoid provider-specific 4xx request-shape failures."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {"server": {"llama_request_timeout": 300}}
     server_module.current_model = None
@@ -1925,9 +1860,10 @@ async def test_proxy_to_remote_strips_unknown_chat_fields_for_remote_compatibili
 async def test_proxy_to_remote_passes_model_unchanged_without_model_field():
     """When a remote provider config has NO `model` field, proxy_to_remote
     should pass the original model name through unchanged."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import MagicMock, patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -1971,8 +1907,9 @@ async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_
     """When a local model with remote providers is NOT loaded and the remote
     fallback returns a 503 error, proxy_openai_api should return a model_loading
     response, not the 503 from the exhausted remote providers."""
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     # Set up config with a local model that has providers (local + remote)
     server_module.config = {
@@ -2027,8 +1964,8 @@ async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_
         # Also mock session/slot detection to skip (no session header)
         with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
             with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
-                from proxy.ui import proxy_openai_api
                 from fastapi import Request as FastAPIRequest
+                from proxy.ui import proxy_openai_api
 
                 body = json.dumps({
                     "model": "test-local",
@@ -2062,8 +1999,9 @@ async def test_router_transient_not_loaded_then_loaded_prefers_local_before_remo
     """When router briefly reports a local model as not loaded, a short grace
     window should allow local fallback path to recover before remote fallback.
     """
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     server_module.config = {
         "models": {
@@ -2127,8 +2065,8 @@ async def test_router_transient_not_loaded_then_loaded_prefers_local_before_remo
         with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
             with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
                 with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
-                    from proxy.ui import proxy_openai_api
                     from fastapi import Request as FastAPIRequest
+                    from proxy.ui import proxy_openai_api
 
                     body = json.dumps({
                         "model": "test-local",
@@ -2159,8 +2097,9 @@ async def test_router_loading_status_but_router_load_model_already_loaded_prefer
     """If router status lags as 'loading' but router_load_model reports already
     loaded, local path should be preferred before remote fallback.
     """
-    import proxy.server as server_module
     from unittest.mock import MagicMock
+
+    import proxy.server as server_module
 
     server_module.config = {
         "models": {
@@ -2225,8 +2164,8 @@ async def test_router_loading_status_but_router_load_model_already_loaded_prefer
         with patch("proxy.provider.proxy_with_remote_fallback", mock_remote_fallback):
             with patch("proxy.session._resolve_session_id_header", return_value=(None, None)):
                 with patch("proxy.session._build_slot_context", return_value=(None, None, None)):
-                    from proxy.ui import proxy_openai_api
                     from fastapi import Request as FastAPIRequest
+                    from proxy.ui import proxy_openai_api
 
                     body = json.dumps({
                         "model": "test-local",
@@ -2357,9 +2296,10 @@ async def test_local_http_exception_triggers_fallback(mixed_model_config):
 async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
     """proxy_to_remote with the opencode-go-deepseek provider config must
     override the model name from the incoming request to 'deepseek-v4-flash'."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2403,9 +2343,10 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_model_override():
 async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_authorization_header():
     """Incoming client Authorization header must be replaced (not duplicated)
     with the upstream OPENCODE API key header."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2454,9 +2395,10 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_replaces_incoming_autho
 async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
     """proxy_to_remote with the opencode-go-deepseek provider config must
     inject the Authorization header using the API key from the env var."""
+    from unittest.mock import patch as mock_patch
+
     import proxy.server as server_module
     from proxy.proxy_remote import proxy_to_remote
-    from unittest.mock import patch as mock_patch
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2503,9 +2445,10 @@ async def test_proxy_to_remote_with_opencode_go_deepseek_injects_auth_header():
 async def test_proxy_to_remote_falls_back_to_auth_json_when_env_var_not_set():
     """When api_key_env is set but the env var is NOT set, proxy_to_remote
     must fall back to resolving the key from ~/.pi/agent/auth.json."""
-    import proxy.server as server_module
-    from proxy.proxy_remote import proxy_to_remote, _try_pi_auth_json
     from unittest.mock import patch as mock_patch
+
+    import proxy.server as server_module
+    from proxy.proxy_remote import proxy_to_remote
 
     server_module.config = {
         "server": {"llama_request_timeout": 300},
@@ -2557,7 +2500,8 @@ def test_try_pi_auth_json_resolves_opencode_api_key(tmp_path):
     """_try_pi_auth_json must resolve OPENCODE_API_KEY to the opencode-go
     key from auth.json."""
     from unittest.mock import patch as mock_patch
-    from proxy.proxy_remote import _try_pi_auth_json, _get_auth_json_path
+
+    from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
         "opencode-go": {
@@ -2585,6 +2529,7 @@ def test_try_pi_auth_json_falls_back_to_opencode_when_opencode_go_missing(tmp_pa
     """When opencode-go is not in auth.json, _try_pi_auth_json must fall
     back to opencode entry for OPENCODE_API_KEY."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2609,6 +2554,7 @@ def test_try_pi_auth_json_exact_match(tmp_path):
     """_try_pi_auth_json must return the key for an exact lowercase match
     when the auth.json key matches the lookup key directly."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2633,6 +2579,7 @@ def test_try_pi_auth_json_returns_none_when_file_missing():
     """_try_pi_auth_json must return None when auth.json does not exist."""
     from pathlib import Path
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     with mock_patch("proxy.proxy_remote._get_auth_json_path", return_value=Path("/nonexistent/auth.json")):
@@ -2645,6 +2592,7 @@ def test_try_pi_auth_json_returns_none_for_unknown_key(tmp_path):
     """_try_pi_auth_json must return None when the key is not in auth.json
     and no fallback matches."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2666,6 +2614,7 @@ def test_try_pi_auth_json_returns_none_for_unknown_key(tmp_path):
 def test_try_pi_auth_json_strips_api_key_suffix(tmp_path):
     """_try_pi_auth_json must strip _api_key suffix and look up the stem."""
     from unittest.mock import patch as mock_patch
+
     from proxy.proxy_remote import _try_pi_auth_json
 
     auth_data = {
@@ -2859,8 +2808,8 @@ async def test_cache_cold_bypass_uses_session_history_tokens(mixed_model_config)
     (delta-sized) but the active session already contains a large context,
     fallback routing must still skip local and route to remote.
     """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
+    provider._last_cached_ratio.clear()
+    # No entry for ("Qwen3", "session-large-context") → defaults to 0.0 (cold)
 
     request = _DummyRequest(
         body=b'{"model":"hybrid","messages":[{"role":"user","content":"continue"}],"stream":false}'
@@ -2917,8 +2866,8 @@ async def test_cache_cold_bypass_first_request_after_restart(mixed_model_config)
     Regression for LP-0MRDE669Y003V1SO: a request with >40K tokens on a cold
     cache with no existing session must still be routed to remote fallback.
     """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
+    provider._last_cached_ratio.clear()
+    # No cached ratio entry → defaults to 0.0 (cold)
 
     # First request: no session header, large body
     large_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
@@ -2967,140 +2916,15 @@ async def test_cache_cold_bypass_first_request_after_restart(mixed_model_config)
 
 
 @pytest.mark.asyncio
-async def test_cache_cold_bypass_releases_scheduler_slot(mixed_model_config):
-    """Cache-cold bypass should release the session's scheduler slot.
-
-    AC 1 (LP-0MRGUJ3QR002K18G): When a session is routed from a local provider
-    to a remote fallback via cache_cold_bypass, the local model slot is released
-    immediately.
-    """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
-
-    session_id = "test-session-with-slot"
-    request = _DummyRequest(
-        body=b'{"model":"hybrid","messages":[{"role":"user","content":"'
-        + b'test message content for token estimation ' * 7000
-        + b'"}],"stream":false}'
-    )
-    request.headers = {"x-session-id": session_id}
-
-    cfg = {
-        "provider_cooldown_seconds": 60,
-        "local_large_context_fallback_threshold": 40000,
-    }
-
-    call_log = []
-    remove_job_called = False
-
-    # Create a mock scheduler with the session in active_jobs
-    class _MockScheduler:
-        active_jobs = {session_id: 0}  # session -> slot_id
-
-        async def remove_job(self, sid):
-            nonlocal remove_job_called
-            remove_job_called = True
-            call_log.append(("remove_job", sid))
-            self.active_jobs.pop(sid, None)
-            return True
-
-    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
-        call_log.append(("remote", provider_cfg.get("name")))
-        return Response(
-            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
-            status_code=200,
-            media_type="application/json",
-        )
-
-    with (
-        patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
-        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.router._get_job_scheduler", return_value=_MockScheduler()),
-        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
-    ):
-        result = await provider.proxy_with_fallback(
-            request, "v1/chat/completions", mixed_model_config, cfg
-        )
-
-    assert result.status_code == 200
-    assert result.headers.get("X-Provider") == "remote-fallback"
-    assert call_log == [("remove_job", session_id), ("remote", "remote-fallback")], (
-        f"Expected remove_job + remote call, got: {call_log}"
-    )
-    assert remove_job_called, "scheduler.remove_job should have been called"
-
-
-@pytest.mark.asyncio
-async def test_cache_cold_bypass_no_slot_no_error(mixed_model_config):
-    """Cache-cold bypass with no scheduler slot should not error.
-
-    When the session does NOT have a scheduler slot (e.g., first request or
-    hash-based slot assignment), the cache_cold_bypass should proceed normally
-    without any errors.
-    """
-    provider._model_cache_cold.clear()
-    provider.mark_model_cache_cold("Qwen3")
-
-    request = _DummyRequest(
-        body=b'{"model":"hybrid","messages":[{"role":"user","content":"'
-        + b'test message content for token estimation ' * 7000
-        + b'"}],"stream":false}'
-    )
-    request.headers = {"x-session-id": "session-no-slot"}
-
-    cfg = {
-        "provider_cooldown_seconds": 60,
-        "local_large_context_fallback_threshold": 40000,
-    }
-
-    call_log = []
-
-    # Mock scheduler with empty active_jobs (session has no slot)
-    class _EmptyMockScheduler:
-        active_jobs = {}
-
-        async def remove_job(self, sid):
-            call_log.append(("remove_job", sid))
-            return False
-
-    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
-        call_log.append(("remote", provider_cfg.get("name")))
-        return Response(
-            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
-            status_code=200,
-            media_type="application/json",
-        )
-
-    with (
-        patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
-        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.router._get_job_scheduler", return_value=_EmptyMockScheduler()),
-        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
-    ):
-        result = await provider.proxy_with_fallback(
-            request, "v1/chat/completions", mixed_model_config, cfg
-        )
-
-    assert result.status_code == 200
-    assert result.headers.get("X-Provider") == "remote-fallback"
-    # remove_job should have been called but returned False (no slot to release)
-    # remove_job should NOT be called because session has no active slot
-    assert call_log == [("remote", "remote-fallback")], (
-        f"Expected only remote call (no slot to release), got: {call_log}"
-    )
-
-
-@pytest.mark.asyncio
 async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_config):
     """Warm-cache large context bypass should release the slot and mark cache cold.
 
     AC 3 (LP-0MRGUJ3QR002K18G): The model's cache is marked as cold after
     release, so subsequent large-context requests also bypass local.
     """
-    provider._model_cache_cold.clear()
-    provider._cache_cold_initialized()
-    # Do NOT mark cache cold — test warm-cache behavior marks it cold
-    assert not provider.is_model_cache_cold("Qwen3"), "Cache should be warm initially"
+    provider._last_cached_ratio.clear()
+    # No entry for ("Qwen3", session_id) → defaults to 0.0 (cold)
+    # This simulates warm-cache bypass: ratio < 1 means not fully warm
 
     session_id = "test-session-warm-bypass"
     large_body = (
@@ -3114,18 +2938,9 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
     cfg = {
         "provider_cooldown_seconds": 60,
         "local_large_context_cold_cache_threshold": 40000,
-        "local_large_context_warm_cache_threshold": 60000,
     }
 
     call_log = []
-
-    class _MockScheduler:
-        active_jobs = {session_id: 0}
-
-        async def remove_job(self, sid):
-            call_log.append(("remove_job", sid))
-            self.active_jobs.pop(sid, None)
-            return True
 
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         call_log.append(("remote", provider_cfg.get("name")))
@@ -3138,8 +2953,6 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
     with (
         patch("proxy.router.proxy_to_local", AsyncMock(side_effect=AssertionError("Should not reach local"))),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
-        patch("proxy.router._get_job_scheduler", return_value=_MockScheduler()),
-        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -3147,11 +2960,7 @@ async def test_cache_cold_bypass_releases_slot_and_marks_cache_cold(mixed_model_
 
     assert result.status_code == 200
     assert result.headers.get("X-Provider") == "remote-fallback"
-    assert call_log == [("remove_job", session_id), ("remote", "remote-fallback")]
-    # Cache should now be cold after warm-cache bypass
-    assert provider.is_model_cache_cold("Qwen3"), (
-        "Model cache should have been marked cold after warm-cache bypass"
-    )
+    assert call_log == [("remote", "remote-fallback")]
 
 
 @pytest.mark.asyncio
@@ -3162,8 +2971,10 @@ async def test_warm_cache_large_context_bypass(mixed_model_config):
     estimated_tokens > warm_cache_threshold, the request should be routed
     to the next remote provider.
     """
-    provider._model_cache_cold.clear()
-    # Do NOT mark cache cold — test warm-cache behavior
+    provider._last_cached_ratio.clear()
+    # No cached ratio entry → defaults to 0.0 (cold)
+    # With new cached_tokens routing, a session with no ratio defaults to cold,
+    # so a very large request bypasses local.
 
     large_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
         b'test message content for token estimation ' * 11000 + \
@@ -3173,7 +2984,6 @@ async def test_warm_cache_large_context_bypass(mixed_model_config):
     cfg = {
         "provider_cooldown_seconds": 60,
         "local_large_context_cold_cache_threshold": 40000,
-        "local_large_context_warm_cache_threshold": 60000,
     }
 
     call_log = []
@@ -3205,10 +3015,9 @@ async def test_warm_cache_large_context_bypass(mixed_model_config):
     assert result.status_code == 200, (
         f"Expected 200, got {result.status_code}: {result.body.decode()}"
     )
-    # Should have been routed to remote even though cache is warm,
-    # because estimated_tokens > warm_cache_threshold (60K)
+    # With no cached ratio entry, defaults to cold, so large context bypasses
     assert call_log == ["remote-fallback"], (
-        f"Expected remote-provider call for warm-cache large context, got: {call_log}"
+        f"Expected remote-provider call for large context, got: {call_log}"
     )
     assert result.headers.get("X-Provider") == "remote-fallback"
 
@@ -3221,8 +3030,9 @@ async def test_warm_cache_moderate_context_routes_local(mixed_model_config):
     estimated_tokens <= warm_cache_threshold, the request should route
     to local as normal.
     """
-    provider._model_cache_cold.clear()
-    # Do NOT mark cache cold — test warm-cache behavior
+    provider._last_cached_ratio.clear()
+    # No cached ratio entry → defaults to 0.0 (cold)
+    # But moderate context is below threshold, so it routes local.
 
     moderate_body = b'{"model":"hybrid","messages":[{"role":"user","content":"' + \
         b'test message content ' * 3000 + \
@@ -3232,7 +3042,6 @@ async def test_warm_cache_moderate_context_routes_local(mixed_model_config):
     cfg = {
         "provider_cooldown_seconds": 60,
         "local_large_context_cold_cache_threshold": 40000,
-        "local_large_context_warm_cache_threshold": 60000,
     }
 
     call_log = []
@@ -3933,7 +3742,6 @@ async def test_cross_session_cooldown_does_not_affect_available_providers(mixed_
     with (
         patch("proxy.router.proxy_to_local", _local_mock_s1),
         patch("proxy.server.proxy_to_remote", _remote_mock_s1),
-        patch("proxy.provider._get_scheduler_has_idle_slot", return_value=True),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg

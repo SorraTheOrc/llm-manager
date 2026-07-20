@@ -10,10 +10,8 @@ Note: SessionManager methods are async; tests use @pytest.mark.asyncio.
 """
 
 import pytest
-
-from proxy.session_manager import Session, SessionManager
 from proxy.session import _classify_delta_routing
-
+from proxy.session_manager import SessionManager
 
 # ===================================================================
 # Session continuity tests

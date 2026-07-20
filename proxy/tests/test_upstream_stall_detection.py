@@ -11,16 +11,13 @@ Tests cover:
 """
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
 import pytest
 from fastapi import Request
 from fastapi.responses import StreamingResponse
-
 from proxy.proxy_remote import _handle_remote_streaming
-
 
 # ===================================================================
 # Async iterator helpers
