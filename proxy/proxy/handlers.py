@@ -30,6 +30,90 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
+# Voice validation — cache of valid TTS voices
+# ---------------------------------------------------------------------------
+
+_valid_voices: list[str] | None = None
+"""Cached list of valid TTS voice names from the TTS server. ``None`` means
+not yet fetched."""
+
+_voice_cache_time: float = 0.0
+"""Timestamp (``time.monotonic()``) when ``_valid_voices`` was last fetched."""
+
+_VOICE_CACHE_TTL: float = 300.0
+"""How long (seconds) the voice list is considered fresh."""
+
+_DEFAULT_VOICE = "vivian"
+"""Default voice name used when an unrecognized voice is provided."""
+
+
+async def _ensure_voices_cached() -> list[str] | None:
+    """Fetch and cache the valid TTS voice list from ``/v1/voices``.
+
+    Returns the list of valid voice names (strings), or ``None`` if the TTS
+    server could not be reached.  The cache has a TTL of ``_VOICE_CACHE_TTL``
+    seconds (default 5 minutes).
+    """
+    global _valid_voices, _voice_cache_time
+
+    now = time.monotonic()
+    if _valid_voices is not None and (now - _voice_cache_time) < _VOICE_CACHE_TTL:
+        return _valid_voices
+
+    srv = _srv()
+    server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+    tts_host = server_cfg.get("tts_server_host", "localhost")
+    tts_port = server_cfg.get("tts_server_port", 8081)
+    voices_url = f"http://{tts_host}:{tts_port}/v1/voices"
+
+    try:
+        client = srv._http_client if srv._http_client else None
+        if client is None:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:
+                resp = await c.get(voices_url, timeout=10.0)
+        else:
+            try:
+                resp = await client.get(voices_url, timeout=10.0)
+            except RuntimeError:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:
+                    resp = await c.get(voices_url, timeout=10.0)
+    except Exception:
+        logger.warning("Failed to fetch voices from %s, using cached list", voices_url)
+        # Return stale cache if available, otherwise None
+        return _valid_voices
+
+    if resp.status_code != 200:
+        logger.warning("TTS server returned %d fetching voices, using cached list", resp.status_code)
+        return _valid_voices
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("Invalid JSON from TTS /v1/voices, using cached list")
+        return _valid_voices
+
+    # Support both {"voices": [...]} and plain [...] response formats
+    voices_raw = data.get("voices", data) if isinstance(data, dict) else data
+
+    voice_names: list[str] = []
+    for entry in voices_raw if isinstance(voices_raw, list) else []:
+        if isinstance(entry, str):
+            voice_names.append(entry)
+        elif isinstance(entry, dict):
+            name = entry.get("name", "")
+            if name:
+                voice_names.append(name)
+
+    if not voice_names:
+        logger.warning("No voice names found in TTS /v1/voices response")
+        return _valid_voices
+
+    _valid_voices = voice_names
+    _voice_cache_time = now
+    return _valid_voices
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers  (lazy server import)
 # ---------------------------------------------------------------------------
 
@@ -769,6 +853,19 @@ async def create_speech(request: Request):
     response_format = body.get("response_format", "wav")
     instructions = body.get("instructions", "")
 
+    # -- Voice validation: ensure the voice name is recognised -----------
+    voice_substituted = False
+    original_voice = voice
+    if voice:
+        valid_voices = await _ensure_voices_cached()
+        if valid_voices is not None and voice not in valid_voices:
+            logger.warning(
+                "Voice '%s' not recognized, using default '%s'",
+                voice, _DEFAULT_VOICE,
+            )
+            voice = _DEFAULT_VOICE
+            voice_substituted = True
+
     # Input length guard
     if len(input_text) > 10000:
         raise HTTPException(status_code=400, detail="input exceeds maximum length of 10000 characters")
@@ -871,4 +968,15 @@ async def create_speech(request: Request):
 
     # Return the audio response from tts-server
     content_type = resp.headers.get("content-type", "audio/wav")
-    return Response(content=resp.content, media_type=content_type, status_code=resp.status_code)
+    headers = {}
+    if voice_substituted:
+        headers["Warning"] = (
+            f'299 proxy "voice=\'{original_voice}\' not recognized, '
+            f"using default '{_DEFAULT_VOICE}'"
+        )
+    return Response(
+        content=resp.content,
+        media_type=content_type,
+        status_code=resp.status_code,
+        headers=headers or None,
+    )

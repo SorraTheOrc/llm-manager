@@ -1714,6 +1714,14 @@ Content-Type: application/json
 | `voice` | No | Speaker voice (see pre-registered voices below; omit for default) |
 | `response_format` | No | Output format (currently only `wav` is supported) |
 
+> **Voice validation:** The proxy validates the `voice` field against the
+> list of known voices (fetched from the TTS server and cached with a 5-minute
+> TTL). If the requested voice is not in the list, the proxy falls back to
+> `vivian` and adds a standard HTTP `Warning` header (RFC 7234, code 299) to
+> the response, e.g.:
+> `Warning: 299 proxy "voice='alloy' not recognized, using default 'vivian'"`
+> When no `voice` field is provided the request is passed through unchanged.
+
 **Pre-registered voices**
 
 The proxy uses the **custom_voice** variant of the Qwen3-TTS model,
