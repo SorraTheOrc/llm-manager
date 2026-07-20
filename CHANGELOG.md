@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.1.7 (2026-07-20)
+### Features
+- Learn to use LlamaBench (LP-0MPU61APP003SJ24)
+- Persist prompt-processing progress as timestamped INFO log entries instead of in-place stderr overwrites (LP-0MRNKBL1O0047R44)
+- Investigate and fix slot 1 progress logging gap (LP-0MRO4U5NP0099TOI)
+- Fix poll_slots_for_model() to iterate all slots (LP-0MRO4U5NT005DP6L)
+- Fix: Add scheduler.start() call to _get_job_scheduler() in router.py (LP-0MRO36Y2T004T6JM)
+- Replace proxy cache-cold state machine with cached_tokens-based routing (LP-0MRP44W7I0085I6N)
+- Add author fallback model with same fallback chain as plan (LP-0MRPDJ2XF005Y9XN)
+- Extend self-healing to monitor and revive TTS server and include TTS status in /health endpoint (LP-0MRPHQZ2M003X5YU)
+- Add TTS status fields to /health endpoint (LP-0MRT928D30015JV0)
+- Add TTS watchdog loop for automatic restart (LP-0MRT928DD008136S)
+- Add instructions passthrough support to proxy TTS handler (LP-0MRO4L9930057AL3)
+### Bug Fixes
+- Add model/slot prefix and tokens/sec to token processing progress display (LP-0MRMG3IC9003HAVI)
+- Fix local_active_queries leak in streaming error paths causing all requests to skip Qwen3 (LP-0MRMGUEVR0002S5W)
+- Per-session cache warm/cold tracking instead of model-level flag (LP-0MRMMBZ7T007ER59)
+- [test-failure] test_stub_router_integration — failing test (LP-0MRNLBHSH007ILOI)
+- [test-failure] test_concurrent_embeddings_and_chat — Queue full 503 body text mismatch (LP-0MRNUZZL7000SVK1)
+- [test-failure] test_stub_router_integration — flaky test-ordering-dependent assert ok Failure (LP-0MRNV040H0055N2Q)
+- Wire cached_tokens ratio tracking into production response path (LP-0MRRK2ZAQ000TOXJ)
+- Fix slot_management config path in _get_job_scheduler() (LP-0MRNJYEF1009QG3G)
+- [test-failure] test_query_llama_status — 4 tests fail when run in sequence due to _http_client bypassing httpx.AsyncClient patch (LP-0MRO0V6RA000NNG0)
+- Proxy progress logging only monitors slot 0, missing slot 1 (LP-0MRO1CM5A008R2KX)
+- RCA: All local Qwen3 dispatches getting slot_busy_skip_queue despite idle slot 1 (LP-0MRO31CX80025HJU)
+- [test-failure] TestEstimatePromptTokensForRouting::test_large_message — failing test (LP-0MRP5JJXQ001SWPB)
+### Other
+- Tune BATCH_SIZE, ubatch, and proxy max_concurrent_queries for this host (LP-0MQMH0RKE006UK3F)
+- Write multi-slot tests for poll_slots_for_model() (LP-0MRO4U5O1008TLFU)
+- Write integration-level tests for multi-slot _stream_output progress (LP-0MRO4U5O5001UCRT)
+- Run ruff check --fix to resolve 223 auto-fixable lint errors (LP-0MROX8F610024YL9)
+- Fix 51 unused variable warnings (F841) across codebase (LP-0MROX8F6600331RO)
+- Manually fix remaining 5 non-auto-fixable lint errors (4 F401, 1 F811) (LP-0MROYEVL3004Y04Z)
+- Remove JobScheduler (slot_management) redundant admission queuing layer (LP-0MRPHVDWU007XPLK)
+- Create .ruff.toml to align lint rules with project conventions (LP-0MROX8F6B003HEXU)
+- Fix 27 ambiguous variable names (E741) for readability (LP-0MROX8F69003JPAB)
+
 ## v0.1.6 (2026-07-14)
 ### Features
 - Implement incremental session-based prompt ingestion for llama-server (LP-0MO6DJP0P006WCHA)
