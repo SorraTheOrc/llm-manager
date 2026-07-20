@@ -177,6 +177,21 @@ backend_recovery_state: dict = {
 # Background watchdog task (started in lifespan)
 backend_watchdog_task: asyncio.Task | None = None
 
+# Background TTS watchdog task (started in lifespan)
+tts_watchdog_task: asyncio.Task | None = None
+
+# TTS self-healing recovery state
+# Mirrors backend_recovery_state but for TTS server
+# "in_progress": bool, "attempt_timestamps": list[float],
+# "max_attempts": int, "window_seconds": int, "last_failure": str|None
+tts_recovery_state: dict = {
+    "in_progress": False,
+    "attempt_timestamps": [],
+    "max_attempts": 3,
+    "window_seconds": 120,
+    "last_failure": None,
+}
+
 # Background model health monitoring task (started in lifespan)
 model_health_task: asyncio.Task | None = None
 
@@ -306,13 +321,13 @@ def _startup_config_logging():
 
 
 def _startup_initialize_backend_state():
-    """Initialize backend-ready flag and recovery state dict.
+    """Initialize backend-ready flag and recovery state dicts.
 
     Sets ``backend_ready = False`` and builds ``backend_recovery_state``
-    from the current config (with sensible defaults).
-    Returns the new recovery state dict.
+    and ``tts_recovery_state`` from the current config (with sensible defaults).
+    Returns the backend recovery state dict.
     """
-    global backend_ready, backend_recovery_state
+    global backend_ready, backend_recovery_state, tts_recovery_state
     backend_ready = False
     backend_recovery_state = {
         "in_progress": False,
@@ -320,6 +335,13 @@ def _startup_initialize_backend_state():
         "max_attempts": int(config.get("server", {}).get("llama_self_heal_max_attempts", 3) or 3),
         "window_seconds": int(config.get("server", {}).get("llama_self_heal_window_seconds", 300) or 300),
         "retry_after_seconds": int(config.get("server", {}).get("llama_self_heal_retry_after_seconds", 30) or 30),
+        "last_failure": None,
+    }
+    tts_recovery_state = {
+        "in_progress": False,
+        "attempt_timestamps": [],
+        "max_attempts": int(config.get("server", {}).get("tts_self_heal_max_attempts", 3) or 3),
+        "window_seconds": int(config.get("server", {}).get("tts_self_heal_window_seconds", 120) or 120),
         "last_failure": None,
     }
     return backend_recovery_state
@@ -525,15 +547,17 @@ def _startup_launch_tts_server():
 
 
 def _startup_launch_watchdog_tasks():
-    """Spawn the backend watchdog and model health background loops.
+    """Spawn the backend watchdog, TTS watchdog, and model health background loops.
 
-    Skips creation if either task is already set (guards against
+    Skips creation if any task is already set (guards against
     double-initialization).
     """
-    global backend_watchdog_task, model_health_task
+    global backend_watchdog_task, tts_watchdog_task, model_health_task
     loop = asyncio.get_running_loop()
     if backend_watchdog_task is None:
         backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
+    if tts_watchdog_task is None:
+        tts_watchdog_task = loop.create_task(_tts_watchdog_loop())
     if model_health_task is None:
         model_health_task = loop.create_task(_router_model_health_loop())
 
@@ -612,11 +636,11 @@ def _shutdown_stop_session_cleanup():
 
 
 async def _shutdown_cleanup_tasks():
-    """Cancel and await the dispatch lease cleanup and watchdog tasks.
+    """Cancel and await the dispatch lease cleanup, watchdog, and TTS watchdog tasks.
 
     Sets each task reference to ``None`` after completion.
     """
-    global _dispatch_cleanup_task, backend_watchdog_task
+    global _dispatch_cleanup_task, backend_watchdog_task, tts_watchdog_task
     if _dispatch_cleanup_task is not None:
         _dispatch_cleanup_task.cancel()
         try:
@@ -632,6 +656,14 @@ async def _shutdown_cleanup_tasks():
         except (Exception, asyncio.CancelledError):
             pass
         backend_watchdog_task = None
+
+    if tts_watchdog_task is not None:
+        tts_watchdog_task.cancel()
+        try:
+            await tts_watchdog_task
+        except (Exception, asyncio.CancelledError):
+            pass
+        tts_watchdog_task = None
 
 
 async def _shutdown_http_client():
@@ -870,6 +902,7 @@ from .handlers import (  # noqa: E402, F401
 )
 from .lifecycle import (  # noqa: E402, F401
     _attempt_router_self_heal,
+    _attempt_tts_self_heal,
     _backend_recovery_snapshot,
     _backend_watchdog_loop,
     _call_with_backend_retries,
@@ -879,6 +912,8 @@ from .lifecycle import (  # noqa: E402, F401
     _estimate_prompt_tokens,
     _extract_model_port_from_args,
     _extract_router_model_ids,
+    _get_tts_self_heal_max_attempts,
+    _get_tts_watchdog_interval,
     _inc_model_switch_refcount,
     _is_retryable_backend_exception,
     _is_self_healing_active,
@@ -891,6 +926,8 @@ from .lifecycle import (  # noqa: E402, F401
     _self_heal_retry_after_seconds,
     _self_healing_response,
     _should_force_full_prompt,
+    _tts_recovery_snapshot,
+    _tts_watchdog_loop,
     _worker_process_unhealthy,
     ensure_model_loaded,
     get_local_model_name,

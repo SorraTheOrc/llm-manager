@@ -39,12 +39,17 @@ def _srv():
 # ===================================================================
 from .backend_health import (  # noqa: F401
     _attempt_router_self_heal,
+    _attempt_tts_self_heal,
     _backend_recovery_snapshot,
     _backend_watchdog_loop,
+    _get_tts_self_heal_max_attempts,
+    _get_tts_watchdog_interval,
     _is_self_healing_active,
     _prune_recovery_attempts,
     _self_heal_retry_after_seconds,
     _self_healing_response,
+    _tts_recovery_snapshot,
+    _tts_watchdog_loop,
     _worker_process_unhealthy,
 )
 
