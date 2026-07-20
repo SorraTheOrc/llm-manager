@@ -7,7 +7,6 @@ These tests verify that the proxyctl CLI and server support dev mode correctly:
 - Production mode is unaffected by dev mode changes
 """
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -43,8 +42,9 @@ class TestDevModeLogging:
         xdg_home = str(tmp_path / "state")
         monkeypatch.setenv("LLAMA_PROXY_DEV", "1")
         monkeypatch.setenv("XDG_STATE_HOME", xdg_home)
-        from proxy import server
         from proxy.server import setup_logging
+
+        from proxy import server
         config = {
             "logging": {
                 "directory": "/var/log/llama-proxy",
@@ -58,12 +58,13 @@ class TestDevModeLogging:
 
     def test_production_mode_ignores_llama_proxy_dev(self, tmp_path, monkeypatch):
         """Production mode should not be affected by LLAMA_PROXY_DEV."""
-        xdg_home = str(tmp_path / "state")
+        _xdg_home = str(tmp_path / "state")
         log_dir = str(tmp_path / "prod-logs")
         # Make sure LLAMA_PROXY_DEV is NOT set
         monkeypatch.delenv("LLAMA_PROXY_DEV", raising=False)
-        from proxy import server
         from proxy.server import setup_logging
+
+        from proxy import server
         config = {
             "logging": {
                 "directory": log_dir,

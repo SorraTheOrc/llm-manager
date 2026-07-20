@@ -1,8 +1,7 @@
-import requests
-import json
 import time
 
 import pytest
+import requests
 from requests.exceptions import RequestException
 
 

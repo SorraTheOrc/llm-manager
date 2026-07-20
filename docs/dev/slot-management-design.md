@@ -511,6 +511,7 @@ controls the GPU-level parallelism.
 | **Session header resolution** | Unchanged |
 | **503/Retry-After** | Unchanged — still returned when queue is full |
 | **Slot availability check** | Unchanged — pre-route check still works |
+| **Session-owned slot fallback exception** | **New** (LP-0MRNVULW4008DK19) — when a session owns a slot (``session_id in scheduler.active_jobs``), requests bypass the "no idle slots → skip local" guard and proceed to the local provider. This prevents incorrect fallback to remote during the slot-save window (~200–500ms POST). See ``proxy_with_fallback`` in ``provider.py`` for the guard logic and ``_scheduler_session_has_slot()`` in ``router.py``. |
 | **Polling for slot state** | Unchanged |
 
 ---

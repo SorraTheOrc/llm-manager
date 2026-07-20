@@ -16,12 +16,11 @@ import logging
 import re
 import threading
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+
 from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
@@ -44,11 +43,11 @@ def _srv():
 # Progress parsing helpers
 # ---------------------------------------------------------------------------
 
-def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
-    """Extract ``n_tokens`` and ``progress`` from llama-server stdout progress lines.
+def extract_progress_data(line: str | None) -> tuple[int, int, float] | None:
+    """Extract ``slot_id``, ``n_tokens`` and ``progress`` from llama-server stdout progress lines.
 
-    Returns a tuple (n_tokens: int, progress: float) or None if the line does
-    not contain valid progress data.
+    Returns a tuple (slot_id: int, n_tokens: int, progress: float) or None if the line does
+    not contain valid progress data. When slot ID is not found, defaults to 0.
     """
     if not isinstance(line, str):
         return None
@@ -60,13 +59,20 @@ def extract_progress_data(line: Optional[str]) -> Optional[Tuple[int, float]]:
     if ',' not in text:
         return None
     try:
+        m_slot = re.search(
+            r'slot\s+update_slots:.*?id\s+(\d+)|slot\s+(\d+)',
+            text, flags=re.IGNORECASE
+        )
         m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
         m_progress = re.search(r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b', text, flags=re.IGNORECASE)
         if not m_tokens or not m_progress:
             return None
+        slot_id = int(m_slot.group(1)) if m_slot and m_slot.group(1) is not None else (
+            int(m_slot.group(2)) if m_slot else 0
+        )
         n_tokens = int(m_tokens.group(1))
         progress = float(m_progress.group(1))
-        return (n_tokens, progress)
+        return (slot_id, n_tokens, progress)
     except Exception:
         return None
 
@@ -80,7 +86,7 @@ async def poll_slots_for_model(
     model: str,
     llama_port: int = 0,
     interval: float = 0.5,
-    max_polls: Optional[int] = None,
+    max_polls: int | None = None,
 ) -> None:
     """Poll the llama-server `/slots` endpoint for a given model and update
     ``slot_polling_state[model]``.
@@ -108,13 +114,20 @@ async def poll_slots_for_model(
                     data = None
                 if isinstance(data, list):
                     if data:
-                        slot = data[0]
-                        is_processing = bool(slot.get('is_processing', False))
-                        next_token = slot.get('next_token') if isinstance(slot.get('next_token'), dict) else None
-                        if next_token is not None and 'n_decoded' in next_token:
-                            n_decoded = next_token.get('n_decoded')
-                        else:
-                            n_decoded = slot.get('n_decoded')
+                        # Aggregate across ALL slots, not just data[0]
+                        is_processing = any(
+                            bool(slot.get('is_processing', False)) for slot in data
+                        )
+                        n_decoded = None
+                        for slot in data:
+                            next_token = slot.get('next_token') if isinstance(slot.get('next_token'), dict) else None
+                            if next_token is not None and 'n_decoded' in next_token:
+                                slot_n = next_token.get('n_decoded')
+                            else:
+                                slot_n = slot.get('n_decoded')
+                            if slot_n is not None:
+                                if n_decoded is None or slot_n > n_decoded:
+                                    n_decoded = slot_n
                 elif isinstance(data, dict):
                     is_processing = bool(data.get('is_processing', False))
                     next_token = data.get('next_token')
@@ -162,20 +175,32 @@ def start_slot_polling(model: str, llama_port: int, interval: float = 0.5) -> No
         t.start()
 
 
-def format_progress(n_tokens: int, total_tokens: int, progress: float) -> str:
-    """Return a formatted, ANSI-dimmed, in-place-updating progress string."""
+def format_progress(
+    n_tokens: int,
+    total_tokens: int,
+    progress: float,
+    model_name: str = "unknown",
+    slot_id: int = 0,
+    tokens_per_sec: float | None = None,
+) -> str:
+    """Return a clean, log-friendly progress string without terminal control characters.
+
+    Includes model/slot prefix and tokens-per-second rate when available.
+    Output is suitable for logging via the Python logging system (no ANSI
+    escape codes, no carriage returns).
+    """
     try:
         pct = int(max(0, min(100, int(progress * 100))))
     except Exception:
-        try:
-            pct = int(max(0, min(100, int(float(progress) * 100))))
-        except Exception:
-            pct = 0
-    pct = int(max(0, min(100, int(progress * 100)))) if isinstance(progress, (int, float)) else pct
-    dim = "\x1b[2m"
-    reset = "\x1b[0m"
-    body = f"Processing {n_tokens}/{total_tokens} tokens ({pct}%)"
-    return f"\r{dim}{body}{reset}"
+        pct = 0
+
+    # Build TPS suffix
+    if tokens_per_sec is not None:
+        tps_str = f" @ {tokens_per_sec:.1f} tok/s"
+    else:
+        tps_str = " @ --.- tok/s"
+
+    return f"[slot:{slot_id} {model_name}] Processing {n_tokens}/{total_tokens} tokens ({pct}%){tps_str}"
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +246,7 @@ async def get_llama_local_status():
     timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
     try:
         status = await asyncio.wait_for(srv.query_llama_status(), timeout=timeout)
-    except (asyncio.TimeoutError, Exception):
+    except (TimeoutError, Exception):
         status = {"llama_server_running": False, "n_ctx": None, "kv_cache_tokens": None, "router_mode": False}
 
     llama_running = bool(status.get("llama_server_running", False))
@@ -320,12 +345,47 @@ async def get_llama_local_status():
 
 
 # ---------------------------------------------------------------------------
+# TTS health probe helper
+# ---------------------------------------------------------------------------
+
+async def _probe_tts_health(tts_host: str, tts_port: int, timeout: float = 2.0) -> bool:
+    """Probe the TTS server's /health endpoint.
+
+    Performs a simple GET to ``http://<host>:<port>/health``.
+    Returns True if the endpoint responds with HTTP 200 and
+    ``{"status": "ok"}``.
+    """
+    if not tts_host or not tts_port or tts_port <= 0:
+        return False
+    try:
+        url = f"http://{tts_host}:{tts_port}/health"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(max(timeout, 1.0))) as client:
+            response = await client.get(url, timeout=timeout)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("status") == "ok":
+                        return True
+                except Exception:
+                    pass
+            return False
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint with readiness gating."""
+    """Health check endpoint with readiness gating.
+
+    Includes TTS server status fields:
+    - ``tts_enabled``: Whether TTS is enabled in config.
+    - ``tts_server_running``: Whether the TTS process is alive (poll() is None).
+    - ``tts_server_healthy``: Whether the TTS server responds to its /health endpoint.
+    """
     srv = _srv()
     server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
     router_mode = bool(server_cfg.get("llama_router_mode", False))
@@ -340,6 +400,21 @@ async def health_check():
     self_healing = srv._is_self_healing_active()
     ready = bool(llama_running and srv.backend_ready and backend_reachable and not self_healing)
 
+    # -- TTS health fields -------------------------------------------------
+    tts_enabled = bool(server_cfg.get("tts_enabled", True))
+    tts_host = str(server_cfg.get("tts_server_host", "localhost"))
+    tts_port = int(server_cfg.get("tts_server_port", 8081) or 8081)
+
+    tts_process_alive = (
+        srv.tts_process is not None
+        and callable(getattr(srv.tts_process, "poll", None))
+        and srv.tts_process.poll() is None
+    )
+
+    tts_server_healthy = False
+    if tts_enabled and tts_process_alive:
+        tts_server_healthy = await _probe_tts_health(tts_host, tts_port, timeout=2.0)
+
     return {
         "status": "healthy" if ready else "degraded",
         "ready": ready,
@@ -350,6 +425,9 @@ async def health_check():
         "self_healing_in_progress": self_healing,
         "backend_recovery": srv._backend_recovery_snapshot(),
         "backend_signals": dict(srv.backend_signal_counts),
+        "tts_enabled": tts_enabled,
+        "tts_server_running": tts_process_alive,
+        "tts_server_healthy": tts_server_healthy,
     }
 
 
@@ -689,6 +767,7 @@ async def create_speech(request: Request):
     # Optional parameters
     voice = body.get("voice", "")
     response_format = body.get("response_format", "wav")
+    instructions = body.get("instructions", "")
 
     # Input length guard
     if len(input_text) > 10000:
@@ -699,7 +778,7 @@ async def create_speech(request: Request):
     tts_port = server_cfg.get("tts_server_port", 8081)
     tts_url = f"http://{tts_host}:{tts_port}/v1/audio/speech"
 
-    # Forward request to tts-server (omit voice when empty)
+    # Forward request to tts-server (omit empty optional fields)
     forward_body = {
         "model": model,
         "input": input_text,
@@ -707,6 +786,8 @@ async def create_speech(request: Request):
     }
     if voice:
         forward_body["voice"] = voice
+    if instructions:
+        forward_body["instructions"] = instructions
 
     try:
         client = srv._http_client if srv._http_client else None
@@ -724,14 +805,70 @@ async def create_speech(request: Request):
                     resp = await c.post(tts_url, json=forward_body, timeout=180.0)
     except httpx.ConnectError as e:
         logger.error("TTS server unreachable at %s: %s", tts_url, e)
-        raise HTTPException(status_code=502, detail=f"TTS server unreachable: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_unreachable",
+                    "message": f"TTS server unreachable: {e}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
     except httpx.TimeoutException as e:
         logger.error("TTS server timeout at %s: %s", tts_url, e)
-        raise HTTPException(status_code=502, detail=f"TTS server timeout: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_timeout",
+                    "message": f"TTS server timeout: {e}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
     except Exception as e:
         logger.exception("Unexpected error forwarding TTS request to %s", tts_url)
-        raise HTTPException(status_code=502, detail=f"TTS server error: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_error",
+                    "message": f"TTS server error: {e}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+            },
+        )
+
+    # Check for backend HTTP errors (>=400) and return structured 502
+    if resp.status_code >= 400:
+        try:
+            root_body = json.loads(resp.content.decode("utf-8", errors="replace"))
+        except Exception:
+            root_body = resp.content.decode("utf-8", errors="replace")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "type": "tts_error",
+                    "code": "tts_server_error",
+                    "message": f"TTS server returned HTTP {resp.status_code}",
+                },
+                "status": 502,
+                "path": "/v1/audio/speech",
+                "root_cause": {
+                    "backend_status_code": resp.status_code,
+                    "backend_body": root_body,
+                },
+            },
+        )
 
     # Return the audio response from tts-server
     content_type = resp.headers.get("content-type", "audio/wav")
-    return Response(content=resp.content, media_type=content_type)
+    return Response(content=resp.content, media_type=content_type, status_code=resp.status_code)

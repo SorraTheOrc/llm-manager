@@ -1,4 +1,4 @@
 # Proxy package shim
-from . import server  # noqa: F401
+from . import server
 
 __all__ = ["server"]

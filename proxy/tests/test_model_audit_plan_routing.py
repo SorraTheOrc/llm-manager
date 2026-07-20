@@ -19,14 +19,13 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import requests
-
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e_live]
 
@@ -106,11 +105,11 @@ def _require_local_proxy() -> None:
 def _chat(
     *,
     prompt: str,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     max_tokens: int = 800,
     temperature: float = 0.0,
     timeout: float = DEFAULT_TIMEOUT,
-) -> Tuple[requests.Response, Dict[str, Any], float]:
+) -> tuple[requests.Response, dict[str, Any], float]:
     """Send a chat completion request using model=plan.
 
     Returns (response, body_dict, elapsed_seconds).
@@ -143,7 +142,7 @@ def _chat(
     response = requests.post(url, json=payload, headers=headers, timeout=timeout)
     elapsed = time.monotonic() - started
 
-    body: Dict[str, Any] = {}
+    body: dict[str, Any] = {}
     try:
         body = response.json()
     except Exception:
@@ -164,7 +163,7 @@ def _chat(
     return response, body, elapsed
 
 
-def _extract_response_text(body: Dict[str, Any]) -> str:
+def _extract_response_text(body: dict[str, Any]) -> str:
     try:
         choices = body.get("choices") if isinstance(body, dict) else None
         if not isinstance(choices, list) or not choices:
@@ -192,7 +191,7 @@ def _provider_from_headers(response: requests.Response) -> str:
     return (response.headers.get("X-Provider") or "").strip()
 
 
-def _model_from_response(body: Dict[str, Any]) -> str:
+def _model_from_response(body: dict[str, Any]) -> str:
     return str(body.get("model", "") or "").strip()
 
 
@@ -200,7 +199,7 @@ def _model_from_response(body: Dict[str, Any]) -> str:
 # Proxy log inspection
 # ---------------------------------------------------------------------------
 
-def _find_latest_proxy_log() -> Optional[Path]:
+def _find_latest_proxy_log() -> Path | None:
     """Find the most recent proxy log file (current + rotated)."""
     if not PROXY_LOG_DIR.exists():
         _log(f"Proxy log directory {PROXY_LOG_DIR} does not exist")
@@ -219,7 +218,7 @@ def _find_latest_proxy_log() -> Optional[Path]:
     return candidates[0]
 
 
-def _read_proxy_log_since(timestamp_iso: str) -> List[str]:
+def _read_proxy_log_since(timestamp_iso: str) -> list[str]:
     """Read proxy log lines that occur at or after the given ISO timestamp.
 
     Since the log format is ``YYYY-MM-DD HH:MM:SS,mmm``, we compare
@@ -243,9 +242,9 @@ def _read_proxy_log_since(timestamp_iso: str) -> List[str]:
 
     _log(f"Reading proxy log: {log_path} (since lines with prefix '{log_prefix}')")
 
-    relevant_lines: List[str] = []
+    relevant_lines: list[str] = []
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if not line.strip():
@@ -267,14 +266,14 @@ def _read_proxy_log_since(timestamp_iso: str) -> List[str]:
 
 
 def _find_routing_lines(
-    log_lines: List[str],
-    body_preview_substrings: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
+    log_lines: list[str],
+    body_preview_substrings: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Extract routing_check and [local]/[remote] dispatch lines.
 
     Returns a list of dicts with keys: timestamp, kind, details.
     """
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for line in log_lines:
         # Match routing_check lines
@@ -345,7 +344,7 @@ def _find_routing_lines(
     # If body_preview_substrings is provided, filter to lines whose body
     # preview contains at least one of the substrings.
     if body_preview_substrings:
-        filtered: List[Dict[str, Any]] = []
+        filtered: list[dict[str, Any]] = []
         for entry in results:
             details = entry.get("details", "")
             if any(sub in details for sub in body_preview_substrings):
@@ -355,7 +354,7 @@ def _find_routing_lines(
     return results
 
 
-def _parse_routing_check(details: str) -> Dict[str, Any]:
+def _parse_routing_check(details: str) -> dict[str, Any]:
     """Parse a routing_check log line into structured data.
 
     Example:
@@ -363,7 +362,7 @@ def _parse_routing_check(details: str) -> Dict[str, Any]:
             cache_cold=False estimated_tokens=42676
             cold_threshold=30000 warm_threshold=40000 messages=109
     """
-    parsed: Dict[str, Any] = {"raw": details}
+    parsed: dict[str, Any] = {"raw": details}
     # Extract key=value pairs
     for m in re.finditer(r"(\w+)=(\S+)", details):
         key = m.group(1)
@@ -379,12 +378,12 @@ def _parse_routing_check(details: str) -> Dict[str, Any]:
     return parsed
 
 
-def _find_request_log_timestamps(session_id: str, log_lines: List[str]) -> Dict[str, str]:
+def _find_request_log_timestamps(session_id: str, log_lines: list[str]) -> dict[str, str]:
     """Find the [local] or [remote] log line timestamp for a given session_id.
 
     Returns dict with keys: dispatch_timestamp.
     """
-    result: Dict[str, str] = {}
+    result: dict[str, str] = {}
     for line in log_lines:
         # Look for session_id in the line
         if session_id[:16] in line or session_id in line:
@@ -401,11 +400,11 @@ def _find_request_log_timestamps(session_id: str, log_lines: List[str]) -> Dict[
 # Test result accumulator
 # ---------------------------------------------------------------------------
 
-_REQUEST_RESULTS: List[Dict[str, Any]] = []
+_REQUEST_RESULTS: list[dict[str, Any]] = []
 
 # Track session IDs used in the current test run so their dispatch leases
 # can be explicitly released after completion (LP-0MRFOF7XO003T7CT).
-_SESSION_IDS_FOR_CLEANUP: List[str] = []
+_SESSION_IDS_FOR_CLEANUP: list[str] = []
 
 
 def _release_lease(session_id: str) -> None:
@@ -461,14 +460,14 @@ def _print_final_summary() -> None:
         _log(f"  Model:        {r.get('model')}")
         _log(f"  Session:      {r.get('session_id')}")
         _log(f"  Time (UTC):   {r.get('timestamp_utc')}")
-        _log(f"  Log analysis:")
+        _log("  Log analysis:")
 
         routing_events = r.get("routing_events", [])
         if routing_events:
             for event in routing_events:
                 _log(f"    [{event.get('timestamp')}] {event.get('kind')}: {event.get('details')}")
         else:
-            _log(f"    (no routing events found in log)")
+            _log("    (no routing events found in log)")
 
     # If first two are NOT served by Qwen3, trace back leases
     first_model = _REQUEST_RESULTS[0].get("model", "") if len(_REQUEST_RESULTS) > 0 else ""
@@ -569,8 +568,8 @@ def test_model_audit_plan_routing() -> None:
 
     _log("Launching 3 requests with 15s gaps between starts (overlapping)...")
 
-    results_lock: Dict[int, Any] = {}
-    started_times: Dict[int, float] = {}
+    results_lock: dict[int, Any] = {}
+    started_times: dict[int, float] = {}
 
     def _send_request(index: int) -> None:
         """Send a single request and store its result."""
@@ -656,7 +655,7 @@ def test_model_audit_plan_routing() -> None:
 
     for idx, r in enumerate(_REQUEST_RESULTS):
         session_id = r["session_id"]
-        prompt_truncated = r["prompt_truncated"]
+        _prompt_truncated = r["prompt_truncated"]
 
         _log(f"\n--- Analysing routing for request {idx+1} ---")
         _log(f"  Session: {session_id}")
@@ -671,7 +670,7 @@ def test_model_audit_plan_routing() -> None:
             # Broader search: look for ALL routing-related lines by
             # matching session_id or prompt text (since Fallback triggered
             # lines lack session IDs but are temporally correlated).
-            _log(f"  Broader search for routing events...")
+            _log("  Broader search for routing events...")
             all_log_lines = _read_proxy_log_since("")
             all_routing_events = _find_routing_lines(all_log_lines)
             prompt_text = r.get("prompt_truncated", "")[:60].rstrip(".")
@@ -688,7 +687,7 @@ def test_model_audit_plan_routing() -> None:
             all_fb = _find_routing_lines(_read_proxy_log_since(""))
             all_fb = [ev for ev in all_fb if ev["kind"] == "fallback"]
             import datetime as _dt
-            def _ts2epoch(ts: str) -> Optional[float]:
+            def _ts2epoch(ts: str) -> float | None:
                 try:
                     return _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S,%f").timestamp()
                 except Exception:
@@ -735,10 +734,10 @@ def test_model_audit_plan_routing() -> None:
                 routing_analysis += f"Local dispatch denied: {ev['details']}. "
             elif ev["kind"] == "local_dispatch":
                 _log(f"  LOCAL DISPATCH: {ev['details']}")
-                routing_analysis += f"Routed to local backend."
+                routing_analysis += "Routed to local backend."
             elif ev["kind"] == "remote_dispatch":
                 _log(f"  REMOTE DISPATCH: {ev['details']}")
-                routing_analysis += f"Routed to remote backend."
+                routing_analysis += "Routed to remote backend."
             elif ev["kind"] == "fallback":
                 _log(f"  FALLBACK: {ev['details']}")
                 routing_analysis += f"Fallback: {ev['details']}. "
@@ -785,7 +784,7 @@ def test_model_audit_plan_routing() -> None:
             if ev["kind"] in ("lease_renewed", "lease_released", "dispatch_denied", "routing_check")
         ]
 
-        _log(f"\nAll lease/dispatch events in the test log window:")
+        _log("\nAll lease/dispatch events in the test log window:")
         for ev in lease_history:
             _log(f"  [{ev.get('timestamp')}] {ev.get('kind')}: {ev.get('details')}")
 
@@ -831,7 +830,7 @@ def test_model_audit_plan_routing() -> None:
                 if owner_session:
                     _log(f"  Lease owned by session: {owner_session}")
                 else:
-                    _log(f"  No lease owner identified (possibly cache_cold bypass or no active lease)")
+                    _log("  No lease owner identified (possibly cache_cold bypass or no active lease)")
     else:
         _log("Both first two requests were served by Qwen3. No backward lease trace needed.")
 

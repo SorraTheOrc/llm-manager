@@ -13,8 +13,6 @@ waste when the router loaded both. This test suite verifies:
 import configparser
 import os
 
-import pytest
-
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODELS_INI_PATH = os.path.join(REPO_ROOT, "models.ini")
 CONFIG_YAML_PATH = os.path.join(REPO_ROOT, "proxy", "config.yaml")
@@ -66,7 +64,7 @@ def test_models_ini_qwen3_coder_next_section_exists():
 def _load_config_yaml():
     """Load config.yaml and return the raw parsed dict."""
     import yaml
-    with open(CONFIG_YAML_PATH, "r") as f:
+    with open(CONFIG_YAML_PATH) as f:
         return yaml.safe_load(f)
 
 
@@ -126,7 +124,7 @@ def test_config_code_keeps_local_fallback_chain():
 
 def test_start_llama_qwen3_has_jinja():
     """The Qwen3 case block in start-llama.sh should include --jinja."""
-    with open(START_LLAMA_PATH, "r") as f:
+    with open(START_LLAMA_PATH) as f:
         content = f.read()
 
     # Find the qwen3 case block and check for --jinja
@@ -141,7 +139,7 @@ def test_start_llama_qwen3_has_jinja():
 
 def test_start_llama_no_qwen3_next_case():
     """start-llama.sh should NOT have a combined qwen3|qwen3-next case."""
-    with open(START_LLAMA_PATH, "r") as f:
+    with open(START_LLAMA_PATH) as f:
         content = f.read()
 
     assert "qwen3-next)" not in content, (

@@ -5,39 +5,36 @@ These tests verify that the shared httpx client with connection pooling
 allows concurrent requests to complete without blocking each other.
 """
 import asyncio
-import pytest
-from concurrent.futures import ThreadPoolExecutor
 import threading
-import sys
-import os
 
 import httpx
+import pytest
 
 
 class SlowHTTPHandler:
     """HTTP handler that simulates slow/streaming responses."""
-    
+
     def __init__(self, delay=0.5, streaming=False):
         self.delay = delay
         self.streaming = streaming
         self._stream_complete = threading.Event()
-    
+
     async def handle(self, reader, writer):
         """Handle incoming HTTP requests."""
         data = await reader.read(1024)
         request_line = data.decode().split('\r\n')[0]
-        
+
         if '/stream' in request_line:
             await self._handle_streaming(writer)
         elif '/status' in request_line:
             await self._handle_status(writer)
         else:
             await self._handle_not_found(writer)
-        
+
         await writer.drain()
         writer.close()
         await writer.wait_closed()
-    
+
     async def _handle_status(self, writer):
         """Return a quick status response."""
         body = b'{"n_ctx": 4096}'
@@ -50,7 +47,7 @@ class SlowHTTPHandler:
         ).encode() + body
         writer.write(response)
         await writer.drain()
-    
+
     async def _handle_not_found(self, writer):
         """Return 404."""
         response = (
@@ -60,7 +57,7 @@ class SlowHTTPHandler:
         )
         writer.write(response.encode())
         await writer.drain()
-    
+
     async def _handle_streaming(self, writer):
         """Simulate a slow streaming response."""
         await asyncio.sleep(self.delay)
@@ -96,24 +93,24 @@ async def test_connection_pooling_allows_concurrent_status_requests():
     handler = SlowHTTPHandler(delay=0.1)
     server, addr = await start_test_server(handler)
     port = addr[1]
-    
+
     try:
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
         async with httpx.AsyncClient(limits=limits, timeout=5.0) as client:
             start = asyncio.get_event_loop().time()
-            
+
             async def make_request():
                 response = await client.get(f"http://localhost:{port}/status")
                 return response.json()
-            
+
             results = await asyncio.gather(
                 make_request(),
                 make_request(),
                 make_request()
             )
-            
+
             elapsed = asyncio.get_event_loop().time() - start
-            
+
             assert len(results) == 3
             for r in results:
                 assert r["n_ctx"] == 4096
@@ -133,23 +130,23 @@ async def test_status_request_not_blocked_by_streaming_request():
     """
     streaming_started = asyncio.Event()
     server_ready = asyncio.Event()
-    
+
     class SlowResponseHandler:
         async def handle(self, reader, writer):
             data = await reader.read(1024)
             request_line = data.decode().split('\r\n')[0]
-            
+
             if '/stream' in request_line:
                 await self._handle_slow_stream(writer, streaming_started, server_ready)
             elif '/status' in request_line:
                 await self._handle_quick_status(writer)
             else:
                 await self._handle_not_found(writer)
-            
+
             await writer.drain()
             writer.close()
             await writer.wait_closed()
-        
+
         async def _handle_quick_status(self, writer):
             body = b'{"n_ctx": 4096}'
             response = (
@@ -160,11 +157,11 @@ async def test_status_request_not_blocked_by_streaming_request():
                 f"\r\n"
             ).encode() + body
             writer.write(response)
-        
+
         async def _handle_not_found(self, writer):
             response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
             writer.write(response)
-        
+
         async def _handle_slow_stream(self, writer, streaming_started, server_ready):
             body = b'{"model": "slow"}'
             response = (
@@ -179,34 +176,34 @@ async def test_status_request_not_blocked_by_streaming_request():
             server_ready.set()
             streaming_started.set()
             await asyncio.sleep(2.0)
-    
+
     handler = SlowResponseHandler()
     server, addr = await start_test_server(handler)
     port = addr[1]
-    
+
     try:
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
         async with httpx.AsyncClient(limits=limits, timeout=10.0) as client:
             async def make_status_request():
                 response = await client.get(f"http://localhost:{port}/status")
                 return response.json()
-            
+
             async def make_streaming_request():
                 response = await client.get(f"http://localhost:{port}/stream")
                 return response.json()
-            
+
             streaming_task = asyncio.create_task(make_streaming_request())
             await server_ready.wait()
-            
+
             status_task = asyncio.create_task(make_status_request())
-            
+
             done, pending = await asyncio.wait(
                 [status_task, streaming_task],
                 timeout=3.0
             )
-            
+
             assert status_task in done, "Status request did not complete in time"
-            
+
             status_result = await status_task
             assert status_result["n_ctx"] == 4096
     finally:
@@ -227,23 +224,23 @@ async def test_status_request_with_limited_connections_and_blocking_stream():
     the status request should still be able to complete using the second connection.
     """
     server_ready = asyncio.Event()
-    
+
     class LimitedConnectionHandler:
         async def handle(self, reader, writer):
             data = await reader.read(1024)
             request_line = data.decode().split('\r\n')[0]
-            
+
             if '/stream' in request_line:
                 await self._handle_slow_stream(writer, server_ready)
             elif '/status' in request_line:
                 await self._handle_quick_status(writer)
             else:
                 await self._handle_not_found(writer)
-            
+
             await writer.drain()
             writer.close()
             await writer.wait_closed()
-        
+
         async def _handle_quick_status(self, writer):
             body = b'{"n_ctx": 4096}'
             response = (
@@ -254,11 +251,11 @@ async def test_status_request_with_limited_connections_and_blocking_stream():
                 f"\r\n"
             ).encode() + body
             writer.write(response)
-        
+
         async def _handle_not_found(self, writer):
             response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
             writer.write(response)
-        
+
         async def _handle_slow_stream(self, writer, server_ready):
             body = b'{"model": "slow"}'
             response = (
@@ -272,37 +269,37 @@ async def test_status_request_with_limited_connections_and_blocking_stream():
             await writer.drain()
             server_ready.set()
             await asyncio.sleep(3.0)
-    
+
     handler = LimitedConnectionHandler()
     server, addr = await start_test_server(handler)
     port = addr[1]
-    
+
     try:
         limits = httpx.Limits(max_connections=2, max_keepalive_connections=1)
         async with httpx.AsyncClient(limits=limits, timeout=10.0) as client:
             async def make_status_request():
                 response = await client.get(f"http://localhost:{port}/status")
                 return response.json()
-            
+
             async def make_streaming_request():
                 response = await client.get(f"http://localhost:{port}/stream")
                 return response.json()
-            
-            streaming_task_1 = asyncio.create_task(make_streaming_request())
+
+            _streaming_task_1 = asyncio.create_task(make_streaming_request())
             await server_ready.wait()
-            
-            streaming_task_2 = asyncio.create_task(make_streaming_request())
+
+            _streaming_task_2 = asyncio.create_task(make_streaming_request())
             await asyncio.sleep(0.1)
-            
+
             status_task = asyncio.create_task(make_status_request())
-            
+
             done, pending = await asyncio.wait(
                 [status_task],
                 timeout=3.0
             )
-            
+
             assert status_task in done, "Status request did not complete in time (connection pool exhausted)"
-            
+
             status_result = await status_task
             assert status_result["n_ctx"] == 4096
     finally:
@@ -320,23 +317,23 @@ async def test_without_connection_pooling_blocks():
     handler = SlowHTTPHandler(delay=0.2)
     server, addr = await start_test_server(handler)
     port = addr[1]
-    
+
     try:
         async def make_request_without_pooling():
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"http://localhost:{port}/status")
                 return response.json()
-        
+
         start = asyncio.get_event_loop().time()
-        
+
         results = await asyncio.gather(
             make_request_without_pooling(),
             make_request_without_pooling(),
             make_request_without_pooling()
         )
-        
+
         elapsed = asyncio.get_event_loop().time() - start
-        
+
         assert len(results) == 3
         for r in results:
             assert r["n_ctx"] == 4096

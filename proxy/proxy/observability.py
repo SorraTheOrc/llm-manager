@@ -27,11 +27,12 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
 
 import asyncio
-from typing import Any
 import json
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
 import httpx
 
 
@@ -168,11 +169,10 @@ async def broadcast_status(event_type: str, data: dict):
     All events include a ``type`` field, an ISO8601 ``timestamp``,
     and any additional fields provided in *data*.
     """
-    srv = _srv()
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = datetime.now(UTC).isoformat(timespec="seconds")
     event_data = json.dumps({"type": event_type, "timestamp": now, **data})
     message = f"data: {event_data}\n\n"
-    
+
     # Send to all connected clients
     dead_clients = set()
     for queue in sse_clients:
@@ -180,7 +180,7 @@ async def broadcast_status(event_type: str, data: dict):
             queue.put_nowait(message)
         except asyncio.QueueFull:
             dead_clients.add(queue)
-    
+
     # Clean up dead clients
     for client in dead_clients:
         sse_clients.discard(client)
@@ -189,7 +189,6 @@ async def broadcast_status(event_type: str, data: dict):
 
 def broadcast_status_sync(event_type: str, data: dict):
     """Synchronous wrapper to broadcast status (for use in sync code)."""
-    srv = _srv()
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(broadcast_status(event_type, data))
@@ -279,7 +278,7 @@ def load_counts():
     try:
         path = _counts_file_path()
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 srv.request_counts = json.load(f)
         else:
             srv.request_counts = {}
@@ -315,7 +314,7 @@ def load_token_counts():
     try:
         path = _token_file_path()
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 srv.token_counts = json.load(f)
         else:
             srv.token_counts = {}
@@ -339,13 +338,11 @@ def save_token_counts_sync():
 
 
 async def save_token_counts():
-    srv = _srv()
     await asyncio.to_thread(save_token_counts_sync)
 
 
 
 async def save_counts():
-    srv = _srv()
     await asyncio.to_thread(save_counts_sync)
 
 
@@ -542,7 +539,7 @@ async def _periodic_broadcast_loop():
                     snap_t = dict(srv.token_counts)
 
                 llama_status = await query_llama_status()
-                
+
                 total_sent = srv.token_counts.get("total_sent", 0)
                 total_recv = srv.token_counts.get("total_recv", 0)
 
@@ -550,7 +547,7 @@ async def _periodic_broadcast_loop():
                     for q in list(log_tail_clients):
                         try:
                             q.put_nowait({
-                                "counts": snap_c, 
+                                "counts": snap_c,
                                 "tokens": snap_t,
                                 "llama_status": llama_status,
                                 "total_sent": total_sent,
@@ -558,7 +555,7 @@ async def _periodic_broadcast_loop():
                             })
                         except asyncio.QueueFull:
                             continue
-                
+
                 if sse_clients:
                     status_data = {
                         "type": "status",
@@ -579,7 +576,7 @@ async def _periodic_broadcast_loop():
                             dead_clients.add(q)
                     for client in dead_clients:
                         sse_clients.discard(client)
-                        
+
             except asyncio.CancelledError:
                 break
             except Exception:

@@ -10,25 +10,19 @@ Verifies that:
 6. Non-fallback direct calls to proxy_to_local() also set the header
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
-import httpx
+import proxy.provider as provider
 import pytest
 from fastapi import Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
-
-import proxy.router as router
-import proxy.proxy_remote as proxy_remote
-import proxy.provider as provider
-from proxy.router import proxy_to_local
-from proxy.proxy_remote import proxy_to_remote
+from fastapi.responses import StreamingResponse
 from proxy.provider import (
     proxy_with_fallback,
     proxy_with_remote_fallback,
 )
-
+from proxy.proxy_remote import proxy_to_remote
+from proxy.router import proxy_to_local
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -177,7 +171,6 @@ def _mock_server_state(monkeypatch):
     monkeypatch.setattr(server, "session_manager", MagicMock())
     monkeypatch.setattr(server, "logger", MagicMock())
 
-    monkeypatch.setattr("proxy.router._get_job_scheduler", lambda: None)
     monkeypatch.setattr("proxy.router._is_self_healing_active", lambda: False)
     monkeypatch.setattr("proxy.router._restore_slot_snapshot", AsyncMock(return_value=False))
     monkeypatch.setattr("proxy.router._save_slot_snapshot", AsyncMock(return_value=False))
@@ -773,8 +766,8 @@ def test_add_provider_header_uses_set_not_append():
     """_add_provider_header sets the header (not appends) to prevent
     duplicate X-Provider header values on fallback responses.
     """
-    from proxy.provider import _add_provider_header
     from fastapi import Response as FastAPIResponse
+    from proxy.provider import _add_provider_header
 
     resp = FastAPIResponse(status_code=200)
     # First call should set the header

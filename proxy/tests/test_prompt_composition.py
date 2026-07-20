@@ -8,7 +8,6 @@ Unit tests that validate message composition logic:
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Test: compose_messages function exists
 # ---------------------------------------------------------------------------

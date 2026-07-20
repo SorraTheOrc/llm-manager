@@ -16,7 +16,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Default gating thresholds
@@ -35,7 +35,7 @@ DEFAULT_THRESHOLDS = {
 # ---------------------------------------------------------------------------
 
 
-def safe_pct(baseline: Optional[float], candidate: Optional[float]) -> Optional[float]:
+def safe_pct(baseline: float | None, candidate: float | None) -> float | None:
     """Compute percentage change: ((candidate - baseline) / baseline) * 100.
 
     Returns None when baseline is None, zero, or both are None.
@@ -92,7 +92,7 @@ def compute_deltas(baseline: dict, candidate: dict) -> dict:
 
 
 def check_gates(
-    deltas: dict, baseline: dict, candidate: dict, thresholds: Optional[dict] = None
+    deltas: dict, baseline: dict, candidate: dict, thresholds: dict | None = None
 ) -> dict:
     """Evaluate gating policy thresholds against computed deltas.
 
@@ -207,8 +207,8 @@ def generate_report(
     baseline: dict,
     candidate: dict,
     deltas: dict,
-    gates: Optional[dict] = None,
-    thresholds: Optional[dict] = None,
+    gates: dict | None = None,
+    thresholds: dict | None = None,
 ) -> str:
     """Generate a Markdown comparison report."""
     if thresholds is None:
@@ -336,7 +336,7 @@ def generate_json_output(deltas: dict, gates: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Compare baseline and candidate benchmark results",
@@ -379,7 +379,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Main entry point for the comparison tool."""
     args = parse_args(argv)
 

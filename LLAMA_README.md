@@ -40,6 +40,86 @@ cmake --build build --config Release -j$(nproc)
 sudo cmake --install build
 ```
 
+# Benchmarking with llama-bench.sh
+
+The project includes a benchmark wrapper (`scripts/llama-bench.sh`) around
+llama.cpp's `llama-bench` tool for systematically measuring model performance
+on Strix Halo (gfx1151) hardware.
+
+## Usage
+
+```bash
+# Quick benchmark of a specific model with optimal defaults
+./scripts/llama-bench.sh --model gemma
+
+# Full parameter sweep on a model (GPU layers, threads, batch, flash-attn, KV cache)
+./scripts/llama-bench.sh --sweep --model gemma
+
+# Benchmark all discovered models (one run each)
+./scripts/llama-bench.sh --all
+
+# Full sweep across all models
+./scripts/llama-bench.sh --all --sweep
+
+# Preview commands without running
+./scripts/llama-bench.sh --dry-run --all
+
+# List discovered models
+./scripts/llama-bench.sh --list-models
+
+# List models as JSON
+./scripts/llama-bench.sh --list-models-json
+```
+
+## Output
+
+Results are output as JSON to stdout. In dry-run mode, planned commands are printed
+to stderr so stdout remains clean for machine consumption.
+
+```bash
+# Save results to a file
+./scripts/llama-bench.sh --model gemma > benchmark-results.json
+
+# Pipe through jq for analysis
+./scripts/llama-bench.sh --model gemma | jq '.results[].avg_ts'
+```
+
+## Benchmark Parameters
+
+The script sweeps the following parameters (configurable in the script defaults):
+
+| Parameter | Flag | Default | Sweep Values |
+|-----------|------|---------|-------------|
+| GPU layers | `-ngl` | 99 | 99, 80, 60 |
+| Threads | `-t` | 16 | 16, 12, 8 |
+| Batch size | `-b` | 2048 | 4096, 2048, 1024 |
+| Micro batch | `-ub` | 512 | 512, 256 |
+| Flash attn | `-fa` | 1 | 1, 0 |
+| KV cache K | `-ctk` | f16 | f16, q8_0 |
+| KV cache V | `-ctv` | f16 | f16, q8_0 |
+| Prompt len | `-p` | 512 | 512, 1024 |
+| Gen len | `-n` | 128 | 128, 256 |
+
+## Model Discovery
+
+The script automatically discovers GGUF models from:
+1. HuggingFace cache (`~/.cache/huggingface/hub/`)
+2. llama.cpp local cache (`~/.cache/llama.cpp/`)
+
+Models can be filtered by name substring using `--model`. Incomplete downloads
+are skipped with a warning.
+
+## Library Path
+
+The script automatically sets `LD_LIBRARY_PATH` to include
+`~/llama.cpp/build/bin/` so that `llama-bench` can find its shared libraries
+(`libllama.so.0`, `libggml*.so.0`).
+
+## Custom Parameters
+
+Override individual parameters via environment variables or by editing the
+script defaults at the top of `scripts/llama-bench.sh`.
+
 ## Slot save/restore endpoints (KV persistence)
 
 Slot persistence is required for stable KV cache reuse across requests. The

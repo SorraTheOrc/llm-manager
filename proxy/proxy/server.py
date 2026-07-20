@@ -7,42 +7,27 @@ or remote API services based on configuration.
 """
 
 import asyncio
-import hashlib
-import json
 import logging
-import os
-import re
-import signal
 import subprocess
-import sys
+import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from fnmatch import fnmatch
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
-import shutil
-import io
-import traceback
-import threading
-from datetime import timedelta
-import yaml
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from proxy.session_manager import SessionManager, DEFAULT_SESSION_TTL_SECONDS
-import proxy.metrics as metrics
-from proxy.metrics import record_http_error
+import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
+from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
 
 # Global state
-llama_process: Optional[subprocess.Popen] = None
-tts_process: Optional[subprocess.Popen] = None
-llama_log_file: Optional[Any] = None
-current_model: Optional[str] = None
-last_start_failure: Optional[str] = None
+llama_process: subprocess.Popen | None = None
+tts_process: subprocess.Popen | None = None
+llama_log_file: Any | None = None
+current_model: str | None = None
+last_start_failure: str | None = None
 model_switch_lock = asyncio.Lock()
 # Mark if a background model load is in progress (model_name -> True)
 background_loads: dict = {}
@@ -67,16 +52,16 @@ session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL
 
 
 # Shared httpx client for connection pooling (local/internal operations)
-_http_client: Optional[httpx.AsyncClient] = None
+_http_client: httpx.AsyncClient | None = None
 # Shared httpx client for remote upstream requests (LP-0MRE8G3JK0099Y4J)
-_remote_http_client: Optional[httpx.AsyncClient] = None
+_remote_http_client: httpx.AsyncClient | None = None
 # Cache for which llama-server endpoint successfully provided status
-_llama_status_endpoint_cache: Optional[str] = None
+_llama_status_endpoint_cache: str | None = None
 # Record recent failures for endpoints to avoid hammering endpoints that 404
 _llama_status_endpoint_failures: dict = {}
 # One-time discovery markers: avoid repeated discovery for the same process
 _llama_status_discovered: bool = False
-_llama_status_discovered_pid: Optional[int] = None
+_llama_status_discovered_pid: int | None = None
 
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
@@ -93,8 +78,8 @@ counts_lock = asyncio.Lock()
 counts_filename = "request_counts.json"
 # Dirty flags and persist tasks
 counts_dirty = False
-counts_persist_task: Optional[asyncio.Task] = None
-periodic_broadcast_task: Optional[asyncio.Task] = None
+counts_persist_task: asyncio.Task | None = None
+periodic_broadcast_task: asyncio.Task | None = None
 
 # Active local queries counter (global, all providers)
 active_queries: int = 0
@@ -119,7 +104,7 @@ session_observability: dict = {
 provider_fallback_count: dict = {}
 
 # Background lease cleanup task (started in lifespan)
-_dispatch_cleanup_task: Optional[asyncio.Task] = None
+_dispatch_cleanup_task: asyncio.Task | None = None
 
 
 async def _release_lease_on_session_eviction(session_id: str) -> None:
@@ -130,8 +115,8 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
     than waiting for the lease timeout (LP-0MRHV4UYE0013F6P).
     """
     try:
-        from proxy.router_helpers import _release_local_dispatch
         import proxy.server as _srv
+        from proxy.router_helpers import _release_local_dispatch
         await _release_local_dispatch(_srv, session_id)
         logger.info(
             "lease_released session=%s reason=session_evicted",
@@ -147,16 +132,16 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
 async def _dispatch_cleanup_loop() -> None:
     """Background task that periodically removes stale dispatch leases.
 
-    Runs every 10 seconds (matching the JobScheduler interval) and
+    Runs every 10 seconds and
     calls ``_cleanup_stale_local_dispatch`` on the server state to
     evict inactive lease records whose *expires_at* has passed.
     """
     while True:
         try:
             await asyncio.sleep(10.0)
-            from proxy.router_helpers import _cleanup_stale_local_dispatch, _recover_stuck_local_active_queries
             # Import via _srv() to get the current module state
             import proxy.server as _srv
+            from proxy.router_helpers import _cleanup_stale_local_dispatch, _recover_stuck_local_active_queries
             removed = await _cleanup_stale_local_dispatch(_srv)
             if removed:
                 try:
@@ -190,10 +175,25 @@ backend_recovery_state: dict = {
 }
 
 # Background watchdog task (started in lifespan)
-backend_watchdog_task: Optional[asyncio.Task] = None
+backend_watchdog_task: asyncio.Task | None = None
+
+# Background TTS watchdog task (started in lifespan)
+tts_watchdog_task: asyncio.Task | None = None
+
+# TTS self-healing recovery state
+# Mirrors backend_recovery_state but for TTS server
+# "in_progress": bool, "attempt_timestamps": list[float],
+# "max_attempts": int, "window_seconds": int, "last_failure": str|None
+tts_recovery_state: dict = {
+    "in_progress": False,
+    "attempt_timestamps": [],
+    "max_attempts": 3,
+    "window_seconds": 120,
+    "last_failure": None,
+}
 
 # Background model health monitoring task (started in lifespan)
-model_health_task: Optional[asyncio.Task] = None
+model_health_task: asyncio.Task | None = None
 
 # Token counting
 token_counts: dict = {}
@@ -201,7 +201,7 @@ token_lock = asyncio.Lock()
 token_counts_filename = "token_counts.json"
 # Dirty flags and persist tasks for tokens
 tokens_dirty = False
-tokens_persist_task: Optional[asyncio.Task] = None
+tokens_persist_task: asyncio.Task | None = None
 
 
 # Optional process metrics (psutil)
@@ -214,7 +214,7 @@ except Exception:
 config: dict = {}
 
 
-log_dir: Optional[Path] = None
+log_dir: Path | None = None
 logger: logging.Logger = logging.getLogger("llama-proxy")
 
 
@@ -320,28 +320,14 @@ def _startup_config_logging():
     return config, logger
 
 
-def _startup_initialize_cache_cold_start():
-    """Mark all local model caches as cold on startup.
-
-    Corresponds to LP-0MRDE669Y003V1SO — ensures large-context requests
-    are routed to remote fallback immediately after restart, rather than
-    attempting expensive full re-prefill.
-    """
-    try:
-        from proxy.provider import initialize_cache_cold_from_config as _init_cache
-        _init_cache(config)
-    except Exception:
-        pass
-
-
 def _startup_initialize_backend_state():
-    """Initialize backend-ready flag and recovery state dict.
+    """Initialize backend-ready flag and recovery state dicts.
 
     Sets ``backend_ready = False`` and builds ``backend_recovery_state``
-    from the current config (with sensible defaults).
-    Returns the new recovery state dict.
+    and ``tts_recovery_state`` from the current config (with sensible defaults).
+    Returns the backend recovery state dict.
     """
-    global backend_ready, backend_recovery_state
+    global backend_ready, backend_recovery_state, tts_recovery_state
     backend_ready = False
     backend_recovery_state = {
         "in_progress": False,
@@ -349,6 +335,13 @@ def _startup_initialize_backend_state():
         "max_attempts": int(config.get("server", {}).get("llama_self_heal_max_attempts", 3) or 3),
         "window_seconds": int(config.get("server", {}).get("llama_self_heal_window_seconds", 300) or 300),
         "retry_after_seconds": int(config.get("server", {}).get("llama_self_heal_retry_after_seconds", 30) or 30),
+        "last_failure": None,
+    }
+    tts_recovery_state = {
+        "in_progress": False,
+        "attempt_timestamps": [],
+        "max_attempts": int(config.get("server", {}).get("tts_self_heal_max_attempts", 3) or 3),
+        "window_seconds": int(config.get("server", {}).get("tts_self_heal_window_seconds", 120) or 120),
         "last_failure": None,
     }
     return backend_recovery_state
@@ -497,6 +490,7 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                         logger.info(f"Router preload complete: {router_preload_list}")
                         if resolved:
                             current_model = resolved[0]
+
                     return
 
                 if await ensure_model_loaded(default_model):
@@ -553,15 +547,17 @@ def _startup_launch_tts_server():
 
 
 def _startup_launch_watchdog_tasks():
-    """Spawn the backend watchdog and model health background loops.
+    """Spawn the backend watchdog, TTS watchdog, and model health background loops.
 
-    Skips creation if either task is already set (guards against
+    Skips creation if any task is already set (guards against
     double-initialization).
     """
-    global backend_watchdog_task, model_health_task
+    global backend_watchdog_task, tts_watchdog_task, model_health_task
     loop = asyncio.get_running_loop()
     if backend_watchdog_task is None:
         backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
+    if tts_watchdog_task is None:
+        tts_watchdog_task = loop.create_task(_tts_watchdog_loop())
     if model_health_task is None:
         model_health_task = loop.create_task(_router_model_health_loop())
 
@@ -640,11 +636,11 @@ def _shutdown_stop_session_cleanup():
 
 
 async def _shutdown_cleanup_tasks():
-    """Cancel and await the dispatch lease cleanup and watchdog tasks.
+    """Cancel and await the dispatch lease cleanup, watchdog, and TTS watchdog tasks.
 
     Sets each task reference to ``None`` after completion.
     """
-    global _dispatch_cleanup_task, backend_watchdog_task
+    global _dispatch_cleanup_task, backend_watchdog_task, tts_watchdog_task
     if _dispatch_cleanup_task is not None:
         _dispatch_cleanup_task.cancel()
         try:
@@ -660,6 +656,14 @@ async def _shutdown_cleanup_tasks():
         except (Exception, asyncio.CancelledError):
             pass
         backend_watchdog_task = None
+
+    if tts_watchdog_task is not None:
+        tts_watchdog_task.cancel()
+        try:
+            await tts_watchdog_task
+        except (Exception, asyncio.CancelledError):
+            pass
+        tts_watchdog_task = None
 
 
 async def _shutdown_http_client():
@@ -705,7 +709,6 @@ async def lifespan(app: FastAPI):
     # Startup phase
     # ------------------------------------------------------------------ #
     _startup_config_logging()
-    _startup_initialize_cache_cold_start()
     _startup_initialize_backend_state()
     _startup_create_http_client(config)
     _startup_create_remote_http_client(config)
@@ -740,6 +743,7 @@ app = FastAPI(
 
 # Include handlers from the extracted handlers module
 from . import handlers  # noqa: E402
+
 app.include_router(handlers.router)
 
 
@@ -864,14 +868,14 @@ async def debug_prompt(request: Request, alias: str = "", full: bool = False):
 def main():
     """Main entry point."""
     import uvicorn
-    
+
     # Load config for server settings
     cfg = load_config()
     server_cfg = cfg.get("server", {})
-    
+
     host = server_cfg.get("host", "0.0.0.0")
     port = server_cfg.get("port", 8000)
-    
+
     uvicorn.run(
         "server:app",
         host=host,
@@ -885,169 +889,178 @@ def main():
 # Backward-compatibility re-exports for tests that import these from server
 # ---------------------------------------------------------------------------
 from .handlers import (  # noqa: E402, F401
+    admin_delete_session,
+    admin_dump_counts,
+    admin_metrics,
+    admin_reset_counts,
+    admin_stop_server,
     get_llama_local_status,
     health_check,
     list_models,
     prometheus_metrics,
-    admin_metrics,
-    admin_dump_counts,
-    admin_stop_server,
-    admin_reset_counts,
-    admin_delete_session,
     reload_config,
 )
 from .lifecycle import (  # noqa: E402, F401
-    _self_heal_retry_after_seconds,
-    _is_self_healing_active,
-    _self_healing_response,
-    _backend_recovery_snapshot,
-    _worker_process_unhealthy,
-    _prune_recovery_attempts,
     _attempt_router_self_heal,
+    _attempt_tts_self_heal,
+    _backend_recovery_snapshot,
     _backend_watchdog_loop,
-    _router_model_health_loop,
-    _extract_model_port_from_args,
-    _probe_model_instance,
-    _inc_model_switch_refcount,
-    _dec_model_switch_refcount,
-    schedule_background_load,
-    _model_loading_response,
-    _is_retryable_backend_exception,
-    _compute_retry_delay,
-    _estimate_prompt_tokens,
-    _compute_adaptive_timeout,
     _call_with_backend_retries,
-    _probe_backend_reachable,
-    get_model_config,
-    _should_force_full_prompt,
-    get_local_model_name,
-    _resolve_slot_model_name,
-    wait_for_llama_server,
-    router_load_model,
-    router_list_models,
+    _compute_adaptive_timeout,
+    _compute_retry_delay,
+    _dec_model_switch_refcount,
+    _estimate_prompt_tokens,
+    _extract_model_port_from_args,
     _extract_router_model_ids,
-    router_is_model_loaded,
-    router_wait_for_model,
-    router_preload_models,
-    start_llama_server,
-    rotate_llama_logs,
-    stop_llama_server,
+    _get_tts_self_heal_max_attempts,
+    _get_tts_watchdog_interval,
+    _inc_model_switch_refcount,
+    _is_retryable_backend_exception,
+    _is_self_healing_active,
+    _model_loading_response,
+    _probe_backend_reachable,
+    _probe_model_instance,
+    _prune_recovery_attempts,
+    _resolve_slot_model_name,
+    _router_model_health_loop,
+    _self_heal_retry_after_seconds,
+    _self_healing_response,
+    _should_force_full_prompt,
+    _tts_recovery_snapshot,
+    _tts_watchdog_loop,
+    _worker_process_unhealthy,
     ensure_model_loaded,
-    slot_polling_state,
-    _slot_polling_tasks,
-)
-from .session import (  # noqa: E402, F401
-    session_restore_observability,
-    session_single_flight_observability,
-    session_guardrail_observability,
-    _record_restore_success,
-    _record_restore_fallback,
-    _record_delta_payload_bytes,
-    _record_single_flight_queue,
-    _record_single_flight_reject,
-    _record_guardrail_cutoff,
-    _record_session_invalidation,
-    _detect_restore_signal_from_log_slice,
-    _detect_restore_signal_from_llama_log,
-    extract_streamed_content_from_chunk,
-    ContentOnlyConsoleHandler,
-    # Session coordination helpers
-    _sanitize_session_id,
-    _slot_id_for_session,
-    _slot_filename_for_session,
-    _build_slot_context,
-    _call_slot_endpoint,
-    _restore_slot_snapshot,
-    _save_slot_snapshot,
-    _ensure_slot_dir,
-    _slot_persistence_enabled,
-    _invalidate_session_and_slot,
-    _should_cutoff_for_repetition,
-    evaluate_stream_guardrail,
-    _should_invalidate_on_guardrail,
-    merge_session_history_for_update,
-    _classify_delta_routing,
-    _has_explicit_restore_signal,
-    _resolve_session_id_header,
-    _log_session_header_resolution,
-    SlotLockCoordinator,
-    slot_lock_coordinator,
-    SessionSingleFlightRejected,
-    SessionSingleFlightCoordinator,
-    session_single_flight_coordinator,
+    get_local_model_name,
+    get_model_config,
+    rotate_llama_logs,
+    router_is_model_loaded,
+    router_list_models,
+    router_load_model,
+    router_preload_models,
+    router_wait_for_model,
+    schedule_background_load,
+    start_llama_server,
+    stop_llama_server,
+    wait_for_llama_server,
 )
 from .observability import (  # noqa: E402, F401
-    backend_signal_counts,
-    _record_backend_signal,
     _classify_backend_exception,
-    sse_clients,
-    log_tail_clients,
-    broadcast_status,
-    broadcast_status_sync,
     _counts_file_path,
-    load_counts,
-    save_counts_sync,
-    _token_file_path,
-    load_token_counts,
-    save_token_counts_sync,
-    save_token_counts,
-    save_counts,
     _counts_persist_loop,
-    _tokens_persist_loop,
-    query_llama_status,
-    _periodic_broadcast_loop,
     _increment_count,
     _increment_count_multi,
     _increment_tokens,
+    _periodic_broadcast_loop,
+    _record_backend_signal,
+    _token_file_path,
+    _tokens_persist_loop,
+    backend_signal_counts,
+    broadcast_status,
+    broadcast_status_sync,
+    load_counts,
+    load_token_counts,
+    log_tail_clients,
+    query_llama_status,
+    save_counts,
+    save_counts_sync,
+    save_token_counts,
+    save_token_counts_sync,
+    sse_clients,
 )
-from .utils import (  # noqa: E402, F401
-    _get_tiktoken_encoding_for_model,
-    count_text_tokens,
-    _extract_tool_call_from_reasoning,
-    _extract_assistant_content,
-    _call_with_empty_retry,
-    _is_empty_response,
-    _extract_assistant_content_from_sse,
-    _extract_delta_text_from_sse_chunk,
-    _normalize_outgoing_headers,
-    normalize_provider_name,
-    load_config,
-    setup_logging,
-)
-
-from .ui import (  # noqa: E402, F401
-    index as _ui_index,
-    status_events as _ui_status_events,
-    tail_logs as _ui_tail_logs,
-    view_logs as _ui_view_logs,
-    create_embeddings as _ui_create_embeddings,
-    proxy_openai_api as _ui_proxy_openai_api,
-    switch_model as _ui_switch_model,
-    list_session_recording_routes as _ui_list_session_recording_routes,
-    list_session_recordings as _ui_list_session_recordings,
-    get_session_recording as _ui_get_session_recording,
-    list_all_sessions as _ui_list_all_sessions,
+from .provider import (  # noqa: E402, F401
+    _is_connection_error,
+    _is_http_error_status,
+    _is_provider_unavailable,
+    _is_slot_exhaustion_response,
+    _parse_retry_after,
+    _provider_unavailable_until,
+    mark_provider_unavailable,
+    proxy_with_fallback,
+    proxy_with_remote_fallback,
+    resolve_provider,
 )
 from .router import (  # noqa: E402, F401
-    proxy_to_local,
-    proxy_to_remote,
     log_request,
     log_response,
     log_response_chunk,
+    proxy_to_local,
+    proxy_to_remote,
 )
-from .provider import (  # noqa: E402, F401
-    resolve_provider,
-    mark_provider_unavailable,
-    proxy_with_remote_fallback,
-    proxy_with_fallback,
-    _provider_unavailable_until,
-    _is_provider_unavailable,
-    _is_connection_error,
-    _is_http_error_status,
-    _is_slot_exhaustion_response,
-    _parse_retry_after,
+from .session import (  # noqa: E402, F401
+    ContentOnlyConsoleHandler,
+    SessionSingleFlightCoordinator,
+    SessionSingleFlightRejected,
+    SlotLockCoordinator,
+    _build_slot_context,
+    _call_slot_endpoint,
+    _classify_delta_routing,
+    _detect_restore_signal_from_llama_log,
+    _detect_restore_signal_from_log_slice,
+    _ensure_slot_dir,
+    _has_explicit_restore_signal,
+    _invalidate_session_and_slot,
+    _log_session_header_resolution,
+    _record_delta_payload_bytes,
+    _record_guardrail_cutoff,
+    _record_restore_fallback,
+    _record_restore_success,
+    _record_session_invalidation,
+    _record_single_flight_queue,
+    _record_single_flight_reject,
+    _resolve_session_id_header,
+    _restore_slot_snapshot,
+    # Session coordination helpers
+    _sanitize_session_id,
+    _save_slot_snapshot,
+    _should_cutoff_for_repetition,
+    _should_invalidate_on_guardrail,
+    _slot_filename_for_session,
+    _slot_id_for_session,
+    _slot_persistence_enabled,
+    evaluate_stream_guardrail,
+    extract_streamed_content_from_chunk,
+    merge_session_history_for_update,
+    session_guardrail_observability,
+    session_restore_observability,
+    session_single_flight_coordinator,
+    session_single_flight_observability,
+    slot_lock_coordinator,
 )
-
+from .ui import (
+    create_embeddings as _ui_create_embeddings,
+)
+from .ui import (  # noqa: E402
+    index as _ui_index,
+)
+from .ui import (
+    proxy_openai_api as _ui_proxy_openai_api,
+)
+from .ui import (
+    status_events as _ui_status_events,
+)
+from .ui import (
+    switch_model as _ui_switch_model,
+)
+from .ui import (
+    tail_logs as _ui_tail_logs,
+)
+from .ui import (
+    view_logs as _ui_view_logs,
+)
+from .utils import (  # noqa: E402, F401
+    _call_with_empty_retry,
+    _extract_assistant_content,
+    _extract_assistant_content_from_sse,
+    _extract_delta_text_from_sse_chunk,
+    _extract_tool_call_from_reasoning,
+    _get_tiktoken_encoding_for_model,
+    _is_empty_response,
+    _normalize_outgoing_headers,
+    count_text_tokens,
+    load_config,
+    normalize_provider_name,
+    setup_logging,
+)
 
 if __name__ == "__main__":
     main()

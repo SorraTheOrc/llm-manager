@@ -14,11 +14,11 @@ Functions in this module:
 import asyncio
 import json
 import time
-from typing import Optional
 
 import httpx
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+
 
 # Lazy server import — avoids circular imports when server.py imports us
 def _srv():
@@ -26,12 +26,16 @@ def _srv():
     return _m
 
 # Imports from sibling extracted modules
+import proxy.metrics as metrics  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
-    _is_self_healing_active,
-    _self_healing_response,
-    _resolve_slot_model_name,
     _compute_adaptive_timeout,
-    get_model_config,
+    _is_self_healing_active,
+    _resolve_slot_model_name,
+    _self_healing_response,
+)
+from proxy.observability import (  # noqa: E402
+    _increment_tokens,
+    _record_backend_signal,
 )
 from proxy.session import (  # noqa: E402
     SessionSingleFlightRejected,
@@ -39,22 +43,18 @@ from proxy.session import (  # noqa: E402
     _detect_restore_signal_from_llama_log,
     _detect_restore_signal_from_log_slice,
     _has_explicit_restore_signal,
-    _restore_slot_snapshot,
-    _save_slot_snapshot,
     _record_guardrail_cutoff,
     _record_restore_success,
-    evaluate_stream_guardrail,
+    _restore_slot_snapshot,
+    _save_slot_snapshot,
     _should_invalidate_on_guardrail,
+    evaluate_stream_guardrail,
     extract_streamed_assistant_message_from_sse,
     merge_session_history_for_update,
     session_single_flight_coordinator,
     slot_lock_coordinator,
 )
-from proxy.observability import (  # noqa: E402
-    _increment_tokens,
-    _record_backend_signal,
-)
-import proxy.metrics as metrics  # noqa: E402
+
 # legacy alias for convenience
 record_http_error = metrics.record_http_error
 
@@ -65,18 +65,18 @@ from proxy.utils import (  # noqa: E402
     count_text_tokens,
 )
 
-from proxy.slot_scheduler import JobScheduler, AdmitResult  # noqa: E402
-
 # Imports from sibling router helpers
-from .router_helpers import (  # noqa: E402
+from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _build_backend_error_response,
     _build_backend_unavailable_response,
+    _call_with_backend_retries,
+    _call_with_empty_retry,
     _check_slot_availability,
-    _cleanup_stale_local_dispatch,
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
     _estimate_tokens_sent,
+    _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
@@ -84,85 +84,13 @@ from .router_helpers import (  # noqa: E402
     _normalize_outgoing_headers,
     _schedule_recv_token_increment,
     _schedule_token_increment,
+    _schedule_traffic_recording,
     _try_acquire_local_dispatch,
-    _get_lease_timeout_seconds,
-    _call_with_backend_retries,
-    _call_with_empty_retry,
-    normalize_upstream_request_headers,
     log_request,
     log_response,
     log_response_chunk,
+    normalize_upstream_request_headers,
 )
-
-from .router_helpers import (  # noqa: E402, F401
-    _schedule_traffic_recording,
-)
-
-
-# ===================================================================
-# Job-level slot scheduler (global, lazy-initialized from config)
-# ===================================================================
-
-_job_scheduler: Optional[JobScheduler] = None
-_job_scheduler_initialized: bool = False
-
-
-def _get_job_scheduler() -> Optional[JobScheduler]:
-    """
-    Return the global JobScheduler, initialising it from config on first call.
-    Returns None if slot management is not configured.
-    """
-    global _job_scheduler, _job_scheduler_initialized
-    if _job_scheduler_initialized:
-        return _job_scheduler
-
-    _job_scheduler_initialized = True
-    srv = _srv()
-    slot_config = srv.config.get("slot_management", {})
-    if not slot_config:
-        srv.logger.info(
-            "scheduler not initialized: slot_management config missing, "
-            "using hash-based slot assignment",
-        )
-        return None
-
-    pool_size = int(slot_config.get("slot_pool_size", 0) or 0)
-    if pool_size < 1:
-        srv.logger.info(
-            "scheduler not initialized: pool_size=%s < 1, "
-            "using hash-based slot assignment",
-            pool_size,
-        )
-        return None
-
-    _job_scheduler = JobScheduler(
-        pool_size=pool_size,
-        max_queue_depth=int(slot_config.get("slot_queue_max_depth", 16) or 16),
-        job_timeout=float(slot_config.get("slot_job_timeout_seconds", 300.0) or 300.0),
-        queue_overflow_retry_after=float(
-            slot_config.get("slot_queue_overflow_retry_after", 900) or 900
-        ),
-        max_request_duration=float(
-            slot_config.get("slot_max_request_duration_seconds", 600.0) or 600.0
-        ),
-    )
-    # Wire scheduler into SlotLockCoordinator
-    slot_lock_coordinator.set_scheduler(_job_scheduler)
-    return _job_scheduler
-
-
-def _scheduler_has_idle_slot() -> bool:
-    """
-    Check whether the JobScheduler has at least one idle slot.
-
-    Returns ``True`` if there is an idle slot (the request can be served),
-    ``False`` if all slots are busy (the request would be queued).
-    Returns ``True`` when no scheduler is active (no slot management).
-    """
-    scheduler = _get_job_scheduler()
-    if scheduler is None:
-        return True
-    return scheduler.has_idle_slot()
 
 
 def _get_local_max_concurrent_queries(server_config: dict) -> int:
@@ -208,10 +136,10 @@ def _get_local_active_count(srv) -> int:
 
 
 def _build_session_headers(
-    session_id: Optional[str],
+    session_id: str | None,
     session_created: bool,
     is_delta_request: bool,
-    session_fallback_reason: Optional[str],
+    session_fallback_reason: str | None,
 ) -> dict:
     """Build the X-Session-* response headers common to both paths."""
     headers = {}
@@ -264,21 +192,21 @@ def _get_guardrail_config(server_config: dict) -> dict:
 
 async def _update_session_and_slot(
     srv,
-    session_id: Optional[str],
+    session_id: str | None,
     body_json: dict,
     is_delta_request: bool,
     delta_messages: list,
     original_message_count: int,
     response,
     llama_port: int,
-    slot_id: Optional[str],
-    slot_filename: Optional[str],
+    slot_id: str | None,
+    slot_filename: str | None,
     slot_timeout: float,
-    slot_model_payload: Optional[str],
+    slot_model_payload: str | None,
     slot_enabled: bool,
     upstream_status: int,
     slot_save_allowed: bool = True,
-    collected_content: Optional[list] = None,
+    collected_content: list | None = None,
     llama_log_path=None,
     llama_log_offset: int = 0,
 ) -> None:
@@ -400,20 +328,38 @@ async def _update_session_and_slot(
                     session_id[:8] if session_id else "unknown",
                     slot_id,
                 )
+                # Update per-session cached-tokens ratio (LP-0MRMMBZ7T007ER59)
+                if session_id and srv.current_model:
+                    try:
+                        from proxy.provider import update_cached_ratio
+                        update_cached_ratio(
+                            srv.current_model,
+                            session_id,
+                            cached_tokens=1,
+                            prompt_tokens=1,
+                        )
+                    except Exception:
+                        srv.logger.debug(
+                            "update_cached_ratio failed", exc_info=True
+                        )
+
         except Exception:
             srv.logger.debug("slot_save failed", exc_info=True)
 
 
-async def _release_scheduler_and_decrement(
+async def _cleanup_after_request(
     srv,
-    scheduler,
-    session_id: Optional[str],
-    slot_id: Optional[int],
+    session_id: str | None,
     disconnected: bool = False,
     decrement_local: bool = True,
     session_explicit: bool = False,
 ) -> None:
-    """Release scheduler slot and decrement active query counters.
+    """Decrement active query counters and clean up dispatch records.
+
+    The dispatch lease system (``_try_acquire_local_dispatch``) handles
+    concurrency gating, session ownership, and timeout-based release
+    independently. This cleanup ensures counters and lease records are
+    properly released after a request completes.
 
     When *disconnected* is True and *session_id* is known, any dispatch
     lease record for that session is also removed immediately (the client
@@ -423,17 +369,33 @@ async def _release_scheduler_and_decrement(
     corresponding dispatch record is marked as inactive with a future
     expires_at timestamp, keeping the lease alive for a returning session.
     """
-    if scheduler is not None:
-        if disconnected and session_id:
-            await scheduler.remove_job(session_id)
-        elif slot_id is not None:
-            await scheduler.mark_request_end(slot_id)
     await _decrement_active_queries(srv)
     if decrement_local:
         await _decrement_local_active_queries(
             srv,
-            session_key=session_id if session_explicit else None,
+            session_key=session_id,
         )
+        # For non-explicit sessions (no session affinity), immediately
+        # remove the dispatch record instead of letting it linger with
+        # a 60-second inactive lease — these one-shot sessions won't
+        # return, so accumulating inactive records would block slots.
+        if not session_explicit and session_id:
+            try:
+                lock = getattr(srv, "local_dispatch_records_lock", None)
+                if lock is not None:
+                    async with lock:
+                        records = getattr(srv, "local_dispatch_records", {})
+                        if session_id in records:
+                            del records[session_id]
+                            try:
+                                srv.logger.info(
+                                    "lease_released session=%s reason=non_explicit",
+                                    session_id[:8] if session_id else "unknown",
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
     # On client disconnect, immediately remove the dispatch lease record
     if disconnected and session_id:
@@ -529,50 +491,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     slot_timeout = 3.0
     slot_enabled = False
 
-    # Try job-level scheduler (slot management) first
-    scheduler = _get_job_scheduler()
-    if scheduler is not None and session_id:
-        admit_result = await scheduler.reenter_job(session_id)
-        if admit_result is None:
-            admit_result = await scheduler.admit_job(session_id)
-        if isinstance(admit_result, AdmitResult):
-            if admit_result.kind == "ASSIGNED":
-                slot_id = admit_result.slot_id
-                # Job owns the slot — no save/restore needed
-                slot_enabled = False
-                srv.logger.debug(
-                    "scheduler assigned slot %s to session %s",
-                    slot_id, session_id[:8] if session_id else "unknown",
-                )
-                await scheduler.mark_request_start(slot_id)
-            elif admit_result.kind == "QUEUED":
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"Slot unavailable: session {session_id[:8]} queued "
-                        f"at position {admit_result.position}"
-                    ),
-                    headers={"Retry-After": "30"},
-                )
-            elif admit_result.kind == "REJECTED_503":
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Queue full. Try again later.",
-                    headers={
-                        "Retry-After": str(
-                            int(admit_result.retry_after)
-                            if admit_result.retry_after
-                            else 900
-                        )
-                    },
-                )
-
-    # Fall back to hash-based slot context if no scheduler assigned a slot
-    if slot_id is None:
-        slot_id, slot_filename, slot_timeout = _build_slot_context(
-            server_config, session_id
-        )
-        slot_enabled = slot_id is not None and slot_filename is not None
+    # Use hash-based slot context (dispatch lease system handles concurrency gating)
+    slot_id, slot_filename, slot_timeout = _build_slot_context(
+        server_config, session_id
+    )
+    slot_enabled = slot_id is not None and slot_filename is not None
 
     # Log request with resolved session_id and slot_id (LP-0MQQSM1V7004QOGL)
     log_request(
@@ -730,7 +653,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not (session_id and session_explicit):
         await _increment_local_active_queries(
             srv,
-            session_key=session_id if session_explicit else None,
+            session_key=session_id,
             backend="local",
         )
 
@@ -741,7 +664,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
 
-    from proxy.session import _resolve_log_path  # noqa: E402
+    from proxy.session import _resolve_log_path
     llama_log_path = _resolve_log_path("llama")
     try:
         llama_log_offset = (
@@ -814,7 +737,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                     except Exception:
                         srv.backend_ready = False
-                        await _decrement_active_queries(srv)
+                        await _cleanup_after_request(
+                            srv, session_id,
+                            decrement_local=True,
+                            session_explicit=session_explicit,
+                        )
                         try:
                             await client.aclose()
                         except Exception:
@@ -868,7 +795,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 is_delta_request, session_fallback_reason,
                             )
                         )
-                        await _decrement_active_queries(srv)
+                        await _cleanup_after_request(
+                            srv, session_id,
+                            decrement_local=True,
+                            session_explicit=session_explicit,
+                        )
                         return Response(
                             content=body_bytes,
                             status_code=upstream_status,
@@ -896,7 +827,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         "content-type", "text/event-stream"
                     )
 
-                    guardrail_reason: Optional[str] = None
+                    guardrail_reason: str | None = None
                     guardrail_response_text = ""
                     completion_tokens_total = 0
                     stream_start = time.monotonic()
@@ -1178,8 +1109,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                                 session_id,
                                                 f"guardrail_{guardrail_reason}",
                                                 slot_filename,
-                                                scheduler=scheduler,
-                                                scheduler_slot_id=slot_id,
                                             )
                                             slot_save_allowed = False
                                         break
@@ -1235,7 +1164,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 }
                                 final_bytes = (
                                     f"data: {json.dumps(final_obj)}\n\n"
-                                ).encode("utf-8")
+                                ).encode()
                                 yield final_bytes
                                 log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
@@ -1266,7 +1195,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             }
                             final_bytes = (
                                 f"data: {json.dumps(final_obj)}\n\n"
-                            ).encode("utf-8")
+                            ).encode()
                             yield final_bytes
                             log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
@@ -1300,18 +1229,18 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # configurable timeout so that an unresponsive upstream
                             # (llama-server stalled mid-stream) does not block the
                             # generator cleanup, which would prevent session counter
-                            # and scheduler slot release (LP-0MRE7CMVZ002D2QU).
+                            # and dispatch lease release (LP-0MRE7CMVZ002D2QU).
                             disconnect_cleanup_timeout = server_config.get("disconnect_cleanup_timeout", 5.0)
                             try:
                                 await asyncio.wait_for(
                                     cm.__aexit__(None, None, None),
                                     timeout=disconnect_cleanup_timeout,
                                 )
-                            except (asyncio.TimeoutError, Exception):
+                            except (TimeoutError, Exception):
                                 pass
                             try:
                                 await asyncio.wait_for(client.aclose(), timeout=disconnect_cleanup_timeout)
-                            except (asyncio.TimeoutError, Exception):
+                            except (TimeoutError, Exception):
                                 pass
                             # Clean up the pending _stream_iter future if the
                             # stream_generator used FIRST_COMPLETED waiting.
@@ -1350,8 +1279,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # has finished (LP-0MR96QL8400022BW: streaming path was
                             # not decrementing local_active_queries, causing subsequent
                             # requests to the same session to be rejected with 503).
-                            await _release_scheduler_and_decrement(
-                                srv, scheduler, session_id, slot_id,
+                            await _cleanup_after_request(
+                                srv, session_id,
                                 disconnected=disconnected,
                                 decrement_local=True,
                                 session_explicit=session_explicit,
@@ -1364,8 +1293,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         status_code=upstream_status,
                     )
         except SessionSingleFlightRejected as exc:
-            await _release_scheduler_and_decrement(
-                srv, scheduler, session_id, slot_id,
+            await _cleanup_after_request(
+                srv, session_id,
                 decrement_local=False,
             )
             # Clean up any dispatch record that was created before the rejection
@@ -1527,14 +1456,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 headers=resp_headers,
                             )
                     finally:
-                        await _release_scheduler_and_decrement(
-                            srv, scheduler, session_id, slot_id,
+                        await _cleanup_after_request(
+                            srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
                         )
         except SessionSingleFlightRejected as exc:
-            await _release_scheduler_and_decrement(
-                srv, scheduler, session_id, slot_id,
+            await _cleanup_after_request(
+                srv, session_id,
                 decrement_local=True,
             )
             # Clean up any dispatch record that was created before the rejection
@@ -1561,11 +1490,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             return JSONResponse(status_code=429, content=payload)
 
 # Backward-compatibility re-exports for tests
-from .router_helpers import (  # noqa: E402, F401
+from .proxy_remote import (  # noqa: E402, F401
+    proxy_to_remote,
+)
+from .router_helpers import (  # noqa: E402, F811
     log_request,
     log_response,
     log_response_chunk,
-)
-from .proxy_remote import (  # noqa: E402, F401
-    proxy_to_remote,
 )

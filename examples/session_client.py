@@ -23,7 +23,6 @@ import argparse
 import json
 import sys
 import time
-from typing import Optional
 
 try:
     import httpx
@@ -36,7 +35,7 @@ def make_request(
     url: str,
     messages: list[dict],
     model: str,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     stream: bool = False,
 ) -> tuple[dict, dict, float]:
     """Send a chat completion request with optional session header.
@@ -79,7 +78,7 @@ def make_request(
 
 
 def run_session_conversation(
-    url: str, model: str, turns: int, session_id: Optional[str] = None
+    url: str, model: str, turns: int, session_id: str | None = None
 ) -> None:
     """Run a multi-turn conversation using session-based incremental ingestion.
 
@@ -94,7 +93,7 @@ def run_session_conversation(
     ]
 
     print(f"\n{'='*60}")
-    print(f"Session Client Example")
+    print("Session Client Example")
     print(f"URL: {url}  Model: {model}  Turns: {turns}")
     print(f"{'='*60}\n")
 
@@ -145,7 +144,7 @@ def run_session_conversation(
 
     # Summary
     print(f"{'='*60}")
-    print(f"Session Summary")
+    print("Session Summary")
     print(f"  Session ID: {session_header}")
     print(f"  Total turns: {turns}")
     print(f"  Total messages in conversation: {len(conversation)}")
@@ -160,7 +159,7 @@ def run_comparison(url: str, model: str, turns: int = 3) -> None:
     This demonstrates the latency benefit of session-based incremental ingestion.
     """
     print(f"\n{'#'*60}")
-    print(f"# COMPARISON: With Session vs Without Session")
+    print("# COMPARISON: With Session vs Without Session")
     print(f"# {turns} turns each, model: {model}")
     print(f"{'#'*60}\n")
 
@@ -183,7 +182,7 @@ def run_comparison(url: str, model: str, turns: int = 3) -> None:
         print(f"  Turn {turn}: {elapsed:.2f}s ({len(conversation)} messages)")
 
     # Reset conversation for session-based
-    print(f"\n>>> WITH SESSION (incremental ingestion)")
+    print("\n>>> WITH SESSION (incremental ingestion)")
     print("-" * 40)
     conversation2: list[dict] = [
         {"role": "system", "content": "You are a helpful assistant. Be concise."}
@@ -206,7 +205,7 @@ def run_comparison(url: str, model: str, turns: int = 3) -> None:
 
     # Summary comparison
     print(f"\n{'='*60}")
-    print(f"COMPARISON SUMMARY")
+    print("COMPARISON SUMMARY")
     print(f"  Without session: {', '.join(f'{t:.2f}s' for t in times_no_session)}")
     print(f"  With session:    {', '.join(f'{t:.2f}s' for t in times_with_session)}")
     avg_no = sum(times_no_session) / len(times_no_session)

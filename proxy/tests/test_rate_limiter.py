@@ -10,14 +10,11 @@ Tests cover:
 - remaining() helper
 """
 
-import asyncio
 import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from proxy.rate_limiter import SlidingWindowRateLimiter, get_rate_limiter
-
 
 # ---------------------------------------------------------------------------
 # SlidingWindowRateLimiter unit tests
@@ -66,7 +63,7 @@ async def test_sliding_window_expiry(limiter):
 
     try:
         fake_now = 1000.0
-        call_count = 0
+        _call_count = 0
 
         def _fake_monotonic():
             nonlocal fake_now
@@ -203,7 +200,7 @@ async def test_rate_limiter_check_called_in_provider_fallback():
         # Call the fallback function.  The rate limiter should allow the first
         # few requests and return the upstream 429.  Since there's only one
         # provider, the result should be an "all providers exhausted" response.
-        resp = await proxy_with_remote_fallback(request, "v1/chat/completions", model_config, config)
+        _resp = await proxy_with_remote_fallback(request, "v1/chat/completions", model_config, config)
 
         # The rate limiter should have been checked and incremented for
         # "test-rl-provider" (5 rpm).  We can verify by checking remaining count.

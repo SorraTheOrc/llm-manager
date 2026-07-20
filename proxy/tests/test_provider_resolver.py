@@ -9,11 +9,10 @@ Tests for:
 - Integration: Free-model fallback chain exercise.
 """
 
-import pytest
 from unittest.mock import patch
 
 import proxy.provider_resolver as resolver
-
+import pytest
 
 # ---------------------------------------------------------------------------
 # Fixtures

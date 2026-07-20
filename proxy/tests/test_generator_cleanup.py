@@ -12,14 +12,12 @@ Acceptance criteria covered:
 - AC6: New disconnect cleanup test
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
 import pytest
 from fastapi.responses import StreamingResponse
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -239,7 +237,7 @@ async def test_remote_proxy_normal_completion_with_finish_marker(remote_setup):
         mock_client.aclose = AsyncMock()
         mock_client_cls.return_value = mock_client
 
-        with patch("proxy.proxy_remote.log_response_chunk") as mock_log:
+        with patch("proxy.proxy_remote.log_response_chunk") as _mock_log:
             result = await _handle_remote_streaming(
                 remote_setup,
                 "http://fake.api/v1/chat/completions",
@@ -357,6 +355,7 @@ async def test_router_proxy_aclose_cleanup_no_runtime_error():
     """
     import ast
     import inspect
+
     from proxy import router as router_mod
 
     # Read the source to verify no yield in finally in router.py

@@ -12,8 +12,8 @@ concurrent processing chains for the same logical request.
 import asyncio
 import hashlib
 import json
-import time
-from typing import Any, Callable, Coroutine, Dict, Optional, Tuple
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 from fastapi import Response
 
@@ -34,7 +34,7 @@ class RequestCoalescer:
     """
 
     def __init__(self, max_retained: int = 256) -> None:
-        self._in_flight: Dict[Tuple[str, str], asyncio.Future] = {}
+        self._in_flight: dict[tuple[str, str], asyncio.Future] = {}
         self._lock = asyncio.Lock()
         self._max_retained = max_retained
 
@@ -45,7 +45,7 @@ class RequestCoalescer:
     async def coalesce_or_execute(
         self,
         path: str,
-        body: Optional[bytes],
+        body: bytes | None,
         coro_factory: Callable[[], Coroutine[Any, Any, Response]],
     ) -> Response:
         """Execute ``coro_factory()``, coalescing in-flight duplicates.
@@ -126,7 +126,7 @@ class RequestCoalescer:
 
     async def _execute_leader(
         self,
-        key: Tuple[str, str],
+        key: tuple[str, str],
         coro_factory: Callable[[], Coroutine[Any, Any, Response]],
     ) -> Response:
         """Execute the factory, store the result, and clean up."""
@@ -166,7 +166,7 @@ class RequestCoalescer:
                 self._in_flight.pop(key, None)
 
     @staticmethod
-    def _hash_body(body: Optional[bytes]) -> str:
+    def _hash_body(body: bytes | None) -> str:
         """Deterministic hash of request body.
 
         For JSON bodies, we parse and re-serialize with sorted keys so that
@@ -218,7 +218,7 @@ class RequestCoalescer:
 # Module-level convenience
 # ---------------------------------------------------------------------------
 
-_coalescer: Optional[RequestCoalescer] = None
+_coalescer: RequestCoalescer | None = None
 
 
 def get_coalescer() -> RequestCoalescer:

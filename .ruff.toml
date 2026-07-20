@@ -1,0 +1,21 @@
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = [
+    "F",      # Pyflakes (logic errors)
+    "E",      # Pycodestyle (errors)
+    "W",      # Pycodestyle (warnings)
+    "I",      # isort (import sorting)
+    "N",      # PEP 8 naming conventions
+    "UP",     # pyupgrade (modern Python)
+    "RUF100", # Ruff-specific: detect unused noqa directives
+]
+
+ignore = [
+    "E501",   # Line length is advisory; project uses 120 chars
+]
+
+# Test-specific overrides
+# Permit assert (S101), print (T201), and unused imports in test files
+per-file-ignores = { "tests/*" = ["S101", "T201", "F401"], "proxy/tests/*" = ["S101", "T201", "F401"] }

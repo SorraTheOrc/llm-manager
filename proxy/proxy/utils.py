@@ -11,9 +11,9 @@ import json
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 import yaml
@@ -73,7 +73,7 @@ def count_text_tokens(text: str, model_name: str | None = None) -> int:
 # Provider / identifier helpers
 # ===================================================================
 
-def normalize_provider_name(name: Optional[str]) -> Optional[str]:
+def normalize_provider_name(name: str | None) -> str | None:
     """Normalize provider display/identifier strings.
 
     Current compatibility rules:
@@ -94,7 +94,7 @@ def normalize_provider_name(name: Optional[str]) -> Optional[str]:
 # Tool call and response extraction helpers
 # ===================================================================
 
-def _extract_tool_call_from_reasoning(reasoning_content: Optional[str]) -> Optional[str]:
+def _extract_tool_call_from_reasoning(reasoning_content: str | None) -> str | None:
     """Extract a tool call XML pattern from reasoning_content.
 
     When a model with thinking mode enabled (like Qwen3) generates tool calls
@@ -113,7 +113,7 @@ def _extract_tool_call_from_reasoning(reasoning_content: Optional[str]) -> Optio
     return None
 
 
-def _extract_assistant_content(resp_json: dict) -> Optional[str]:
+def _extract_assistant_content(resp_json: dict) -> str | None:
     """Extract assistant content from a non-streaming OpenAI-style response.
 
     Prefer explicit message.content when it is non-empty. If message.content
@@ -173,7 +173,7 @@ def _extract_assistant_content(resp_json: dict) -> Optional[str]:
     return None
 
 
-def _is_empty_response(response_text: str, resp_json: Optional[dict] = None) -> bool:
+def _is_empty_response(response_text: str, resp_json: dict | None = None) -> bool:
     """Check if a response is effectively empty (no content, no tool calls).
 
     Used to detect cases where the model generates thinking content but
@@ -208,7 +208,7 @@ def _is_empty_response(response_text: str, resp_json: Optional[dict] = None) -> 
     return True
 
 
-def _extract_assistant_content_from_sse(sse_text: str) -> Optional[str]:
+def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
     """Extract concatenated assistant content from SSE stream text.
 
     Parses 'data: {json}' lines, extracting delta.content from each chunk.
@@ -411,7 +411,7 @@ def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dic
 # Config loading
 # ===================================================================
 
-def load_config(config_path: Optional[str] = None) -> dict:
+def load_config(config_path: str | None = None) -> dict:
     """Load configuration from YAML file."""
     if config_path is None:
         config_path = os.environ.get(
@@ -419,7 +419,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
             str(Path(__file__).parent.parent / "config.yaml")
         )
 
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
     # Validate system_prompt configurations

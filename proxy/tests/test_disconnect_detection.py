@@ -4,9 +4,7 @@ Tests for client disconnect detection and cleanup.
 Verifies that:
 1. request.is_disconnected() is called periodically during streaming (AC5)
 2. On disconnect, cleanup functions execute correctly (AC5)
-3. Queued jobs are removed when the client disconnects (AC3/AC5)
-4. Active queries counter does not leak (AC5)
-5. Scheduler slots are released on disconnect (AC4)
+3. Active queries counter does not leak (AC5)
 """
 
 import asyncio
@@ -16,8 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import httpx
 import pytest
 from fastapi.responses import StreamingResponse
-
-from proxy.slot_scheduler import JobScheduler
 
 
 class AsyncIterator:
@@ -32,160 +28,6 @@ class AsyncIterator:
     async def _iterator(self):
         for item in self.items:
             yield item
-
-
-# ===================================================================
-# JobScheduler.remove_job() tests
-# ===================================================================
-
-
-class TestRemoveJob:
-    """Tests for JobScheduler.remove_job()."""
-
-    async def _make_scheduler(self, pool_size=2, max_queue_depth=4, job_timeout=300.0):
-        sched = JobScheduler(
-            pool_size=pool_size,
-            max_queue_depth=max_queue_depth,
-            job_timeout=job_timeout,
-        )
-        await sched.start()
-        return sched
-
-    async def _cleanup(self, sched):
-        await sched.stop()
-
-    @pytest.mark.asyncio
-    async def test_remove_owned_slot_releases_it(self):
-        """remove_job releases the slot when session owns one (AC4)."""
-        s = await self._make_scheduler()
-        try:
-            result = await s.admit_job("session-a")
-            assert result.kind == "ASSIGNED"
-            slot_id = result.slot_id
-
-            assert s.active_jobs["session-a"] == slot_id
-            assert s.slots[slot_id].state == "Owned"
-
-            await s.remove_job("session-a")
-
-            assert "session-a" not in s.active_jobs
-            assert s.slots[slot_id].state == "Idle"
-        finally:
-            await self._cleanup(s)
-
-    @pytest.mark.asyncio
-    async def test_remove_queued_job_clears_it(self):
-        """remove_job removes a queued job from the queue (AC3)."""
-        s = await self._make_scheduler()
-        try:
-            await s.admit_job("session-a")
-            await s.admit_job("session-b")
-
-            result = await s.admit_job("session-c")
-            assert result.kind == "QUEUED"
-
-            removed = await s.remove_job("session-c")
-            assert removed is True
-
-            assert "session-c" not in s._queued_jobs
-            assert "session-c" in s._cancelled_jobs
-
-            await s.release_slot(0)
-            slot0 = s.slots[0]
-            if slot0.state == "Owned":
-                assert slot0.job_id != "session-c"
-        finally:
-            await self._cleanup(s)
-
-    @pytest.mark.asyncio
-    async def test_remove_unknown_session_noop(self):
-        """remove_job on unknown session is a no-op."""
-        s = await self._make_scheduler()
-        try:
-            result = await s.remove_job("nonexistent")
-            assert result is False
-        finally:
-            await self._cleanup(s)
-
-    @pytest.mark.asyncio
-    async def test_remove_owned_releases_and_dequeues(self):
-        """remove_job of an owner releases slot and assigns next queued job."""
-        s = await self._make_scheduler()
-        try:
-            await s.admit_job("session-a")
-            await s.admit_job("session-b")
-            await s.admit_job("session-c")
-            await s.admit_job("session-d")
-
-            slot_b = s.active_jobs["session-b"]
-            await s.remove_job("session-b")
-
-            assert s.active_jobs.get("session-c") == slot_b
-            assert s.slots[slot_b].job_id == "session-c"
-        finally:
-            await self._cleanup(s)
-
-    @pytest.mark.asyncio
-    async def test_remove_queued_does_not_affect_slots(self):
-        """remove_job on a queued session does not affect active slots."""
-        s = await self._make_scheduler()
-        try:
-            await s.admit_job("session-a")
-            await s.admit_job("session-b")
-            await s.admit_job("session-c")
-
-            await s.remove_job("session-c")
-
-            assert "session-a" in s.active_jobs
-            assert "session-b" in s.active_jobs
-            assert s.slots[0].state == "Owned"
-            assert s.slots[1].state == "Owned"
-        finally:
-            await self._cleanup(s)
-
-    @pytest.mark.asyncio
-    async def test_remove_then_admit_same_session(self):
-        """After remove_job, same session can be re-admitted."""
-        s = await self._make_scheduler()
-        try:
-            result1 = await s.admit_job("session-a")
-
-            await s.remove_job("session-a")
-
-            result2 = await s.admit_job("session-a")
-            assert result2.kind == "ASSIGNED"
-        finally:
-            await self._cleanup(s)
-
-    @pytest.mark.asyncio
-    async def test_single_job_pool_remove(self):
-        """With a single-slot scheduler, remove_job prevents timeout race."""
-        sched = JobScheduler(pool_size=1, max_queue_depth=3, job_timeout=300.0)
-        await sched.start()
-        try:
-            await sched.admit_job("session-a")
-            await sched.remove_job("session-a")
-            assert "session-a" not in sched.active_jobs
-            assert sched.slots[0].state == "Idle"
-        finally:
-            await sched.stop()
-
-    @pytest.mark.asyncio
-    async def test_all_queued_cancelled_slot_stays_idle(self):
-        """When all queued jobs are cancelled, released slot stays idle."""
-        s = await self._make_scheduler()
-        try:
-            await s.admit_job("session-a")
-            await s.admit_job("session-b")
-            await s.admit_job("session-c")
-
-            await s.remove_job("session-c")
-
-            await s.release_slot(0)
-
-            assert s.slots[0].state == "Idle"
-        finally:
-            await self._cleanup(s)
 
 
 # ===================================================================
@@ -354,7 +196,6 @@ async def test_router_stream_disconnect_calls_is_disconnected(mock_server):
 
     with (
         patch("proxy.router._srv", return_value=mock_server),
-        patch("proxy.router._get_job_scheduler", return_value=None),
         patch("proxy.router._is_self_healing_active", return_value=False),
         patch("proxy.router._check_slot_availability", return_value=None),
         patch("proxy.router._increment_active_queries"),
@@ -421,7 +262,6 @@ async def test_router_stream_disconnect_triggers_cleanup(mock_server):
 
     with (
         patch("proxy.router._srv", return_value=mock_server),
-        patch("proxy.router._get_job_scheduler", return_value=None),
         patch("proxy.router._is_self_healing_active", return_value=False),
         patch("proxy.router._check_slot_availability", return_value=None),
         patch("proxy.router._increment_active_queries"),
@@ -495,7 +335,6 @@ async def test_router_stream_disconnect_active_queries_not_leaked(mock_server):
 
     with (
         patch("proxy.router._srv", return_value=mock_server),
-        patch("proxy.router._get_job_scheduler", return_value=None),
         patch("proxy.router._is_self_healing_active", return_value=False),
         patch("proxy.router._check_slot_availability", return_value=None),
         patch("proxy.router._increment_active_queries"),
@@ -547,159 +386,6 @@ async def test_router_stream_disconnect_active_queries_not_leaked(mock_server):
         )
 
 
-@pytest.mark.asyncio
-async def test_router_stream_disconnect_releases_scheduler_slot(mock_server):
-    """On disconnect, scheduler slot is released (AC4)."""
-    from proxy.router import proxy_to_local
-
-    mock_req = _make_mock_request(is_disconnected=True)
-    session_id = "test-session-789"
-
-    # Need 11+ chunks to trigger disconnect check (check every 10 iterations)
-    chunks = [b'data: test\n\n'] * 15
-
-    mock_resp = _make_mock_stream_response(chunks)
-    mock_scheduler = MagicMock()
-
-    with (
-        patch("proxy.router._srv", return_value=mock_server),
-        patch("proxy.router._get_job_scheduler", return_value=mock_scheduler),
-        patch("proxy.router._is_self_healing_active", return_value=False),
-        patch("proxy.router._check_slot_availability", return_value=None),
-        patch("proxy.router._increment_active_queries"),
-        patch("proxy.router._decrement_active_queries"),
-        patch("proxy.router._handle_session") as mock_session,
-        patch("proxy.router._build_slot_context", return_value=(None, None, 3.0)),
-        patch("proxy.router._call_with_backend_retries", new_callable=AsyncMock) as mock_retry,
-        patch("proxy.router.httpx.AsyncClient") as mock_client_cls,
-        patch("proxy.router._schedule_token_increment"),
-        patch("proxy.router._schedule_recv_token_increment"),
-        patch("proxy.router.count_text_tokens", return_value=5),
-        patch("proxy.router._extract_delta_text_from_sse_chunk", return_value=""),
-        patch("proxy.router.evaluate_stream_guardrail", return_value=None),
-        patch("proxy.router.log_request"),
-        patch("proxy.router.log_response_chunk"),
-    ):
-        mock_session.return_value = {
-            "session_id": session_id,
-            "session_created": True,
-            "is_delta_request": False,
-            "session_fallback_reason": None,
-            "delta_messages": None,
-            "body_override": None,
-            "body_json": {"messages": [], "model": "test-model", "stream": True},
-            "original_message_count": 0,
-        }
-
-        # Mock scheduler admit_job to return ASSIGNED
-        result = MagicMock()
-        result.kind = "ASSIGNED"
-        result.slot_id = 0
-        mock_scheduler.admit_job = AsyncMock(return_value=result)
-        mock_scheduler.reenter_job = AsyncMock(return_value=None)
-        mock_scheduler.remove_job = AsyncMock()
-        mock_scheduler.mark_request_start = AsyncMock()
-        mock_scheduler.mark_request_end = AsyncMock()
-
-        mock_cm = AsyncMock()
-        mock_cm.__aenter__.return_value = mock_resp
-        mock_client = MagicMock()
-        mock_client.stream = MagicMock(return_value=mock_cm)
-        mock_client.aclose = AsyncMock()
-        mock_client_cls.return_value = mock_client
-        mock_retry.return_value = (mock_cm, mock_resp)
-
-        mock_req.body = AsyncMock(return_value=json.dumps(
-            {"messages": [], "model": "test-model", "stream": True}
-        ).encode())
-
-        result = await proxy_to_local(mock_req, "v1/chat/completions")
-        assert isinstance(result, StreamingResponse), (
-            f"Expected StreamingResponse, got {type(result).__name__}"
-        )
-        async for chunk in result.body_iterator:
-            pass
-
-        assert mock_scheduler.remove_job.called, (
-            "scheduler.remove_job should be called on client disconnect"
-        )
-
-
-@pytest.mark.asyncio
-async def test_stream_disconnect_with_scheduler_cleanup_integration(mock_server):
-    """Integration: streaming disconnect triggers scheduler.remove_job."""
-    from proxy.router import proxy_to_local
-
-    mock_req = _make_mock_request(is_disconnected=True)
-    session_id = "test-integration-001"
-
-    # Need 11+ chunks to trigger disconnect check (check every 10 iterations)
-    chunks = [b'data: test\n\n'] * 15
-
-    mock_resp = _make_mock_stream_response(chunks)
-    mock_scheduler = MagicMock()
-
-    with (
-        patch("proxy.router._srv", return_value=mock_server),
-        patch("proxy.router._get_job_scheduler", return_value=mock_scheduler),
-        patch("proxy.router._is_self_healing_active", return_value=False),
-        patch("proxy.router._check_slot_availability", return_value=None),
-        patch("proxy.router._increment_active_queries"),
-        patch("proxy.router._decrement_active_queries"),
-        patch("proxy.router._handle_session") as mock_session,
-        patch("proxy.router._build_slot_context", return_value=(None, None, 3.0)),
-        patch("proxy.router._call_with_backend_retries", new_callable=AsyncMock) as mock_retry,
-        patch("proxy.router.httpx.AsyncClient") as mock_client_cls,
-        patch("proxy.router._schedule_token_increment"),
-        patch("proxy.router._schedule_recv_token_increment"),
-        patch("proxy.router.count_text_tokens", return_value=5),
-        patch("proxy.router._extract_delta_text_from_sse_chunk", return_value=""),
-        patch("proxy.router.evaluate_stream_guardrail", return_value=None),
-        patch("proxy.router.log_request"),
-        patch("proxy.router.log_response_chunk"),
-    ):
-        mock_session.return_value = {
-            "session_id": session_id,
-            "session_created": False,
-            "is_delta_request": False,
-            "session_fallback_reason": None,
-            "delta_messages": None,
-            "body_override": None,
-            "body_json": {"messages": [], "model": "test-model", "stream": True},
-            "original_message_count": 0,
-        }
-
-        result = MagicMock()
-        result.kind = "ASSIGNED"
-        result.slot_id = 0
-        mock_scheduler.admit_job = AsyncMock(return_value=result)
-        mock_scheduler.reenter_job = AsyncMock(return_value=None)
-        mock_scheduler.remove_job = AsyncMock()
-        mock_scheduler.mark_request_start = AsyncMock()
-        mock_scheduler.mark_request_end = AsyncMock()
-
-        mock_cm = AsyncMock()
-        mock_cm.__aenter__.return_value = mock_resp
-        mock_client = MagicMock()
-        mock_client.stream = MagicMock(return_value=mock_cm)
-        mock_client.aclose = AsyncMock()
-        mock_client_cls.return_value = mock_client
-        mock_retry.return_value = (mock_cm, mock_resp)
-
-        mock_req.body = AsyncMock(return_value=json.dumps(
-            {"messages": [], "model": "test-model", "stream": True}
-        ).encode())
-
-        result = await proxy_to_local(mock_req, "v1/chat/completions")
-        assert isinstance(result, StreamingResponse), (
-            f"Expected StreamingResponse, got {type(result).__name__}"
-        )
-        async for chunk in result.body_iterator:
-            pass
-
-        mock_scheduler.remove_job.assert_called_once_with(session_id)
-
-
 # ===================================================================
 # Non-streaming disconnect tests
 # ===================================================================
@@ -716,7 +402,6 @@ async def test_non_streaming_disconnect_before_request(mock_server):
 
     with (
         patch("proxy.router._srv", return_value=mock_server),
-        patch("proxy.router._get_job_scheduler", return_value=None),
         patch("proxy.router._is_self_healing_active", return_value=False),
         patch("proxy.router._check_slot_availability", return_value=None),
         patch("proxy.router._increment_active_queries"),

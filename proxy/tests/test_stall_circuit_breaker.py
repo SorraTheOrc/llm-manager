@@ -14,13 +14,9 @@ Tests cover:
 
 import asyncio
 import time
-from collections import deque
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 import proxy.provider as provider_mod
-
+import pytest
 
 # ===================================================================
 # Test helpers
@@ -166,7 +162,7 @@ def test_stalls_outside_window_not_counted(monkeypatch):
     # Only 1 stall remains in the window, but we add 2 more
     cb.record_stall("provider-b")  # 3rd stall within window
     stepper.advance(10)
-    triggered = cb.record_stall("provider-b")  # 4th stall within window
+    _triggered = cb.record_stall("provider-b")  # 4th stall within window
 
     # Should have triggered on the 4th stall (3 within window: 3rd + 4th + one
     # of the earlier ones depends on timing — let's be more precise)
@@ -360,7 +356,7 @@ def test_config_defaults(monkeypatch):
     AC5: When config has no circuit breaker keys, the default values
     (window=300, threshold=3, cooldown=180) are used.
     """
-    from proxy.stall_circuit_breaker import StallCircuitBreaker, _get_circuit_breaker_config
+    from proxy.stall_circuit_breaker import _get_circuit_breaker_config
 
     # Config with no circuit breaker keys
     config_empty = {}
@@ -523,11 +519,9 @@ def test_stall_circuit_breaker_is_singleton(monkeypatch):
     instance on repeated access.
     """
     # First import
-    from proxy.stall_circuit_breaker import stall_circuit_breaker as cb1
-
     # Re-import should give same instance
-    import importlib
     import proxy.stall_circuit_breaker as scb_mod
+    from proxy.stall_circuit_breaker import stall_circuit_breaker as cb1
     cb2 = scb_mod.stall_circuit_breaker
 
     assert cb1 is cb2, (
