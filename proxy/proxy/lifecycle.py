@@ -841,9 +841,17 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger
                             if logger:
                                 logger.info(progress_str)
             except Exception:
-                pass
+                if logger:
+                    logger.exception("Error processing progress line in _stream_output")
+                else:
+                    import traceback
+                    traceback.print_exc()
     except Exception:
-        pass
+        if logger:
+            logger.exception("Fatal error in _stream_output thread")
+        else:
+            import traceback
+            traceback.print_exc()
 
 
 def start_llama_server(model: str | None, display_name: str | None = None) -> subprocess.Popen | None:

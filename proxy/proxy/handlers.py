@@ -59,12 +59,17 @@ def extract_progress_data(line: str | None) -> tuple[int, int, float] | None:
     if ',' not in text:
         return None
     try:
-        m_slot = re.search(r'\bslot\s+(\d+)\b', text, flags=re.IGNORECASE)
+        m_slot = re.search(
+            r'slot\s+update_slots:.*?id\s+(\d+)|slot\s+(\d+)',
+            text, flags=re.IGNORECASE
+        )
         m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
         m_progress = re.search(r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b', text, flags=re.IGNORECASE)
         if not m_tokens or not m_progress:
             return None
-        slot_id = int(m_slot.group(1)) if m_slot else 0
+        slot_id = int(m_slot.group(1)) if m_slot and m_slot.group(1) is not None else (
+            int(m_slot.group(2)) if m_slot else 0
+        )
         n_tokens = int(m_tokens.group(1))
         progress = float(m_progress.group(1))
         return (slot_id, n_tokens, progress)

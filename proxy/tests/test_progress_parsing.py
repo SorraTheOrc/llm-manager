@@ -1,9 +1,11 @@
 """Tests for prompt processing progress line parsing.
 
 Validates extraction of `n_tokens` and `progress` from llama-server stdout
-log lines in the format::
+log lines in formats::
 
     slot N : prompt processing progress, n_tokens = 26988, progress = 0.658083
+
+    [58143] slot update_slots: id  1 | task 1 | prompt processing progress, n_tokens = 2048, batch.n_tokens = 2048, progress = 0.133368
 """
 
 from proxy.server import extract_progress_data
@@ -198,3 +200,77 @@ class TestExtractProgressDataSlot:
         result = extract_progress_data(line)
         assert result is not None
         assert result[0] == 12345
+
+
+# ---------------------------------------------------------------------------
+# Actual llama-server format tests
+# ---------------------------------------------------------------------------
+
+class TestExtractProgressDataActualFormat:
+    """Tests for the actual llama-server stdout format seen in production.
+
+    The actual format differs from the old tests::
+
+        [PID] slot update_slots: id  N | task M | prompt processing progress, n_tokens = X, batch.n_tokens = X, progress = Y
+    """
+
+    def test_update_slots_format_slot_1(self):
+        """Parse actual llama-server format for slot 1."""
+        line = (
+            "[58143] slot update_slots: id  1 | task 1 | "
+            "prompt processing progress, n_tokens = 2048, "
+            "batch.n_tokens = 2048, progress = 0.133368"
+        )
+        result = extract_progress_data(line)
+        assert result is not None
+        assert result[0] == 1, f"Expected slot_id=1, got {result[0]}"
+        assert result[1] == 2048, f"Expected n_tokens=2048, got {result[1]}"
+        assert result[2] == 0.133368, f"Expected progress=0.133368, got {result[2]}"
+
+    def test_update_slots_format_slot_0(self):
+        """Parse actual llama-server format for slot 0."""
+        line = (
+            "[58143] slot update_slots: id  0 | task 2 | "
+            "prompt processing progress, n_tokens = 4096, "
+            "batch.n_tokens = 4096, progress = 0.500000"
+        )
+        result = extract_progress_data(line)
+        assert result is not None
+        assert result[0] == 0, f"Expected slot_id=0, got {result[0]}"
+        assert result[1] == 4096
+        assert result[2] == 0.5
+
+    def test_update_slots_format_completion(self):
+        """Parse actual format at 100% completion."""
+        line = (
+            "[58143] slot update_slots: id  1 | task 1 | "
+            "prompt processing progress, n_tokens = 5000, "
+            "batch.n_tokens = 5000, progress = 1.000000"
+        )
+        result = extract_progress_data(line)
+        assert result is not None
+        assert result[0] == 1
+        assert result[1] == 5000
+        assert result[2] == 1.0
+
+    def test_update_slots_format_multi_digit_slot(self):
+        """Parse actual format with multi-digit slot ID."""
+        line = (
+            "[58143] slot update_slots: id  12 | task 1 | "
+            "prompt processing progress, n_tokens = 1000, "
+            "batch.n_tokens = 1000, progress = 0.250000"
+        )
+        result = extract_progress_data(line)
+        assert result is not None
+        assert result[0] == 12
+        assert result[1] == 1000
+        assert result[2] == 0.25
+
+    def test_old_format_still_works_alongside_new(self):
+        """Regression: the old `slot N :` format must still parse."""
+        old = "slot 1 : prompt processing progress, n_tokens = 26988, progress = 0.658083"
+        result = extract_progress_data(old)
+        assert result is not None
+        assert result[0] == 1
+        assert result[1] == 26988
+        assert result[2] == 0.658083
