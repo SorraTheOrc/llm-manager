@@ -345,12 +345,47 @@ async def get_llama_local_status():
 
 
 # ---------------------------------------------------------------------------
+# TTS health probe helper
+# ---------------------------------------------------------------------------
+
+async def _probe_tts_health(tts_host: str, tts_port: int, timeout: float = 2.0) -> bool:
+    """Probe the TTS server's /health endpoint.
+
+    Performs a simple GET to ``http://<host>:<port>/health``.
+    Returns True if the endpoint responds with HTTP 200 and
+    ``{"status": "ok"}``.
+    """
+    if not tts_host or not tts_port or tts_port <= 0:
+        return False
+    try:
+        url = f"http://{tts_host}:{tts_port}/health"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(max(timeout, 1.0))) as client:
+            response = await client.get(url, timeout=timeout)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("status") == "ok":
+                        return True
+                except Exception:
+                    pass
+            return False
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint with readiness gating."""
+    """Health check endpoint with readiness gating.
+
+    Includes TTS server status fields:
+    - ``tts_enabled``: Whether TTS is enabled in config.
+    - ``tts_server_running``: Whether the TTS process is alive (poll() is None).
+    - ``tts_server_healthy``: Whether the TTS server responds to its /health endpoint.
+    """
     srv = _srv()
     server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
     router_mode = bool(server_cfg.get("llama_router_mode", False))
@@ -365,6 +400,21 @@ async def health_check():
     self_healing = srv._is_self_healing_active()
     ready = bool(llama_running and srv.backend_ready and backend_reachable and not self_healing)
 
+    # -- TTS health fields -------------------------------------------------
+    tts_enabled = bool(server_cfg.get("tts_enabled", True))
+    tts_host = str(server_cfg.get("tts_server_host", "localhost"))
+    tts_port = int(server_cfg.get("tts_server_port", 8081) or 8081)
+
+    tts_process_alive = (
+        srv.tts_process is not None
+        and callable(getattr(srv.tts_process, "poll", None))
+        and srv.tts_process.poll() is None
+    )
+
+    tts_server_healthy = False
+    if tts_enabled and tts_process_alive:
+        tts_server_healthy = await _probe_tts_health(tts_host, tts_port, timeout=2.0)
+
     return {
         "status": "healthy" if ready else "degraded",
         "ready": ready,
@@ -375,6 +425,9 @@ async def health_check():
         "self_healing_in_progress": self_healing,
         "backend_recovery": srv._backend_recovery_snapshot(),
         "backend_signals": dict(srv.backend_signal_counts),
+        "tts_enabled": tts_enabled,
+        "tts_server_running": tts_process_alive,
+        "tts_server_healthy": tts_server_healthy,
     }
 
 
