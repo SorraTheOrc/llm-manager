@@ -1701,7 +1701,8 @@ Content-Type: application/json
   "model": "qwen3-tts",
   "input": "Text to convert to speech.",
   "voice": "serena",
-  "response_format": "wav"
+  "response_format": "wav",
+  "lang": "english"
 }
 ```
 
@@ -1713,6 +1714,7 @@ Content-Type: application/json
 | `input` | Yes | Text to synthesise (must be non-empty) |
 | `voice` | No | Speaker voice (see pre-registered voices below; omit for default) |
 | `response_format` | No | Output format (currently only `wav` is supported) |
+| `lang` | No | Language hint (e.g. `"english"` or `"chinese"`); passed through to the TTS backend without validation. When absent, the backend uses its startup default (`--lang`). |
 
 > **Voice validation:** The proxy validates the `voice` field against the
 > list of known voices (fetched from the TTS server and cached with a 5-minute

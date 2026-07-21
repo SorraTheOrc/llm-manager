@@ -822,7 +822,8 @@ async def create_speech(request: Request):
             "model": "qwen3-tts",
             "input": "Text to convert to speech",
             "voice": "default",
-            "response_format": "wav"
+            "response_format": "wav",
+            "lang": "english"
         }
 
     Returns audio content with ``Content-Type: audio/wav`` on success.
@@ -852,6 +853,7 @@ async def create_speech(request: Request):
     voice = body.get("voice", "")
     response_format = body.get("response_format", "wav")
     instructions = body.get("instructions", "")
+    lang = body.get("lang", "")
 
     # -- Voice validation: ensure the voice name is recognised -----------
     voice_substituted = False
@@ -885,6 +887,8 @@ async def create_speech(request: Request):
         forward_body["voice"] = voice
     if instructions:
         forward_body["instructions"] = instructions
+    if lang:
+        forward_body["lang"] = lang
 
     try:
         client = srv._http_client if srv._http_client else None
