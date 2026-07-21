@@ -16,6 +16,7 @@ from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from proxy.lifecycle import _extract_router_model_ids
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
+from proxy.router_helpers import _get_per_model_queries
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,63 @@ def _has_fallback_providers(model_cfg):
         return True
     first = providers[0] if providers else {}
     return isinstance(first, dict) and first.get("type") == "remote"
+
+
+def _build_home_model_rows(srv) -> str:
+    """Build the Home tab model endpoint table rows.
+
+    Returns an HTML string of table rows for all configured models,
+    showing name, type, primary endpoint, fallback providers, and
+    active query count (rendered server-side with placeholder IDs
+    for live SSE updates).
+    """
+    rows = ""
+    model_type_labels = {"local": "Local", "remote": "Remote"}
+    model_type_badges = {"local": "badge-type-local", "remote": "badge-type-remote"}
+    for name, cfg in srv.config.get("models", {}).items():
+        model_type = get_model_type(cfg) or "unknown"
+        type_label = model_type_labels.get(model_type, model_type.title())
+        type_badge_class = model_type_badges.get(model_type, "badge-type-unknown")
+
+        # Primary endpoint
+        providers = cfg.get("providers") or []
+        primary_endpoint = ""
+        fallback_list = ""
+        first = True
+        for p in providers:
+            if isinstance(p, dict):
+                ptype = p.get("type", "")
+                pname = p.get("name", "")
+                endpoint = p.get("endpoint") or p.get("llama_model", "")
+                if first:
+                    primary_endpoint = endpoint or "-"
+                    first = False
+                else:
+                    fallback_list += f'<li><span class="provider-endpoint">{pname}: {endpoint}</span></li>'
+        if not primary_endpoint:
+            primary_endpoint = "-"
+
+        fallback_html = (
+            f'<ul class="fallback-list">{fallback_list}</ul>'
+            if fallback_list
+            else '<span style="color: var(--text-secondary); font-size: 0.85rem;">None</span>'
+        )
+
+        # Active query count cell - data attribute for SSE updates
+        active_count_cell = (
+            f'<span class="active-query-count zero" '
+            f'id="aq-{name}" data-model="{name}">0</span>'
+        )
+
+        rows += f"""
+        <tr>
+            <td><code>{name}</code></td>
+            <td><span class="badge-type {type_badge_class}">{type_label}</span></td>
+            <td><span class="provider-endpoint">{primary_endpoint}</span></td>
+            <td>{fallback_html}</td>
+            <td>{active_count_cell}</td>
+        </tr>"""
+    return rows
 
 
 async def index(request: Request):
@@ -130,6 +188,7 @@ async def index(request: Request):
     html_content = html_content.replace('__LLAMA_STATUS_DISPLAY__', 'Running' if srv.llama_process and srv.llama_process.poll() is None else 'Stopped')
     html_content = html_content.replace('__MODEL_BUTTONS__', model_buttons)
     html_content = html_content.replace('__MODELS_ROWS__', models_rows)
+    html_content = html_content.replace('__HOME_MODEL_ROWS__', _build_home_model_rows(srv))
     html_content = html_content.replace('__MODEL_OPTIONS__', model_options)
     html_content = html_content.replace('__CURRENT_MODEL_JS__', srv.current_model or 'None')
     html_content = html_content.replace('__LOCAL_MODEL_NAMES_JSON__', local_model_names_json)
@@ -140,6 +199,30 @@ async def index(request: Request):
     # Inject router script
     router_script = f'<script>window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'
     html_content = html_content.replace('__ROUTER_SCRIPT__', router_script)
+
+    # Build model endpoint data for the Home tab (per-model config with providers)
+    model_endpoints = []
+    from proxy.provider import get_model_type as _get_model_type, get_local_model_name_from_providers as _get_local_model, get_remote_endpoint as _get_remote_endpoint
+    for name, cfg in srv.config.get("models", {}).items():
+        entry = {
+            "name": name,
+            "type": _get_model_type(cfg) or "unknown",
+            "providers": [],
+        }
+        providers = cfg.get("providers") or []
+        for p in providers:
+            if isinstance(p, dict):
+                ptype = p.get("type", "")
+                endpoint = p.get("endpoint") or p.get("llama_model", "")
+                provider_entry = {
+                    "name": p.get("name", ""),
+                    "type": ptype,
+                    "endpoint": endpoint,
+                }
+                entry["providers"].append(provider_entry)
+        model_endpoints.append(entry)
+    model_endpoints_json = json.dumps(model_endpoints)
+    html_content = html_content.replace('__MODEL_ENDPOINTS_JSON__', model_endpoints_json)
 
     return HTMLResponse(content=html_content)
 
@@ -168,6 +251,8 @@ async def status_events():
                 router_models = await srv.router_list_models()
                 loaded_models = _extract_router_model_ids(router_models)
 
+            per_model_queries = await _get_per_model_queries(srv)
+
             initial_status = json.dumps({
                 "type": "status",
                 "current_model": srv.current_model,
@@ -176,7 +261,8 @@ async def status_events():
                 "n_ctx": llama_status["n_ctx"],
                 "kv_cache_tokens": llama_status["kv_cache_tokens"],
                 "total_sent": total_sent,
-                "total_recv": total_recv
+                "total_recv": total_recv,
+                "per_model_queries": per_model_queries,
             })
             yield f"data: {initial_status}\n\n"
 

@@ -468,6 +468,99 @@
             color: var(--text-secondary);
             z-index: 100;
         }
+        
+        /* Tab bar styles */
+        .tab-bar {
+            display: flex;
+            gap: 0;
+            margin-bottom: 1.5rem;
+            border-bottom: 2px solid var(--border);
+        }
+        .tab-btn {
+            background: transparent;
+            color: var(--text-secondary);
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-size: 0.95rem;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+        .tab-btn:hover {
+            color: var(--text-primary);
+            background: var(--bg-card);
+        }
+        .tab-btn.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+            font-weight: 500;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        
+        /* Home tab: model endpoint table with activity */
+        .home-model-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+        .home-model-table th {
+            text-align: left;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+        }
+        .home-model-table td {
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+        }
+        .fallback-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .fallback-list li {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            padding: 0.15rem 0;
+        }
+        .fallback-list li::before {
+            content: "↳ ";
+            color: var(--warning);
+        }
+        .badge-type {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+        .badge-type-local { background: #2e7d32; color: #fff; }
+        .badge-type-remote { background: #7b1fa2; color: #fff; }
+        .badge-type-unknown { background: #555; color: #fff; }
+        .active-query-count {
+            font-family: monospace;
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+        .active-query-count.zero { color: var(--text-secondary); }
+        .active-query-count.nonzero { color: var(--success); }
+        .active-query-count.unknown { color: var(--warning); }
+        .provider-endpoint {
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
     </style>
 </head>
 <body>
@@ -547,164 +640,202 @@
             __MODEL_BUTTONS__
         </div>
 
-        <div class="card">
-            <h2>Quick Test</h2>
-            <p style="color: var(--text-secondary); margin-bottom: 0.5rem;">
-                Send a message to test the current model. Press Enter to send (Shift+Enter for new line).
-            </p>
-            <div class="quick-test">
-                <div class="test-input-area">
-                    <label>Input</label>
-                    <textarea id="testInput" class="test-input" placeholder="Type your message here..."></textarea>
-                    <p class="test-hint">Press Enter to send, Shift+Enter for new line</p>
+        <!-- Tab Bar -->
+        <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('home')">Home</button>
+            <button class="tab-btn" onclick="switchTab('models')">Models</button>
+            <button class="tab-btn" onclick="switchTab('api')">API</button>
+        </div>
+
+        <!-- Home Tab -->
+        <div id="tab-home" class="tab-content active">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Model Endpoints &amp; Activity</h2>
                 </div>
-                <div class="test-output-area">
-                    <label>Response</label>
-                    <div id="testOutput" class="test-output"></div>
-                    <p id="testStatus" class="test-status"></p>
-                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                    Overview of all configured models, their provider endpoints, and current active query counts.
+                </p>
+                <table class="home-model-table" id="modelEndpointTable">
+                    <thead>
+                        <tr>
+                            <th>Model</th>
+                            <th>Type</th>
+                            <th>Primary Endpoint</th>
+                            <th>Fallback Providers</th>
+                            <th>Active Queries</th>
+                        </tr>
+                    </thead>
+                    <tbody id="modelEndpointBody">
+                        __HOME_MODEL_ROWS__
+                    </tbody>
+                </table>
             </div>
         </div>
 
-        <div class="card">
-            <h2>Configured Models</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Model ID</th>
-                        <th>Type</th>
-                        <th>Aliases (supports wildcards)</th>
-                        <th>Endpoint</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    __MODELS_ROWS__
-                </tbody>
-            </table>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <h2>API Passthrough Endpoints</h2>
-                <div class="model-select-wrapper">
-                    <label for="modelSelect" class="model-select-label">Test with model:</label>
-                    <select id="modelSelect" class="model-select" onchange="updateTestRequest()">
-                        __MODEL_OPTIONS__
-                    </select>
-                </div>
-            </div>
-            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
-                These endpoints are fully compatible with the OpenAI API. Requests are automatically routed to local llama-server or remote APIs based on the model specified. Click "Test" to try each endpoint.
-            </p>
-            <div class="endpoint-grid">
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-post">POST</span>
-                        <span class="endpoint-path">/v1/chat/completions</span>
-                        <button class="btn-test" onclick="testEndpoint('chat')">Test</button>
+        <!-- Models Tab -->
+        <div id="tab-models" class="tab-content">
+            <div class="card">
+                <h2>Quick Test</h2>
+                <p style="color: var(--text-secondary); margin-bottom: 0.5rem;">
+                    Send a message to test the current model. Press Enter to send (Shift+Enter for new line).
+                </p>
+                <div class="quick-test">
+                    <div class="test-input-area">
+                        <label>Input</label>
+                        <textarea id="testInput" class="test-input" placeholder="Type your message here..."></textarea>
+                        <p class="test-hint">Press Enter to send, Shift+Enter for new line</p>
                     </div>
-                    <p class="endpoint-desc">Chat completions - send messages and get AI responses</p>
-                </div>
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-post">POST</span>
-                        <span class="endpoint-path">/v1/completions</span>
-                        <button class="btn-test" onclick="testEndpoint('completions')">Test</button>
-                    </div>
-                    <p class="endpoint-desc">Text completions - complete a prompt</p>
-                </div>
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-get">GET</span>
-                        <span class="endpoint-path">/v1/models</span>
-                        <button class="btn-test" onclick="testEndpoint('models')">Test</button>
-                    </div>
-                    <p class="endpoint-desc">List all available models</p>
-                </div>
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-post">POST</span>
-                        <span class="endpoint-path">/v1/embeddings</span>
-                        <button class="btn-test" onclick="testEndpoint('embeddings')">Test</button>
-                    </div>
-                    <p class="endpoint-desc">Generate embeddings for text</p>
-                </div>
-            </div>
-            
-            <div id="apiTestSection" class="api-test-section" style="display: none; margin-top: 1.5rem;">
-                <div class="api-test-header">
-                    <strong id="apiTestTitle">Test Request</strong>
-                    <button class="btn-close" onclick="closeApiTest()">&times;</button>
-                </div>
-                <div class="api-test-grid">
-                    <div class="api-test-input-area">
-                        <label>Request</label>
-                        <pre id="apiTestRequest" class="api-test-pre"></pre>
-                    </div>
-                    <div class="api-test-output-area">
+                    <div class="test-output-area">
                         <label>Response</label>
-                        <pre id="apiTestResponse" class="api-test-pre"></pre>
-                        <p id="apiTestStatus" class="test-status"></p>
+                        <div id="testOutput" class="test-output"></div>
+                        <p id="testStatus" class="test-status"></p>
                     </div>
                 </div>
             </div>
-        </div>
 
-        <div class="card">
-            <h2>Admin Endpoints</h2>
-            <div class="endpoint-grid">
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-get">GET</span>
-                        <span class="endpoint-path">/health</span>
-                        <button class="btn-switch" style="margin-left:auto;" onclick="refreshStatus()">Refresh</button>
-                    </div>
-                    <p class="endpoint-desc">Health check - returns server and model status</p>
-                </div>
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-post">POST</span>
-                        <span class="endpoint-path">/admin/reload-srv.config</span>
-                        <button class="btn-switch" style="margin-left:auto;" onclick="reloadConfig()">Reload</button>
-                    </div>
-                    <p class="endpoint-desc">Reload configuration from srv.config.yaml</p>
-                </div>
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-post">POST</span>
-                        <span class="endpoint-path">/admin/switch-model/{model}</span>
-                        <button class="btn-switch" style="margin-left:auto;" onclick="adminSwitchModel()">Switch To Selected</button>
-                    </div>
-                    <p class="endpoint-desc">Switch the llama-server to the model selected in the dropdown above</p>
-                </div>
-                <div class="endpoint">
-                    <div class="endpoint-header">
-                        <span class="method method-post">POST</span>
-                        <span class="endpoint-path">/admin/stop-server</span>
-                        <button class="btn-switch" style="margin-left:auto; background:#d32f2f;" onclick="stopServer()">Stop</button>
-                    </div>
-                    <p class="endpoint-desc">Stop the llama-server process (requires confirmation)</p>
-                </div>
+            <div class="card">
+                <h2>Configured Models</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Model ID</th>
+                            <th>Type</th>
+                            <th>Aliases (supports wildcards)</th>
+                            <th>Endpoint</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        __MODELS_ROWS__
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>Model Routing</h2>
+                <p style="color: var(--text-secondary);">
+                    The proxy automatically routes requests based on the <code>model</code> parameter in your API request:
+                </p>
+                <ul style="margin: 1rem 0 0 1.5rem; color: var(--text-secondary);">
+                    <li><strong>Local models</strong> are served by llama-server running in a podman container</li>
+                    <li><strong>Remote models</strong> are proxied to external APIs (OpenAI, Anthropic, etc.)</li>
+                    <li><strong>Wildcard aliases</strong> like <code>gpt-*</code> match any model starting with that prefix</li>
+                    <li>If a model switch is needed, the server will automatically load the new model</li>
+                </ul>
             </div>
         </div>
 
-        <div class="card">
-            <h2>Model Routing</h2>
-            <p style="color: var(--text-secondary);">
-                The proxy automatically routes requests based on the <code>model</code> parameter in your API request:
-            </p>
-            <ul style="margin: 1rem 0 0 1.5rem; color: var(--text-secondary);">
-                <li><strong>Local models</strong> are served by llama-server running in a podman container</li>
-                <li><strong>Remote models</strong> are proxied to external APIs (OpenAI, Anthropic, etc.)</li>
-                <li><strong>Wildcard aliases</strong> like <code>gpt-*</code> match any model starting with that prefix</li>
-                <li>If a model switch is needed, the server will automatically load the new model</li>
-            </ul>
-        </div>
-        
-        <div class="card">
-            <h2>API Endpoints</h2>
-            <pre style="background:var(--bg-primary); padding:1rem; border-radius:6px; color:var(--text-secondary);">==========================================
+        <!-- API Tab -->
+        <div id="tab-api" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h2>API Passthrough Endpoints</h2>
+                    <div class="model-select-wrapper">
+                        <label for="modelSelect" class="model-select-label">Test with model:</label>
+                        <select id="modelSelect" class="model-select" onchange="updateTestRequest()">
+                            __MODEL_OPTIONS__
+                        </select>
+                    </div>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                    These endpoints are fully compatible with the OpenAI API. Requests are automatically routed to local llama-server or remote APIs based on the model specified. Click "Test" to try each endpoint.
+                </p>
+                <div class="endpoint-grid">
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-post">POST</span>
+                            <span class="endpoint-path">/v1/chat/completions</span>
+                            <button class="btn-test" onclick="testEndpoint('chat')">Test</button>
+                        </div>
+                        <p class="endpoint-desc">Chat completions - send messages and get AI responses</p>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-post">POST</span>
+                            <span class="endpoint-path">/v1/completions</span>
+                            <button class="btn-test" onclick="testEndpoint('completions')">Test</button>
+                        </div>
+                        <p class="endpoint-desc">Text completions - complete a prompt</p>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-get">GET</span>
+                            <span class="endpoint-path">/v1/models</span>
+                            <button class="btn-test" onclick="testEndpoint('models')">Test</button>
+                        </div>
+                        <p class="endpoint-desc">List all available models</p>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-post">POST</span>
+                            <span class="endpoint-path">/v1/embeddings</span>
+                            <button class="btn-test" onclick="testEndpoint('embeddings')">Test</button>
+                        </div>
+                        <p class="endpoint-desc">Generate embeddings for text</p>
+                    </div>
+                </div>
+                
+                <div id="apiTestSection" class="api-test-section" style="display: none; margin-top: 1.5rem;">
+                    <div class="api-test-header">
+                        <strong id="apiTestTitle">Test Request</strong>
+                        <button class="btn-close" onclick="closeApiTest()">&times;</button>
+                    </div>
+                    <div class="api-test-grid">
+                        <div class="api-test-input-area">
+                            <label>Request</label>
+                            <pre id="apiTestRequest" class="api-test-pre"></pre>
+                        </div>
+                        <div class="api-test-output-area">
+                            <label>Response</label>
+                            <pre id="apiTestResponse" class="api-test-pre"></pre>
+                            <p id="apiTestStatus" class="test-status"></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Admin Endpoints</h2>
+                <div class="endpoint-grid">
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-get">GET</span>
+                            <span class="endpoint-path">/health</span>
+                            <button class="btn-switch" style="margin-left:auto;" onclick="refreshStatus()">Refresh</button>
+                        </div>
+                        <p class="endpoint-desc">Health check - returns server and model status</p>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-post">POST</span>
+                            <span class="endpoint-path">/admin/reload-srv.config</span>
+                            <button class="btn-switch" style="margin-left:auto;" onclick="reloadConfig()">Reload</button>
+                        </div>
+                        <p class="endpoint-desc">Reload configuration from srv.config.yaml</p>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-post">POST</span>
+                            <span class="endpoint-path">/admin/switch-model/{model}</span>
+                            <button class="btn-switch" style="margin-left:auto;" onclick="adminSwitchModel()">Switch To Selected</button>
+                        </div>
+                        <p class="endpoint-desc">Switch the llama-server to the model selected in the dropdown above</p>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
+                            <span class="method method-post">POST</span>
+                            <span class="endpoint-path">/admin/stop-server</span>
+                            <button class="btn-switch" style="margin-left:auto; background:#d32f2f;" onclick="stopServer()">Stop</button>
+                        </div>
+                        <p class="endpoint-desc">Stop the llama-server process (requires confirmation)</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>API Endpoints</h2>
+                <pre style="background:var(--bg-primary); padding:1rem; border-radius:6px; color:var(--text-secondary);">==========================================
 API Endpoints
 ==========================================
 
@@ -718,6 +849,7 @@ API Endpoints
     Switch model:   POST __BASE__/admin/switch-model/{model}
     Stop server:    POST __BASE__/admin/stop-server
 </pre>
+            </div>
         </div>
     </div>
 
@@ -1281,6 +1413,57 @@ API Endpoints
             apiTestSection.style.display = 'none';
             currentEndpointType = null;
         }
+
+        // Tab switching
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute('onclick').includes(tabName));
+            });
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.toggle('active', content.id === 'tab-' + tabName);
+            });
+            // Persist in sessionStorage
+            try { sessionStorage.setItem('activeTab', tabName); } catch(e) {}
+        }
+
+        // Restore active tab from sessionStorage on page load
+        (function restoreTab() {
+            try {
+                const saved = sessionStorage.getItem('activeTab');
+                if (saved) { switchTab(saved); }
+            } catch(e) {}
+        })();
+
+        // Per-model active query counter data (injected from server)
+        const MODEL_ENDPOINTS = __MODEL_ENDPOINTS_JSON__;
+
+        // Update per-model active query counters from SSE data
+        function updatePerModelQueries(perModelQueries) {
+            if (!perModelQueries) return;
+            Object.keys(perModelQueries).forEach(modelName => {
+                const el = document.getElementById('aq-' + modelName);
+                if (!el) return;
+                const count = perModelQueries[modelName] || 0;
+                el.textContent = count;
+                el.className = 'active-query-count' + (count > 0 ? ' nonzero' : ' zero');
+            });
+        }
+
+        // Extend the existing updateStatsPanel to also handle per_model_queries
+        // Save a reference to the original function before overriding
+        const _origUpdateStatsPanel = window.updateStatsPanel;
+        window.updateStatsPanel = function(data) {
+            // Call original handler
+            if (_origUpdateStatsPanel) {
+                _origUpdateStatsPanel(data);
+            }
+            // Handle per_model_queries if present
+            if (data && data.per_model_queries) {
+                updatePerModelQueries(data.per_model_queries);
+            }
+        };
     </script>
 __ROUTER_SCRIPT__</body>
 </html>
