@@ -440,3 +440,153 @@ class TestLastSlotDetailsCache:
         assert len(result2) == 2
         assert result2[0]["slot_id"] == 5
         assert result2[0]["n_decoded"] == 12288
+
+
+# ======================================================================
+# Slot progress cache tests
+# ======================================================================
+
+
+class TestSlotProgressCache:
+    """Tests for the per-slot progress cache that merges llama-server log
+    progress data into slot details when ``/slots`` is unresponsive.
+    """
+
+    def setup_method(self):
+        """Clear the progress cache before each test."""
+        from proxy.observability import _slot_progress_cache
+        _slot_progress_cache.clear()
+
+    # --- _extract_progress_data_from_log ---
+
+    def test_extract_progress_data_valid_line(self):
+        """Parses a standard llama-server progress line."""
+        from proxy.observability import _extract_progress_data_from_log
+        line = (
+            "[58143] slot update_slots: id  5 | task 1 | prompt processing progress, "
+            "n_tokens = 4096, batch.n_tokens = 4096, progress = 0.170"
+        )
+        result = _extract_progress_data_from_log(line)
+        assert result is not None
+        slot_id, n_tokens, progress = result
+        assert slot_id == 5
+        assert n_tokens == 4096
+        assert progress == 0.17
+
+    def test_extract_progress_data_multi_digit_slot(self):
+        """Parses a line with multi-digit slot id."""
+        from proxy.observability import _extract_progress_data_from_log
+        line = (
+            "[58143] slot update_slots: id  15 | task 1 | prompt processing progress, "
+            "n_tokens = 22800, batch.n_tokens = 22800, progress = 0.840"
+        )
+        result = _extract_progress_data_from_log(line)
+        assert result is not None
+        slot_id, n_tokens, progress = result
+        assert slot_id == 15
+        assert n_tokens == 22800
+        assert progress == 0.84
+
+    def test_extract_progress_data_non_progress_line(self):
+        """Returns None for non-progress log lines."""
+        from proxy.observability import _extract_progress_data_from_log
+        assert _extract_progress_data_from_log("INFO - Server started") is None
+        assert _extract_progress_data_from_log("GET /slots 200") is None
+        assert _extract_progress_data_from_log("") is None
+        assert _extract_progress_data_from_log(None) is None
+
+    def test_extract_progress_data_partial_fields(self):
+        """Returns None when required fields are missing, or defaults slot to 0."""
+        from proxy.observability import _extract_progress_data_from_log
+        # Missing n_tokens entirely
+        assert _extract_progress_data_from_log("slot update_slots: id=5") is None
+        # Missing progress entirely
+        assert _extract_progress_data_from_log("slot 5 n_tokens=4096") is None
+        # Has n_tokens and progress but no slot -> defaults to 0
+        result = _extract_progress_data_from_log("n_tokens=4096 progress=0.17")
+        assert result is not None
+        assert result[0] == 0  # slot_id defaults to 0
+        assert result[1] == 4096
+        assert result[2] == 0.17
+
+    # --- _enrich_slot_details_with_progress ---
+
+    def test_enrich_overrides_n_decoded_from_progress(self):
+        """When progress has higher n_tokens than API n_decoded, override."""
+        from proxy.observability import (
+            _enrich_slot_details_with_progress, _slot_progress_cache,
+        )
+        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.17, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 512}]
+        with _patch_time(1000.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["n_decoded"] == 4096
+
+    def test_enrich_does_not_override_when_api_is_higher(self):
+        """When API n_decoded is already higher than progress, keep it."""
+        from proxy.observability import (
+            _enrich_slot_details_with_progress, _slot_progress_cache,
+        )
+        _slot_progress_cache[3] = {"n_tokens": 100, "progress": 0.5, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 500}]
+        with _patch_time(1000.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["n_decoded"] == 500  # API value kept
+
+    def test_enrich_sets_is_processing_from_progress(self):
+        """Sets is_processing=True when progress > 0 but API says idle."""
+        from proxy.observability import (
+            _enrich_slot_details_with_progress, _slot_progress_cache,
+        )
+        _slot_progress_cache[5] = {"n_tokens": 2048, "progress": 0.50, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 5, "is_processing": False, "n_decoded": None}]
+        with _patch_time(1000.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["is_processing"] is True
+        assert result[0]["n_decoded"] == 2048
+
+    def test_enrich_ignores_stale_progress(self):
+        """Ignores progress data older than 60 seconds."""
+        from proxy.observability import (
+            _enrich_slot_details_with_progress, _slot_progress_cache,
+        )
+        _slot_progress_cache[3] = {"n_tokens": 999, "progress": 0.5, "timestamp": 900.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 10}]
+        with _patch_time(1000.0):  # 100s later = stale
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["n_decoded"] == 10  # Not overridden
+
+    def test_enrich_skips_slot_without_progress(self):
+        """Slots without progress cache entry are unchanged."""
+        from proxy.observability import _enrich_slot_details_with_progress
+        slot_details = [{"slot_id": 9, "is_processing": False, "n_decoded": None}]
+        result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["n_decoded"] is None
+        assert result[0]["is_processing"] is False
+
+    def test_enrich_empty_list(self):
+        """Empty slot list returns empty."""
+        from proxy.observability import _enrich_slot_details_with_progress
+        assert _enrich_slot_details_with_progress([]) == []
+
+
+class _TimePatcher:
+    """Context manager that patches time.time() to return a fixed value."""
+    def __init__(self, fixed_time):
+        self.fixed_time = fixed_time
+        self._orig = None
+
+    def __enter__(self):
+        import proxy.observability as obs
+        self._orig = obs.time.time
+        obs.time.time = lambda: self.fixed_time
+        return self
+
+    def __exit__(self, *args):
+        import proxy.observability as obs
+        obs.time.time = self._orig
+
+
+def _patch_time(fixed_time):
+    """Return a context manager that patches time.time."""
+    return _TimePatcher(fixed_time)

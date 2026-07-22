@@ -268,13 +268,22 @@ async def status_events():
             # is too busy to respond (ReadTimeout during token generation).
             # Use the shared module-level cache from _periodic_broadcast_loop()
             # so that a page-reload during a busy generation still shows real data.
-            from proxy.observability import _last_slot_details_cache as _slot_cache
+            # Read llama-server log for supplemental progress data so the
+            # initial SSE payload shows real token counts even when /slots
+            # endpoint is unresponsive during busy generation.
+            from proxy.observability import (
+                _last_slot_details_cache as _slot_cache,
+                _update_slot_progress_from_log,
+                _enrich_slot_details_with_progress,
+            )
+            _update_slot_progress_from_log()
             if slot_details:
                 # In-place update is fine because we're extending the list variable
                 _slot_cache.clear()
                 _slot_cache.extend(slot_details)
             else:
                 slot_details = list(_slot_cache)
+            _enrich_slot_details_with_progress(slot_details)
 
             initial_status = json.dumps({
                 "type": "status",

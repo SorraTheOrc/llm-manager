@@ -31,6 +31,7 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -246,6 +247,18 @@ _last_slot_details_cache: list[dict] = []
 Updated by ``_periodic_broadcast_loop()`` on each successful query.
 Read by ``status_events()`` in ``proxy.ui`` as a fallback when the
 initial /slots query times out.
+"""
+
+
+_slot_progress_cache: dict[int, dict] = {}
+"""Per-slot progress data parsed from llama-server log lines.
+
+Maps ``slot_id`` to ``{"n_tokens": int, "progress": float,"timestamp": float}``.
+Used as a supplemental source of token counts when the ``/slots`` HTTP
+endpoint is unresponsive during busy token generation.
+
+Populated by ``_update_slot_progress_from_log()`` which is called by
+``_periodic_broadcast_loop()`` on each iteration.
 """
 
 
@@ -609,6 +622,143 @@ async def query_llama_status() -> dict:
     return result
 
 
+# ===================================================================
+# Slot progress cache – supplemental token counts from llama-server log
+# ===================================================================
+
+
+def _update_slot_progress_from_log() -> None:
+    """Read the tail of llama-server.log and extract per-slot progress data.
+
+    llama-server writes progress lines like::
+
+        slot update_slots: id=5 n_tokens=4096 progress=0.17
+
+    These are parsed by ``extract_progress_data()`` (from ``handlers``)
+    and stored in the module-level ``_slot_progress_cache`` keyed by
+    ``slot_id``.
+
+    When the log file cannot be read (e.g. not yet created, missing
+    permissions) the cache is simply not updated — no exception is raised.
+    """
+    srv = _srv()
+    try:
+        log_dir = getattr(srv, "log_dir", None)
+        if log_dir is None:
+            log_path = Path(__file__).parent / "logs" / "llama-server.log"
+        else:
+            log_path = Path(log_dir) / "llama-server.log"
+
+        if not log_path.exists():
+            return
+
+        # Read the last 64KB to find progress lines
+        stat = log_path.stat()
+        read_size = min(65536, stat.st_size)
+        with open(log_path, "rb") as f:
+            if read_size < stat.st_size:
+                f.seek(stat.st_size - read_size)
+            # Skip to first newline to avoid partial-line reads
+            if read_size < stat.st_size:
+                f.readline()
+            tail = f.read().decode("utf-8", errors="replace")
+
+        now = time.time()
+        for line in tail.splitlines():
+            result = _extract_progress_data_from_log(line)
+            if result is not None:
+                slot_id, n_tokens, progress = result
+                _slot_progress_cache[slot_id] = {
+                    "n_tokens": n_tokens,
+                    "progress": progress,
+                    "timestamp": now,
+                }
+
+        # Prune entries older than 60 seconds (generations don't last that
+        # long, and stale entries would show bogus token counts).
+        stale = [sid for sid, data in _slot_progress_cache.items()
+                 if now - data["timestamp"] > 60.0]
+        for sid in stale:
+            _slot_progress_cache.pop(sid, None)
+    except Exception:
+        pass
+
+
+def _extract_progress_data_from_log(line: str) -> tuple | None:
+    """Lightweight inline parser for llama-server progress log lines.
+
+    Extracts ``(slot_id, n_tokens, progress)`` from lines like::
+
+        slot update_slots: id=5 n_tokens=4096 progress=0.17
+
+    Returns ``None`` if the line does not contain valid progress data.
+    """
+    if not isinstance(line, str):
+        return None
+    text = line.strip()
+    if not text or "n_tokens" not in text or "progress" not in text:
+        return None
+    try:
+        m_slot = re.search(
+            r'slot\s+update_slots:.*?id\s+(\d+)|slot\s+(\d+)',
+            text, flags=re.IGNORECASE,
+        )
+        m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
+        m_progress = re.search(
+            r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b',
+            text, flags=re.IGNORECASE,
+        )
+        if not m_tokens or not m_progress:
+            return None
+        slot_id = int(m_slot.group(1)) if m_slot and m_slot.group(1) is not None else (
+            int(m_slot.group(2)) if m_slot else 0
+        )
+        return (slot_id, int(m_tokens.group(1)), float(m_progress.group(1)))
+    except Exception:
+        return None
+
+
+def _enrich_slot_details_with_progress(slot_details: list[dict]) -> list[dict]:
+    """Merge log-parsed progress n_tokens into slot_details.
+
+    For each slot in *slot_details*, if the progress cache has a
+    fresher *n_tokens* value than the API's *n_decoded*, override
+    *n_decoded* with the progress value (and mark *is_processing* if
+    progress is > 0).
+
+    Args:
+        slot_details: List of slot dicts from ``_query_slots_detail()``
+            or ``_last_slot_details_cache``.
+
+    Returns:
+        The same list (modified in-place) with enriched token counts.
+    """
+    if not slot_details:
+        return slot_details
+    now = time.time()
+    for slot in slot_details:
+        sid = slot.get("slot_id")
+        if sid is None:
+            continue
+        prog = _slot_progress_cache.get(sid)
+        if prog is None:
+            continue
+        # Only use progress data if it's recent (within 60 seconds)
+        if now - prog["timestamp"] > 60.0:
+            continue
+        n_tokens = prog["n_tokens"]
+        api_n_decoded = slot.get("n_decoded")
+        # Use the larger of API n_decoded and log n_tokens
+        if n_tokens is not None and (
+            api_n_decoded is None or n_tokens > api_n_decoded
+        ):
+            slot["n_decoded"] = n_tokens
+        # If progress > 0, the slot is actively processing
+        if prog["progress"] > 0 and not slot.get("is_processing"):
+            slot["is_processing"] = True
+    return slot_details
+
+
 
 async def _periodic_broadcast_loop():
     """Periodically broadcast current counts/tokens to connected log-tail clients.
@@ -667,12 +817,21 @@ async def _periodic_broadcast_loop():
                         )
                     except Exception:
                         pass
+
+                # Read llama-server log for supplemental progress data
+                _update_slot_progress_from_log()
+
                 # Preserve last known slot data when query fails or llama-server
                 # is too busy to respond (ReadTimeout during token generation).
                 if slot_details:
                     _last_slot_details_cache = slot_details
                 else:
                     slot_details = _last_slot_details_cache
+
+                # Merge log-parsed progress token counts into slot details.
+                # This ensures the web UI shows real token counts even when
+                # the /slots endpoint is unresponsive during busy generation.
+                _enrich_slot_details_with_progress(slot_details)
 
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast
