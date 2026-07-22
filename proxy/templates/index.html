@@ -1209,6 +1209,11 @@ API Endpoints
                             }
                             llamaStatusEl.textContent = data.llama_server_running ? 'Running' : 'Stopped';
                             updateStatsPanel(data);
+                            if (data.slots !== undefined) {
+                                console.log('[Slot Status] Received', data.slots.length, 'slots:', data.slots.length > 0 ? JSON.stringify(data.slots) : '(empty)');
+                            } else {
+                                console.log('[Slot Status] No slots field in SSE data');
+                            }
                             renderSlots(data.slots);
                             break;
                             

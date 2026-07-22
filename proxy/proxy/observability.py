@@ -193,7 +193,7 @@ async def _query_slots_detail(
                     })
                 return result
     except Exception as exc:
-        _srv().logger.debug(
+        _srv().logger.warning(
             "Slot detail query failed for port %d: %s",
             llama_port, exc,
         )
@@ -607,7 +607,8 @@ async def _periodic_broadcast_loop():
 
                 # --- Per-slot data query (best-effort) ---
                 slot_details: list[dict] = []
-                if llama_status.get("llama_server_running"):
+                server_running = llama_status.get("llama_server_running")
+                if server_running:
                     try:
                         server_cfg = srv.config.get("server", {})
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
@@ -616,6 +617,11 @@ async def _periodic_broadcast_loop():
                     except Exception:
                         # slot query is best-effort; empty list on failure
                         pass
+                    if not slot_details:
+                        srv.logger.info(
+                            "No slot data from port %d (server running=%s)",
+                            llama_port, server_running,
+                        )
 
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast
