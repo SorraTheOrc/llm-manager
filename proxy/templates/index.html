@@ -1166,14 +1166,20 @@ API Endpoints
             for (const slot of slots) {
                 const isProcessing = slot.is_processing === true;
                 const statusClass = isProcessing ? 'processing' : 'idle';
-                const statusLabel = isProcessing
-                    ? (slot.n_decoded !== null && slot.n_decoded !== undefined
-                        ? `Processing ${slot.n_decoded} tokens`
-                        : 'Processing')
-                    : 'Idle';
-                const tokenDisplay = (isProcessing && slot.n_decoded !== null && slot.n_decoded !== undefined)
-                    ? `${slot.n_decoded} tokens decoded`
-                    : '';
+                
+                let statusLabel;
+                if (!isProcessing) {
+                    statusLabel = 'Idle';
+                } else if (slot.n_tokens !== undefined && slot.n_tokens !== null &&
+                           slot.total_tokens !== undefined && slot.total_tokens !== null &&
+                           slot.progress !== undefined && slot.progress !== null) {
+                    const pct = Math.round(slot.progress * 100);
+                    statusLabel = `Processed ${slot.n_tokens} of ${slot.total_tokens} (${pct}%) tokens`;
+                } else if (slot.n_decoded !== null && slot.n_decoded !== undefined) {
+                    statusLabel = `Processed ${slot.n_decoded} tokens`;
+                } else {
+                    statusLabel = 'Processing';
+                }
                 
                 html += '<div class="slot-card">' +
                     '<div class="slot-card-header">' +
@@ -1183,7 +1189,6 @@ API Endpoints
                             statusLabel +
                         '</span>' +
                     '</div>' +
-                    (tokenDisplay ? '<div class="slot-token-count">' + tokenDisplay + '</div>' : '') +
                 '</div>';
             }
             

@@ -521,6 +521,10 @@ class TestSlotProgressCache:
         with _patch_time(1000.0):
             result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["n_decoded"] == 4096
+        # Verify new progress fields are injected
+        assert result[0]["n_tokens"] == 4096
+        assert result[0]["progress"] == 0.17
+        assert result[0]["total_tokens"] == int(round(4096 / 0.17))
 
     def test_enrich_does_not_override_when_api_is_higher(self):
         """When API n_decoded is already higher than progress, keep it."""
@@ -532,6 +536,9 @@ class TestSlotProgressCache:
         with _patch_time(1000.0):
             result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["n_decoded"] == 500  # API value kept
+        # Progress fields still injected
+        assert result[0]["n_tokens"] == 100
+        assert result[0]["total_tokens"] == 200
 
     def test_enrich_sets_is_processing_from_progress(self):
         """Sets is_processing=True when progress > 0 but API says idle."""
@@ -544,6 +551,9 @@ class TestSlotProgressCache:
             result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["is_processing"] is True
         assert result[0]["n_decoded"] == 2048
+        assert result[0]["n_tokens"] == 2048
+        assert result[0]["progress"] == 0.5
+        assert result[0]["total_tokens"] == 4096
 
     def test_enrich_ignores_stale_progress(self):
         """Ignores progress data older than 60 seconds."""
@@ -555,6 +565,7 @@ class TestSlotProgressCache:
         with _patch_time(1000.0):  # 100s later = stale
             result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["n_decoded"] == 10  # Not overridden
+        assert "n_tokens" not in result[0]  # No progress fields injected
 
     def test_enrich_skips_slot_without_progress(self):
         """Slots without progress cache entry are unchanged."""
@@ -563,6 +574,7 @@ class TestSlotProgressCache:
         result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["n_decoded"] is None
         assert result[0]["is_processing"] is False
+        assert "n_tokens" not in result[0]
 
     def test_enrich_empty_list(self):
         """Empty slot list returns empty."""

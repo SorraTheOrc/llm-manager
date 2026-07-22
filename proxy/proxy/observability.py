@@ -726,6 +726,9 @@ def _enrich_slot_details_with_progress(slot_details: list[dict]) -> list[dict]:
     *n_decoded* with the progress value (and mark *is_processing* if
     progress is > 0).
 
+    Also injects ``n_tokens``, ``progress``, and ``total_tokens`` into
+    each slot dict so the frontend can display "Processed x of y (z%)".
+
     Args:
         slot_details: List of slot dicts from ``_query_slots_detail()``
             or ``_last_slot_details_cache``.
@@ -747,14 +750,24 @@ def _enrich_slot_details_with_progress(slot_details: list[dict]) -> list[dict]:
         if now - prog["timestamp"] > 60.0:
             continue
         n_tokens = prog["n_tokens"]
-        api_n_decoded = slot.get("n_decoded")
+        pct = prog["progress"]
+
+        # Inject progress fields for frontend display
+        slot["n_tokens"] = n_tokens
+        slot["progress"] = round(pct, 3)
+        if pct > 0:
+            slot["total_tokens"] = int(round(n_tokens / pct))
+        else:
+            slot["total_tokens"] = None
+
         # Use the larger of API n_decoded and log n_tokens
+        api_n_decoded = slot.get("n_decoded")
         if n_tokens is not None and (
             api_n_decoded is None or n_tokens > api_n_decoded
         ):
             slot["n_decoded"] = n_tokens
         # If progress > 0, the slot is actively processing
-        if prog["progress"] > 0 and not slot.get("is_processing"):
+        if pct > 0 and not slot.get("is_processing"):
             slot["is_processing"] = True
     return slot_details
 
