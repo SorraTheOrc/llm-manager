@@ -156,9 +156,17 @@ async def _query_slots(client, llama_port: int, timeout: float = 2.0) -> tuple:
 
 
 async def _query_slots_detail(
-    client, llama_port: int, timeout: float = 2.0
+    client, llama_port: int, timeout: float = 2.0, model: str | None = None
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
+
+    Args:
+        client: HTTP client (httpx.AsyncClient).
+        llama_port: Port llama-server is listening on.
+        timeout: Request timeout in seconds.
+        model: Optional model name to filter slots. Many llama-server
+            instances require ``?model=...`` on the ``/slots`` endpoint
+            and return HTTP 400 without it.
 
     Returns a list of dicts, one per slot, with keys:
 
@@ -175,6 +183,8 @@ async def _query_slots_detail(
     """
     try:
         url = _build_llama_url(llama_port, "/slots")
+        if model:
+            url = f"{url}?model={model}"
         slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
         if slots_resp.status_code == 200:
             slots_data = await _safe_parse_json_response(slots_resp)
@@ -612,15 +622,19 @@ async def _periodic_broadcast_loop():
                     try:
                         server_cfg = srv.config.get("server", {})
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                        # Use current_model as the model param for /slots
+                        model_name = srv.current_model or None
                         client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                        slot_details = await _query_slots_detail(client, llama_port, timeout=2.0)
+                        slot_details = await _query_slots_detail(
+                            client, llama_port, timeout=2.0, model=model_name,
+                        )
                     except Exception:
                         # slot query is best-effort; empty list on failure
                         pass
                     if not slot_details:
                         srv.logger.info(
-                            "No slot data from port %d (server running=%s)",
-                            llama_port, server_running,
+                            "No slot data from port %d (server running=%s, model=%s)",
+                            llama_port, server_running, srv.current_model,
                         )
 
                 if sse_clients:

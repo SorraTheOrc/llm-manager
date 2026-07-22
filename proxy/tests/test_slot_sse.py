@@ -121,6 +121,62 @@ class TestQuerySlotsDetail:
         assert result == []
 
     @pytest.mark.asyncio
+    async def test_queries_with_model_param(self):
+        """When model is provided, the URL includes ?model=..."""
+        from proxy.observability import _query_slots_detail
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=200)
+
+        async def mock_json():
+            return []
+
+        mock_response.json = mock_json
+        mock_client.get.return_value = mock_response
+
+        await _query_slots_detail(
+            mock_client, llama_port=8080, timeout=2.0, model="Qwen3",
+        )
+
+        # Verify the URL includes ?model=Qwen3
+        call_url = mock_client.get.call_args[0][0]
+        assert "?model=Qwen3" in call_url
+        assert "/slots" in call_url
+
+    @pytest.mark.asyncio
+    async def test_queries_without_model_when_none(self):
+        """When model is None, the URL has no query string."""
+        from proxy.observability import _query_slots_detail
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=200)
+
+        async def mock_json():
+            return []
+
+        mock_response.json = mock_json
+        mock_client.get.return_value = mock_response
+
+        await _query_slots_detail(
+            mock_client, llama_port=8080, timeout=2.0, model=None,
+        )
+
+        call_url = mock_client.get.call_args[0][0]
+        assert "?" not in call_url
+
+    @pytest.mark.asyncio
+    async def test_handles_400_without_model(self):
+        """Returns [] when /slots returns 400 due to missing model."""
+        from proxy.observability import _query_slots_detail
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=400)
+        mock_client.get.return_value = mock_response
+
+        result = await _query_slots_detail(mock_client, llama_port=8080)
+        assert result == []
+
+    @pytest.mark.asyncio
     async def test_handles_slot_without_next_token(self):
         """Slot data lacking next_token is handled gracefully (n_decoded=None)."""
         from proxy.observability import _query_slots_detail
