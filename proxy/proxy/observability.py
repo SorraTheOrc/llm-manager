@@ -600,6 +600,9 @@ async def _periodic_broadcast_loop():
     Also queries llama-server for status and broadcasts stats.
     """
     srv = _srv()
+    # Cache the last successful slot query result so that transient
+    # timeouts (e.g. during busy token generation) don't blank the UI.
+    _last_slot_details: list[dict] = []
     try:
         while True:
             try:
@@ -638,17 +641,19 @@ async def _periodic_broadcast_loop():
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                         # Use current_model as the model param for /slots
                         model_name = srv.current_model or None
+                        # 5s timeout: llama-server may be slow to respond
+                        # to /slots when busy generating tokens.
                         slot_details = await _query_slots_detail(
-                            llama_port, timeout=2.0, model=model_name,
+                            llama_port, timeout=5.0, model=model_name,
                         )
                     except Exception:
-                        # slot query is best-effort; empty list on failure
                         pass
-                    if not slot_details:
-                        srv.logger.info(
-                            "No slot data from port %d (server running=%s, model=%s)",
-                            llama_port, server_running, srv.current_model,
-                        )
+                # Preserve last known slot data when query fails or llama-server
+                # is too busy to respond (ReadTimeout during token generation).
+                if slot_details:
+                    _last_slot_details = slot_details
+                else:
+                    slot_details = _last_slot_details
 
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast

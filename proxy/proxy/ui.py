@@ -257,8 +257,10 @@ async def status_events():
                     server_cfg = srv.config.get("server", {})
                     llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                     model_name = srv.current_model or None
+                    # 5s timeout: llama-server may be slow to respond
+                    # to /slots when busy generating tokens.
                     slot_details = await _query_slots_detail(
-                        llama_port, timeout=2.0, model=model_name,
+                        llama_port, timeout=5.0, model=model_name,
                     )
                 except Exception:
                     pass
