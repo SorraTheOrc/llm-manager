@@ -177,6 +177,34 @@ class TestQuerySlotsDetail:
         assert result == []
 
     @pytest.mark.asyncio
+    async def test_handles_next_token_as_list(self):
+        """Handles next_token being a list of token objects."""
+        from proxy.observability import _query_slots_detail
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=200)
+
+        async def mock_json():
+            return [
+                {
+                    "id": 3,
+                    "is_processing": True,
+                    "next_token": [
+                        {"has_next_token": True, "n_decoded": 42}
+                    ]
+                },
+            ]
+
+        mock_response.json = mock_json
+        mock_client.get.return_value = mock_response
+
+        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        assert len(result) == 1
+        assert result[0]["slot_id"] == 3
+        assert result[0]["is_processing"] is True
+        assert result[0]["n_decoded"] == 42
+
+    @pytest.mark.asyncio
     async def test_handles_slot_without_next_token(self):
         """Slot data lacking next_token is handled gracefully (n_decoded=None)."""
         from proxy.observability import _query_slots_detail

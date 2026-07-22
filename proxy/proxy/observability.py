@@ -196,16 +196,22 @@ async def _query_slots_detail(
                     n_decoded = None
                     if isinstance(next_token, dict):
                         n_decoded = next_token.get("n_decoded")
+                    elif isinstance(next_token, list) and len(next_token) > 0:
+                        # next_token can be a list of token objects
+                        first = next_token[0]
+                        if isinstance(first, dict):
+                            n_decoded = first.get("n_decoded")
                     result.append({
-                        "slot_id": i,
+                        "slot_id": slot.get("id", i),
                         "is_processing": is_processing,
                         "n_decoded": n_decoded,
                     })
                 return result
     except Exception as exc:
         _srv().logger.warning(
-            "Slot detail query failed for port %d: %s",
-            llama_port, exc,
+            "Slot detail query failed [%s] for %s?model=%s: %s",
+            type(exc).__name__, _build_llama_url(llama_port, "/slots"),
+            model or "(none)", exc,
         )
     return []
 
@@ -624,10 +630,10 @@ async def _periodic_broadcast_loop():
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                         # Use current_model as the model param for /slots
                         model_name = srv.current_model or None
-                        client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                        slot_details = await _query_slots_detail(
-                            client, llama_port, timeout=2.0, model=model_name,
-                        )
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+                            slot_details = await _query_slots_detail(
+                                client, llama_port, timeout=2.0, model=model_name,
+                            )
                     except Exception:
                         # slot query is best-effort; empty list on failure
                         pass
