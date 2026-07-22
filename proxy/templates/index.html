@@ -20,6 +20,7 @@
             --log-warning: #f59e0b;
             --log-info: #60a5fa;
             --log-debug: #9ca3af;
+            --na-color: #888;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -524,19 +525,26 @@
             border-bottom: 1px solid var(--border);
             vertical-align: top;
         }
-        .fallback-list {
-            list-style: none;
-            padding: 0;
-            margin: 0;
+        .home-model-table td[rowspan] {
+            vertical-align: top;
         }
-        .fallback-list li {
+        .home-model-table tbody tr:nth-child(even) {
+            background: rgba(79, 140, 255, 0.04);
+        }
+        .provider-model {
+            display: inline-block;
             font-size: 0.85rem;
-            color: var(--text-secondary);
-            padding: 0.15rem 0;
         }
-        .fallback-list li::before {
-            content: "↳ ";
+        .primary-model {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .fallback-model {
+            color: var(--text-secondary);
+        }
+        .fallback-indicator {
             color: var(--warning);
+            font-weight: 400;
         }
         .badge-type {
             font-size: 0.75rem;
@@ -547,14 +555,7 @@
         .badge-type-local { background: #2e7d32; color: #fff; }
         .badge-type-remote { background: #7b1fa2; color: #fff; }
         .badge-type-unknown { background: #555; color: #fff; }
-        .active-query-count {
-            font-family: monospace;
-            font-size: 1.1rem;
-            font-weight: 600;
-        }
-        .active-query-count.zero { color: var(--text-secondary); }
-        .active-query-count.nonzero { color: var(--success); }
-        .active-query-count.unknown { color: var(--warning); }
+
         .provider-endpoint {
             font-family: monospace;
             font-size: 0.85rem;
@@ -651,10 +652,10 @@
         <div id="tab-home" class="tab-content active">
             <div class="card">
                 <div class="card-header">
-                    <h2>Model Endpoints &amp; Activity</h2>
+                    <h2>Model Endpoints</h2>
                 </div>
                 <p style="color: var(--text-secondary); margin-bottom: 1rem;">
-                    Overview of all configured models, their provider endpoints, and current active query counts.
+                    Overview of all configured models and their provider endpoints.
                 </p>
                 <table class="home-model-table" id="modelEndpointTable">
                     <thead>
@@ -662,8 +663,7 @@
                             <th>Model</th>
                             <th>Type</th>
                             <th>Primary Endpoint</th>
-                            <th>Fallback Providers</th>
-                            <th>Active Queries</th>
+                            <th>Model</th>
                         </tr>
                     </thead>
                     <tbody id="modelEndpointBody">
@@ -1436,34 +1436,7 @@ API Endpoints
             } catch(e) {}
         })();
 
-        // Per-model active query counter data (injected from server)
-        const MODEL_ENDPOINTS = __MODEL_ENDPOINTS_JSON__;
 
-        // Update per-model active query counters from SSE data
-        function updatePerModelQueries(perModelQueries) {
-            if (!perModelQueries) return;
-            Object.keys(perModelQueries).forEach(modelName => {
-                const el = document.getElementById('aq-' + modelName);
-                if (!el) return;
-                const count = perModelQueries[modelName] || 0;
-                el.textContent = count;
-                el.className = 'active-query-count' + (count > 0 ? ' nonzero' : ' zero');
-            });
-        }
-
-        // Extend the existing updateStatsPanel to also handle per_model_queries
-        // Save a reference to the original function before overriding
-        const _origUpdateStatsPanel = window.updateStatsPanel;
-        window.updateStatsPanel = function(data) {
-            // Call original handler
-            if (_origUpdateStatsPanel) {
-                _origUpdateStatsPanel(data);
-            }
-            // Handle per_model_queries if present
-            if (data && data.per_model_queries) {
-                updatePerModelQueries(data.per_model_queries);
-            }
-        };
     </script>
 __ROUTER_SCRIPT__</body>
 </html>

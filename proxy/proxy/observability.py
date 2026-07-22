@@ -36,6 +36,7 @@ from typing import Any
 import httpx
 
 
+
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
 # ---------------------------------------------------------------------------
@@ -557,13 +558,12 @@ async def _periodic_broadcast_loop():
                             continue
 
                 if sse_clients:
-                    # Snapshot per-model queries for SSE broadcast
+                    # Snapshot per-model and per-provider queries for SSE broadcast
                     try:
                         async with srv.per_model_queries_lock:
                             per_model_snapshot = dict(srv.per_model_queries)
                     except Exception:
                         per_model_snapshot = {}
-
                     status_data = {
                         "type": "status",
                         "current_model": srv.current_model,

@@ -49,56 +49,73 @@ def _has_fallback_providers(model_cfg):
 def _build_home_model_rows(srv) -> str:
     """Build the Home tab model endpoint table rows.
 
-    Returns an HTML string of table rows for all configured models,
-    showing name, type, primary endpoint, fallback providers, and
-    active query count (rendered server-side with placeholder IDs
-    for live SSE updates).
+    Returns an HTML string with one table row per provider entry in the
+    fallback chain (not one row per model config key).  The table shows:
+    - Model (1st col): the config key (rowspans across providers in chain)
+    - Type: provider type (local/remote)
+    - Primary Endpoint: the endpoint URL for this specific provider
+    - Model (4th col): the provider-level model name (llama_model for
+      local, endpoint model for remote)
     """
     rows = ""
     model_type_labels = {"local": "Local", "remote": "Remote"}
     model_type_badges = {"local": "badge-type-local", "remote": "badge-type-remote"}
     for name, cfg in srv.config.get("models", {}).items():
+        providers = cfg.get("providers") or []
+        provider_count = 0
+        for p in providers:
+            if isinstance(p, dict):
+                provider_count += 1
+
+        if provider_count == 0:
+            continue
+
+        # Type badge for this config key (first row only)
         model_type = get_model_type(cfg) or "unknown"
         type_label = model_type_labels.get(model_type, model_type.title())
         type_badge_class = model_type_badges.get(model_type, "badge-type-unknown")
 
-        # Primary endpoint
-        providers = cfg.get("providers") or []
-        primary_endpoint = ""
-        fallback_list = ""
-        first = True
-        for p in providers:
-            if isinstance(p, dict):
-                ptype = p.get("type", "")
-                pname = p.get("name", "")
-                endpoint = p.get("endpoint") or p.get("llama_model", "")
-                if first:
-                    primary_endpoint = endpoint or "-"
-                    first = False
-                else:
-                    fallback_list += f'<li><span class="provider-endpoint">{pname}: {endpoint}</span></li>'
-        if not primary_endpoint:
-            primary_endpoint = "-"
+        rowspan_attr = f' rowspan="{provider_count}"' if provider_count > 1 else ""
 
-        fallback_html = (
-            f'<ul class="fallback-list">{fallback_list}</ul>'
-            if fallback_list
-            else '<span style="color: var(--text-secondary); font-size: 0.85rem;">None</span>'
-        )
+        for idx, p in enumerate(providers):
+            if not isinstance(p, dict):
+                continue
 
-        # Active query count cell - data attribute for SSE updates
-        active_count_cell = (
-            f'<span class="active-query-count zero" '
-            f'id="aq-{name}" data-model="{name}">0</span>'
-        )
+            ptype = p.get("type", "")
+            endpoint = p.get("endpoint") or p.get("llama_model", "") or "-"
+            provider_model_name = p.get("model") or p.get("llama_model") or p.get("name", "") or "-"
+            is_first = idx == 0
 
-        rows += f"""
+            # Build the endpoint display
+            endpoint_display = (
+                f'<span class="provider-endpoint">{endpoint}</span>'
+            )
+
+            # Model name (4th col): primary at top, fallbacks below with indent
+            if is_first:
+                model_display = (
+                    f'<span class="provider-model primary-model">{provider_model_name}</span>'
+                )
+            else:
+                model_display = (
+                    f'<span class="provider-model fallback-model">'
+                    f'  <span class="fallback-indicator">↳ fallback:</span> {provider_model_name}'
+                    f'</span>'
+                )
+
+            if is_first:
+                rows += f"""
         <tr>
-            <td><code>{name}</code></td>
-            <td><span class="badge-type {type_badge_class}">{type_label}</span></td>
-            <td><span class="provider-endpoint">{primary_endpoint}</span></td>
-            <td>{fallback_html}</td>
-            <td>{active_count_cell}</td>
+            <td{rowspan_attr}><code>{name}</code></td>
+            <td{rowspan_attr}><span class="badge-type {type_badge_class}">{type_label}</span></td>
+            <td>{endpoint_display}</td>
+            <td>{model_display}</td>
+        </tr>"""
+            else:
+                rows += f"""
+        <tr>
+            <td>{endpoint_display}</td>
+            <td>{model_display}</td>
         </tr>"""
     return rows
 
@@ -200,29 +217,7 @@ async def index(request: Request):
     router_script = f'<script>window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'
     html_content = html_content.replace('__ROUTER_SCRIPT__', router_script)
 
-    # Build model endpoint data for the Home tab (per-model config with providers)
-    model_endpoints = []
-    from proxy.provider import get_model_type as _get_model_type, get_local_model_name_from_providers as _get_local_model, get_remote_endpoint as _get_remote_endpoint
-    for name, cfg in srv.config.get("models", {}).items():
-        entry = {
-            "name": name,
-            "type": _get_model_type(cfg) or "unknown",
-            "providers": [],
-        }
-        providers = cfg.get("providers") or []
-        for p in providers:
-            if isinstance(p, dict):
-                ptype = p.get("type", "")
-                endpoint = p.get("endpoint") or p.get("llama_model", "")
-                provider_entry = {
-                    "name": p.get("name", ""),
-                    "type": ptype,
-                    "endpoint": endpoint,
-                }
-                entry["providers"].append(provider_entry)
-        model_endpoints.append(entry)
-    model_endpoints_json = json.dumps(model_endpoints)
-    html_content = html_content.replace('__MODEL_ENDPOINTS_JSON__', model_endpoints_json)
+    # (removed: per-provider model endpoint JSON – no longer needed)
 
     return HTMLResponse(content=html_content)
 

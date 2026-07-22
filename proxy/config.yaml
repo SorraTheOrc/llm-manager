@@ -48,7 +48,7 @@
 # See proxy/MODEL_ADD.md for the full guide.
 # ---------------------------------------------------------------------------
 
-default_model: Qwen3
+default_model: code
 # default_remote is commented out: the openai provider was removed (LP-0MQNQUR7K005GDP6).
 # default_remote:
 #   api_key_env: OPENAI_API_KEY
@@ -108,14 +108,6 @@ models:
     aliases:
     - embeddings
     - embed
-  gemma4:
-    providers:
-      - name: local-gemma4
-        type: local
-        llama_model: gemma4
-    aliases:
-    - gemma4
-    - Gemma4
   github:
     providers:
       - name: github-primary
@@ -124,27 +116,6 @@ models:
         endpoint: https://models.inference.ai.azure.com
     aliases:
     - github-*
-  gpt120:
-    providers:
-      - name: local-gpt120
-        type: local
-        llama_model: gpt120
-    aliases:
-    - gpt-oss-120b
-    - gpt-oss*
-    - GPT-OSS*
-    - Casey
-    - casey
-  qwen3:
-    providers:
-      - name: local-qwen3
-        type: local
-        llama_model: Qwen3
-    aliases:
-    - qwen3*
-    - Qwen3*
-    force_full_prompt: true
-
   # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
@@ -206,16 +177,6 @@ models:
     - author
     force_full_prompt: true
 
-  qwen3-next:
-    providers:
-      - name: local-qwen3-next
-        type: local
-        llama_model: Qwen3
-    aliases:
-    - qwen3-next
-    - qwen3-coder-next
-    - qwen3-next*
-    force_full_prompt: true
   code:
     providers:
       - name: local-qwen3-next
@@ -467,7 +428,7 @@ server:
   llama_self_heal_retry_after_seconds: 30
   llama_router_preload:
   - embeddings
-  - Qwen3
+  - code
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
   # Must be an absolute path or a script resolvable from PATH.
