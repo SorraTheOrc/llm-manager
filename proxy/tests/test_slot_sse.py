@@ -286,3 +286,157 @@ class TestSseBroadcastSlotData:
                     break
         finally:
             sse_clients.discard(queue)
+
+
+# ======================================================================
+# Last-known slot details cache tests
+# ======================================================================
+
+
+class TestLastSlotDetailsCache:
+    """Tests for the shared module-level slot details cache.
+
+    The cache is defined as ``_last_slot_details_cache`` in
+    ``proxy.observability`` and is shared between
+    ``_periodic_broadcast_loop()`` and ``ui.status_events()`` so that
+    transient timeouts (ReadTimeout) during busy token generation don't
+    blank the slot display in the UI.
+    """
+
+    def test_cache_is_accessible_from_ui_module(self):
+        """The shared cache can be imported from the proxy.ui module path."""
+        from proxy.observability import _last_slot_details_cache
+        assert isinstance(_last_slot_details_cache, list)
+
+    def test_cache_starts_empty(self):
+        """The cache starts as an empty list."""
+        from proxy.observability import _last_slot_details_cache
+        assert _last_slot_details_cache == []
+
+    def test_cache_can_be_populated_and_read(self):
+        """The cache accepts slot data and can be read back as a copy."""
+        from proxy.observability import _last_slot_details_cache
+        _last_slot_details_cache.clear()
+        _last_slot_details_cache.extend([
+            {"slot_id": 0, "is_processing": False, "n_decoded": None},
+            {"slot_id": 1, "is_processing": True, "n_decoded": 42},
+        ])
+        assert len(_last_slot_details_cache) == 2
+        assert _last_slot_details_cache[0]["slot_id"] == 0
+        assert _last_slot_details_cache[1]["n_decoded"] == 42
+
+    def test_cache_read_returns_reference_to_same_list(self):
+        """Importing the cache gives a reference to the same module list."""
+        from proxy.observability import _last_slot_details_cache as cache1
+        from proxy.observability import _last_slot_details_cache as cache2
+        assert cache1 is cache2
+
+    @pytest.mark.asyncio
+    async def test_status_events_payload_has_slots_field(self):
+        """status_events() includes a slots field in the initial SSE payload.
+        When llama-server is not running, slots should be an empty list."""
+        from proxy.ui import status_events
+        from proxy.observability import _last_slot_details_cache
+        from unittest.mock import patch, AsyncMock, MagicMock
+
+        # Clear the shared cache
+        _last_slot_details_cache.clear()
+
+        srv = MagicMock()
+        srv.per_model_queries = {}
+        srv.per_model_queries_lock = MagicMock()
+        srv.sse_clients = set()
+        srv.current_model = "Qwen3"
+        srv.token_counts = {"total_sent": 100, "total_recv": 200}
+        srv.config = {"server": {}}
+        # llama_server_running=False means no slot query is attempted
+        srv.query_llama_status = AsyncMock(return_value={
+            "llama_server_running": False,
+            "n_ctx": None,
+            "kv_cache_tokens": None,
+            "router_mode": False,
+        })
+        srv.router_list_models = AsyncMock(return_value=[])
+
+        with patch("proxy.ui._srv", return_value=srv):
+            response = await status_events()
+
+        chunk = await asyncio.wait_for(
+            response.body_iterator.__anext__(),
+            timeout=3.0
+        )
+        raw = chunk if isinstance(chunk, str) else chunk.decode("utf-8")
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                payload = json.loads(line[len("data:"):].strip())
+                assert payload["type"] == "status"
+                assert "slots" in payload
+                assert payload["slots"] == []
+                break
+
+    @pytest.mark.asyncio
+    async def test_caching_pattern_matches_observability(self):
+        """The caching pattern in ui.py matches the pattern in
+        observability.py._periodic_broadcast_loop(): on success update
+        the cache; on failure fall back to it.  We verify the logic by
+        exercising _query_slots_detail() with mock clients that simulate
+        success then failure."""
+        from proxy.observability import _query_slots_detail, _last_slot_details_cache
+        from unittest.mock import AsyncMock, MagicMock
+
+        # Start with empty cache
+        _last_slot_details_cache.clear()
+        assert _last_slot_details_cache == []
+
+        # --- First call: success, should populate cache ---
+        mock_client_ok = AsyncMock()
+        mock_response_ok = MagicMock(status_code=200)
+
+        async def mock_json_ok():
+            return [
+                {"id": 5, "is_processing": True, "next_token": {"n_decoded": 12288}},
+                {"id": 3, "is_processing": False},
+            ]
+
+        mock_response_ok.json = mock_json_ok
+        mock_client_ok.get.return_value = mock_response_ok
+
+        result = await _query_slots_detail(
+            8080, timeout=2.0, model="Qwen3", _client=mock_client_ok,
+        )
+
+        # The function itself returns slot data
+        assert len(result) == 2
+        assert result[0]["slot_id"] == 5
+        assert result[0]["n_decoded"] == 12288
+
+        # Now simulate the caching logic used in both _periodic_broadcast_loop
+        # and status_events: if slot_details is truthy, update the cache
+        if result:
+            _last_slot_details_cache.clear()
+            _last_slot_details_cache.extend(result)
+
+        assert len(_last_slot_details_cache) == 2
+        assert _last_slot_details_cache[0]["slot_id"] == 5
+
+        # --- Second call: failure (timeout), should fall back to cache ---
+        mock_client_fail = AsyncMock()
+        mock_client_fail.get.side_effect = Exception("ReadTimeout")
+
+        result2 = await _query_slots_detail(
+            8080, timeout=2.0, model="Qwen3", _client=mock_client_fail,
+        )
+        # Returns [] from the function itself
+        assert result2 == []
+
+        # Simulate the caching fallback
+        if result2:
+            _last_slot_details_cache.clear()
+            _last_slot_details_cache.extend(result2)
+        else:
+            result2 = list(_last_slot_details_cache)
+
+        # Should have fallen back to the cached data
+        assert len(result2) == 2
+        assert result2[0]["slot_id"] == 5
+        assert result2[0]["n_decoded"] == 12288

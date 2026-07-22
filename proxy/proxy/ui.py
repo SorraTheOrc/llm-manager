@@ -264,6 +264,17 @@ async def status_events():
                     )
                 except Exception:
                     pass
+            # Preserve last known slot data when query fails or llama-server
+            # is too busy to respond (ReadTimeout during token generation).
+            # Use the shared module-level cache from _periodic_broadcast_loop()
+            # so that a page-reload during a busy generation still shows real data.
+            from proxy.observability import _last_slot_details_cache as _slot_cache
+            if slot_details:
+                # In-place update is fine because we're extending the list variable
+                _slot_cache.clear()
+                _slot_cache.extend(slot_details)
+            else:
+                slot_details = list(_slot_cache)
 
             initial_status = json.dumps({
                 "type": "status",

@@ -233,6 +233,23 @@ log_tail_clients: set[asyncio.Queue] = set()
 
 
 # ===================================================================
+# Last-known slot details cache
+#
+# Shared module-level cache so that both ``_periodic_broadcast_loop()`` and
+# per-connection SSE handlers (``ui.status_events()``) can survive transient
+# timeouts when llama-server is busy generating tokens.
+# ===================================================================
+
+_last_slot_details_cache: list[dict] = []
+"""Last successful result from ``_query_slots_detail()``.
+
+Updated by ``_periodic_broadcast_loop()`` on each successful query.
+Read by ``status_events()`` in ``proxy.ui`` as a fallback when the
+initial /slots query times out.
+"""
+
+
+# ===================================================================
 # Counters, tokens, status broadcast and persistence
 # ===================================================================
 
@@ -602,7 +619,9 @@ async def _periodic_broadcast_loop():
     srv = _srv()
     # Cache the last successful slot query result so that transient
     # timeouts (e.g. during busy token generation) don't blank the UI.
-    _last_slot_details: list[dict] = []
+    # Use the module-level cache so that ``status_events()`` in ``proxy.ui``
+    # can also survive timeouts on initial SSE connection.
+    global _last_slot_details_cache
     try:
         while True:
             try:
@@ -651,9 +670,9 @@ async def _periodic_broadcast_loop():
                 # Preserve last known slot data when query fails or llama-server
                 # is too busy to respond (ReadTimeout during token generation).
                 if slot_details:
-                    _last_slot_details = slot_details
+                    _last_slot_details_cache = slot_details
                 else:
-                    slot_details = _last_slot_details
+                    slot_details = _last_slot_details_cache
 
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast
