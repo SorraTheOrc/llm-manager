@@ -6,6 +6,7 @@ Uses lazy server import (_srv()) to avoid circular imports.
 """
 
 import asyncio
+import httpx
 import json
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from proxy.lifecycle import _extract_router_model_ids
+from proxy.observability import _build_llama_url, _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
 from proxy.router_helpers import _get_per_model_queries
@@ -248,6 +250,17 @@ async def status_events():
 
             per_model_queries = await _get_per_model_queries(srv)
 
+            # --- Per-slot data query (best-effort) ---
+            slot_details = []
+            if llama_status.get("llama_server_running"):
+                try:
+                    server_cfg = srv.config.get("server", {})
+                    llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                    client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                    slot_details = await _query_slots_detail(client, llama_port, timeout=2.0)
+                except Exception:
+                    pass
+
             initial_status = json.dumps({
                 "type": "status",
                 "current_model": srv.current_model,
@@ -258,6 +271,7 @@ async def status_events():
                 "total_sent": total_sent,
                 "total_recv": total_recv,
                 "per_model_queries": per_model_queries,
+                "slots": slot_details,
             })
             yield f"data: {initial_status}\n\n"
 

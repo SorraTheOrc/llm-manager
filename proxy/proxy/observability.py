@@ -192,8 +192,11 @@ async def _query_slots_detail(
                         "n_decoded": n_decoded,
                     })
                 return result
-    except Exception:
-        pass
+    except Exception as exc:
+        _srv().logger.debug(
+            "Slot detail query failed for port %d: %s",
+            llama_port, exc,
+        )
     return []
 
 
