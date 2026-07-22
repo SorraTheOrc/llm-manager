@@ -486,6 +486,52 @@ async def _increment_active_queries(srv) -> None:
         pass
 
 
+async def _increment_per_model_query(srv, model_name: str | None) -> None:
+    """Increment per-model active query counter.
+
+    When *model_name* is ``None`` or empty, this is a no-op.
+    """
+    if not model_name:
+        return
+    try:
+        async with srv.per_model_queries_lock:
+            srv.per_model_queries[model_name] = srv.per_model_queries.get(model_name, 0) + 1
+    except AttributeError as exc:
+        # Gracefully handle missing server attributes (e.g., in tests)
+        import proxy.server as _s
+        _s.logger.debug("per_model_query_lock not available: %s", exc)
+    except Exception:
+        pass
+
+
+async def _decrement_per_model_query(srv, model_name: str | None) -> None:
+    """Decrement per-model active query counter.
+
+    When *model_name* is ``None`` or empty, this is a no-op.
+    The counter is clamped to a minimum of 0.
+    """
+    if not model_name:
+        return
+    try:
+        async with srv.per_model_queries_lock:
+            current = srv.per_model_queries.get(model_name, 0)
+            if current > 0:
+                srv.per_model_queries[model_name] = current - 1
+            else:
+                srv.per_model_queries[model_name] = 0
+    except Exception:
+        pass
+
+
+async def _get_per_model_queries(srv) -> dict[str, int]:
+    """Return a snapshot of per-model query counts."""
+    try:
+        async with srv.per_model_queries_lock:
+            return dict(srv.per_model_queries)
+    except Exception:
+        return {}
+
+
 def _get_lease_timeout_seconds(srv) -> float:
     """Return the configured lease timeout in seconds (default 180)."""
     try:
@@ -685,20 +731,11 @@ async def _try_acquire_local_dispatch(
 
     try:
         async with srv.local_dispatch_records_lock:
-            # ---------------------------------------------------------------
-            # 1. Clean ALL expired lease records (not just same-session).
-            #    This ensures stale records from crashed/abandoned sessions
-            #    do not permanently occupy slots.
-            # ---------------------------------------------------------------
+            # ... (cleaning, checking, acquiring logic)
             for existing_key, record in list(srv.local_dispatch_records.items()):
                 if not record.get("active") and record.get("expires_at", 0) <= now:
                     del srv.local_dispatch_records[existing_key]
 
-            # ---------------------------------------------------------------
-            # 2. Check: does the requesting session already hold a valid lease?
-            #    Same-session re-acquisition is always permitted regardless of
-            #    how many other sessions hold leases.
-            # ---------------------------------------------------------------
             own_record = srv.local_dispatch_records.get(session_key)
             own_has_lease = (
                 own_record is not None
@@ -708,10 +745,6 @@ async def _try_acquire_local_dispatch(
                 )
             )
 
-            # ---------------------------------------------------------------
-            # 3. For new sessions (not re-acquiring), count occupied slots
-            #    from OTHER sessions. Only deny when occupied >= max_local.
-            # ---------------------------------------------------------------
             if not own_has_lease:
                 occupied_by_others = 0
                 first_occupied_owner = None
@@ -724,19 +757,12 @@ async def _try_acquire_local_dispatch(
                             first_occupied_owner = existing_key
 
                 if occupied_by_others >= max_local:
-                    # All N slots are occupied by other sessions
                     active_count = getattr(srv, "local_active_queries", 0)
                     retry_after = max(1.0, lease_timeout)
                     return (False, first_occupied_owner, active_count, retry_after)
 
-            # ---------------------------------------------------------------
-            # 4. Check active-query concurrency cap.
-            #    Same-session re-acquisition skips the cap check since the
-            #    session's previous request already decremented the counter.
-            # ---------------------------------------------------------------
             async with srv.local_active_queries_lock:
                 if srv.local_active_queries >= max_local and not own_has_lease:
-                    # At concurrency limit -- find the owner of the active request
                     active_owner = None
                     for ek, er in srv.local_dispatch_records.items():
                         if er.get("active"):
@@ -749,12 +775,8 @@ async def _try_acquire_local_dispatch(
                         max(1.0, lease_timeout),
                     )
 
-                # Acquire: increment active-query counter
                 srv.local_active_queries += 1
 
-            # ---------------------------------------------------------------
-            # 5. Create or update the dispatch lease record.
-            # ---------------------------------------------------------------
             srv.local_dispatch_records[session_key] = {
                 "backend": backend,
                 "started_at": now,

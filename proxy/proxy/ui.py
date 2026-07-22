@@ -16,6 +16,7 @@ from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from proxy.lifecycle import _extract_router_model_ids
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
+from proxy.router_helpers import _get_per_model_queries
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,80 @@ def _has_fallback_providers(model_cfg):
         return True
     first = providers[0] if providers else {}
     return isinstance(first, dict) and first.get("type") == "remote"
+
+
+def _build_home_model_rows(srv) -> str:
+    """Build the Home tab model endpoint table rows.
+
+    Returns an HTML string with one table row per provider entry in the
+    fallback chain (not one row per model config key).  The table shows:
+    - Model (1st col): the config key (rowspans across providers in chain)
+    - Type: provider type (local/remote)
+    - Primary Endpoint: the endpoint URL for this specific provider
+    - Model (4th col): the provider-level model name (llama_model for
+      local, endpoint model for remote)
+    """
+    rows = ""
+    model_type_labels = {"local": "Local", "remote": "Remote"}
+    model_type_badges = {"local": "badge-type-local", "remote": "badge-type-remote"}
+    for name, cfg in srv.config.get("models", {}).items():
+        providers = cfg.get("providers") or []
+        provider_count = 0
+        for p in providers:
+            if isinstance(p, dict):
+                provider_count += 1
+
+        if provider_count == 0:
+            continue
+
+        # Type badge for this config key (first row only)
+        model_type = get_model_type(cfg) or "unknown"
+        type_label = model_type_labels.get(model_type, model_type.title())
+        type_badge_class = model_type_badges.get(model_type, "badge-type-unknown")
+
+        rowspan_attr = f' rowspan="{provider_count}"' if provider_count > 1 else ""
+
+        for idx, p in enumerate(providers):
+            if not isinstance(p, dict):
+                continue
+
+            ptype = p.get("type", "")
+            endpoint = p.get("endpoint") or p.get("llama_model", "") or "-"
+            provider_model_name = p.get("model") or p.get("llama_model") or p.get("name", "") or "-"
+            is_first = idx == 0
+
+            # Build the endpoint display
+            endpoint_display = (
+                f'<span class="provider-endpoint">{endpoint}</span>'
+            )
+
+            # Model name (4th col): primary at top, fallbacks below with indent
+            if is_first:
+                model_display = (
+                    f'<span class="provider-model primary-model">{provider_model_name}</span>'
+                )
+            else:
+                model_display = (
+                    f'<span class="provider-model fallback-model">'
+                    f'  <span class="fallback-indicator">↳ fallback:</span> {provider_model_name}'
+                    f'</span>'
+                )
+
+            if is_first:
+                rows += f"""
+        <tr>
+            <td{rowspan_attr}><code>{name}</code></td>
+            <td{rowspan_attr}><span class="badge-type {type_badge_class}">{type_label}</span></td>
+            <td>{endpoint_display}</td>
+            <td>{model_display}</td>
+        </tr>"""
+            else:
+                rows += f"""
+        <tr>
+            <td>{endpoint_display}</td>
+            <td>{model_display}</td>
+        </tr>"""
+    return rows
 
 
 async def index(request: Request):
@@ -130,6 +205,7 @@ async def index(request: Request):
     html_content = html_content.replace('__LLAMA_STATUS_DISPLAY__', 'Running' if srv.llama_process and srv.llama_process.poll() is None else 'Stopped')
     html_content = html_content.replace('__MODEL_BUTTONS__', model_buttons)
     html_content = html_content.replace('__MODELS_ROWS__', models_rows)
+    html_content = html_content.replace('__HOME_MODEL_ROWS__', _build_home_model_rows(srv))
     html_content = html_content.replace('__MODEL_OPTIONS__', model_options)
     html_content = html_content.replace('__CURRENT_MODEL_JS__', srv.current_model or 'None')
     html_content = html_content.replace('__LOCAL_MODEL_NAMES_JSON__', local_model_names_json)
@@ -140,6 +216,8 @@ async def index(request: Request):
     # Inject router script
     router_script = f'<script>window.__ROUTER_MODE = {json.dumps(router_mode)}; window.__ROUTER_MODELS = {json.dumps(router_models)};</script>'
     html_content = html_content.replace('__ROUTER_SCRIPT__', router_script)
+
+    # (removed: per-provider model endpoint JSON – no longer needed)
 
     return HTMLResponse(content=html_content)
 
@@ -168,6 +246,8 @@ async def status_events():
                 router_models = await srv.router_list_models()
                 loaded_models = _extract_router_model_ids(router_models)
 
+            per_model_queries = await _get_per_model_queries(srv)
+
             initial_status = json.dumps({
                 "type": "status",
                 "current_model": srv.current_model,
@@ -176,7 +256,8 @@ async def status_events():
                 "n_ctx": llama_status["n_ctx"],
                 "kv_cache_tokens": llama_status["kv_cache_tokens"],
                 "total_sent": total_sent,
-                "total_recv": total_recv
+                "total_recv": total_recv,
+                "per_model_queries": per_model_queries,
             })
             yield f"data: {initial_status}\n\n"
 

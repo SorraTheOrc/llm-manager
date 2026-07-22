@@ -28,6 +28,7 @@ Structured error format (all 502 responses follow the same pattern):
 """
 
 import struct
+import time
 from unittest.mock import AsyncMock
 
 import httpx
@@ -289,6 +290,165 @@ class TestTtsRouteContract:
             "Handler did not forward any body to tts-server"
         assert sent_body.get("instructions") == "Speak slowly and clearly", \
             "instructions must be forwarded when provided"
+
+    @pytest.mark.asyncio
+    async def test_lang_is_forwarded(self, monkeypatch):
+        """The proxy must forward the lang field when provided."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "serena",
+                    "lang": "english",
+                },
+            )
+
+        assert sent_body is not None, \
+            "Handler did not forward any body to tts-server"
+        assert sent_body.get("lang") == "english", \
+            "lang must be forwarded when provided"
+
+    @pytest.mark.asyncio
+    async def test_lang_is_optional(self, monkeypatch):
+        """The proxy must handle requests without lang (backward compatible)."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "serena",
+                },
+            )
+
+        assert resp.status_code == 200, \
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert sent_body is not None, \
+            "Handler did not forward any body to tts-server"
+        # lang should not be present in forward_body when not provided
+        assert "lang" not in sent_body or not sent_body.get("lang"), \
+            "lang should not be forwarded when not provided"
+
+    @pytest.mark.asyncio
+    async def test_lang_passthrough_invalid_value(self, monkeypatch):
+        """Invalid lang values are still passed through (backend validation,
+        not proxy concern)."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "serena",
+                    "lang": "invalid_language_xyz",
+                },
+            )
+
+        assert sent_body is not None, \
+            "Handler did not forward any body to tts-server"
+        assert sent_body.get("lang") == "invalid_language_xyz", \
+            "Invalid lang values must still be passed through"
+
+    @pytest.mark.asyncio
+    async def test_lang_in_passthrough_all_params_test(self, monkeypatch):
+        """The passthrough contract test should include lang."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Forward test",
+                    "voice": "serena",
+                    "response_format": "wav",
+                    "instructions": "Speak in a cheerful tone",
+                    "lang": "english",
+                },
+            )
+
+        assert sent_body is not None, \
+            "Handler did not forward any body to tts-server"
+        assert sent_body.get("model") == "qwen3-tts"
+        assert sent_body.get("input") == "Forward test"
+        assert sent_body.get("voice") == "serena"
+        assert sent_body.get("response_format") == "wav"
+        assert sent_body.get("instructions") == "Speak in a cheerful tone", \
+            "instructions must be forwarded to tts-server"
+        assert sent_body.get("lang") == "english", \
+            "lang must be forwarded to tts-server"
 
     @pytest.mark.asyncio
     async def test_instructions_is_optional(self, monkeypatch):
@@ -589,3 +749,245 @@ class TestTtsRouteErrors:
 
         assert resp.status_code == 400, \
             f"Expected 400, got {resp.status_code}: {resp.text}"
+
+
+# ---------------------------------------------------------------------------
+# Voice validation and fallback tests
+# ---------------------------------------------------------------------------
+
+class TestTtsVoiceValidation:
+    """Verify voice validation, default fallback, and Warning header logic."""
+
+    VALID_VOICES = ["serena", "vivian", "uncle_fu", "ryan", "aiden",
+                    "ono_anna", "sohee", "eric", "dylan"]
+
+    @pytest.fixture(autouse=True)
+    def setup_voice_cache(self, monkeypatch):
+        """Pre-populate the voice cache in the handlers module so tests
+        don't require an actual /v1/voices call."""
+        import proxy.handlers as h
+        monkeypatch.setattr(h, "_valid_voices", list(self.VALID_VOICES))
+        monkeypatch.setattr(h, "_voice_cache_time", time.monotonic())
+        yield
+
+    # -- (a) Valid voice passes through -----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_valid_voice_passes_through(self, monkeypatch):
+        """A known valid voice is forwarded unchanged, no Warning header."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "serena",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert sent_body is not None
+        assert sent_body.get("voice") == "serena", \
+            "Valid voice should pass through unchanged"
+        # No Warning header expected
+        assert "warning" not in resp.headers or not resp.headers.get("warning"), \
+            "No Warning header expected when voice is valid"
+
+    # -- (b) Invalid voice triggers fallback + Warning header -------------
+
+    @pytest.mark.asyncio
+    async def test_invalid_voice_falls_back_to_vivian(self, monkeypatch):
+        """An unrecognized voice name is replaced with 'vivian' and a
+        Warning header is added."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                    "voice": "alloy",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert sent_body is not None
+        assert sent_body.get("voice") == "vivian", \
+            "Invalid voice should be replaced with default 'vivian'"
+        # Warning header must be present (case-insensitive check)
+        warning = resp.headers.get("warning") or resp.headers.get("Warning", "")
+        assert warning, "Warning header should be present when voice is substituted"
+        assert "alloy" in warning, "Warning header should mention the original voice"
+        assert "vivian" in warning, "Warning header should mention the fallback voice"
+
+    # -- (c) No voice field works as before -------------------------------
+
+    @pytest.mark.asyncio
+    async def test_no_voice_field_succeeds(self, monkeypatch):
+        """Request without a voice field works like before (no voice in
+        forward_body, no Warning header)."""
+        from proxy.server import app
+
+        transport = httpx.ASGITransport(app=app)
+        mock_resp = _make_tts_response()
+        sent_body = None
+
+        async def capture_post(url, *, json=None, **kwargs):
+            nonlocal sent_body
+            sent_body = json
+            return mock_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = capture_post
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello world",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert sent_body is not None
+        # voice should not be in forward_body when not provided
+        assert "voice" not in sent_body or not sent_body.get("voice"), \
+            "voice should not be forwarded when not provided"
+        # No Warning header expected
+        assert "warning" not in resp.headers or not resp.headers.get("warning"), \
+            "No Warning header expected when no voice field"
+
+    # -- (d) Voice list caching works ------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_voice_cache_fetch_and_miss(self, monkeypatch):
+        """When the voice cache is empty, the handler fetches voices from
+        the TTS server via /v1/voices."""
+        import proxy.handlers as h
+        # Clear the cache
+        monkeypatch.setattr(h, "_valid_voices", None)
+        monkeypatch.setattr(h, "_voice_cache_time", 0.0)
+
+        # Mock the httpx client for both the tts-server /v1/voices call
+        # and the /v1/audio/speech call
+        voices_resp = _make_voices_response()
+        tts_resp = _make_tts_response()
+        call_log = []
+
+        async def mock_post(url, *, json=None, **kwargs):
+            call_log.append(("post", url, json))
+            return tts_resp
+
+        async def mock_get(url, **kwargs):
+            call_log.append(("get", url))
+            return voices_resp
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = mock_post
+        mock_client.get = mock_get
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        from proxy.server import app
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello",
+                    "voice": "serena",
+                },
+            )
+
+        assert resp.status_code == 200
+        # Should have fetched voices via GET
+        get_calls = [c for c in call_log if c[0] == "get"]
+        assert len(get_calls) >= 1, "Expected at least one GET to /v1/voices"
+        assert "/v1/voices" in get_calls[0][1], "GET should be to /v1/voices"
+
+    @pytest.mark.asyncio
+    async def test_voice_cache_reuses_data(self, monkeypatch):
+        """When the voice cache is populated, no GET to /v1/voices is made."""
+        import proxy.handlers as h
+        # Pre-populate the cache (already set by setup_voice_cache)
+        monkeypatch.setattr(h, "_valid_voices", list(self.VALID_VOICES))
+        monkeypatch.setattr(h, "_voice_cache_time", time.monotonic())
+
+        tts_resp = _make_tts_response()
+        call_log = []
+
+        async def mock_post(url, *, json=None, **kwargs):
+            call_log.append(("post", url, json))
+            return tts_resp
+
+        async def mock_get(url, **kwargs):
+            call_log.append(("get", url))
+            # Should never be called in the cache-hit scenario
+            return _make_voices_response()
+
+        import proxy.server as srv
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post = mock_post
+        mock_client.get = mock_get
+        monkeypatch.setattr(srv, "_http_client", mock_client)
+
+        from proxy.server import app
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "qwen3-tts",
+                    "input": "Hello",
+                    "voice": "serena",
+                },
+            )
+
+        assert resp.status_code == 200
+        get_calls = [c for c in call_log if c[0] == "get"]
+        assert len(get_calls) == 0, "No GET to /v1/voices expected when cache is populated"
