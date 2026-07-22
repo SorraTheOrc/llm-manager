@@ -36,6 +36,7 @@ from typing import Any
 import httpx
 
 
+
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
 # ---------------------------------------------------------------------------
@@ -557,6 +558,12 @@ async def _periodic_broadcast_loop():
                             continue
 
                 if sse_clients:
+                    # Snapshot per-model and per-provider queries for SSE broadcast
+                    try:
+                        async with srv.per_model_queries_lock:
+                            per_model_snapshot = dict(srv.per_model_queries)
+                    except Exception:
+                        per_model_snapshot = {}
                     status_data = {
                         "type": "status",
                         "current_model": srv.current_model,
@@ -564,7 +571,8 @@ async def _periodic_broadcast_loop():
                         "n_ctx": llama_status["n_ctx"],
                         "kv_cache_tokens": llama_status["kv_cache_tokens"],
                         "total_sent": total_sent,
-                        "total_recv": total_recv
+                        "total_recv": total_recv,
+                        "per_model_queries": per_model_snapshot,
                     }
                     event_data = json.dumps(status_data)
                     message = f"data: {event_data}\n\n"

@@ -85,6 +85,12 @@ periodic_broadcast_task: asyncio.Task | None = None
 active_queries: int = 0
 active_queries_lock = asyncio.Lock()
 
+# Per-model active query counters (model_name -> count)
+per_model_queries: dict[str, int] = {}
+per_model_queries_lock = asyncio.Lock()
+
+
+
 # Local-only active queries counter (LP-0MR5MAJNM005R905)
 local_active_queries: int = 0
 local_active_queries_lock = asyncio.Lock()

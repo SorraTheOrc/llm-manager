@@ -75,12 +75,15 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
+    _decrement_per_model_query,
+    _get_per_model_queries,
     _estimate_tokens_sent,
     _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
     _increment_local_active_queries,
+    _increment_per_model_query,
     _normalize_outgoing_headers,
     _schedule_recv_token_increment,
     _schedule_token_increment,
@@ -353,6 +356,7 @@ async def _cleanup_after_request(
     disconnected: bool = False,
     decrement_local: bool = True,
     session_explicit: bool = False,
+    model_name: str | None = None,
 ) -> None:
     """Decrement active query counters and clean up dispatch records.
 
@@ -368,8 +372,12 @@ async def _cleanup_after_request(
     When *session_explicit* is True and *session_id* is known, the
     corresponding dispatch record is marked as inactive with a future
     expires_at timestamp, keeping the lease alive for a returning session.
+
+    When *model_name* is provided, the per-model active query counter
+    is also decremented.
     """
     await _decrement_active_queries(srv)
+    await _decrement_per_model_query(srv, model_name)
     if decrement_local:
         await _decrement_local_active_queries(
             srv,
@@ -646,6 +654,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Mark active query
     await _increment_active_queries(srv)
+    try:
+        await _increment_per_model_query(srv, model_name)
+    except Exception:
+        srv.logger.warning("Failed to increment per-model query counter", exc_info=True)
     # Only increment local_active_queries if _try_acquire_local_dispatch did not
     # already do so (LP-0MR96QL8400022BW: double-increment bug). When the lease
     # check above ran (session_id and session_explicit), _try_acquire_local_dispatch
@@ -1284,6 +1296,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 disconnected=disconnected,
                                 decrement_local=True,
                                 session_explicit=session_explicit,
+                                model_name=model_name,
                             )
 
                     return StreamingResponse(
@@ -1296,6 +1309,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=False,
+                model_name=model_name,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:

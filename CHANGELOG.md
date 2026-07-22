@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.8 (2026-07-22)
+### Features
+- Add voice validation with default fallback and Warning header in proxy TTS handler (LP-0MRPJA3E4005MDMY)
+- LLama Proxy Server drops lang field from TTS requests to qwentts.cpp (LP-0MRV0WJBN0028TYL)
+### Other
+- Refactor backend resilience into per-server modules (llama, tts) (LP-0MRT90L0H0001MA1)
+- Update model config and simplify home page UI (LP-0MRVF9M85000L2H8)
+
 ## v0.1.7 (2026-07-20)
 ### Features
 - Learn to use LlamaBench (LP-0MPU61APP003SJ24)
