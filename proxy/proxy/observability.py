@@ -217,7 +217,7 @@ async def _query_slots_detail(
                     })
                 return result
     except Exception as exc:
-        _srv().logger.warning(
+        _srv().logger.debug(
             "Slot detail query failed [%s] for %s?model=%s: %s",
             type(exc).__name__, _build_llama_url(llama_port, "/slots"),
             model or "(none)", exc,
