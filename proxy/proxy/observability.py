@@ -22,6 +22,9 @@ HTTP JSON parsing and URL building patterns found in both
   endpoints.
 - ``_query_slots(client, llama_port, timeout)`` — Query the ``/slots``
   endpoint, returning ``(available_slots, total_slots)``.
+- ``_query_slots_detail(client, llama_port, timeout)`` — Query the ``/slots``
+  endpoint, returning a list of per-slot dicts with keys
+  ``slot_id``, ``is_processing``, and ``n_decoded``.
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
@@ -150,6 +153,48 @@ async def _query_slots(client, llama_port: int, timeout: float = 2.0) -> tuple:
     except Exception:
         pass
     return 0, 0
+
+
+async def _query_slots_detail(
+    client, llama_port: int, timeout: float = 2.0
+) -> list[dict]:
+    """Query the llama-server ``/slots`` endpoint and return per-slot details.
+
+    Returns a list of dicts, one per slot, with keys:
+
+    - ``slot_id`` (int) — zero-based index of the slot.
+    - ``is_processing`` (bool) — whether the slot is actively processing.
+    - ``n_decoded`` (int or ``None``) — the number of decoded tokens so far,
+      or ``None`` if ``next_token.n_decoded`` is not available.
+
+    Returns an empty list on any failure (HTTP error, connection error,
+    timeout, or unexpected response shape).
+
+    The 2.0-second default timeout matches the original inline query in
+    ``get_llama_local_status()``.
+    """
+    try:
+        url = _build_llama_url(llama_port, "/slots")
+        slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
+        if slots_resp.status_code == 200:
+            slots_data = await _safe_parse_json_response(slots_resp)
+            if isinstance(slots_data, list):
+                result = []
+                for i, slot in enumerate(slots_data):
+                    is_processing = bool(slot.get("is_processing", False))
+                    next_token = slot.get("next_token")
+                    n_decoded = None
+                    if isinstance(next_token, dict):
+                        n_decoded = next_token.get("n_decoded")
+                    result.append({
+                        "slot_id": i,
+                        "is_processing": is_processing,
+                        "n_decoded": n_decoded,
+                    })
+                return result
+    except Exception:
+        pass
+    return []
 
 
 # ===================================================================
@@ -557,6 +602,18 @@ async def _periodic_broadcast_loop():
                         except asyncio.QueueFull:
                             continue
 
+                # --- Per-slot data query (best-effort) ---
+                slot_details: list[dict] = []
+                if llama_status.get("llama_server_running"):
+                    try:
+                        server_cfg = srv.config.get("server", {})
+                        llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                        client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                        slot_details = await _query_slots_detail(client, llama_port, timeout=2.0)
+                    except Exception:
+                        # slot query is best-effort; empty list on failure
+                        pass
+
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast
                     try:
@@ -573,6 +630,7 @@ async def _periodic_broadcast_loop():
                         "total_sent": total_sent,
                         "total_recv": total_recv,
                         "per_model_queries": per_model_snapshot,
+                        "slots": slot_details,
                     }
                     event_data = json.dumps(status_data)
                     message = f"data: {event_data}\n\n"
