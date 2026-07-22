@@ -42,7 +42,7 @@ class TestQuerySlotsDetail:
         mock_response.json = mock_json
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
 
         assert isinstance(result, list)
         assert len(result) == 3
@@ -72,7 +72,7 @@ class TestQuerySlotsDetail:
         mock_response.json = AsyncMock(return_value={})
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
         assert result == []
 
     @pytest.mark.asyncio
@@ -83,7 +83,7 @@ class TestQuerySlotsDetail:
         mock_client = AsyncMock()
         mock_client.get.side_effect = Exception("Connection refused")
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
         assert result == []
 
     @pytest.mark.asyncio
@@ -100,7 +100,7 @@ class TestQuerySlotsDetail:
         mock_response.json = mock_json
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
         assert result == []
 
     @pytest.mark.asyncio
@@ -117,7 +117,7 @@ class TestQuerySlotsDetail:
         mock_response.json = mock_json
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
         assert result == []
 
     @pytest.mark.asyncio
@@ -135,7 +135,7 @@ class TestQuerySlotsDetail:
         mock_client.get.return_value = mock_response
 
         await _query_slots_detail(
-            mock_client, llama_port=8080, timeout=2.0, model="Qwen3",
+            8080, timeout=2.0, model="Qwen3", _client=mock_client,
         )
 
         # Verify the URL includes ?model=Qwen3
@@ -158,7 +158,7 @@ class TestQuerySlotsDetail:
         mock_client.get.return_value = mock_response
 
         await _query_slots_detail(
-            mock_client, llama_port=8080, timeout=2.0, model=None,
+            8080, timeout=2.0, model=None, _client=mock_client,
         )
 
         call_url = mock_client.get.call_args[0][0]
@@ -173,7 +173,7 @@ class TestQuerySlotsDetail:
         mock_response = MagicMock(status_code=400)
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080)
+        result = await _query_slots_detail(8080, _client=mock_client)
         assert result == []
 
     @pytest.mark.asyncio
@@ -198,7 +198,7 @@ class TestQuerySlotsDetail:
         mock_response.json = mock_json
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
         assert len(result) == 1
         assert result[0]["slot_id"] == 3
         assert result[0]["is_processing"] is True
@@ -220,7 +220,7 @@ class TestQuerySlotsDetail:
         mock_response.json = mock_json
         mock_client.get.return_value = mock_response
 
-        result = await _query_slots_detail(mock_client, llama_port=8080, timeout=2.0)
+        result = await _query_slots_detail(8080, timeout=2.0, _client=mock_client)
         assert len(result) == 1
         assert result[0]["slot_id"] == 0
         assert result[0]["is_processing"] is True

@@ -257,10 +257,9 @@ async def status_events():
                     server_cfg = srv.config.get("server", {})
                     llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                     model_name = srv.current_model or None
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                        slot_details = await _query_slots_detail(
-                            client, llama_port, timeout=2.0, model=model_name,
-                        )
+                    slot_details = await _query_slots_detail(
+                        llama_port, timeout=2.0, model=model_name,
+                    )
                 except Exception:
                     pass
 

@@ -22,9 +22,9 @@ HTTP JSON parsing and URL building patterns found in both
   endpoints.
 - ``_query_slots(client, llama_port, timeout)`` — Query the ``/slots``
   endpoint, returning ``(available_slots, total_slots)``.
-- ``_query_slots_detail(client, llama_port, timeout)`` — Query the ``/slots``
-  endpoint, returning a list of per-slot dicts with keys
-  ``slot_id``, ``is_processing``, and ``n_decoded``.
+- ``_query_slots_detail(llama_port, timeout, model)`` — Query the ``/slots``
+  endpoint with an optional ``model`` query parameter, returning a list of
+  per-slot dicts with keys ``slot_id``, ``is_processing``, and ``n_decoded``.
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
@@ -156,36 +156,45 @@ async def _query_slots(client, llama_port: int, timeout: float = 2.0) -> tuple:
 
 
 async def _query_slots_detail(
-    client, llama_port: int, timeout: float = 2.0, model: str | None = None
+    llama_port: int,
+    timeout: float = 2.0,
+    model: str | None = None,
+    _client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
 
+    By default creates its own ``httpx.AsyncClient`` for each call,
+    avoiding shared-client state issues.  Uses httpx's built-in timeout
+    (not ``asyncio.wait_for``) to avoid cancellation-related bugs with
+    httpx's internal connection management (Python 3.12+).
+
     Args:
-        client: HTTP client (httpx.AsyncClient).
         llama_port: Port llama-server is listening on.
         timeout: Request timeout in seconds.
-        model: Optional model name to filter slots. Many llama-server
+        model: Optional model name to filter slots.  Many llama-server
             instances require ``?model=...`` on the ``/slots`` endpoint
             and return HTTP 400 without it.
+        _client: Internal — for testing only.  Pass a mock client to
+            avoid real HTTP calls in unit tests.
 
     Returns a list of dicts, one per slot, with keys:
 
-    - ``slot_id`` (int) — zero-based index of the slot.
+    - ``slot_id`` (int) — slot identifier from the response.
     - ``is_processing`` (bool) — whether the slot is actively processing.
-    - ``n_decoded`` (int or ``None``) — the number of decoded tokens so far,
-      or ``None`` if ``next_token.n_decoded`` is not available.
+    - ``n_decoded`` (int or ``None``) — the number of decoded tokens so far.
 
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
-
-    The 2.0-second default timeout matches the original inline query in
-    ``get_llama_local_status()``.
     """
     try:
         url = _build_llama_url(llama_port, "/slots")
         if model:
             url = f"{url}?model={model}"
-        slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
+        if _client is not None:
+            slots_resp = await _client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+                slots_resp = await client.get(url)
         if slots_resp.status_code == 200:
             slots_data = await _safe_parse_json_response(slots_resp)
             if isinstance(slots_data, list):
@@ -197,7 +206,6 @@ async def _query_slots_detail(
                     if isinstance(next_token, dict):
                         n_decoded = next_token.get("n_decoded")
                     elif isinstance(next_token, list) and len(next_token) > 0:
-                        # next_token can be a list of token objects
                         first = next_token[0]
                         if isinstance(first, dict):
                             n_decoded = first.get("n_decoded")
@@ -630,10 +638,9 @@ async def _periodic_broadcast_loop():
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                         # Use current_model as the model param for /slots
                         model_name = srv.current_model or None
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                            slot_details = await _query_slots_detail(
-                                client, llama_port, timeout=2.0, model=model_name,
-                            )
+                        slot_details = await _query_slots_detail(
+                            llama_port, timeout=2.0, model=model_name,
+                        )
                     except Exception:
                         # slot query is best-effort; empty list on failure
                         pass
