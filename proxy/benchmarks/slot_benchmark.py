@@ -936,7 +936,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "  SLOT-COUNT BENCHMARK REPORT",
         "=" * 72,
         f"  Target: {TARGET_PROMPT_TOKENS:,} prompt tokens, ~{TARGET_RESPONSE_TIME_S}s response",
-        f"  Requests per run: {TOTAL_REQUESTS_PER_RUN}  |  Warmup: {WARMUP_REQUESTS if WARMUP_REQUESTS > 0 else 'none'}",
+        f"  Requests per run: {TOTAL_REQUESTS_PER_RUN}  |  Warmup: 0 (use --warmup to enable)",
         f"  Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
         f"{'Slots':>6}  {'Completed':>10}  {'Errors':>7}  {'Avg Dur':>8}  {'Min Dur':>8}  {'Max Dur':>8}  {'Avg TPS':>8}  {'Avg TTFT':>9}  {'GPU Mem':>10}",
@@ -1091,8 +1091,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip proxy/llama-server restart between runs (dangerous)",
     )
     parser.add_argument(
-        "--no-warmup", action="store_true",
-        help="Skip the warmup request before measured requests (default: 1 warmup)",
+        "--warmup", action="store_true",
+        help="Include 1 warmup request before measured requests (default: no warmup)",
     )
 
     return parser.parse_args(argv)
@@ -1165,7 +1165,7 @@ def main(argv: list[str] | None = None) -> None:
             print("  Skipping restart (--skip-restart)")
 
         # Determine warmup count
-        warmup_count = 0 if args.no_warmup else WARMUP_REQUESTS
+        warmup_count = WARMUP_REQUESTS if args.warmup else 0
 
         # 3. Run benchmark
         run_result = asyncio.run(run_slot_benchmark(
