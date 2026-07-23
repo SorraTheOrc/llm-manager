@@ -1181,28 +1181,29 @@ API Endpoints
                 const hasSession = slot.session_id !== undefined && slot.session_id !== null;
                 const hasProgress = slot.n_tokens !== undefined && slot.n_tokens !== null &&
                     slot.progress !== undefined && slot.progress !== null;
-                const hasTotal = slot.total_tokens !== undefined && slot.total_tokens !== null;
                 const isProcessing = slot.is_processing === true;
-                const isComplete = hasProgress && hasTotal && (
-                    slot.progress >= 0.99 || slot.n_tokens >= slot.total_tokens
-                );
                 
                 let statusClass, statusLabel;
-                if (hasSession && !hasProgress) {
-                    // Session assigned to this processing slot but no tokens yet
+                if (hasSession && !hasProgress && isProcessing) {
+                    // Session assigned but no tokens yet — waiting for decoder
                     statusClass = 'waiting';
                     statusLabel = 'Waiting for Decoder';
-                } else if (hasProgress && isProcessing && !isComplete) {
-                    // Actively processing tokens
-                    statusClass = 'processing';
-                    const pct = Math.round(slot.progress * 100);
-                    statusLabel = `Processed ${slot.n_tokens} of ${slot.total_tokens} (${pct}%) tokens`;
-                } else if (hasProgress && isComplete) {
-                    // All tokens processed, slot recently active
+                } else if (hasSession && !isProcessing) {
+                    // Session assigned, but slot is done processing — streaming response
+                    // The /slots API (or cached data) says is_processing=false,
+                    // which means token generation is complete. The session is
+                    // still active, delivering the streamed response to the client.
                     statusClass = 'working';
                     statusLabel = 'Working';
+                } else if (hasProgress && isProcessing) {
+                    // Actively processing tokens (progress data exists, /slots says busy)
+                    statusClass = 'processing';
+                    const pct = Math.round(slot.progress * 100);
+                    const total = slot.total_tokens !== null && slot.total_tokens !== undefined
+                        ? ` of ${slot.total_tokens}` : '';
+                    statusLabel = `Processed ${slot.n_tokens}${total} (${pct}%) tokens`;
                 } else if (isProcessing) {
-                    // /slots API says processing but no progress data yet
+                    // /slots API says processing but no progress data or session
                     statusClass = 'processing';
                     statusLabel = 'Processing';
                 } else {
