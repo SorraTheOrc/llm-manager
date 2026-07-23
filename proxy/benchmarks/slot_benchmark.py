@@ -545,56 +545,72 @@ async def _heartbeat_progress(
     label: str,
     start: float,
     request_task: asyncio.Task,
+    resolved: dict,
     model_name: str = "",
 ):
     """Print diagnostic heartbeats every HEARTBEAT_INTERVAL_S while a request runs.
 
+    Uses a shared mutable ``resolved`` dict so that once the response headers
+    arrive (with ``X-Resolved-Model``), the heartbeat can switch from showing
+    ``req_model=<name>`` to ``via=<provider/model>``.
+
     Args:
+        resolved: Shared dict with key ``"model"`` — populated by the caller
+            after the response is received.
         model_name: The model name being requested (e.g. "plan").
-            Shown in the heartbeat as ``req_model=<name>`` so the operator
-            can see which model config is being routed, rather than just
-            the proxy's loaded ``current_model`` from the health endpoint.
     """
     no_activity_warning = False
-    while not request_task.done():
-        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
-        if request_task.done():
-            break
-        elapsed = time.monotonic() - start
-        health = await _poll_health()
+    try:
+        while not request_task.done():
+            try:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+            except asyncio.CancelledError:
+                # Task was cancelled — print final line with resolved model if available
+                if resolved.get("model"):
+                    async with _heartbeat_lock:
+                        print(f"    {label}: done  via={resolved['model']}", flush=True)
+                raise
 
-        # Build status string from available diagnostics
-        parts = [f"({elapsed:.0f}s)"]
-        if health["slots_processing"] is not None:
-            if health["slots_processing"] > 0:
-                parts.append(f"slots={health['slots_processing']} active")
-                no_activity_warning = False
-            else:
-                parts.append("no slot activity")
-                if elapsed > 60 and not no_activity_warning:
-                    parts.append("WARNING: request may be stuck")
-                    no_activity_warning = True
-        elif health.get("running") is True and health.get("ready") is False:
-            # llama-server is running but too busy to respond to health checks
-            parts.append("backend busy (health check timeout)")
-        elif health.get("running") is None:
-            parts.append("health check timed out")
+            if request_task.done():
+                break
+            elapsed = time.monotonic() - start
+            health = await _poll_health()
 
-        if health["sessions_active"] is not None and health["sessions_active"] > 0:
-            parts.append(f"sessions={health['sessions_active']}")
-        if model_name:
-            parts.append(f"req_model={model_name}")
-        elif health["model"]:
-            parts.append(f"model={health['model']}")
-        if health.get("running") is False:
-            parts.append("LLAMA NOT RUNNING")
-        elif health.get("ready") is False and health.get("running") is not False:
-            # Only show BACKEND NOT READY when we're sure the backend isn't busy
-            # (handled above: busy gets a different message)
-            pass
+            # Build status string from available diagnostics
+            parts = [f"({elapsed:.0f}s)"]
+            if health["slots_processing"] is not None:
+                if health["slots_processing"] > 0:
+                    parts.append(f"slots={health['slots_processing']} active")
+                    no_activity_warning = False
+                else:
+                    parts.append("no slot activity")
+                    if elapsed > 60 and not no_activity_warning:
+                        parts.append("WARNING: request may be stuck")
+                        no_activity_warning = True
+            elif health.get("running") is True and health.get("ready") is False:
+                parts.append("backend busy (health check timeout)")
+            elif health.get("running") is None:
+                parts.append("health check timed out")
 
-        async with _heartbeat_lock:
-            print(f"    {label}: {'  '.join(parts)}", flush=True)
+            if health["sessions_active"] is not None and health["sessions_active"] > 0:
+                parts.append(f"sessions={health['sessions_active']}")
+            if resolved.get("model"):
+                # X-Resolved-Model header available from completed response
+                parts.append(f"via={resolved['model']}")
+            elif model_name:
+                parts.append(f"req_model={model_name}")
+            elif health["model"]:
+                parts.append(f"model={health['model']}")
+            if health.get("running") is False:
+                parts.append("LLAMA NOT RUNNING")
+            elif health.get("ready") is False and health.get("running") is not False:
+                pass
+
+            async with _heartbeat_lock:
+                print(f"    {label}: {'  '.join(parts)}", flush=True)
+    except asyncio.CancelledError:
+        # Re-raise if we didn't handle it in the inner sleep handler
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -643,11 +659,15 @@ async def send_request(
 
     request_task = asyncio.create_task(_do_post())
 
+    # Shared mutable container so the heartbeat can show the actual
+    # resolved provider once response headers arrive.
+    _resolved = {"model": None}
+
     # Start heartbeat background task if we have a label
     if progress_label:
         heartbeat = asyncio.create_task(
             _heartbeat_progress(
-                progress_label, start, request_task,
+                progress_label, start, request_task, _resolved,
                 model_name=payload.get("model", ""),
             ),
         )
@@ -655,6 +675,10 @@ async def send_request(
     try:
         resp = await request_task
         elapsed = time.monotonic() - start
+
+        # Populate resolved model from response header for the heartbeat
+        if resp.status_code == 200:
+            _resolved["model"] = resp.headers.get("X-Resolved-Model") or None
 
         # Cancel the heartbeat task now that the request is done
         if progress_label:
