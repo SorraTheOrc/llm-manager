@@ -162,6 +162,14 @@
             background: #e65100;
             color: #ffcc80;
         }
+        .slot-status-badge.waiting {
+            background: #1565c0;
+            color: #90caf9;
+        }
+        .slot-status-badge.working {
+            background: #4a148c;
+            color: #ce93d8;
+        }
         .slot-status-dot {
             width: 8px;
             height: 8px;
@@ -174,6 +182,12 @@
         .slot-status-dot.processing {
             background: #ff9800;
             animation: pulse 1.5s infinite;
+        }
+        .slot-status-dot.waiting {
+            background: #2196f3;
+        }
+        .slot-status-dot.working {
+            background: #ab47bc;
         }
         .slot-token-count {
             font-size: 0.85rem;
@@ -1164,24 +1178,42 @@ API Endpoints
             // Build HTML for each slot card
             let html = '';
             for (const slot of slots) {
-                const isProcessing = slot.is_processing === true;
-                const statusClass = isProcessing ? 'processing' : 'idle';
+                const hasSession = slot.session_id !== undefined && slot.session_id !== null;
+                const hasProgress = slot.n_tokens !== undefined && slot.n_tokens !== null &&
+                    slot.progress !== undefined && slot.progress !== null;
+                const hasTotal = slot.total_tokens !== undefined && slot.total_tokens !== null;
+                const isComplete = hasProgress && hasTotal && (
+                    slot.progress >= 0.99 || slot.n_tokens >= slot.total_tokens
+                );
                 
-                let statusLabel;
-                if (!isProcessing) {
-                    statusLabel = 'Idle';
-                } else if (slot.n_tokens !== undefined && slot.n_tokens !== null &&
-                           slot.total_tokens !== undefined && slot.total_tokens !== null &&
-                           slot.progress !== undefined && slot.progress !== null) {
+                let statusClass, statusLabel;
+                if (hasSession && !hasProgress) {
+                    // Session assigned but no tokens yet — waiting for decoder
+                    statusClass = 'waiting';
+                    statusLabel = 'Waiting for Decoder';
+                } else if (hasSession && hasProgress && isComplete) {
+                    // All tokens processed, session still active (streaming response)
+                    statusClass = 'working';
+                    statusLabel = 'Working';
+                } else if (hasSession && hasProgress) {
+                    // Actively processing tokens
+                    statusClass = 'processing';
                     const pct = Math.round(slot.progress * 100);
                     statusLabel = `Processed ${slot.n_tokens} of ${slot.total_tokens} (${pct}%) tokens`;
-                } else if (slot.n_decoded !== null && slot.n_decoded !== undefined) {
-                    statusLabel = `Processed ${slot.n_decoded} tokens`;
-                } else {
+                } else if (hasSession) {
+                    // Session assigned but unknown state — fallback
+                    statusClass = 'processing';
                     statusLabel = 'Processing';
+                } else {
+                    // No session assigned — slot is idle regardless of stale cache
+                    // The dispatch registry determines liveness, not the /slots API.
+                    // Once _free_slot_assignment removes the session_id, the slot
+                    // reverts to idle even if progress cache data still lingers.
+                    statusClass = 'idle';
+                    statusLabel = 'Idle';
                 }
                 
-                const sessionDisplay = (slot.session_id !== undefined && slot.session_id !== null)
+                const sessionDisplay = hasSession
                     ? '<div class="slot-token-count">Session: ' + slot.session_id.substring(0, 16) + '...</div>'
                     : '';
                 
