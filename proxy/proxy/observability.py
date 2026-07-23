@@ -731,23 +731,29 @@ def _extract_progress_data_from_log(line: str) -> tuple | None:
         return None
 
 
-def _update_processing_slot_assignments(srv) -> None:
+def _update_processing_slot_assignments(srv, slot_details=None) -> None:
     """Update ``_processing_slot_assignments`` by matching active dispatch
-    leases against slots that have recent progress data.
+    leases against slots that are processing (from progress cache OR
+    ``/slots`` API).
 
     Each active dispatch session is paired with a processing slot that
-    has recent progress data, in order of dispatch start time.  This
-    gives us a working ``{llama_server_slot_id: session_id}`` mapping
-    for the UI without relying on the persistence slot registry.
+    has recent progress data or is reported as processing by the
+    ``/slots`` endpoint, in order of dispatch start time.  This gives
+    us a working ``{llama_server_slot_id: session_id}`` mapping for the
+    UI without relying on the persistence slot registry.
+
+    Args:
+        srv: The server module (from ``_srv()``).
+        slot_details: Current slot details from ``_query_slots_detail()``
+            or ``_last_slot_details_cache``.  When provided, slots that
+            are ``is_processing == True`` but lack progress cache entries
+            are included as candidates for pairing.
     """
     global _processing_slot_assignments
     try:
         now = time.time()
         # Get active dispatch sessions sorted by start time
-        lock = getattr(srv, "local_dispatch_records_lock", None)
         records = getattr(srv, "local_dispatch_records", {})
-        if lock is None:
-            return
 
         active_sessions: list[str] = []
         for sid_key, info in list(records.items()):
@@ -755,25 +761,39 @@ def _update_processing_slot_assignments(srv) -> None:
                 active_sessions.append((info.get("started_at", 0), sid_key))
         active_sessions.sort(key=lambda x: x[0])  # oldest first
 
-        # Get progress slots that are recent (within 60s) and not yet mapped
-        progress_slots = sorted([
-            sid for sid, data in _slot_progress_cache.items()
-            if now - data.get("timestamp", 0) < 60.0
-        ])
+        # Collect candidate slots from TWO sources:
+        # 1. Slots with recent progress data in the cache
+        # 2. Slots that /slots reports as processing (may not have progress yet)
+        candidate_slots: set[int] = set()
+
+        # Source 1: progress cache (recent, within 60s)
+        for sid, data in _slot_progress_cache.items():
+            if now - data.get("timestamp", 0) < 60.0:
+                candidate_slots.add(sid)
+
+        # Source 2: /slots API reports as processing
+        if slot_details:
+            for sd in slot_details:
+                if sd.get("is_processing"):
+                    sid = sd.get("slot_id")
+                    if sid is not None:
+                        candidate_slots.add(sid)
+
+        candidate_sorted = sorted(candidate_slots)
 
         # Build reverse: session_id -> slot_id for already-mapped entries
         session_to_slot: dict[str, int] = {
             s: p for p, s in _processing_slot_assignments.items()
         }
 
-        # Assign unmatched sessions to unmatched progress slots
+        # Assign unmatched sessions to unmatched candidate slots
         i = 0
         for _, session_id in active_sessions:
             if session_id in session_to_slot:
                 continue  # already mapped
-            # Find next progress slot not yet assigned
-            while i < len(progress_slots):
-                ps = progress_slots[i]
+            # Find next candidate slot not yet assigned
+            while i < len(candidate_sorted):
+                ps = candidate_sorted[i]
                 i += 1
                 if ps not in _processing_slot_assignments:
                     _processing_slot_assignments[ps] = session_id
@@ -789,18 +809,18 @@ def _update_processing_slot_assignments(srv) -> None:
         for ps in stale:
             _processing_slot_assignments.pop(ps, None)
 
-        # Clean up: remove assignments for slots with stale progress
-        stale_progress = [
+        # Clean up: remove assignments for slots no longer in candidate set
+        stale_candidates = [
             ps for ps in _processing_slot_assignments
-            if ps not in progress_slots
+            if ps not in candidate_sorted
         ]
-        for ps in stale_progress:
+        for ps in stale_candidates:
             _processing_slot_assignments.pop(ps, None)
     except Exception:
         pass
 
 
-def _build_slot_to_session_map(srv) -> dict:
+def _build_slot_to_session_map(srv, slot_details=None) -> dict:
     """Return the current ``_processing_slot_assignments`` mapping from
     llama-server processing slot_id to session_id.
 
@@ -809,8 +829,13 @@ def _build_slot_to_session_map(srv) -> dict:
     leases (session_id).  It is separate from ``_slot_owners`` in
     ``proxy.session``, which tracks *persistence* slot numbers for
     session state save/restore.
+
+    Args:
+        srv: The server module (from ``_srv()``).
+        slot_details: Optional list of slot dicts from ``/slots`` API.
+            Passed through to ``_update_processing_slot_assignments``.
     """
-    _update_processing_slot_assignments(srv)
+    _update_processing_slot_assignments(srv, slot_details=slot_details)
     return dict(_processing_slot_assignments)
 
 
@@ -843,7 +868,7 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
     slot_to_session: dict = {}
     if srv is not None:
         try:
-            slot_to_session = _build_slot_to_session_map(srv)
+            slot_to_session = _build_slot_to_session_map(srv, slot_details=slot_details)
         except Exception:
             pass
 
