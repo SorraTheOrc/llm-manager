@@ -262,6 +262,16 @@ Populated by ``_update_slot_progress_from_log()`` which is called by
 """
 
 
+_slot_stable_tracker: dict[int, dict] = {}
+"""Tracks n_tokens stability to detect when generation is complete.
+
+Maps ``slot_id`` to ``{"n_tokens": int, "stable_since": float}``.
+When ``n_tokens`` stops increasing for > 3 seconds, generation is
+considered complete (streaming response to client).  Used to set
+``generation_done`` in enriched slot details.
+"""
+
+
 _processing_slot_assignments: dict[int, str] = {}
 """Mapping from llama-server processing slot_id to session_id.
 
@@ -905,9 +915,23 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
             api_n_decoded is None or n_tokens > api_n_decoded
         ):
             slot["n_decoded"] = n_tokens
-        # If progress > 0, the slot is actively processing
-        if pct > 0 and not slot.get("is_processing"):
-            slot["is_processing"] = True
+
+        # --- Generation-complete detection via n_tokens stability ---
+        # When n_tokens stops increasing for > 3s, generation is done
+        # and the session is streaming the response to the client.
+        stable = _slot_stable_tracker.get(sid)
+        if stable and stable["n_tokens"] == n_tokens:
+            # n_tokens hasn't changed — check how long it's been stable
+            if now - stable["stable_since"] > 3.0:
+                slot["generation_done"] = True
+                slot["is_processing"] = False
+        else:
+            # n_tokens increased (or first sighting) — reset tracker
+            _slot_stable_tracker[sid] = {"n_tokens": n_tokens, "stable_since": now}
+            slot["generation_done"] = False
+            # Mark as processing if progress > 0
+            if pct > 0:
+                slot["is_processing"] = True
     return slot_details
 
 

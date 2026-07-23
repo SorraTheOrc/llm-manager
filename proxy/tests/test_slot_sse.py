@@ -511,11 +511,16 @@ class TestSlotProgressCache:
 
     # --- _enrich_slot_details_with_progress ---
 
+    def _clear_stable_tracker(self):
+        from proxy.observability import _slot_stable_tracker
+        _slot_stable_tracker.clear()
+
     def test_enrich_overrides_n_decoded_from_progress(self):
         """When progress has higher n_tokens than API n_decoded, override."""
         from proxy.observability import (
             _enrich_slot_details_with_progress, _slot_progress_cache,
         )
+        self._clear_stable_tracker()
         _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.17, "timestamp": 1000.0}
         slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 512}]
         with _patch_time(1000.0):
@@ -525,12 +530,16 @@ class TestSlotProgressCache:
         assert result[0]["n_tokens"] == 4096
         assert result[0]["progress"] == 0.17
         assert result[0]["total_tokens"] == int(round(4096 / 0.17))
+        # First sighting: generation_done=False, is_processing=True
+        assert result[0]["generation_done"] is False
+        assert result[0]["is_processing"] is True
 
     def test_enrich_does_not_override_when_api_is_higher(self):
         """When API n_decoded is already higher than progress, keep it."""
         from proxy.observability import (
             _enrich_slot_details_with_progress, _slot_progress_cache,
         )
+        self._clear_stable_tracker()
         _slot_progress_cache[3] = {"n_tokens": 100, "progress": 0.5, "timestamp": 1000.0}
         slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 500}]
         with _patch_time(1000.0):
@@ -539,27 +548,54 @@ class TestSlotProgressCache:
         # Progress fields still injected
         assert result[0]["n_tokens"] == 100
         assert result[0]["total_tokens"] == 200
+        assert result[0]["generation_done"] is False
 
     def test_enrich_sets_is_processing_from_progress(self):
         """Sets is_processing=True when progress > 0 but API says idle."""
         from proxy.observability import (
             _enrich_slot_details_with_progress, _slot_progress_cache,
         )
+        self._clear_stable_tracker()
         _slot_progress_cache[5] = {"n_tokens": 2048, "progress": 0.50, "timestamp": 1000.0}
         slot_details = [{"slot_id": 5, "is_processing": False, "n_decoded": None}]
         with _patch_time(1000.0):
             result = _enrich_slot_details_with_progress(slot_details)
+        # First sighting: n_tokens increased, so is_processing=True
         assert result[0]["is_processing"] is True
         assert result[0]["n_decoded"] == 2048
         assert result[0]["n_tokens"] == 2048
         assert result[0]["progress"] == 0.5
         assert result[0]["total_tokens"] == 4096
+        assert result[0]["generation_done"] is False
+
+    def test_enrich_detects_generation_complete(self):
+        """When n_tokens is stable for > 3s, sets generation_done=True."""
+        from proxy.observability import (
+            _enrich_slot_details_with_progress, _slot_progress_cache,
+            _slot_stable_tracker,
+        )
+        self._clear_stable_tracker()
+        # First call: seed the tracker
+        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.99, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 4096}]
+        with _patch_time(1000.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["generation_done"] is False  # first sighting
+
+        # Second call: same n_tokens, 4s later (past the 3s threshold)
+        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.99, "timestamp": 1004.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 4096}]
+        with _patch_time(1004.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["generation_done"] is True
+        assert result[0]["is_processing"] is False  # overridden to False
 
     def test_enrich_ignores_stale_progress(self):
         """Ignores progress data older than 60 seconds."""
         from proxy.observability import (
             _enrich_slot_details_with_progress, _slot_progress_cache,
         )
+        self._clear_stable_tracker()
         _slot_progress_cache[3] = {"n_tokens": 999, "progress": 0.5, "timestamp": 900.0}
         slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 10}]
         with _patch_time(1000.0):  # 100s later = stale
@@ -570,6 +606,7 @@ class TestSlotProgressCache:
     def test_enrich_skips_slot_without_progress(self):
         """Slots without progress cache entry are unchanged."""
         from proxy.observability import _enrich_slot_details_with_progress
+        self._clear_stable_tracker()
         slot_details = [{"slot_id": 9, "is_processing": False, "n_decoded": None}]
         result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["n_decoded"] is None

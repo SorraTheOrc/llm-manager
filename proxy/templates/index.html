@@ -1183,20 +1183,20 @@ API Endpoints
                     slot.progress !== undefined && slot.progress !== null;
                 const isProcessing = slot.is_processing === true;
                 
+                const genDone = slot.generation_done === true;
+                
                 let statusClass, statusLabel;
                 if (hasSession && !hasProgress && isProcessing) {
                     // Session assigned but no tokens yet — waiting for decoder
                     statusClass = 'waiting';
                     statusLabel = 'Waiting for Decoder';
-                } else if (hasSession && !isProcessing) {
-                    // Session assigned, but slot is done processing — streaming response
-                    // The /slots API (or cached data) says is_processing=false,
-                    // which means token generation is complete. The session is
-                    // still active, delivering the streamed response to the client.
+                } else if (hasSession && genDone) {
+                    // n_tokens hasn't increased for > 3s — generation complete,
+                    // streaming response to client
                     statusClass = 'working';
                     statusLabel = 'Working';
                 } else if (hasProgress && isProcessing) {
-                    // Actively processing tokens (progress data exists, /slots says busy)
+                    // Actively processing tokens (progress data exists)
                     statusClass = 'processing';
                     const pct = Math.round(slot.progress * 100);
                     const total = slot.total_tokens !== null && slot.total_tokens !== undefined
