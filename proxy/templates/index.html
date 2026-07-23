@@ -1178,6 +1178,7 @@ API Endpoints
             // Build HTML for each slot card
             let html = '';
             for (const slot of slots) {
+                const hasSession = slot.session_id !== undefined && slot.session_id !== null;
                 const hasProgress = slot.n_tokens !== undefined && slot.n_tokens !== null &&
                     slot.progress !== undefined && slot.progress !== null;
                 const hasTotal = slot.total_tokens !== undefined && slot.total_tokens !== null;
@@ -1187,7 +1188,11 @@ API Endpoints
                 );
                 
                 let statusClass, statusLabel;
-                if (hasProgress && !isComplete) {
+                if (hasSession && !hasProgress) {
+                    // Session assigned to this processing slot but no tokens yet
+                    statusClass = 'waiting';
+                    statusLabel = 'Waiting for Decoder';
+                } else if (hasProgress && isProcessing && !isComplete) {
                     // Actively processing tokens
                     statusClass = 'processing';
                     const pct = Math.round(slot.progress * 100);
@@ -1206,6 +1211,10 @@ API Endpoints
                     statusLabel = 'Idle';
                 }
                 
+                const sessionDisplay = hasSession
+                    ? '<div class="slot-token-count">Session: ' + slot.session_id.substring(0, 16) + '...</div>'
+                    : '';
+                
                 html += '<div class="slot-card">' +
                     '<div class="slot-card-header">' +
                         '<span class="slot-id">Slot ' + slot.slot_id + '</span>' +
@@ -1214,6 +1223,7 @@ API Endpoints
                             statusLabel +
                         '</span>' +
                     '</div>' +
+                    sessionDisplay +
                 '</div>';
             }
             
