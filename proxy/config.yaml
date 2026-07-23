@@ -177,6 +177,17 @@ models:
     - author
     force_full_prompt: true
 
+  qwen3-next:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3
+    aliases:
+    - qwen3-next
+    - qwen3-coder-next
+    - qwen3-next*
+    force_full_prompt: true
+
   code:
     providers:
       - name: local-qwen3-next
