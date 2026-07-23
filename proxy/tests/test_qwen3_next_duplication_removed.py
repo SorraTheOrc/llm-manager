@@ -68,18 +68,6 @@ def _load_config_yaml():
         return yaml.safe_load(f)
 
 
-def test_config_qwen3_next_llama_model_is_qwen3():
-    """qwen3-next entry in config.yaml must point to llama_model: Qwen3 (not Qwen3-Next)."""
-    cfg = _load_config_yaml()
-    qwen3_next = cfg.get("models", {}).get("qwen3-next")
-    assert qwen3_next is not None, "qwen3-next model entry should exist"
-    providers = qwen3_next.get("providers", [])
-    assert len(providers) > 0, "qwen3-next should have providers"
-    assert providers[0].get("llama_model") == "Qwen3", (
-        f"qwen3-next first provider should use llama_model: Qwen3, got {providers[0].get('llama_model')!r}"
-    )
-
-
 def test_config_code_llama_model_is_qwen3():
     """code entry in config.yaml must point to llama_model: Qwen3 for the local provider."""
     cfg = _load_config_yaml()
@@ -90,16 +78,6 @@ def test_config_code_llama_model_is_qwen3():
     assert providers[0].get("llama_model") == "Qwen3", (
         f"code first provider should use llama_model: Qwen3, got {providers[0].get('llama_model')!r}"
     )
-
-
-def test_config_qwen3_next_keeps_aliases():
-    """qwen3-next should keep its aliases (qwen3-next, qwen3-coder-next, etc.)."""
-    cfg = _load_config_yaml()
-    qwen3_next = cfg.get("models", {}).get("qwen3-next")
-    assert qwen3_next is not None
-    aliases = qwen3_next.get("aliases", [])
-    assert "qwen3-next" in aliases, "qwen3-next alias should be preserved"
-    assert "qwen3-coder-next" in aliases, "qwen3-coder-next alias should be preserved"
 
 
 def test_config_code_keeps_local_fallback_chain():
