@@ -1389,3 +1389,116 @@ from .backend_health import (  # noqa: E402, F401
 )
 
 
+# ---------------------------------------------------------------------------
+# Slot-scheduled restart (time-based slot count transitions)
+# ---------------------------------------------------------------------------
+
+
+async def restart_services(
+    slot_count: int | None = None,
+    reason: str = "scheduled_slot_change",
+) -> bool:
+    """Gracefully restart llama-server with a new slot count.
+
+    Called by the slot scheduler when a scheduled transition time arrives.
+    The function:
+    1. Updates ``session_slot_pool_size`` in the server config to match
+       the new slot count.
+    2. Stops the current llama-server process via ``stop_llama_server()``.
+    3. Restarts llama-server via ``start_llama_server()`` or
+       ``ensure_model_loaded()``, which reads the updated config value.
+    4. Waits for the backend to become ready.
+
+    Args:
+        slot_count: The new ``--parallel N`` value.  When ``None``, the
+            current ``session_slot_pool_size`` from config is used.
+        reason: A descriptive label for log messages (default
+            ``"scheduled_slot_change"``).
+
+    Returns:
+        ``True`` if the restart succeeded, ``False`` on failure.
+    """
+    srv = _srv()
+
+    # Resolve the slot count to use.
+    if slot_count is not None:
+        # Update the config so downstream code reads the new value.
+        server_cfg = srv.config.get("server", {})
+        if isinstance(server_cfg, dict):
+            server_cfg["session_slot_pool_size"] = int(slot_count)
+            # Also update the legacy key for backward compatibility.
+            server_cfg["local_max_concurrent_queries"] = int(slot_count)
+    else:
+        server_cfg = srv.config.get("server", {})
+        slot_count = int(server_cfg.get("session_slot_pool_size", 1) or 1)
+
+    srv.logger.info(
+        "restart_services: restarting llama-server with %d slots (reason=%s)",
+        slot_count,
+        reason,
+    )
+
+    # Stop the current llama-server.
+    srv.stop_llama_server()
+    srv.backend_ready = False
+
+    # Set the LLAMA_PARALLEL env var so the start script reads it.
+    os.environ["LLAMA_PARALLEL"] = str(slot_count)
+
+    # Determine which model to reload.
+    server_config = srv.config.get("server", {})
+    router_mode = bool(server_config.get("llama_router_mode", False))
+    current_model = getattr(srv, "current_model", None)
+
+    try:
+        if router_mode:
+            # Router mode: start llama-server with no specific model.
+            srv.llama_process = srv.start_llama_server(None)
+            if srv.llama_process is None:
+                srv.logger.error(
+                    "restart_services: failed to start router-mode llama-server"
+                )
+                return False
+
+            timeout = int(server_config.get("llama_startup_timeout", 300) or 300)
+            if not await srv.wait_for_llama_server(timeout):
+                srv.logger.error(
+                    "restart_services: router-mode llama-server did not become ready"
+                )
+                srv.stop_llama_server()
+                return False
+
+            # Reload current model if we know it.
+            if current_model:
+                if not await srv.router_load_model(current_model):
+                    srv.logger.warning(
+                        "restart_services: failed to reload model %s",
+                        current_model,
+                    )
+
+            srv.backend_ready = True
+            srv.logger.info(
+                "restart_services: router-mode restart complete (%d slots)",
+                slot_count,
+            )
+            return True
+        else:
+            # Single-model mode: restart with the current model.
+            if current_model:
+                result = await srv.ensure_model_loaded(current_model)
+                srv.backend_ready = result
+                return result
+            else:
+                # No model loaded yet — start fresh.
+                default_model = srv.config.get("default_model", "gemma4")
+                result = await srv.ensure_model_loaded(default_model)
+                srv.backend_ready = result
+                return result
+    except Exception:
+        srv.logger.exception(
+            "restart_services: exception during restart with %d slots",
+            slot_count,
+        )
+        return False
+
+

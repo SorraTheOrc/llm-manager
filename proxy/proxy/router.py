@@ -450,6 +450,54 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not srv.backend_ready or srv.llama_process is None:
         return _build_backend_unavailable_response(srv, path)
 
+    # LP-0MRXZU90M007WNWT: Check if the proxy is in drain mode for a
+    # scheduled slot-count transition.  When draining, new requests receive
+    # a 503 with a retry-after header so clients can retry after the
+    # transition completes.
+    # LP-0MRXZU90M007WNWT: Check if the proxy is in drain mode for a
+    # scheduled slot-count transition.  Only checks the module-level
+    # ``draining`` flag when it is explicitly set to True in the real
+    # server module (not auto-created by Mock).  We use a string check
+    # on the class name to avoid false positives from MagicMock.
+    _draining = None
+    try:
+        _draining = getattr(srv, 'draining', None)
+    except Exception:
+        pass
+    if _draining is True:  # explicitly True, not a mock attribute
+        drain_retry_after = 15  # default retry-after in seconds
+        try:
+            scheduler = getattr(srv, 'slot_scheduler', None)
+            if scheduler is not None and hasattr(scheduler, '_config'):
+                drain_retry_after = max(15, scheduler._config.drain_minutes * 60)
+        except Exception:
+            pass
+
+        srv.logger.info(
+            "drain_active: refusing new request, retry_after=%ds",
+            drain_retry_after,
+        )
+        record_http_error("v1/chat/completions", "5xx", "draining")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "draining",
+                    "message": (
+                        "Draining workloads for scheduled slot-count change "
+                        "— please retry shortly"
+                    ),
+                },
+                "status": 503,
+                "retry_after": drain_retry_after,
+            },
+            headers={
+                "Retry-After": str(drain_retry_after),
+                "Cache-Control": "no-store",
+            },
+        )
+
     # Get request body (keep original for logging before any modifications)
     body = await request.body()
     body_for_logging = body

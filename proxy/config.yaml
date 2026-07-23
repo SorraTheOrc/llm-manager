@@ -309,6 +309,45 @@ server:
   #
   # Server restart required to change this value (no hot reload).
   session_slot_pool_size: 2
+
+  # -----------------------------------------------------------------------
+  # Slot schedule (LP-0MRXZU90M007WNWT)
+  # -----------------------------------------------------------------------
+  # Time-based slot count scheduling. When enabled, the proxy automatically
+  # varies the number of concurrent slots (``--parallel N``) based on the
+  # time of day. Before each transition, the proxy drains in-flight workloads
+  # and sends 503 responses to new requests during the drain window.
+  #
+  # Disabled by default (no schedule → static slot count from
+  # ``session_slot_pool_size`` above).
+  #
+  # Fields:
+  #   enabled:        Set to true to activate scheduling.
+  #   drain_minutes:  How long before a transition to start refusing new
+  #                   requests and drain in-flight workloads (default: 15).
+  #   entries:        List of transition rules. Each entry has:
+  #     time:         "HH:MM" format (24-hour). The time at which the new
+  #                   slot count becomes active.
+  #     slots:        The ``--parallel N`` value to apply from this time
+  #                   onward until the next entry.
+  #
+  # Example (peak hours 10:00-11:59 = 4 slots, off-peak = 8):
+  #   slot_schedule:
+  #     enabled: true
+  #     drain_minutes: 15
+  #     entries:
+  #       - time: "10:00"
+  #         slots: 4
+  #       - time: "12:00"
+  #         slots: 8
+  #
+  # Entries with the same slot count as the current value are skipped
+  # (no unnecessary restart). Midnight wrapping is supported.
+  slot_schedule:
+    enabled: false
+    drain_minutes: 15
+    entries: []
+
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
   session_guardrail_max_runtime_seconds: 1800
