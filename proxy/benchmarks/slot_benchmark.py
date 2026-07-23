@@ -48,7 +48,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # /home/rgardler/projects/llm
 CONFIG_YAML = PROJECT_ROOT / "proxy" / "config.yaml"
-SLOT_CACHE_DIR = Path("/home/rgardler/projects/llm/slot-cache")
+LOG_DIR = Path("/var/log/llama-proxy")
+BENCHMARK_LOG = PROJECT_ROOT / "logs" / "proxy-benchmark.log"
 LLAMA_SERVER_PORT = 8080
 PROXY_PORT = 8000
 
@@ -206,6 +207,16 @@ def set_slot_count(slot_count: int) -> None:
 # Service management
 # ---------------------------------------------------------------------------
 
+def clear_proxy_logs() -> None:
+    """Truncate proxy and benchmark logs so each run starts with clean output."""
+    for log_path in [LOG_DIR / "proxy.log", BENCHMARK_LOG]:
+        try:
+            log_path.write_text("")
+            print(f"  Cleared: {log_path}")
+        except Exception as e:
+            print(f"  WARNING: could not clear {log_path}: {e}")
+
+
 def restart_services(slot_count: int) -> None:
     """Restart proxy via start-proxy.sh (which triggers llama-server restart).
 
@@ -215,11 +226,13 @@ def restart_services(slot_count: int) -> None:
       - Uvicorn invocation with correct module path and working directory
 
     Steps:
-      1. Kill the current proxy process (children, including llama-server, die with it)
-      2. Run start-proxy.sh in the background
-      3. Wait for proxy and llama-server to become ready
+      1. Clear proxy logs for a fresh start
+      2. Kill the current proxy process (children, including llama-server, die with it)
+      3. Run start-proxy.sh in the background
+      4. Wait for proxy and llama-server to become ready
     """
     print("  Restarting proxy and llama-server...")
+    clear_proxy_logs()
 
     # 1. Find current proxy PID
     proxy_pid = None
