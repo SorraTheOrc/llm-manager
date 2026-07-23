@@ -545,8 +545,16 @@ async def _heartbeat_progress(
     label: str,
     start: float,
     request_task: asyncio.Task,
+    model_name: str = "",
 ):
-    """Print diagnostic heartbeats every HEARTBEAT_INTERVAL_S while a request runs."""
+    """Print diagnostic heartbeats every HEARTBEAT_INTERVAL_S while a request runs.
+
+    Args:
+        model_name: The model name being requested (e.g. "plan").
+            Shown in the heartbeat as ``req_model=<name>`` so the operator
+            can see which model config is being routed, rather than just
+            the proxy's loaded ``current_model`` from the health endpoint.
+    """
     no_activity_warning = False
     while not request_task.done():
         await asyncio.sleep(HEARTBEAT_INTERVAL_S)
@@ -574,7 +582,9 @@ async def _heartbeat_progress(
 
         if health["sessions_active"] is not None and health["sessions_active"] > 0:
             parts.append(f"sessions={health['sessions_active']}")
-        if health["model"]:
+        if model_name:
+            parts.append(f"req_model={model_name}")
+        elif health["model"]:
             parts.append(f"model={health['model']}")
         if health.get("running") is False:
             parts.append("LLAMA NOT RUNNING")
@@ -636,7 +646,10 @@ async def send_request(
     # Start heartbeat background task if we have a label
     if progress_label:
         heartbeat = asyncio.create_task(
-            _heartbeat_progress(progress_label, start, request_task),
+            _heartbeat_progress(
+                progress_label, start, request_task,
+                model_name=payload.get("model", ""),
+            ),
         )
 
     try:
