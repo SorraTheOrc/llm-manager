@@ -735,6 +735,11 @@ async def _try_acquire_local_dispatch(
             for existing_key, record in list(srv.local_dispatch_records.items()):
                 if not record.get("active") and record.get("expires_at", 0) <= now:
                     del srv.local_dispatch_records[existing_key]
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(existing_key)
+                    except Exception:
+                        pass
 
             own_record = srv.local_dispatch_records.get(session_key)
             own_has_lease = (
@@ -816,6 +821,13 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
                     pass
     except Exception:
         raise
+    # Free the slot registry entry
+    if session_id:
+        try:
+            from proxy.session import _free_slot_assignment
+            _free_slot_assignment(session_id)
+        except Exception:
+            pass
     return removed
 
 

@@ -721,35 +721,18 @@ def _extract_progress_data_from_log(line: str) -> tuple | None:
 def _build_slot_to_session_map(srv) -> dict:
     """Build a reverse mapping from llama-server slot_id to session_id.
 
-    Iterates ``local_dispatch_records`` and computes each session's slot
-    via ``_slot_id_for_session`` (deterministic hash of session_id mod
-    pool_size).
+    Reads the ``_slot_owners`` registry in ``proxy.session`` which tracks
+    active slot assignments directly (no hashing).
 
     Returns:
         dict[int, str]: Mapping ``{slot_id: session_id}`` for currently
-        active dispatch leases.
+        assigned slots.
     """
-    mapping: dict[int, str] = {}
     try:
-        server_config = getattr(srv, "config", {}).get("server", {})
-        pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
-        if pool_size <= 0:
-            return mapping
-
-        lock = getattr(srv, "local_dispatch_records_lock", None)
-        records = getattr(srv, "local_dispatch_records", {})
-        if lock is not None:
-            # Synchronous access is safe here since this is called from
-            # the event loop thread; the lock prevents concurrent mutation.
-            for sid_key, info in list(records.items()):
-                if info.get("active"):
-                    import hashlib
-                    digest = hashlib.sha256(sid_key.encode("utf-8")).hexdigest()
-                    slot_id = int(digest[:8], 16) % pool_size
-                    mapping[slot_id] = sid_key
+        from proxy.session import _slot_owners
+        return dict(_slot_owners)
     except Exception:
-        pass
-    return mapping
+        return {}
 
 
 def _enrich_slot_details_with_progress(slot_details: list[dict],

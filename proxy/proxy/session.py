@@ -616,11 +616,53 @@ def _sanitize_session_id(session_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id)
 
 
+# ---------------------------------------------------------------------------
+# Slot assignment registry
+#
+# Tracks which session_id currently owns each slot number, replacing the
+# previous hash-based deterministic mapping. Slots are assigned on demand
+# (lowest-numbered free slot first) so that session_id ↔ slot_number is
+# transparent and doesn't rely on a digest.
+# ---------------------------------------------------------------------------
+
+_slot_owners: dict[int, str] = {}
+"""Active slot assignments: ``{slot_id: session_id}``."""
+
+
 def _slot_id_for_session(session_id: str, pool_size: int) -> int | None:
+    """Return the slot number assigned to *session_id*.
+
+    If the session already has an assigned slot, returns it.
+    Otherwise assigns the lowest-numbered free slot in ``[0, pool_size)``.
+    Returns ``None`` when *session_id* is empty or *pool_size* ≤ 0.
+    """
     if not session_id or pool_size <= 0:
         return None
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % int(pool_size)
+
+    # Check existing assignment
+    for sid, owner in list(_slot_owners.items()):
+        if owner == session_id:
+            return sid
+
+    # Find the lowest-numbered free slot
+    used = set(_slot_owners.keys())
+    for sid in range(pool_size):
+        if sid not in used:
+            _slot_owners[sid] = session_id
+            return sid
+
+    # All slots occupied — pool is exhausted
+    return None
+
+
+def _free_slot_assignment(session_id: str) -> None:
+    """Release the slot assigned to *session_id*, if any."""
+    if not session_id:
+        return
+    for sid, owner in list(_slot_owners.items()):
+        if owner == session_id:
+            _slot_owners.pop(sid, None)
+            return
 
 
 def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
@@ -684,6 +726,9 @@ async def _invalidate_session_and_slot(
                         pass
         except Exception:
             pass
+    # Free the slot registry entry
+    _free_slot_assignment(session_id)
+
     # Clear cached ratio entries for this session (LP-0MRMMBZ7T007ER59)
     if session_id:
         try:

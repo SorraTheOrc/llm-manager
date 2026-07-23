@@ -859,8 +859,13 @@ class TestSessionHistoryIntegrityHelpers:
 
 
 class TestSlotPersistenceHelpers:
+    def _clear_slot_registry(self):
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
+
     def test_slot_id_for_session_is_deterministic(self):
         from proxy.server import _slot_id_for_session
+        self._clear_slot_registry()
 
         slot_id = _slot_id_for_session("session-123", 4)
         assert slot_id == _slot_id_for_session("session-123", 4)
@@ -868,11 +873,13 @@ class TestSlotPersistenceHelpers:
 
     def test_slot_id_for_session_single_slot(self):
         from proxy.server import _slot_id_for_session
+        self._clear_slot_registry()
 
         assert _slot_id_for_session("session-123", 1) == 0
 
     def test_slot_id_for_session_returns_none_when_pool_invalid(self):
         from proxy.server import _slot_id_for_session
+        self._clear_slot_registry()
 
         assert _slot_id_for_session("session-123", 0) is None
         assert _slot_id_for_session("session-123", -1) is None

@@ -51,20 +51,26 @@ class TestSlotPersistenceEnabled:
 
 
 class TestSlotIdForSession:
-    """Verifies slot ID is deterministic and within pool bounds."""
+    """Verifies tracked slot assignment works correctly."""
 
-    def test_deterministic_across_calls(self):
-        """Same session_id + pool_size produces same slot_id every time."""
+    @pytest.fixture(autouse=True)
+    def _clear_registry(self):
+        """Clear the module-level slot registry before each test."""
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
+
+    def test_same_session_gets_same_slot(self):
+        """Same session_id + pool_size produces same slot_id every call."""
         sid_a = _slot_id_for_session("session-foo", 4)
         sid_b = _slot_id_for_session("session-foo", 4)
         assert sid_a == sid_b
         assert 0 <= sid_a < 4
 
-    def test_different_sessions_may_map_to_different_slots(self):
-        """Different session IDs may produce different slot IDs."""
+    def test_different_sessions_get_different_slots(self):
+        """Different session IDs get different slots when pool has room."""
         sid1 = _slot_id_for_session("session-alpha", 4)
         sid2 = _slot_id_for_session("session-beta", 4)
-        # They could collide by chance, but should be valid
+        assert sid1 != sid2, "Two fresh sessions should get different slots"
         assert 0 <= sid1 < 4
         assert 0 <= sid2 < 4
 
@@ -73,14 +79,36 @@ class TestSlotIdForSession:
         sid = _slot_id_for_session("anything", 1)
         assert sid == 0
 
-    def test_pool_size_matches_session_distribution(self):
-        """With pool_size=N, all returned IDs are in [0, N-1]."""
-        for pool in [1, 2, 3, 4, 8]:
-            for session in [f"session-{i}" for i in range(100)]:
-                sid = _slot_id_for_session(session, pool)
-                assert 0 <= sid < pool, (
-                    f"session={session} pool={pool} got sid={sid}"
-                )
+    def test_slots_assigned_round_robin(self):
+        """Slots are assigned lowest-numbered free slot first."""
+        s1 = _slot_id_for_session("sess-a", 4)
+        s2 = _slot_id_for_session("sess-b", 4)
+        s3 = _slot_id_for_session("sess-c", 4)
+        s4 = _slot_id_for_session("sess-d", 4)
+        # All should be different and within range
+        assert len({s1, s2, s3, s4}) == 4
+        assert all(0 <= s < 4 for s in (s1, s2, s3, s4))
+
+    def test_returns_none_when_pool_exhausted(self):
+        """When all slots are assigned, returns None."""
+        _slot_id_for_session("sess-a", 2)
+        _slot_id_for_session("sess-b", 2)
+        # Third session should get None (pool of 2 exhausted)
+        assert _slot_id_for_session("sess-c", 2) is None
+
+    def test_freed_slot_reused(self):
+        """After freeing a slot, it becomes available for a new session."""
+        from proxy.session import _free_slot_assignment
+
+        s1 = _slot_id_for_session("sess-a", 2)
+        s2 = _slot_id_for_session("sess-b", 2)
+        assert s1 != s2
+
+        _free_slot_assignment("sess-a")
+        # A new session should be able to use the freed slot
+        s3 = _slot_id_for_session("sess-c", 2)
+        assert 0 <= s3 < 2
+        assert s3 != s2  # Should not conflict with sess-b
 
     def test_empty_session_id_returns_none(self):
         """Empty session_id returns None."""
@@ -358,24 +386,33 @@ class TestLifecycleExportsLLamaParallel:
 
 
 class TestSlotDistributionConsistency:
-    """Verify slot distribution is consistent and valid for all pool sizes."""
+    """Verify tracked slot assignment works correctly within pool limits."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_registry(self):
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
 
     def test_pool_size_two_coverage(self):
-        """With pool_size=2, at least some sessions map to each slot."""
-        slot0_count = 0
-        slot1_count = 0
-        for i in range(100):
-            sid = _slot_id_for_session(f"session-{i}", 2)
-            if sid == 0:
-                slot0_count += 1
-            else:
-                slot1_count += 1
-        assert slot0_count > 0
-        assert slot1_count > 0
+        """With pool_size=2, first two sessions get slots 0 and 1."""
+        from proxy.session import _free_slot_assignment
+
+        sid0 = _slot_id_for_session("sess-0", 2)
+        sid1 = _slot_id_for_session("sess-1", 2)
+        # All slots occupied now
+        assert _slot_id_for_session("sess-2", 2) is None
+
+        # Free one slot and verify it can be reused
+        _free_slot_assignment("sess-0")
+        assert _slot_id_for_session("sess-2", 2) is not None
 
     def test_pool_size_equals_parallel(self):
-        """Simulate alignment: pool_size=N matches --parallel N → all IDs valid."""
+        """Only up to pool_size distinct sessions get valid slots."""
         for pool_size in [1, 2, 4]:
-            for i in range(50):
+            from proxy.session import _slot_owners
+            _slot_owners.clear()
+            for i in range(pool_size):
                 sid = _slot_id_for_session(f"test-{i}", pool_size)
-                assert 0 <= sid < pool_size
+                assert 0 <= sid < pool_size, f"i={i} pool={pool_size} sid={sid}"
+            # Pool exhausted — next session gets None
+            assert _slot_id_for_session(f"test-{pool_size}", pool_size) is None
