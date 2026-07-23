@@ -721,18 +721,16 @@ def _extract_progress_data_from_log(line: str) -> tuple | None:
 def _build_slot_to_session_map(srv) -> dict:
     """Build a reverse mapping from llama-server slot_id to session_id.
 
-    Reads the ``_slot_owners`` registry in ``proxy.session`` which tracks
-    active slot assignments directly (no hashing).
+    NOTE: ``_slot_owners`` in ``proxy.session`` tracks *persistence* slot
+    numbers (used for session state save/restore), NOT llama-server
+    processing slot numbers.  These are different — llama-server assigns
+    its own internal slots at dispatch time.  Using ``_slot_owners`` here
+    would attach the session_id to the wrong slot.
 
-    Returns:
-        dict[int, str]: Mapping ``{slot_id: session_id}`` for currently
-        assigned slots.
+    Returns an empty dict.  Session information is displayed via the
+    dispatch lease table instead.
     """
-    try:
-        from proxy.session import _slot_owners
-        return dict(_slot_owners)
-    except Exception:
-        return {}
+    return {}
 
 
 def _enrich_slot_details_with_progress(slot_details: list[dict],
