@@ -1181,6 +1181,10 @@ API Endpoints
                     statusLabel = 'Processing';
                 }
                 
+                const sessionDisplay = (slot.session_id !== undefined && slot.session_id !== null)
+                    ? '<div class="slot-token-count">Session: ' + slot.session_id.substring(0, 16) + '...</div>'
+                    : '';
+                
                 html += '<div class="slot-card">' +
                     '<div class="slot-card-header">' +
                         '<span class="slot-id">Slot ' + slot.slot_id + '</span>' +
@@ -1189,6 +1193,7 @@ API Endpoints
                             statusLabel +
                         '</span>' +
                     '</div>' +
+                    sessionDisplay +
                 '</div>';
             }
             

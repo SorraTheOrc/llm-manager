@@ -283,7 +283,7 @@ async def status_events():
                 _slot_cache.extend(slot_details)
             else:
                 slot_details = list(_slot_cache)
-            _enrich_slot_details_with_progress(slot_details)
+            _enrich_slot_details_with_progress(slot_details, srv=srv)
 
             initial_status = json.dumps({
                 "type": "status",

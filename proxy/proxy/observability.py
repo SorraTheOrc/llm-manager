@@ -718,7 +718,42 @@ def _extract_progress_data_from_log(line: str) -> tuple | None:
         return None
 
 
-def _enrich_slot_details_with_progress(slot_details: list[dict]) -> list[dict]:
+def _build_slot_to_session_map(srv) -> dict:
+    """Build a reverse mapping from llama-server slot_id to session_id.
+
+    Iterates ``local_dispatch_records`` and computes each session's slot
+    via ``_slot_id_for_session`` (deterministic hash of session_id mod
+    pool_size).
+
+    Returns:
+        dict[int, str]: Mapping ``{slot_id: session_id}`` for currently
+        active dispatch leases.
+    """
+    mapping: dict[int, str] = {}
+    try:
+        server_config = getattr(srv, "config", {}).get("server", {})
+        pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
+        if pool_size <= 0:
+            return mapping
+
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        records = getattr(srv, "local_dispatch_records", {})
+        if lock is not None:
+            # Synchronous access is safe here since this is called from
+            # the event loop thread; the lock prevents concurrent mutation.
+            for sid_key, info in list(records.items()):
+                if info.get("active"):
+                    import hashlib
+                    digest = hashlib.sha256(sid_key.encode("utf-8")).hexdigest()
+                    slot_id = int(digest[:8], 16) % pool_size
+                    mapping[slot_id] = sid_key
+    except Exception:
+        pass
+    return mapping
+
+
+def _enrich_slot_details_with_progress(slot_details: list[dict],
+                                        srv=None) -> list[dict]:
     """Merge log-parsed progress n_tokens into slot_details.
 
     For each slot in *slot_details*, if the progress cache has a
@@ -726,23 +761,40 @@ def _enrich_slot_details_with_progress(slot_details: list[dict]) -> list[dict]:
     *n_decoded* with the progress value (and mark *is_processing* if
     progress is > 0).
 
-    Also injects ``n_tokens``, ``progress``, and ``total_tokens`` into
-    each slot dict so the frontend can display "Processed x of y (z%)".
+    Also injects ``n_tokens``, ``progress``, ``total_tokens``, and
+    ``session_id`` into each slot dict so the frontend can display
+    "Processed x of y (z%)" with the owning session.
 
     Args:
         slot_details: List of slot dicts from ``_query_slots_detail()``
             or ``_last_slot_details_cache``.
+        srv: Optional server module. If provided, ``session_id`` is
+            resolved from dispatch records.
 
     Returns:
         The same list (modified in-place) with enriched token counts.
     """
     if not slot_details:
         return slot_details
+
+    # Build slot→session mapping once for this batch
+    slot_to_session: dict = {}
+    if srv is not None:
+        try:
+            slot_to_session = _build_slot_to_session_map(srv)
+        except Exception:
+            pass
+
     now = time.time()
     for slot in slot_details:
         sid = slot.get("slot_id")
         if sid is None:
             continue
+
+        # Attach session_id if we found an active dispatch for this slot
+        if sid in slot_to_session:
+            slot["session_id"] = slot_to_session[sid]
+
         prog = _slot_progress_cache.get(sid)
         if prog is None:
             continue
@@ -841,10 +893,11 @@ async def _periodic_broadcast_loop():
                 else:
                     slot_details = _last_slot_details_cache
 
-                # Merge log-parsed progress token counts into slot details.
-                # This ensures the web UI shows real token counts even when
-                # the /slots endpoint is unresponsive during busy generation.
-                _enrich_slot_details_with_progress(slot_details)
+                # Merge log-parsed progress token counts and session IDs into
+                # slot details. This ensures the web UI shows real token counts
+                # even when the /slots endpoint is unresponsive during busy
+                # generation, and identifies the owning session.
+                _enrich_slot_details_with_progress(slot_details, srv=srv)
 
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast
