@@ -922,7 +922,7 @@ class TestSlotPersistenceHelpers:
         from proxy import server
 
         server.config = server.load_config()
-        resolved = server._resolve_slot_model_name("qwen3", None, {"llama_router_mode": True})
+        resolved = server._resolve_slot_model_name("plan", None, {"llama_router_mode": True})
         assert resolved == "Qwen3"
 
     def test_resolve_slot_model_name_uses_current_model_when_missing(self):
