@@ -10,7 +10,8 @@ Features:
 - Automatic drain phase before transitions (configurable drain window).
 - Background scheduler that periodically checks the schedule and triggers
   graceful restart of llama-server with the new slot count.
-- Disabled by default (no schedule configured → current static behavior).
+- Enabled by default with a sensible schedule (10:00→4, 12:00→8). Disable
+  by setting ``enabled: false`` or removing the ``slot_schedule`` section.
 """
 
 import asyncio
@@ -234,11 +235,21 @@ class SlotScheduleConfig:
 class SlotScheduler:
     """Background scheduler for time-based slot count transitions.
 
-    Runs a periodic check (every 60 seconds) to:
-    1. Check if we're inside a drain window approaching a slot transition.
-    2. Set ``draining`` flag to prevent new requests during drain.
-    3. When the transition time arrives, stop draining and trigger a
-       graceful restart of llama-server with the new slot count.
+    Instead of polling on a fixed interval, the scheduler calculates the
+    exact time until the next relevant event (drain window opening or
+    transition deadline) and sleeps only until then.  This avoids hundreds
+    of unnecessary wake-ups per day.
+
+    The scheduler:
+    1. Computes seconds until the next interesting event.
+    2. Sleeps exactly that long (adaptive sleep).
+    3. On wake, runs the evaluation cycle.
+    4. Repeats — each cycle recomputes the next target.
+
+    Events the scheduler cares about:
+    - A drain window opening (transition_time - drain_minutes).
+    - A transition deadline (the time a new slot count takes effect).
+    - The next event after a pending restart was executed.
 
     Usage::
 
@@ -247,6 +258,12 @@ class SlotScheduler:
 
     The scheduler is disabled by default (no schedule → no-op).
     """
+
+    # Maximum sleep between checks (24 hours).  In practice the next
+    # transition is always within 24 h, but this cap prevents infinity.
+    _MAX_SLEEP_SECONDS: float = 86400.0
+    # Minimum sleep — avoid busy-waiting when events are sub-second apart.
+    _MIN_SLEEP_SECONDS: float = 1.0
 
     def __init__(self, srv):
         """Initialize the scheduler.
@@ -262,7 +279,6 @@ class SlotScheduler:
         self._draining: bool = False
         self._pending_restart_slot: int | None = None
         self._task: asyncio.Task | None = None
-        self._check_interval: float = 60.0  # check every 60 seconds
 
     @property
     def enabled(self) -> bool:
@@ -302,16 +318,23 @@ class SlotScheduler:
     async def start(self) -> None:
         """Start the background scheduler loop.
 
-        Creates an asyncio task that runs ``_check_loop``.
+        Creates an asyncio task that runs ``_check_loop``.  The loop uses
+        adaptive sleep: it calculates the exact time until the next drain
+        window opening or transition deadline and sleeps only that long.
         """
         if not self.enabled:
             logger.info("Slot scheduler: disabled, not starting background loop")
             return
 
+        entries_desc = ", ".join(
+            f'{e.time.strftime("%H:%M")}→{e.slots}'
+            for e in self._config.entries
+        )
         logger.info(
-            "Slot scheduler: starting background loop (interval=%ss, entries=%d)",
-            self._check_interval,
+            "Slot scheduler: starting (entries=%d: %s, drain=%d min)",
             len(self._config.entries),
+            entries_desc,
+            self._config.drain_minutes,
         )
         loop = asyncio.get_running_loop()
         self._task = loop.create_task(self._check_loop())
@@ -328,16 +351,27 @@ class SlotScheduler:
             logger.info("Slot scheduler: stopped")
 
     async def _check_loop(self) -> None:
-        """Periodic check loop that evaluates the schedule every 60 seconds."""
+        """Adaptive check loop that sleeps until the next interesting event.
+
+        On each iteration:
+        1. Run the evaluation cycle (drain / transition / clear).
+        2. Calculate the exact seconds until the next relevant event.
+        3. Sleep for that duration.
+
+        This avoids hundreds of unnecessary 60-second polls per day.
+        """
         while True:
             try:
-                await asyncio.sleep(self._check_interval)
                 await self._run_check_cycle()
+                sleep_seconds = self._calculate_sleep_seconds()
+                if sleep_seconds > 0:
+                    await asyncio.sleep(sleep_seconds)
             except asyncio.CancelledError:
                 logger.info("Slot scheduler: check loop cancelled")
                 return
             except Exception:
                 logger.exception("Slot scheduler: unexpected error in check loop, continuing...")
+                await asyncio.sleep(self._MIN_SLEEP_SECONDS)
 
     async def _run_check_cycle(self) -> None:
         """Perform a single schedule evaluation cycle.
@@ -469,6 +503,95 @@ class SlotScheduler:
             if entry.time > now:
                 return entry.time.strftime("%H:%M")
         return self._config.entries[0].time.strftime("%H:%M") + " (next day)" if self._config.entries else "(none)"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Adaptive sleep calculation
+    # ────────────────────────────────────────────────────────────────────
+
+    def _now_dt(self) -> datetime:
+        """Return the current datetime.  PATCHABLE in tests."""
+        return datetime.now()
+
+    def _seconds_until(self, target: dt_time) -> float:
+        """Return the number of seconds from now until the next *target* time-of-day.
+
+        If *target* has already passed today, wraps to tomorrow.
+        Returns at least ``_MIN_SLEEP_SECONDS`` and at most ``_MAX_SLEEP_SECONDS``.
+        """
+        now_dt = self._now_dt()
+        target_dt = datetime.combine(now_dt.date(), target)
+        if target_dt <= now_dt:
+            target_dt += timedelta(days=1)
+        seconds = (target_dt - now_dt).total_seconds()
+        return max(self._MIN_SLEEP_SECONDS, min(seconds, self._MAX_SLEEP_SECONDS))
+
+    def _calculate_sleep_seconds(self) -> float:
+        """Calculate seconds until the next action is needed.
+
+        Returns the number of seconds to sleep before the next
+        ``_run_check_cycle`` should run.  The calculation depends on
+        the scheduler's current state:
+
+        **Draining or pending restart**
+            Sleep until the transition time of the matching schedule entry.
+
+        **Normal (no pending work)**
+            Find the next schedule entry where the slot count differs from
+            the current value.  If a drain window exists before that
+            transition, sleep until the drain window opens.  Otherwise
+            sleep until the transition time itself.
+
+        If no future event differs (all entries match the current slot),
+        sleep the full maximum duration (24 h).
+        """
+        if not self.enabled:
+            return self._MAX_SLEEP_SECONDS
+
+        now_time = self._now()
+
+        # ── Pending restart → wake when the matching entry's time arrives ──
+        if self._pending_restart_slot is not None:
+            for entry in self._config.entries:
+                if entry.slots == self._pending_restart_slot:
+                    return self._seconds_until(entry.time)
+            return self._MIN_SLEEP_SECONDS  # should not happen, be safe
+
+        # ── Determine current slot count for comparison ───────────────
+        static_slots = self._get_static_slot_count()
+        schedule_current = self._config.get_active_slot(now_time)
+        current_slots = static_slots  # before first transition
+
+        # ── Find the next entry where the slot count actually changes ──
+        for entry in self._config.entries:
+            if entry.time > now_time:
+                if entry.slots != current_slots:
+                    drain_start = self._config._drain_start_time(entry.time)
+                    now_dt = self._now_dt()
+                    drain_dt = datetime.combine(now_dt.date(), drain_start)
+
+                    # If drain_start wraps past midnight, it's later than
+                    # entry.time on the same day → shift back one day.
+                    if drain_start > entry.time:
+                        drain_dt -= timedelta(days=1)
+
+                    transition_dt = datetime.combine(now_dt.date(), entry.time)
+
+                    if now_dt < drain_dt:
+                        # Wake when the drain window opens.
+                        seconds = (drain_dt - now_dt).total_seconds()
+                        return max(self._MIN_SLEEP_SECONDS,
+                                   min(seconds, self._MAX_SLEEP_SECONDS))
+                    # Already inside the drain window — wake at transition.
+                    return self._seconds_until(entry.time)
+                break  # no change → skip this transition
+
+        # ── No transition with a different slot count exists today ────
+        # All remaining entries match or are no-ops.  Sleep until the
+        # first entry tomorrow (the schedule wraps).
+        if self._config.entries:
+            return self._seconds_until(self._config.entries[0].time)
+
+        return self._MAX_SLEEP_SECONDS
 
     async def perform_restart(self) -> bool:
         """Execute the pending restart of llama-server with the new slot count.

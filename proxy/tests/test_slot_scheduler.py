@@ -389,6 +389,58 @@ class TestSlotScheduler:
         assert scheduler.enabled is True
 
     @pytest.mark.asyncio
+    async def test_calculate_sleep_no_pending(self):
+        """Verify calculate_sleep_seconds returns reasonable values."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [{"time": "12:00", "slots": 8}],
+        }
+        mock_srv.config = {"server": {"slot_schedule": schedule}}
+        scheduler = SlotScheduler(mock_srv)
+        # No pending restart, no draining
+        assert scheduler.pending_restart_slot is None
+        sleep_s = scheduler._calculate_sleep_seconds()
+        assert sleep_s >= 1.0
+        assert sleep_s <= 86400.0
+
+    @pytest.mark.asyncio
+    async def test_calculate_sleep_with_pending_restart(self):
+        """Verify calculate_sleep_seconds targets the matching entry."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        now_dt = datetime(2026, 7, 23, 11, 0, 0)  # 11:00 today
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [{"time": "12:00", "slots": 8}],
+        }
+        mock_srv.config = {"server": {"slot_schedule": schedule}}
+        scheduler = SlotScheduler(mock_srv)
+        scheduler.set_pending_restart(8)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                sleep_s = scheduler._calculate_sleep_seconds()
+                # Should sleep until 12:00 (3600 seconds from 11:00)
+                assert 3599 <= sleep_s <= 3601, f"Expected ~3600, got {sleep_s}"
+
+    @pytest.mark.asyncio
+    async def test_calculate_sleep_disabled(self, disabled_schedule):
+        """Verify disabled schedule returns max sleep."""
+        from proxy.slot_scheduler import SlotScheduler, SlotScheduler
+
+        mock_srv = MagicMock()
+        mock_srv.config = {"server": {"slot_schedule": disabled_schedule}}
+        scheduler = SlotScheduler(mock_srv)
+        assert scheduler.enabled is False
+        sleep_s = scheduler._calculate_sleep_seconds()
+        assert sleep_s == scheduler._MAX_SLEEP_SECONDS
+
+    @pytest.mark.asyncio
     async def test_drain_flag_start_and_stop(self, sample_schedule):
         """Verify draining flag can be set and cleared."""
         from proxy.slot_scheduler import SlotScheduler
@@ -451,10 +503,13 @@ class TestSlotScheduler:
         mock_srv = MagicMock()
         mock_srv.config = {"server": {"slot_schedule": sample_schedule}}
         scheduler = SlotScheduler(mock_srv)
-        # Patch current_time to give a time far from any transition
+        # Patch current_time to give a time far from any transition.
+        # With schedule [10:00→4, 12:00→8], at 03:00 the wrapped value is
+        # 8 (last entry), and the next transition at 10:00 is also 8→4
+        # but current_slots=static (default 1).  So check with that context.
         with patch.object(scheduler, '_now', return_value=dt_time(3, 0)):
             await scheduler._run_check_cycle()
-            # No drain, no restart
+            # At 03:00, no drain window, no transition time
             assert scheduler.draining is False
             assert scheduler.pending_restart_slot is None
 
@@ -508,6 +563,8 @@ class TestSlotScheduler:
         mock_srv = MagicMock()
         mock_srv.config = {"server": {"slot_schedule": disabled_schedule}}
         scheduler = SlotScheduler(mock_srv)
+        # Disabled schedule → enabled=False → _run_check_cycle returns early
+        assert scheduler.enabled is False
         with patch.object(scheduler, '_now', return_value=dt_time(9, 45)):
             await scheduler._run_check_cycle()
             assert scheduler.draining is False

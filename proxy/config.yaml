@@ -344,9 +344,13 @@ server:
   # Entries with the same slot count as the current value are skipped
   # (no unnecessary restart). Midnight wrapping is supported.
   slot_schedule:
-    enabled: false
+    enabled: true
     drain_minutes: 15
-    entries: []
+    entries:
+      - time: "10:00"
+        slots: 4
+      - time: "12:00"
+        slots: 8
 
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5
