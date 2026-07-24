@@ -52,7 +52,7 @@ def test_start_script_success(monkeypatch):
     monkeypatch.setattr(lifecycle, "_srv", lambda: dummy)
     monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)  # No-op sleep
 
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
         if isinstance(cmd, list) and len(cmd) > 0 and cmd[0].endswith("start-llama.sh"):
             return FakeProc()
         raise FileNotFoundError(cmd[0])
@@ -95,7 +95,7 @@ def test_host_fallback_default_disabled(monkeypatch):
     monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
     started_cmds = []
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
         if isinstance(cmd, list) and cmd[0] == "/custom/podman_start_llama.sh":
             started_cmds.append(cmd)
             return FakeProc()
@@ -120,7 +120,7 @@ def test_host_fallback_enabled_succeeds(monkeypatch):
     monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
     started_cmds = []
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
         if isinstance(cmd, list) and cmd[0].endswith("start-llama.sh"):
             started_cmds.append(cmd)
             return FakeProc()
@@ -144,7 +144,7 @@ def test_host_fallback_enabled_fails_then_fallback(monkeypatch):
     monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
     started_cmds = []
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
         started_cmds.append(cmd[0])
         if isinstance(cmd, list) and cmd[0] == "/custom/podman_start_llama.sh":
             return FakeProc()
@@ -172,7 +172,7 @@ def test_host_fallback_router_mode(monkeypatch):
     monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
     host_cmds = []
-    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+    def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
         if isinstance(cmd, list) and cmd[0].endswith("start-llama.sh"):
             host_cmds.append(cmd)
             return FakeProc()
