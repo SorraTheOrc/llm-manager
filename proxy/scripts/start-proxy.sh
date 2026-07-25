@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [uvicorn-args...]
+#
+# Flags:
+#   --restart   Kill all running proxy/llama-server/TTS processes before starting
 #
 # Automatically resolves required API keys from:
 #   1. Environment variables (already set)
@@ -43,15 +46,19 @@ fi
 
 # Determine port: default 8000 unless overridden by --port or PROXY_PORT/PORT env var
 PORT="${PROXY_PORT:-${PORT:-8000}}"
+RESTART=0
+UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
     PORT="$arg"
+    UVICORN_ARGS+=("--port" "$arg")
     prev=""
   else
     case "$arg" in
       --port=*)
         PORT="${arg#*=}"
+        UVICORN_ARGS+=("$arg")
         ;;
       --port)
         prev="--port"
@@ -59,11 +66,32 @@ for arg in "$@"; do
       -p)
         prev="-p"
         ;;
+      --restart)
+        RESTART=1
+        ;;
       *)
+        UVICORN_ARGS+=("$arg")
         ;;
     esac
   fi
 done
+
+# --restart: kill all running proxy-related processes before starting
+if [ "$RESTART" -eq 1 ]; then
+  echo "Restart requested: stopping running proxy services..."
+  pkill -f 'uvicorn proxy\.server' 2>/dev/null || true
+  sleep 1
+  pkill -f 'llama-server' 2>/dev/null || true
+  pkill -f 'qwentts' 2>/dev/null || true
+  sleep 2
+  # Verify port is now free
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn | awk '{print $4}' | grep -Eq ":${PORT}$|\.${PORT}$"; then
+      echo "Warning: port $PORT is still in use after killing processes. Continuing anyway..." >&2
+    fi
+  fi
+  echo "Done. Starting fresh..."
+fi
 
 # Check if the port is already in use. Prefer ss/netstat for a fast local check,
 # fall back to a Python connect test when those tools are unavailable.
@@ -97,7 +125,7 @@ fi
 
 if [ "$PORT_IN_USE" -eq 1 ]; then
   echo "Error: port $PORT is already in use. Is another proxy or service running?" >&2
-  echo "If you intended to run in development mode use: proxyctl start --dev (uses port 8001), or run this script with --port <port>." >&2
+  echo "If you intended to run in development mode, use --port <port> to specify a different port." >&2
   exit 1
 fi
 
@@ -223,4 +251,4 @@ echo ""
 echo "=== Starting proxy server ==="
 
 # Exec uvicorn using chosen python binary
-exec "$PY_BIN" -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PORT" "$@"
+exec "$PY_BIN" -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PORT" "${UVICORN_ARGS[@]+${UVICORN_ARGS[@]}}"

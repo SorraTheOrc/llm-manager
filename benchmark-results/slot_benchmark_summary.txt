@@ -1,0 +1,24 @@
+========================================================================
+  SLOT-COUNT BENCHMARK REPORT
+========================================================================
+  Target: 6,000 prompt tokens, ~600s response
+  Requests per run: 6  |  Warmup: 0 (use --warmup to enable)
+  Date: 2026-07-23 20:34 UTC
+
+ Slots   Completed   Errors   Avg Dur   Min Dur   Max Dur   Avg TPS   Avg TTFT     GPU Mem
+--------------------------------------------------------------------------------
+     1     24/ 24        0      201s       22s      302s    105.7     99.06s            
+     2     24/ 24        0      236s       36s      459s     52.5    127.66s            
+     4     24/ 24        0      344s       27s      782s    191.0    225.46s            
+     6     24/ 24        0      346s      111s      738s     32.8    237.98s            
+     8     24/ 24        0      426s      171s      761s    194.7    318.63s            
+    12     22/ 24        2      946s      352s     2047s    332.5    532.66s            
+--------------------------------------------------------------------------------
+
+  Throughput scaling (completed requests x avg_tps):
+    1 slots -> 24 req in 80.5min total, 51759 tokens generated
+    2 slots -> 24 req in 94.4min total, 60121 tokens generated
+    4 slots -> 24 req in 137.5min total, 81597 tokens generated
+    6 slots -> 24 req in 138.6min total, 58807 tokens generated
+    8 slots -> 24 req in 170.2min total, 99023 tokens generated
+    12 slots -> 22 req in 346.8min total, 54091 tokens generated

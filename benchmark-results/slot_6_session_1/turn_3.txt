@@ -1,0 +1,503 @@
+# Benchmark: slot_count=6  session=1  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 4078  TPS: 17.9
+# ============================================================
+
+We'll build a complete Python to‑do application with `daily` and `week` commands, keeping the existing commands (`add`, `list`, `done`, `delete`) intact. The tasks are stored in a JSON file, each with an optional `due_date` (YYYY‑MM‑DD), a `completed` flag, and a `completed_date` for marking completions. The `daily` command shows tasks due today, overdue tasks, and tasks completed today. The `week` command shows the same but for today and the next six days. Both only display tasks that have a due date.
+
+Below is the full implementation of `todo.py` and its tests in `test_todo.py`.
+
+## `todo.py`
+```python
+#!/usr/bin/env python3
+"""
+Command-line to-do application with daily and week overviews.
+"""
+
+import argparse
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+# Path to the JSON storage file
+DATA_DIR = os.path.expanduser("~/.todo")
+DATA_FILE = os.path.join(DATA_DIR, "tasks.json")
+
+# Date format used throughout
+DATE_FORMAT = "%Y-%m-%d"
+
+
+# ----------------------------------------------------------------------
+# Data Layer
+# ----------------------------------------------------------------------
+def load_tasks() -> list[dict]:
+    """Load tasks from the JSON file. Returns an empty list if file not found."""
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_tasks(tasks: list[dict]) -> None:
+    """Save tasks list to the JSON file, creating the directory if needed."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DATA_FILE, "w") as f:
+        json.dump(tasks, f, indent=2)
+
+
+def next_id(tasks: list[dict]) -> int:
+    """Return the next free id (max existing id + 1)."""
+    if not tasks:
+        return 1
+    return max(task["id"] for task in tasks) + 1
+
+
+# ----------------------------------------------------------------------
+# Task helpers
+# ----------------------------------------------------------------------
+def task_with_id(tasks: list[dict], task_id: int) -> Optional[dict]:
+    """Return the task with the given id, or None."""
+    for task in tasks:
+        if task["id"] == task_id:
+            return task
+    return None
+
+
+def today_str() -> str:
+    """Return today's date as YYYY-MM-DD."""
+    return datetime.now().strftime(DATE_FORMAT)
+
+
+def date_from_str(s: str) -> datetime:
+    """Parse a date string; raise ValueError if invalid."""
+    return datetime.strptime(s, DATE_FORMAT)
+
+
+def overdue(tasks: list[dict]) -> list[dict]:
+    """Return incomplete tasks with a due date earlier than today."""
+    today = today_str()
+    return [
+        t
+        for t in tasks
+        if not t["completed"] and t.get("due_date") and t["due_date"] < today
+    ]
+
+
+def due_today(tasks: list[dict]) -> list[dict]:
+    """Return incomplete tasks due today."""
+    today = today_str()
+    return [
+        t
+        for t in tasks
+        if not t["completed"] and t.get("due_date") and t["due_date"] == today
+    ]
+
+
+def completed_today(tasks: list[dict]) -> list[dict]:
+    """Return tasks that were completed today."""
+    today = today_str()
+    return [
+        t for t in tasks if t["completed"] and t.get("completed_date") == today
+    ]
+
+
+# ----------------------------------------------------------------------
+# CLI Commands
+# ----------------------------------------------------------------------
+def cmd_add(args: argparse.Namespace, tasks: list[dict]) -> None:
+    """Add a new task."""
+    task = {
+        "id": next_id(tasks),
+        "description": args.description,
+        "due_date": args.due,  # None if not given
+        "completed": False,
+        "completed_date": None,
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    print(f"Added task {task['id']}: {args.description}")
+
+
+def cmd_list(args: argparse.Namespace, tasks: list[dict]) -> None:
+    """List all tasks (or only incomplete if --all not given)."""
+    show_all = args.all
+    for t in tasks:
+        if not show_all and t["completed"]:
+            continue
+        status = "✓" if t["completed"] else " "
+        due = f" (due {t['due_date']})" if t.get("due_date") else ""
+        print(f'[{status}] {t["id"]}: {t["description"]}{due}')
+
+
+def cmd_done(args: argparse.Namespace, tasks: list[dict]) -> None:
+    """Mark a task as completed (with today's date)."""
+    task = task_with_id(tasks, args.task_id)
+    if not task:
+        print(f"Task {args.task_id} not found")
+        return
+    if task["completed"]:
+        print(f"Task {args.task_id} is already completed")
+        return
+    task["completed"] = True
+    task["completed_date"] = today_str()
+    save_tasks(tasks)
+    print(f"Completed task {args.task_id}: {task['description']}")
+
+
+def cmd_delete(args: argparse.Namespace, tasks: list[dict]) -> None:
+    """Delete a task by id."""
+    task = task_with_id(tasks, args.task_id)
+    if not task:
+        print(f"Task {args.task_id} not found")
+        return
+    tasks.remove(task)
+    save_tasks(tasks)
+    print(f"Deleted task {args.task_id}")
+
+
+def cmd_daily(args: argparse.Namespace, tasks: list[dict]) -> None:
+    """Show a summary of today's tasks (due, overdue, completed)."""
+    today = today_str()
+    due = due_today(tasks)
+    over = overdue(tasks)
+    comp = completed_today(tasks)
+
+    print(f"Daily Overview – {today}")
+    print(f"  Due today: {len(due)}")
+    print(f"  Overdue:   {len(over)}")
+    print(f"  Completed: {len(comp)}")
+    print()
+
+    if due:
+        print("Due today:")
+        for t in due:
+            print(f'  - {t["description"]}')
+        print()
+    if over:
+        print("Overdue:")
+        for t in over:
+            print(f'  - {t["description"]} (due {t["due_date"]})')
+        print()
+    if comp:
+        print("Completed today:")
+        for t in comp:
+            print(f'  - {t["description"]}')
+
+
+def cmd_week(args: argparse.Namespace, tasks: list[dict]) -> None:
+    """Show an overview of the next 7 days (today + 6 days)."""
+    today = today_str()
+    # Parse today for arithmetic
+    td = datetime.strptime(today, DATE_FORMAT)
+    print(f"Week Overview – {today} to {(td + timedelta(days=6)).strftime(DATE_FORMAT)}")
+    print()
+
+    for offset in range(7):
+        day = td + timedelta(days=offset)
+        day_str = day.strftime(DATE_FORMAT)
+        label = " (Today)" if offset == 0 else ""
+        due_tasks = [
+            t
+            for t in tasks
+            if not t["completed"]
+            and t.get("due_date") == day_str
+        ]
+        comp_tasks = [
+            t
+            for t in tasks
+            if t["completed"] and t.get("completed_date") == day_str
+        ]
+        if not due_tasks and not comp_tasks:
+            continue
+        print(f"{day_str}{label}:")
+        if due_tasks:
+            print('  Due:')
+            for t in due_tasks:
+                print(f'    - {t["description"]}')
+        if comp_tasks:
+            print('  Completed:')
+            for t in comp_tasks:
+                print(f'    - {t["description"]}')
+        print()
+
+
+# ----------------------------------------------------------------------
+# Main argument parser & dispatcher
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Simple to‑do application")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # add
+    add_parser = subparsers.add_parser("add", help="add a new task")
+    add_parser.add_argument("description", help="task description")
+    add_parser.add_argument("--due", "-d", help="due date (YYYY-MM-DD)")
+    add_parser.set_defaults(func=cmd_add)
+
+    # list
+    list_parser = subparsers.add_parser("list", aliases=["ls"], help="list tasks")
+    list_parser.add_argument("--all", "-a", action="store_true", help="show completed tasks too")
+    list_parser.set_defaults(func=cmd_list)
+
+    # done
+    done_parser = subparsers.add_parser("done", help="mark a task as completed")
+    done_parser.add_argument("task_id", type=int, help="id of the task")
+    done_parser.set_defaults(func=cmd_done)
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", aliases=["rm"], help="delete a task")
+    delete_parser.add_argument("task_id", type=int, help="id of the task")
+    delete_parser.set_defaults(func=cmd_delete)
+
+    # daily
+    daily_parser = subparsers.add_parser("daily", help="show today's overview")
+    daily_parser.set_defaults(func=cmd_daily)
+
+    # week
+    week_parser = subparsers.add_parser("week", help="show weekly overview")
+    week_parser.set_defaults(func=cmd_week)
+
+    args = parser.parse_args()
+    tasks = load_tasks()
+    args.func(args, tasks)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## `test_todo.py`
+The tests use `pytest` and operate on a temporary JSON file, mocking the file location.
+
+```python
+import os
+import json
+import tempfile
+from datetime import datetime, timedelta
+from unittest.mock import patch
+
+import pytest
+
+# Import the functions from todo.py
+from todo import (
+    load_tasks,
+    save_tasks,
+    next_id,
+    overdue,
+    due_today,
+    completed_today,
+    cmd_daily,
+    cmd_week,
+    today_str,
+    cmd_add,
+    cmd_done,
+    cmd_delete,
+    cmd_list,
+)
+
+# ----------------------------------------------------------------------
+# Helper to create a temporary storage file
+# ----------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def use_temp_data_file():
+    """Replace the DATA_FILE path with a temporary file for the duration of each test."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        temp_path = f.name
+    # Patch the DATA_FILE constant in the todo module
+    with patch("todo.DATA_FILE", temp_path):
+        yield
+    os.unlink(temp_path)
+
+
+# ----------------------------------------------------------------------
+# Tool functions – tests
+# ----------------------------------------------------------------------
+def test_next_id_empty():
+    assert next_id([]) == 1
+
+
+def test_next_id_nonempty():
+    tasks = [{"id": 5}, {"id": 3}]
+    assert next_id(tasks) == 6
+
+
+def test_save_and_load():
+    tasks = [{"id": 1, "description": "test"}]
+    save_tasks(tasks)
+    loaded = load_tasks()
+    assert loaded == tasks
+
+
+def test_load_nonexistent():
+    with patch("todo.DATA_FILE", "/nonexistent/path/tasks.json"):
+        assert load_tasks() == []
+
+
+# ----------------------------------------------------------------------
+# Overdue, due today, completed today – tests
+# ----------------------------------------------------------------------
+def test_overdue():
+    tasks = [
+        {"id": 1, "description": "old", "due_date": "2020-01-01", "completed": False},
+        {"id": 2, "description": "future", "due_date": "2099-01-01", "completed": False},
+        {"id": 3, "description": "no due", "due_date": None, "completed": False},
+        {"id": 4, "description": "completed overdue", "due_date": "2020-01-01", "completed": True},
+I'll provide a complete implementation of the enhanced To-Do application built on a typical existing structure. The app uses JSON storage, handles tasks with optional due dates, and supports commands: `add`, `list`, `done`, `daily`, and `week`. Below are the full files: `todo.py` and `test_todo.py`.
+
+## Implementation Details
+
+- **Task format**: Dictionary with `id` (auto‑increment), `description`, `due_date` (ISO date string or `None`), `completed` (bool), `created_at` (ISO datetime), `completed_at` (ISO datetime or `None`).
+- **Storage**: `~/.todo.json` (or `todos.json` if HOME not set).
+- **CLI**: argparse with subcommands.
+- **Assumptions about existing code**: Only basic `add`, `list`, `done` were present. I maintain them exactly as originally implemented (see the `add`, `list`, `done` handlers).
+
+## New Commands
+
+### `todo daily`
+- Prints a compact morning summary:
+  - Counts: `N tasks due today`, `M tasks overdue`, `P tasks completed today`.
+  - Lists each group with a bullet and task description, optionally with due date if overdue.
+- Tasks without a due date are not shown.
+
+### `todo week`
+- Shows tasks due over the next 7 days (today + next 6 days).
+- Groups by date and prints a header for each day.
+- For each group, lists the tasks not yet completed.
+- Includes a summary: `Tasks due this week: X`.
+
+## Tests
+- All tests use a temporary JSON file and check the standard output/returned data.
+- `test_daily` covers tasks due today, overdue, completed today, and tasks without due dates.
+- `test_week` covers tasks due on various days, missing days, and ensures no tasks without due date appear.
+
+---
+
+## File: `todo.py`
+
+```python
+#!/usr/bin/env python3
+"""To-Do application – enhanced with daily and week overview commands."""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, date, timedelta
+
+
+DATA_FILE = os.path.join(os.path.expanduser("~"), ".todo.json")
+
+# ---------- Core Logic ----------
+
+class TodoList:
+    def __init__(self, storage_path=None):
+        self.path = storage_path or DATA_FILE
+        self.tasks = self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path, 'r') as f:
+            return json.load(f)
+
+    def save(self):
+        with open(self.path, 'w') as f:
+            json.dump(self.tasks, f, indent=2)
+
+    def add(self, description, due_date=None):
+        now = datetime.now().isoformat()
+        task = {
+            "id": self._next_id(),
+            "description": description,
+            "due_date": due_date.isoformat() if due_date else None,
+            "completed": False,
+            "created_at": now,
+            "completed_at": None
+        }
+        self.tasks.append(task)
+        self.save()
+        return task
+
+    def _next_id(self):
+        return max((t["id"] for t in self.tasks), default=0) + 1
+
+    def list_all(self):
+        return list(self.tasks)
+
+    def mark_done(self, task_id):
+        for task in self.tasks:
+            if task["id"] == task_id:
+                if not task["completed"]:
+                    task["completed"] = True
+                    task["completed_at"] = datetime.now().isoformat()
+                    self.save()
+                return task
+        return None
+
+    # ---- daily / week helpers ----
+
+    def get_today(self):
+        return date.today()
+
+    def _parse_date(self, date_str):
+        if date_str is None:
+            return None
+        try:
+            return datetime.fromisoformat(date_str).date()
+        except (ValueError, TypeError):
+            return None
+
+    def tasks_due_today(self):
+        today = self.get_today()
+        return [t for t in self.tasks
+                if not t["completed"]
+                and self._parse_date(t["due_date"]) == today]
+
+    def tasks_overdue(self):
+        today = self.get_today()
+        return [t for t in self.tasks
+                if not t["completed"]
+                and self._parse_date(t["due_date"]) is not None
+                and self._parse_date(t["due_date"]) < today]
+
+    def tasks_completed_today(self):
+        today = self.get_today()
+        result = []
+        for t in self.tasks:
+            if t["completed"] and t["completed_at"]:
+                c_date = datetime.fromisoformat(t["completed_at"]).date()
+                if c_date == today:
+                    result.append(t)
+        return result
+
+    def tasks_due_in_range(self, start_date, end_date):
+        """Return (not completed) tasks whose due_date falls in [start, end] inclusive."""
+        return [t for t in self.tasks
+                if not t["completed"]
+                and self._parse_date(t["due_date"]) is not None
+                and start_date <= self._parse_date(t["due_date"]) <= end_date]
+
+    def week_overview(self):
+        today = self.get_today()
+        end = today + timedelta(days=6)
+        tasks = self.tasks_due_in_range(today, end)
+        # Group by date
+        groups = {}
+        for t in tasks:
+            d = self._parse_date(t["due_date"])
+            groups.setdefault(d, []).append(t)
+        # Ensure all days in range appear (even if empty)
+        ordered = []
+        for i in range(7):
+            day = today + timedelta(days=i)
+            ordered.append((day, groups.get(day, [])))
+        return ordered
+
+# ---------- CLI ---------

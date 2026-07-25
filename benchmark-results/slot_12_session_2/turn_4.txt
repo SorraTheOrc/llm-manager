@@ -1,0 +1,46 @@
+# Benchmark: slot_count=12  session=2  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 1878s  Tokens: 219  TPS: 0.9
+# ============================================================
+
+Here's a complete, modular implementation that adds a lightweight web UI while keeping the CLI fully functional. The structure is clean, dependency-light, and includes graceful error handling and tests.
+
+### 📁 Project Structure
+```
+todo/
+├── __init__.py
+├── __main__.py          # Entry point for `python -m todo`
+├── cli.py               # CLI commands (add, list, daily)
+├── models.py            # Task dataclass
+├── storage.py           # JSON persistence
+├── web.py               # FastAPI routes & HTML template
+└── tests/
+    └── test_web.py      # HTTP route tests
+```
+
+### 📄 `todo/__init__.py`
+```python
+# Empty file to mark as package
+```
+
+### 📄 `todo/__main__.py`
+```python
+from todo.main import main
+
+if __name__ == "__main__":
+    main()
+```
+
+### 📄 `todo/main.py`
+```python
+import sys
+import uvicorn
+from . import cli
+from .web import app
+
+def main():
+    if len(sys

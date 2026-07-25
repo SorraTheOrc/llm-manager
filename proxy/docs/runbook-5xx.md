@@ -79,9 +79,9 @@
    ```bash
    sudo systemctl restart llama-proxy
    ```
-   Or via proxyctl:
+   Or restart the proxy process directly:
    ```bash
-   proxyctl stop && proxyctl start
+   pkill -f 'uvicorn proxy.server' && sleep 2 && bash proxy/scripts/start-proxy.sh
    ```
 
 2. **Restart llama-server** (if the backend is unresponsive or crashed):

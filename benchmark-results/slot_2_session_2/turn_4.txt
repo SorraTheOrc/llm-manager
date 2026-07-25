@@ -1,0 +1,74 @@
+# Benchmark: slot_count=2  session=2  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 442  TPS: 2.1
+# ============================================================
+
+We'll build a complete **To-Do** application with both CLI and web UI, using **FastAPI** for the web layer. The data is stored in a JSON file, ensuring persistence across CLI and web sessions. The structure keeps CLI commands fully functional while adding the web server as an extra command (`todo serve --port 8080`).
+
+## Project Structure
+
+```
+todo/
+├── __init__.py
+├── models.py       # Task dataclass
+├── storage.py      # JSON persistence
+├── cli.py          # CLI (argparse)
+├── web.py          # FastAPI app, routes, HTML template
+└── templates/      # (optional, HTML is inlined in web.py)
+tests/
+├── test_web.py     # Web route tests using FastAPI TestClient
+```
+
+## Implementation
+
+### 1. `todo/__init__.py`
+```python
+# Empty
+```
+
+### 2. `todo/models.py`
+Data model for a task.
+```python
+from datetime import datetime, date
+from typing import Optional
+import json
+
+class Task:
+    def __init__(self, id: int, title: str, done: bool = False,
+                 created_at: Optional[datetime] = None):
+        self.id = id
+        self.title = title
+        self.done = done
+        self.created_at = created_at or datetime.now()
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "done": self.done,
+            "created_at": self.created_at.isoformat()
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data["id"],
+            title=data["title"],
+            done=data.get("done", False),
+            created_at=datetime.fromisoformat(data["created_at"])
+        )
+```
+
+### 3. `todo/storage.py`
+Read/write tasks as JSON.
+```python
+import json
+import os
+from typing import List
+from .models import Task
+
+DATA_FILE = os.path.join(os.path.dirname(__file__), "

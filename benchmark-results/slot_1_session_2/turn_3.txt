@@ -1,0 +1,246 @@
+# Benchmark: slot_count=1  session=2  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 2044  TPS: 20.2
+# ============================================================
+
+Below is a complete implementation of a To‑Do application that adds `todo daily` and `todo week` commands.  
+The code maintains a classic CLI structure (add, list, done, delete) and extends it with the requested summary commands.  
+Tasks are stored in a JSON file (`tasks.json`). Dates are handled as `YYYY-MM-DD` strings.
+
+---
+
+## Implementation – `todo.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Simple To-Do CLI with daily and weekly summary commands.
+"""
+
+import argparse
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+
+DATA_FILE = "tasks.json"
+
+# ----------------------------------------------------------------------
+# Date helpers
+# ----------------------------------------------------------------------
+def today_str() -> str:
+    """Return today's date as 'YYYY-MM-DD'."""
+    return datetime.now().strftime("%Y-%m-%d")
+
+def future_str(days: int) -> str:
+    """Return date `days` from today as 'YYYY-MM-DD'."""
+    return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+# ----------------------------------------------------------------------
+# Task storage
+# ----------------------------------------------------------------------
+class TaskManager:
+    def __init__(self, filepath: str = DATA_FILE):
+        self.filepath = filepath
+        self.tasks = self._load()
+
+    def _load(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(self.filepath):
+            return []
+        with open(self.filepath, "r") as f:
+            return json.load(f)
+
+    def _save(self) -> None:
+        with open(self.filepath, "w") as f:
+            json.dump(self.tasks, f, indent=2)
+
+    def _next_id(self) -> int:
+        if not self.tasks:
+            return 1
+        return max(t["id"] for t in self.tasks) + 1
+
+    # ------------------------------------------------------------------
+    # Existing commands (maintained with all original logic)
+    # ------------------------------------------------------------------
+    def add_task(self, description: str, due_date: Optional[str] = None) -> Dict[str, Any]:
+        task = {
+            "id": self._next_id(),
+            "description": description,
+            "due_date": due_date,          # None or "YYYY-MM-DD"
+            "completed": False,
+            "completed_date": None
+        }
+        self.tasks.append(task)
+        self._save()
+        return task
+
+    def list_tasks(self, show_completed: bool = False) -> List[Dict[str, Any]]:
+        tasks = self.tasks
+        if not show_completed:
+            tasks = [t for t in tasks if not t["completed"]]
+        return tasks
+
+    def done_task(self, task_id: int) -> Optional[Dict[str, Any]]:
+        for t in self.tasks:
+            if t["id"] == task_id:
+                if t["completed"]:
+                    return None   # already done
+                t["completed"] = True
+                t["completed_date"] = today_str()
+                self._save()
+                return t
+        return None
+
+    def delete_task(self, task_id: int) -> bool:
+        before = len(self.tasks)
+        self.tasks = [t for t in self.tasks if t["id"] != task_id]
+        if len(self.tasks) != before:
+            self._save()
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # New daily and week commands
+    # ------------------------------------------------------------------
+    def daily_summary(self, reference_date: str = None) -> Dict[str, Any]:
+        """
+        Return summary for `reference_date` (today by default).
+        Returns dict with keys:
+            - due_today: list of tasks with due_date == reference_date
+            - overdue: list of incomplete tasks with due_date < reference_date
+            - completed_today: list of tasks whose completed_date == reference_date
+        """
+        if reference_date is None:
+            reference_date = today_str()
+        today = reference_date
+
+        due_today: List[Dict[str, Any]] = []
+        overdue: List[Dict[str, Any]] = []
+        completed_today: List[Dict[str, Any]] = []
+
+        for t in self.tasks:
+            due = t.get("due_date")
+            comp = t.get("completed_date")
+            # Only consider tasks that have a due_date set
+            if due is None and not t["completed"]:
+                continue   # task without due date (ignore in views)
+            if due == today:
+                due_today.append(t)
+            if due is not None and due < today and not t["completed"]:
+                overdue.append(t)
+            if comp == today:
+                completed_today.append(t)
+
+        return {
+            "date": today,
+            "due_today": due_today,
+            "overdue": overdue,
+            "completed_today": completed_today
+        }
+
+    def weekly_overview(self, start_date: str = None) -> List[Dict[str, Any]]:
+        """
+        Return list of day summaries for a 7‑day window (starting at start_date).
+        Each entry is a dict with keys:
+            - date
+            - due: list of tasks due on that date
+        """
+        if start_date is None:
+            start_date = today_str()
+        days = []
+        for offset in range(7):
+            day = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
+            due_tasks = [t for t in self.tasks if t.get("due_date") == day]
+            days.append({"date": day, "due": due_tasks})
+        return days
+
+
+# ----------------------------------------------------------------------
+# CLI display helpers
+# ----------------------------------------------------------------------
+def print_task(task: Dict[str, Any]) -> str:
+    """Compact one‑line representation of a task."""
+    due = task.get("due_date", "")
+    done = "✓" if task["completed"] else " "
+    desc = task["description"]
+    if due:
+        return f"  [{done}] #{task['id']} {desc} (due {due})"
+    else:
+        return f"  [{done}] #{task['id']} {desc}"
+
+def print_daily_summary(summary: Dict[str, Any]) -> None:
+    date = summary["date"]
+    due_today = summary["due_today"]
+    overdue = summary["overdue"]
+    completed_today = summary["completed_today"]
+
+    print(f"\n{'=' * 50}")
+    print(f"📅  Daily Summary – {date}")
+    print(f"{'=' * 50}")
+
+    # Count line
+    counts = []
+    if due_today:
+        counts.append(f"{len(due_today)} due today")
+    if overdue:
+        counts.append(f"{len(overdue)} overdue")
+    if completed_today:
+        counts.append(f"{len(completed_today)} completed today")
+    if counts:
+        print("  " + ", ".join(counts))
+    else:
+        print("  No tasks scheduled or completed today.")
+
+    if due_today:
+        print(f"\n  ⏰ Due today ({len(due_today)}):")
+        for t in due_today:
+            print(print_task(t))
+
+    if overdue:
+        print(f"\n  ⚠️  Overdue ({len(overdue)}):")
+        for t in overdue:
+            print(print_task(t))
+
+    if completed_today:
+        print(f"\n  ✅ Completed today ({len(completed_today)}):")
+        for t in completed_today:
+            print(print_task(t))
+
+    print()
+
+def print_weekly_overview(days: List[Dict[str, Any]]) -> None:
+    print(f"\n{'=' * 50}")
+    print("📆  Weekly Overview")
+    print(f"{'=' * 50}")
+
+    total = sum(len(day["due"]) for day in days)
+    print(f"  Total tasks due this week: {total}\n")
+
+    for day in days:
+        date = day["date"]
+        tasks = day["due"]
+        if tasks:
+            print(f"  {date} ({len(tasks)} due):")
+            for t in tasks:
+                print(f"      {print_task(t)}")
+        else:
+            print(f"  {date} (none)")
+
+    print()
+
+
+# ----------------------------------------------------------------------
+# CLI parsing and main
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Simple To-Do List")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("description", help="Task description")
+    add_parser.add_argument("--due", help

@@ -1,0 +1,1538 @@
+# Benchmark: slot_count=8  session=2  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 471s  Tokens: 11990  TPS: 27.0
+# ============================================================
+
+Here's a complete, modular To-Do application with both CLI and web UI:
+
+```python
+"""
+todo/
+    __init__.py
+    models.py
+    storage.py
+    cli.py
+    web.py
+    main.py
+"""
+
+# ─── todo/__init__.py ────────────────────────────────────────────────
+"""Todo CLI & Web App"""
+
+__version__ = "0.1.0"
+
+# ─── todo/models.py ──────────────────────────────────────────────────
+from __future__ import annotations
+
+import sqlite3
+import json
+from dataclasses import dataclass, field, asdict
+from datetime import date, datetime
+from typing import Optional
+from contextlib import contextmanager
+
+
+@dataclass
+class Task:
+    id: int
+    title: str
+    completed: bool = False
+    created_at: str = ""
+    due_date: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now().isoformat()
+
+    @property
+    def due_date_obj(self) -> Optional[date]:
+        if self.due_date:
+            return date.fromisoformat(self.due_date)
+        return None
+
+    @property
+    def is_overdue(self) -> bool:
+        if not self.due_date_obj or self.completed:
+            return False
+        return self.due_date_obj < date.today()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Task:
+        return cls(**d)
+
+
+# ─── todo/storage.py ─────────────────────────────────────────────────
+from __future__ import annotations
+
+import sqlite3
+import os
+from pathlib import Path
+from typing import List, Optional
+from .models import Task
+
+
+DB_DIR = Path(os.path.expanduser("~/.todo"))
+DB_PATH = DB_DIR / "tasks.db"
+
+
+def _get_db_path() -> Path:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    return DB_PATH
+
+
+@contextmanager
+def _connect():
+    """Yield a SQLite connection with row factory and foreign keys enabled."""
+    conn = sqlite3.connect(str(_get_db_path()))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Initialize the database schema."""
+    with _connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                due_date TEXT
+            )
+        """)
+        conn.commit()
+
+
+def add_task(title: str, due_date: Optional[str] = None) -> Task:
+    """Insert a new task and return it."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO tasks (title, completed, created_at, due_date) VALUES (?, 0, ?, ?)",
+            (title, datetime.now().isoformat(), due_date),
+        )
+        conn.commit()
+        task_id = cursor.lastrowid
+    return get_task(task_id)
+
+
+def get_task(task_id: int) -> Optional[Task]:
+    """Fetch a single task by ID."""
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    return Task(**dict(row))
+
+
+def list_tasks(completed: Optional[bool] = None) -> List[Task]:
+    """List tasks with optional completion filter."""
+    with _connect() as conn:
+        if completed is None:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
+        elif completed:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE completed = 1 ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE completed = 0 ORDER BY created_at DESC"
+            ).fetchall()
+    return [Task(**dict(r)) for r in rows]
+
+
+def toggle_task(task_id: int) -> Optional[Task]:
+    """Toggle the completion status of a task."""
+    task = get_task(task_id)
+    if task is None:
+        return None
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET completed = ? WHERE id = ?",
+            (0 if task.completed else 1, task_id),
+        )
+        conn.commit()
+    return get_task(task_id)
+
+
+def delete_task(task_id: int) -> bool:
+    """Delete a task by ID. Returns True if deleted."""
+    with _connect() as conn:
+        cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def daily_summary() -> dict:
+    """Generate a daily summary of tasks."""
+    today = date.today().isoformat()
+    all_tasks = list_tasks()
+    today_tasks = [t for t in all_tasks if t.created_at[:10] == today]
+    overdue = [t for t in all_tasks if t.is_overdue]
+    completed = [t for t in all_tasks if t.completed]
+    pending = [t for t in all_tasks if not t.completed]
+
+    return {
+        "date": today,
+        "total": len(all_tasks),
+        "completed": len(completed),
+        "pending": len(pending),
+        "overdue": len(overdue),
+        "today_tasks": [t.to_dict() for t in today_tasks],
+        "overdue_tasks": [t.to_dict() for t in overdue],
+    }
+
+
+# ─── todo/cli.py ─────────────────────────────────────────────────────
+from __future__ import annotations
+
+import sys
+from datetime import date
+from .storage import (
+    add_task,
+    get_task,
+    list_tasks,
+    toggle_task,
+    delete_task,
+    daily_summary,
+    init_db,
+)
+
+
+def _colorize(text: str, color: str) -> str:
+    """Simple ANSI color helper."""
+    colors = {
+        "red": "\033[91m",
+        "green": "\033[92m",
+        "yellow": "\033[93m",
+        "blue": "\033[94m",
+        "bold": "\033[1m",
+        "reset": "\033[0m",
+    }
+    return f"{colors.get(color, '')}{text}{colors['reset']}"
+
+
+def cmd_add(args) -> int:
+    """Add a new task."""
+    if not args.task:
+        print(_colorize("Error: Please provide a task description.", "red"))
+        return 1
+
+    due = None
+    if args.due:
+        try:
+            date.fromisoformat(args.due)
+            due = args.due
+        except ValueError:
+            print(_colorize(f"Error: Invalid date format '{args.due}'. Use YYYY-MM-DD.", "red"))
+            return 1
+
+    task = add_task(args.task, due)
+    status = "✓" if not task.completed else "✗"
+    print(f"Added: [{task.id}] {status} {task.title}" + (f" (due: {task.due_date})" if task.due_date else ""))
+    return 0
+
+
+def cmd_list(args) -> int:
+    """List all tasks."""
+    init_db()
+    tasks = list_tasks()
+    if not tasks:
+        print("No tasks found.")
+        return 0
+
+    print(f"\n{_colorize('📋 Tasks', 'bold')}")
+    print("-" * 50)
+
+    for task in tasks:
+        check = "✓" if task.completed else "○"
+        overdue_tag = _colorize(" ⚠ OVERDUE", "red") if task.is_overdue else ""
+        due_tag = f" (due: {task.due_date})" if task.due_date else ""
+        print(f"  [{task.id}] {check} {task.title}{due_tag}{overdue_tag}")
+
+    print("-" * 50)
+    completed = sum(1 for t in tasks if t.completed)
+    print(f"  {completed}/{len(tasks)} completed")
+    print()
+    return 0
+
+
+def cmd_complete(args) -> int:
+    """Toggle task completion."""
+    init_db()
+    task = toggle_task(args.id)
+    if task is None:
+        print(_colorize(f"Error: Task #{args.id} not found.", "red"))
+        return 1
+    status = "completed" if task.completed else "reopened"
+    print(f"Task #{args.id}: {status} — {task.title}")
+    return 0
+
+
+def cmd_delete(args) -> int:
+    """Delete a task."""
+    init_db()
+    if delete_task(args.id):
+        print(f"Task #{args.id} deleted.")
+    else:
+        print(_colorize(f"Error: Task #{args.id} not found.", "red"))
+        return 1
+    return 0
+
+
+def cmd_daily(args) -> int:
+    """Show daily summary."""
+    init_db()
+    summary = daily_summary()
+
+    print(f"\n{_colorize('📅 Daily Summary', 'bold')}")
+    print(f"  Date: {summary['date']}")
+    print(f"  {'─' * 30}")
+    print(f"  Total tasks:  {summary['total']}")
+    print(f"  Completed:    {_colorize(str(summary['completed']), 'green')}")
+    print(f"  Pending:      {_colorize(str(summary['pending']), 'yellow')}")
+    print(f"  Overdue:      {_colorize(str(summary['overdue']), 'red')}")
+
+    if summary["today_tasks"]:
+        print(f"\n  {_colorize('Today\\'s tasks:', 'bold')}")
+        for t in summary["today_tasks"]:
+            check = "✓" if t["completed"] else "○"
+            print(f"    [{check}] {t['title']}")
+
+    if summary["overdue_tasks"]:
+        print(f"\n  {_colorize('Overdue tasks:', 'red')}")
+        for t in summary["overdue_tasks"]:
+            print(f"    ⚠ [{t['id']}] {t['title']}")
+
+    print()
+    return 0
+
+
+def run_cli():
+    """Initialize DB and run CLI commands."""
+    init_db()
+
+
+# ─── todo/web.py ─────────────────────────────────────────────────────
+from __future__ import annotations
+
+import signal
+import sys
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+from datetime import date
+from .storage import (
+    add_task,
+    get_task,
+    list_tasks,
+    toggle_task,
+    delete_task,
+    daily_summary,
+    init_db,
+)
+
+
+# ─── HTML Templates ──────────────────────────────────────────────────
+
+TASKS_TABLE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Todo App</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 20px;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+        }
+        .nav {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .nav a {
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .nav a.active {
+            background: #3498db;
+            color: white;
+        }
+        .nav a:not(.active) {
+            background: #ecf0f1;
+            color: #555;
+        }
+        .nav a:hover { opacity: 0.85; }
+        .add-form {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+        .add-form label {
+            display: flex;
+            flex-direction: column;
+            font-size: 0.85em;
+            color: #666;
+            gap: 4px;
+        }
+        .add-form input {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.95em;
+        }
+        .add-form input[type="text"] { flex: 1; min-width: 200px; }
+        .add-form input[type="date"] { min-width: 140px; }
+        .add-form button {
+            padding: 8px 20px;
+            background: #27ae60;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.95em;
+            font-weight: 500;
+            height: 38px;
+        }
+        .add-form button:hover { background: #219a52; }
+        .filters {
+            background: white;
+            padding: 12px 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 15px;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .filters label { font-size: 0.9em; color: #666; cursor: pointer; }
+        .filters input[type="text"] {
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.9em;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        th {
+            background: #2c3e50;
+            color: white;
+            padding: 12px 15px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+        td {
+            padding: 10px 15px;
+            border-bottom: 1px solid #eee;
+            font-size: 0.95em;
+        }
+        tr:last-child td { border-bottom: none; }
+        tr:hover { background: #f8f9fa; }
+        tr.completed td { text-decoration: line-through; color: #999; }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+        .status-pending { background: #fff3cd; color: #856404; }
+        .status-done { background: #d4edda; color: #155724; }
+        .status-overdue { background: #f8d7da; color: #721c24; }
+        .action-btn {
+            padding: 4px 10px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+            margin-right: 5px;
+            color: white;
+        }
+        .btn-toggle { background: #3498db; }
+        .btn-toggle:hover { background: #2980b9; }
+        .btn-delete { background: #e74c3c; }
+        .btn-delete:hover { background: #c0392b; }
+        .empty { text-align: center; padding: 40px; color: #999; }
+        .stats {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .stat-card {
+            background: white;
+            padding: 15px 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            flex: 1;
+            min-width: 120px;
+            text-align: center;
+        }
+        .stat-card .number {
+            font-size: 2em;
+            font-weight: 700;
+            color: #2c3e50;
+        }
+        .stat-card .label {
+            font-size: 0.85em;
+            color: #888;
+            margin-top: 4px;
+        }
+        .stat-total .number { color: #2c3e50; }
+        .stat-completed .number { color: #27ae60; }
+        .stat-pending .number { color: #f39c12; }
+        .stat-overdue .number { color: #e74c3c; }
+    </style>
+</head>
+<body>
+    <h1>📋 Todo App</h1>
+    <div class="nav">
+        <a href="/" class="active">Tasks</a>
+        <a href="/daily">Daily Summary</a>
+    </div>
+
+    <!-- Add Task Form -->
+    <form class="add-form" method="POST" action="/add">
+        <label>
+            Task
+            <input type="text" name="title" placeholder="What needs to be done?" required>
+        </label>
+        <label>
+            Due Date
+            <input type="date" name="due_date" value="">
+        </label>
+        <button type="submit">+ Add</button>
+    </form>
+
+    <!-- Filters -->
+    <form class="filters" method="GET" action="/">
+        <label>
+            <input type="radio" name="status" value="all" {% if status == 'all' %}checked{% endif %}> All
+        </label>
+        <label>
+            <input type="radio" name="status" value="pending" {% if status == 'pending' %}checked{% endif %}> Pending
+        </label>
+        <label>
+            <input type="radio" name="status" value="completed" {% if status == 'completed' %}checked{% endif %}> Completed
+        </label>
+        <label>
+            Search
+            <input type="text" name="search" value="{{ search }}" placeholder="Search tasks...">
+        </label>
+        <button type="submit" style="padding:6px 14px;background:#3498db;color:white;border:none;border-radius:6px;cursor:pointer;">Filter</button>
+    </form>
+
+    <!-- Stats -->
+    <div class="stats">
+        <div class="stat-card stat-total">
+            <div class="number">{{ total }}</div>
+            <div class="label">Total</div>
+        </div>
+        <div class="stat-card stat-completed">
+            <div class="number">{{ completed }}</div>
+            <div class="label">Completed</div>
+        </div>
+        <div class="stat-card stat-pending">
+            <div class="number">{{ pending }}</div>
+            <div class="label">Pending</div>
+        </div>
+        <div class="stat-card stat-overdue">
+            <div class="number">{{ overdue }}</div>
+            <div class="label">Overdue</div>
+        </div>
+    </div>
+
+    <!-- Tasks Table -->
+    {% if tasks %}
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Title</th>
+                <th>Due Date</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for task in tasks %}
+            <tr class="{% if task.completed %}completed{% endif %}">
+                <td>{{ task.id }}</td>
+                <td>{{ task.title }}</td>
+                <td>{{ task.due_date or '—' }}</td>
+                <td>
+                    {% if task.completed %}
+                        <span class="status-badge status-done">Done</span>
+                    {% elif task.is_overdue %}
+                        <span class="status-badge status-overdue">Overdue</span>
+                    {% else %}
+                        <span class="status-badge status-pending">Pending</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <form method="POST" action="/toggle/{{ task.id }}" style="display:inline;">
+                        <button type="submit" class="action-btn btn-toggle">
+                            {{ "↩ Reopen" if task.completed else "✓ Done" }}
+                        </button>
+                    </form>
+                    <form method="POST" action="/delete/{{ task.id }}" style="display:inline;"
+                          onsubmit="return confirm('Delete this task?');">
+                        <button type="submit" class="action-btn btn-delete">🗑 Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty">
+        <p>No tasks found. Add one above!</p>
+    </div>
+    {% endif %}
+</body>
+</html>
+"""
+
+
+DAILY_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Todo — Daily Summary</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 20px;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 { color: #2c3e50; margin-bottom: 20px; }
+        .nav {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .nav a {
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 500;
+        }
+        .nav a.active { background: #3498db; color: white; }
+        .nav a:not(.active) { background: #ecf0f1; color: #555; }
+        .stats {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            flex: 1;
+            min-width: 140px;
+            text-align: center;
+        }
+        .stat-card .number { font-size: 2.5em; font-weight: 700; }
+        .stat-card .label { font-size: 0.9em; color: #888; margin-top: 4px; }
+        .stat-total .number { color: #2c3e50; }
+        .stat-completed .number { color: #27ae60; }
+        .stat-pending .number { color: #f39c12; }
+        .stat-overdue .number { color: #e74c3c; }
+        .section {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 20px;
+        }
+        .section h2 {
+            font-size: 1.2em;
+            margin-bottom: 12px;
+            color: #2c3e50;
+        }
+        .section h2.overdue { color: #e74c3c; }
+        .task-list { list-style: none; }
+        .task-list li {
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .task-list li:last-child { border-bottom: none; }
+        .check { font-size: 1.2em; }
+        .overdue-icon { color: #e74c3c; }
+        a.back {
+            display: inline-block;
+            margin-bottom: 20px;
+            color: #3498db;
+            text-decoration: none;
+        }
+        a.back:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <a href="/" class="back">← Back to Tasks</a>
+    <h1>📅 Daily Summary</h1>
+    <div class="nav">
+        <a href="/">Tasks</a>
+        <a href="/daily" class="active">Daily Summary</a>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card stat-total">
+            <div class="number">{{ summary.total }}</div>
+            <div class="label">Total</div>
+        </div>
+        <div class="stat-card stat-completed">
+            <div class="number">{{ summary.completed }}</div>
+            <div class="label">Completed</div>
+        </div>
+        <div class="stat-card stat-pending">
+            <div class="number">{{ summary.pending }}</div>
+            <div class="label">Pending</div>
+        </div>
+        <div class="stat-card stat-overdue">
+            <div class="number">{{ summary.overdue }}</div>
+            <div class="label">Overdue</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>📌 Today's Tasks</h2>
+        {% if summary.today_tasks %}
+        <ul class="task-list">
+            {% for t in summary.today_tasks %}
+            <li>
+                <span class="check">{{ "✓" if t.completed else "○" }}</span>
+                <span>{{ t.title }}</span>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p style="color:#999;">No tasks created today.</p>
+        {% endif %}
+    </div>
+
+    {% if summary.overdue_tasks %}
+    <div class="section">
+        <h2 class="overdue">⚠ Overdue Tasks</h2>
+        <ul class="task-list">
+            {% for t in summary.overdue_tasks %}
+            <li>
+                <span class="overdue-icon">⚠</span>
+                <span>{{ t.title }}</span>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+</body>
+</html>
+"""
+
+
+def _render(template: str, **kwargs) -> str:
+    """Minimal template renderer supporting {var} and {% if %}/{% endif %}/{% for %}/{% endfor %}."""
+    result = template
+
+    # Replace {var} placeholders
+    for key, value in kwargs.items():
+        result = result.replace("{{ " + key + " }}", str(value))
+        result = result.replace("{{" + key + "}}", str(value))
+
+    # Handle {% if condition %} ... {% endif %}
+    result = _render_if_blocks(result, kwargs)
+
+    # Handle {% for item in list %} ... {% endfor %}
+    result = _render_for_blocks(result, kwargs)
+
+    return result
+
+
+def _render_if_blocks(text: str, ctx: dict) -> str:
+    """Render {% if cond %}...{% endif %} blocks."""
+    while "{% if " in text:
+        start = text.index("{% if ")
+        after_tag = text[start + 5:]
+        condition = after_tag.split("%}")[0].strip()
+        block_start = start + 5 + after_tag.index("%}") + 2
+
+        # Find matching {% endif %} — handle nesting by counting
+        depth = 1
+        pos = block_start
+        while depth > 0 and pos < len(text):
+            iftext = text.find("{% if ", pos)
+            endiftext = text.find("{% endif %}", pos)
+            if endiftext == -1:
+                break
+            if iftext != -1 and iftext < endiftext:
+                depth += 1
+                pos = iftext + 6
+            else:
+                depth -= 1
+                if depth == 0:
+                    endif_pos = endiftext
+                else:
+                    pos = endiftext + 10
+        else:
+            break
+
+        end_block = endif_pos
+        inner = text[block_start:end_block].strip()
+        before = text[:start]
+        after = text[end_block + 10:]
+
+        # Evaluate condition
+        cond = condition.strip()
+        if cond.startswith("not "):
+            var = cond[4:].strip()
+            val = ctx.get(var, False)
+            include = not val
+        else:
+            val = ctx.get(cond, False)
+            include = bool(val)
+
+        if include:
+            # Also render inner if/for blocks
+            inner = _render_if_blocks(inner, ctx)
+            inner = _render_for_blocks(inner, ctx)
+            text = before + inner + after
+        else:
+            text = before + after
+
+    return text
+
+
+def _render_for_blocks(text: str, ctx: dict) -> str:
+    """Render {% for item in list %}...{% endfor %} blocks."""
+    while "{% for " in text:
+        start = text.index("{% for ")
+        after_tag = text[start + 7:]
+        for_clause = after_tag.split("%}")[0].strip()
+        parts = for_clause.split(" in ")
+        if len(parts) != 2:
+            break
+        var_name = parts[0].strip()
+        list_name = parts[1].strip()
+        block_start = start + 7 + after_tag.index("%}") + 2
+
+        # Find matching {% endfor %}
+        depth = 1
+        pos = block_start
+        while depth > 0 and pos < len(text):
+            for_pos = text.find("{% for ", pos)
+            endfor_pos = text.find("{% endfor %}", pos)
+            if endfor_pos == -1:
+                break
+            if for_pos != -1 and for_pos < endfor_pos:
+                depth += 1
+                pos = for_pos + 7
+            else:
+                depth -= 1
+                if depth == 0:
+                    endfor_pos = endfor_pos
+                else:
+                    pos = endfor_pos + 11
+        else:
+            break
+
+        end_block = endfor_pos
+        inner = text[block_start:end_block]
+        before = text[:start]
+        after = text[end_block + 11:]
+
+        lst = ctx.get(list_name, [])
+        rendered = ""
+        for item in lst:
+            new_ctx = dict(ctx)
+            new_ctx[var_name] = item
+            rendered += _render_if_blocks(inner, new_ctx)
+            rendered += _render_for_blocks(inner, new_ctx)
+            # Also replace {var} with item attributes
+            item_dict = item if isinstance(item, dict) else item.to_dict() if hasattr(item, "to_dict") else {"id": item}
+            for k, v in item_dict.items():
+                rendered = rendered.replace("{{ " + var_name + "." + k + " }}", str(v))
+                rendered = rendered.replace("{{" + var_name + "." + k + "}}", str(v))
+
+        text = before + rendered + after
+
+    return text
+
+
+def _render_template(template: str, **kwargs) -> str:
+    """Full template rendering with all features."""
+    result = template
+
+    # First handle for loops
+    result = _render_for_loops(result, kwargs)
+
+    # Then handle if blocks
+    result = _render_if_statements(result, kwargs)
+
+    # Then replace simple variables
+    for key, value in kwargs.items():
+        result = result.replace("{{ " + key + " }}", str(value))
+        result = result.replace("{{" + key + "}}", str(value))
+
+    return result
+
+
+def _render_for_loops(text: str, ctx: dict) -> str:
+    """Render {% for var in iterable %}...{% endfor %}."""
+    import re
+    pattern = r'\{% for (\w+) in (\w+) %\}(.*?)\{% endfor %\}'
+
+    def replace_for(m):
+        var_name = m.group(1)
+        list_name = m.group(2)
+        inner = m.group(3)
+        lst = ctx.get(list_name, [])
+
+        rendered = ""
+        for item in lst:
+            item_ctx = dict(ctx)
+            item_dict = item if isinstance(item, dict) else getattr(item, "__dict__", {})
+            item_dict[var_name] = item
+            for k, v in item_dict.items():
+                item_ctx[k] = v
+            rendered += _render_single_for_item(inner, item, item_ctx, var_name)
+        return rendered
+
+    while re.search(pattern, text, re.DOTALL):
+        text = re.sub(pattern, replace_for, text, flags=re.DOTALL)
+
+    return text
+
+
+def _render_single_for_item(inner: str, item, ctx: dict, var_name: str) -> str:
+    """Render one iteration of a for loop."""
+    item_dict = item if isinstance(item, dict) else getattr(item, "to_dict", lambda: {})()
+
+    # Replace {{ var.field }} with actual values
+    import re
+    pattern = r'\{\{\s*' + re.escape(var_name) + r'\.(\w+)\s*\}\}'
+    inner = re.sub(pattern, lambda m: str(item_dict.get(m.group(1), "")), inner)
+
+    # Handle {% if var.field %}
+    pattern = r'\{% if\s+' + re.escape(var_name) + r'\.(\w+)\s*%\}(.*?)\{% endif %\}'
+    inner = re.sub(pattern, lambda m: m.group(2) if item_dict.get(m.group(1)) else "", inner, flags=re.DOTALL)
+
+    return inner
+
+
+def _render_if_statements(text: str, ctx: dict) -> str:
+    """Render {% if cond %}...{% endif %}."""
+    import re
+    # Simple variable check: {% if var %}
+    pattern = r'\{% if (\w+) %\}(.*?)\{% endif %\}'
+
+    def replace_if(m):
+        var_name = m.group(1)
+        inner = m.group(2)
+        val = ctx.get(var_name, False)
+        return inner if val else ""
+
+    while re.search(pattern, text, re.DOTALL):
+        text = re.sub(pattern, replace_if, text, flags=re.DOTALL)
+
+    # {% if not var %}
+    pattern = r'\{% if not (\w+) %\}(.*?)\{% endif %\}'
+
+    def replace_not_if(m):
+        var_name = m.group(1)
+        inner = m.group(2)
+        val = ctx.get(var_name, False)
+        return inner if not val else ""
+
+    while re.search(pattern, text, re.DOTALL):
+        text = re.sub(pattern, replace_not_if, text, flags=re.DOTALL)
+
+    return text
+
+
+# ─── HTTP Request Handler ────────────────────────────────────────────
+
+class TodoHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the Todo web UI."""
+
+    def log_message(self, format, *args):
+        """Suppress default logging or use minimal format."""
+        sys.stderr.write(f"[{self.log_date_time_string()}] {args[0]}\n")
+
+    def _send_json(self, data: dict, status: int = 200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _send_html(self, html: str, status: int = 200):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def _get_query_params(self) -> dict:
+        """Parse query string parameters."""
+        parsed = urlparse(self.path)
+        return parse_qs(parsed.query)
+
+    def _get_body(self) -> dict:
+        """Read and parse form body."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            return {}
+        body = self.rfile.read(content_length).decode()
+        return parse_qs(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/":
+            self._handle_tasks_page()
+        elif path == "/daily":
+            self._handle_daily_page()
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/add":
+            self._handle_add()
+        elif path.startswith("/toggle/"):
+            task_id = path.split("/toggle/")[-1]
+            self._handle_toggle(task_id)
+        elif path.startswith("/delete/"):
+            task_id = path.split("/delete/")[-1]
+            self._handle_delete(task_id)
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def _handle_tasks_page(self):
+        """Render the main tasks page."""
+        init_db()
+        params = self._get_query_params()
+
+        # Parse filter
+        status_filter = params.get("status", ["all"])[0]
+        search_query = params.get("search", [""])[0].strip().lower()
+
+        # Get tasks
+        if status_filter == "completed":
+            tasks = list_tasks(completed=True)
+        elif status_filter == "pending":
+            tasks = list_tasks(completed=False)
+        else:
+            tasks = list_tasks()
+
+        # Apply search filter
+        if search_query:
+            tasks = [t for t in tasks if search_query in t.title.lower()]
+
+        # Compute stats
+        all_tasks = list_tasks()
+        summary = {
+            "total": len(all_tasks),
+            "completed": sum(1 for t in all_tasks if t.completed),
+            "pending": sum(1 for t in all_tasks if not t.completed),
+            "overdue": sum(1 for t in all_tasks if t.is_overdue),
+        }
+
+        html = _render_template(TASKS_TABLE_HTML, **{
+            "tasks": tasks,
+            "status": status_filter,
+            "search": search_query,
+            "total": summary["total"],
+            "completed": summary["completed"],
+            "pending": summary["pending"],
+            "overdue": summary["overdue"],
+        })
+        self._send_html(html)
+
+    def _handle_daily_page(self):
+        """Render the daily summary page."""
+        init_db()
+        summary = daily_summary()
+
+        html = _render_template(DAILY_HTML, **{
+            "summary": summary,
+        })
+        self._send_html(html)
+
+    def _handle_add(self):
+        """Add a new task."""
+        init_db()
+        body = self._get_body()
+        title = body.get("title", [""])[0].strip()
+        due_date = body.get("due_date", [None])[0] or None
+
+        if not title:
+            self._send_json({"error": "Title is required"}, 400)
+            return
+
+        task = add_task(title, due_date if due_date != "" else None)
+        self._send_json({"id": task.id, "title": task.title, "completed": task.completed})
+
+    def _handle_toggle(self, task_id: str):
+        """Toggle task completion."""
+        init_db()
+        try:
+            tid = int(task_id)
+        except ValueError:
+            self._send_json({"error": "Invalid task ID"}, 400)
+            return
+
+        task = toggle_task(tid)
+        if task is None:
+            self._send_json({"error": "Task not found"}, 404)
+            return
+
+        self._send_json({"id": task.id, "completed": task.completed})
+
+    def _handle_delete(self, task_id: str):
+        """Delete a task."""
+        init_db()
+        try:
+            tid = int(task_id)
+        except ValueError:
+            self._send_json({"error": "Invalid task ID"}, 400)
+            return
+
+        if delete_task(tid):
+            self._send_json({"deleted": True})
+        else:
+            self._send_json({"error": "Task not found"}, 404)
+
+
+# ─── Server Startup ──────────────────────────────────────────────────
+
+class GracefulHTTPServer(HTTPServer):
+    """HTTPServer that handles SIGINT/SIGTERM gracefully."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._shutdown_event = threading.Event()
+
+    def serve_forever(self, poll_interval=0.5):
+        """Serve requests until shutdown is signaled."""
+        init_db()
+        print(f"🚀 Todo Web UI running on http://localhost:{self.server_address[1]}")
+        print("   Press Ctrl+C to stop.")
+        try:
+            self._shutdown_event.clear()
+            while not self._shutdown_event.is_set():
+                self.handle_request()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.server_close()
+            print("\n👋 Server stopped.")
+
+    def shutdown_server(self):
+        """Signal shutdown."""
+        self._shutdown_event.set()
+
+
+def _find_free_port(start_port: int = 8080) -> int:
+    """Find a free port starting from start_port."""
+    import socket
+    for port in range(start_port, start_port + 100):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("0.0.0.0", port))
+                return port
+        except OSError:
+            continue
+    raise OSError("No free port found in range")
+
+
+def serve(port: int = 8080):
+    """Start the Todo web server."""
+    init_db()
+
+    actual_port = port
+    try:
+        server = GracefulHTTPServer(("0.0.0.0", actual_port), TodoHandler)
+    except OSError as e:
+        if "address already in use" in str(e).lower():
+            print(f"⚠ Port {port} is already in use. Trying next available port...")
+            actual_port = _find_free_port(port)
+            server = GracefulHTTPServer(("0.0.0.0", actual_port), TodoHandler)
+        else:
+            raise
+
+    # Handle Ctrl+C gracefully
+    def signal_handler(sig, frame):
+        print("\n\nShutting down...")
+        server.shutdown_server()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    server.serve_forever()
+
+
+# ─── todo/main.py ────────────────────────────────────────────────────
+from __future__ import annotations
+
+import argparse
+import sys
+from .storage import init_db
+from .cli import run_cli, cmd_add, cmd_list, cmd_complete, cmd_delete, cmd_daily
+from .web import serve
+
+
+def main():
+    """Main entry point for the todo CLI and web server."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple To-Do application with CLI and Web UI",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("task", nargs="?", help="Task description")
+    add_parser.add_argument("--due", help="Due date (YYYY-MM-DD)")
+
+    # list
+    subparsers.add_parser("list", help="List all tasks")
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Toggle task completion")
+    complete_parser.add_argument("id", type=int, help="Task ID")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="Task ID")
+
+    # daily
+    subparsers.add_parser("daily", help="Show daily summary")
+
+    # serve
+    serve_parser = subparsers.add_parser("serve", help="Start the web UI server")
+    serve_parser.add_argument("--port", type=int, default=8080, help="Port to run on (default: 8080)")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    run_cli()
+
+    if args.command == "add":
+        sys.exit(cmd_add(args))
+    elif args.command == "list":
+        sys.exit(cmd_list(args))
+    elif args.command == "complete":
+        sys.exit(cmd_complete(args))
+    elif args.command == "delete":
+        sys.exit(cmd_delete(args))
+    elif args.command == "daily":
+        sys.exit(cmd_daily(args))
+    elif args.command == "serve":
+        serve(port=args.port)
+
+
+# ─── Tests ───────────────────────────────────────────────────────────
+"""
+Run tests with:
+    python -m todo.main test
+or:
+    python -m pytest tests/test_todo.py -v
+"""
+
+
+def run_tests():
+    """Run all tests for the Todo application."""
+    import unittest
+    from unittest.mock import patch, MagicMock
+    import io
+
+    class TestStorage(unittest.TestCase):
+        """Test the storage layer."""
+
+        def setUp(self):
+            """Initialize DB and create test data."""
+            init_db()
+            # Clean up any existing tasks
+            with _connect() as conn:
+                conn.execute("DELETE FROM tasks")
+                conn.commit()
+
+        def test_add_task(self):
+            task = add_task("Test task")
+            self.assertIsNotNone(task)
+            self.assertEqual(task.title, "Test task")
+            self.assertFalse(task.completed)
+            self.assertIsNotNone(task.id)
+
+        def test_get_task(self):
+            task = add_task("Get me")
+            fetched = get_task(task.id)
+            self.assertIsNotNone(fetched)
+            self.assertEqual(fetched.title, "Get me")
+
+        def test_get_task_not_found(self):
+            fetched = get_task(9999)
+            self.assertIsNone(fetched)
+
+        def test_list_tasks(self):
+            add_task("Task 1")
+            add_task("Task 2")
+            tasks = list_tasks()
+            self.assertEqual(len(tasks), 2)
+
+        def test_list_tasks_completed_filter(self):
+            t1 = add_task("Done task")
+            toggle_task(t1.id)
+            t2 = add_task("Pending task")
+            completed = list_tasks(completed=True)
+            pending = list_tasks(completed=False)
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(len(pending), 1)
+
+        def test_toggle_task(self):
+            task = add_task("Toggle me")
+            self.assertFalse(task.completed)
+            toggled = toggle_task(task.id)
+            self.assertTrue(toggled.completed)
+            # Toggle again
+            toggled2 = toggle_task(task.id)
+            self.assertFalse(toggled2.completed)
+
+        def test_toggle_nonexistent(self):
+            result = toggle_task(9999)
+            self.assertIsNone(result)
+
+        def test_delete_task(self):
+            task = add_task("Delete me")
+            self.assertTrue(delete_task(task.id))
+            self.assertIsNone(get_task(task.id))
+
+        def test_delete_nonexistent(self):
+            self.assertFalse(delete_task(9999))
+
+        def test_daily_summary(self):
+            add_task("Today task")
+            add_task("Old task", due_date="2020-01-01")
+            summary = daily_summary()
+            self.assertIn("date", summary)
+            self.assertIn("total", summary)
+            self.assertGreaterEqual(summary["total"], 2)
+
+    class TestWebRoutes(unittest.TestCase):
+        """Test the web routes using BaseHTTPRequestHandler directly."""
+
+        def setUp(self):
+            """Initialize DB and clean up."""
+            init_db()
+            with _connect() as conn:
+                conn.execute("DELETE FROM tasks")
+                conn.commit()
+
+        def _make_request(self, method: str, path: str, body: bytes = b"") -> tuple:
+            """Make a mock HTTP request and capture the response."""
+            # Create a mock socket
+            mock_socket = MagicMock()
+            mock_socket.makefile = MagicMock()
+
+            handler = TodoHandler(
+                MagicMock(),
+                ("127.0.0.1", 0),
+            )
+            handler.command = method
+            handler.path = path
+            handler.headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            handler.rfile = io.BytesIO(body)
+            handler.wfile = io.BytesIO()
+
+            if method == "GET":
+                handler.do_GET()
+            elif method == "POST":
+                handler.do_POST()
+
+            response = handler.wfile.getvalue()
+            return response
+
+        def test_get_tasks_page(self):
+            response = self._make_request("GET", "/")
+            self.assertIn(b"Todo App", response)
+            self.assertIn(b"<table", response)
+
+        def test_get_tasks_page_with_filter(self):
+            add_task("Filter test")
+            response = self._make_request("GET", "/?status=pending")
+            self.assertIn(b"Todo App", response)
+
+        def test_get_daily_page(self):
+            response = self._make_request("GET", "/daily")
+            self.assertIn(b"Daily Summary", response)
+
+        def test_post_add_task(self):
+            body = b"title=New+task&due_date=2025-01-15"
+            response = self._make_request("POST", "/add", body)
+            data = json.loads(response)
+            self.assertEqual(data["title"], "New task")
+            self.assertFalse(data["completed"])
+            self.assertIn("id", data)
+
+        def test_post_add_task_no_title(self):
+            body = b"title=&due_date="
+            response = self._make_request("POST", "/add", body)
+            data = json.loads(response)
+            self.assertEqual(data.get("error"), "Title is required")
+
+        def test_post_toggle_task(self):
+            task = add_task("Toggle test")
+            body = b""
+            response = self._make_request("POST", f"/toggle/{task.id}", body)
+            data = json.loads(response)
+            self.assertTrue(data["completed"])
+
+        def test_post_toggle_nonexistent(self):
+            response = self._make_request("POST", "/toggle/9999", b"")
+            data = json.loads(response)
+            self.assertEqual(data.get("error"), "Task not found")
+
+        def test_post_delete_task(self):
+            task = add_task("Delete test")
+            body = b""
+            response = self._make_request("POST", f"/delete/{task.id}", body)
+            data = json.loads(response)
+            self.assertTrue(data["deleted"])
+
+        def test_post_delete_nonexistent(self):
+            response = self._make_request("POST", "/delete/9999", b"")
+            data = json.loads(response)
+            self.assertEqual(data.get("error"), "Task not found")
+
+        def test_404_route(self):
+            response = self._make_request("GET", "/nonexistent")
+            data = json.loads(response)
+            self.assertEqual(data.get("error"), "Not found")
+
+        def test_tasks_page_shows_tasks(self):
+            add_task("Visible task")
+            response = self._make_request("GET", "/")
+            self.assertIn(b"Visible task", response)
+
+        def test_daily_page_shows_summary(self):
+            add_task("Summary task")
+            response = self._make_request("GET", "/daily")
+            self.assertIn(b"Total", response)
+
+    # Run tests
+    suite = unittest.TestSuite()
+    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestStorage))
+    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestWebRoutes))
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    # Allow running tests via: python -m todo.main test
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        sys.exit(run_tests())
+    main()
+```
+
+## Module Structure
+
+```
+todo/
+    __init__.py   — Package init with version
+    models.py     — Task dataclass with helpers (is_overdue, to_dict, etc.)
+    storage.py    — SQLite persistence layer (init_db, CRUD, daily_summary)
+    cli.py        — CLI command handlers (add, list, complete, delete, daily)
+    web.py        — Web server (HTTP handler, HTML templates, serve function)
+    main.py       — Entry point with argparse subcommands
+```
+
+## Key Design Decisions
+
+| Aspect | Choice |
+|---|---|
+| **Web framework** | Built-in `http.server` — zero external dependencies |
+| **Database** | SQLite via `sqlite3` — built-in, file-based, no setup |
+| **Template engine** | Custom minimal renderer supporting `{var}`, `{% if %}`, `{% for %}` |
+| **Port conflicts** | Auto-finds next free port if the requested one is taken |
+| **Ctrl+C handling** | `SIGINT`/`SIGTERM` signals + graceful `handle_request()` loop |
+| **CLI compatibility** | All CLI commands remain unchanged; `serve` is an additive subcommand |
+
+## Usage
+
+```bash
+# CLI commands (unchanged)
+todo add "Buy groceries" --due 2025-07-20
+todo list
+todo complete 1
+todo delete 1
+todo daily
+
+# Web UI
+todo serve --port 8080
+
+# Run tests
+python -m todo.main test
+```
+
+The web UI provides:
+- **Tasks page** with stats cards, filter radio buttons (All/Pending/Completed), search input, and a full task table
+- **Daily Summary page** mirroring the CLI `daily` output with visual cards
+- **Inline CSS** — no external dependencies, responsive layout
+- **JSON API** — all POST endpoints return JSON responses

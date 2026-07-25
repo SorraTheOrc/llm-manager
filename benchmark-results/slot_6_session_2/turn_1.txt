@@ -1,0 +1,351 @@
+# Benchmark: slot_count=6  session=2  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 501s  Tokens: 2895  TPS: 17.7
+# ============================================================
+
+Here's a complete, production-ready implementation following your requirements. It's structured into two files: `todo.py` (core logic + CLI) and `test_todo.py` (pytest tests).
+
+### 📁 `todo.py`
+```python
+"""CLI-based To-Do Application with JSON storage.
+
+Usage:
+    python todo.py add <title>
+    python todo.py list [--uncompleted]
+    python todo.py complete <id>
+    python todo.py delete <id>
+    python todo.py -h / --help
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+__all__ = ["TodoStore", "main"]
+
+
+class TodoStore:
+    """Manages task CRUD operations and JSON file persistence."""
+
+    def __init__(self, db_path: str = "todo.json"):
+        self.db_path = Path(db_path)
+        if not self.db_path.exists():
+            self._save([])
+
+    def _load(self) -> list[dict]:
+        """Load tasks from the JSON file."""
+        try:
+            with open(self.db_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+
+    def _save(self, tasks: list[dict]) -> None:
+        """Save tasks to the JSON file."""
+        with open(self.db_path, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2)
+            f.write("\n")
+
+    def _get_next_id(self, tasks: list[dict]) -> int:
+        """Return the next available task ID."""
+        if not tasks:
+            return 1
+        return max(task["id"] for task in tasks) + 1
+
+    def add(self, title: str) -> dict:
+        """Add a new task to the store."""
+        if not title.strip():
+            raise ValueError("Task title cannot be empty.")
+        tasks = self._load()
+        new_task = {
+            "id": self._get_next_id(tasks),
+            "title": title.strip(),
+            "completed": False,
+        }
+        tasks.append(new_task)
+        self._save(tasks)
+        return new_task
+
+    def list_tasks(self, show_completed: bool = True) -> list[dict]:
+        """List tasks, optionally filtering out completed ones."""
+        tasks = self._load()
+        if not show_completed:
+            tasks = [t for t in tasks if not t["completed"]]
+        return tasks
+
+    def complete(self, task_id: int) -> dict:
+        """Mark a task as completed by its ID."""
+        tasks = self._load()
+        for task in tasks:
+            if task["id"] == task_id:
+                task["completed"] = True
+                self._save(tasks)
+                return task
+        raise ValueError(f"Task with id {task_id} not found.")
+
+    def delete(self, task_id: int) -> dict:
+        """Delete a task by its ID."""
+        tasks = self._load()
+        for i, task in enumerate(tasks):
+            if task["id"] == task_id:
+                removed = tasks.pop(i)
+                self._save(tasks)
+                return removed
+        raise ValueError(f"Task with id {task_id} not found.")
+
+
+def _format_tasks(tasks: list[dict]) -> str:
+    """Format tasks for console output."""
+    if not tasks:
+        return "No tasks found."
+    lines = [f"{'ID':<4} {'Status':<8} {'Title'}", "-" * 40]
+    for t in tasks:
+        status = "Done" if t["completed"] else "Todo"
+        lines.append(f"{t['id']:<4} {status:<8} {t['title']}")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    """CLI entry point for the To-Do application."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple CLI To-Do application with JSON storage.",
+    )
+    parser.add_argument(
+        "--db", default="todo.json", help="Path to the JSON database file"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", help="Title of the task")
+
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument(
+        "--uncompleted", action="store_true", help="Show only uncompleted tasks"
+    )
+
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as complete")
+    complete_parser.add_argument("id", type=int, help="ID of the task to complete")
+
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="ID of the task to delete")
+
+    args = parser.parse_args(argv)
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    store = TodoStore(args.db)
+
+    try:
+        if args.command == "add":
+            task = store.add(args.title)
+            print(f"Added task: {task}")
+        elif args.command == "list":
+            show_completed = not args.uncompleted
+            tasks = store.list_tasks(show_completed=show_completed)
+            print(_format_tasks(tasks))
+        elif args.command == "complete":
+            task = store.complete(args.id)
+            print(f"Completed task {task['id']}: {task['title']}")
+        elif args.command == "delete":
+            task = store.delete(args.id)
+            print(f"Deleted task {task['id']}: {task['title']}")
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 🧪 `test_todo.py`
+```python
+"""Unit tests for the CLI To-Do application."""
+
+import pytest
+from pathlib import Path
+from todo import TodoStore, main
+
+
+class TestTodoStore:
+    @pytest.fixture
+    def store(self, tmp_path: Path) -> TodoStore:
+        db_file = tmp_path / "test_todos.json"
+        return TodoStore(str(db_file))
+
+    def test_add_task(self, store: TodoStore) -> None:
+        task = store.add("Buy groceries")
+        assert task["id"] == 1
+        assert task["title"] == "Buy groceries"
+        assert task["completed"] is False
+        assert len(store._load()) == 1
+
+    def test_add_multiple_tasks_auto_increment(self, store: TodoStore) -> None:
+        t1 = store.add("Task 1")
+        t2 = store.add("Task 2")
+        assert t1["id"] == 1
+        assert t2["id"] == 2
+
+    def test_add_empty_title_raises(self, store: TodoStore) -> None:
+        with pytest.raises(ValueError, match="cannot be empty"):
+            store.add("   ")
+
+    def test_list_tasks_all(self, store: TodoStore) -> None:
+        store.add("Task 1")
+        store.add("Task 2")
+        tasks = store.list_tasks()
+        assert len(tasks) == 2
+
+    def test_list_tasks_uncompleted_only(self, store: TodoStore) -> None:
+        store.add("Task 1")
+        store.add("Task 2")
+        store.complete(1)
+        tasks = store.list_tasks(show_completed=False)
+        assert len(tasks) == 1
+        assert tasks[0]["id"] == 2
+
+    def test_complete_task(self, store: TodoStore) -> None:
+        store.add("Task 1")
+        completed_task = store.complete(1)
+        assert completed_task["completed"] is True
+        assert store._load()[0]["completed"] is True
+
+    def test_complete_nonexistent_task_raises(self, store: TodoStore) -> None:
+        with pytest.raises(ValueError, match="not found"):
+            store.complete(99)
+
+    def test_delete_task(self, store: TodoStore) -> None:
+        store.add("Task 1")
+        store.add("Task 2")
+        deleted = store.delete(1)
+        assert deleted["title"] == "Task 1"
+        assert len(store._load()) == 1
+        assert store._load()[0]["id"] == 2
+
+    def test_delete_nonexistent_task_raises(self, store: TodoStore) -> None:
+        with pytest.raises(ValueError, match="not found"):
+            store.delete(99)
+
+    def test_id_continues_after_delete(self, store: TodoStore) -> None:
+        store.add("Task 1")
+        store.add("Task 2")
+        store.add("Task 3")
+        store.delete(2)
+        new_task = store.add("Task 4")
+        assert new_task["id"] == 4
+
+    def test_persistence_across_instances(self, tmp_path: Path) -> None:
+        db_file = tmp_path / "persist.json"
+        store1 = TodoStore(str(db_file))
+        store1.add("Persistent Task")
+        store2 = TodoStore(str(db_file))
+        tasks = store2._load()
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "Persistent Task"
+
+
+class TestCLI:
+    @pytest.fixture
+    def db_path(self, tmp_path: Path) -> Path:
+        return tmp_path / "cli_test.json"
+
+    def test_add_command(self, db_path: Path, capsys: pytest.CaptureFixture) -> None:
+        main(["--db", str(db_path), "add", "Buy milk"])
+        captured = capsys.readouterr()
+        assert "Added task:" in captured.out
+        store = TodoStore(str(db_path))
+        assert len(store._load()) == 1
+
+    def test_list_command(self, db_path: Path, capsys: pytest.CaptureFixture) -> None:
+        store = TodoStore(str(db_path))
+        store.add("Task A")
+        store.add("Task B")
+        main(["--db", str(db_path), "list"])
+        captured = capsys.readouterr()
+        assert "Task A" in captured.out
+        assert "Task B" in captured.out
+
+    def test_complete_command(self, db_path: Path, capsys: pytest.CaptureFixture) -> None:
+        store = TodoStore(str(db_path))
+        store.add("Task 1")
+        main(["--db", str(db_path), "complete", "1"])
+        captured = capsys.readouterr()
+        assert "Completed task 1:" in captured.out
+        assert store._load()[0]["completed"] is True
+
+    def test_delete_command(self, db_path: Path, capsys: pytest.CaptureFixture) -> None:
+        store = TodoStore(str(db_path))
+        store.add("Task 1")
+        main(["--db", str(db_path), "delete", "1"])
+        captured = capsys.readouterr()
+        assert "Deleted task 1:" in captured.out
+        assert len(store._load()) == 0
+
+    def test_error_on_missing_task(self, db_path: Path, capsys: pytest.CaptureFixture) -> None:
+        main(["--db", str(db_path), "complete", "99"])
+        captured = capsys.readouterr()
+        assert "Error: Task with id 99 not found." in captured.err
+        assert captured.out == ""
+
+    def test_help_shows_usage(self, capsys: pytest.CaptureFixture) -> None:
+        main(["--help"])
+        captured = capsys.readouterr()
+        assert "usage:" in captured.out.lower()
+        assert "add" in captured.out.lower()
+        assert "list" in captured.out.lower()
+        assert "complete" in captured.out.lower()
+        assert "delete" in captured.out.lower()
+```
+
+### 🚀 How to Run
+
+1. **Install dependencies** (only `pytest` is required for testing):
+   ```bash
+   pip install pytest
+   ```
+
+2. **Run tests**:
+   ```bash
+   pytest test_todo.py -v
+   ```
+
+3. **Use the CLI**:
+   ```bash
+   # Add a task
+   python todo.py add "Buy groceries"
+
+   # List all tasks
+   python todo.py list
+
+   # List only uncompleted tasks
+   python todo.py list --uncompleted
+
+   # Mark task #1 as complete
+   python todo.py complete 1
+
+   # Delete task #2
+   python todo.py delete 2
+
+   # Show help
+   python todo.py --help
+   ```
+
+### ✅ Design Highlights
+- **Separation of Concerns**: `TodoStore` handles business logic & persistence; `main()` handles CLI parsing & I/O.
+- **Importable**: `from todo import TodoStore, main` works seamlessly for programmatic use.
+- **Safe Storage**: JSON is read/written atomically per operation with fallback on corruption. No `eval`/`exec`.
+- **Testable CLI**: `main(argv)` accepts explicit arguments, enabling deterministic CLI testing without mocking `sys.argv`.
+- **Type Hints & Docstrings**: Full PEP 484 compliance with `typing` module, ready for static analysis tools like `mypy`.
+- **Idempotent & Predictable**: Auto-increment IDs survive deletions; empty strings are rejected; missing tasks raise clear `ValueError`s.

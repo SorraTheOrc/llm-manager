@@ -295,8 +295,14 @@ class SlotScheduler:
         return self._draining
 
     def set_draining(self, value: bool) -> None:
-        """Set the draining flag."""
+        """Set the draining flag, propagating to the server module for router checks."""
         self._draining = value
+        # Propagate to the server module-level flag so the router can check it
+        # without importing the scheduler (LP-0MRXZU90M007WNWT regression fix).
+        try:
+            self._srv.draining = value
+        except Exception:
+            pass
 
     @property
     def pending_restart_slot(self) -> int | None:
@@ -424,6 +430,22 @@ class SlotScheduler:
                 return
         except Exception:
             pass
+
+        # ── Catch-up: if we started after a transition time, apply it now ──
+        if self._pending_restart_slot is None:
+            now = self._now()
+            schedule_current = self._config.get_active_slot(now)
+            static_slots = self._get_static_slot_count()
+            if schedule_current is not None and schedule_current != static_slots:
+                logger.info(
+                    "Slot scheduler: catch-up detected — should be at %d slots "
+                    "(currently at %d) per schedule; applying transition now",
+                    schedule_current,
+                    static_slots,
+                )
+                self.set_pending_restart(schedule_current)
+                await self.perform_restart()
+                return
 
         now = self._now()
 

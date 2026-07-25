@@ -308,7 +308,7 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  session_slot_pool_size: 2
+  session_slot_pool_size: 4
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
@@ -347,10 +347,10 @@ server:
     enabled: true
     drain_minutes: 15
     entries:
+      - time: "23:59"
+        slots: 8
       - time: "10:00"
         slots: 4
-      - time: "12:00"
-        slots: 8
 
   session_slot_timeout_seconds: 3.0
   slot_unavailable_retry_after: 5

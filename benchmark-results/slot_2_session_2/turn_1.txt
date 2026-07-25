@@ -1,0 +1,382 @@
+# Benchmark: slot_count=2  session=2  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 35s  Tokens: 5362  TPS: 383.8
+# ============================================================
+
+Below is a complete CLI‑based to‑do application with JSON file storage, full CRUD operations, and unit tests. The code is organized as a Python package that can be imported as a module or run directly via the command line.
+
+## Project structure
+
+```
+todo_app/
+    __init__.py
+    todo_list.py
+    cli.py
+    __main__.py          # optional, allows `python -m todo_app`
+tests/
+    test_todo_list.py
+```
+
+All source files are shown below.
+
+---
+
+## `todo_app/__init__.py`
+
+Exposes the `TodoList` class for easy importing.
+
+```python
+from .todo_list import TodoList
+
+__all__ = ["TodoList"]
+```
+
+---
+
+## `todo_app/todo_list.py`
+
+Contains the core `TodoList` class that manages tasks in a JSON file.
+
+```python
+import json
+import os
+from typing import Dict, List, Optional
+
+class TodoList:
+    """A simple to-do list that stores tasks in a JSON file."""
+
+    def __init__(self, filepath: str = "tasks.json") -> None:
+        self.filepath = filepath
+        self._tasks: List[Dict] = []
+
+    def _load(self) -> None:
+        if os.path.exists(self.filepath):
+            with open(self.filepath, "r") as f:
+                self._tasks = json.load(f)
+        else:
+            self._tasks = []
+
+    def _save(self) -> None:
+        with open(self.filepath, "w") as f:
+            json.dump(self._tasks, f, indent=2)
+
+    def add(self, title: str) -> Dict:
+        """Add a new task and return it.
+
+        Args:
+            title: Description of the task.
+
+        Returns:
+            The newly created task dictionary.
+        """
+        self._load()
+        new_id = max((t["id"] for t in self._tasks), default=0) + 1
+        task = {"id": new_id, "title": title, "completed": False}
+        self._tasks.append(task)
+        self._save()
+        return task
+
+    def list(self, completed: Optional[bool] = None) -> List[Dict]:
+        """Return a list of tasks, optionally filtered by completion status.
+
+        Args:
+            completed: If True, return only completed tasks;
+                       if False, return only pending tasks;
+                       if None (default), return all tasks.
+
+        Returns:
+            A list of task dictionaries.
+        """
+        self._load()
+        if completed is None:
+            return list(self._tasks)
+        return [t for t in self._tasks if t["completed"] == completed]
+
+    def complete(self, task_id: int) -> Dict:
+        """Mark a task as completed.
+
+        Args:
+            task_id: The id of the task to complete.
+
+        Returns:
+            The updated task dictionary.
+
+        Raises:
+            ValueError: If no task with the given id exists.
+        """
+        self._load()
+        for task in self._tasks:
+            if task["id"] == task_id:
+                task["completed"] = True
+                self._save()
+                return task
+        raise ValueError(f"Task with id {task_id} not found")
+
+    def delete(self, task_id: int) -> Dict:
+        """Delete a task by its id.
+
+        Args:
+            task_id: The id of the task to delete.
+
+        Returns:
+            The deleted task dictionary.
+
+        Raises:
+            ValueError: If no task with the given id exists.
+        """
+        self._load()
+        for task in self._tasks:
+            if task["id"] == task_id:
+                self._tasks.remove(task)
+                self._save()
+                return task
+        raise ValueError(f"Task with id {task_id} not found")
+```
+
+---
+
+## `todo_app/cli.py`
+
+Command‑line interface using `argparse`.
+
+```python
+import argparse
+from .todo_list import TodoList
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Simple To-Do App")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Task title")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument(
+        "--completed", "-c",
+        type=str,
+        choices=["true", "false"],
+        help="Filter by completion status"
+    )
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+    complete_parser.add_argument("id", type=int, help="Task ID to complete")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="Task ID to delete")
+
+    # help is handled automatically, but we also add an explicit "help" command
+    help_parser = subparsers.add_parser("help", help="Show this help message and exit")
+
+    args = parser.parse_args()
+
+    todo = TodoList()
+
+    if args.command == "add":
+        task = todo.add(args.title)
+        print(f"Task added: {task['id']} - {task['title']}")
+
+    elif args.command == "list":
+        completed_flag = None
+        if args.completed:
+            completed_flag = args.completed == "true"
+        tasks = todo.list(completed=completed_flag)
+        if not tasks:
+            print("No tasks found.")
+        else:
+            for task in tasks:
+                status = "[x]" if task["completed"] else "[ ]"
+                print(f"{task['id']}. {status} {task['title']}")
+
+    elif args.command == "complete":
+        try:
+            task = todo.complete(args.id)
+            print(f"Task {args.id} completed: {task['title']}")
+        except ValueError as e:
+            print(f"Error: {e}")
+
+    elif args.command == "delete":
+        try:
+            task = todo.delete(args.id)
+            print(f"Task {args.id} deleted: {task['title']}")
+        except ValueError as e:
+            print(f"Error: {e}")
+
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## `todo_app/__main__.py` (optional)
+
+Allows `python -m todo_app` to work.
+
+```python
+from .cli import main
+
+main()
+```
+
+---
+
+## `tests/test_todo_list.py`
+
+Unit tests using `pytest` and `tmp_path`. Every CRUD operation is tested, including error conditions and the auto‑increment behaviour.
+
+```python
+import json
+import pytest
+from todo_app import TodoList
+
+
+def test_add_task(tmp_path):
+    """Adding a task persists it and gives it the correct attributes."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+
+    task = todo.add("Buy milk")
+
+    assert task["title"] == "Buy milk"
+    assert task["completed"] is False
+    assert task["id"] == 1
+
+    saved = json.loads(db.read_text())
+    assert len(saved) == 1
+    assert saved[0]["title"] == "Buy milk"
+
+
+def test_list_all_tasks(tmp_path):
+    """List returns all tasks when no filter is applied."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("Task 1")
+    todo.add("Task 2")
+
+    tasks = todo.list()
+    assert len(tasks) == 2
+    assert tasks[0]["title"] == "Task 1"
+    assert tasks[1]["title"] == "Task 2"
+
+
+def test_list_filter_by_completion(tmp_path):
+    """Filtering by completed status works correctly."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("Unfinished")
+    todo.add("Done")
+    todo.complete(2)  # "Done" is completed
+
+    pending = todo.list(completed=False)
+    assert len(pending) == 1
+    assert pending[0]["title"] == "Unfinished"
+
+    done = todo.list(completed=True)
+    assert len(done) == 1
+    assert done[0]["title"] == "Done"
+
+
+def test_list_empty(tmp_path):
+    """An empty file returns an empty list."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    assert todo.list() == []
+
+
+def test_complete_task(tmp_path):
+    """Completing a task sets its completed flag to True."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("Task to complete")
+
+    completed = todo.complete(1)
+    assert completed["completed"] is True
+
+    # Verify persistence
+    reloaded = TodoList(str(db)).list()
+    assert reloaded[0]["completed"] is True
+
+
+def test_complete_nonexistent_task(tmp_path):
+    """Completing a non‑existent task raises ValueError."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("Only one")
+
+    with pytest.raises(ValueError, match="Task with id 99 not found"):
+        todo.complete(99)
+
+
+def test_delete_task(tmp_path):
+    """Deleting a task removes it from storage."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("To be deleted")
+
+    deleted = todo.delete(1)
+    assert deleted["title"] == "To be deleted"
+
+    tasks = todo.list()
+    assert len(tasks) == 0
+
+
+def test_delete_nonexistent_task(tmp_path):
+    """Deleting a non‑existent task raises ValueError."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("Keep me")
+
+    with pytest.raises(ValueError, match="Task with id 99 not found"):
+        todo.delete(99)
+
+
+def test_auto_increment_after_delete(tmp_path):
+    """New tasks receive an id higher than any existing id, even after a delete."""
+    db = tmp_path / "tasks.json"
+    todo = TodoList(str(db))
+    todo.add("First")
+    todo.add("Second")
+    todo.delete(1)          # removes task id=1
+    todo.add("Third")       # should get id=3, not 1
+
+    tasks = todo.list()
+    ids = [t["id"] for t in tasks]
+    assert ids == [2, 3]
+```
+
+---
+
+## Running the application
+
+1. **Install** (no extra dependencies needed):  
+   `pip install .` (if you create a `setup.py` or `pyproject.toml`) or simply run the scripts.
+
+2. **Usage** (from the project root):
+   ```bash
+   python -m todo_app add "My first task"
+   python -m todo_app add "Another task"
+   python -m todo_app list
+   python -m todo_app complete 1
+   python -m todo_app list --completed true
+   python -m todo_app delete 2
+   python -m todo_app help
+   ```
+
+3. **Run tests**:
+   ```bash
+   pytest tests/
+   ```
+
+All tasks are stored in a `tasks.json` file in the current working directory (customise via `TodoList(filepath="my_tasks.json")`). The application is fully importable – use `from todo_app import TodoList` in your own code.
+
+Let me know if you need any further adjustments or additions!

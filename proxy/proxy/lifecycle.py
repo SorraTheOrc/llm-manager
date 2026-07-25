@@ -901,8 +901,12 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger
     first_progress_time = None
     try:
         for line in src:
-            dst.write(line)
-            dst.flush()
+            try:
+                dst.write(line)
+                dst.flush()
+            except ValueError:
+                # Destination closed during restart or log rotation — stop writing.
+                break
             # Parse and log prompt processing progress
             try:
                 line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)

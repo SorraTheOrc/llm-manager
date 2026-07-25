@@ -1,0 +1,261 @@
+# Benchmark: slot_count=2  session=0  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 1905  TPS: 8.6
+# ============================================================
+
+Below is a complete implementation of a To‑Do application with `daily` and `week` commands as requested.  
+The application includes existing commands (`add`, `list`, `done`, `remove`), stores tasks in a JSON file, and provides compact summaries for morning or weekly reviews.
+
+All functionality is preserved; tests for `daily` and `week` are included.
+
+## File Structure
+
+- `todo.py` – main CLI application
+- `test_todo.py` – pytest tests for the daily and week commands
+
+---
+
+### `todo.py`
+
+```python
+#!/usr/bin/env python3
+"""
+A simple To-Do CLI application with daily and weekly summary commands.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Optional
+
+
+# -------------------------------------------------------------------
+# Data management
+# -------------------------------------------------------------------
+DATA_FILE = os.path.join(os.path.dirname(__file__) or '.', 'tasks.json')
+
+TASK_KEYS = ['id', 'description', 'due_date', 'done', 'done_at', 'created_at']
+
+
+def load_tasks() -> List[Dict]:
+    """Load tasks from the JSON file."""
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, 'r') as f:
+        try:
+            data = json.load(f)
+            # Ensure all required keys exist
+            tasks = []
+            for item in data:
+                task = {k: item.get(k, None) for k in TASK_KEYS}
+                tasks.append(task)
+            return tasks
+        except json.JSONDecodeError:
+            return []
+
+
+def save_tasks(tasks: List[Dict]) -> None:
+    """Save tasks to the JSON file."""
+    with open(DATA_FILE, 'w') as f:
+        json.dump(tasks, f, indent=2)
+
+
+def next_id(tasks: List[Dict]) -> int:
+    """Generate a new unique task ID."""
+    if not tasks:
+        return 1
+    return max(t['id'] for t in tasks) + 1
+
+
+# -------------------------------------------------------------------
+# Task manipulation
+# -------------------------------------------------------------------
+def add_task(description: str, due_date: Optional[str] = None) -> Dict:
+    """Create a new task and save it."""
+    tasks = load_tasks()
+    new_task = {
+        'id': next_id(tasks),
+        'description': description,
+        'due_date': due_date,          # YYYY-MM-DD or None
+        'done': False,
+        'done_at': None,
+        'created_at': datetime.now().isoformat()
+    }
+    tasks.append(new_task)
+    save_tasks(tasks)
+    return new_task
+
+
+def done_task(task_id: int) -> bool:
+    """Mark a task as done. Returns False if task not found."""
+    tasks = load_tasks()
+    for t in tasks:
+        if t['id'] == task_id:
+            t['done'] = True
+            t['done_at'] = datetime.now().isoformat()
+            save_tasks(tasks)
+            return True
+    return False
+
+
+def remove_task(task_id: int) -> bool:
+    """Remove a task by ID. Returns False if not found."""
+    tasks = load_tasks()
+    new_tasks = [t for t in tasks if t['id'] != task_id]
+    if len(new_tasks) == len(tasks):
+        return False
+    save_tasks(new_tasks)
+    return True
+
+
+def list_tasks(show_all: bool = False) -> List[Dict]:
+    """Return tasks. If show_all is False, only active (not done) tasks."""
+    tasks = load_tasks()
+    if not show_all:
+        tasks = [t for t in tasks if not t['done']]
+    return tasks
+
+
+# -------------------------------------------------------------------
+# Date helpers
+# -------------------------------------------------------------------
+def today_str() -> str:
+    """Return today's date as YYYY-MM-DD."""
+    return date.today().isoformat()
+
+
+def parse_date(s: str) -> Optional[date]:
+    """Try to parse a YYYY-MM-DD string; return None on failure."""
+    try:
+        return datetime.strptime(s, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return None
+
+
+def date_from_iso(iso: str) -> Optional[date]:
+    """Extract date from an ISO datetime string."""
+    if iso is None:
+        return None
+    try:
+        return datetime.fromisoformat(iso).date()
+    except (ValueError, TypeError):
+        return None
+
+
+# -------------------------------------------------------------------
+# Summary functions (daily and week)
+# -------------------------------------------------------------------
+def daily_summary() -> Dict:
+    """
+    Return a dict with:
+      - completed_today: tasks done today
+      - overdue: undone tasks with due_date < today
+      - due_today: undone tasks with due_date == today
+    """
+    tasks = load_tasks()
+    today = date.today()
+    today_iso = today_str()
+
+    completed_today = []
+    overdue = []
+    due_today = []
+
+    for t in tasks:
+        due = parse_date(t['due_date']) if t['due_date'] else None
+        completed = t['done']
+        done_at_date = date_from_iso(t['done_at']) if t['done_at'] else None
+
+        if completed and done_at_date == today:
+            completed_today.append(t)
+        elif completed:
+            continue  # older done tasks are ignored
+        else:
+            if due is None:
+                continue  # no due date → not shown in daily/week
+            if due < today:
+                overdue.append(t)
+            elif due == today:
+                due_today.append(t)
+
+    return {
+        'completed_today': completed_today,
+        'overdue': overdue,
+        'due_today': due_today,
+        'today_iso': today_iso
+    }
+
+
+def week_summary() -> Dict:
+    """
+    Return a dict with:
+      - completed_today: tasks done today
+      - overdue: undone tasks with due_date < today
+      - upcoming: list of dicts { 'date': str, 'tasks': [...] } for today + next 6 days
+                  (only undone tasks due exactly on that date)
+    """
+    tasks = load_tasks()
+    today = date.today()
+    today_iso = today_str()
+
+    completed_today = []
+    overdue = []
+    upcoming = []
+
+    for t in tasks:
+        due = parse_date(t['due_date']) if t['due_date'] else None
+        completed = t['done']
+        done_at_date = date_from_iso(t['done_at']) if t['done_at'] else None
+
+        if completed and done_at_date == today:
+            completed_today.append(t)
+        elif completed:
+            continue
+        else:
+            if due is None:
+                continue
+            if due < today:
+                overdue.append(t)
+            else:
+                # check if due falls within the next 7 days (today included)
+                if today <= due <= today + timedelta(days=6):
+                    # add to the appropriate day bucket
+                    day_str = due.isoformat()
+                    existing = next((d for d in upcoming if d['date'] == day_str), None)
+                    if existing:
+                        existing['tasks'].append(t)
+                    else:
+                        upcoming.append({'date': day_str, 'tasks': [t]})
+
+    # Sort upcoming by date
+    upcoming.sort(key=lambda x: x['date'])
+
+    return {
+        'completed_today': completed_today,
+        'overdue': overdue,
+        'upcoming': upcoming,
+        'today_iso': today_iso
+    }
+
+
+# -------------------------------------------------------------------
+# Formatting helpers
+# -------------------------------------------------------------------
+def format_date(iso_date: str) -> str:
+    """Convert YYYY-MM-DD to a human‑readable day name (short) + date."""
+    d = parse_date(iso_date)
+    if d is None:
+        return iso_date
+    day_name = d.strftime('%a')
+    return f"{day_name} {iso_date}"
+
+
+def format_due(task: Dict) -> str:
+    """Return a string representation of the due date if present."""
+    if task['due_date']:
+        return f" (due {task

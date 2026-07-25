@@ -1,0 +1,675 @@
+# Benchmark: slot_count=2  session=4  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 76s  Tokens: 4218  TPS: 65.2
+# ============================================================
+
+Below is the complete implementation of a CLI-based To‑Do application with full CRUD operations, JSON storage, and unit tests. The application is structured as an importable Python package.
+
+## Project Structure
+
+```
+todo/
+    __init__.py    # CLI entry point
+    core.py        # Core CRUD functions and storage
+tests/
+    test_todo.py   # Unit tests for all CRUD operations
+```
+
+---
+
+## `todo/core.py` – Core Operations
+
+```python
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import TypedDict
+
+
+class Task(TypedDict):
+    """Representation of a single to-do task."""
+    id: int
+    title: str
+    completed: bool
+
+
+def load_tasks(path: str) -> list[Task]:
+    """Load tasks from a JSON file.
+
+    Args:
+        path: Path to the JSON storage file.
+
+    Returns:
+        A list of tasks. Returns an empty list if the file does not exist
+        or contains invalid JSON.
+    """
+    file = Path(path)
+    if not file.exists():
+        return []
+    try:
+        with file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Ensure we always return a list of dicts even if the file is malformed
+        if not isinstance(data, list):
+            return []
+        return [Task(id=t["id"], title=t["title"], completed=t.get("completed", False)) for t in data]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return []
+
+
+def save_tasks(tasks: list[Task], path: str) -> None:
+    """Save tasks to a JSON file.
+
+    Args:
+        tasks: List of tasks to save.
+        path: Path to the JSON storage file.
+    """
+    with Path(path).open("w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=2)
+
+
+def add_task(tasks: list[Task], title: str) -> list[Task]:
+    """Add a new task to the list.
+
+    Args:
+        tasks: Current list of tasks.
+        title: Title of the new task.
+
+    Returns:
+        The updated list of tasks.
+    """
+    if not title or not title.strip():
+        raise ValueError("Task title must not be empty.")
+
+    new_id = _next_id(tasks)
+    task = Task(id=new_id, title=title.strip(), completed=False)
+    tasks.append(task)
+    return tasks
+
+
+def list_tasks(tasks: list[Task]) -> list[Task]:
+    """Return all tasks (no filtering yet).
+
+    Args:
+        tasks: Current list of tasks.
+
+    Returns:
+        The same list of tasks.
+    """
+    return tasks
+
+
+def complete_task(tasks: list[Task], task_id: int) -> list[Task]:
+    """Mark a task as completed by its ID.
+
+    Args:
+        tasks: Current list of tasks.
+        task_id: ID of the task to complete.
+
+    Returns:
+        The updated list of tasks.
+
+    Raises:
+        ValueError: If no task with the given ID exists.
+    """
+    for task in tasks:
+        if task["id"] == task_id:
+            task["completed"] = True
+            return tasks
+    raise ValueError(f"Task with ID {task_id} not found.")
+
+
+def delete_task(tasks: list[Task], task_id: int) -> list[Task]:
+    """Delete a task by its ID.
+
+    Args:
+        tasks: Current list of tasks.
+        task_id: ID of the task to delete.
+
+    Returns:
+        The updated list of tasks.
+
+    Raises:
+        ValueError: If no task with the given ID exists.
+    """
+    for i, task in enumerate(tasks):
+        if task["id"] == task_id:
+            del tasks[i]
+            return tasks
+    raise ValueError(f"Task with ID {task_id} not found.")
+
+
+def _next_id(tasks: list[Task]) -> int:
+    """Generate the next free ID based on the existing tasks."""
+    if not tasks:
+        return 1
+    return max(t["id"] for t in tasks) + 1
+```
+
+---
+
+## `todo/__init__.py` – CLI Entry Point
+
+```python
+#!/usr/bin/env python3
+"""CLI-based To-Do application with JSON storage."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from .core import (
+    Task,
+    add_task,
+    complete_task,
+    delete_task,
+    list_tasks,
+    load_tasks,
+    save_t```python
+#!/usr/bin/env python3
+"""
+todo.py — A CLI-based To-Do application with full CRUD operations.
+
+Tasks are stored as a JSON array in a file (default: tasks.json).
+Each task has:
+    - id (int, auto-increment)
+    - title (str)
+    - completed (bool)
+
+Usage:
+    python todo.py add TITLE         Add a new task.
+    python todo.py list              List all tasks.
+    python todo.py complete ID        Mark a task as completed.
+    python todo.py delete ID          Delete a task.
+    python todo.py help               Show this help message.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Constants & Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_STORAGE_FILE = "tasks.json"
+
+
+# ---------------------------------------------------------------------------
+# Storage helpers
+# ---------------------------------------------------------------------------
+
+def load_tasks(filepath: str) -> List[Dict]:
+    """Load tasks from a JSON file.
+
+    Args:
+        filepath: Path to the JSON file.
+
+    Returns:
+        List of task dictionaries. If the file doesn't exist or is empty,
+        an empty list is returned.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+def save_tasks(tasks: List[Dict], filepath: str) -> None:
+    """Save tasks to a JSON file.
+
+    Args:
+        tasks: List of task dictionaries.
+        filepath: Path to the JSON file.
+    """
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# CRUD operations
+# ---------------------------------------------------------------------------
+
+def _next_id(tasks: List[Dict]) -> int:
+    """Return the next auto-increment ID based on existing tasks."""
+    if not tasks:
+        return 1
+    return max(task["id"] for task in tasks) + 1
+
+
+def add_task(title: str, filepath: str) -> Dict:
+    """Add a new task with the given title.
+
+    Args:
+        title: Title of the new task.
+        filepath: Path to the JSON file.
+
+    Returns:
+        The newly created task dictionary.
+
+    Raises:
+        ValueError: If title is empty.
+    """
+    if not title or not title.strip():
+        raise ValueError("Task title cannot be empty.")
+
+    tasks = load_tasks(filepath)
+    task = {
+        "id": _next_id(tasks),
+        "title": title.strip(),
+        "completed": False,
+    }
+    tasks.append(task)
+    save_tasks(tasks, filepath)
+    return task
+
+
+def list_tasks(filepath: str) -> List[Dict]:
+    """Return all tasks from the file.
+
+    Args:
+        filepath: Path to the JSON file.
+
+    Returns:
+        List of task dictionaries.
+    """
+    return load_tasks(filepath)
+
+
+def complete_task(task_id: int, filepath: str) -> Optional[Dict]:
+    """Mark a task as completed by its ID.
+
+    Args:
+        task_id: ID of the task to complete.
+        filepath: Path to the JSON file.
+
+    Returns:
+        The updated task dictionary if found, or None if not found.
+    """
+    tasks = load_tasks(filepath)
+    for task in tasks:
+        if task["id"] == task_id:
+            task["completed"] = True
+            save_tasks(tasks, filepath)
+            return task
+    return None
+
+
+def delete_task(task_id: int, filepath: str) -> bool:
+    """Delete a task by its ID.
+
+    Args:
+        task_id: ID of the task to delete.
+        filepath: Path to the JSON file.
+
+    Returns:
+        True if the task was deleted, False if not found.
+    """
+    tasks = load_tasks(filepath)
+    for i, task in enumerate(tasks):
+        if task["id"] == task_id:
+            del tasks[i]
+            save_tasks(tasks, filepath)
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def print_help() -> None:
+    """Print usage instructions."""
+    print("Usage:")
+    print("  python todo.py add TITLE         Add a new task.")
+    print("  python todo.py list              List all tasks.")
+    print("  python todo.py complete ID        Mark a task as completed.")
+    print("  python todo.py delete ID          Delete a task.")
+    print("  python todo.py help               Show this help message.")
+
+
+def print_task(task: Dict) -> None:
+    """Print a single task in a readable format."""
+    status = "[✓]" if task["completed"] else "[ ]"
+    print(f"{task['id']}. {status} {task['title']}")
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for the CLI."""
+    parser = argparse.ArgumentParser(
+        description="Simple To-Do Application",
+        add_help=False,  # we handle help manually
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Title of the task")
+
+    # list
+    subparsers.add_parser("list", help="List all tasks")
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+    complete_parser.add_argument("id", type=int, help="ID of the task to complete")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="ID of the task to delete")
+
+    # help
+    subparsers.add_parser("help", help="Show help message")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Run the CLI application.
+
+    Args:
+        argv: Command-line arguments (defaults to sys.argv[1:]).
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Support running without arguments -> show help
+    if not argv:
+        print_help()
+        return 0
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Determine storage file (default or from environment)
+    filepath = os.environ.get("TODO_FILE", DEFAULT_STORAGE_FILE)
+
+    if args.command == "add":
+        try:
+            task = add_task(args.title, filepath)
+            print("Task added:")
+            print_task(task)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    elif args.command == "list":
+        tasks = list_tasks(filepath)
+        if not tasks:
+            print("No tasks found.")
+        else:
+            print("Tasks:")
+            for task in tasks:
+                print_task(task)
+
+    elif args.command == "complete":
+        task = complete_task(args.id, filepath)
+        if task:
+            print("Task completed:")
+            print_task(task)
+        else:
+            print(f"Error: No task with ID {args.id}.", file=sys.stderr)
+            return 1
+
+    elif args.command == "delete":
+        if delete_task(args.id, filepath):
+            print(f"Task {args.id} deleted.")
+        else:
+            print(f"Error: No task with ID {args.id}.", file=sys.stderr)
+            return 1
+
+    elif args.command == "help":
+        print_help()
+
+    else:
+        # This should not happen, but just in case
+        print("Unknown command. Use 'help' for usage.", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```python
+# test_todo.py — Unit tests for all CRUD operations.
+import json
+import pytest
+from pathlib import Path
+from todo import (
+    load_tasks,
+    save_tasks,
+    add_task,
+    list_tasks,
+    complete_task,
+    delete_task,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def temp_file(tmp_path: Path) -> str:
+    """Provide a temporary file path for the JSON storage."""
+    return str(tmp_path / "tasks.json")
+
+
+@pytest.fixture
+def sample_tasks() -> list[dict]:
+    """Return a list of two sample tasks."""
+    return [
+        {"id": 1, "title": "Buy milk", "completed": False},
+        {"id": 2, "title": "Read book", "completed": True},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Tests for storage helpers
+# ---------------------------------------------------------------------------
+
+class TestStorage:
+    def test_load_tasks_nonexistent(self, temp_file):
+        """Loading from a non‑existent file returns an empty list."""
+        assert load_tasks(temp_file) == []
+
+    def test_load_tasks_empty_file(self, temp_file):
+        """Loading from an empty file returns an empty list."""
+        Path(temp_file).write_text("", encoding="utf-8")
+        assert load_tasks(temp_file) == []
+
+    def test_load_tasks_invalid_json(self, temp_file):
+        """Loading from a file with invalid JSON returns an empty list."""
+        Path(temp_file).write_text("not json", encoding="utf-8")
+        assert load_tasks(temp_file) == []
+
+    def test_save_and_load(self, temp_file, sample_tasks):
+        """Saving then loading returns the same tasks."""
+        save_tasks(sample_tasks, temp_file)
+        assert load_tasks(temp_file) == sample_tasks
+
+
+# ---------------------------------------------------------------------------
+# Tests for CRUD operations
+# ---------------------------------------------------------------------------
+
+class TestAddTask:
+    def test_add_task(self, temp_file):
+        """Adding a task writes it to the file with auto‑incremented ID."""
+        t1 = add_task("Test task", temp_file)
+        assert t1["id"] == 1
+        assert t1["title"] == "Test task"
+        assert t1["completed"] is False
+        # Verify persisted
+        tasks = load_tasks(temp_file)
+        assert len(tasks) == 1
+        assert tasks[0] == t1
+
+    def test_add_multiple_increments_id(self, temp_file):
+        """IDs auto‑increment when adding multiple tasks."""
+        t1 = add_task("First", temp_file)
+        t2 = add_task("Second", temp_file)
+        t3 = add_task("Third", temp_file)
+        assert t1["id"] == 1
+        assert t2["id"] == 2
+        assert t3["id"] == 3
+        assert len(load_tasks(temp_file)) == 3
+
+    def test_add_empty_title_raises(self, temp_file):
+        """Adding a task with an empty title raises ValueError."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            add_task("", temp_file)
+        with pytest.raises(ValueError, match="cannot be empty"):
+            add_task("   ", temp_file)
+
+    def test_add_preserves_existing(self, temp_file, sample_tasks):
+        """Adding a task does not overwrite existing tasks."""
+        save_tasks(sample_tasks, temp_file)
+        add_task("New task", temp_file)
+        tasks = load_tasks(temp_file)
+        assert len(tasks) == 3
+        assert tasks[2]["title"] == "New task"
+        assert tasks[2]["id"] == 3
+
+
+class TestListTasks:
+    def test_list_empty(self, temp_file):
+        """Listing with no tasks returns an empty list."""
+        assert list_tasks(temp_file) == []
+
+    def test_list_returns_correct_tasks(self, temp_file, sample_tasks):
+        """Listing returns all saved tasks."""
+        save_tasks(sample_tasks, temp_file)
+        tasks = list_tasks(temp_file)
+        assert tasks == sample_tasks
+
+    def test_list_does_not_mutate(self, temp_file, sample_tasks):
+        """Listing does not modify the task list."""
+        save_tasks(sample_tasks, temp_file)
+        before = load_tasks(temp_file).copy()
+        _ = list_tasks(temp_file)
+        assert load_tasks(temp_file) == before
+
+
+class TestCompleteTask:
+    def test_complete_existing(self, temp_file, sample_tasks):
+        """Completing an existing task sets completed to True."""
+        save_tasks(sample_tasks, temp_file)
+        updated = complete_task(1, temp_file)
+        assert updated is not None
+        assert updated["completed"] is True
+        # Verify file
+        tasks = load_tasks(temp_file)
+        assert tasks[0]["completed"] is True
+
+    def test_complete_nonexistent_returns_none(self, temp_file):
+        """Completing a non‑existing ID returns None and does nothing."""
+        result = complete_task(999, temp_file)
+        assert result is None
+        assert load_tasks(temp_file) == []
+
+    def test_complete_already_completed(self, temp_file, sample_tasks):
+        """Completing an already completed task remains completed."""
+        save_tasks(sample_tasks, temp_file)
+        complete_task(2, temp_file)
+        tasks = load_tasks(temp_file)
+        assert tasks[1]["completed"] is True
+
+    def test_complete_only_one_task(self, temp_file, sample_tasks):
+        """Only the requested task is completed."""
+        save_tasks(sample_tasks, temp_file)
+        complete_task(1, temp_file)
+        tasks = load_tasks(temp_file)
+        assert tasks[0]["completed"] is True
+        assert tasks[1]["completed"] is True  # already True, unaffected
+
+
+class TestDeleteTask:
+    def test_delete_existing(self, temp_file, sample_tasks):
+        """Deleting an existing task removes it from the file."""
+        save_tasks(sample_tasks, temp_file)
+        deleted = delete_task(1, temp_file)
+        assert deleted is True
+        tasks = load_tasks(temp_file)
+        assert len(tasks) == 1
+        assert tasks[0]["id"] == 2
+
+    def test_delete_nonexistent_returns_false(self, temp_file):
+        """Deleting a non‑existing ID returns False and does nothing."""
+        result = delete_task(999, temp_file)
+        assert result is False
+        assert load_tasks(temp_file) == []
+
+    def test_delete_last_task(self, temp_file, sample_tasks):
+        """Deleting all tasks leaves an empty file."""
+        save_tasks(sample_tasks, temp_file)
+        delete_task(1, temp_file)
+        delete_task(2, temp_file)
+        assert load_tasks(temp_file) == []
+
+    def test_delete_does_not_affect_other_tasks(self, temp_file, sample_tasks):
+        """Only the specified task is removed."""
+        save_tasks(sample_tasks, temp_file)
+        delete_task(1, temp_file)
+        tasks = load_tasks(temp_file)
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "Read book"
+
+
+# ---------------------------------------------------------------------------
+# Integration test
+# ---------------------------------------------------------------------------
+
+class TestIntegration:
+    def test_full_workflow(self, temp_file):
+        """Simulate a complete user workflow."""
+        # add
+        add_task("Task 1", temp_file)
+        add_task("Task 2", temp_file)
+        add_task("Task 3", temp_file)
+        tasks = list_tasks(temp_file)
+        assert len(tasks) == 3
+
+        # complete
+        complete_task(2, temp_file)
+        tasks = list_tasks(temp_file)
+        assert tasks[1]["completed"] is True
+
+        # delete
+        delete_task(1, temp_file)
+        tasks = list_tasks(temp_file)
+        assert [t["id"] for t in tasks] == [2, 3]
+        assert tasks[0]["completed"] is True  # only task 2 was completed
+
+        # remaining
+        assert len(tasks) == 2
+        assert tasks[0]["title"] == "Task 2"
+        assert tasks[1]["title"] == "Task 3"
+
+```

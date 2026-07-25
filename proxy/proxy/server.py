@@ -845,8 +845,45 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
 async def view_logs(request: Request):
     return await _ui_view_logs(request)
 
+def _drain_check():
+    """Return a 503 response if the proxy is in drain mode, or None."""
+    global draining, slot_scheduler
+    if draining is True:
+        drain_retry_after = 15
+        if slot_scheduler is not None and hasattr(slot_scheduler, '_config'):
+            drain_retry_after = max(15, slot_scheduler._config.drain_minutes * 60)
+        logger.info(
+            "drain_active: refusing new request, retry_after=%ds",
+            drain_retry_after,
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "draining",
+                    "message": (
+                        "Draining workloads for scheduled slot-count change "
+                        "\u2014 please retry shortly"
+                    ),
+                },
+                "status": 503,
+                "retry_after": drain_retry_after,
+            },
+            headers={
+                "Retry-After": str(drain_retry_after),
+                "Cache-Control": "no-store",
+            },
+        )
+    return None
+
+
 @app.post("/v1/embeddings")
 async def create_embeddings(request: Request):
+    drain_resp = _drain_check()
+    if drain_resp:
+        return drain_resp
     return await _ui_create_embeddings(request)
 
 @app.api_route(
@@ -854,6 +891,9 @@ async def create_embeddings(request: Request):
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
 )
 async def proxy_openai_api(request: Request, path: str):
+    drain_resp = _drain_check()
+    if drain_resp:
+        return drain_resp
     return await _ui_proxy_openai_api(request, path)
 
 @app.post("/admin/switch-model/{model_name}")
@@ -1003,6 +1043,7 @@ from .lifecycle import (  # noqa: E402, F401
     schedule_background_load,
     start_llama_server,
     stop_llama_server,
+    stop_tts_server,
     wait_for_llama_server,
 )
 from .observability import (  # noqa: E402, F401

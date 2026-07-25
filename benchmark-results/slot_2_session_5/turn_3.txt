@@ -1,0 +1,298 @@
+# Benchmark: slot_count=2  session=5  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 348s  Tokens: 2398  TPS: 29.1
+# ============================================================
+
+Here's the complete implementation with the new `daily` and `week` commands, plus comprehensive tests. The solution maintains all existing functionality (`add`, `list`, `done`) and uses a simple JSON file for persistence.
+
+### `todo.py`
+```python
+import sys
+import json
+import os
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
+
+DATA_FILE = "todos.json"
+
+def load_todos() -> List[Dict[str, Any]]:
+    """Load tasks from JSON file with backward compatibility."""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            todos = json.load(f)
+            for t in todos:
+                t.setdefault("due", None)
+                t.setdefault("completed_date", None)
+            return todos
+    return []
+
+def save_todos(todos: List[Dict[str, Any]]) -> None:
+    """Persist tasks to JSON file."""
+    with open(DATA_FILE, "w") as f:
+        json.dump(todos, f, indent=2)
+
+def add_todo(args: List[str]) -> None:
+    """Add a new task with optional due date."""
+    if not args:
+        print("Usage: todo add <task description> [-d YYYY-MM-DD]")
+        return
+        
+    desc = []
+    due_date = None
+    i = 0
+    while i < len(args):
+        if args[i] == "-d" and i + 1 < len(args):
+            due_date = args[i+1]
+            try:
+                datetime.strptime(due_date, "%Y-%m-%d")
+            except ValueError:
+                print("Invalid date format. Use YYYY-MM-DD")
+                return
+            i += 2
+        else:
+            desc.append(args[i])
+            i += 1
+    
+    desc_text = " ".join(desc)
+    todos = load_todos()
+    new_id = max([t["id"] for t in todos], default=0) + 1
+    todos.append({"id": new_id, "desc": desc_text, "done": False, "due": due_date, "completed_date": None})
+    save_todos(todos)
+    print(f"Added task #{new_id}: {desc_text}" + (f" (due: {due_date})" if due_date else ""))
+
+def list_todos(args: List[str]) -> None:
+    """List all tasks."""
+    todos = load_todos()
+    if not todos:
+        print("No tasks.")
+        return
+    for t in todos:
+        status = "✅" if t["done"] else "⬜"
+        due_str = f" (due: {t['due']})" if t['due'] else ""
+        comp_str = f" (done: {t['completed_date']})" if t['completed_date'] else ""
+        print(f"{status} #{t['id']} {t['desc']}{due_str}{comp_str}")
+
+def done_todo(args: List[str]) -> None:
+    """Mark a task as completed."""
+    if not args:
+        print("Usage: todo done <id>")
+        return
+    try:
+        tid = int(args[0])
+    except ValueError:
+        print("Invalid task ID.")
+        return
+        
+    todos = load_todos()
+    for t in todos:
+        if t["id"] == tid:
+            t["done"] = True
+            t["completed_date"] = datetime.now().strftime("%Y-%m-%d")
+            save_todos(todos)
+            print(f"Marked task #{tid} as done.")
+            return
+    print(f"Task #{tid} not found.")
+
+def daily_view() -> None:
+    """Show today's tasks summary: due, overdue, and completed today."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    todos = load_todos()
+    
+    due_today = [t for t in todos if t.get("due") == today and not t["done"]]
+    overdue = [t for t in todos if t.get("due") and t["due"] < today and not t["done"]]
+    completed_today = [t for t in todos if t["done"] and t.get("completed_date") == today]
+    
+    print(f"📅 Daily: {today}")
+    print(f"Due today: {len(due_today)} | Overdue: {len(overdue)} | Completed today: {len(completed_today)}")
+    print("-" * 40)
+    
+    if due_today:
+        for t in due_today:
+            print(f"  ⬜ #{t['id']} {t['desc']}")
+    if overdue:
+        for t in overdue:
+            print(f"  🔴 #{t['id']} {t['desc']} (due {t['due']})")
+    if completed_today:
+        for t in completed_today:
+            print(f"  ✅ #{t['id']} {t['desc']}")
+    if not due_today and not overdue and not completed_today:
+        print("No tasks for today.")
+    print()
+
+def week_view() -> None:
+    """Show weekly overview (today + next 6 days)."""
+    today = datetime.now()
+    week_dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    todos = load_todos()
+    
+    print(f"📅 Weekly: {today.strftime('%Y-%m-%d')} to {(today + timedelta(days=6)).strftime('%Y-%m-%d')}")
+    print("-" * 40)
+    
+    total_due = 0
+    for date in week_dates:
+        due = [t for t in todos if t.get("due") == date and not t["done"]]
+        if due:
+            total_due += len(due)
+            print(f"{date}: {len(due)} task(s)")
+            for t in due:
+                print(f"  ⬜ #{t['id']} {t['desc']}")
+            print()
+            
+    if total_due == 0:
+        print("No tasks due this week.")
+    print()
+
+def main() -> None:
+    """CLI entry point."""
+    if len(sys.argv) < 2:
+        print("Usage: todo <command> [args]")
+        print("Commands: add, list, done, daily, week")
+        return
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "add":
+        add_todo(args)
+    elif cmd == "list":
+        list_todos(args)
+    elif cmd == "done":
+        done_todo(args)
+    elif cmd == "daily":
+        daily_view()
+    elif cmd == "week":
+        week_view()
+    else:
+        print(f"Unknown command: {cmd}")
+
+if __name__ == "__main__":
+    main()
+```
+
+### `test_todo.py`
+```python
+import pytest
+import sys
+import io
+from datetime import datetime, timedelta
+from unittest.mock import patch
+
+import todo
+
+@pytest.fixture
+def setup_todos(tmp_path):
+    """Provide a temporary JSON file for each test."""
+    temp_file = tmp_path / "todos.json"
+    with patch.object(todo, 'DATA_FILE', temp_file):
+        yield temp_file
+
+def test_daily_view_due_today(setup_todos):
+    today = datetime.now().strftime('%Y-%m-%d')
+    with patch.object(todo, 'DATA_FILE', setup_todos):
+        with patch.object(sys, 'argv', ['todo', 'add', 'Buy milk', '-d', today]):
+            todo.main()
+            
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            with patch.object(sys, 'argv', ['todo', 'daily']):
+                todo.main()
+        
+        output = captured.getvalue()
+        assert "Buy milk" in output
+        assert "Due today: 1" in output
+
+def test_daily_view_overdue(setup_todos):
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    with patch.object(todo, 'DATA_FILE', setup_todos):
+        with patch.object(sys, 'argv', ['todo', 'add', 'Pay rent', '-d', yesterday]):
+            todo.main()
+            
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            with patch.object(sys, 'argv', ['todo', 'daily']):
+                todo.main()
+        
+        output = captured.getvalue()
+        assert "Pay rent" in output
+        assert "Overdue: 1" in output
+
+def test_daily_view_completed_today(setup_todos):
+    with patch.object(todo, 'DATA_FILE', setup_todos):
+        with patch.object(sys, 'argv', ['todo', 'add', 'Review code']):
+            todo.main()
+        with patch.object(sys, 'argv', ['todo', 'done', '1']):
+            todo.main()
+            
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            with patch.object(sys, 'argv', ['todo', 'daily']):
+                todo.main()
+        
+        output = captured.getvalue()
+        assert "Review code" in output
+        assert "Completed today: 1" in output
+
+def test_week_view(setup_todos):
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+    with patch.object(todo, 'DATA_FILE', setup_todos):
+        with patch.object(sys, 'argv', ['todo', 'add', 'Team meeting', '-d', tomorrow]):
+            todo.main()
+            
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            with patch.object(sys, 'argv', ['todo', 'week']):
+                todo.main()
+        
+        output = captured.getvalue()
+        assert "Team meeting" in output
+        assert tomorrow in output
+
+def test_no_due_date_not_shown(setup_todos):
+    with patch.object(todo, 'DATA_FILE', setup_todos):
+        with patch.object(sys, 'argv', ['todo', 'add', 'Random thought']):
+            todo.main()
+            
+        # Test daily
+        captured_daily = io.StringIO()
+        with patch('sys.stdout', captured_daily):
+            with patch.object(sys, 'argv', ['todo', 'daily']):
+                todo.main()
+        output_daily = captured_daily.getvalue()
+        assert "Random thought" not in output_daily
+        assert "No tasks for today." in output_daily
+        
+        # Test week
+        captured_week = io.StringIO()
+        with patch('sys.stdout', captured_week):
+            with patch.object(sys, 'argv', ['todo', 'week']):
+                todo.main()
+        output_week = captured_week.getvalue()
+        assert "Random thought" not in output_week
+        assert "No tasks due this week." in output_week
+```
+
+### Usage & Testing
+1. Run commands:
+   ```bash
+   python todo.py add Buy groceries -d 2023-10-25
+   python todo.py add Pay rent -d 2023-10-24
+   python todo.py daily
+   python todo.py week
+   ```
+2. Run tests:
+   ```bash
+   pip install pytest
+   pytest test_todo.py -v
+   ```
+
+### Key Features Implemented
+- ✅ `todo daily` shows compact morning-ready summary with counts
+- ✅ `todo week` shows 7-day rolling overview grouped by date
+- ✅ Tasks without due dates are explicitly excluded from daily/week views
+- ✅ Backward compatible: handles missing `due` or `completed_date` fields gracefully
+- ✅ Full test coverage for both new commands plus edge cases
+- ✅ All original commands (`add`, `list`, `done`) preserved and fully functional

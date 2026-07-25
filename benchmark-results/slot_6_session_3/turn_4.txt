@@ -1,0 +1,445 @@
+# Benchmark: slot_count=6  session=3  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 738s  Tokens: 3821  TPS: 24.9
+# ============================================================
+
+Here's a complete, production-ready implementation that adds a lightweight web UI to your To-Do application while keeping the CLI fully functional. The code is structured as a clean Python package.
+
+### 📁 Project Structure
+```
+todo_app/
+├── __init__.py
+├── core.py          # Data models & business logic
+├── cli.py           # CLI commands
+├── web.py           # FastAPI app, routes & HTML templates
+└── main.py          # Entry point
+tests/
+└── test_web.py      # Web route tests
+```
+
+### 1. `core.py` (Storage & Business Logic)
+```python
+import json
+import os
+import html
+from datetime import date
+from typing import List, Optional
+from uuid import uuid4
+
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.json")
+
+def _load() -> List[dict]:
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def _save(tasks: List[dict]):
+    with open(DATA_FILE, "w") as f:
+        json.dump(tasks, f, indent=2)
+
+def add_task(title: str, due_date: Optional[str] = None) -> dict:
+    tasks = _load()
+    task = {
+        "id": str(uuid4())[:8],
+        "title": html.escape(title),
+        "completed": False,
+        "created_at": date.today().isoformat(),
+        "due_at": due_date
+    }
+    tasks.append(task)
+    _save(tasks)
+    return task
+
+def get_tasks(filter_status: Optional[str] = None) -> List[dict]:
+    tasks = _load()
+    if filter_status == "completed":
+        return [t for t in tasks if t["completed"]]
+    if filter_status == "pending":
+        return [t for t in tasks if not t["completed"]]
+    return tasks
+
+def toggle_task(task_id: str) -> Optional[dict]:
+    tasks = _load()
+    for t in tasks:
+        if t["id"] == task_id:
+            t["completed"] = not t["completed"]
+            _save(tasks)
+            return t
+    return None
+
+def delete_task(task_id: str) -> bool:
+    tasks = _load()
+    original_len = len(tasks)
+    tasks = [t for t in tasks if t["id"] != task_id]
+    if len(tasks) < original_len:
+        _save(tasks)
+        return True
+    return False
+
+def get_daily_summary() -> dict:
+    today = date.today().isoformat()
+    tasks = _load()
+    total = len(tasks)
+    completed = sum(1 for t in tasks if t["completed"])
+    pending = total - completed
+    due_today = [t for t in tasks if t.get("due_at") == today and not t["completed"]]
+    return {
+        "date": today,
+        "total": total,
+        "completed": completed,
+        "pending": pending,
+        "due_today": due_today
+    }
+```
+
+### 2. `cli.py` (Command Line Interface)
+```python
+import argparse
+import sys
+from .core import add_task, get_tasks, toggle_task, delete_task, get_daily_summary
+
+def main():
+    parser = argparse.ArgumentParser(description="To-Do Application CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_add = subparsers.add_parser("add", help="Add a new task")
+    p_add.add_argument("title", help="Task title")
+    p_add.add_argument("--due", help="Due date (YYYY-MM-DD)", default=None)
+
+    p_list = subparsers.add_parser("list", help="List tasks")
+    p_list.add_argument("--filter", choices=["pending", "completed"], default=None)
+
+    p_toggle = subparsers.add_parser("toggle", help="Toggle task completion")
+    p_toggle.add_argument("id", help="Task ID")
+
+    p_delete = subparsers.add_parser("delete", help="Delete a task")
+    p_delete.add_argument("id", help="Task ID")
+
+    subparsers.add_parser("daily", help="Daily summary")
+
+    p_serve = subparsers.add_parser("serve", help="Start web server")
+    p_serve.add_argument("--port", type=int, default=8080)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    if args.command == "add":
+        task = add_task(args.title, args.due)
+        print(f"Added task: {task['id']} - {task['title']}")
+    elif args.command == "list":
+        tasks = get_tasks(args.filter)
+        print(f"{'ID':<8} | {'Title':<30} | {'Status':<10} | {'Due'}")
+        print("-" * 60)
+        for t in tasks:
+            status = "Done" if t["completed"] else "Pending"
+            print(f"{t['id']:<8} | {t['title']:<30} | {status:<10} | {t.get('due_at', 'N/A')}")
+    elif args.command == "toggle":
+        task = toggle_task(args.id)
+        if task:
+            print(f"Toggled: {task['id']} - {'Done' if task['completed'] else 'Pending'}")
+        else:
+            print("Task not found.")
+    elif args.command == "delete":
+        if delete_task(args.id):
+            print(f"Deleted: {args.id}")
+        else:
+            print("Task not found.")
+    elif args.command == "daily":
+        summary = get_daily_summary()
+        print(f"Daily Summary for {summary['date']}")
+        print(f"Total: {summary['total']}, Completed: {summary['completed']}, Pending: {summary['pending']}")
+        if summary['due_today']:
+            print("Due today:")
+            for t in summary['due_today']:
+                print(f"  - {t['title']} ({t['id']})")
+    elif args.command == "serve":
+        from .web import run_server
+        run_server(port=args.port)
+```
+
+### 3. `web.py` (FastAPI App & HTML UI)
+```python
+from fastapi import FastAPI, Form, Query, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from .core import add_task, get_tasks, toggle_task, delete_task, get_daily_summary
+import uvicorn
+import signal
+import sys
+
+app = FastAPI(title="To-Do Web UI")
+
+@app.get("/", response_class=HTMLResponse)
+def index(filter: str = Query(None)):
+    tasks = get_tasks(filter)
+    summary = get_daily_summary()
+    due_count = len(summary["due_today"])
+
+    rows = ""
+    for t in tasks:
+        css_class = "completed" if t["completed"] else ""
+        status = "Done" if t["completed"] else "Pending"
+        rows += f"""
+        <tr class="{css_class}">
+            <td>{t['id']}</td>
+            <td>{t['title']}</td>
+            <td>{status}</td>
+            <td>
+                <form action="/toggle/{t['id']}" method="POST" style="display:inline;">
+                    <button type="submit" class="btn btn-toggle">Toggle</button>
+                </form>
+                <form action="/delete/{t['id']}" method="POST" style="display:inline;">
+                    <button type="submit" class="btn btn-delete">Delete</button>
+                </form>
+            </td>
+        </tr>"""
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>To-Do App</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; background: #f5f7fa; color: #333; }}
+            h1 {{ text-align: center; color: #2c3e50; }}
+            .controls {{ margin: 1rem 0; display: flex; gap: 0.5rem; justify-content: center; }}
+            table {{ width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #eee; }}
+            th {{ background: #3498db; color: white; }}
+            .btn {{ padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; color: white; font-size: 0.9em; }}
+            .btn-toggle {{ background: #f39c12; }}
+            .btn-delete {{ background: #e74c3c; }}
+            .btn-add {{ background: #2ecc71; padding: 8px 16px; font-size: 1em; }}
+            input[type="text"] {{ padding: 8px; width: 60%; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; }}
+            .completed {{ text-decoration: line-through; color: #7f8c8d; }}
+            .daily-summary {{ background: white; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }}
+            .form-group {{ text-align: center; margin-bottom: 1.5rem; }}
+            a {{ text-decoration: none; color: #3498db; }}
+        </style>
+    </head>
+    <body>
+        <h1>To-Do Application</h1>
+        <div class="daily-summary">
+            <strong>Daily Summary:</strong> Total: {summary['total']} | Completed: {summary['completed']} | Pending: {summary['pending']} | Due Today: {due_count}
+        </div>
+        <form action="/add" method="POST" class="form-group">
+            <input type="text" name="title" placeholder="New task title..." required>
+            <button type="submit" class="btn btn-add">Add Task</button>
+        </form>
+        <div class="controls">
+            <a href="/" class="btn btn-toggle" style="background:#95a5a6;">All</a>
+            <a href="/?filter=pending" class="btn btn-toggle">Pending</a>
+            <a href="/?filter=completed" class="btn btn-toggle">Completed</a>
+        </div>
+        <table>
+            <thead>
+                <tr><th>ID</th><th>Title</th><th>Status</th><th>Actions</th></tr>
+            </thead>
+            <tbody>
+                {rows}
+            </tbody>
+        </table>
+        <p style="text-align:center; margin-top:1rem;"><a href="/daily">View Full Daily Summary</a></p>
+    </body>
+    </html>
+    """
+
+@app.post("/add")
+async def add_task_route(request: Request, title: str = Form(None)):
+    if not title:
+        body = await request.json()
+        title = body.get("title")
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    task = add_task(title)
+    return {"status": "success", "task": task}
+
+@app.post("/toggle/{task_id}")
+def toggle_task_route(task_id: str):
+    task = toggle_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"status": "success", "task": task}
+
+@app.post("/delete/{task_id}")
+def delete_task_route(task_id: str):
+    if not delete_task(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"status": "success"}
+
+@app.get("/daily", response_class=HTMLResponse)
+def daily_route():
+    summary = get_daily_summary()
+    due_items = ""
+    for t in summary["due_today"]:
+        due_items += f"<li>{t['title']} (ID: {t['id']})</li>"
+    if not due_items:
+        due_items = "<li>No tasks due today.</li>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Daily Summary</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; background: #f5f7fa; color: #333; }}
+            .card {{ background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 1rem; }}
+            h2 {{ color: #2c3e50; }}
+            ul {{ padding-left: 1.5rem; }}
+            li {{ margin-bottom: 0.5rem; }}
+            a {{ color: #3498db; text-decoration: none; }}
+        </style>
+    </head>
+    <body>
+        <h2>Daily Summary for {summary['date']}</h2>
+        <div class="card">
+            <p><strong>Total Tasks:</strong> {summary['total']}</p>
+            <p><strong>Completed:</strong> {summary['completed']}</p>
+            <p><strong>Pending:</strong> {summary['pending']}</p>
+        </div>
+        <div class="card">
+            <h3>Due Today</h3>
+            <ul>{due_items}</ul>
+        </div>
+        <p style="text-align:center;"><a href="/">← Back to Tasks</a></p>
+    </body>
+    </html>
+    """
+
+def run_server(port: int = 8080):
+    def signal_handler(sig, frame):
+        print("\nShutting down server gracefully...")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        print(f"Starting To-Do Web Server on http://0.0.0.0:{port}")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    except OSError as e:
+        if e.errno in (48, 98, 10048):  # Address already in use (macOS/Linux/Windows)
+            print(f"Error: Port {port} is already in use. Try a different port.")
+        else:
+            print(f"Server error: {e}")
+        sys.exit(1)
+```
+
+### 4. `main.py` (Entry Point)
+```python
+from .cli import main
+
+if __name__ == "__main__":
+    main()
+```
+
+### 5. `tests/test_web.py` (Web Route Tests)
+```python
+import pytest
+import os
+import json
+from fastapi.testclient import TestClient
+from ..web import app
+from ..core import DATA_FILE
+
+client = TestClient(app)
+
+@pytest.fixture(autouse=True)
+def clean_state():
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    yield
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+
+def test_add_task():
+    res = client.post("/add", data={"title": "Test Task"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "success"
+    assert "id" in data["task"]
+    assert data["task"]["title"] == "Test Task"
+    assert data["task"]["completed"] is False
+
+def test_get_index():
+    res = client.get("/")
+    assert res.status_code == 200
+    assert "To-Do Application" in res.text
+
+def test_filter_tasks():
+    client.post("/add", data={"title": "Task 1"})
+    client.post("/add", data={"title": "Task 2"})
+    task_id = client.post("/add", data={"title": "Task 3"}).json()["task"]["id"]
+    client.post(f"/toggle/{task_id}")
+
+    res_all = client.get("/")
+    assert "Task 1" in res_all.text and "Task 2" in res_all.text
+
+    res_pending = client.get("/?filter=pending")
+    assert "Task 1" in res_pending.text and "Task 2" in res_pending.text
+    assert "Task 3" not in res_pending.text
+
+def test_toggle_task():
+    res = client.post("/add", data={"title": "Toggle Me"})
+    task_id = res.json()["task"]["id"]
+    res_toggle = client.post(f"/toggle/{task_id}")
+    assert res_toggle.json()["task"]["completed"] is True
+
+def test_delete_task():
+    res = client.post("/add", data={"title": "Delete Me"})
+    task_id = res.json()["task"]["id"]
+    res_del = client.post(f"/delete/{task_id}")
+    assert res_del.status_code == 200
+    res_get = client.get("/")
+    assert "Delete Me" not in res_get.text
+
+def test_daily_route():
+    client.post("/add", data={"title": "Daily Task"})
+    res = client.get("/daily")
+    assert res.status_code == 200
+    assert "Daily Summary" in res.text
+```
+
+### 🚀 Usage Instructions
+
+1. **Install Dependencies**
+   ```bash
+   pip install fastapi uvicorn pytest
+   ```
+
+2. **Run CLI Commands**
+   ```bash
+   python -m todo_app add "Buy groceries" --due 2024-12-31
+   python -m todo_app list
+   python -m todo_app toggle <id>
+   python -m todo_app delete <id>
+   python -m todo_app daily
+   ```
+
+3. **Start Web Server**
+   ```bash
+   python -m todo_app serve --port 8080
+   ```
+   Visit `http://localhost:8080` in your browser. The server handles `Ctrl+C` gracefully and will warn you if the port is already in use.
+
+4. **Run Tests**
+   ```bash
+   pytest tests/test_web.py -v
+   ```
+
+### ✅ Key Features
+- **Zero External UI Dependencies**: Pure HTML/CSS with inline styles
+- **Dual Input Support**: `/add` accepts both `multipart/form-data` (HTML forms) and `application/json`
+- **XSS Protection**: Titles are escaped before rendering in HTML
+- **Graceful Shutdown**: Custom signal handlers + OS-level port conflict detection
+- **Shared State**: CLI and Web UI read/write to the same `tasks.json` file
+- **Testable**: Full test coverage for all web routes using FastAPI's built-in test client

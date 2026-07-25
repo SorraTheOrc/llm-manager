@@ -14,6 +14,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
+- **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -206,31 +207,6 @@ If you prefer not to activate the virtualenv, you can run pytest directly from t
 ```bash
 proxy/.venv/bin/pytest -q
 ```
-
-## proxyctl (CLI)
-
-A small bash CLI `proxyctl` is included to manage a user-local proxy process. It supports: `start`, `stop`, `restart`, `status`, and `logs`.
-
-Installation example:
-
-```sh
-sudo install -m 0755 proxy/proxyctl /usr/local/bin/proxyctl
-```
-
-Usage examples:
-
-```sh
-proxyctl start              # start using proxy/config.yaml llama_start_script or proxy/scripts/start-proxy.sh
-proxyctl start --dev        # start dev instance (port 8001, DEBUG logging, auto-reload)
-proxyctl status             # show running status and PID
-proxyctl status --dev       # show dev instance status
-proxyctl logs               # tail the proxy logs
-proxyctl logs --dev         # tail dev instance logs
-proxyctl stop               # stop the running proxy
-proxyctl stop --dev         # stop the dev instance
-```
-
-The script respects `LLAMA_START_SCRIPT` environment variable and `proxy/config.yaml` `server.llama_start_script` entry when determining what to run. Use the `--dev` flag to run in development mode, or set `LLAMA_PROXY_DEV=1` to force dev mode via environment variable.
 
 ## Configuration
 
@@ -714,13 +690,61 @@ localhost (127.0.0.1).
 |----------|-------------|
 | `LLAMA_PROXY_CONFIG` | Path to config file (default: `./config.yaml`) |
 | `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
-| `LLAMA_START_SCRIPT` | Override the start script path (used by proxyctl) |
+| `LLAMA_START_SCRIPT` | Override the start script path |
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
 | `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
+
+### Slot Scheduling
+
+The proxy supports **time-based slot scheduling**, allowing operators to vary the number of concurrent llama-server slots (`session_slot_pool_size` / `--parallel N`) based on the time of day. This is useful when the same server handles both latency-sensitive interactive requests (fewer slots → faster per-request response) and high-throughput batch workloads (more slots).
+
+#### Configuration
+
+Add a `slot_schedule` section under `server:` in `config.yaml`:
+
+```yaml
+server:
+  slot_schedule:
+    enabled: true
+    drain_minutes: 15
+    entries:
+      - time: "10:00"
+        slots: 4
+      - time: "12:00"
+        slots: 8
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Set to `true` to activate the schedule. When `false` or absent, the feature is disabled and the static `session_slot_pool_size` value is used (backward compatible). |
+| `drain_minutes` | Duration (in minutes) before a transition during which the proxy drains in-flight workloads and refuses new requests. Default: 15. |
+| `entries` | List of time-to-slot mappings. Each entry has a `time` (HH:MM format) and a `slots` value. Entries are sorted chronologically. |
+
+#### How It Works
+
+1. At startup, the proxy reads the `slot_schedule` section from `config.yaml`.
+2. A background scheduler periodically checks the current time against the schedule.
+3. When a transition approaches (within `drain_minutes`), the proxy enters **drain mode**:
+   - New requests receive `503 Service Unavailable` with a `Retry-After` header and the message `"Draining workloads for scheduled slot-count change — please retry shortly"`.
+   - In-flight streams are allowed to finish naturally.
+4. At the transition time, llama-server is gracefully restarted with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
+5. New requests are accepted again once the restart completes.
+
+#### Disabling
+
+To disable the feature, either:
+- Set `enabled: false` in the `slot_schedule` section, or
+- Remove the `slot_schedule` section entirely from `config.yaml`.
+
+When disabled, the proxy uses the static `session_slot_pool_size` value (unchanged from the original behavior).
+
+#### Midnight Wrapping
+
+The schedule supports midnight wrapping: if only one entry is defined (e.g., `10:00 → 4`), the slot count wraps to the last entry's value from the previous day during the hours before the first entry. This ensures a sensible slot count is always active, even before the first scheduled transition of the day.
 
 ### Upstream Timeout Configuration
 
@@ -771,25 +795,6 @@ The proxy supports a development mode that allows running a dev instance side-by
 | Proxy web server | 8000 | 8001 | `PROXY_PORT` env var |
 | llama-server backend | 8080 | 8081 | `LLAMA_SERVER_PORT` or `PORT` env var |
 
-#### Using Dev Mode with proxyctl
-
-```bash
-# Start dev instance (auto-reload + DEBUG logging)
-proxyctl start --dev
-
-# Check dev instance status
-proxyctl status --dev
-
-# View dev logs
-proxyctl logs --dev
-
-# Restart dev instance
-proxyctl restart --dev
-
-# Stop dev instance
-proxyctl stop --dev
-```
-
 #### Direct uvicorn invocation
 
 You can also run the proxy directly with uvicorn for development:
@@ -817,15 +822,6 @@ Systemd-specific instructions removed. If you run systemd units outside this rep
 
 ### Starting the Server
 
-**With proxyctl (recommended):**
-```bash
-# Production (default port 8000)
-proxyctl start
-
-# Development (port 8001, DEBUG logging, auto-reload)
-proxyctl start --dev
-```
-
 **Direct uvicorn:**
 ```bash
 source .venv/bin/activate
@@ -840,7 +836,7 @@ Note on start-proxy.sh hardening
 
 The bundled `proxy/scripts/start-proxy.sh` script now prefers the virtualenv Python interpreter (`.venv/bin/python3`) when available, falls back to the system `python3`, and will set `PYTHONPATH` to the repository root if it is not already set to avoid import errors when running from the repository checkout.
 
-Before launching the server the script also checks whether the selected port (default `8000`, or overridden with `--port`) is already in use on the local host. If the port is occupied the script exits with a helpful message indicating the port and suggesting `proxyctl start --dev` or running with a different `--port` value.
+Before launching the server the script also checks whether the selected port (default `8000`, or overridden with `--port`) is already in use on the local host. If the port is occupied the script exits with a helpful message indicating the port and suggesting running with a different `--port` value.
 
 This makes manual invocations of the proxy more robust across developer environments and reduces confusing import or bind errors when starting the server directly.
 ```
@@ -1917,7 +1913,7 @@ pytest proxy/tests/test_tts_integration.py -v
 These tests are **automatically skipped** when the tts-server is not running
 (default port `localhost:8081`).  To run them:
 
-1. Start the proxy (which starts the tts-server): `proxyctl start`
+1. Start the proxy (which starts the tts-server): `bash proxy/scripts/start-proxy.sh`
 2. In another terminal: `pytest proxy/tests/test_tts_integration.py -v`
 
 Alternatively, start the tts-server directly:

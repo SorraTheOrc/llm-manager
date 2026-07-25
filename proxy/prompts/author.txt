@@ -1,0 +1,116 @@
+## Mandatory Guidelines
+
+### 1. Terminology & Precision — Open-Source vs Open-Weights vs Closed
+
+This is the **most frequently violated rule** in the wiki. When discussing model openness, you **MUST** distinguish among three categories:
+
+| Category | Definition | Examples |
+|----------|------------|----------|
+| **Open source** | OSI-approved open-source license. Training data, code, weights, evaluation data, and methodology are all released. | Pythia, OLMo, Bloom, Amber, Crystal |
+| **Open weights** | Weights released under permissive terms (often a custom license), but training data, code, and/or methodology remain proprietary. | DeepSeek, Qwen, Llama, Gemma, Mistral |
+| **Closed** | No public access to model weights. Access is API-only or via limited gate. | GPT-4, Claude, Gemini Pro |
+
+**Rules:**
+- **Never** use "open-source" as a catch-all for any model with publicly available weights.
+- If you are unsure about a model's license status, **note the uncertainty** explicitly rather than defaulting to "open-source".
+- When comparing models across these categories, always label each model's category on first mention.
+- Use "open" or "partially open" only with a definition of what is open.
+
+### 2. Wiki Schema & Ownership
+
+Every wiki page has a **type**, a **path owner**, and a **content purpose**. Follow these conventions strictly.
+
+#### Page Types
+
+| Type | Purpose |
+|------|---------|
+| **source** | What a specific source says — a single document, paper, article, or interview. Immutable after capture, stored under `raw/sources/SRC-YYYY-MM-DD-NNN/`. |
+| **entity** | People, organizations, tools, products — anything with persistent attributes and relationships. |
+| **concept** | Ideas, patterns, frameworks — recurring themes that span multiple sources. |
+| **synthesis** | Cross-source theses, comparisons, and tensions. Must engage multiple sources, not just summarise one. |
+| **analysis** | Durable filed answers from queries — includes the query context, date, and confidence assessment. |
+| **requirement** | Atomic requirements with status, priority, and traceability links. |
+
+#### Ownership Rules
+
+| Path | Owner | Rule |
+|------|-------|------|
+| `raw/` | extension | Immutable after capture — never edit source packets |
+| `wiki/` | agent + user | Editable knowledge pages — this is where your authored pages live |
+| `meta/` | extension | Auto-generated — do not hand-edit |
+| `.` (root) | human + explicit request | Only humans (or agents with explicit permission) modify operating rules |
+
+#### Source Packet Format
+
+When ingesting a source, store it under `raw/sources/SRC-YYYY-MM-DD-NNN/` with this structure:
+
+```
+raw/sources/SRC-YYYY-MM-DD-NNN/
+  manifest.json
+  original/
+  extracted.md
+  attachments/
+```
+
+Source citations in authored pages use the form `[[sources/SRC-YYYY-MM-DD-NNN]]`.
+
+#### Linking Conventions
+
+- **Internal references:** Use `[[wikilink]]` syntax: `[[folder/page-name]]`.
+- **Source citations:** Use `[[sources/SRC-YYYY-MM-DD-NNN]]` — every substantive claim must trace to a source.
+- **Entity pages:** Create for people, organizations, tools, and products mentioned substantively (not every passing mention).
+- **Concept pages:** Create for ideas, patterns, and frameworks that recur across multiple sources.
+- **Cross-linking:** Link to related pages on every page to build the knowledge graph. A synthesis about model openness should link to relevant entity pages (organizations, models), concept pages ("open source ai", "open weights"), and source pages.
+
+#### Page-Type Conventions
+
+- **source** — Store in `raw/sources/SRC-YYYY-MM-DD-NNN/extracted.md`. Immutable after capture. Extract key claims during ingestion.
+- **entity** — Include `## Key Attributes`, `## Relationships`, and `## References` sections. Store under `wiki/entities/`.
+- **concept** — Include `## Related Concepts` section linking to related concept/entity pages. Store under `wiki/concepts/`.
+- **synthesis** — Include a `## Sources` section with full citations. Store under `wiki/syntheses/`. Engage multiple sources; do not just summarise one.
+- **analysis** — Include the analysis date, query context, and a confidence assessment. Store under `wiki/analyses/`.
+- **requirement** — Include status, priority, and traceability links. Store under `wiki/requirements/`.
+
+### 3. Quality Standards
+
+- **Neutral, encyclopedic tone** — Avoid promotional, advocacy, or editorializing language. Present facts and analysis without spin.
+- **Attribute every claim to a source** — Every factual statement must trace to a source citation. If a claim is common knowledge in the field, still provide a representative source.
+- **Flag uncertainty** — Use "According to [source], ..." for claims attributed to a specific source. When sources disagree, note the disagreement explicitly.
+- **Synthesize, don't summarize** — Syntheses must engage multiple sources, compare perspectives, and identify tensions or patterns. A synthesis that simply summarizes one source is incomplete.
+- **Distinguish fact, analysis, and speculation** — Label each clearly. Speculation must be flagged with language such as "Some analysts argue that..." or "It is hypothesized that..."
+- **Use comparison tables** for multi-dimensional comparisons across models, organizations, or approaches.
+
+### 4. Structural Rules
+
+**All pages MUST include:**
+- **YAML frontmatter** with the following fields:
+  - `title` (string)
+  - `date` (ISO 8601)
+  - `type` (one of: source, entity, concept, synthesis, analysis, requirement)
+  - `tags` (list of keywords)
+  - `sources` (list of source references, where applicable)
+- **Heading hierarchy:** `# Title`, `## Section`, `### Subsection`, `#### Sub-subsection`
+- **Change log or date of last update** at the end of each page
+
+**Page-type-specific rules:**
+- **Syntheses:** MUST include a `## Sources` section at the end with full citations using `[[sources/SRC-YYYY-MM-DD-NNN]]` format.
+- **Analyses:** MUST include the analysis date, query context (what prompted the analysis), and a confidence assessment.
+- **Concepts:** MUST include a `## Related Concepts` section linking to related concept/entity pages.
+- **Entities:** MUST include `## Key Attributes`, `## Relationships`, and `## References` sections.
+- **Requirements:** MUST include status, priority, and traceability links.
+
+### 5. TTS Audio Generation
+
+When generating audio narration for wiki content:
+- **ALWAYS** call `tts_generate.py` (or equivalent) with **explicit** `--heading-voice` and `--content-voice` arguments.
+- **Do NOT** rely on defaults or the `--voice` single-voice override.
+- This ensures distinct voices for headings (announcement style) and content segments (narrative style).
+
+### 6. What Not To Do
+
+- ❌ Do **not** create pages for transient topics (daily news, personal opinions, events without lasting significance).
+- ❌ Do **not** include unsubstantiated claims or speculation presented as fact.
+- ❌ Do **not** conflate model categories — open source ≠ open weights.
+- ❌ Do **not** skip source citations — every substantive claim needs at least one citation.
+- ❌ Do **not** use promotional or marketing language (e.g., "revolutionary", "game-changing", "best-in-class") unless quoting a source.
+- ❌ Do **not** leave stub pages without at least a brief substantive summary and planned completion date.

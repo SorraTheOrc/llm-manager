@@ -1,0 +1,128 @@
+# Benchmark: slot_count=4  session=1  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 951  TPS: 24.8
+# ============================================================
+
+We'll add a web UI to the existing To‑Do application using **FastAPI**. The implementation keeps the CLI fully intact and introduces a `serve` command. The web layer uses the same business logic and storage as the CLI.
+
+## Project Structure (after refactor)
+
+```
+todo/
+├── __init__.py        # package init, optional
+├── api.py             # core operations (list, add, toggle, delete, daily)
+├── cli.py             # CLI commands (existing + new 'serve')
+├── storage.py         # JSON file storage
+└── web.py             # FastAPI app with routes & HTML templates
+tests/
+├── test_api.py        # existing tests
+└── test_web.py        # new tests using httpx
+```
+
+We assume an existing `api.py` that provides functions like:
+
+```python
+def list_tasks() -> list[dict]: ...
+def add_task(description: str) -> dict: ...
+def toggle_task(task_id: int) -> dict: ...
+def delete_task(task_id: int) -> None: ...
+def daily_summary() -> str: ...
+```
+
+Below is the complete implementation for the web module, the updated CLI, and the new tests.
+
+---
+
+## 1. `todo/web.py` – FastAPI Web Application
+
+```python
+import asyncio
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+import uvicorn
+from . import api  # reuse existing logic
+
+app = FastAPI()
+
+# --------------------------------------------------------------------
+# HTML templates (inline, no external dependencies)
+# --------------------------------------------------------------------
+TASK_ROWS_TPL = """
+    <tr class="{cls}">
+        <td>{id}</td>
+        <td>{description}</td>
+        <td>{status}</td>
+        <td>
+            <form action="/toggle/{id}" method="post" style="display:inline">
+                <button type="submit">{toggle_btn}</button>
+            </form>
+            <form action="/delete/{id}" method="post" style="display:inline">
+                <button type="submit" class="delete">🗑</button>
+            </form>
+        </td>
+    </tr>
+"""
+
+SUMMARY_TPL = """
+<!DOCTYPE html>
+<html>
+<head><title>Daily Summary – To‑Do</title>
+<style>
+  body {{ font-family: sans-serif; max-width: 600px; margin: 2rem auto; }}
+  .stats {{ background: #f4f4f4; padding: 1rem; border-radius: 8px; }}
+  h1 {{ color: #333; }}
+  a {{ text-decoration: none; color: #0066cc; }}
+</style>
+</head>
+<body>
+<h1>📋 Daily Summary</h1>
+<div class="stats">
+{summary}
+</div>
+<p><a href="/">← Back to all tasks</a></p>
+</body>
+</html>
+"""
+
+PAGE_TPL = """
+<!DOCTYPE html>
+<html>
+<head><title>To‑Do App</title>
+<style>
+  body {{ font-family: sans-serif; max-width: 900px; margin: 2rem auto; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 1em 0; }}
+  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+  th {{ background: #f5f5f5; }}
+  button {{ cursor: pointer; padding: 4px 8px; }}
+  .delete {{ background: #ff4d4d; color: white; border: none; border-radius: 4px; }}
+  .done {{ background: #d4edda; }}
+  .pending {{ background: #fff3cd; }}
+  .filters {{ margin: 1em 0; }}
+  .filters a {{ margin-right: 1em; text-decoration: none; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; }}
+  .filters .active {{ background: #0066cc; color: white; border-color: #0066cc; }}
+  form.inline {{ display: inline; }}
+</style>
+</head>
+<body>
+<h1>📝 To‑Do Tasks</h1>
+
+<div class="filters">
+  <a href="/" class="{all_active}">All</a>
+  <a href="/?filter=pending" class="{pend_active}">Pending</a>
+  <a href="/?filter=done" class="{done_active}">Done</a>
+  <a href="/daily">📅 Daily Summary</a>
+</div>
+
+<form action="/add" method="post">
+  <input type="text" name="description" placeholder="New task…" required>
+  <button type="submit">Add</button>
+</form>
+
+<table>
+  <thead><tr><th>ID</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead>
+  <tbody>
+    {rows

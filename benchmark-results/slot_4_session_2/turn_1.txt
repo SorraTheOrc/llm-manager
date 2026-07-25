@@ -1,0 +1,394 @@
+# Benchmark: slot_count=4  session=2  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 543s  Tokens: 3483  TPS: 21.1
+# ============================================================
+
+Here's the complete implementation split into the application module and its test suite. The code follows PEP 8, uses modern Python 3.12+ type hints, includes comprehensive docstrings, and is structured for maximum testability.
+
+### `todo_app.py`
+```python
+"""todo_app.py - A simple CLI-based To-Do application with JSON storage."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional
+import argparse
+
+__all__ = ["Task", "TodoStore", "create_parser", "main"]
+
+
+@dataclass
+class Task:
+    """Represents a single to-do task."""
+    id: int
+    title: str
+    completed: bool = False
+
+
+class TodoStore:
+    """Manages task persistence in a JSON file.
+
+    Note: Not thread/process safe. Use one instance per execution.
+    """
+
+    def __init__(self, file_path: str = "tasks.json") -> None:
+        self.file_path = Path(file_path)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        """Create an empty store file if it doesn't exist."""
+        if not self.file_path.exists():
+            self.save({"tasks": [], "next_id": 1})
+
+    def _load(self) -> dict:
+        """Load tasks from the JSON file. Resets to empty on corruption."""
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            self.save({"tasks": [], "next_id": 1})
+            return {"tasks": [], "next_id": 1}
+
+    def save(self, data: dict) -> None:
+        """Persist data to the JSON file."""
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def add_task(self, title: str) -> Task:
+        """Add a new task and return it."""
+        if not title or not title.strip():
+            raise ValueError("Task title cannot be empty.")
+        data = self._load()
+        new_id = data["next_id"]
+        task = Task(id=new_id, title=title.strip())
+        data["tasks"].append(asdict(task))
+        data["next_id"] = new_id + 1
+        self.save(data)
+        return task
+
+    def list_tasks(self, completed: Optional[bool] = None) -> list[Task]:
+        """List tasks, optionally filtering by completion status."""
+        data = self._load()
+        tasks = [Task(**t) for t in data["tasks"]]
+        if completed is not None:
+            tasks = [t for t in tasks if t.completed == completed]
+        return tasks
+
+    def complete_task(self, task_id: int) -> Optional[Task]:
+        """Mark a task as completed. Returns the updated task or None."""
+        data = self._load()
+        for t in data["tasks"]:
+            if t["id"] == task_id:
+                t["completed"] = True
+                self.save(data)
+                return Task(**t)
+        return None
+
+    def delete_task(self, task_id: int) -> bool:
+        """Delete a task by ID. Returns True if deleted, False otherwise."""
+        data = self._load()
+        initial_len = len(data["tasks"])
+        data["tasks"] = [t for t in data["tasks"] if t["id"] != task_id]
+        if len(data["tasks"]) < initial_len:
+            self.save(data)
+            return True
+        return False
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create and configure the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple CLI-based To-Do application with JSON storage."
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Task title")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_group = list_parser.add_mutually_exclusive_group()
+    list_group.add_argument("--completed", action="store_true", help="Show only completed tasks")
+    list_group.add_argument("--pending", action="store_true", help="Show only pending tasks")
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+    complete_parser.add_argument("id", type=int, help="Task ID to complete")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="Task ID to delete")
+
+    # help
+    subparsers.add_parser("help", help="Show usage information")
+
+    return parser
+
+
+def main(store_file: str = "tasks.json", args: Optional[list[str]] = None) -> int:
+    """Main entry point for the CLI application.
+
+    Args:
+        store_file: Path to the JSON storage file.
+        args: Command-line arguments. If None, reads from sys.argv.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    parser = create_parser()
+    parsed_args = parser.parse_args(args)
+
+    if not parsed_args.command:
+        parser.print_help()
+        return 0
+
+    if parsed_args.command == "help":
+        parser.print_help()
+        return 0
+
+    store = TodoStore(store_file)
+
+    try:
+        if parsed_args.command == "add":
+            task = store.add_task(parsed_args.title)
+            print(f"Added task #{task.id}: {task.title}")
+
+        elif parsed_args.command == "list":
+            completed_filter = None
+            if parsed_args.completed:
+                completed_filter = True
+            elif parsed_args.pending:
+                completed_filter = False
+            tasks = store.list_tasks(completed=completed_filter)
+            if not tasks:
+                print("No tasks found.")
+            else:
+                for t in tasks:
+                    status = "✓" if t.completed else " "
+                    print(f"[{status}] #{t.id} {t.title}")
+
+        elif parsed_args.command == "complete":
+            task = store.complete_task(parsed_args.id)
+            if task:
+                print(f"Marked task #{task.id} as completed.")
+            else:
+                print(f"Error: Task #{parsed_args.id} not found.", file=sys.stderr)
+                return 1
+
+        elif parsed_args.command == "delete":
+            if store.delete_task(parsed_args.id):
+                print(f"Deleted task #{parsed_args.id}.")
+            else:
+                print(f"Error: Task #{parsed_args.id} not found.", file=sys.stderr)
+                return 1
+
+        return 0
+
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### `test_todo_app.py`
+```python
+"""test_todo_app.py - Unit tests for the todo application."""
+
+import pytest
+from todo_app import TodoStore, Task, main
+
+
+@pytest.fixture
+def temp_store(tmp_path):
+    """Provide a TodoStore instance backed by a temporary JSON file."""
+    store_file = tmp_path / "tasks.json"
+    store_file.write_text('{"tasks": [], "next_id": 1}')
+    yield TodoStore(str(store_file))
+
+
+class TestTodoStore:
+    def test_add_task(self, temp_store):
+        task = temp_store.add_task("Buy groceries")
+        assert task.id == 1
+        assert task.title == "Buy groceries"
+        assert task.completed is False
+
+        task2 = temp_store.add_task("Walk the dog")
+        assert task2.id == 2
+        assert len(temp_store.list_tasks()) == 2
+
+    def test_add_task_empty_title(self, temp_store):
+        with pytest.raises(ValueError, match="cannot be empty"):
+            temp_store.add_task("   ")
+
+    def test_list_tasks_all(self, temp_store):
+        temp_store.add_task("Task 1")
+        temp_store.add_task("Task 2")
+        assert len(temp_store.list_tasks()) == 2
+
+    def test_list_tasks_completed(self, temp_store):
+        temp_store.add_task("Task 1")
+        temp_store.add_task("Task 2")
+        temp_store.complete_task(1)
+
+        assert len(temp_store.list_tasks(completed=True)) == 1
+        assert temp_store.list_tasks(completed=True)[0].id == 1
+
+    def test_list_tasks_pending(self, temp_store):
+        temp_store.add_task("Task 1")
+        temp_store.add_task("Task 2")
+        temp_store.complete_task(1)
+
+        assert len(temp_store.list_tasks(completed=False)) == 1
+        assert temp_store.list_tasks(completed=False)[0].id == 2
+
+    def test_complete_task(self, temp_store):
+        temp_store.add_task("Complete me")
+        result = temp_store.complete_task(1)
+        assert result is not None
+        assert result.completed is True
+
+        # Verify persistence
+        assert temp_store.list_tasks(completed=True)[0].completed is True
+
+    def test_complete_nonexistent_task(self, temp_store):
+        assert temp_store.complete_task(999) is None
+
+    def test_delete_task(self, temp_store):
+        temp_store.add_task("Delete me")
+        temp_store.add_task("Keep me")
+
+        assert temp_store.delete_task(1) is True
+        assert len(temp_store.list_tasks()) == 1
+        assert temp_store.list_tasks()[0].id == 2
+
+    def test_delete_nonexistent_task(self, temp_store):
+        assert temp_store.delete_task(999) is False
+
+    def test_corrupted_file_handling(self, temp_store):
+        # Overwrite with invalid JSON to simulate corruption
+        temp_store.file_path.write_text("{invalid json}")
+        # Should reset gracefully and allow new operations
+        task = temp_store.add_task("New task")
+        assert task.id == 1
+        assert len(temp_store.list_tasks()) == 1
+
+
+class TestCLI:
+    def test_add_command(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        return_code = main(store_file=store_file, args=["add", "Buy milk"])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "Added task #1: Buy milk" in out
+
+    def test_list_command(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        main(store_file=store_file, args=["add", "Task 1"])
+        main(store_file=store_file, args=["add", "Task 2"])
+        main(store_file=store_file, args=["complete", "1"])
+
+        return_code = main(store_file=store_file, args=["list"])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "[✓] #1 Task 1" in out
+        assert "[ ] #2 Task 2" in out
+
+    def test_list_pending_command(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        main(store_file=store_file, args=["add", "Task 1"])
+        main(store_file=store_file, args=["add", "Task 2"])
+        main(store_file=store_file, args=["complete", "1"])
+
+        return_code = main(store_file=store_file, args=["list", "--pending"])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "[ ] #2 Task 2" in out
+        assert "#1" not in out  # Completed tasks should be filtered out
+
+    def test_complete_command(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        main(store_file=store_file, args=["add", "Task 1"])
+        return_code = main(store_file=store_file, args=["complete", "1"])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "Marked task #1 as completed." in out
+
+    def test_complete_nonexistent(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        return_code = main(store_file=store_file, args=["complete", "999"])
+        assert return_code == 1
+        _, err = capfd.readouterr()
+        assert "Error: Task #999 not found." in err
+
+    def test_delete_command(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        main(store_file=store_file, args=["add", "Task 1"])
+        return_code = main(store_file=store_file, args=["delete", "1"])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "Deleted task #1." in out
+
+    def test_delete_nonexistent(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        return_code = main(store_file=store_file, args=["delete", "999"])
+        assert return_code == 1
+        _, err = capfd.readouterr()
+        assert "Error: Task #999 not found." in err
+
+    def test_help_command(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        return_code = main(store_file=store_file, args=["help"])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "usage:" in out.lower() or "Available commands" in out
+
+    def test_no_command_shows_help(self, tmp_path, capfd):
+        store_file = str(tmp_path / "tasks.json")
+        return_code = main(store_file=store_file, args=[])
+        assert return_code == 0
+        out, _ = capfd.readouterr()
+        assert "usage:" in out.lower() or "Available commands" in out
+```
+
+### How to Run & Test
+
+1. **Run the CLI directly:**
+   ```bash
+   python todo_app.py add "Finish report"
+   python todo_app.py list
+   python todo_app.py complete 1
+   python todo_app.py list --pending
+   python todo_app.py delete 1
+   python todo_app.py help
+   ```
+
+2. **Run the test suite:**
+   ```bash
+   pip install pytest
+   pytest test_todo_app.py -v
+   ```
+
+### Design Notes
+- **Separation of Concerns**: Business logic (`TodoStore`, `Task`) is completely decoupled from CLI parsing (`main`, `create_parser`). This makes the module importable and highly testable.
+- **Storage Resilience**: The store gracefully recovers from missing or corrupted JSON files without crashing.
+- **Type Safety**: Uses modern Python 3.12+ type hints (`list[Task]`, `Optional[bool]`, etc.) and `__future__.annotations` for forward compatibility.
+- **CLI UX**: Mutually exclusive filters for `list`, clear stdout/stderr routing, and sensible exit codes (`0` success, `1` error).
+- **Security**: No `eval`/`exec`, input validation for empty titles, safe file path handling with `pathlib`, and UTF-8 encoding enforced.

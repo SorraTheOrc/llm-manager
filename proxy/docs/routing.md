@@ -39,6 +39,7 @@ The `get_model_config()` function matches the model name against the `models` se
 
 For local models, the proxy checks:
 
+- If the proxy is in **drain mode** (scheduled slot-count transition in progress), all requests receive `503 Service Unavailable` with a `Retry-After` header and a descriptive message. See [Slot Scheduling](../README.md#slot-scheduling) in the main README for details.
 - If the requested model is already loaded (`current_model == llama_model_str` and process running) → route immediately
 - If in **router mode** (`llama_router_mode: true`), it queries the router to see if the model is already loaded
 - Otherwise, it schedules a **background load** and returns `503 Model Loading` to the client
