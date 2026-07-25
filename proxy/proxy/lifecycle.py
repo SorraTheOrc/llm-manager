@@ -1274,6 +1274,9 @@ def stop_tts_server():
         if is_real_process:
             _kill_process_group(srv.tts_process, srv.logger)
             srv.tts_process = None
+            # Reset recovery state since this is an intentional stop, not a failure
+            srv.tts_recovery_state["attempt_timestamps"] = []
+            srv.tts_recovery_state["last_failure"] = None
             srv.logger.info("TTS server stopped (process group killed)")
         else:
             srv.tts_process = None
@@ -1625,18 +1628,31 @@ async def restart_services(
                 "restart_services: router-mode restart complete (%d slots)",
                 slot_count,
             )
+            # Restart TTS server if it was running before the restart.
+            if tts_was_running:
+                srv.logger.info("restart_services: restarting TTS server")
+                proc = start_tts_server()
+                srv.tts_process = proc
             return True
         else:
             # Single-model mode: restart with the current model.
             if current_model:
                 result = await srv.ensure_model_loaded(current_model)
                 srv.backend_ready = result
+                if result and tts_was_running:
+                    srv.logger.info("restart_services: restarting TTS server")
+                    proc = start_tts_server()
+                    srv.tts_process = proc
                 return result
             else:
                 # No model loaded yet — start fresh.
                 default_model = srv.config.get("default_model", "gemma4")
                 result = await srv.ensure_model_loaded(default_model)
                 srv.backend_ready = result
+                if result and tts_was_running:
+                    srv.logger.info("restart_services: restarting TTS server")
+                    proc = start_tts_server()
+                    srv.tts_process = proc
                 return result
     except Exception:
         srv.logger.exception(

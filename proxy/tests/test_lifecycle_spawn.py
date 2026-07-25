@@ -580,6 +580,13 @@ class _DummySrvFull:
         self.logger = logging.getLogger("test-dummy")
         self.llama_log_file = None
         self.config = {"models": {}, "server": {}}
+        self.tts_recovery_state = {
+            "in_progress": False,
+            "attempt_timestamps": [],
+            "max_attempts": 3,
+            "window_seconds": 120,
+            "last_failure": None,
+        }
     def rotate_llama_logs(self, *a, **kw):
         pass
     def broadcast_status_sync(self, *a, **kw):
@@ -683,6 +690,34 @@ class TestStopTtsServer:
 
         assert srv.tts_process is None
 
+    def test_resets_recovery_state_on_intentional_stop(self, monkeypatch):
+        """stop_tts_server resets tts_recovery_state when stopping a real process."""
+        fake_proc = _FakeProcWithPgid(pid=7777)
+        srv = _DummySrvFull(tts_proc=fake_proc)
+        srv.tts_recovery_state = {
+            "in_progress": False,
+            "attempt_timestamps": [100.0, 110.0, 120.0],
+            "max_attempts": 3,
+            "window_seconds": 120,
+            "last_failure": "previous TTS crash",
+        }
+        monkeypatch.setattr(lifecycle, "_srv", lambda: srv)
+
+        killpg_called = []
+        def fake_killpg(pgid, sig):
+            killpg_called.append((pgid, sig))
+        monkeypatch.setattr(lifecycle.os, "killpg", fake_killpg)
+        monkeypatch.setattr(lifecycle.signal, "SIGTERM", 15)
+        monkeypatch.setattr(lifecycle.signal, "SIGKILL", 9)
+        monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+        lifecycle.stop_tts_server()
+
+        # Recovery state should be reset
+        assert srv.tts_recovery_state["attempt_timestamps"] == []
+        assert srv.tts_recovery_state["last_failure"] is None
+        assert srv.tts_process is None
+
 
 # ---------------------------------------------------------------------------
 # Tests for start_llama_server / start_tts_server with start_new_session
@@ -763,6 +798,13 @@ class _DummySrvRestart:
             },
         }
         self._released_ports = []
+        self.tts_recovery_state = {
+            "in_progress": False,
+            "attempt_timestamps": [],
+            "max_attempts": 3,
+            "window_seconds": 120,
+            "last_failure": None,
+        }
     def rotate_llama_logs(self, *a, **kw):
         pass
     def broadcast_status_sync(self, *a, **kw):
@@ -775,6 +817,10 @@ class _DummySrvRestart:
     def stop_tts_server(self):
         self.logger.info("stop_tts_server called")
         self.tts_process = None
+    def start_tts_server(self):
+        self.logger.info("start_tts_server called")
+        from proxy.lifecycle import start_tts_server as real_start
+        return real_start()
     def get_local_model_name(self, model_name):
         return model_name
     def get_model_config(self, model_name):
@@ -868,6 +914,32 @@ class TestRestartServices:
 
         assert result is True
         assert len(stop_tts_called) >= 1
+
+    def test_restart_restarts_tts_server(self, monkeypatch):
+        """restart_services restarts TTS server after llama is ready when TTS was running."""
+        fake_proc = _FakeProcWithPgid(pid=5001)
+        srv = _DummySrvRestart(llama_proc=fake_proc, tts_proc=_FakeProcWithPgid(pid=5002))
+        monkeypatch.setattr(lifecycle, "_srv", lambda: srv)
+
+        start_tts_called = []
+        def fake_start_tts():
+            start_tts_called.append(True)
+            return _FakeProcWithPgid(pid=5003)
+        monkeypatch.setattr(lifecycle, "start_tts_server", fake_start_tts)
+
+        def fake_port_release(port, timeout=5.0, interval=0.5):
+            return True
+        monkeypatch.setattr(lifecycle, "_wait_for_port_release", fake_port_release)
+        monkeypatch.setattr(lifecycle.asyncio, "sleep", lambda s: _FakeAwaitable())
+        monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+        import asyncio
+        result = asyncio.run(lifecycle.restart_services(slot_count=8))
+
+        assert result is True
+        assert len(start_tts_called) >= 1
+        assert srv.backend_ready is True
+        assert srv.tts_process is not None
 
 
 class _FakeAwaitable:
