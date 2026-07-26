@@ -472,6 +472,11 @@ async def test_router_stream_error_yields_finish_reason(monkeypatch):
         f"Expected finish_reason 'error' in outputs, got {finish_reasons}"
     )
 
+    # Verify [DONE] marker is emitted after synthetic finish event
+    assert b"data: [DONE]" in collected, (
+        "[DONE] marker must be present after synthetic finish event"
+    )
+
     # Verify original content is preserved
     assert b"Hello" in collected, "Original content should be preserved"
 
@@ -499,6 +504,9 @@ async def test_router_stream_error_with_read_timeout(monkeypatch):
 
     assert b"finish_reason" in collected
     assert b'"error"' in collected
+    assert b"data: [DONE]" in collected, (
+        "[DONE] marker must be present after synthetic finish event"
+    )
 
 
 @pytest.mark.asyncio
@@ -544,6 +552,13 @@ async def test_router_normal_completion_preserved(monkeypatch):
     # Normal completion emits a synthetic stop if the original had finish_reason
     # already, so verify at least one finish_reason exists (not an error one)
     assert b'"stop"' in collected, "Should have finish_reason 'stop'"
+
+    # Normal upstream-closed stream must NOT double-emit [DONE]
+    # The upstream already sent [DONE], so we should see exactly one
+    done_count = collected.count(b"[DONE]")
+    assert done_count == 1, (
+        f"[DONE] should appear exactly once (from upstream), got {done_count}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

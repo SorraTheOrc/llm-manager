@@ -1227,6 +1227,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 ).encode()
                                 yield final_bytes
                                 log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+                                # Emit [DONE] marker after synthetic finish event
+                                # so client agents detect stream completion (LP-0MS14PM7I0077MXD)
+                                done_bytes = b"data: [DONE]\n\n"
+                                yield done_bytes
+                                log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
                             # Client disconnected or generator is being closed.
                             # Skip the final event yield and proceed directly to cleanup.
@@ -1258,6 +1263,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             ).encode()
                             yield final_bytes
                             log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+                            # Emit [DONE] marker after synthetic error finish event
+                            # so client agents detect stream completion (LP-0MS14PM7I0077MXD)
+                            done_bytes = b"data: [DONE]\n\n"
+                            yield done_bytes
+                            log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
                             # Record assembled streaming response (fire-and-forget)
                             if session_id and collected_content:
