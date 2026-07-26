@@ -927,7 +927,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     max_token_rate = gc["max_token_rate"]
                     token_rate_window_seconds = gc["token_rate_window_seconds"]
                     stream_idle_timeout = float(
-                        server_config.get("stream_idle_timeout_seconds", 30) or 30
+                        server_config.get("stream_idle_timeout_seconds", 120) or 120
                     )
                     stream_heartbeat_interval = float(
                         server_config.get("stream_heartbeat_interval_seconds", 10) or 10

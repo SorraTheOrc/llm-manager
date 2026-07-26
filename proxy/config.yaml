@@ -366,8 +366,10 @@ server:
   # When the upstream stops sending data without emitting a [DONE] event
   # or closing the connection, the proxy waits this long for the next
   # chunk before synthesising a final finish_reason:stop event and ending
-  # the stream.  Default: 30 seconds.
-  stream_idle_timeout_seconds: 30
+  # the stream.  Increased from 30 to 120 for local Qwen3 reasoning models
+  # which can have long pauses during complex reasoning (LP-0MS14PM7J003XPS8).
+  # Default: 120 seconds.
+  stream_idle_timeout_seconds: 120
 
   # Upstream stall idle timeout (LP-0MRE52D3C001KP1H).
   # When the remote upstream stops sending data mid-stream without closing
