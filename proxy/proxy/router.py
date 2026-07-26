@@ -997,7 +997,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 # connection to llama-server.
                                 if _hb_task in done:
                                     # Heartbeat interval elapsed with no chunk.
-                                    if remaining_budget <= _heartbeat_interval:
+                                    if remaining_budget < _heartbeat_interval:
                                         srv.logger.info(
                                             "stream_idle_timeout session=%s "
                                             "idle=%.1fs budget=%.1fs",
