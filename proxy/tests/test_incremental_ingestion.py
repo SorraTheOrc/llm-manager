@@ -569,6 +569,80 @@ class TestSessionSingleFlightCoordinator:
         await first_task
         assert await queued_task == "ok"
 
+    @pytest.mark.asyncio
+    async def test_queue_timeout_raises_rejected_when_expired(self):
+        """AC1+AC3: Queue timeout fires and raises SessionSingleFlightRejected.
+
+        When a queued request waits longer than queue_timeout_seconds, it
+        should receive a SessionSingleFlightRejected instead of hanging.
+        """
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+
+        coordinator = SessionSingleFlightCoordinator()
+        first_entered = asyncio.Event()
+        first_hold = asyncio.Event()
+
+        async def first_request():
+            async with coordinator.acquire(
+                "timeout-session", mode="queue", max_queue_depth=8
+            ):
+                first_entered.set()
+                await first_hold.wait()
+
+        first_task = asyncio.create_task(first_request())
+        await first_entered.wait()
+
+        # Second request should time out quickly
+        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+            async with coordinator.acquire(
+                "timeout-session", mode="queue", max_queue_depth=8, queue_timeout_seconds=0.05
+            ):
+                pass
+
+        assert excinfo.value.reason == "queue_timeout"
+
+        # Clean up
+        first_hold.set()
+        await first_task
+
+    @pytest.mark.asyncio
+    async def test_queue_timeout_none_behaves_as_unbounded(self):
+        """AC4: When queue_timeout_seconds is None, behaves as unbounded (backward compat)."""
+        from proxy.server import SessionSingleFlightCoordinator
+
+        coordinator = SessionSingleFlightCoordinator()
+        first_entered = asyncio.Event()
+        first_release = asyncio.Event()
+
+        async def first_request():
+            async with coordinator.acquire(
+                "no-timeout-session", mode="queue", max_queue_depth=8
+            ):
+                first_entered.set()
+                await first_release.wait()
+
+        async def second_request():
+            async with coordinator.acquire(
+                "no-timeout-session", mode="queue", max_queue_depth=8, queue_timeout_seconds=None
+            ):
+                return "completed"
+
+        first_task = asyncio.create_task(first_request())
+        await first_entered.wait()
+
+        second_task = asyncio.create_task(second_request())
+        await asyncio.sleep(0.05)
+
+        # Second task should NOT have completed yet (still waiting)
+        assert not second_task.done()
+
+        # Release the first request
+        first_release.set()
+        result = await second_task
+        assert result == "completed"
+
+        await first_task
+
 
 class TestStreamGuardrails:
     def test_repetition_detection_triggers_for_pathological_output(self):

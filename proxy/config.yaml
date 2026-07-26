@@ -289,6 +289,12 @@ server:
   local_dispatch_lease_timeout_seconds: 60
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
+  # Session single-flight queue timeout (LP-0MS14PM88007NNUJ).
+  # When a session has an active in-flight request and mode is "queue",
+  # subsequent requests wait for this duration before being rejected.
+  # Prevents stuck requests from starving subsequent requests indefinitely.
+  # Default: 120 seconds.
+  session_single_flight_queue_timeout_seconds: 120
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   # Number of parallel sessions (GPU contexts) for local dispatch.
   # Controls how many concurrent Pi agent sessions can hold dispatch leases

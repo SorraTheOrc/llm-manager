@@ -806,7 +806,7 @@ class SessionSingleFlightCoordinator:
                 self._states[session_id] = state
             return state
 
-    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int):
+    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int, queue_timeout_seconds: float | None = None):
         @asynccontextmanager
         async def _guard():
             if not session_id:
@@ -831,7 +831,19 @@ class SessionSingleFlightCoordinator:
                     is_waiting = True
                     _record_single_flight_queue()
 
-            await state["lock"].acquire()
+            try:
+                if queue_timeout_seconds is not None and queue_timeout_seconds > 0:
+                    await asyncio.wait_for(
+                        state["lock"].acquire(), timeout=queue_timeout_seconds
+                    )
+                else:
+                    await state["lock"].acquire()
+            except asyncio.TimeoutError:
+                async with self._state_lock:
+                    if is_waiting:
+                        state["waiters"] = max(0, state["waiters"] - 1)
+                _record_single_flight_reject()
+                raise SessionSingleFlightRejected("queue_timeout")
             async with self._state_lock:
                 if is_waiting:
                     state["waiters"] = max(0, state["waiters"] - 1)

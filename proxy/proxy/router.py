@@ -606,6 +606,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     single_flight_max_queue_depth = int(
         server_config.get("session_single_flight_max_queue_depth", 1) or 1
     )
+    single_flight_queue_timeout = float(
+        server_config.get("session_single_flight_queue_timeout_seconds", 120) or 120
+    )
 
     # Check concurrency limit
     max_queries = server_config.get("max_concurrent_queries", 4)
@@ -745,6 +748,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id,
             single_flight_mode,
             single_flight_max_queue_depth,
+            queue_timeout_seconds=single_flight_queue_timeout,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
@@ -1396,6 +1400,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id,
             single_flight_mode,
             single_flight_max_queue_depth,
+            queue_timeout_seconds=single_flight_queue_timeout,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
