@@ -519,14 +519,28 @@ class TestSlotScheduler:
         from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
+        # Two entries: 10:00→4 and 12:00→8. At 11:55, the active slot from
+        # the schedule is 4 (second entry hasn't arrived yet). We set static
+        # slots to 4 so catch-up doesn't fire, and the drain window for the
+        # 12:00→8 transition is properly detected (slot count changes).
         schedule = {
             "enabled": True,
             "drain_minutes": 15,
-            "entries": [{"time": "12:00", "slots": 8}],
+            "entries": [
+                {"time": "10:00", "slots": 4},
+                {"time": "12:00", "slots": 8},
+            ],
         }
-        mock_srv.config = {"server": {"slot_schedule": schedule}}
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 4,
+                "slot_schedule": schedule,
+            }
+        }
+        mock_srv.restart_services = AsyncMock(return_value=True)
         scheduler = SlotScheduler(mock_srv)
-        # At 11:55, we're 5 min before the transition AND 10 min inside drain window
+        # At 11:55, we're 5 min before the 12:00 transition AND 10 min inside
+        # the 15-min drain window. The slot count changes from 4→8.
         with patch.object(scheduler, '_now', return_value=dt_time(11, 55)):
             await scheduler._run_check_cycle()
             # Should be draining
@@ -647,7 +661,14 @@ class TestSlotSchedulerEdgeCases:
                 {"time": "00:00", "slots": 8},
             ],
         }
-        mock_srv.config = {"server": {"slot_schedule": schedule}}
+        # Set static slot count to match the wrapped schedule value (8, from the
+        # last entry at 00:00) so the catch-up logic does not fire at 23:45.
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 8,
+                "slot_schedule": schedule,
+            }
+        }
         mock_srv.restart_services = AsyncMock(return_value=True)
         scheduler = SlotScheduler(mock_srv)
 
@@ -656,7 +677,8 @@ class TestSlotSchedulerEdgeCases:
             await scheduler._run_check_cycle()
             assert scheduler.draining is True
 
-        # At 23:50, restart
+        # At 23:50, restart — catch-up fires because active slot (2) differs
+        # from static (8), triggering immediate restart.
         scheduler.set_draining(False)  # simulate state
         with patch.object(scheduler, '_now', return_value=dt_time(23, 50)):
             scheduler.set_draining(True)  # was draining before
