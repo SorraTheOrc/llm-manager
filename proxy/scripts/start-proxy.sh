@@ -79,11 +79,18 @@ done
 # --restart: kill all running proxy-related processes before starting
 if [ "$RESTART" -eq 1 ]; then
   echo "Restart requested: stopping running proxy services..."
+  # Phase 1: graceful SIGTERM
   pkill -f 'uvicorn proxy\.server' 2>/dev/null || true
-  sleep 1
   pkill -f 'llama-server' 2>/dev/null || true
   pkill -f 'qwentts' 2>/dev/null || true
   pkill -f 'tts-server' 2>/dev/null || true
+  sleep 3
+  # Phase 2: force-kill any survivors (graceful shutdown may hang — e.g.,
+  # asyncio tasks that don't cancel cleanly leaving a zombie process).
+  pkill -9 -f 'uvicorn proxy\.server' 2>/dev/null || true
+  pkill -9 -f 'llama-server' 2>/dev/null || true
+  pkill -9 -f 'qwentts' 2>/dev/null || true
+  pkill -9 -f 'tts-server' 2>/dev/null || true
   sleep 2
   # Verify port is now free
   if command -v ss >/dev/null 2>&1; then
