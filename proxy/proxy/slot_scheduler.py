@@ -277,6 +277,7 @@ class SlotScheduler:
             srv.config.get("server", {}) if isinstance(srv.config, dict) else None
         )
         self._draining: bool = False
+        self._drain_started_at: datetime | None = None
         self._pending_restart_slot: int | None = None
         self._task: asyncio.Task | None = None
 
@@ -297,6 +298,10 @@ class SlotScheduler:
     def set_draining(self, value: bool) -> None:
         """Set the draining flag, propagating to the server module for router checks."""
         self._draining = value
+        if value:
+            self._drain_started_at = self._now_dt()
+        else:
+            self._drain_started_at = None
         # Propagate to the server module-level flag so the router can check it
         # without importing the scheduler (LP-0MRXZU90M007WNWT regression fix).
         try:
@@ -431,6 +436,21 @@ class SlotScheduler:
         except Exception:
             pass
 
+        # ── Drain stuck circuit breaker ─────────────────────────────────
+        if self._draining and self._drain_started_at is not None:
+            elapsed = (self._now_dt() - self._drain_started_at).total_seconds()
+            margin = self._config.drain_minutes * 60 + 60
+            if elapsed > margin:
+                logger.warning(
+                    "Slot scheduler: drain circuit breaker — draining for %.0fs "
+                    "(margin=%ds), forcing clear",
+                    elapsed,
+                    margin,
+                )
+                self.set_draining(False)
+                self.clear_pending_restart()
+                return
+
         # ── Catch-up: if we started after a transition time, apply it now ──
         if self._pending_restart_slot is None:
             now = self._now()
@@ -471,24 +491,55 @@ class SlotScheduler:
 
         # ── Phase 1: Check if a pending restart should execute now ──────────
         if self._pending_restart_slot is not None:
-            # Find the entry that matches our pending slot and is at or past now.
+            now_dt = self._now_dt()
+            tolerance = timedelta(seconds=1)
+
+            # Find the entry that matches our pending slot.
+            matched_entry = None
             for entry in self._config.entries:
-                if (
-                    entry.slots == self._pending_restart_slot
-                    and entry.time <= now
-                ):
-                    # Transition time arrived (or passed) — execute restart.
+                if entry.slots == self._pending_restart_slot:
+                    matched_entry = entry
+                    break
+
+            if matched_entry is not None:
+                entry_dt = datetime.combine(now_dt.date(), matched_entry.time)
+                diff_seconds = (now_dt - entry_dt).total_seconds()
+
+                if diff_seconds >= -1.0:
+                    # Transition time reached:
+                    # - diff >= 0: entry time is in the past (catch-up)
+                    # - -1s < diff < 0: entry is slightly in the future
+                    #   (microsecond timing jitter tolerance)
                     logger.info(
-                        "Slot scheduler: transition time reached for %d slots at %s",
-                        entry.slots,
-                        entry.time.strftime("%H:%M"),
+                        "Slot scheduler: transition time reached for %d slots at %s "
+                        "(diff=%.3fs)",
+                        matched_entry.slots,
+                        matched_entry.time.strftime("%H:%M"),
+                        diff_seconds,
                     )
                     self.set_draining(False)
                     await self.perform_restart()
                     return
 
+                # ── Missed transition: entry time has passed ──────────
+                # The entry time is more than 1s in the future today.
+                # This means the pending restart slot's conceptual
+                # transition was missed (would sleep 24h for this entry).
+                # Clear drain and pending so the scheduler falls through
+                # to normal evaluation.
+                logger.warning(
+                    "Slot scheduler: missed transition window for %d slots "
+                    "at %s — time has passed, clearing drain",
+                    matched_entry.slots,
+                    matched_entry.time.strftime("%H:%M"),
+                )
+                self.set_draining(False)
+                self.clear_pending_restart()
+                return
+
             # If the pending slot matches the current active slot without
-            # needing a restart (e.g., static config already matches), clear.
+            # needing a restart (e.g., static config already matches) and
+            # the transition time has not yet passed, just clear silently.
             if self._pending_restart_slot == current_slots:
                 self.set_draining(False)
                 self.clear_pending_restart()
@@ -573,10 +624,24 @@ class SlotScheduler:
 
         # ── Pending restart → wake when the matching entry's time arrives ──
         if self._pending_restart_slot is not None:
+            now_dt = self._now_dt()
             for entry in self._config.entries:
                 if entry.slots == self._pending_restart_slot:
+                    entry_dt = datetime.combine(now_dt.date(), entry.time)
+                    if entry_dt <= now_dt:
+                        # Entry time has already passed today — fall through
+                        # to normal schedule evaluation instead of sleeping
+                        # until tomorrow (24h freeze bug).
+                        logger.warning(
+                            "Slot scheduler: pending slot %d time has passed, "
+                            "falling through to normal schedule",
+                            entry.slots,
+                        )
+                        break
                     return self._seconds_until(entry.time)
-            return self._MIN_SLEEP_SECONDS  # should not happen, be safe
+            # Pending time passed — clear and fall through
+            self.clear_pending_restart()
+            self.set_draining(False)
 
         # ── Determine current slot count for comparison ───────────────
         static_slots = self._get_static_slot_count()
