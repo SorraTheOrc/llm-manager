@@ -741,10 +741,11 @@ async def _handle_remote_streaming(
                             await _current_cm.__aexit__(None, None, None)
                         except Exception:
                             pass
-                        try:
-                            await _current_client.aclose()
-                        except Exception:
-                            pass
+                        if _owns_client:
+                            try:
+                                await _current_client.aclose()
+                            except Exception:
+                                pass
                         _retry_count += 1
                         if _retry_count >= max_retries:
                             continue  # Will exit on next outer iteration
