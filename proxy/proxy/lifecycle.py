@@ -12,6 +12,7 @@ import asyncio
 import errno
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -1209,8 +1210,195 @@ def stop_llama_server():
 # ---------------------------------------------------------------------------
 
 
+def _kill_process_on_port(port: int, logger=None) -> bool:
+    """Find and kill any process holding a TCP port.
+
+    Uses multiple detection strategies:
+    1. ``ss -ltnp`` (preferred, available on most Linux)
+    2. ``fuser`` (fallback)
+    3. ``/proc/net/tcp`` parsing (last resort)
+
+    Args:
+        port: TCP port number.
+        logger: Optional logger for diagnostics.
+
+    Returns:
+        ``True`` if at least one process was killed, ``False`` otherwise.
+    """
+    pid = _find_pid_on_port(port)
+    if pid is None:
+        return False
+
+    killed_any = False
+
+    # Single PID could represent multiple children; kill them all
+    for single_pid in (pid if isinstance(pid, list) else [pid]):
+        if not isinstance(single_pid, int) or single_pid <= 0:
+            continue
+        try:
+            if logger:
+                logger.info(f"Killing process PID {single_pid} holding port {port}")
+            os.kill(single_pid, signal.SIGTERM)
+            # Give it a moment to die gracefully
+            try:
+                os.waitpid(single_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            killed_any = True
+        except (ProcessLookupError, OSError):
+            # Process already gone
+            continue
+
+    if killed_any:
+        # Brief wait for port release
+        _wait_for_port_release(port, timeout=3.0, interval=0.3)
+
+    return killed_any
+
+
+def _find_pid_on_port(port: int) -> int | list[int] | None:
+    """Find the PID(s) of process(es) holding a TCP port.
+
+    Tries detection strategies in order:
+    1. ``ss -ltnp`` (preferred)
+    2. ``fuser`` (fallback)
+    3. ``/proc/net/tcp`` (portable fallback)
+
+    Args:
+        port: TCP port number.
+
+    Returns:
+        A single PID (int), a list of PIDs, or ``None`` if not found.
+    """
+    # Strategy 1: ss -ltnp
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnp"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            pids = _extract_pids_from_ss_output(result.stdout, port)
+            if pids:
+                return pids[0] if len(pids) == 1 else pids
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # Strategy 2: fuser
+    try:
+        result = subprocess.run(
+            ["fuser", f"{port}/tcp"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            pids = []
+            for token in result.stdout.strip().split():
+                try:
+                    pids.append(int(token))
+                except ValueError:
+                    pass
+            if pids:
+                return pids[0] if len(pids) == 1 else pids
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # Strategy 3: /proc/net/tcp parsing
+    pids = _find_pids_via_proc_net_tcp(port)
+    if pids:
+        return pids[0] if len(pids) == 1 else pids
+
+    return None
+
+
+def _extract_pids_from_ss_output(ss_output: str, port: int) -> list[int]:
+    """Extract PIDs from ``ss -ltnp`` output for a given port.
+
+    ``ss -ltnp`` output lines look like:
+    ``LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:(("tts-server",pid=12345,fd=5))``
+
+    Returns a list of PIDs.
+    """
+    pids = []
+    port_str = f":{port}"
+    dot_port_str = f".{port}"
+    for line in ss_output.splitlines():
+        # Check if line mentions our port
+        if port_str not in line and dot_port_str not in line:
+            continue
+        # Extract pid=N from the users: section
+        pid_matches = re.findall(r"pid=(\d+)", line)
+        for pid_str in pid_matches:
+            try:
+                pids.append(int(pid_str))
+            except ValueError:
+                pass
+    return pids
+
+
+def _find_pids_via_proc_net_tcp(port: int) -> list[int]:
+    """Parse ``/proc/net/tcp`` to find process PIDs holding a port.
+
+    Returns a list of PIDs, or an empty list if not found.
+    Note: ``/proc/net/tcp`` does not directly expose PIDs; we can only
+    identify that the port is in use but not which process.  For finding
+    the PID we rely on ``/proc/*/fd/`` scanning as a fallback.
+    """
+    pids = []
+    hex_port = f"{port:04x}"
+    try:
+        with open("/proc/net/tcp") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                # local_address is column 1 (index 1 after skipping header)
+                local_addr = parts[1]
+                if ":" in local_addr:
+                    addr_port = local_addr.split(":")[1]
+                    if addr_port == hex_port and parts[3] == "0A":
+                        # Port is in LISTEN state but we need to find the PID
+                        # Scan /proc for the socket inode
+                        inode = parts[9] if len(parts) > 9 else ""
+                        if inode and inode.isdigit():
+                            pid = _find_pid_by_inode(int(inode))
+                            if pid:
+                                pids.append(pid)
+    except (FileNotFoundError, PermissionError, Exception):
+        pass
+    return pids
+
+
+def _find_pid_by_inode(inode: int) -> int | None:
+    """Find the PID owning a given socket inode by scanning ``/proc/*/fd/``.
+
+    Returns the PID or ``None``.
+    """
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                fd_dir = f"/proc/{pid}/fd"
+                for fd_entry in os.listdir(fd_dir):
+                    try:
+                        link = os.readlink(f"{fd_dir}/{fd_entry}")
+                        if f"socket:[{inode}]" in link:
+                            return pid
+                    except (OSError, FileNotFoundError):
+                        continue
+            except (PermissionError, FileNotFoundError):
+                continue
+    except (FileNotFoundError, Exception):
+        pass
+    return None
+
+
 def start_tts_server() -> subprocess.Popen | None:
     """Start the qwentts TTS server using the configured start script.
+
+    Before spawning, any process holding the TTS port is killed (zombie
+    cleanup).  After spawning, the function verifies the process stays
+    alive (does not exit immediately due to port conflict).
 
     Returns a subprocess.Popen when successful, None on failure.
     """
@@ -1228,6 +1416,12 @@ def start_tts_server() -> subprocess.Popen | None:
     if not os.path.isfile(script_path):
         srv.logger.warning(f"TTS start script not found: {script_path}")
         return None
+
+    # ------------------------------------------------------------------ #
+    # Pre-start zombie cleanup: kill any orphan process holding the port
+    # ------------------------------------------------------------------ #
+    if _kill_process_on_port(tts_port, logger=srv.logger):
+        srv.logger.info(f"Cleaned up zombie process on port {tts_port}")
 
     env = os.environ.copy()
     env["QWTTS_PORT"] = str(tts_port)
@@ -1254,6 +1448,23 @@ def start_tts_server() -> subprocess.Popen | None:
     except Exception as e:
         srv.logger.error(f"Failed to start TTS server: {e}")
         return None
+
+    # ------------------------------------------------------------------ #
+    # Spawn verification: check the process didn't exit immediately.
+    # This handles the case where start-qwentts.sh exits with code 1
+    # because the port is still in use (e.g., old zombie not yet dead).
+    # ------------------------------------------------------------------ #
+    try:
+        proc.wait(timeout=0.5)
+        # Process exited before timeout -> it failed
+        exit_code = proc.returncode
+        srv.logger.warning(
+            f"TTS server exited immediately with code {exit_code}"
+        )
+        return None
+    except subprocess.TimeoutExpired:
+        # Process is still running after 0.5s -> likely healthy
+        pass
 
     srv.logger.info(f"Started TTS server (PID: {proc.pid})")
     return proc

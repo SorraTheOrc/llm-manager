@@ -83,6 +83,7 @@ if [ "$RESTART" -eq 1 ]; then
   sleep 1
   pkill -f 'llama-server' 2>/dev/null || true
   pkill -f 'qwentts' 2>/dev/null || true
+  pkill -f 'tts-server' 2>/dev/null || true
   sleep 2
   # Verify port is now free
   if command -v ss >/dev/null 2>&1; then
