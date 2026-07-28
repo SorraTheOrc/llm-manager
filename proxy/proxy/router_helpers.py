@@ -276,6 +276,20 @@ def log_response_chunk(
                     if preview:
                         parts.append(f"request={preview}")
                 srv.logger.info(" ".join(parts))
+
+                # Log a WARNING when the upstream provider truncated the response
+                # due to reaching its max_tokens (LP-0MS4C6E2L004HLLZ).
+                if finish_reason == "length":
+                    _parts = ["Response truncated: finish_reason=length"]
+                    if session_id:
+                        _parts.append(f"session={session_id}")
+                    if model:
+                        _parts.append(f"model={model}")
+                    if isinstance(usage, dict):
+                        ct = usage.get("completion_tokens")
+                        if ct is not None:
+                            _parts.append(f"completion_tokens={ct}")
+                    srv.logger.warning(" ".join(_parts))
     except Exception:
         pass
 

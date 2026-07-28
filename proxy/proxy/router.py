@@ -170,7 +170,7 @@ def _get_guardrail_config(server_config: dict) -> dict:
             server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
         ),
         "max_completion_tokens": int(
-            server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
+            server_config.get("session_guardrail_max_completion_tokens", 16384) or 16384
         ),
         "repetition_min_pattern_chars": int(
             server_config.get("session_guardrail_repetition_min_pattern_chars", 64) or 64
