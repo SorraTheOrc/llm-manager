@@ -766,6 +766,15 @@ The proxy uses two separate timeout values for upstream remote connections:
 
 The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
 
+### Local Stream Timeout Configuration
+
+The proxy uses a separate idle timeout for **local model** (llama-server) streaming, distinct from the remote upstream timeout above. This timeout governs pauses between tokens from the local inference engine, which can be significantly longer during complex reasoning chains (LP-0MS14PM7J003XPS8).
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `server.stream_idle_timeout_seconds` | `120` | Per-chunk idle timeout for SSE streaming from the local provider. When llama-server stops sending tokens without emitting a `[DONE]` event or closing the connection, the proxy waits this long for the next chunk before synthesising a finish event and ending the stream. Increased from 30s to 120s to accommodate long reasoning pauses in Qwen3 reasoning models. |
+| `server.stream_heartbeat_interval_seconds` | `10` | Interval at which the proxy emits `{"type":"heartbeat"}` keepalive events to the client during local streaming. The idle timeout budget is decremented each heartbeat cycle when no data arrives. |
+
 ### Remote HTTP Client Configuration
 
 The proxy uses a shared, pooled `httpx.AsyncClient` for all remote upstream requests, replacing per-request client creation. This enables connection reuse (TCP/TLS keepalive) and configurable connection-level timeouts.
@@ -1329,6 +1338,7 @@ on config.
 Config keys:
 - `server.session_single_flight_mode` — `queue` (default) or `reject`
 - `server.session_single_flight_max_queue_depth` — max waiting requests per session
+- `server.session_single_flight_queue_timeout_seconds` — timeout (in seconds) for queued requests. When the timeout expires, the waiting request is rejected with a `queue_timeout` error instead of hanging indefinitely. Default `120` seconds (LP-0MS14PM88007NNUJ).
 
 Guardrails stop runaway responses and invalidate sessions when configured:
 - `server.session_guardrail_max_runtime_seconds` — cutoff streaming after N seconds
