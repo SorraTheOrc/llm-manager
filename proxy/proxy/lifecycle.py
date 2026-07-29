@@ -800,6 +800,9 @@ def _wait_for_port_release(port: int, timeout: float = 10.0, interval: float = 0
     Attempts a TCP connect to ``localhost:<port>`` at the given interval until
     the connection is refused (ECONNREFUSED), indicating the port is free.
 
+    Other non-zero connect_ex results (e.g., EAGAIN when the accept queue is
+    full) are treated as "still in use" and cause a retry.
+
     Args:
         port: TCP port number to check.
         timeout: Maximum seconds to wait before returning False.
@@ -808,15 +811,21 @@ def _wait_for_port_release(port: int, timeout: float = 10.0, interval: float = 0
     Returns:
         ``True`` if the port became free within the timeout, ``False`` otherwise.
     """
+    import errno
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(interval)
         try:
             result = sock.connect_ex(("127.0.0.1", port))
-            if result != 0:
+            if result == errno.ECONNREFUSED:
                 # Connection refused — port is free
                 return True
+            if result != 0:
+                # Non-ECONNREFUSED error (e.g., EAGAIN) — port is still busy,
+                # the accept queue is just full. Retry.
+                time.sleep(interval / 2)
+                continue
         finally:
             sock.close()
         time.sleep(interval)
