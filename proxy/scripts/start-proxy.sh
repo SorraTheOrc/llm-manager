@@ -152,7 +152,7 @@ if [ "$RESTART" -eq 1 ]; then
   fi
 
   # Phase 4: wait until all ports are confirmed free (blocking, up to 10s each)
-  local failed=0
+  failed=0
   if ! _wait_for_port_release "$LLAMA_PORT"; then
     echo "Warning: llama-server port $LLAMA_PORT did NOT become free within 10s after kill" >&2
     failed=1
