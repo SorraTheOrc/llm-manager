@@ -1172,6 +1172,39 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
 
 
 
+def _close_and_recreate_http_client(srv=None) -> None:
+    """Close the shared HTTP client and create a fresh one.
+
+    Discards stale connections in the connection pool that may have been
+    established to a previous llama-server instance. After calling this,
+    all internal HTTP calls will use a clean connection pool.
+    """
+    if srv is None:
+        srv = _srv()
+
+    old_client = getattr(srv, "_http_client", None)
+
+    # Create a new client with the same configuration as startup.
+    new_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(5.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    srv._http_client = new_client
+
+    # Schedule the old client for graceful close on the event loop.
+    if old_client is not None:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(old_client.aclose())
+            else:
+                # No running loop — just let it be garbage collected.
+                pass
+        except RuntimeError:
+            # No event loop at all — old client will be garbage collected.
+            pass
+
+
 def stop_llama_server():
     """Stop the currently running llama-server.
 
@@ -1212,6 +1245,9 @@ def stop_llama_server():
        except Exception:
            pass
        srv.llama_log_file = None
+
+    # Refresh the HTTP client to discard stale connections from the old server.
+    _close_and_recreate_http_client(srv)
 
 
 # ---------------------------------------------------------------------------
