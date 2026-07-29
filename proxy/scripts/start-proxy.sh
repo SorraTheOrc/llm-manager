@@ -76,15 +76,67 @@ for arg in "$@"; do
   fi
 done
 
+# Ports used by backend services (llama-server on 8080, TTS on 8081)
+LLAMA_PORT=8080
+TTS_PORT=8081
+
+# ---------------------------------------------------------------------------
+# Port helpers
+# ---------------------------------------------------------------------------
+
+# _port_in_use <port>  ->  0 if in use, 1 if free
+_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn | awk '{print $4}' | grep -Eq ":$port$|\.$port$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":$port$|\.$port$"
+  else
+    "$PY_BIN" -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(0.5)
+try:
+    s.connect(('127.0.0.1', $port))
+except Exception:
+    sys.exit(1)
+else:
+    sys.exit(0)
+" 2>/dev/null
+  fi
+}
+
+# _wait_for_port_release <port> [timeout]  ->  0 on success, 1 on timeout
+# Polls until the port is free (ECONNREFUSED), with a default 10s timeout.
+_wait_for_port_release() {
+  local port="$1"
+  local timeout="${2:-10}"
+  local deadline
+  deadline="$(python3 -c "import time; print(time.monotonic() + $timeout)")"
+  while true; do
+    local now
+    now="$(python3 -c "import time; print(time.monotonic())")"
+    if python3 -c "import sys; sys.exit(0 if $now > $deadline else 1)" 2>/dev/null; then
+      return 1  # timeout
+    fi
+    if ! _port_in_use "$port"; then
+      return 0  # port is free
+    fi
+    sleep 0.5
+  done
+}
+
 # --restart: kill all running proxy-related processes before starting
 if [ "$RESTART" -eq 1 ]; then
   echo "Restart requested: stopping running proxy services..."
+
   # Phase 1: graceful SIGTERM
   pkill -f 'uvicorn proxy\.server' 2>/dev/null || true
   pkill -f 'llama-server' 2>/dev/null || true
   pkill -f 'qwentts' 2>/dev/null || true
   pkill -f 'tts-server' 2>/dev/null || true
   sleep 3
+
   # Phase 2: force-kill any survivors (graceful shutdown may hang — e.g.,
   # asyncio tasks that don't cancel cleanly leaving a zombie process).
   pkill -9 -f 'uvicorn proxy\.server' 2>/dev/null || true
@@ -92,43 +144,38 @@ if [ "$RESTART" -eq 1 ]; then
   pkill -9 -f 'qwentts' 2>/dev/null || true
   pkill -9 -f 'tts-server' 2>/dev/null || true
   sleep 2
-  # Verify port is now free
-  if command -v ss >/dev/null 2>&1; then
-    if ss -ltn | awk '{print $4}' | grep -Eq ":${PORT}$|\.${PORT}$"; then
-      echo "Warning: port $PORT is still in use after killing processes. Continuing anyway..." >&2
-    fi
+
+  # Phase 3: fuser fallback — kill any leftover processes holding our ports
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "$LLAMA_PORT/tcp" 2>/dev/null || true
+    fuser -k "$TTS_PORT/tcp" 2>/dev/null || true
+  fi
+
+  # Phase 4: wait until all ports are confirmed free (blocking, up to 10s each)
+  local failed=0
+  if ! _wait_for_port_release "$LLAMA_PORT"; then
+    echo "Warning: llama-server port $LLAMA_PORT did NOT become free within 10s after kill" >&2
+    failed=1
+  fi
+  if ! _wait_for_port_release "$TTS_PORT"; then
+    echo "Warning: TTS port $TTS_PORT did NOT become free within 10s after kill" >&2
+    failed=1
+  fi
+  if ! _wait_for_port_release "${PORT}"; then
+    echo "Warning: proxy port $PORT did NOT become free within 10s after kill" >&2
+    failed=1
+  fi
+
+  if [ "$failed" -eq 0 ]; then
+    echo "All ports freed successfully."
   fi
   echo "Done. Starting fresh..."
 fi
 
-# Check if the port is already in use. Prefer ss/netstat for a fast local check,
-# fall back to a Python connect test when those tools are unavailable.
+# Check if the proxy port is already in use
 PORT_IN_USE=0
-if command -v ss >/dev/null 2>&1; then
-  if ss -ltn | awk '{print $4}' | grep -Eq ":${PORT}$|\.${PORT}$"; then
-    PORT_IN_USE=1
-  fi
-elif command -v netstat >/dev/null 2>&1; then
-  if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${PORT}$|\.${PORT}$"; then
-    PORT_IN_USE=1
-  fi
-else
-  # Fallback: try to connect using Python
-  if "$PY_BIN" - <<PYTEST 2>/dev/null
-import socket,sys
-port = int(${PORT})
-s=socket.socket()
-s.settimeout(0.5)
-try:
-    s.connect(('127.0.0.1', port))
-except Exception:
-    sys.exit(0)
-else:
-    sys.exit(1)
-PYTEST
-  then
-    PORT_IN_USE=1
-  fi
+if _port_in_use "${PORT}"; then
+  PORT_IN_USE=1
 fi
 
 if [ "$PORT_IN_USE" -eq 1 ]; then
