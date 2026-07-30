@@ -10,7 +10,6 @@ Verifies that:
    16384.
 """
 
-import io
 import logging
 import re
 from pathlib import Path
@@ -20,8 +19,15 @@ import proxy.server as server
 from proxy.router import _get_guardrail_config
 
 
-def _configure_logger_for_test(tmp_path: Path):
-    """Set up a logger with a StringIO handler for assertion."""
+# ── Tests for finish_reason: "length" warning ─────────────────────────────
+
+
+def _caplog_setup(caplog, tmp_path: Path, log_level=logging.WARNING) -> None:
+    """Configure logging and attach caplog to capture the llama-proxy logger.
+
+    Sets up logging via server.setup_logging then configures caplog
+    to intercept the ``llama-proxy`` logger at the desired level.
+    """
     cfg = {
         "logging": {
             "directory": str(tmp_path / "logs"),
@@ -30,70 +36,48 @@ def _configure_logger_for_test(tmp_path: Path):
             "level": "INFO",
         }
     }
-
-    logger = logging.getLogger("llama-proxy")
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-
     server.setup_logging(cfg)
-
-    # Capture all log output via a StringIO handler
-    strio = io.StringIO()
-    handler = logging.StreamHandler(strio)
-    handler.setLevel(logging.WARNING)
-    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-    logger.addHandler(handler)
-
-    # Also capture the ContentOnlyConsoleHandler output
-    console_handler = None
-    for h in logger.handlers:
-        if isinstance(h, server.ContentOnlyConsoleHandler):
-            console_handler = h
-            break
-    # Set it to also use our strio for capturing
-    if console_handler:
-        console_handler.setStream(strio)
-
-    strio.truncate(0)
-    strio.seek(0)
-    return logger, strio
+    caplog.set_level(log_level, logger="llama-proxy")
 
 
-# ── Tests for finish_reason: "length" warning ─────────────────────────────
-
-
-def test_finish_reason_length_logs_warning(tmp_path):
+def test_finish_reason_length_logs_warning(caplog, tmp_path):
     """A WARNING-level log is emitted when finish_reason is 'length'."""
-    logger, strio = _configure_logger_for_test(tmp_path)
+    _caplog_setup(caplog, tmp_path)
 
     chunk = (
         b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"length"}]}\n\n'
     )
     server.log_response_chunk(chunk, session_id="sess123", model="test-model")
 
-    out = strio.getvalue()
-    assert "WARNING" in out or "WARN" in out.upper()
-    assert "truncat" in out.lower() or "length" in out.lower()
+    assert len(caplog.records) > 0, "Expected at least one log record"
+    # At least one record should be at WARNING level with truncation-related text
+    assert any(
+        r.levelname in ("WARNING", "WARN") and (
+            "truncat" in r.getMessage().lower() or "length" in r.getMessage().lower()
+        )
+        for r in caplog.records
+    ), "Expected a WARNING-level log about response truncation"
 
 
-def test_finish_reason_stop_does_not_log_warning(tmp_path):
+def test_finish_reason_stop_does_not_log_warning(caplog, tmp_path):
     """No warning log is emitted when finish_reason is 'stop' (normal)."""
-    logger, strio = _configure_logger_for_test(tmp_path)
+    _caplog_setup(caplog, tmp_path)
 
     chunk = (
         b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
     )
     server.log_response_chunk(chunk, session_id="sess123", model="test-model")
 
-    out = strio.getvalue()
-    # The Stream finished line is INFO level, not WARNING — should not be captured
-    # by our WARNING-level handler
-    assert "truncat" not in out.lower()
+    # The Stream finished line is INFO level — should not appear as WARNING
+    assert not any(
+        r.levelname in ("WARNING", "WARN")
+        for r in caplog.records
+    ), "Expected no WARNING-level log for finish_reason=stop"
 
 
-def test_finish_reason_length_includes_token_info(tmp_path):
+def test_finish_reason_length_includes_token_info(caplog, tmp_path):
     """Truncation warning includes token usage info when available."""
-    logger, strio = _configure_logger_for_test(tmp_path)
+    _caplog_setup(caplog, tmp_path)
 
     chunk = (
         b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"length"}],'
@@ -101,9 +85,10 @@ def test_finish_reason_length_includes_token_info(tmp_path):
     )
     server.log_response_chunk(chunk, session_id="sess456", model="test-model")
 
-    out = strio.getvalue()
-    assert "WARNING" in out
-    assert "2048" in out
+    assert any(
+        r.levelname in ("WARNING", "WARN") and "2048" in r.getMessage()
+        for r in caplog.records
+    ), "Expected a WARNING log containing token count 2048"
 
 
 # ── Tests for config default change ───────────────────────────────────────
