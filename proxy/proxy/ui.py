@@ -19,6 +19,7 @@ from proxy.observability import _build_llama_url, _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
 from proxy.router_helpers import _get_per_model_queries
+from proxy.session_recorder import MAX_SESSION_DROPDOWN_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1053,12 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
     # Sort all sessions by last_activity descending — the most recently updated
     # session appears at the top regardless of active/inactive status.
     merged.sort(key=lambda s: s.get("last_activity", s.get("response_time", "")), reverse=True)
+
+    # Limit to MAX_SESSION_DROPDOWN_COUNT most recently updated sessions to
+    # prevent the web UI dropdown from being overwhelmed by hundreds of stale
+    # sessions. This is the definitive limit point — it ensures the API response
+    # never exceeds this count regardless of how many live or recorded sessions exist.
+    merged = merged[:MAX_SESSION_DROPDOWN_COUNT]
 
     result = {"sessions": merged, "count": len(merged)}
     if model_filter:
