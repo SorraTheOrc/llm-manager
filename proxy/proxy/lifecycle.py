@@ -1454,6 +1454,10 @@ def start_tts_server() -> subprocess.Popen | None:
         "tts_start_script",
         str(Path(__file__).parent.parent / "scripts" / "start-qwentts.sh")
     )
+    # Resolve relative config paths against the repo root (Path(__file__).parent.parent.parent)
+    # so they work regardless of the process working directory.
+    if not os.path.isabs(script_path):
+        script_path = str(Path(__file__).parent.parent.parent / script_path)
     tts_port = int(server_cfg.get("tts_server_port", 8081))
     tts_model_path = str(server_cfg.get("tts_model_path", ""))
     tts_codec_path = str(server_cfg.get("tts_codec_path", ""))

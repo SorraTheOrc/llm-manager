@@ -434,6 +434,110 @@ class TestStartTtsServerSpawnVerification:
 
 
 # ---------------------------------------------------------------------------
+# Tests for start_tts_server config path resolution
+# ---------------------------------------------------------------------------
+
+
+class TestStartTtsServerPathResolution:
+    """Tests that start_tts_server resolves config paths correctly."""
+
+    @pytest.mark.asyncio
+    async def test_relative_config_path_resolved_against_repo_root(self):
+        """Relative path in config should be resolved against repo root.
+
+        Config has tts_start_script: "proxy/scripts/start-qwentts.sh" which is
+        relative to repo root. The code must resolve it to an absolute path
+        based on Path(__file__).parent.parent.parent before checking isfile().
+        """
+        from proxy.lifecycle import start_tts_server
+
+        srv = _make_mock_server(tts_server_port=_find_free_port())
+        # Set a relative config path (assumes repo root as base)
+        srv.config["server"]["tts_start_script"] = "proxy/scripts/start-qwentts.sh"
+
+        # Track what path is passed to os.path.isfile
+        checked_paths = []
+
+        def fake_isfile(path):
+            checked_paths.append(path)
+            return False  # script doesn't exist in test env
+
+        with patch("proxy.lifecycle._srv", return_value=srv):
+            with patch("proxy.lifecycle._kill_process_on_port", return_value=False):
+                with patch("proxy.lifecycle.os.path.isfile", side_effect=fake_isfile):
+                    result = start_tts_server()
+
+        assert result is None, "Expected None since script doesn't exist"
+        assert len(checked_paths) > 0, "os.path.isfile should have been called"
+        checked = checked_paths[0]
+        # The path should be an absolute path ending with proxy/scripts/start-qwentts.sh
+        assert checked.endswith("proxy/scripts/start-qwentts.sh"), (
+            f"Expected path ending with 'proxy/scripts/start-qwentts.sh', got {checked!r}"
+        )
+        assert os.path.isabs(checked), (
+            f"Expected absolute path, got {checked!r}"
+        )
+        # It should NOT contain double proxy/proxy
+        assert "proxy/proxy/scripts" not in checked, (
+            f"Path should not have duplicate proxy/ segment: {checked!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_absolute_config_path_unchanged(self):
+        """Absolute path in config should be used as-is (no regression)."""
+        from proxy.lifecycle import start_tts_server
+
+        srv = _make_mock_server(tts_server_port=_find_free_port())
+        abs_path = "/custom/absolute/path/start-qwentts.sh"
+        srv.config["server"]["tts_start_script"] = abs_path
+
+        checked_paths = []
+
+        def fake_isfile(path):
+            checked_paths.append(path)
+            return False
+
+        with patch("proxy.lifecycle._srv", return_value=srv):
+            with patch("proxy.lifecycle._kill_process_on_port", return_value=False):
+                with patch("proxy.lifecycle.os.path.isfile", side_effect=fake_isfile):
+                    result = start_tts_server()
+
+        assert result is None
+        assert len(checked_paths) > 0
+        assert checked_paths[0] == abs_path, (
+            f"Expected absolute path unchanged, got {checked_paths[0]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_config_path_resolved_correctly(self):
+        """When no config override, the default path should be correct."""
+        from proxy.lifecycle import start_tts_server
+
+        srv = _make_mock_server(tts_server_port=_find_free_port())
+        # Remove tts_start_script from config to trigger the code default
+        srv.config["server"].pop("tts_start_script", None)
+
+        checked_paths = []
+
+        def fake_isfile(path):
+            checked_paths.append(path)
+            return False
+
+        with patch("proxy.lifecycle._srv", return_value=srv):
+            with patch("proxy.lifecycle._kill_process_on_port", return_value=False):
+                with patch("proxy.lifecycle.os.path.isfile", side_effect=fake_isfile):
+                    result = start_tts_server()
+
+        assert result is None
+        assert len(checked_paths) > 0
+        checked = checked_paths[0]
+        assert checked.endswith("proxy/scripts/start-qwentts.sh"), (
+            f"Expected ending with proxy/scripts/start-qwentts.sh, got {checked!r}"
+        )
+        assert os.path.isabs(checked), f"Expected absolute path, got {checked!r}"
+
+
+# ---------------------------------------------------------------------------
 # Tests for _startup_launch_tts_server
 # ---------------------------------------------------------------------------
 
