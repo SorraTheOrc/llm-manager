@@ -2,12 +2,18 @@
 Tests for TTS server spawn verification and port-based zombie cleanup.
 
 Verifies that:
-- _kill_process_on_port() detects and kills a process listening on a port
+- _extract_pids_from_ss_output() correctly parses ss -ltnp output
+- _kill_process_on_port() detects no process on unused ports
 - start_tts_server() kills zombies on the TTS port before spawning
 - start_tts_server() returns None when the spawned process exits immediately
   (port conflict / startup failure), instead of returning a dead Popen handle
 - _startup_launch_tts_server() calls start_tts_server() which does cleanup
 - _attempt_tts_self_heal() cleans up port before restart
+- _wait_for_port_release() uses safe in-process port holding instead of
+  spawning real subprocesses
+
+WARNING: No test in this file spawns or kills real OS subprocesses.
+All process-killing functions are fully mocked.
 """
 
 import asyncio
@@ -15,6 +21,7 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +31,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_free_port() -> int:
     """Return a currently unused TCP port on localhost."""
@@ -75,85 +83,252 @@ def _make_mock_server(tts_server_port=8081):
 
 
 # ---------------------------------------------------------------------------
-# Tests for _kill_process_on_port
+# Tests for _extract_pids_from_ss_output
 # ---------------------------------------------------------------------------
 
+
+class TestExtractPidsFromSsOutput:
+    """Unit tests for the ss output parsing function."""
+
+    def _call_fut(self, ss_output: str, port: int):
+        """Call the function under test (_extract_pids_from_ss_output)."""
+        from proxy.lifecycle import _extract_pids_from_ss_output
+        return _extract_pids_from_ss_output(ss_output, port)
+
+    def test_extracts_pid_when_port_present(self):
+        """Should extract PID when the port is present in ss output."""
+        ss_output = (
+            "LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:((\"python3\",pid=12345,fd=5))\n"
+            "LISTEN 0 128 127.0.0.53%lo:53 0.0.0.0:* users:((\"systemd-resolve\",pid=789,fd=13))"
+        )
+        pids = self._call_fut(ss_output, 8081)
+        assert pids == [12345], f"Expected [12345], got {pids}"
+
+    def test_returns_empty_list_when_port_not_present(self):
+        """Should return empty list when the port is not in ss output."""
+        ss_output = (
+            "LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:((\"python3\",pid=12345,fd=5))\n"
+            "LISTEN 0 128 127.0.0.53%lo:53 0.0.0.0:* users:((\"systemd-resolve\",pid=789,fd=13))"
+        )
+        pids = self._call_fut(ss_output, 9999)
+        assert pids == [], f"Expected empty list, got {pids}"
+
+    def test_extracts_multiple_pids_on_same_port(self):
+        """Should extract all PIDs when multiple processes share the port."""
+        ss_output = (
+            "LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:((\"python3\",pid=12345,fd=5))\n"
+            "LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:((\"python3\",pid=12346,fd=6))"
+        )
+        pids = self._call_fut(ss_output, 8081)
+        assert pids == [12345, 12346], f"Expected [12345, 12346], got {pids}"
+
+    def test_handles_malformed_lines_gracefully(self):
+        """Should skip malformed lines without raising."""
+        ss_output = (
+            "LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:((\"python3\",pid=12345,fd=5))\n"
+            "LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:((\"python3\",unknown_key=999,fd=5))\n"
+            "LISTEN 0 128 0.0.0.0:9999 0.0.0.0:* users:((\"sshd\",pid=0,fd=3))\n"
+        )
+        pids = self._call_fut(ss_output, 8081)
+        assert pids == [12345], f"Expected [12345], got {pids}"
+
+    def test_handles_empty_output(self):
+        """Should return empty list for empty ss output."""
+        pids = self._call_fut("", 8081)
+        assert pids == [], f"Expected empty list, got {pids}"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _kill_process_on_port (fully mocked, no real subprocesses)
+# ---------------------------------------------------------------------------
+
+
 class TestKillProcessOnPort:
-    """Tests for the port-based zombie process killer."""
+    """Tests for the port-based zombie process killer (fully mocked)."""
+
+    def test_kills_listening_process(self):
+        """Should kill a process identified as holding the port."""
+        from proxy.lifecycle import _kill_process_on_port
+
+        with patch("proxy.lifecycle._find_pid_on_port", return_value=12345) as mock_find:
+            with patch("os.kill") as mock_kill:
+                result = _kill_process_on_port(8081)
+
+        assert result is True, "Expected True when a PID is found and killed"
+        mock_find.assert_called_once_with(8081)
+        mock_kill.assert_called_once_with(12345, signal.SIGTERM)
 
     def test_returns_false_when_port_not_in_use(self):
         """Should return False when no process is listening on the port."""
         from proxy.lifecycle import _kill_process_on_port
 
-        free_port = _find_free_port()
-        result = _kill_process_on_port(free_port)
-        assert result is False, (
-            f"Expected False for unused port {free_port}, got {result}"
-        )
+        with patch("proxy.lifecycle._find_pid_on_port", return_value=None) as mock_find:
+            with patch("os.kill") as mock_kill:
+                result = _kill_process_on_port(8081)
 
-    def test_kills_listening_process(self):
-        """Should kill a simple process listening on a TCP port."""
+        assert result is False, "Expected False when no PID found"
+        mock_find.assert_called_once_with(8081)
+        mock_kill.assert_not_called()
+
+    def test_waits_for_port_release_after_kill(self):
+        """Should call _wait_for_port_release after killing the process."""
         from proxy.lifecycle import _kill_process_on_port
 
-        port = _find_free_port()
+        with patch("proxy.lifecycle._find_pid_on_port", return_value=12345):
+            with patch("os.kill"):
+                with patch("proxy.lifecycle._wait_for_port_release") as mock_wait:
+                    _kill_process_on_port(8081)
 
-        # Spawn a simple TCP listener using Python's socketserver
-        listener_proc = subprocess.Popen(
-            [
-                "python3", "-c",
-                rf"""
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', {port}))
-s.listen(1)
-# Signal ready by printing "listening"
-print("listening", flush=True)
-import time
-time.sleep(30)  # Stay alive until killed
-"""
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        mock_wait.assert_called_once()
+        args, _ = mock_wait.call_args
+        assert args[0] == 8081, f"Expected port 8081, got {args[0]}"
+
+    def test_handles_multiple_pids(self):
+        """Should kill all PIDs when multiple are returned."""
+        from proxy.lifecycle import _kill_process_on_port
+
+        with patch("proxy.lifecycle._find_pid_on_port", return_value=[12345, 12346]):
+            with patch("os.kill") as mock_kill:
+                _kill_process_on_port(8081)
+
+        assert mock_kill.call_count == 2
+        mock_kill.assert_any_call(12345, signal.SIGTERM)
+        mock_kill.assert_any_call(12346, signal.SIGTERM)
+
+    def test_handles_process_already_gone(self):
+        """Should not crash if process is already gone between detection and kill."""
+        from proxy.lifecycle import _kill_process_on_port
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError()
+
+        with patch("proxy.lifecycle._find_pid_on_port", return_value=12345):
+            with patch("os.kill", side_effect=fake_kill):
+                result = _kill_process_on_port(8081)
+
+        assert result is False, "Expected False when process already gone"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _wait_for_port_release (safe in-process port holding)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForPortRelease:
+    """Tests for the port release waiter using safe in-process socket holding."""
+
+    def test_returns_true_when_port_is_free(self):
+        """Should return True when the port is not in use."""
+        from proxy.lifecycle import _wait_for_port_release
+
+        free_port = _find_free_port()
+        result = _wait_for_port_release(free_port, timeout=2.0)
+        assert result is True, (
+            f"Expected True for free port {free_port}, got {result}"
         )
 
-        # Wait for the listener to be ready
-        line = listener_proc.stdout.readline() if listener_proc.stdout else ""
-        assert "listening" in line, f"Listener did not start: {line}"
+    def test_returns_false_when_port_stays_busy(self):
+        """Should return False when the port remains in use (in-process socket bind)."""
+        from proxy.lifecycle import _wait_for_port_release
 
-        # Verify port is in use
-        sock_check = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        port = _find_free_port()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
         try:
-            result = sock_check.connect_ex(("127.0.0.1", port))
-            assert result == 0, f"Port {port} should be in use, connect_ex={result}"
+            result = _wait_for_port_release(port, timeout=0.5, interval=0.1)
+            assert result is False, (
+                f"Expected False for busy port {port}, got {result}"
+            )
         finally:
-            sock_check.close()
+            s.close()
 
-        # Kill the process via _kill_process_on_port
-        result = _kill_process_on_port(port)
+    def test_returns_true_after_port_becomes_free(self):
+        """Should return True after the port is released (timer closes socket)."""
+        from proxy.lifecycle import _wait_for_port_release
 
-        assert result is True, f"Expected True (killed), got {result}"
+        port = _find_free_port()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
 
-        # Give the kill time to take effect
-        time.sleep(0.5)
+        def release():
+            s.close()
 
-        # Verify port is now free
-        sock_check2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        t = threading.Timer(0.3, release)
+        t.daemon = True
+        t.start()
+
         try:
-            result2 = sock_check2.connect_ex(("127.0.0.1", port))
-            assert result2 != 0, f"Port {port} should be free after kill"
+            result = _wait_for_port_release(port, timeout=3.0, interval=0.1)
+            assert result is True, (
+                f"Expected True after port released, got {result}"
+            )
         finally:
-            sock_check2.close()
+            t.cancel()
+            try:
+                s.close()
+            except OSError:
+                pass
 
-        # Clean up
-        listener_proc.kill()
-        listener_proc.wait(timeout=2)
+    def test_port_available_for_rebind_after_release(self):
+        """After _wait_for_port_release returns True, a new socket can bind."""
+        from proxy.lifecycle import _wait_for_port_release
+
+        port = _find_free_port()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+
+        def release():
+            s.close()
+
+        t = threading.Timer(0.3, release)
+        t.daemon = True
+        t.start()
+
+        try:
+            assert _wait_for_port_release(port, timeout=3.0, interval=0.1), "Port did not release"
+            s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s2.bind(("127.0.0.1", port))
+            finally:
+                s2.close()
+        finally:
+            t.cancel()
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def test_short_timeout_on_busy_port(self):
+        """Very short timeout on a busy port should return False quickly."""
+        from proxy.lifecycle import _wait_for_port_release
+
+        port = _find_free_port()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        try:
+            start = time.monotonic()
+            result = _wait_for_port_release(port, timeout=0.3, interval=0.1)
+            elapsed = time.monotonic() - start
+
+            assert result is False, "Should return False for busy port"
+            assert elapsed < 2.0, f"Took too long: {elapsed:.2f}s"
+        finally:
+            s.close()
 
 
 # ---------------------------------------------------------------------------
 # Tests for start_tts_server spawn verification
 # ---------------------------------------------------------------------------
+
 
 class TestStartTtsServerSpawnVerification:
     """Tests that start_tts_server verifies the spawned process."""
@@ -189,9 +364,6 @@ class TestStartTtsServerSpawnVerification:
 
         srv = _make_mock_server(tts_server_port=_find_free_port())
 
-        # Mock Popen returning a process that stays alive.
-        # The mock has .poll() return None (alive) and .wait() raise
-        # TimeoutExpired to simulate a process that stays running.
         mock_proc = MagicMock(spec=subprocess.Popen)
         mock_proc.poll = MagicMock(return_value=None)  # Still running
         mock_proc.pid = 12345
@@ -218,10 +390,8 @@ class TestStartTtsServerSpawnVerification:
         from proxy.lifecycle import start_tts_server
 
         srv = _make_mock_server(tts_server_port=_find_free_port())
-        # Override the script path to a non-existent file
         srv.config["server"]["tts_start_script"] = "/nonexistent/start-qwentts.sh"
 
-        # Do NOT mock os.path.isfile so it actually checks the filesystem
         with patch("proxy.lifecycle._srv", return_value=srv):
             with patch("proxy.lifecycle._kill_process_on_port", return_value=False):
                 result = start_tts_server()
@@ -267,6 +437,7 @@ class TestStartTtsServerSpawnVerification:
 # Tests for _startup_launch_tts_server
 # ---------------------------------------------------------------------------
 
+
 class TestStartupLaunchTtsServer:
     """Tests for startup TTS server launch with zombie cleanup."""
 
@@ -298,7 +469,6 @@ class TestStartupLaunchTtsServer:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        # We just verify it doesn't crash
         server_mod.tts_process = None
 
     @pytest.mark.asyncio
@@ -323,9 +493,6 @@ class TestStartupLaunchTtsServer:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        # Verify a warning was logged about TTS server failing to start
-        # (The actual assertions are hard to make deterministic in async;
-        #  we just verify no crash and tts_process remains None)
         assert server_mod.tts_process is None
         server_mod.tts_process = None
 
@@ -333,6 +500,7 @@ class TestStartupLaunchTtsServer:
 # ---------------------------------------------------------------------------
 # Tests for _attempt_tts_self_heal port cleanup
 # ---------------------------------------------------------------------------
+
 
 class TestTtsSelfHealPortCleanup:
     """Tests that _attempt_tts_self_heal cleans up port before restart."""
@@ -347,7 +515,6 @@ class TestTtsSelfHealPortCleanup:
         port_cleaned = [False]
 
         def fake_start_tts():
-            # Verify port was cleaned
             return None
 
         with patch("proxy.backends.tts._srv", return_value=srv):
@@ -358,65 +525,4 @@ class TestTtsSelfHealPortCleanup:
                             with patch("proxy.backend_health._get_tts_self_heal_window", return_value=120):
                                 result = await _attempt_tts_self_heal()
 
-        # Function should complete without error
         assert result is not None
-
-
-# ---------------------------------------------------------------------------
-# Tests for _wait_for_port_release interop
-# ---------------------------------------------------------------------------
-
-class TestWaitForPortRelease:
-    """Tests for the port release waiter used in restart_services."""
-
-    def test_returns_true_when_port_is_free(self):
-        """Should return True when the port is not in use."""
-        from proxy.lifecycle import _wait_for_port_release
-
-        free_port = _find_free_port()
-        result = _wait_for_port_release(free_port, timeout=2.0)
-        assert result is True, (
-            f"Expected True for free port {free_port}, got {result}"
-        )
-
-    def test_returns_true_after_port_becomes_free(self):
-        """Should return True after the port is released."""
-        from proxy.lifecycle import _wait_for_port_release
-
-        port = _find_free_port()
-
-        # Start a listener, then kill it after a delay
-        listener_proc = subprocess.Popen(
-            [
-                "python3", "-c",
-                rf"""
-import socket, threading, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', {port}))
-s.listen(1)
-print("listening", flush=True)
-# Close after 0.7s via timer
-def close():
-    s.close()
-    print("closed", flush=True)
-t = threading.Timer(0.7, close)
-t.daemon = True
-t.start()
-time.sleep(10)
-""" ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        line = listener_proc.stdout.readline() if listener_proc.stdout else ""
-        assert "listening" in line, f"Listener did not start: {line}"
-
-        # Wait for port release
-        result = _wait_for_port_release(port, timeout=3.0)
-
-        assert result is True, f"Expected True after port released, got {result}"
-
-        listener_proc.kill()
-        listener_proc.wait(timeout=2)
