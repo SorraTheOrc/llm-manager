@@ -41,7 +41,7 @@ class SlotScheduleConfig:
     """
 
     enabled: bool = False
-    drain_minutes: int = 15
+    drain_minutes: int = 3  # LP-0MS6OD1G90023F0A: reduced from 15 to 3 (180 seconds)
     entries: list[SlotScheduleEntry] = field(default_factory=list)
 
     def __init__(self, raw: dict[str, Any] | None):
@@ -52,7 +52,7 @@ class SlotScheduleConfig:
 
             slot_schedule:
               enabled: true
-              drain_minutes: 15
+              drain_minutes: 3
               entries:
                 - time: "10:00"
                   slots: 4
@@ -63,12 +63,12 @@ class SlotScheduleConfig:
         """
         if not raw or not isinstance(raw, dict):
             self.enabled = False
-            self.drain_minutes = 15
+            self.drain_minutes = 3  # LP-0MS6OD1G90023F0A: reduced from 15 to 3
             self.entries = []
             return
 
         self.enabled = bool(raw.get("enabled", False))
-        self.drain_minutes = int(raw.get("drain_minutes", 15) or 15)
+        self.drain_minutes = int(raw.get("drain_minutes", 3) or 3)  # LP-0MS6OD1G90023F0A: reduced from 15 to 3
         self.entries = []
 
         raw_entries = raw.get("entries", [])

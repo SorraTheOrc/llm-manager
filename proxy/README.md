@@ -710,7 +710,7 @@ Add a `slot_schedule` section under `server:` in `config.yaml`:
 server:
   slot_schedule:
     enabled: true
-    drain_minutes: 15
+    drain_minutes: 3
     entries:
       - time: "10:00"
         slots: 4
@@ -721,7 +721,7 @@ server:
 | Field | Description |
 |-------|-------------|
 | `enabled` | Set to `true` to activate the schedule. When `false` or absent, the feature is disabled and the static `session_slot_pool_size` value is used (backward compatible). |
-| `drain_minutes` | Duration (in minutes) before a transition during which the proxy drains in-flight workloads and refuses new requests. Default: 15. |
+| `drain_minutes` | Duration (in minutes) before a transition during which the proxy drains in-flight workloads and refuses new requests. Default: 3 (reduced from 15 per LP-0MS6OD1G90023F0A). |
 | `entries` | List of time-to-slot mappings. Each entry has a `time` (HH:MM format) and a `slots` value. Entries are sorted chronologically. |
 
 #### How It Works

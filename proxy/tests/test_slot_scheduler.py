@@ -108,7 +108,7 @@ class TestSlotScheduleConfig:
 
         cfg = SlotScheduleConfig({})
         assert cfg.enabled is False  # disabled by default
-        assert cfg.drain_minutes == 15
+        assert cfg.drain_minutes == 3
         assert len(cfg.entries) == 0
 
     def test_parse_defaults_on_none(self):
@@ -117,8 +117,37 @@ class TestSlotScheduleConfig:
 
         cfg = SlotScheduleConfig(None)
         assert cfg.enabled is False
-        assert cfg.drain_minutes == 15
+        assert cfg.drain_minutes == 3  # LP-0MS6OD1G90023F0A: reduced from 15 to 3
         assert len(cfg.entries) == 0
+
+    def test_default_drain_minutes_is_3_minutes(self):
+        """Verify the default drain window is 180 seconds (3 minutes).
+
+        LP-0MS6OD1G90023F0A: reduced from 15 to 3 to speed up slot-count
+        transition restarts while still allowing in-flight streams to finish.
+        """
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        # No drain_minutes specified — should default to 3
+        cfg = SlotScheduleConfig({"enabled": True, "entries": []})
+        assert cfg.drain_minutes == 3, (
+            f"Expected default drain_minutes=3, got {cfg.drain_minutes}"
+        )
+
+        # Full end-to-end: parse from server config without drain_minutes
+        cfg2 = SlotScheduleConfig({
+            "enabled": True,
+            "entries": [{"time": "12:00", "slots": 8}]
+        })
+        assert cfg2.drain_minutes == 3
+
+        # Explicit value of 15 must still work (backward compatibility)
+        cfg3 = SlotScheduleConfig({
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [{"time": "12:00", "slots": 8}]
+        })
+        assert cfg3.drain_minutes == 15
 
     def test_from_server_config(self, sample_schedule):
         """Verify from_server_config extracts slot_schedule from server config."""
@@ -127,7 +156,7 @@ class TestSlotScheduleConfig:
         server_cfg = {"slot_schedule": sample_schedule}
         cfg = SlotScheduleConfig.from_server_config(server_cfg)
         assert cfg.enabled is True
-        assert cfg.drain_minutes == 15
+        assert cfg.drain_minutes == 15  # explicit value in sample_schedule
         assert len(cfg.entries) == 2
 
     def test_from_server_config_no_schedule(self):
@@ -150,7 +179,7 @@ class TestSlotScheduleConfig:
 
         schedule = {
             "enabled": True,
-            "drain_minutes": 15,
+            "drain_minutes": 3,
             "entries": [
                 {"time": "not-a-time", "slots": 4},
                 {"time": "25:00", "slots": 8},
@@ -563,12 +592,14 @@ class TestSlotScheduler:
         scheduler = SlotScheduler(mock_srv)
         scheduler.set_pending_restart(8)
         # At 12:00 exactly, transition time
-        with patch.object(scheduler, '_now', return_value=dt_time(12, 0)):
-            await scheduler._run_check_cycle()
-            # Restart should have happened
-            mock_srv.restart_services.assert_called_once_with(
-                slot_count=8, reason="scheduled_slot_change"
-            )
+        now_dt = datetime(2026, 7, 23, 12, 0, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                await scheduler._run_check_cycle()
+                # Restart should have happened
+                mock_srv.restart_services.assert_called_once_with(
+                    slot_count=8, reason="scheduled_slot_change"
+                )
 
     @pytest.mark.asyncio
     async def test_run_cycle_disabled_schedule_noop(self, disabled_schedule):

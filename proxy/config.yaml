@@ -330,7 +330,7 @@ server:
   # Fields:
   #   enabled:        Set to true to activate scheduling.
   #   drain_minutes:  How long before a transition to start refusing new
-  #                   requests and drain in-flight workloads (default: 15).
+  #                   requests and drain in-flight workloads (default: 3).
   #   entries:        List of transition rules. Each entry has:
   #     time:         "HH:MM" format (24-hour). The time at which the new
   #                   slot count becomes active.
@@ -340,7 +340,7 @@ server:
   # Example (peak hours 10:00-11:59 = 4 slots, off-peak = 8):
   #   slot_schedule:
   #     enabled: true
-  #     drain_minutes: 15
+  #     drain_minutes: 3
   #     entries:
   #       - time: "10:00"
   #         slots: 4
@@ -351,7 +351,7 @@ server:
   # (no unnecessary restart). Midnight wrapping is supported.
   slot_schedule:
     enabled: true
-    drain_minutes: 15
+    drain_minutes: 3
     entries:
       - time: "23:59"
         slots: 8
