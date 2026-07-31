@@ -354,6 +354,28 @@ async def proxy_to_remote(
         )
 
 
+def _delta_has_content(delta: dict) -> bool:
+    """True if a stream delta carries meaningful output.
+
+    Counts non-empty ``content``, a non-empty ``tool_calls`` list, and
+    non-empty ``reasoning_content`` as content so that tool-call-only and
+    reasoning-only streams are not misclassified as empty responses
+    (LP-0MS8XAPXT009W3CL).
+    """
+    if not isinstance(delta, dict):
+        return False
+    c = delta.get("content")
+    if isinstance(c, str) and c.strip():
+        return True
+    tc = delta.get("tool_calls")
+    if isinstance(tc, list) and tc:
+        return True
+    rc = delta.get("reasoning_content")
+    if isinstance(rc, str) and rc.strip():
+        return True
+    return False
+
+
 async def _handle_remote_streaming(
     request: Request,
     target_url: str,
@@ -522,7 +544,12 @@ async def _handle_remote_streaming(
         saw_done = False
         saw_finish = False
         # Content tracking for empty-response detection (LP-0MRF77A0E0026B9T)
+        # _has_content is set when a chunk carries meaningful output: non-empty
+        # content, tool_calls, or reasoning_content (LP-0MS8XAPXT009W3CL).
         _has_content = False
+        # Diagnostic flags for empty-retry logging (LP-0MS8XAPXT009W3CL)
+        _saw_tool_calls = False
+        _saw_reasoning = False
         # Client disconnect detection (LP-0MQTHP828000JYM6)
         disconnected = False
         _disconnect_check_count = 0
@@ -562,12 +589,15 @@ async def _handle_remote_streaming(
                 try:
                     _srv().logger.info(
                         "Empty response detected on stream attempt %s/%s, "
-                        "retrying in %.2fs (provider=%s model=%s)",
+                        "retrying in %.2fs (provider=%s model=%s "
+                        "saw_tool_calls=%s saw_reasoning=%s)",
                         _empty_retry_count,
                         empty_max_attempts + 1,
                         empty_base_delay,
                         provider or "remote",
                         model_name,
+                        _saw_tool_calls,
+                        _saw_reasoning,
                     )
                 except Exception:
                     pass
@@ -632,11 +662,14 @@ async def _handle_remote_streaming(
                 try:
                     _srv().logger.warning(
                         "Empty upstream response: max retries exhausted "
-                        "session=%s provider=%s model=%s retries=%d",
+                        "session=%s provider=%s model=%s retries=%d "
+                        "saw_tool_calls=%s saw_reasoning=%s",
                         session_id or "unknown",
                         provider or "remote",
                         model_name,
                         _empty_retry_count,
+                        _saw_tool_calls,
+                        _saw_reasoning,
                     )
                 except Exception:
                     pass
@@ -809,11 +842,22 @@ async def _handle_remote_streaming(
                                         saw_finish = True
                                 for choice in j.get("choices", []):
                                     delta = choice.get("delta", {})
+                                    if _delta_has_content(delta):
+                                        _has_content = True
+                                    # Token counting for text content remains
+                                    # unchanged (content only).
                                     if isinstance(delta, dict) and "content" in delta:
                                         d_content = delta.get("content")
                                         if d_content is not None and d_content != "":
-                                            _has_content = True
                                             texts.append(str(d_content))
+                                    # Track tool_calls/reasoning separately for
+                                    # empty-retry diagnostics (LP-0MS8XAPXT009W3CL).
+                                    if isinstance(delta, dict) and delta.get("tool_calls"):
+                                        _saw_tool_calls = True
+                                    if isinstance(delta, dict):
+                                        _rc = delta.get("reasoning_content")
+                                        if isinstance(_rc, str) and _rc.strip():
+                                            _saw_reasoning = True
                             except Exception:
                                 texts.append(payload)
                         if texts:
