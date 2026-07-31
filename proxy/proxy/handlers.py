@@ -482,7 +482,14 @@ async def health_check():
     llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
     backend_reachable = bool(llama_running and await srv._probe_backend_reachable(llama_port))
     self_healing = srv._is_self_healing_active()
-    ready = bool(llama_running and srv.backend_ready and backend_reachable and not self_healing)
+    gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
+    ready = bool(
+        llama_running
+        and srv.backend_ready
+        and backend_reachable
+        and not self_healing
+        and not gpu_wedge_detected
+    )
 
     # -- TTS health fields -------------------------------------------------
     tts_enabled = bool(server_cfg.get("tts_enabled", True))
@@ -507,6 +514,10 @@ async def health_check():
         "llama_server_running": llama_running,
         "backend_reachable": backend_reachable,
         "self_healing_in_progress": self_healing,
+        "gpu_wedge_detected": gpu_wedge_detected,
+        "gpu_wedge_signal_count": int(
+            srv.backend_signal_counts.get("gpu_wedge", 0) or 0
+        ),
         "backend_recovery": srv._backend_recovery_snapshot(),
         "backend_signals": dict(srv.backend_signal_counts),
         "tts_enabled": tts_enabled,

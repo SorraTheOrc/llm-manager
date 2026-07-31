@@ -59,6 +59,7 @@ backend_signal_counts: dict = {
     "timeout_failures": 0,
     "other_failures": 0,
     "concurrency_rejects": 0,
+    "gpu_wedge": 0,
 }
 
 

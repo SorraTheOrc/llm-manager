@@ -8,6 +8,7 @@ backend_health module.
 """
 
 import asyncio
+import subprocess
 import time
 
 import httpx
@@ -19,6 +20,96 @@ import httpx
 def _srv():
     from ..backend_health import _srv as _shared_srv
     return _shared_srv()
+
+
+# ===================================================================
+# GPU-wedge detection (LP-0MS91DHQ9003EGB0)
+#
+# A wedged llama-server is still HTTP-reachable but its GPU kernels never
+# complete: the GPU reads ~100% busy while every slot is idle and no tokens
+# are produced. The existing watchdog/health probes only catch dead or
+# unreachable workers, so the wedge was invisible to self-healing. Detection
+# is proxy-side only (no llama.cpp changes):
+#
+#   signature = gpu_busy_percent >= threshold AND all slots idle
+#
+# sustained for ``llama_gpu_wedge_idle_checks_required`` consecutive health
+# loop iterations. GPU busy is read from sysfs (AMD) with a rocm-smi
+# fallback; when neither is available detection is skipped.
+# ===================================================================
+
+
+def _gpu_busy_percent_sysfs() -> float | None:
+    """Read GPU busy % from sysfs (AMD gfx cards). None when unavailable."""
+    try:
+        with open("/sys/class/drm/card0/device/gpu_busy_percent") as f:
+            val = f.read().strip()
+        return float(val)
+    except Exception:
+        return None
+
+
+def _gpu_busy_percent_rocm_smi() -> float | None:
+    """Fallback: parse ``rocm-smi --showuse`` output. None when unavailable."""
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "--showuse"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        ).stdout
+        for line in out.splitlines():
+            if "GPU use (%)" in line:
+                val = line.split(":")[-1].strip().rstrip("%")
+                return float(val)
+    except Exception:
+        return None
+    return None
+
+
+def _read_gpu_busy_percent() -> float | None:
+    """Best-effort GPU busy %: sysfs first, then rocm-smi."""
+    val = _gpu_busy_percent_sysfs()
+    if val is None:
+        val = _gpu_busy_percent_rocm_smi()
+    return val
+
+
+def _slots_all_idle(slots_payload) -> bool:
+    """True when every slot in a /slots payload reports is_processing == False."""
+    if not isinstance(slots_payload, list):
+        return False
+    if not slots_payload:
+        return True
+    return all(
+        not bool(s.get("is_processing"))
+        for s in slots_payload
+        if isinstance(s, dict)
+    )
+
+
+def _gpu_wedge_signature(busy_percent: float | None, slots_idle: bool, threshold: float) -> bool:
+    """True when the wedge signature is present: high GPU busy + all slots idle."""
+    return busy_percent is not None and slots_idle and busy_percent >= threshold
+
+
+async def _probe_gpu_wedge(
+    host: str, port: int, timeout: float = 5.0
+) -> tuple[float | None, bool]:
+    """Return ``(gpu_busy_percent, all_slots_idle)`` for a model instance."""
+    busy = _read_gpu_busy_percent()
+    slots_idle = False
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        try:
+            resp = await client.get(f"http://{host}:{port}/slots", timeout=timeout)
+            if resp.status_code == 200:
+                slots_idle = _slots_all_idle(resp.json())
+        finally:
+            await client.aclose()
+    except Exception:
+        pass
+    return busy, slots_idle
 
 
 # ===================================================================
@@ -276,6 +367,50 @@ async def _backend_watchdog_loop() -> None:
 # Router model health monitoring
 # ===================================================================
 
+async def _unload_and_reload_model(
+    srv,
+    router_host: str,
+    router_port: int,
+    model_id: str,
+    reason: str,
+) -> bool:
+    """Unload and reload a model instance (shared by unreachable and GPU-wedge recovery)."""
+    srv.logger.info("model_health: unloading model %s (%s)", model_id, reason)
+    try:
+        client = (
+            srv._http_client if srv._http_client else httpx.AsyncClient(timeout=10.0)
+        )
+        try:
+            await client.post(
+                f"http://{router_host}:{router_port}/models/unload",
+                json={"model": model_id},
+                timeout=10.0,
+            )
+        finally:
+            if not srv._http_client:
+                await client.aclose()
+    except Exception as exc:
+        srv.logger.warning(
+            "model_health: unload request for %s failed: %s",
+            model_id,
+            exc,
+        )
+
+    srv.logger.info("model_health: reloading model %s", model_id)
+    loaded = await srv.router_load_model(model_id)
+    if loaded:
+        srv.logger.info(
+            "model_health: successfully reloaded model %s",
+            model_id,
+        )
+    else:
+        srv.logger.error(
+            "model_health: failed to reload model %s",
+            model_id,
+        )
+    return bool(loaded)
+
+
 async def _router_model_health_loop() -> None:
     """Periodically check loaded models' reachability in router mode.
 
@@ -299,6 +434,8 @@ async def _router_model_health_loop() -> None:
     consecutive_failures: dict[str, int] = {}
     observed_ports: dict[str, int] = {}
     port_first_seen_at: dict[str, float] = {}
+    wedge_checks: dict[str, int] = {}
+    gpu_wedge_source_logged = False
 
     while True:
         try:
@@ -347,6 +484,22 @@ async def _router_model_health_loop() -> None:
                 _coerce_float(
                     server_cfg.get("llama_model_health_grace_period_seconds", 15.0),
                     15.0,
+                ),
+            )
+
+            # GPU-wedge detection configuration (LP-0MS91DHQ9003EGB0)
+            gpu_wedge_enabled = bool(
+                server_cfg.get("llama_gpu_wedge_detection_enabled", True)
+            )
+            gpu_wedge_busy_threshold = _coerce_float(
+                server_cfg.get("llama_gpu_wedge_busy_threshold_percent", 90.0),
+                90.0,
+            )
+            gpu_wedge_idle_checks = max(
+                1,
+                _coerce_int(
+                    server_cfg.get("llama_gpu_wedge_idle_checks_required", 2),
+                    2,
                 ),
             )
 
@@ -440,6 +593,71 @@ async def _router_model_health_loop() -> None:
                             consecutive_failures.get(model_id, 0),
                         )
                     consecutive_failures[model_id] = 0
+
+                    # GPU-wedge detection: the instance is reachable but the GPU
+                    # may be wedged (busy with idle slots, no progress).
+                    # Skip embeddings instances and when no GPU busy source exists.
+                    if gpu_wedge_enabled and "--embeddings" not in args:
+                        busy_pct, slots_idle = await _probe_gpu_wedge(
+                            router_host, port, timeout=probe_timeout
+                        )
+                        if busy_pct is None:
+                            if not gpu_wedge_source_logged:
+                                srv.logger.warning(
+                                    "model_health: GPU busy source unavailable "
+                                    "(no sysfs gpu_busy_percent, no rocm-smi); "
+                                    "GPU-wedge detection disabled"
+                                )
+                                gpu_wedge_source_logged = True
+                        elif _gpu_wedge_signature(busy_pct, slots_idle, gpu_wedge_busy_threshold):
+                            count = wedge_checks.get(model_id, 0) + 1
+                            wedge_checks[model_id] = count
+                            if count >= gpu_wedge_idle_checks:
+                                srv.logger.error(
+                                    "model_health: GPU wedge detected for model %s "
+                                    "(port %d): gpu_busy=%.0f%% with all slots idle "
+                                    "for %d consecutive check(s); triggering recovery",
+                                    model_id,
+                                    port,
+                                    busy_pct,
+                                    count,
+                                )
+                                srv._record_backend_signal("gpu_wedge")
+                                srv.gpu_wedge_detected = True
+                                srv.gpu_wedge_detected_at = time.time()
+                                srv.gpu_wedge_last_model = model_id
+                                await _unload_and_reload_model(
+                                    srv,
+                                    router_host,
+                                    router_port,
+                                    model_id,
+                                    reason=f"gpu_wedge (busy {busy_pct:.0f}%)",
+                                )
+                                wedge_checks[model_id] = 0
+                                port_first_seen_at[model_id] = time.time()
+                            else:
+                                srv.logger.warning(
+                                    "model_health: possible GPU wedge for model %s "
+                                    "(port %d): gpu_busy=%.0f%% with all slots idle "
+                                    "(%d/%d checks)",
+                                    model_id,
+                                    port,
+                                    busy_pct,
+                                    count,
+                                    gpu_wedge_idle_checks,
+                                )
+                        else:
+                            wedge_checks[model_id] = 0
+                            if getattr(srv, "gpu_wedge_detected", False):
+                                srv.logger.info(
+                                    "model_health: GPU wedge cleared for model %s "
+                                    "(gpu_busy=%.0f%%)",
+                                    model_id,
+                                    busy_pct if busy_pct is not None else -1.0,
+                                )
+                                srv.gpu_wedge_detected = False
+                                srv.gpu_wedge_detected_at = None
+                                srv.gpu_wedge_last_model = None
                     continue
 
                 failure_count = consecutive_failures.get(model_id, 0) + 1
@@ -462,41 +680,13 @@ async def _router_model_health_loop() -> None:
                     failure_count,
                 )
 
-                srv.logger.info("model_health: unloading dead model %s", model_id)
-                try:
-                    client = (
-                        srv._http_client
-                        if srv._http_client
-                        else httpx.AsyncClient(timeout=10.0)
-                    )
-                    try:
-                        await client.post(
-                            f"http://{router_host}:{router_port}/models/unload",
-                            json={"model": model_id},
-                            timeout=10.0,
-                        )
-                    finally:
-                        if not srv._http_client:
-                            await client.aclose()
-                except Exception as exc:
-                    srv.logger.warning(
-                        "model_health: unload request for %s failed: %s",
-                        model_id,
-                        exc,
-                    )
-
-                srv.logger.info("model_health: reloading model %s", model_id)
-                loaded = await srv.router_load_model(model_id)
-                if loaded:
-                    srv.logger.info(
-                        "model_health: successfully reloaded model %s",
-                        model_id,
-                    )
-                else:
-                    srv.logger.error(
-                        "model_health: failed to reload model %s",
-                        model_id,
-                    )
+                await _unload_and_reload_model(
+                    srv,
+                    router_host,
+                    router_port,
+                    model_id,
+                    reason="unreachable",
+                )
 
                 # Reset counters and re-apply grace period after recovery attempt
                 consecutive_failures[model_id] = 0

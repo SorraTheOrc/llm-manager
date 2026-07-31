@@ -227,6 +227,19 @@ server:
   llama_model_health_probe_timeout_seconds: 5
   llama_model_health_probe_backoff_seconds: 0.5
   llama_model_health_grace_period_seconds: 15
+  # --- GPU-wedge self-healing (LP-0MS91DHQ9003EGB0) ---
+  # A wedged llama-server is still HTTP-reachable but its GPU kernels never
+  # complete (GPU ~100% busy with all slots idle, no tokens produced). The
+  # model-health loop detects this signature and unloads/reloads the model.
+  # Detection reads gpu_busy_percent from sysfs (AMD) with a rocm-smi
+  # fallback; when neither is available detection is skipped.
+  # Enables/disables the wedge check entirely.
+  llama_gpu_wedge_detection_enabled: true
+  # GPU busy % at or above which the GPU is considered busy.
+  llama_gpu_wedge_busy_threshold_percent: 90
+  # Consecutive health-loop checks with the wedge signature before recovery.
+  # With the default 10s interval, 2 checks bounds detection to ~20-30s.
+  llama_gpu_wedge_idle_checks_required: 2
   llama_model_load_timeout: 600
   llama_models_max: 2
   llama_request_timeout: 1500
