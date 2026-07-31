@@ -16,6 +16,7 @@ from proxy.session import (
     _restore_slot_snapshot,
     _save_slot_snapshot,
     _slot_filename_for_session,
+    _slot_failure_state,
     _slot_id_for_session,
     _slot_persistence_enabled,
 )
@@ -179,6 +180,81 @@ class TestBuildSlotContext:
         _, _, timeout = _build_slot_context(config, "test-session")
         assert timeout == 3.0
 
+    def test_large_context_skips_persistence(self):
+        """Contexts above session_slot_max_prompt_tokens skip persistence."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_prompt_tokens": 100,
+        }
+        body = {"messages": [{"role": "user", "content": "x" * 20000}]}  # ~5000 tokens
+        slot_id, filename, _ = _build_slot_context(config, "test-session", body)
+        assert slot_id is None
+        assert filename is None
+
+    def test_small_context_persists(self):
+        """Contexts within session_slot_max_prompt_tokens persist normally."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_prompt_tokens": 100,
+        }
+        body = {"messages": [{"role": "user", "content": "hi"}]}  # ~1 token
+        slot_id, filename, _ = _build_slot_context(config, "test-session", body)
+        assert slot_id is not None
+        assert filename is not None
+
+    def test_adaptive_timeout_scales_with_context(self):
+        """Timeout scales with context when per-token add-on is configured."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_timeout_seconds": 3.0,
+            "session_slot_timeout_per_token_seconds": 0.001,
+            "session_slot_max_timeout_seconds": 60.0,
+        }
+        body = {"messages": [{"role": "user", "content": "x" * 20000}]}  # ~5000 tokens
+        _, _, timeout = _build_slot_context(config, "test-session", body)
+        assert timeout > 3.0
+        assert timeout <= 60.0
+
+    def test_circuit_breaker_disables_slot(self):
+        """A slot in failure cooldown has persistence skipped."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_consecutive_failures": 3,
+            "session_slot_failure_cooldown_seconds": 300,
+        }
+        # Fresh session maps to the lowest free slot (0); trip the breaker
+        slot_id, _, _ = _build_slot_context(config, "breaker-session")
+        assert slot_id is not None
+        _slot_failure_state[slot_id] = (3, __import__("time").time())
+        try:
+            s2, f2, _ = _build_slot_context(config, "breaker-session")
+            assert s2 is None
+            assert f2 is None
+        finally:
+            _slot_failure_state.pop(slot_id, None)
+
+    def test_circuit_breaker_resets_after_cooldown(self):
+        """A slot whose cooldown expired is allowed to persist again."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_consecutive_failures": 3,
+            "session_slot_failure_cooldown_seconds": 300,
+        }
+        slot_id, _, _ = _build_slot_context(config, "breaker-session-2")
+        assert slot_id is not None
+        _slot_failure_state[slot_id] = (3, __import__("time").time() - 400)
+        try:
+            s2, f2, _ = _build_slot_context(config, "breaker-session-2")
+            assert s2 is not None
+            assert f2 is not None
+        finally:
+            _slot_failure_state.pop(slot_id, None)
+
 
 # ===================================================================
 # _save_slot_snapshot / _restore_slot_snapshot (with mock backend)
@@ -257,6 +333,80 @@ class TestSlotSaveRestoreMocked:
                 timeout=3.0,
             )
             assert result is False
+
+    @pytest.mark.asyncio
+    async def test_http_failure_feeds_circuit_breaker(self):
+        """A non-200 response records a slot failure for the circuit breaker."""
+        with patch("proxy.session.httpx.AsyncClient") as mock_client_cls:
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 500
+            mock_resp.text = "boom"
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            _slot_failure_state.pop(7, None)
+            try:
+                result = await _save_slot_snapshot(
+                    llama_port=8080,
+                    slot_id=7,
+                    filename="/tmp/slots/test.bin",
+                    timeout=3.0,
+                )
+                assert result is False
+                count, _ = _slot_failure_state.get(7, (0, 0.0))
+                assert count == 1
+            finally:
+                _slot_failure_state.pop(7, None)
+
+    @pytest.mark.asyncio
+    async def test_timeout_feeds_circuit_breaker(self):
+        """A ReadTimeout exception records a slot failure for the circuit breaker."""
+        import httpx
+
+        with patch("proxy.session.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(
+                side_effect=httpx.ReadTimeout("ReadTimeout")
+            )
+            mock_client_cls.return_value = mock_client
+
+            _slot_failure_state.pop(8, None)
+            try:
+                result = await _save_slot_snapshot(
+                    llama_port=8080,
+                    slot_id=8,
+                    filename="/tmp/slots/test.bin",
+                    timeout=3.0,
+                )
+                assert result is False
+                count, _ = _slot_failure_state.get(8, (0, 0.0))
+                assert count == 1
+            finally:
+                _slot_failure_state.pop(8, None)
+
+    @pytest.mark.asyncio
+    async def test_success_resets_circuit_breaker(self):
+        """A successful save clears the slot's failure state."""
+        with patch("proxy.session.httpx.AsyncClient") as mock_client_cls:
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 200
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            _slot_failure_state[9] = (2, 0.0)
+            try:
+                result = await _save_slot_snapshot(
+                    llama_port=8080,
+                    slot_id=9,
+                    filename="/tmp/slots/test.bin",
+                    timeout=3.0,
+                )
+                assert result is True
+                assert 9 not in _slot_failure_state
+            finally:
+                _slot_failure_state.pop(9, None)
 
     @pytest.mark.asyncio
     async def test_save_with_model_payload(self):

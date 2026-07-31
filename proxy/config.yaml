@@ -359,6 +359,22 @@ server:
         slots: 4
 
   session_slot_timeout_seconds: 3.0
+  # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
+  # Skip slot save/restore when the request context exceeds this many
+  # estimated tokens. llama-server serializes the whole KV cache on save,
+  # so large contexts ReadTimeout and can wedge the GPU. 0 disables the
+  # check (persistence is attempted for every context size).
+  session_slot_max_prompt_tokens: 12288
+  # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
+  # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
+  # 0 disables the add-on (fixed timeout only).
+  session_slot_timeout_per_token_seconds: 0.001
+  session_slot_max_timeout_seconds: 60
+  # Circuit breaker: after this many consecutive save/restore failures for
+  # a slot, stop issuing persistence calls for that slot until the cooldown
+  # expires. Prevents piling doomed KV-cache copies onto a wedged GPU.
+  session_slot_max_consecutive_failures: 3
+  session_slot_failure_cooldown_seconds: 300
   slot_unavailable_retry_after: 5
   session_guardrail_max_runtime_seconds: 1800
   session_guardrail_max_completion_tokens: 16384

@@ -549,7 +549,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Use hash-based slot context (dispatch lease system handles concurrency gating)
     slot_id, slot_filename, slot_timeout = _build_slot_context(
-        server_config, session_id
+        server_config, session_id, body_json
     )
     slot_enabled = slot_id is not None and slot_filename is not None
 
