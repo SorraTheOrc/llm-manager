@@ -1076,6 +1076,27 @@ async def test_n2_integration_release_then_retry(monkeypatch):
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
 
+    # LP-0MS7VQZ1L0046752: make the test hermetic. The backend HTTP call to
+    # llama-server must be mocked so the result does not depend on a live
+    # server on llama_server_port. Without this, when the live server is down
+    # (connection refused) or mid-model-load (upstream 503), proxy_to_local
+    # returns a 503 with code=backend_error (or passes through the upstream
+    # 503) — NOT a dispatch-gate denial — and the old `status_code != 503`
+    # assertion failed spuriously even though the dispatch gate had correctly
+    # allowed sess-c through.
+    class _FakeBackendResponse:
+        status_code = 200
+        content = b'{"id":"chatcmpl-flaky-fix","choices":[{"message":{"role":"assistant","content":"hi"}}]}'
+        headers = {"content-type": "application/json"}
+
+    async def _fake_backend_call(*args, **kwargs):
+        return _FakeBackendResponse()
+
+    monkeypatch.setattr(
+        router_mod, "_call_with_backend_retries", _fake_backend_call
+    )
+    monkeypatch.setattr(router_mod, "_call_with_empty_retry", _fake_backend_call)
+
     req = _DummyRequest(
         body=json.dumps(
             {
@@ -1089,10 +1110,9 @@ async def test_n2_integration_release_then_retry(monkeypatch):
     resp = await proxy_to_local(req, "v1/chat/completions")
 
     # With only 1 active lease (sess-a), sess-c should be allowed through
-    # the dispatch gate. Note: this test verifies dispatch gate passes, but
-    # the actual backend call may fail — we only check that it's NOT a 503
-    # from the dispatch gate.
-    assert resp.status_code != 503, (
+    # the dispatch gate. The backend call is mocked, so a non-200 here can
+    # only be a dispatch-gate denial (503, code=no_slots_available).
+    assert resp.status_code == 200, (
         "Session should not receive 503 when only 1 of N=2 slots is occupied"
     )
 
