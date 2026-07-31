@@ -233,13 +233,32 @@ server:
   # model-health loop detects this signature and unloads/reloads the model.
   # Detection reads gpu_busy_percent from sysfs (AMD) with a rocm-smi
   # fallback; when neither is available detection is skipped.
-  # Enables/disables the wedge check entirely.
-  llama_gpu_wedge_detection_enabled: true
+  #
+  # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
+  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is pinned at 100% regardless
+  # of actual GPU state (30/30 samples read 100 while power draw showed the
+  # GPU idle at ~54W vs ~115W when computing). The busy+idle signature
+  # therefore false-positives on every idle period, causing constant
+  # unload/reload churn (144 unloads in one day, killing in-flight requests).
+  # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle
+  # power) is indistinguishable from normal idle from GPU sensors, so the
+  # busy counter cannot be trusted. Enable only on hardware with a reliable
+  # busy counter; the power-draw discriminator below reduces false positives
+  # and auto-disables detection when the counter is found pinned.
+  llama_gpu_wedge_detection_enabled: false
   # GPU busy % at or above which the GPU is considered busy.
   llama_gpu_wedge_busy_threshold_percent: 90
   # Consecutive health-loop checks with the wedge signature before recovery.
   # With the default 10s interval, 2 checks bounds detection to ~20-30s.
   llama_gpu_wedge_idle_checks_required: 2
+  # Power draw (W) below which the GPU is considered NOT genuinely computing.
+  # busy>=threshold + idle slots + power below this = pinned/unreliable busy
+  # counter (or stalled engine) -> never unloads; detection auto-disables if
+  # this state persists for llama_gpu_wedge_pinned_checks_required checks.
+  llama_gpu_wedge_power_low_threshold_watts: 90
+  # Consecutive pinned-counter observations (busy high + idle + low power)
+  # before GPU-wedge detection is disabled for the process lifetime.
+  llama_gpu_wedge_pinned_checks_required: 4
   llama_model_load_timeout: 600
   llama_models_max: 2
   llama_request_timeout: 1500

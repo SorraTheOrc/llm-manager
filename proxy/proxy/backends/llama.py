@@ -10,6 +10,7 @@ backend_health module.
 import asyncio
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 
@@ -36,6 +37,28 @@ def _srv():
 # sustained for ``llama_gpu_wedge_idle_checks_required`` consecutive health
 # loop iterations. GPU busy is read from sysfs (AMD) with a rocm-smi
 # fallback; when neither is available detection is skipped.
+#
+# False-positive guard (LP-0MS9GA6QL007XTBP):
+#
+# On the Strix Halo APU (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is
+# pinned at 100% regardless of actual GPU state (30/30 samples read 100
+# while power draw showed the GPU idle at ~54W vs ~115W when genuinely
+# computing), so the busy+idle signature fired on every idle period and
+# caused constant unload/reload churn. Power draw (sysfs power1_average in
+# micro-watts, rocm-smi fallback) is now the discriminating signal:
+#
+#   - busy >= threshold AND slots idle AND power >= compute threshold
+#     (or power unavailable, preserving legacy behavior) -> "wedge"
+#   - busy >= threshold AND slots idle AND power < compute threshold
+#     -> "pinned": the counter claims busy while the GPU is NOT computing.
+#     On this hardware class this is indistinguishable from a stalled engine
+#     (the LP-0MS91D782006XIR6 wedge drew only ~53W), so it is never treated
+#     as a wedge; a sustained run of this state disables detection for the
+#     process lifetime (see the model-health loop).
+#
+# Detection is disabled by default (llama_gpu_wedge_detection_enabled:
+# false) because the busy counter cannot discriminate real work from idle on
+# this APU; operators on hardware with a reliable counter may opt in.
 # ===================================================================
 
 
@@ -75,6 +98,57 @@ def _read_gpu_busy_percent() -> float | None:
     return val
 
 
+def _gpu_power_draw_sysfs(base: str = "/sys/class/drm/card0/device") -> float | None:
+    """Read GPU power draw in watts from sysfs hwmon power1_average (uW).
+
+    Scans the hwmon nodes under the card0 device dir and returns the first
+    ``power1_average`` found (e.g. amdgpu PPT on the Strix Halo APU). None
+    when unavailable.
+    """
+    try:
+        hwmon_root = Path(base) / "hwmon"
+        for hwmon_dir in sorted(hwmon_root.glob("hwmon*")):
+            power_file = hwmon_dir / "power1_average"
+            if power_file.exists():
+                val = float(power_file.read_text().strip()) / 1_000_000.0
+                if val >= 0:
+                    return val
+    except Exception:
+        return None
+    return None
+
+
+def _gpu_power_draw_rocm_smi() -> float | None:
+    """Fallback: parse ``rocm-smi --showpower`` output (W). None when unavailable."""
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "--showpower"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        ).stdout
+        for line in out.splitlines():
+            if "Power" not in line:
+                continue
+            val_str = line.split(":")[-1].strip().rstrip("W").strip()
+            try:
+                val = float(val_str)
+            except ValueError:
+                continue
+            return val
+    except Exception:
+        return None
+    return None
+
+
+def _read_gpu_power_draw() -> float | None:
+    """Best-effort GPU power draw (W): sysfs first, then rocm-smi."""
+    val = _gpu_power_draw_sysfs()
+    if val is None:
+        val = _gpu_power_draw_rocm_smi()
+    return val
+
+
 def _slots_all_idle(slots_payload) -> bool:
     """True when every slot in a /slots payload reports is_processing == False."""
     if not isinstance(slots_payload, list):
@@ -88,16 +162,48 @@ def _slots_all_idle(slots_payload) -> bool:
     )
 
 
-def _gpu_wedge_signature(busy_percent: float | None, slots_idle: bool, threshold: float) -> bool:
-    """True when the wedge signature is present: high GPU busy + all slots idle."""
-    return busy_percent is not None and slots_idle and busy_percent >= threshold
+# GPU state classification from the wedge probe.
+WEDGE_STATE_NONE = "none"  # no wedge signature
+WEDGE_STATE_WEDGE = "wedge"  # busy + idle + compute-level power (or no power source)
+WEDGE_STATE_PINNED = "pinned"  # busy + idle + low power: counter unreliable/stalled
+
+
+def _gpu_wedge_discriminate(
+    busy_percent: float | None,
+    slots_idle: bool,
+    power_watts: float | None,
+    busy_threshold: float,
+    power_low_threshold: float,
+) -> str:
+    """Classify the GPU state from the wedge probe.
+
+    Returns one of the ``WEDGE_STATE_*`` constants:
+
+    - ``none``: no wedge signature (busy below threshold, a slot is
+      processing, or the busy counter is unavailable).
+    - ``wedge``: busy >= threshold AND all slots idle AND the GPU is drawing
+      compute-level power (or power is unavailable, preserving the legacy
+      busy+idle signature for hardware without power sensors).
+    - ``pinned``: busy >= threshold AND all slots idle AND power draw is low.
+      The busy counter claims the GPU is working while power says it is not -
+      either the counter is pinned/unreliable (Strix Halo APU) or the engine
+      is stalled at idle power (LP-0MS91D782006XIR6). The two are
+      indistinguishable from GPU sensors, so this is never treated as a
+      wedge; the model-health loop disables detection if it persists.
+    """
+    if busy_percent is None or not slots_idle or busy_percent < busy_threshold:
+        return WEDGE_STATE_NONE
+    if power_watts is None or power_watts >= power_low_threshold:
+        return WEDGE_STATE_WEDGE
+    return WEDGE_STATE_PINNED
 
 
 async def _probe_gpu_wedge(
     host: str, port: int, timeout: float = 5.0
-) -> tuple[float | None, bool]:
-    """Return ``(gpu_busy_percent, all_slots_idle)`` for a model instance."""
+) -> tuple[float | None, bool, float | None]:
+    """Return ``(gpu_busy_percent, all_slots_idle, gpu_power_watts)`` for a model instance."""
     busy = _read_gpu_busy_percent()
+    power = _read_gpu_power_draw()
     slots_idle = False
     try:
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
@@ -109,7 +215,7 @@ async def _probe_gpu_wedge(
             await client.aclose()
     except Exception:
         pass
-    return busy, slots_idle
+    return busy, slots_idle, power
 
 
 # ===================================================================
@@ -435,6 +541,8 @@ async def _router_model_health_loop() -> None:
     observed_ports: dict[str, int] = {}
     port_first_seen_at: dict[str, float] = {}
     wedge_checks: dict[str, int] = {}
+    wedge_pinned_checks: dict[str, int] = {}
+    gpu_wedge_detection_disabled = False
     gpu_wedge_source_logged = False
 
     while True:
@@ -487,9 +595,12 @@ async def _router_model_health_loop() -> None:
                 ),
             )
 
-            # GPU-wedge detection configuration (LP-0MS91DHQ9003EGB0)
+            # GPU-wedge detection configuration (LP-0MS91DHQ9003EGB0 /
+            # LP-0MS9GA6QL007XTBP). Disabled by default: gpu_busy_percent is
+            # pinned at 100% on the Strix Halo APU regardless of GPU state, so
+            # the busy+idle signature false-positives on every idle period.
             gpu_wedge_enabled = bool(
-                server_cfg.get("llama_gpu_wedge_detection_enabled", True)
+                server_cfg.get("llama_gpu_wedge_detection_enabled", False)
             )
             gpu_wedge_busy_threshold = _coerce_float(
                 server_cfg.get("llama_gpu_wedge_busy_threshold_percent", 90.0),
@@ -500,6 +611,23 @@ async def _router_model_health_loop() -> None:
                 _coerce_int(
                     server_cfg.get("llama_gpu_wedge_idle_checks_required", 2),
                     2,
+                ),
+            )
+            # Power below this (W) means the GPU is not genuinely computing;
+            # used to distinguish a pinned/unreliable busy counter from a real
+            # wedge and to auto-disable detection on unreliable hardware.
+            gpu_wedge_power_low_threshold = max(
+                0.0,
+                _coerce_float(
+                    server_cfg.get("llama_gpu_wedge_power_low_threshold_watts", 90.0),
+                    90.0,
+                ),
+            )
+            gpu_wedge_pinned_checks = max(
+                1,
+                _coerce_int(
+                    server_cfg.get("llama_gpu_wedge_pinned_checks_required", 4),
+                    4,
                 ),
             )
 
@@ -596,9 +724,14 @@ async def _router_model_health_loop() -> None:
 
                     # GPU-wedge detection: the instance is reachable but the GPU
                     # may be wedged (busy with idle slots, no progress).
-                    # Skip embeddings instances and when no GPU busy source exists.
-                    if gpu_wedge_enabled and "--embeddings" not in args:
-                        busy_pct, slots_idle = await _probe_gpu_wedge(
+                    # Skip embeddings instances, when no GPU busy source exists,
+                    # and after the busy counter was found pinned/unreliable.
+                    if (
+                        gpu_wedge_enabled
+                        and not gpu_wedge_detection_disabled
+                        and "--embeddings" not in args
+                    ):
+                        busy_pct, slots_idle, power_watts = await _probe_gpu_wedge(
                             router_host, port, timeout=probe_timeout
                         )
                         if busy_pct is None:
@@ -609,7 +742,57 @@ async def _router_model_health_loop() -> None:
                                     "GPU-wedge detection disabled"
                                 )
                                 gpu_wedge_source_logged = True
-                        elif _gpu_wedge_signature(busy_pct, slots_idle, gpu_wedge_busy_threshold):
+                            continue
+                        state = _gpu_wedge_discriminate(
+                            busy_pct,
+                            slots_idle,
+                            power_watts,
+                            gpu_wedge_busy_threshold,
+                            gpu_wedge_power_low_threshold,
+                        )
+                        if state == WEDGE_STATE_NONE:
+                            wedge_checks[model_id] = 0
+                            wedge_pinned_checks[model_id] = 0
+                            if getattr(srv, "gpu_wedge_detected", False):
+                                srv.logger.info(
+                                    "model_health: GPU wedge cleared for model %s "
+                                    "(gpu_busy=%.0f%%)",
+                                    model_id,
+                                    busy_pct if busy_pct is not None else -1.0,
+                                )
+                                srv.gpu_wedge_detected = False
+                                srv.gpu_wedge_detected_at = None
+                                srv.gpu_wedge_last_model = None
+                        elif state == WEDGE_STATE_PINNED:
+                            # Busy counter claims the GPU is working while power
+                            # draw says it is not: either the counter is pinned
+                            # (APU hardware artifact) or the engine is stalled at
+                            # idle power. Both are indistinguishable from GPU
+                            # sensors, so never unload on this evidence; if it
+                            # persists, disable detection for the process.
+                            wedge_checks[model_id] = 0
+                            count = wedge_pinned_checks.get(model_id, 0) + 1
+                            wedge_pinned_checks[model_id] = count
+                            if (
+                                count >= gpu_wedge_pinned_checks
+                                and not gpu_wedge_detection_disabled
+                            ):
+                                gpu_wedge_detection_disabled = True
+                                srv.gpu_wedge_detection_disabled = True
+                                srv.logger.error(
+                                    "model_health: gpu_busy_percent appears pinned/"
+                                    "unreliable for model %s (port %d): busy=%.0f%% "
+                                    "with all slots idle but power %.0fW below compute "
+                                    "threshold %.0fW; disabling GPU-wedge detection "
+                                    "for this process to prevent unload/reload churn",
+                                    model_id,
+                                    port,
+                                    busy_pct,
+                                    power_watts or 0.0,
+                                    gpu_wedge_power_low_threshold,
+                                )
+                        else:  # WEDGE_STATE_WEDGE
+                            wedge_pinned_checks[model_id] = 0
                             count = wedge_checks.get(model_id, 0) + 1
                             wedge_checks[model_id] = count
                             if count >= gpu_wedge_idle_checks:
@@ -646,18 +829,6 @@ async def _router_model_health_loop() -> None:
                                     count,
                                     gpu_wedge_idle_checks,
                                 )
-                        else:
-                            wedge_checks[model_id] = 0
-                            if getattr(srv, "gpu_wedge_detected", False):
-                                srv.logger.info(
-                                    "model_health: GPU wedge cleared for model %s "
-                                    "(gpu_busy=%.0f%%)",
-                                    model_id,
-                                    busy_pct if busy_pct is not None else -1.0,
-                                )
-                                srv.gpu_wedge_detected = False
-                                srv.gpu_wedge_detected_at = None
-                                srv.gpu_wedge_last_model = None
                     continue
 
                 failure_count = consecutive_failures.get(model_id, 0) + 1
@@ -698,6 +869,8 @@ async def _router_model_health_loop() -> None:
                 consecutive_failures.pop(stale_id, None)
                 observed_ports.pop(stale_id, None)
                 port_first_seen_at.pop(stale_id, None)
+                wedge_checks.pop(stale_id, None)
+                wedge_pinned_checks.pop(stale_id, None)
 
         except asyncio.CancelledError:
             return

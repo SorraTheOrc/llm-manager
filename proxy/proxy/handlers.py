@@ -483,6 +483,9 @@ async def health_check():
     backend_reachable = bool(llama_running and await srv._probe_backend_reachable(llama_port))
     self_healing = srv._is_self_healing_active()
     gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
+    gpu_wedge_detection_disabled = bool(
+        getattr(srv, "gpu_wedge_detection_disabled", False)
+    )
     ready = bool(
         llama_running
         and srv.backend_ready
@@ -515,6 +518,7 @@ async def health_check():
         "backend_reachable": backend_reachable,
         "self_healing_in_progress": self_healing,
         "gpu_wedge_detected": gpu_wedge_detected,
+        "gpu_wedge_detection_disabled": gpu_wedge_detection_disabled,
         "gpu_wedge_signal_count": int(
             srv.backend_signal_counts.get("gpu_wedge", 0) or 0
         ),
