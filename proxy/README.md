@@ -1879,8 +1879,24 @@ The TTS server lifecycle is managed by the proxy:
 - **Startup:** Started asynchronously alongside llama-server during proxy
   `lifespan()` startup.  The proxy waits up to 30 seconds for the TTS server
   to become reachable on its configured port.
+- **Zombie cleanup (pre-start):** Before spawning a new TTS server,
+  `start_tts_server()` kills any process already holding the TTS port
+  (default `8081`) via `_kill_process_on_port()`.  Port-to-PID detection uses
+  `ss -ltnp`, falling back to `fuser` and `/proc/net/tcp`.  This cleans up
+  orphaned `tts-server` processes left behind by crashed (SIGKILL) or
+  uncleanly-shutdown proxy instances, so restarts never accumulate zombies.
+- **Spawn verification:** After spawning, `start_tts_server()` verifies the
+  process stays alive for 0.5 s.  If it exits immediately (e.g. the port was
+  still held and `start-qwentts.sh` exited with code 1), the function returns
+  `None` instead of a dead process handle, so the watchdog/health probes never
+  trust a process that failed to bind its port.
 - **Shutdown:** Stopped gracefully (SIGTERM, 30 s timeout, then SIGKILL) during
   proxy shutdown, before llama-server is stopped.
+- **`start-proxy.sh --restart`:** Kills TTS processes by name — both the
+  `start-qwentts.sh` wrapper (`pkill -f 'qwentts'`) and the `tts-server` binary
+  (`pkill -f 'tts-server'`) — with a SIGTERM phase followed by a SIGKILL
+  fallback, so both wrapper and binary are reliably terminated before the
+  proxy restarts.
 - **Health checks:** Probed automatically on the configured port before
   marking the server as ready.
 
