@@ -1,8 +1,21 @@
+import os
 import time
 
 import pytest
 import requests
 from requests.exceptions import RequestException
+
+# These tests exercise the LIVE proxy (localhost:8000) with real chat and
+# embeddings inference. They are opt-in and disabled by default so a routine
+# `pytest` run can never crash the running proxy/llama-server (GPU contention)
+# or leave it in a bad state (see LP-0MS6R13CP009VO24).
+pytestmark = [pytest.mark.integration, pytest.mark.e2e_live]
+
+if os.getenv("RUN_LIVE_PROXY_E2E", "0") != "1":
+    pytest.skip(
+        "live proxy E2E tests are disabled; set RUN_LIVE_PROXY_E2E=1 to run on demand",
+        allow_module_level=True,
+    )
 
 
 def _require_local_proxy(base: str):

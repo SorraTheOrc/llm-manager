@@ -33,6 +33,11 @@ Testing
   . .venv/bin/activate && python -m pytest -q
   ```
 
+> **Safety:** the default test run never spawns or kills real OS processes and
+> never touches the live proxy/llama-server/TTS server. Live tests are opt-in
+> (`RUN_LIVE_PROXY_E2E=1`, `RUN_LIVE_TTS=1`, `RUN_LIVE_HOST_FLOW=1`,
+> `LIVE_PORT_KILL_TESTS=1`). See `docs/INTEGRATION.md`.
+
 Linting
 -------
 

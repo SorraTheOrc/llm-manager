@@ -9,10 +9,23 @@
 #   2. The cleanup logic (pkill + fuser) is simulated against that port
 #   3. After cleanup, the port should be free for a new server to bind
 #
+# This test spawns real OS processes (python3 TCP listeners) and kills them
+# using port-based mechanisms (kill, fuser -k). It is OPT-IN and disabled by
+# default so it can never accidentally kill a running proxy/llama-server/TTS
+# or close an SSH session during a routine test run (see LP-0MS6R13CP009VO24).
+#
 # Usage:
-#   bash tests/test_start_proxy_restart.sh
+#   LIVE_PORT_KILL_TESTS=1 bash tests/test_start_proxy_restart.sh
 
 set -euo pipefail
+
+# Opt-in gate: refuse to run unless LIVE_PORT_KILL_TESTS=1.
+# Mirrors the live_port_kill pytest marker convention in proxy/pytest.ini.
+if [ "${LIVE_PORT_KILL_TESTS:-0}" != "1" ]; then
+    echo "SKIP: test_start_proxy_restart.sh spawns and kills real OS processes;"
+    echo "      set LIVE_PORT_KILL_TESTS=1 to run on demand."
+    exit 0
+fi
 
 PASS=0
 FAIL=0
