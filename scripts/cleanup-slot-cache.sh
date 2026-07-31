@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # Cleanup stale slot-cache files.
 #
-# Removes slot snapshot files (slot_*.bin) older than a configurable age,
-# retaining a configurable number of the most recently modified files per
-# unique slot ID prefix.
+# Slot files are named slot_<session-uuid>.bin — one snapshot per session,
+# rewritten on every save (mtime tracks last activity). Retention rules:
+#
+#   1. AGE: delete files older than --max-age-days (default 7).
+#   2. SIZE: if the cache still exceeds --max-size-gb (default 20), delete
+#      the oldest files until under the cap, but never delete files newer
+#      than --min-age-days (default 1) to protect active sessions.
 #
 # Usage:
-#   ./scripts/cleanup-slot-cache.sh                     # default: 7 days, keep 3
-#   ./scripts/cleanup-slot-cache.sh --max-age-days 14   # keep 14 days
-#   ./scripts/cleanup-slot-cache.sh --keep-recent 5      # keep 5 per prefix
-#   ./scripts/cleanup-slot-cache.sh --dry-run            # preview only
-#   ./scripts/cleanup-slot-cache.sh --path /custom/path  # custom slot-cache dir
+#   ./scripts/cleanup-slot-cache.sh                        # defaults
+#   ./scripts/cleanup-slot-cache.sh --max-age-days 14      # keep 14 days
+#   ./scripts/cleanup-slot-cache.sh --max-size-gb 50       # cap at 50 GB
+#   ./scripts/cleanup-slot-cache.sh --min-age-days 2       # protect 2 days
+#   ./scripts/cleanup-slot-cache.sh --dry-run              # preview only
+#   ./scripts/cleanup-slot-cache.sh --path /custom/path    # custom slot-cache dir
 #
 # Exit codes:
 #   0 - success (no errors or all errors handled gracefully)
@@ -20,7 +25,8 @@ set -eo pipefail
 
 # Defaults
 MAX_AGE_DAYS=7
-KEEP_RECENT=3
+MAX_SIZE_GB=20
+MIN_AGE_DAYS=1
 SLOT_CACHE_DIR=""
 DRY_RUN=0
 
@@ -28,14 +34,16 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --max-age-days)
       MAX_AGE_DAYS="$2"; shift 2 ;;
-    --keep-recent)
-      KEEP_RECENT="$2"; shift 2 ;;
+    --max-size-gb)
+      MAX_SIZE_GB="$2"; shift 2 ;;
+    --min-age-days)
+      MIN_AGE_DAYS="$2"; shift 2 ;;
     --path)
       SLOT_CACHE_DIR="$2"; shift 2 ;;
     --dry-run)
       DRY_RUN=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--max-age-days N] [--keep-recent N] [--path DIR] [--dry-run]"
+      echo "Usage: $0 [--max-age-days N] [--max-size-gb N] [--min-age-days N] [--path DIR] [--dry-run]"
       exit 0 ;;
     *)
       echo "Unknown option: $1" >&2; exit 2 ;;
@@ -72,76 +80,96 @@ if [[ ${#all_files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-# Sort by modification time (oldest first)
-sorted_files=()
-while IFS= read -r -d '' f; do
-  sorted_files+=("$f")
-done < <(
-  for f in "${all_files[@]}"; do
-    mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo "0")
-    echo "$mtime|$f"
-  done | sort -t'|' -k1 -n | cut -d'|' -f2- | tr '\n' '\0'
-)
-
-# Count files per prefix (everything before first '-' after 'slot_')
-declare -A prefix_counts
-for f in "${sorted_files[@]}"; do
-  basename_f="$(basename "$f")"
-  prefix="${basename_f%%-*}"
-  count=${prefix_counts[$prefix]:-0}
-  prefix_counts[$prefix]=$((count + 1))
-done
-
-declare -A kept_count
-deleted=0
-retained=0
-errors=0
 now_epoch=$(date +%s)
 max_age_seconds=$((MAX_AGE_DAYS * 86400))
+min_age_seconds=$((MIN_AGE_DAYS * 86400))
+max_size_bytes=$((MAX_SIZE_GB * 1073741824))
 
-for f in "${sorted_files[@]}"; do
-  basename_f="$(basename "$f")"
-  prefix="${basename_f%%-*}"
-
-  total="${prefix_counts[$prefix]:-0}"
-  kept="${kept_count[$prefix]:-0}"
-  kept=$((kept + 1))
-  kept_count[$prefix]=$kept
-
-  remaining=$((total - kept))
-
-  if [[ $remaining -lt $KEEP_RECENT ]]; then
-    retained=$((retained + 1))
-    continue
-  fi
-
+# Collect files with mtime and size, sorted oldest first
+entries=()
+total_bytes=0
+for f in "${all_files[@]}"; do
   mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo "0")
+  size=$(stat -c '%s' "$f" 2>/dev/null || echo "0")
   if [[ "$mtime" -eq 0 ]]; then
     echo "WARNING: Cannot read modification time for $f, skipping" >&2
     continue
   fi
+  entries+=("$mtime|$size|$f")
+  total_bytes=$((total_bytes + size))
+done
 
+IFS=$'\n' sorted=($(for e in "${entries[@]}"; do echo "$e"; done | sort -t'|' -k1 -n))
+unset IFS
+
+# 1) AGE RULE: delete anything older than max-age-days
+deleted=0
+retained=0
+errors=0
+remaining_bytes=$total_bytes
+keep_list=()
+
+for e in "${sorted[@]}"; do
+  IFS='|' read -r mtime size f <<< "$e"
+  unset IFS
   age_seconds=$((now_epoch - mtime))
   if [[ $age_seconds -gt $max_age_seconds ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
-      echo "[DRY RUN] Would delete: $f (age: $((age_seconds / 86400)) days)"
+      echo "[DRY RUN] Would delete: $f (age: $((age_seconds / 86400)) days, size: $((size / 1048576)) MB)"
+      echo "  reason: older than $MAX_AGE_DAYS days"
+      remaining_bytes=$((remaining_bytes - size))
+      deleted=$((deleted + 1))
     else
       if rm -f "$f" 2>/dev/null; then
         echo "Deleted: $f (age: $((age_seconds / 86400)) days)"
         deleted=$((deleted + 1))
+        remaining_bytes=$((remaining_bytes - size))
       else
         echo "WARNING: Failed to delete $f" >&2
         errors=$((errors + 1))
       fi
     fi
+  else
+    keep_list+=("$mtime|$size|$f")
   fi
 done
 
+# 2) SIZE RULE: if still over the cap, delete oldest (skipping files newer
+#    than min-age-days to protect active sessions)
+if [[ $remaining_bytes -gt $max_size_bytes ]]; then
+  over_bytes=$((remaining_bytes - max_size_bytes))
+  echo "Cache exceeds --max-size-gb $MAX_SIZE_GB by $((over_bytes / 1073741824)) GB; pruning oldest files (keeping files newer than $MIN_AGE_DAYS day(s))"
+  for e in "${keep_list[@]}"; do
+    [[ $remaining_bytes -le $max_size_bytes ]] && break
+    IFS='|' read -r mtime size f <<< "$e"
+    unset IFS
+    age_seconds=$((now_epoch - mtime))
+    if [[ $age_seconds -lt $min_age_seconds ]]; then
+      continue
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+      echo "[DRY RUN] Would delete: $f (age: $((age_seconds / 86400)) days, size: $((size / 1048576)) MB)"
+      echo "  reason: cache over size cap"
+      remaining_bytes=$((remaining_bytes - size))
+      deleted=$((deleted + 1))
+    else
+      if rm -f "$f" 2>/dev/null; then
+        echo "Deleted: $f (age: $((age_seconds / 86400)) days)"
+        deleted=$((deleted + 1))
+        remaining_bytes=$((remaining_bytes - size))
+      else
+        echo "WARNING: Failed to delete $f" >&2
+        errors=$((errors + 1))
+      fi
+    fi
+  done
+fi
+
 echo ""
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "DRY-RUN SUMMARY: $deleted files would be deleted, $retained recent files retained in $SLOT_CACHE_DIR"
+  echo "DRY-RUN SUMMARY: $deleted files would be deleted; cache would shrink from $((total_bytes / 1073741824)) GB to ~$((remaining_bytes / 1073741824)) GB"
 else
-  echo "SUMMARY: $deleted files deleted, $retained recent files retained in $SLOT_CACHE_DIR"
+  echo "SUMMARY: $deleted files deleted; cache is now $((remaining_bytes / 1073741824)) GB (was $((total_bytes / 1073741824)) GB)"
 fi
 
 if [[ $errors -gt 0 ]]; then
