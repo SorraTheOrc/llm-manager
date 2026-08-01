@@ -736,6 +736,14 @@ async def _try_acquire_local_dispatch(
     Expired lease records (inactive and past their *expires_at* threshold)
     are cleaned before the occupancy check, freeing their slots.
 
+    Lock ordering: ``local_active_queries_lock`` is acquired before
+    ``local_dispatch_records_lock`` so the records-based occupancy count
+    and the ``local_active_queries`` counter check are atomic with respect
+    to all counter mutators. This matches the lock order used by
+    ``_increment_local_active_queries``/``_decrement_local_active_queries``
+    and prevents a TOCTOU false 503 under concurrent anonymous-session
+    increments (LP-0MS8ZM98R000M8AN).
+
     When *body_json* is provided, the lease timeout is extended adaptively
     based on the estimated prompt token count. This prevents mid-stream
     lease expiry during the cache prefill phase for large-context requests
@@ -752,44 +760,52 @@ async def _try_acquire_local_dispatch(
     lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
     now = time.monotonic()
 
+    # Lock ordering: acquire local_active_queries_lock BEFORE
+    # local_dispatch_records_lock so the occupancy count (records) and the
+    # active-counter check are atomic w.r.t. all counter mutators
+    # (_increment_local_active_queries / _decrement_local_active_queries,
+    # which themselves take the active lock first). This closes the TOCTOU
+    # window in which an anonymous-session increment could land between the
+    # records count and the counter check and falsely deny an explicit
+    # session that had a free slot (LP-0MS8ZM98R000M8AN).
     try:
-        async with srv.local_dispatch_records_lock:
-            # ... (cleaning, checking, acquiring logic)
-            for existing_key, record in list(srv.local_dispatch_records.items()):
-                if not record.get("active") and record.get("expires_at", 0) <= now:
-                    del srv.local_dispatch_records[existing_key]
-                    try:
-                        from proxy.session import _free_slot_assignment
-                        _free_slot_assignment(existing_key)
-                    except Exception:
-                        pass
+        async with srv.local_active_queries_lock:
+            async with srv.local_dispatch_records_lock:
+                # ... (cleaning, checking, acquiring logic)
+                for existing_key, record in list(srv.local_dispatch_records.items()):
+                    if not record.get("active") and record.get("expires_at", 0) <= now:
+                        del srv.local_dispatch_records[existing_key]
+                        try:
+                            from proxy.session import _free_slot_assignment
+                            _free_slot_assignment(existing_key)
+                        except Exception:
+                            pass
 
-            own_record = srv.local_dispatch_records.get(session_key)
-            own_has_lease = (
-                own_record is not None
-                and (
-                    own_record.get("active")
-                    or own_record.get("expires_at", 0) > now
+                own_record = srv.local_dispatch_records.get(session_key)
+                own_has_lease = (
+                    own_record is not None
+                    and (
+                        own_record.get("active")
+                        or own_record.get("expires_at", 0) > now
+                    )
                 )
-            )
 
-            if not own_has_lease:
-                occupied_by_others = 0
-                first_occupied_owner = None
-                for existing_key, record in srv.local_dispatch_records.items():
-                    if existing_key == session_key:
-                        continue
-                    if record.get("active") or record.get("expires_at", 0) > now:
-                        occupied_by_others += 1
-                        if first_occupied_owner is None:
-                            first_occupied_owner = existing_key
+                if not own_has_lease:
+                    occupied_by_others = 0
+                    first_occupied_owner = None
+                    for existing_key, record in srv.local_dispatch_records.items():
+                        if existing_key == session_key:
+                            continue
+                        if record.get("active") or record.get("expires_at", 0) > now:
+                            occupied_by_others += 1
+                            if first_occupied_owner is None:
+                                first_occupied_owner = existing_key
 
-                if occupied_by_others >= max_local:
-                    active_count = getattr(srv, "local_active_queries", 0)
-                    retry_after = max(1.0, lease_timeout)
-                    return (False, first_occupied_owner, active_count, retry_after)
+                    if occupied_by_others >= max_local:
+                        active_count = getattr(srv, "local_active_queries", 0)
+                        retry_after = max(1.0, lease_timeout)
+                        return (False, first_occupied_owner, active_count, retry_after)
 
-            async with srv.local_active_queries_lock:
                 if srv.local_active_queries >= max_local and not own_has_lease:
                     active_owner = None
                     for ek, er in srv.local_dispatch_records.items():
@@ -805,14 +821,14 @@ async def _try_acquire_local_dispatch(
 
                 srv.local_active_queries += 1
 
-            srv.local_dispatch_records[session_key] = {
-                "backend": backend,
-                "started_at": now,
-                "active": True,
-                "expires_at": now + lease_timeout,
-            }
+                srv.local_dispatch_records[session_key] = {
+                    "backend": backend,
+                    "started_at": now,
+                    "active": True,
+                    "expires_at": now + lease_timeout,
+                }
 
-        return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
+            return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
     except Exception:
         return (True, None, 0, 1.0)
 
