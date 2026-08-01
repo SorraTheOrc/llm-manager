@@ -223,3 +223,126 @@ class TestBenchmarkRequestBuilder:
         assert SAMPLE_CHAT_REQUEST["model"] == "Qwen3"
         assert len(SAMPLE_CHAT_REQUEST["messages"]) == 1
         assert SAMPLE_CHAT_REQUEST["messages"][0]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# Inline per-request progress (LP-0MRWU82H5003KV47)
+# ---------------------------------------------------------------------------
+
+
+class TestInlineProgress:
+    """run_benchmark_async must report per-request progress via callback."""
+
+    def test_progress_callback_reports_sending_and_completion(self, monkeypatch):
+        """Each request triggers a 'sending' event (result=None) before its
+        completion event, with 1-based request numbers and correct totals."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        import asyncio
+        import types
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        async def fake_send(client, config, prompt, idx):
+            return rb.RequestResult(
+                request_index=idx,
+                prompt=prompt,
+                status="completed",
+                total_duration_seconds=0.1,
+                prompt_tokens=10,
+                completion_tokens=20,
+                tokens_per_second=200.0,
+                time_to_first_token_seconds=0.05,
+            )
+
+        monkeypatch.setattr(
+            rb, "httpx", types.SimpleNamespace(AsyncClient=lambda **kw: FakeAsyncClient())
+        )
+        monkeypatch.setattr(rb, "send_single_request", fake_send)
+
+        config = rb.BenchmarkConfig(
+            run_type="baseline",
+            model="Qwen3",
+            prompts=["p1"],
+            num_requests=3,
+            concurrency=1,
+            timeout=5.0,
+        )
+        events = []
+        result = asyncio.run(
+            rb.run_benchmark_async(
+                config,
+                progress_callback=lambda n, total, res: events.append((n, total, res)),
+            )
+        )
+
+        sending = [e for e in events if e[2] is None]
+        done = [e for e in events if e[2] is not None]
+        assert len(sending) == 3
+        assert len(done) == 3
+        # 1-based request numbers and correct totals
+        assert all(e[1] == 3 for e in events)
+        assert {e[0] for e in sending} == {1, 2, 3}
+        assert {e[0] for e in done} == {1, 2, 3}
+        # Each request's 'sending' event must precede its 'done' event.
+        for n in (1, 2, 3):
+            send_idx = next(i for i, e in enumerate(events) if e[0] == n and e[2] is None)
+            done_idx = next(i for i, e in enumerate(events) if e[0] == n and e[2] is not None)
+            assert send_idx < done_idx, "request done before sending"
+
+        # Final output unchanged: requests in index order, summary intact
+        assert [r["request_index"] for r in result["requests"]] == [0, 1, 2]
+        assert result["summary"]["completed"] == 3
+        assert result["summary"]["total_requests"] == 3
+
+    def test_no_callback_preserves_prior_behavior(self, monkeypatch):
+        """Without a progress callback, results are identical in structure."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        import asyncio
+        import types
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        async def fake_send(client, config, prompt, idx):
+            return rb.RequestResult(
+                request_index=idx,
+                prompt=prompt,
+                status="completed",
+                total_duration_seconds=0.1,
+                prompt_tokens=10,
+                completion_tokens=20,
+                tokens_per_second=200.0,
+                time_to_first_token_seconds=0.05,
+            )
+
+        monkeypatch.setattr(
+            rb, "httpx", types.SimpleNamespace(AsyncClient=lambda **kw: FakeAsyncClient())
+        )
+        monkeypatch.setattr(rb, "send_single_request", fake_send)
+
+        config = rb.BenchmarkConfig(
+            run_type="baseline",
+            model="Qwen3",
+            prompts=["p1"],
+            num_requests=3,
+            concurrency=1,
+            timeout=5.0,
+        )
+        result = asyncio.run(rb.run_benchmark_async(config))
+        assert [r["request_index"] for r in result["requests"]] == [0, 1, 2]
+        assert result["summary"]["completed"] == 3
