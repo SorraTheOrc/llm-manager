@@ -743,6 +743,16 @@ def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: in
     if pid is None:
         return False
 
+    # Signal-safety guard (LP-0MS9LJIAE008Q3AK): os.killpg(pgid, sig)
+    # NEGATES the pgid, so os.killpg(1, ...) issues the syscall kill(-1, ...)
+    # which broadcasts to EVERY process the caller can signal. A fake/mock
+    # llama_process with pid=1 (left in module state by test fixtures) caused
+    # a full pytest run to SIGTERM the entire proxy stack. Never signal
+    # pgid 0 (caller's own group) or pgid 1 (broadcast via negation), and
+    # never pass a non-int pid to os.killpg.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+
     # Check if already dead
     if proc.poll() is not None:
         return True
