@@ -1,0 +1,181 @@
+# Benchmark: slot_count=6  session=4  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 265s  Tokens: 1209  TPS: 5.6
+# ============================================================
+
+```python
+#!/usr/bin/env python3
+"""
+A simple command-line To-Do application with daily and weekly overviews.
+"""
+
+import json
+import os
+import sys
+import argparse
+from datetime import datetime, date, timedelta
+
+TODO_FILE = os.path.join(os.path.expanduser("~"), ".todo.json")
+
+
+def load_tasks():
+    """Load tasks from the JSON file."""
+    if not os.path.exists(TODO_FILE):
+        return []
+    with open(TODO_FILE, 'r') as f:
+        return json.load(f)
+
+
+def save_tasks(tasks):
+    """Save tasks to the JSON file."""
+    with open(TODO_FILE, 'w') as f:
+        json.dump(tasks, f, indent=2)
+
+
+def get_next_id(tasks):
+    """Get the next available task ID."""
+    if not tasks:
+        return 1
+    return max(t['id'] for t in tasks) + 1
+
+
+# ----------------------------------------------------------------------
+# Existing commands (unchanged except for optional minor improvements)
+# ----------------------------------------------------------------------
+
+def cmd_add(args):
+    """Add a new task."""
+    tasks = load_tasks()
+    description = ' '.join(args.task)
+    due_date = args.due
+
+    if due_date:
+        try:
+            datetime.strptime(due_date, '%Y-%m-%d')
+        except ValueError:
+            print(f"Error: Invalid date format '{due_date}'. Use YYYY-MM-DD.")
+            sys.exit(1)
+
+    task = {
+        'id': get_next_id(tasks),
+        'description': description,
+        'due_date': due_date,
+        'done': False,
+        'created_at': str(date.today()),
+        'completed_at': None,
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    print(f"Added task: {description}")
+
+
+def cmd_list(args):
+    """List tasks."""
+    tasks = load_tasks()
+    if args.filter == 'done':
+        tasks = [t for t in tasks if t['done']]
+    elif args.filter == 'pending':
+        tasks = [t for t in tasks if not t['done']]
+
+    if not tasks:
+        print("No tasks found.")
+        return
+
+    print(f"{'ID':<5} {'Description':<30} {'Due Date':<12} {'Done':<6}")
+    print("-" * 55)
+    for t in sorted(tasks, key=lambda x: x['id']):
+        done_flag = "[x]" if t['done'] else "[ ]"
+        due = t.get('due_date') or "No date"
+        desc = t['description'][:28].ljust(28)
+        print(f"{t['id']:<5} {desc} {due:<12} {done_flag:<6}")
+
+
+def cmd_done(args):
+    """Mark a task as done."""
+    tasks = load_tasks()
+    for t in tasks:
+        if t['id'] == args.task_id:
+            if t['done']:
+                print(f"Task {args.task_id} is already done.")
+                return
+            t['done'] = True
+            t['completed_at'] = str(date.today())
+            save_tasks(tasks)
+            print(f"Marked task {args.task_id} as done: {t['description']}")
+            return
+    print(f"Error: Task {args.task_id} not found.")
+
+
+def cmd_delete(args):
+    """Delete a task."""
+    tasks = load_tasks()
+    task_to_delete = None
+    for t in tasks:
+        if t['id'] == args.task_id:
+            task_to_delete = t
+            break
+    if not task_to_delete:
+        print(f"Error: Task {args.task_id} not found.")
+        return
+    tasks.remove(task_to_delete)
+    save_tasks(tasks)
+    print(f"Deleted task {args.task_id}: {task_to_delete['description']}")
+
+
+# ----------------------------------------------------------------------
+# New commands: daily / week
+# ----------------------------------------------------------------------
+
+def cmd_daily():
+    """Show a compact morning overview of today's tasks.
+
+    - Overdue tasks (due before today, not done)
+    - Tasks due today (not done)
+    - Tasks completed today
+    - Tasks without a due date are never shown.
+    """
+    tasks = load_tasks()
+    today = date.today()
+    today_str = str(today)
+
+    due_today = []
+    overdue = []
+    completed_today = []
+
+    for t in tasks:
+        # Filter by due date
+        if t.get('due_date'):
+            try:
+                due_date = datetime.strptime(t['due_date'], '%Y-%m-%d').date()
+                if not t['done']:
+                    if due_date == today:
+                        due_today.append(t)
+                    elif due_date < today:
+                        overdue.append(t)
+            except ValueError:
+                pass  # skip tasks with unparseable dates
+
+        # Completed today (regardless of due date)
+        if t['done'] and t.get('completed_at') == today_str:
+            completed_today.append(t)
+
+    # Sort sections by task ID for consistency
+    due_today.sort(key=lambda x: x['id'])
+    overdue.sort(key=lambda x: x['id'])
+    completed_today.sort(key=lambda x: x['id'])
+
+    print(f"\n{'=' * 50}")
+    print(f"  Daily Overview — {today_str}")
+    print('=' * 50 + '\n')
+
+    if due_today:
+        print(f"📌  Due Today ({len(due_today)}):")
+        for t in due_today:
+            print(f"      [{t['id']}] {t['description']}")
+        print()
+
+    if overdue:

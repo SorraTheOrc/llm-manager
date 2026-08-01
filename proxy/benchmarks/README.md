@@ -194,7 +194,8 @@ If a candidate fails one or more gates but provides other compelling benefits:
 
 ```bash
 # Step 1: Ensure proxy is running
-proxyctl status
+# Verify proxy is running (check /health endpoint)
+curl -s http://127.0.0.1:8000/health
 
 # Step 2: Record baseline with current config
 python -m proxy.benchmarks.run_benchmark --baseline --output baseline.json
@@ -203,7 +204,8 @@ python -m proxy.benchmarks.run_benchmark --baseline --output baseline.json
 # Change hf-repo from Q5_K_M to Q4_K_M for Qwen3
 
 # Step 4: Restart proxy to pick up new config
-proxyctl restart
+# Restart proxy (kill and re-run start-proxy.sh)
+pkill -f 'uvicorn proxy.server' && sleep 2 && bash proxy/scripts/start-proxy.sh
 
 # Step 5: Record candidate
 python -m proxy.benchmarks.run_benchmark --candidate --config models.ini --output candidate.json

@@ -203,7 +203,7 @@ class TestRocmEnvVars:
 
         captured_env = {}
 
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             captured_env.update(env or {})
             raise FileNotFoundError(cmd[0])  # Simulate failure to avoid infinite loop
 
@@ -227,7 +227,7 @@ class TestRocmEnvVars:
 
         captured_env = {}
 
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             captured_env.update(env or {})
             raise FileNotFoundError(cmd[0])
 
@@ -250,7 +250,7 @@ class TestRocmEnvVars:
 
         captured_env = {}
 
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             captured_env.update(env or {})
             raise FileNotFoundError(cmd[0])
 
@@ -334,7 +334,7 @@ class TestRouterModeCommandConstruction:
 
         captured_env = {}
 
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             captured_env.update(env or {})
             raise FileNotFoundError(cmd[0])
 
@@ -360,7 +360,7 @@ class TestRouterModeCommandConstruction:
 
         captured_cmd = []
 
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             captured_cmd.extend(cmd)
             raise FileNotFoundError(cmd[0])
 

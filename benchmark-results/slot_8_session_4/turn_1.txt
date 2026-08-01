@@ -1,0 +1,332 @@
+# Benchmark: slot_count=8  session=4  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 740s  Tokens: 2820  TPS: 13.9
+# ============================================================
+
+Here's the complete implementation split into the main module and the test suite. The code follows PEP 8, uses modern Python 3.12+ typing, and is designed to be both runnable as a CLI and importable as a library.
+
+### `todo_cli.py`
+```python
+"""CLI-based To-Do application with JSON storage."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+__all__ = ["TodoStorage", "TodoCLI"]
+
+
+class TodoStorage:
+    """Handles persistence of tasks using a JSON file."""
+
+    def __init__(self, filepath: str = "tasks.json") -> None:
+        self.filepath = Path(filepath)
+
+    def _load(self) -> list[dict]:
+        """Load tasks from the JSON file."""
+        if not self.filepath.exists():
+            return []
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(f"Failed to load tasks from {self.filepath}: {e}") from e
+
+    def _save(self, tasks: list[dict]) -> None:
+        """Save tasks to the JSON file."""
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2, ensure_ascii=False)
+
+    def add(self, title: str) -> int:
+        """Add a new task and return its auto-incremented ID."""
+        if not title or not title.strip():
+            raise ValueError("Task title cannot be empty.")
+        
+        tasks = self._load()
+        new_id = max((t["id"] for t in tasks), default=0) + 1
+        tasks.append({"id": new_id, "title": title.strip(), "completed": False})
+        self._save(tasks)
+        return new_id
+
+    def get_all(self) -> list[dict]:
+        """Return all tasks."""
+        return self._load()
+
+    def complete(self, task_id: int) -> bool:
+        """Mark a task as completed. Returns True if found, False otherwise."""
+        tasks = self._load()
+        for task in tasks:
+            if task["id"] == task_id:
+                task["completed"] = True
+                self._save(tasks)
+                return True
+        return False
+
+    def delete(self, task_id: int) -> bool:
+        """Delete a task. Returns True if found, False otherwise."""
+        tasks = self._load()
+        initial_len = len(tasks)
+        tasks = [t for t in tasks if t["id"] != task_id]
+        if len(tasks) < initial_len:
+            self._save(tasks)
+            return True
+        return False
+
+
+class TodoCLI:
+    """Command-line interface for the To-Do application."""
+
+    def __init__(self, storage: Optional[TodoStorage] = None) -> None:
+        self.storage = storage or TodoStorage()
+        self.parser = self._build_parser()
+
+    def _build_parser(self) -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(
+            prog="todo",
+            description="A simple CLI-based To-Do application.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+        add_parser = subparsers.add_parser("add", help="Add a new task")
+        add_parser.add_argument("title", type=str, help="Title of the task")
+
+        subparsers.add_parser("list", help="List all tasks")
+
+        complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+        complete_parser.add_argument("id", type=int, help="ID of the task to complete")
+
+        delete_parser = subparsers.add_parser("delete", help="Delete a task")
+        delete_parser.add_argument("id", type=int, help="ID of the task to delete")
+
+        subparsers.add_parser("help", help="Show this help message")
+
+        return parser
+
+    def run(self, args: Optional[list[str]] = None) -> int:
+        """Execute the CLI command and return an exit code."""
+        try:
+            parsed_args = self.parser.parse_args(args)
+        except SystemExit as e:
+            return e.code if e.code is not None else 0
+
+        command = parsed_args.command
+        if command in ("help", None):
+            self.parser.print_help()
+            return 0
+
+        try:
+            if command == "add":
+                task_id = self.storage.add(parsed_args.title)
+                print(f"Added task #{task_id}: {parsed_args.title}")
+                return 0
+
+            elif command == "list":
+                tasks = self.storage.get_all()
+                if not tasks:
+                    print("No tasks found.")
+                    return 0
+                print(f"{'ID':<4} {'Status':<10} {'Title'}")
+                print("-" * 40)
+                for t in tasks:
+                    status = "✓" if t["completed"] else " "
+                    print(f"{t['id']:<4} {status:<10} {t['title']}")
+                return 0
+
+            elif command == "complete":
+                if self.storage.complete(parsed_args.id):
+                    print(f"Task #{parsed_args.id} marked as completed.")
+                    return 0
+                print(f"Error: Task #{parsed_args.id} not found.", file=sys.stderr)
+                return 1
+
+            elif command == "delete":
+                if self.storage.delete(parsed_args.id):
+                    print(f"Task #{parsed_args.id} deleted.")
+                    return 0
+                print(f"Error: Task #{parsed_args.id} not found.", file=sys.stderr)
+                return 1
+
+        except RuntimeError as e:
+            print(f"Storage error: {e}", file=sys.stderr)
+            return 1
+
+        return 1
+
+
+def main() -> None:
+    """Entry point for the CLI."""
+    sys.exit(TodoCLI().run())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### `test_todo_cli.py`
+```python
+"""Unit tests for the To-Do CLI application."""
+
+import pytest
+from pathlib import Path
+from todo_cli import TodoStorage, TodoCLI
+
+
+@pytest.fixture
+def storage(tmp_path: Path) -> TodoStorage:
+    """Provide a temporary JSON storage backend."""
+    return TodoStorage(filepath=str(tmp_path / "tasks.json"))
+
+
+@pytest.fixture
+def cli(storage: TodoStorage) -> TodoCLI:
+    """Provide a CLI instance wired to the temporary storage."""
+    return TodoCLI(storage=storage)
+
+
+class TestTodoStorage:
+    """Tests for the storage layer."""
+
+    def test_add_task(self, storage: TodoStorage) -> None:
+        task_id = storage.add("Buy milk")
+        assert task_id == 1
+        tasks = storage.get_all()
+        assert len(tasks) == 1
+        assert tasks[0] == {"id": 1, "title": "Buy milk", "completed": False}
+
+    def test_add_multiple_tasks_auto_increment(self, storage: TodoStorage) -> None:
+        storage.add("Task 1")
+        assert storage.add("Task 2") == 2
+        assert storage.add("Task 3") == 3
+
+    def test_add_empty_title_raises_error(self, storage: TodoStorage) -> None:
+        with pytest.raises(ValueError, match="cannot be empty"):
+            storage.add("")
+        with pytest.raises(ValueError, match="cannot be empty"):
+            storage.add("   ")
+
+    def test_get_all_empty_initially(self, storage: TodoStorage) -> None:
+        assert storage.get_all() == []
+
+    def test_complete_task(self, storage: TodoStorage) -> None:
+        storage.add("Task 1")
+        assert storage.complete(1) is True
+        tasks = storage.get_all()
+        assert tasks[0]["completed"] is True
+
+    def test_complete_nonexistent_task(self, storage: TodoStorage) -> None:
+        assert storage.complete(999) is False
+
+    def test_delete_task(self, storage: TodoStorage) -> None:
+        storage.add("Task 1")
+        storage.add("Task 2")
+        assert storage.delete(1) is True
+        assert len(storage.get_all()) == 1
+        assert storage.get_all()[0]["id"] == 2
+
+    def test_delete_nonexistent_task(self, storage: TodoStorage) -> None:
+        assert storage.delete(999) is False
+
+
+class TestTodoCLI:
+    """Tests for the CLI layer."""
+
+    def test_cli_add(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["add", "Buy groceries"])
+        captured = capsys.readouterr()
+        assert "Added task #1: Buy groceries" in captured.out
+
+    def test_cli_list_with_tasks(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["add", "Task A"])
+        cli.run(["add", "Task B"])
+        cli.run(["list"])
+        captured = capsys.readouterr()
+        assert "Task A" in captured.out
+        assert "Task B" in captured.out
+        assert "ID" in captured.out
+        assert "Status" in captured.out
+
+    def test_cli_list_empty(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["list"])
+        captured = capsys.readouterr()
+        assert "No tasks found." in captured.out
+
+    def test_cli_complete(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["add", "Task 1"])
+        cli.run(["complete", "1"])
+        captured = capsys.readouterr()
+        assert "marked as completed" in captured.out
+
+    def test_cli_complete_not_found(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["complete", "99"])
+        captured = capsys.readouterr()
+        assert "not found" in captured.err
+
+    def test_cli_delete(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["add", "Task 1"])
+        cli.run(["delete", "1"])
+        captured = capsys.readouterr()
+        assert "deleted" in captured.out
+
+    def test_cli_delete_not_found(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["delete", "99"])
+        captured = capsys.readouterr()
+        assert "not found" in captured.err
+
+    def test_cli_help(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run(["help"])
+        captured = capsys.readouterr()
+        assert "add" in captured.out
+        assert "list" in captured.out
+        assert "complete" in captured.out
+        assert "delete" in captured.out
+
+    def test_cli_no_command_shows_help(self, cli: TodoCLI, capsys: pytest.CaptureFixture) -> None:
+        cli.run([])
+        captured = capsys.readouterr()
+        assert "add" in captured.out
+```
+
+### Usage & Testing Instructions
+
+1. **Run as a CLI:**
+   ```bash
+   python todo_cli.py add "Learn Python"
+   python todo_cli.py list
+   python todo_cli.py complete 1
+   python todo_cli.py delete 1
+   python todo_cli.py help
+   ```
+
+2. **Run Tests:**
+   ```bash
+   pytest test_todo_cli.py -v
+   ```
+
+3. **Import as a Module:**
+   ```python
+   from todo_cli import TodoStorage, TodoCLI
+
+   # Use storage independently
+   store = TodoStorage("my_tasks.json")
+   store.add("Buy coffee")
+   print(store.get_all())
+
+   # Or run CLI programmatically
+   cli = TodoCLI()
+   exit_code = cli.run(["add", "Write tests"])
+   ```
+
+### Design Highlights
+- **Separation of Concerns**: `TodoStorage` handles I/O and data mutation, `TodoCLI` handles argument parsing and user interaction.
+- **Testability**: Storage accepts a file path, allowing `tmp_path` fixtures to isolate tests. CLI accepts explicit `args` lists to avoid `sys.argv` interference.
+- **Robust Defaults**: Auto-increment IDs use `max() + 1` safely. Empty titles are rejected. Missing files/tasks return graceful messages.
+- **PEP 8 & Type Hints**: Fully typed with modern Python 3.12+ syntax, docstrings, and consistent error handling.

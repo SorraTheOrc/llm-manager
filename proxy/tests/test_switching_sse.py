@@ -4,7 +4,7 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_ensure_model_loaded_emits_switching_then_ready():
+async def test_ensure_model_loaded_emits_switching_then_ready(monkeypatch):
     from proxy import server
 
     events = []
@@ -19,16 +19,24 @@ async def test_ensure_model_loaded_emits_switching_then_ready():
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
+    # monkeypatch restores module globals after the test. ensure_model_loaded
+    # assigns server.llama_process = <mocked start_llama_server return value>
+    # and server.current_model; leaking them breaks later tests that call
+    # srv.llama_process.poll() (test_version_footer LP-0MS9MBVJK003D3RR).
+    monkeypatch.setattr(server, "llama_process", None)
+
     with patch.object(server, "config", {"server": {"llama_router_mode": False}}):
         with patch.object(server, "model_switch_lock", DummyLock()):
             with patch.object(server, "broadcast_status", side_effect=fake_broadcast):
-                with patch.object(server, "start_llama_server", return_value=object()):
-                    with patch.object(server, "wait_for_llama_server", new=AsyncMock(return_value=True)):
-                        with patch.object(server, "get_local_model_name", return_value="llama-7b"):
-                            server.current_model = "old-model"
-                            ok = await server.ensure_model_loaded("new-model")
+                with patch.object(server, "stop_llama_server") as mock_stop:
+                    with patch.object(server, "start_llama_server", return_value=object()):
+                        with patch.object(server, "wait_for_llama_server", new=AsyncMock(return_value=True)):
+                            with patch.object(server, "get_local_model_name", return_value="llama-7b"):
+                                server.current_model = "old-model"
+                                ok = await server.ensure_model_loaded("new-model")
 
     assert ok is True
+    mock_stop.assert_called_once()
     assert events[0][0] == "switching"
     assert events[0][1]["target_model"] == "llama-7b"
     assert events[0][1]["previous_model"] == "old-model"
@@ -38,7 +46,7 @@ async def test_ensure_model_loaded_emits_switching_then_ready():
 
 
 @pytest.mark.asyncio
-async def test_ensure_model_loaded_does_not_update_current_model_on_failure():
+async def test_ensure_model_loaded_does_not_update_current_model_on_failure(monkeypatch):
     from proxy import server
 
     events = []
@@ -53,16 +61,20 @@ async def test_ensure_model_loaded_does_not_update_current_model_on_failure():
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
+    monkeypatch.setattr(server, "llama_process", None)
+
     with patch.object(server, "config", {"server": {"llama_router_mode": False}}):
         with patch.object(server, "model_switch_lock", DummyLock()):
             with patch.object(server, "broadcast_status", side_effect=fake_broadcast):
-                with patch.object(server, "start_llama_server", return_value=object()):
-                    with patch.object(server, "wait_for_llama_server", new=AsyncMock(return_value=False)):
-                        with patch.object(server, "get_local_model_name", return_value="llama-7b"):
-                            server.current_model = "old-model"
-                            ok = await server.ensure_model_loaded("new-model")
+                with patch.object(server, "stop_llama_server") as mock_stop:
+                    with patch.object(server, "start_llama_server", return_value=object()):
+                        with patch.object(server, "wait_for_llama_server", new=AsyncMock(return_value=False)):
+                            with patch.object(server, "get_local_model_name", return_value="llama-7b"):
+                                server.current_model = "old-model"
+                                ok = await server.ensure_model_loaded("new-model")
 
     assert ok is False
+    mock_stop.assert_called()
     assert events[0][0] == "switching"
     assert events[-1][0] == "error"
     assert server.current_model == "old-model"

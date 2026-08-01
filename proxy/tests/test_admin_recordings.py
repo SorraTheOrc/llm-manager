@@ -267,6 +267,107 @@ class TestAdminListSessions:
         assert times == sorted(times, reverse=True)
 
 
+class TestListAllSessionsLimit:
+    """Tests for list_all_sessions() respecting the 15-session limit."""
+
+    @pytest.mark.asyncio
+    async def test_list_all_sessions_limited_to_15(self, tmp_path, monkeypatch):
+        """list_all_sessions returns at most 15 sessions when many exist."""
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        # Create 20 sessions to exceed the limit
+        for i in range(20):
+            session_id = f"sess-api-limit-{i:03d}"
+            sess_dir = Path(rec_dir) / session_id
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            recording = {
+                "session_id": session_id,
+                "direction": "client_to_proxy",
+                "timestamp": f"2026-07-07T{10 + i // 60:02d}:{i % 60:02d}:00.000000+00:00",
+                "payload": {"messages": [{"role": "user", "content": f"Message {i}"}]},
+            }
+            (sess_dir / f"2026-07-07T{10 + i // 60:02d}:{i % 60:02d}:00.000000-request.json").write_text(
+                json.dumps(recording)
+            )
+
+        # Mock _get_recorder and _srv to avoid server dependency
+        monkeypatch.setattr(
+            "proxy.ui._get_recorder",
+            lambda: recorder,
+        )
+
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+
+        monkeypatch.setattr(
+            "proxy.ui._srv",
+            lambda: mock_srv,
+        )
+
+        # Create a minimal mock request with query_params
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = None
+
+        response = await list_all_sessions(request=mock_request)
+
+        assert response.status_code == 200
+        data = response.body
+        # JSONResponse body is already serialised, decode it
+        body = json.loads(data) if isinstance(data, bytes) else data
+
+        sessions = body["sessions"]
+        count = body["count"]
+
+        assert len(sessions) <= 15, f"Expected at most 15 sessions, got {len(sessions)}"
+        assert count <= 15, f"Expected count <= 15, got {count}"
+        # Verify sessions are sorted by last_activity descending
+        times = [s.get("last_activity", "") for s in sessions]
+        assert times == sorted(times, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_list_all_sessions_under_limit_returns_all(self, tmp_path, monkeypatch):
+        """list_all_sessions returns all sessions when fewer than 15 exist."""
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        # Create 5 sessions (well under the limit)
+        for i in range(5):
+            session_id = f"sess-api-under-{i:03d}"
+            sess_dir = Path(rec_dir) / session_id
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            recording = {
+                "session_id": session_id,
+                "direction": "client_to_proxy",
+                "timestamp": f"2026-07-07T10:0{i}:00.000000+00:00",
+                "payload": {"messages": [{"role": "user", "content": f"Message {i}"}]},
+            }
+            (sess_dir / f"2026-07-07T10:0{i}:00.000000-request.json").write_text(json.dumps(recording))
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = None
+
+        response = await list_all_sessions(request=mock_request)
+
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+        sessions = body["sessions"]
+        assert len(sessions) == 5, f"Expected 5 sessions, got {len(sessions)}"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Route registration (server.py integration contract)
 # ═══════════════════════════════════════════════════════════════════════════

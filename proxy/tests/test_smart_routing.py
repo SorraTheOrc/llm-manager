@@ -6,7 +6,11 @@ cache-cold state machine.
 cached_tokens-based routing)
 """
 
-from proxy.provider import _estimate_prompt_tokens_for_routing, _should_skip_local
+from proxy.provider import (
+    _estimate_prompt_tokens_for_routing,
+    _get_warm_cache_threshold,
+    _should_skip_local,
+)
 
 # ---------------------------------------------------------------------------
 # Cached-tokens storage tests
@@ -191,15 +195,18 @@ class TestCachedTokensRouting:
         should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is True
 
-    def test_partially_warm_cache_large_request_skips_local(self):
-        """Partially warm cache (ratio 0.5 < 1) + large tokens → skips local."""
+    def test_partially_warm_cache_moderate_context_routes_local(self):
+        """Partially warm cache (ratio 0.5) + 42K total → new_tokens=21K below
+        threshold=40K, so routes local (affordable prefill).
+        This is the key behavioral change: old logic used ratio < 1.0 which
+        would incorrectly bypass local for this case."""
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
         threshold = 40000
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=50, prompt_tokens=100)
         should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
-        assert should_skip is True
+        assert should_skip is False
 
     def test_threshold_zero_disables_bypass(self):
         """Threshold=0 → always routes local regardless of cache state."""
@@ -224,6 +231,66 @@ class TestCachedTokensRouting:
         should_skip = _should_skip_local(
             "Qwen3", "sess_a", {"messages": []}, 40000, estimated_tokens=50000
         )
+        assert should_skip is True
+
+    # ------------------------------------------------------------------
+    # Warm-cache threshold tests
+    # ------------------------------------------------------------------
+
+    def test_warm_cache_moderate_context_routes_local(self):
+        """Warm cache (~0.95 ratio) + 90K total, new_tokens=4.5K below 30K
+        cold threshold, total 90K below 100K warm threshold → routes local."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 15000}]}  # ~90K tokens
+        cold_threshold = 30000
+        warm_threshold = 100000
+        from proxy.provider import update_cached_ratio
+        update_cached_ratio("Qwen3", "sess_a", cached_tokens=95, prompt_tokens=100)
+        should_skip = _should_skip_local(
+            "Qwen3", "sess_a", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+        )
+        assert should_skip is False
+
+    def test_warm_cache_excessive_context_bypasses(self):
+        """Warm cache (~0.95 ratio) + 200K total exceeds warm_threshold(100K)
+        → bypass local regardless of cache state."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 34000}]}  # ~200K tokens
+        cold_threshold = 30000
+        warm_threshold = 100000
+        from proxy.provider import update_cached_ratio
+        update_cached_ratio("Qwen3", "sess_a", cached_tokens=95, prompt_tokens=100)
+        should_skip = _should_skip_local(
+            "Qwen3", "sess_a", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+        )
+        assert should_skip is True
+
+    def test_warm_cache_threshold_zero_disabled(self):
+        """warm_cache_threshold=0 (default) disables the warm-cache hard cap,
+        falling through to cold-cache new-token logic."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 34000}]}  # ~200K tokens
+        cold_threshold = 30000
+        # warm_threshold defaults to 0 (disabled)
+        from proxy.provider import update_cached_ratio
+        update_cached_ratio("Qwen3", "sess_a", cached_tokens=95, prompt_tokens=100)
+        should_skip = _should_skip_local(
+            "Qwen3", "sess_a", body, cold_threshold,
+        )
+        # new_tokens = 200K * (1-0.95) = 10K <= 30K, so route local
+        assert should_skip is False
+
+    def test_cold_cache_new_token_dynamic_calculation(self):
+        """Cold cache (ratio=0.0) with 60K total and threshold=30K:
+        new_tokens = 60K, which exceeds 30K → bypass. This validates the
+        dynamic calculation replaces the old binary ratio < 1.0 check."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 10000}]}  # ~60K tokens
+        cold_threshold = 30000
+        should_skip = _should_skip_local("Qwen3", "sess_a", body, cold_threshold)
+        # new_tokens = 60K * (1-0.0) = 60K > 30K → bypass
         assert should_skip is True
 
     def test_default_cold_for_new_session(self):
@@ -464,6 +531,35 @@ class TestLargeContextThresholdConfig:
         from proxy.provider import _get_large_context_threshold
         config = {"server": {"local_large_context_fallback_threshold": 40000}}
         assert _get_large_context_threshold(config) == 40000
+
+
+class TestWarmCacheThresholdConfig:
+    """Tests for the warm-cache threshold configuration parsing."""
+
+    def test_warm_threshold_default_100000(self):
+        """Default warm cache threshold should be 100000."""
+        config = {"server": {"local_large_context_warm_cache_threshold": 100000}}
+        assert _get_warm_cache_threshold(config) == 100000
+
+    def test_warm_threshold_disabled_when_absent(self):
+        """Missing warm threshold config should return 0 (disabled)."""
+        config = {"server": {}}
+        assert _get_warm_cache_threshold(config) == 0
+
+    def test_warm_threshold_disabled_when_zero(self):
+        """Warm threshold of 0 should disable the warm-cache bypass."""
+        config = {"server": {"local_large_context_warm_cache_threshold": 0}}
+        assert _get_warm_cache_threshold(config) == 0
+
+    def test_warm_threshold_flat_config(self):
+        """Flat (non-nested) config should also work for test compatibility."""
+        config = {"local_large_context_warm_cache_threshold": 80000}
+        assert _get_warm_cache_threshold(config) == 80000
+
+    def test_warm_threshold_nested_config(self):
+        """Nested server config should be parsed correctly."""
+        config = {"server": {"local_large_context_warm_cache_threshold": 120000}}
+        assert _get_warm_cache_threshold(config) == 120000
 
 
 # ---------------------------------------------------------------------------

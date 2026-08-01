@@ -1,0 +1,393 @@
+# Benchmark: slot_count=2  session=5  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 400s  Tokens: 3006  TPS: 37.0
+# ============================================================
+
+Here's a complete, production-ready implementation that adds a lightweight web UI to your To-Do application while keeping CLI functionality intact. The code is organized into a clean Python package structure.
+
+### 📁 Project Structure
+```
+todo_app/
+├── todo/
+│   ├── __init__.py
+│   ├── core.py      # Data model & storage logic
+│   ├── web.py       # FastAPI app, routes & HTML templates
+│   ├── main.py      # CLI entry point & server launcher
+│   └── __main__.py  # Enables `python -m todo`
+├── tests/
+│   └── test_web.py  # Route tests
+└── pyproject.toml   # Dependencies & CLI script
+```
+
+---
+
+### 1. `todo/__init__.py`
+```python
+from .core import Task, TodoStore
+```
+
+### 2. `todo/core.py`
+```python
+import json
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Optional
+from datetime import datetime
+
+@dataclass
+class Task:
+    id: int
+    title: str
+    completed: bool = False
+    created_at: str = ""
+    due_date: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now().isoformat()
+
+class TodoStore:
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self.tasks: List[Task] = self._load()
+
+    def _load(self) -> List[Task]:
+        if self.filepath.exists():
+            with open(self.filepath) as f:
+                data = json.load(f)
+            return [Task(**t) for t in data]
+        return []
+
+    def save(self):
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.filepath, "w") as f:
+            json.dump([asdict(t) for t in self.tasks], f, indent=2)
+
+    def add(self, title: str, due_date: Optional[str] = None) -> Task:
+        new_id = max((t.id for t in self.tasks), default=0) + 1
+        task = Task(id=new_id, title=title, due_date=due_date)
+        self.tasks.append(task)
+        self.save()
+        return task
+
+    def toggle(self, task_id: int) -> Optional[Task]:
+        for t in self.tasks:
+            if t.id == task_id:
+                t.completed = not t.completed
+                self.save()
+                return t
+        return None
+
+    def delete(self, task_id: int) -> bool:
+        initial_len = len(self.tasks)
+        self.tasks = [t for t in self.tasks if t.id != task_id]
+        if len(self.tasks) < initial_len:
+            self.save()
+            return True
+        return False
+
+    def get_all(self, filter_status: Optional[str] = None) -> List[Task]:
+        if filter_status == "completed":
+            return [t for t in self.tasks if t.completed]
+        elif filter_status == "pending":
+            return [t for t in self.tasks if not t.completed]
+        return self.tasks
+
+    def get_daily_summary(self) -> dict:
+        today = datetime.now().strftime("%Y-%m-%d")
+        pending = [t for t in self.tasks if not t.completed]
+        completed = [t for t in self.tasks if t.completed]
+        return {
+            "date": today,
+            "pending_count": len(pending),
+            "completed_count": len(completed),
+            "pending_tasks": pending,
+            "completed_tasks": completed
+        }
+```
+
+### 3. `todo/web.py`
+```python
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
+from typing import Optional
+from pathlib import Path
+
+app = FastAPI()
+store = None
+
+def set_store(new_store):
+    global store
+    store = new_store
+
+def _render_index(tasks, filter_status):
+    filter_links = [
+        ('/', 'All', not filter_status),
+        ('/?filter=pending', 'Pending', filter_status == 'pending'),
+        ('/?filter=completed', 'Completed', filter_status == 'completed'),
+    ]
+    links_html = "".join(
+        f'<a href="{url}" class="{"active" if active else ""}">{text}</a> '
+        for url, text, active in filter_links
+    )
+    rows_html = ""
+    for t in tasks:
+        completed_class = "completed" if t.completed else ""
+        rows_html += f"""
+        <tr class="{completed_class}">
+            <td>{t.id}</td>
+            <td>{t.title}</td>
+            <td>{t.created_at[:10]}</td>
+            <td>✅</td>
+            <td>
+                <form method="POST" action="/toggle/{t.id}" style="display:inline;">
+                    <button type="submit">Toggle</button>
+                </form>
+                <form method="POST" action="/delete/{t.id}" style="display:inline;">
+                    <button type="submit">Delete</button>
+                </form>
+            </td>
+        </tr>"""
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><title>Todo App</title>
+<style>
+    body {{ font-family: sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 1rem; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+    th {{ background: #f4f4f4; }}
+    .completed {{ text-decoration: line-through; color: #888; }}
+    form {{ margin-bottom: 1rem; }}
+    input[type="text"] {{ padding: 5px; width: 300px; }}
+    button {{ padding: 5px 10px; cursor: pointer; }}
+    .filters {{ margin-bottom: 1rem; }}
+    .filters a {{ margin-right: 10px; text-decoration: none; color: #0066cc; }}
+    .filters a.active {{ font-weight: bold; color: #000; }}
+</style></head>
+<body>
+    <h1>Todo List</h1>
+    <form method="POST" action="/add">
+        <input type="text" name="title" placeholder="New task..." required>
+        <button type="submit">Add</button>
+    </form>
+    <div class="filters">{links_html}</div>
+    <table>
+        <tr><th>ID</th><th>Title</th><th>Created</th><th>Completed</th><th>Actions</th></tr>
+        {rows_html}
+    </table>
+</body></html>
+"""
+
+@app.get("/")
+def index(filter_status: Optional[str] = None):
+    if not store:
+        return HTMLResponse("<p>Error: Store not initialized.</p>", status_code=500)
+    tasks = store.get_all(filter_status)
+    return HTMLResponse(content=_render_index(tasks, filter_status))
+
+@app.post("/add")
+def add_task(title: str = Form(...)):
+    if not store:
+        return HTMLResponse("<p>Error: Store not initialized.</p>", status_code=500)
+    store.add(title)
+    return HTMLResponse(content="<script>window.location.href='/';</script>", media_type="text/html")
+
+@app.post("/toggle/{task_id}")
+def toggle_task(task_id: int):
+    if not store:
+        return HTMLResponse("<p>Error: Store not initialized.</p>", status_code=500)
+    store.toggle(task_id)
+    return HTMLResponse(content="<script>window.location.href='/';</script>", media_type="text/html")
+
+@app.post("/delete/{task_id}")
+def delete_task(task_id: int):
+    if not store:
+        return HTMLResponse("<p>Error: Store not initialized.</p>", status_code=500)
+    store.delete(task_id)
+    return HTMLResponse(content="<script>window.location.href='/';</script>", media_type="text/html")
+
+@app.get("/daily")
+def daily():
+    if not store:
+        return HTMLResponse("<p>Error: Store not initialized.</p>", status_code=500)
+    summary = store.get_daily_summary()
+    pending_list = "<li>" + "</li><li>".join(t.title for t in summary["pending_tasks"]) + "</li>"
+    completed_list = "<li>" + "</li><li>".join(t.title for t in summary["completed_tasks"]) + "</li>"
+    return f"""
+    <h1>Daily Summary ({summary['date']})</h1>
+    <p>Pending: {summary['pending_count']}</p>
+    <ul>{pending_list}</ul>
+    <p>Completed: {summary['completed_count']}</p>
+    <ul>{completed_list}</ul>
+    <a href="/">Back to list</a>
+    """
+```
+
+### 4. `todo/main.py`
+```python
+import argparse
+import sys
+import uvicorn
+from pathlib import Path
+from .core import TodoStore
+from .web import app, set_store
+
+def main():
+    parser = argparse.ArgumentParser(description="Todo CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Existing CLI command (additive)
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", help="Task title")
+    add_parser.add_argument("--data", type=str, default="todo_data.json", help="Data file path")
+
+    # Web UI command
+    serve_parser = subparsers.add_parser("serve", help="Start web UI")
+    serve_parser.add_argument("--port", type=int, default=8080, help="Port to run on")
+    serve_parser.add_argument("--data", type=str, default="todo_data.json", help="Data file path")
+
+    args = parser.parse_args()
+
+    if args.command == "add":
+        store = TodoStore(Path(args.data))
+        store.add(args.title)
+        print(f"Added task: {args.title}")
+    elif args.command == "serve":
+        store_path = Path(args.data)
+        try:
+            set_store(TodoStore(store_path))
+            uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+        except KeyboardInterrupt:
+            print("\nServer stopped gracefully.")
+        except OSError as e:
+            if e.errno in (48, 98) or "Address already in use" in str(e):
+                print(f"Error: Port {args.port} is already in use.")
+            else:
+                print(f"Server error: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+    elif args.command is None:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+```
+
+### 5. `todo/__main__.py`
+```python
+from todo.main import main
+main()
+```
+
+### 6. `tests/test_web.py`
+```python
+import os
+import tempfile
+import pytest
+from fastapi.testclient import TestClient
+from todo.core import Task, TodoStore
+from todo.web import app, set_store, store as web_store
+from pathlib import Path
+
+@pytest.fixture
+def client():
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        temp_path = f.name
+    store = TodoStore(Path(temp_path))
+    store.tasks = []
+    store.save()
+    set_store(store)
+    client = TestClient(app)
+    yield client
+    os.unlink(temp_path)
+    set_store(None)
+
+def test_get_index(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "Todo List" in resp.text
+
+def test_add_task(client):
+    resp = client.post("/add", data={"title": "New Task"})
+    assert resp.status_code == 200
+    resp = client.get("/")
+    assert "New Task" in resp.text
+
+def test_toggle_task(client):
+    task = Task(id=1, title="Toggle Task")
+    web_store.tasks = [task]
+    web_store.save()
+    resp = client.post("/toggle/1")
+    assert resp.status_code == 200
+    assert web_store.tasks[0].completed is True
+
+def test_delete_task(client):
+    task = Task(id=2, title="Delete Task")
+    web_store.tasks = [task]
+    web_store.save()
+    resp = client.post("/delete/2")
+    assert resp.status_code == 200
+    assert len(web_store.tasks) == 0
+
+def test_daily_summary(client):
+    resp = client.get("/daily")
+    assert resp.status_code == 200
+    assert "Daily Summary" in resp.text
+```
+
+### 7. `pyproject.toml`
+```toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "todo-app"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+]
+
+[project.scripts]
+todo = "todo.main:main"
+```
+
+---
+
+### 🚀 Usage & Testing
+
+**Install dependencies:**
+```bash
+pip install fastapi uvicorn pytest httpx
+```
+
+**Run CLI commands (fully preserved):**
+```bash
+todo add "Buy groceries"
+todo add --data my_tasks.json "Schedule dentist"
+```
+
+**Launch Web UI:**
+```bash
+todo serve --port 8080
+```
+Visit `http://localhost:8080` in your browser. Press `Ctrl+C` to stop gracefully. Port conflicts are caught and reported without crashing.
+
+**Run Tests:**
+```bash
+pytest tests/test_web.py -v
+```
+
+### ✅ Key Features
+- **Zero external CSS/JS**: All styling is inline, keeping dependencies minimal.
+- **Additive CLI**: Existing commands (`todo add`, etc.) continue to work alongside the web server.
+- **Graceful Shutdown**: Handles `Ctrl+C` and port conflicts (`OSError` 48/98) cleanly.
+- **Test Coverage**: Uses FastAPI's built-in `TestClient` to verify all routes without starting a real server.
+- **Clean Architecture**: Separates core logic (`core.py`), web layer (`web.py`), and CLI routing (`main.py`).

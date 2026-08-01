@@ -1,14 +1,30 @@
+import os
 import time
 
 import pytest
 import requests
 from requests.exceptions import RequestException
 
+# These tests exercise the LIVE proxy (localhost:8000) with real chat and
+# embeddings inference. They are opt-in and disabled by default so a routine
+# `pytest` run can never crash the running proxy/llama-server (GPU contention)
+# or leave it in a bad state (see LP-0MS6R13CP009VO24).
+pytestmark = [pytest.mark.integration, pytest.mark.e2e_live]
+
+if os.getenv("RUN_LIVE_PROXY_E2E", "0") != "1":
+    pytest.skip(
+        "live proxy E2E tests are disabled; set RUN_LIVE_PROXY_E2E=1 to run on demand",
+        allow_module_level=True,
+    )
+
 
 def _require_local_proxy(base: str):
     """Skip integration tests when a local proxy instance is not running."""
     try:
-        r = requests.get(f"{base}/health", timeout=2)
+        # Generous health timeout: a healthy-but-loaded proxy (e.g. concurrent
+        # chat streams contending for the single GPU) may answer /health slowly,
+        # and we must not spuriously skip (see LP-0MS9FM27K007NCNE).
+        r = requests.get(f"{base}/health", timeout=5)
         if r.status_code != 200:
             pytest.skip(f"local proxy not healthy at {base}/health")
     except RequestException:
@@ -66,7 +82,9 @@ def test_embeddings_alias_returns_openai_format():
     _require_local_proxy(base)
     wait_for_embeddings(base, timeout=60)
     payload = {"model": "embeddings", "input": "hello world"}
-    resp = requests.post(url, json=payload, timeout=10)
+    # Generous request timeout: embeddings can be slow on a loaded GPU even
+    # after wait_for_embeddings() warm-up (see LP-0MS9FM27K007NCNE).
+    resp = requests.post(url, json=payload, timeout=30)
     assert resp.status_code == 200, f"unexpected status: {resp.status_code} {resp.text}"
     body = resp.json()
     # Basic OpenAI embeddings response sanity checks

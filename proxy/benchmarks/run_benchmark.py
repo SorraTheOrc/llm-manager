@@ -329,8 +329,16 @@ async def send_single_request(
         )
 
 
-async def run_benchmark_async(config: BenchmarkConfig) -> dict:
-    """Execute the full benchmark asynchronously."""
+async def run_benchmark_async(
+    config: BenchmarkConfig,
+    progress_callback=None,
+) -> dict:
+    """Execute the full benchmark asynchronously.
+
+    If ``progress_callback`` is provided it is invoked twice per request:
+    once with ``(request_number, total, None)`` before the request starts,
+    and once with ``(request_number, total, result)`` after it completes.
+    """
     if httpx is None:
         print("Error: httpx is required. Install with: pip install httpx", file=sys.stderr)
         sys.exit(1)
@@ -348,12 +356,25 @@ async def run_benchmark_async(config: BenchmarkConfig) -> dict:
 
         async def bounded_request(prompt: str, idx: int):
             async with sem:
+                if progress_callback is not None:
+                    progress_callback(idx + 1, config.num_requests, None)
                 return await send_single_request(client, config, prompt, idx)
 
         tasks = [
-            bounded_request(prompts[i], i) for i in range(config.num_requests)
+            asyncio.create_task(bounded_request(prompts[i], i))
+            for i in range(config.num_requests)
         ]
-        results = await asyncio.gather(*tasks)
+        # Report each request as it completes rather than waiting for all
+        results = [None] * len(tasks)
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            results[result.request_index] = result
+            if progress_callback is not None:
+                progress_callback(
+                    result.request_index + 1,
+                    config.num_requests,
+                    result,
+                )
 
     # Compute summary statistics
     completed = [r for r in results if r.status == "completed"]
@@ -556,7 +577,23 @@ def main(argv: list[str] | None = None) -> None:
             print("  Metrics snapshot script returned no output")
 
     # Run benchmark
-    result = asyncio.run(run_benchmark_async(config))
+    def _print_progress(request_number, total, result):
+        """Print inline per-request progress (LP-0MRWU82H5003KV47)."""
+        if result is None:
+            print(f"Sending request {request_number}/{total}...", flush=True)
+        else:
+            status = result.status
+            duration = result.total_duration_seconds
+            tokens = result.completion_tokens
+            print(
+                f"  Request {request_number}/{total} complete: "
+                f"status={status} duration={duration:.2f}s tokens={tokens}",
+                flush=True,
+            )
+
+    result = asyncio.run(
+        run_benchmark_async(config, progress_callback=_print_progress)
+    )
 
     # Write output
     output_path.parent.mkdir(parents=True, exist_ok=True)

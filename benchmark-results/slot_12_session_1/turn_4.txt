@@ -1,0 +1,1420 @@
+# Benchmark: slot_count=12  session=1  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 2047s  Tokens: 11150  TPS: 5.6
+# ============================================================
+
+# To-Do Application with Web UI
+
+## Project Structure
+
+```
+todo_app/
+├── todo/
+│   ├── __init__.py
+│   ├── models.py
+│   ├── store.py
+│   ├── daily.py
+│   ├── cli.py
+│   ├── web.py
+│   └── templates.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_store.py
+│   ├── test_cli.py
+│   └── test_web.py
+├── pyproject.toml
+└── README.md
+```
+
+## Complete Implementation
+
+### `todo/models.py`
+
+```python
+"""Data models for the To-Do application."""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field, asdict
+from datetime import date, datetime
+from enum import Enum
+from typing import Optional
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    DONE = "done"
+
+
+@dataclass
+class Task:
+    """Represents a single to-do task."""
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    title: str = ""
+    description: str = ""
+    status: TaskStatus = TaskStatus.PENDING
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    due_date: Optional[date] = None
+    priority: int = 0  # 0 = normal, 1 = high, 2 = urgent
+
+    def to_dict(self) -> dict:
+        """Serialize task to a dictionary (JSON-safe)."""
+        d = asdict(self)
+        d["status"] = self.status.value
+        if self.due_date:
+            d["due_date"] = self.due_date.isoformat()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Task:
+        """Deserialize task from a dictionary."""
+        data = data.copy()
+        data["status"] = TaskStatus(data["status"])
+        if data.get("due_date"):
+            data["due_date"] = date.fromisoformat(data["due_date"])
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    @property
+    def is_overdue(self) -> bool:
+        """Check if task is overdue."""
+        if not self.due_date or self.status != TaskStatus.PENDING:
+            return False
+        return self.due_date < date.today()
+
+    def __repr__(self) -> str:
+        status_icon = "✓" if self.status == TaskStatus.DONE else "○"
+        overdue_marker = " ⚠" if self.is_overdue else ""
+        return f"Task({status_icon} {self.id}: {self.title}{overdue_marker})"
+```
+
+### `todo/store.py`
+
+```python
+"""SQLite-backed persistent storage for tasks."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
+from typing import Iterator, List, Optional
+
+from .models import Task, TaskStatus
+
+
+class StoreError(Exception):
+    """Base exception for store operations."""
+
+
+class TaskNotFoundError(StoreError):
+    """Raised when a task is not found."""
+
+
+class DuplicateTaskError(StoreError):
+    """Raised when a task already exists."""
+
+
+class TaskStore:
+    """Thread-safe SQLite task store."""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        status TEXT DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        due_date TEXT,
+        priority INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+    CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
+    CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
+    """
+
+    def __init__(self, db_path: Optional[Path] = None):
+        if db_path is None:
+            db_path = Path.home() / ".local" / "share" / "todo" / "tasks.db"
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get a thread-local database connection."""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+            )
+            self._local.conn.row_factory = sqlite3.Row
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA foreign_keys=ON")
+        return self._local.conn
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """Context manager for database transactions."""
+        conn = self._get_conn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _init_db(self) -> None:
+        """Initialize database schema."""
+        conn = self._get_conn()
+        conn.executescript(self.SCHEMA)
+
+    def close(self) -> None:
+        """Close the thread-local connection."""
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
+    def add_task(
+        self,
+        title: str,
+        description: str = "",
+        due_date: Optional[date] = None,
+        priority: int = 0,
+    ) -> Task:
+        """Add a new task to the store."""
+        if not title.strip():
+            raise ValueError("Task title cannot be empty")
+
+        task = Task(
+            title=title.strip(),
+            description=description.strip(),
+            due_date=due_date,
+            priority=max(0, min(2, priority)),
+        )
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (id, title, description, status, created_at, updated_at, due_date, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.id,
+                    task.title,
+                    task.description,
+                    task.status.value,
+                    task.created_at.isoformat(),
+                    task.updated_at.isoformat(),
+                    task.due_date.isoformat() if task.due_date else None,
+                    task.priority,
+                ),
+            )
+
+        return task
+
+    def get_task(self, task_id: str) -> Task:
+        """Get a task by ID."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found")
+        return self._row_to_task(row)
+
+    def update_task_status(self, task_id: str, status: TaskStatus) -> Task:
+        """Update the status of a task."""
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (status.value, datetime.now().isoformat(), task_id),
+            )
+        return self.get_task(task_id)
+
+    def delete_task(self, task_id: str) -> None:
+        """Delete a task by ID."""
+        with self._transaction() as conn:
+            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            if cursor.rowcount == 0:
+                raise TaskNotFoundError(f"Task '{task_id}' not found")
+
+    def list_tasks(
+        self,
+        status: Optional[TaskStatus] = None,
+        due_date: Optional[date] = None,
+        priority: Optional[int] = None,
+        search: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[Task]:
+        """List tasks with optional filters."""
+        conditions = []
+        params = []
+
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status.value)
+        if due_date is not None:
+            conditions.append("due_date = ?")
+            params.append(due_date.isoformat())
+        if priority is not None:
+            conditions.append("priority = ?")
+            params.append(priority)
+        if search is not None:
+            conditions.append("(title LIKE ? OR description LIKE ?)")
+            search_term = f"%{search}%"
+            params.extend([search_term, search_term])
+
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        query = f"SELECT * FROM tasks {where_clause} ORDER BY priority DESC, due_date ASC, created_at DESC"
+
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+        conn = self._get_conn()
+        rows = conn.execute(query, params).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def get_daily_tasks(self, target_date: Optional[date] = None) -> dict:
+        """Get tasks grouped by status for a given date.
+
+        Returns a dict with keys: due_today, overdue, upcoming, completed_today.
+        """
+        if target_date is None:
+            target_date = date.today()
+
+        conn = self._get_conn()
+        target_str = target_date.isoformat()
+
+        # Tasks due today
+        due_today = [
+            self._row_to_task(r)
+            for r in conn.execute(
+                "SELECT * FROM tasks WHERE due_date = ? AND status != 'done' ORDER BY priority DESC, created_at ASC",
+                (target_str,),
+            ).fetchall()
+        ]
+
+        # Overdue tasks
+        overdue = [
+            self._row_to_task(r)
+            for r in conn.execute(
+                "SELECT * FROM tasks WHERE due_date < ? AND status != 'done' ORDER BY due_date ASC, priority DESC",
+                (target_str,),
+            ).fetchall()
+        ]
+
+        # Upcoming tasks (due in next 7 days)
+        from datetime import timedelta
+
+        week_later = (target_date + timedelta(days=7)).isoformat()
+        upcoming = [
+            self._row_to_task(r)
+            for r in conn.execute(
+                "SELECT * FROM tasks WHERE due_date BETWEEN ? AND ? AND status != 'done' ORDER BY due_date ASC",
+                (target_str, week_later),
+            ).fetchall()
+        ]
+
+        # Completed today
+        completed_today = [
+            self._row_to_task(r)
+            for r in conn.execute(
+                "SELECT * FROM tasks WHERE status = 'done' AND date(updated_at) = date(?) ORDER BY updated_at DESC",
+                (target_str,),
+            ).fetchall()
+        ]
+
+        return {
+            "date": target_date,
+            "due_today": due_today,
+            "overdue": overdue,
+            "upcoming": upcoming,
+            "completed_today": completed_today,
+            "stats": {
+                "total": len(due_today) + len(overdue) + len(upcoming) + len(completed_today),
+                "pending": len(due_today) + len(overdue) + len(upcoming),
+                "done": len(completed_today),
+                "overdue_count": len(overdue),
+            },
+        }
+
+    def get_stats(self) -> dict:
+        """Get overall task statistics."""
+        conn = self._get_conn()
+        total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        done = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'done'").fetchone()[0]
+        pending = total - done
+        overdue_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE due_date < date('now') AND status = 'pending'"
+        ).fetchone()[0]
+
+        return {
+            "total": total,
+            "pending": pending,
+            "done": done,
+            "overdue": overdue_count,
+        }
+
+    @staticmethod
+    def _row_to_task(row: sqlite3.Row) -> Task:
+        """Convert a database row to a Task object."""
+        return Task(
+            id=row["id"],
+            title=row["title"],
+            description=row["description"] or "",
+            status=TaskStatus(row["status"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            due_date=date.fromisoformat(row["due_date"]) if row["due_date"] else None,
+            priority=row["priority"],
+        )
+```
+
+### `todo/daily.py`
+
+```python
+"""Daily summary logic for the To-Do application."""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Optional
+
+from .store import TaskStore
+
+
+def format_daily_summary(store: TaskStore, target_date: Optional[date] = None) -> str:
+    """Format a daily summary as a human-readable string."""
+    data = store.get_daily_tasks(target_date)
+    today = data["date"]
+    lines = []
+
+    lines.append(f"\n{'=' * 50}")
+    lines.append(f"  📅 Daily Summary — {today.isoformat()}")
+    lines.append(f"{'=' * 50}")
+
+    stats = data["stats"]
+    lines.append(f"\n  📊 Stats: {stats['pending']} pending, {stats['done']} done, {stats['overdue_count']} overdue")
+
+    if data["overdue"]:
+        lines.append(f"\n  ⚠️  OVERDUE ({len(data['overdue'])}):")
+        for task in data["overdue"]:
+            lines.append(f"      {task.id}: {task.title} (due {task.due_date.isoformat() if task.due_date else 'no date'})")
+
+    if data["due_today"]:
+        lines.append(f"\n  🎯 DUE TODAY ({len(data['due_today'])}):")
+        for task in data["due_today"]:
+            priority_marker = "🔴" if task.priority == 2 else "🟡" if task.priority == 1 else "⚪"
+            lines.append(f"      {priority_marker} {task.id}: {task.title}")
+
+    if data["upcoming"]:
+        lines.append(f"\n  🔜 UPCOMING ({len(data['upcoming'])}):")
+        for task in data["upcoming"]:
+            lines.append(f"      {task.id}: {task.title} (due {task.due_date.isoformat()})")
+
+    if data["completed_today"]:
+        lines.append(f"\n  ✅ COMPLETED TODAY ({len(data['completed_today'])}):")
+        for task in data["completed_today"]:
+            lines.append(f"      ✓ {task.id}: {task.title}")
+
+    if not any([data["overdue"], data["due_today"], data["upcoming"], data["completed_today"]]):
+        lines.append("\n  🎉 No tasks for today!")
+
+    lines.append(f"\n{'=' * 50}\n")
+    return "\n".join(lines)
+```
+
+### `todo/templates.py`
+
+```python
+"""HTML templates for the web UI."""
+
+from __future__ import annotations
+
+from datetime import date
+
+from .models import Task, TaskStatus
+
+
+def render_base(title: str = "To-Do App", body: str = "") -> str:
+    """Render the base HTML template."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 960px;
+            margin: 0 auto;
+        }}
+        header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 2px solid #e0e0e0;
+        }}
+        header h1 {{
+            font-size: 1.8rem;
+            color: #2c3e50;
+        }}
+        nav a {{
+            margin-left: 16px;
+            text-decoration: none;
+            color: #3498db;
+            font-weight: 500;
+            padding: 6px 12px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }}
+        nav a:hover {{
+            background: #e8f4fd;
+        }}
+        nav a.active {{
+            background: #3498db;
+            color: white;
+        }}
+        .form-card {{
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .form-card h2 {{
+            margin-bottom: 12px;
+            color: #2c3e50;
+            font-size: 1.2rem;
+        }}
+        .form-row {{
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }}
+        .form-group {{
+            flex: 1;
+            min-width: 200px;
+        }}
+        .form-group label {{
+            display: block;
+            font-size: 0.85rem;
+            color: #666;
+            margin-bottom: 4px;
+            font-weight: 500;
+        }}
+        .form-group input,
+        .form-group select,
+        .form-group textarea {{
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 0.95rem;
+            transition: border-color 0.2s;
+        }}
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {{
+            outline: none;
+            border-color: #3498db;
+            box-shadow: 0 0 0 2px rgba(52,152,219,0.1);
+        }}
+        .btn {{
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+        }}
+        .btn-primary {{
+            background: #3498db;
+            color: white;
+        }}
+        .btn-primary:hover {{
+            background: #2980b9;
+        }}
+        .btn-success {{
+            background: #27ae60;
+            color: white;
+        }}
+        .btn-success:hover {{
+            background: #219a52;
+        }}
+        .btn-danger {{
+            background: #e74c3c;
+            color: white;
+        }}
+        .btn-danger:hover {{
+            background: #c0392b;
+        }}
+        .btn-sm {{
+            padding: 4px 10px;
+            font-size: 0.8rem;
+        }}
+        .filters {{
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+            padding: 12px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .filters select,
+        .filters input {{
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        th {{
+            background: #2c3e50;
+            color: white;
+            padding: 12px 16px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }}
+        td {{
+            padding: 10px 16px;
+            border-bottom: 1px solid #eee;
+            font-size: 0.9rem;
+        }}
+        tr:hover {{
+            background: #f8f9fa;
+        }}
+        tr.done td {{
+            text-decoration: line-through;
+            color: #999;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }}
+        .badge-pending {{
+            background: #fff3cd;
+            color: #856404;
+        }}
+        .badge-done {{
+            background: #d4edda;
+            color: #155724;
+        }}
+        .badge-overdue {{
+            background: #f8d7da;
+            color: #721c24;
+        }}
+        .priority-high {{ color: #e74c3c; font-weight: bold; }}
+        .priority-normal {{ color: #666; }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-bottom: 20px;
+        }}
+        .stat-card {{
+            background: white;
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .stat-card .number {{
+            font-size: 2rem;
+            font-weight: 700;
+            color: #2c3e50;
+        }}
+        .stat-card .label {{
+            font-size: 0.85rem;
+            color: #666;
+            margin-top: 4px;
+        }}
+        .section-title {{
+            font-size: 1.1rem;
+            color: #2c3e50;
+            margin: 20px 0 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #eee;
+        }}
+        .empty-state {{
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }}
+        .flash {{
+            padding: 12px 16px;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            font-size: 0.9rem;
+        }}
+        .flash-success {{
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }}
+        .flash-error {{
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📝 To-Do App</h1>
+            <nav>
+                <a href="/" class="{'' if title == 'To-Do App' else ''}">Tasks</a>
+                <a href="/daily" class="{'' if title == 'Daily Summary' else ''}">Daily</a>
+            </nav>
+        </header>
+        {body}
+    </div>
+</body>
+</html>"""
+
+
+def render_add_form() -> str:
+    """Render the add task form."""
+    return f"""
+    <div class="form-card">
+        <h2>Add New Task</h2>
+        <form method="POST" action="/add">
+            <div class="form-row">
+                <div class="form-group" style="flex: 2;">
+                    <label for="title">Title *</label>
+                    <input type="text" id="title" name="title" required placeholder="What needs to be done?">
+                </div>
+                <div class="form-group">
+                    <label for="priority">Priority</label>
+                    <select id="priority" name="priority">
+                        <option value="0">Normal</option>
+                        <option value="1">High</option>
+                        <option value="2">Urgent</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="due_date">Due Date</label>
+                    <input type="date" id="due_date" name="due_date">
+                </div>
+                <div class="form-group" style="flex: 0;">
+                    <label>&nbsp;</label>
+                    <button type="submit" class="btn btn-primary">Add Task</button>
+                </div>
+            </div>
+            <div class="form-group" style="margin-top: 12px;">
+                <label for="description">Description</label>
+                <textarea id="description" name="description" rows="2" placeholder="Optional details..."></textarea>
+            </div>
+        </form>
+    </div>"""
+
+
+def render_tasks_table(tasks: list[Task], filters: dict = None) -> str:
+    """Render the tasks table."""
+    if not tasks:
+        return '<div class="empty-state">No tasks found. Add one above!</div>'
+
+    rows = []
+    for task in tasks:
+        status_class = "done" if task.status == TaskStatus.DONE else ""
+        status_badge = (
+            '<span class="badge badge-done">Done</span>'
+            if task.status == TaskStatus.DONE
+            else '<span class="badge badge-pending">Pending</span>'
+        )
+        if task.is_overdue:
+            status_badge = '<span class="badge badge-overdue">Overdue</span>'
+
+        priority_label = (
+            '<span class="priority-high">🔴 Urgent</span>'
+            if task.priority == 2
+            else '<span style="color:#e67e22;font-weight:bold;">🟡 High</span>'
+            if task.priority == 1
+            else '<span class="priority-normal">Normal</span>'
+        )
+
+        due_str = task.due_date.isoformat() if task.due_date else "—"
+        due_class = "priority-high" if task.is_overdue else ""
+
+        rows.append(f"""
+            <tr class="{status_class}">
+                <td>{task.id}</td>
+                <td>{priority_label}</td>
+                <td><strong>{task.title}</strong><br>
+                    <small style="color:#888;">{task.description[:60]}{'...' if len(task.description) > 60 else ''}</small>
+                </td>
+                <td>{status_badge}</td>
+                <td class="{due_class}">{due_str}</td>
+                <td>
+                    <form method="POST" action="/toggle/{task.id}" style="display:inline;">
+                        <button type="submit" class="btn btn-success btn-sm">
+                            {('✓ Done' if task.status == TaskStatus.PENDING else '↩ Undo')}
+                        </button>
+                    </form>
+                    <form method="POST" action="/delete/{task.id}" style="display:inline;" onsubmit="return confirm('Delete this task?');">
+                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                    </form>
+                </td>
+            </tr>""")
+
+    return f"""
+    <div class="filters">
+        <form method="GET" action="/" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;width:100%;">
+            <select name="status">
+                <option value="">All Statuses</option>
+                <option value="pending" {"selected" if filters and filters.get("status") == "pending" else ""}>Pending</option>
+                <option value="done" {"selected" if filters and filters.get("status") == "done" else ""}>Done</option>
+            </select>
+            <select name="priority">
+                <option value="">All Priorities</option>
+                <option value="2" {"selected" if filters and filters.get("priority") == "2" else ""}>Urgent</option>
+                <option value="1" {"selected" if filters and filters.get("priority") == "1" else ""}>High</option>
+                <option value="0" {"selected" if filters and filters.get("priority") == "0" else ""}>Normal</option>
+            </select>
+            <input type="text" name="search" placeholder="Search tasks..." value="{filters.get('search', '') if filters else ''}" style="flex:1;min-width:150px;">
+            <input type="date" name="due_date" value="{filters.get('due_date', '') if filters else ''}" title="Filter by due date">
+            <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+            <a href="/" class="btn btn-sm" style="background:#95a5a6;color:white;">Clear</a>
+        </form>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Priority</th>
+                <th>Title / Description</th>
+                <th>Status</th>
+                <th>Due Date</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {''.join(rows)}
+        </tbody>
+    </table>"""
+
+
+def render_daily_summary(data: dict) -> str:
+    """Render the daily summary page."""
+    today = data["date"]
+    stats = data["stats"]
+
+    stats_html = f"""
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="number">{stats['total']}</div>
+            <div class="label">Total</div>
+        </div>
+        <div class="stat-card">
+            <div class="number" style="color:#e67e22;">{stats['pending']}</div>
+            <div class="label">Pending</div>
+        </div>
+        <div class="stat-card">
+            <div class="number" style="color:#27ae60;">{stats['done']}</div>
+            <div class="label">Done</div>
+        </div>
+        <div class="stat-card">
+            <div class="number" style="color:#e74c3c;">{stats['overdue_count']}</div>
+            <div class="label">Overdue</div>
+        </div>
+    </div>"""
+
+    sections = []
+
+    if data["overdue"]:
+        rows = "".join(
+            f"<tr><td>{t.id}</td><td>{t.title}</td><td>{t.due_date.isoformat() if t.due_date else '—'}</td></tr>"
+            for t in data["overdue"]
+        )
+        sections.append(f"""
+            <h3 class="section-title">⚠️ Overdue ({len(data['overdue'])})</h3>
+            <table><thead><tr><th>ID</th><th>Title</th><th>Due</th></tr></thead>
+            <tbody>{rows}</tbody></table>""")
+
+    if data["due_today"]:
+        rows = "".join(
+            f"<tr><td>{t.id}</td><td>{t.title}</td><td>{t.priority}</td></tr>"
+            for t in data["due_today"]
+        )
+        sections.append(f"""
+            <h3 class="section-title">🎯 Due Today ({len(data['due_today'])})</h3>
+            <table><thead><tr><th>ID</th><th>Title</th><th>Priority</th></tr></thead>
+            <tbody>{rows}</tbody></table>""")
+
+    if data["upcoming"]:
+        rows = "".join(
+            f"<tr><td>{t.id}</td><td>{t.title}</td><td>{t.due_date.isoformat()}</td></tr>"
+            for t in data["upcoming"]
+        )
+        sections.append(f"""
+            <h3 class="section-title">🔜 Upcoming ({len(data['upcoming'])})</h3>
+            <table><thead><tr><th>ID</th><th>Title</th><th>Due</th></tr></thead>
+            <tbody>{rows}</tbody></table>""")
+
+    if data["completed_today"]:
+        rows = "".join(
+            f"<tr><td>{t.id}</td><td>{t.title}</td><td>{t.updated_at.strftime('%H:%M')}</td></tr>"
+            for t in data["completed_today"]
+        )
+        sections.append(f"""
+            <h3 class="section-title">✅ Completed Today ({len(data['completed_today'])})</h3>
+            <table><thead><tr><th>ID</th><th>Title</th><th>Completed</th></tr></thead>
+            <tbody>{rows}</tbody></table>""")
+
+    if not sections:
+        sections.append('<div class="empty-state">🎉 No tasks for today!</div>')
+
+    return f"""
+    <div class="form-card" style="margin-bottom:20px;">
+        <form method="GET" action="/daily" style="display:flex;gap:12px;align-items:center;">
+            <label style="font-weight:500;">View date:</label>
+            <input type="date" name="date" value="{today.isoformat()}" style="padding:6px 10px;border:1px solid #ddd;border-radius:4px;">
+            <button type="submit" class="btn btn-primary btn-sm">Go</button>
+            <a href="/daily?date={today.isoformat()}" class="btn btn-sm" style="background:#95a5a6;color:white;">Today</a>
+        </form>
+    </div>
+    {stats_html}
+    {''.join(sections)}"""
+```
+
+### `todo/cli.py`
+
+```python
+"""CLI interface for the To-Do application."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional
+
+from .models import TaskStatus
+from .store import TaskStore
+from .daily import format_daily_summary
+
+
+def _get_store(args: argparse.Namespace) -> TaskStore:
+    """Get a TaskStore from CLI args."""
+    db_path = getattr(args, "db", None)
+    if db_path:
+        return TaskStore(Path(db_path))
+    return TaskStore()
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    """Add a new task."""
+    store = _get_store(args)
+    try:
+        due_date = None
+        if args.due:
+            due_date = date.fromisoformat(args.due)
+
+        task = store.add_task(
+            title=args.title,
+            description=args.description or "",
+            due_date=due_date,
+            priority=args.priority or 0,
+        )
+        print(f"✅ Added task {task.id}: {task.title}")
+        return 0
+    except ValueError as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List tasks."""
+    store = _get_store(args)
+    try:
+        status = None
+        if args.status:
+            status = TaskStatus(args.status)
+
+        tasks = store.list_tasks(
+            status=status,
+            due_date=date.fromisoformat(args.due) if getattr(args, "due", None) else None,
+            search=args.search,
+            limit=args.limit,
+        )
+
+        if not tasks:
+            print("No tasks found.")
+            return 0
+
+        print(f"\n{'ID':<10} {'Status':<8} {'Priority':<10} {'Title':<40} {'Due':<12}")
+        print("-" * 80)
+        for task in tasks:
+            status_str = "DONE" if task.status == TaskStatus.DONE else "PENDING"
+            due_str = task.due_date.isoformat() if task.due_date else "—"
+            priority_str = ["Normal", "High", "Urgent"][task.priority]
+            print(f"{task.id:<10} {status_str:<8} {priority_str:<10} {task.title:<40} {due_str:<12}")
+        print()
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_toggle(args: argparse.Namespace) -> int:
+    """Toggle task completion."""
+    store = _get_store(args)
+    try:
+        task = store.get_task(args.id)
+        new_status = TaskStatus.DONE if task.status == TaskStatus.PENDING else TaskStatus.PENDING
+        task = store.update_task_status(args.id, new_status)
+        status_str = "completed" if new_status == TaskStatus.DONE else "reopened"
+        print(f"✅ Task {task.id} {status_str}: {task.title}")
+        return 0
+    except Exception as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Delete a task."""
+    store = _get_store(args)
+    try:
+        store.delete_task(args.id)
+        print(f"🗑️  Deleted task {args.id}")
+        return 0
+    except Exception as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+
+def cmd_daily(args: argparse.Namespace) -> int:
+    """Show daily summary."""
+    store = _get_store(args)
+    try:
+        target_date = None
+        if hasattr(args, "date") and args.date:
+            target_date = date.fromisoformat(args.date)
+
+        summary = format_daily_summary(store, target_date)
+        print(summary)
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Show task statistics."""
+    store = _get_store(args)
+    try:
+        stats = store.get_stats()
+        print(f"\n📊 To-Do Statistics")
+        print(f"   Total tasks:  {stats['total']}")
+        print(f"   Pending:      {stats['pending']}")
+        print(f"   Completed:    {stats['done']}")
+        print(f"   Overdue:      {stats['overdue']}")
+        print()
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the web server."""
+    from .web import run_server
+
+    port = getattr(args, "port", 8080)
+    run_server(port=port)
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Main entry point for the CLI."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple to-do application with CLI and web UI.",
+    )
+    parser.add_argument(
+        "--db",
+        type=str,
+        help="Path to the SQLite database file",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", help="Task title")
+    add_parser.add_argument("-d", "--description", help="Task description")
+    add_parser.add_argument("--due", help="Due date (YYYY-MM-DD)")
+    add_parser.add_argument("--priority", type=int, default=0, choices=[0, 1, 2], help="Priority (0=normal, 1=high, 2=urgent)")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument("--status", choices=["pending", "done"], help="Filter by status")
+    list_parser.add_argument("--due", help="Filter by due date (YYYY-MM-DD)")
+    list_parser.add_argument("--search", help="Search in title/description")
+    list_parser.add_argument("--limit", type=int, help="Limit results")
+
+    # toggle
+    toggle_parser = subparsers.add_parser("toggle", help="Toggle task completion")
+    toggle_parser.add_argument("id", help="Task ID")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", help="Task ID")
+
+    # daily
+    daily_parser = subparsers.add_parser("daily", help="Show daily summary")
+    daily_parser.add_argument("--date", help="Date to view (YYYY-MM-DD, defaults to today)")
+
+    # stats
+    subparsers.add_parser("stats", help="Show task statistics")
+
+    # serve
+    serve_parser = subparsers.add_parser("serve", help="Start web server")
+    serve_parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
+
+    args = parser.parse_args(argv)
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    commands = {
+        "add": cmd_add,
+        "list": cmd_list,
+        "toggle": cmd_toggle,
+        "delete": cmd_delete,
+        "daily": cmd_daily,
+        "stats": cmd_stats,
+        "serve": cmd_serve,
+    }
+
+    return commands[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### `todo/web.py`
+
+```python
+"""FastAPI web server for the To-Do application."""
+
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import logging
+from contextlib import asynccontextmanager
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from .models import TaskStatus
+from .store import TaskStore, StoreError
+from .daily import format_daily_summary
+from .templates import (
+    render_base,
+    render_add_form,
+    render_tasks_table,
+    render_daily_summary as render_daily_page,
+)
+
+logger = logging.getLogger("todo.web")
+
+
+# Module-level store instance (initialized on first request)
+_store: Optional[TaskStore] = None
+
+
+def _get_store() -> TaskStore:
+    """Get or create the task store singleton."""
+    global _store
+    if _store is None:
+        db_path = Path.home() / ".local" / "share" / "todo" / "tasks.db"
+        _store = TaskStore(db_path)
+    return _store
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler for cleanup."""
+    logger.info("Web server starting up")
+    yield
+    logger.info("Web server shutting down")
+    global _store
+    if _store is not None:
+        _store.close()
+        _store = None
+
+
+app = FastAPI(
+    title="To-Do App",
+    description="A simple to-do application with CLI and web UI.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ── GET / — Show all tasks ───────────────────────────────────────────────
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(
+    request: Request,
+    status: Optional[str] = Query(None, description="Filter by status"),
+    priority: Optional[str] = Query(None, description="Filter by priority"),
+    search: Optional[str] = Query(None, description="Search tasks"),
+    due_date: Optional[str] = Query(None, description="Filter by due date"),
+):
+    """Show all tasks with filtering controls."""
+    store = _get_store()
+
+    # Build filter dict
+    filters = {}
+    if status:
+        filters["status"] = status
+    if priority:
+        filters["priority"] = int(priority)
+    if search:
+        filters["search"] = search
+    if due_date:
+        filters["due_date"] = due_date
+
+    # Apply filters
+    status_filter = TaskStatus(status) if status else None
+    priority_filter = int(priority) if priority else None
+    due_date_filter = date.fromisoformat(due_date) if due_date else None
+
+    tasks = store.list_tasks(
+        status=status_filter,
+        priority=priority_filter,
+        search=search,
+        due_date=due_date_filter,
+    )
+
+    stats = store.get_stats()
+
+    body = f"""
+    <div class="flash flash-success">
+        📊 {stats['pending']} pending, {stats['done']} done, {stats['overdue']} overdue
+    </div>
+    {render_add_form()}
+    {render_tasks_table(tasks, filters)}
+    """
+    return HTMLResponse(render_base("To-Do App", body))
+
+
+# ── POST /add — Add a new task ───────────────────────────────────────────
+
+
+@app.post("/add")
+async def add_task(
+    request: Request,
+    title: str = Form(...),
+    description: str = Form(""),
+    priority: str = Form("0"),
+    due_date: str = Form(""),
+):
+    """Add a new task."""
+    store = _get_store()
+
+    if not title.strip():
+        return RedirectResponse(url="/", status_code=303,
+                                headers={"X-Flash": "error:Title cannot be empty"})
+
+    due = date.fromisoformat(due_date) if due_date else None
+
+    try:
+        task = store.add_task(
+            title=title,
+            description=description,
+            due_date=due,
+            priority=int(priority),
+        )
+    except ValueError as e:
+        return RedirectResponse(url="/", status_code=303,
+                                headers={"X-Flash": f"error:{e}"})
+
+    return RedirectResponse(url="/", status_code=303,
+                            headers={"X-Flash": f"success:Task {task.id} added!"})
+
+
+# ── POST /toggle/<id> — Toggle task completion ───────────────────────────
+
+
+@app.post("/toggle/{task_id}")
+async def toggle_task(task_id: str):
+    """Toggle task completion status."""
+    store = _get_store()
+
+    try:
+        task = store.get_task(task_id)
+        new_status = TaskStatus.DONE if task.status == TaskStatus.PENDING else TaskStatus.PENDING
+        store.update_task_status(task_id, new_status)
+    except StoreError as e:
+        return RedirectResponse(url="/", status_code=303,
+                                headers={"X-Flash": f"error:{e}"})
+
+    return RedirectResponse(url="/", status_code=303,
+                            headers={"X-Flash": f"success:Task {task_id} toggled!"})
+
+
+# ── POST /delete/<id> — Delete a task ────────────────────────────────────
+
+
+@app.post("/delete/{task_id}")
+async def delete_task(task_id: str):
+    """Delete a task."""
+    store = _get_store()
+
+    try:
+        store.delete_task(task_id)
+    except StoreError as e:
+        return RedirectResponse(url="/", status_code=303,
+                                headers={"X-Flash": f"error:{e}"})
+
+    return RedirectResponse(url="/", status_code=303,
+                            headers={"X-Flash": f"success:Task {task_id} deleted!"})
+
+
+# ── GET /daily — Daily summary view ──────────────────────────────────────
+
+
+@app.get("/daily", response_class=HTMLResponse)
+async def daily_view(
+    request: Request,
+    date_str: Optional[str] = Query(None, description="Date to view"),
+):
+    """Show daily summary view."""
+    store = _get_store()
+
+    target_date = None
+    if date_str:
+        target_date = date.fromisoformat(date_str)
+
+    data = store.get_daily_tasks(target_date)
+    body = render_daily_page(data)
+    return HTMLResponse(render_base("Daily Summary", body))
+
+
+# ── JSON API endpoints ───────────────────────────────────────────────────
+
+
+@app.get("/api/tasks")
+async def api_list_tasks(
+    status: Optional[str] = None,
+    priority: Optional[int] = None,
+    search: Optional[str] = None,
+):
+    """JSON API: List tasks."""
+    store = _get_store()
+    status_filter = TaskStatus(status) if status else None
+    tasks = store.list_tasks(
+        status=status_filter,
+        priority=priority,
+        search=search,
+    )
+    return [t.to_dict() for t in tasks]
+
+
+@app.post("/api/tasks")
+async def api_add_task(data: dict):
+    """JSON API: Add a task."""
+    store = _get_store()
+    title = data.get("title", "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+
+    due = None
+    if data.get("due_date"):
+        due = date.fromisoformat(data["due_date"])
+
+    task = store.add_task(
+        title=title,
+        description=data.get("description", ""),
+        due_date=due,
+        priority=data.get("priority", 0),
+    )
+    return task.to_dict()
+
+
+@app.post("/api/tasks/{task_id}/toggle")
+async def api_toggle_task(task_id: str):
+    """JSON API: Toggle task completion."""
+    store = _get_store()
+    try:
+        task = store.get_task(task_id)
+        new_status = TaskStatus.DONE if task.status == TaskStatus.PENDING else TaskStatus.PENDING
+        task = store.update_task_status(task_id, new_status)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return task.to_dict()
+
+
+@app.delete("/api/tasks/{task_id}")
+async def api_delete_task(task_id: str):
+    """JSON API: Delete a task."""
+    store = _get_store()
+    try:
+        store.delete_task(task_id)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"deleted": task_id}
+
+
+@app.get("/api/daily")
+async def api_daily(date_str: Optional[str] = None):
+    """JSON API: Daily summary

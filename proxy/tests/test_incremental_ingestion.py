@@ -569,6 +569,80 @@ class TestSessionSingleFlightCoordinator:
         await first_task
         assert await queued_task == "ok"
 
+    @pytest.mark.asyncio
+    async def test_queue_timeout_raises_rejected_when_expired(self):
+        """AC1+AC3: Queue timeout fires and raises SessionSingleFlightRejected.
+
+        When a queued request waits longer than queue_timeout_seconds, it
+        should receive a SessionSingleFlightRejected instead of hanging.
+        """
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+
+        coordinator = SessionSingleFlightCoordinator()
+        first_entered = asyncio.Event()
+        first_hold = asyncio.Event()
+
+        async def first_request():
+            async with coordinator.acquire(
+                "timeout-session", mode="queue", max_queue_depth=8
+            ):
+                first_entered.set()
+                await first_hold.wait()
+
+        first_task = asyncio.create_task(first_request())
+        await first_entered.wait()
+
+        # Second request should time out quickly
+        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+            async with coordinator.acquire(
+                "timeout-session", mode="queue", max_queue_depth=8, queue_timeout_seconds=0.05
+            ):
+                pass
+
+        assert excinfo.value.reason == "queue_timeout"
+
+        # Clean up
+        first_hold.set()
+        await first_task
+
+    @pytest.mark.asyncio
+    async def test_queue_timeout_none_behaves_as_unbounded(self):
+        """AC4: When queue_timeout_seconds is None, behaves as unbounded (backward compat)."""
+        from proxy.server import SessionSingleFlightCoordinator
+
+        coordinator = SessionSingleFlightCoordinator()
+        first_entered = asyncio.Event()
+        first_release = asyncio.Event()
+
+        async def first_request():
+            async with coordinator.acquire(
+                "no-timeout-session", mode="queue", max_queue_depth=8
+            ):
+                first_entered.set()
+                await first_release.wait()
+
+        async def second_request():
+            async with coordinator.acquire(
+                "no-timeout-session", mode="queue", max_queue_depth=8, queue_timeout_seconds=None
+            ):
+                return "completed"
+
+        first_task = asyncio.create_task(first_request())
+        await first_entered.wait()
+
+        second_task = asyncio.create_task(second_request())
+        await asyncio.sleep(0.05)
+
+        # Second task should NOT have completed yet (still waiting)
+        assert not second_task.done()
+
+        # Release the first request
+        first_release.set()
+        result = await second_task
+        assert result == "completed"
+
+        await first_task
+
 
 class TestStreamGuardrails:
     def test_repetition_detection_triggers_for_pathological_output(self):
@@ -859,8 +933,13 @@ class TestSessionHistoryIntegrityHelpers:
 
 
 class TestSlotPersistenceHelpers:
+    def _clear_slot_registry(self):
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
+
     def test_slot_id_for_session_is_deterministic(self):
         from proxy.server import _slot_id_for_session
+        self._clear_slot_registry()
 
         slot_id = _slot_id_for_session("session-123", 4)
         assert slot_id == _slot_id_for_session("session-123", 4)
@@ -868,11 +947,13 @@ class TestSlotPersistenceHelpers:
 
     def test_slot_id_for_session_single_slot(self):
         from proxy.server import _slot_id_for_session
+        self._clear_slot_registry()
 
         assert _slot_id_for_session("session-123", 1) == 0
 
     def test_slot_id_for_session_returns_none_when_pool_invalid(self):
         from proxy.server import _slot_id_for_session
+        self._clear_slot_registry()
 
         assert _slot_id_for_session("session-123", 0) is None
         assert _slot_id_for_session("session-123", -1) is None
@@ -915,7 +996,7 @@ class TestSlotPersistenceHelpers:
         from proxy import server
 
         server.config = server.load_config()
-        resolved = server._resolve_slot_model_name("qwen3", None, {"llama_router_mode": True})
+        resolved = server._resolve_slot_model_name("plan", None, {"llama_router_mode": True})
         assert resolved == "Qwen3"
 
     def test_resolve_slot_model_name_uses_current_model_when_missing(self):

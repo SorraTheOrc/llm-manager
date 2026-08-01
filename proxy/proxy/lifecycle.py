@@ -9,8 +9,12 @@ circular import issues.
 """
 
 import asyncio
+import errno
 import logging
 import os
+import re
+import signal
+import socket
 import subprocess
 import threading
 import time
@@ -710,6 +714,135 @@ def _check_unload_lru_threshold(tracker: _UnloadLruTracker) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Process group helpers — ensure child processes are killed on restart
+# ---------------------------------------------------------------------------
+
+
+def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: int = 2) -> bool:
+    """Kill a process and all its children by sending SIGTERM to its process group.
+
+    Uses ``os.killpg()`` to signal the entire process group (PID is used as PGID
+    when ``start_new_session=True`` was used on spawn). Falls back to
+    ``proc.terminate()`` / ``proc.kill()`` if process-group signalling is
+    unavailable or fails.
+
+    Args:
+        proc: A ``subprocess.Popen`` instance (or ``None``).
+        logger: Logger for diagnostic messages.
+        sigterm_timeout: Seconds to wait after SIGTERM before sending SIGKILL.
+        sigkill_wait: Seconds to wait after SIGKILL before giving up.
+
+    Returns:
+        ``True`` if the process was successfully stopped (or was already gone),
+        ``False`` if ``proc`` was ``None``.
+    """
+    if proc is None:
+        return False
+
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        return False
+
+    # Signal-safety guard (LP-0MS9LJIAE008Q3AK): os.killpg(pgid, sig)
+    # NEGATES the pgid, so os.killpg(1, ...) issues the syscall kill(-1, ...)
+    # which broadcasts to EVERY process the caller can signal. A fake/mock
+    # llama_process with pid=1 (left in module state by test fixtures) caused
+    # a full pytest run to SIGTERM the entire proxy stack. Never signal
+    # pgid 0 (caller's own group) or pgid 1 (broadcast via negation), and
+    # never pass a non-int pid to os.killpg.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+
+    # Check if already dead
+    if proc.poll() is not None:
+        return True
+
+    try:
+        # Try process-group signalling first (handles child processes)
+        logger.info(f"Killing process group for PID {pid}")
+        os.killpg(pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=sigterm_timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Process group PID {pid} did not die after SIGTERM, sending SIGKILL")
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=sigkill_wait)
+            except subprocess.TimeoutExpired:
+                logger.error(f"Process group PID {pid} did not die after SIGKILL")
+            return True
+    except (ProcessLookupError, OSError):
+        # Process group not found or not supported — fall back to process-level kill
+        logger.warning(f"killpg not available for PID {pid}, falling back to process terminate")
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=sigterm_timeout)
+                return True
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Process PID {pid} did not terminate, killing")
+                proc.kill()
+                try:
+                    proc.wait(timeout=sigkill_wait)
+                except subprocess.TimeoutExpired:
+                    pass
+                return True
+        except Exception:
+            logger.exception(f"Failed to kill process PID {pid}")
+            return True
+    except Exception:
+        logger.exception(f"Unexpected error killing process group for PID {pid}")
+        # Best-effort: try process-level kill as last resort
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return True
+
+
+def _wait_for_port_release(port: int, timeout: float = 10.0, interval: float = 0.5) -> bool:
+    """Poll a TCP port until it is released (no longer accepting connections).
+
+    Attempts a TCP connect to ``localhost:<port>`` at the given interval until
+    the connection is refused (ECONNREFUSED), indicating the port is free.
+
+    Other non-zero connect_ex results (e.g., EAGAIN when the accept queue is
+    full) are treated as "still in use" and cause a retry.
+
+    Args:
+        port: TCP port number to check.
+        timeout: Maximum seconds to wait before returning False.
+        interval: Seconds between checks.
+
+    Returns:
+        ``True`` if the port became free within the timeout, ``False`` otherwise.
+    """
+    import errno
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(interval)
+        try:
+            result = sock.connect_ex(("127.0.0.1", port))
+            if result == errno.ECONNREFUSED:
+                # Connection refused — port is free
+                return True
+            if result != 0:
+                # Non-ECONNREFUSED error (e.g., EAGAIN) — port is still busy,
+                # the accept queue is just full. Retry.
+                time.sleep(interval / 2)
+                continue
+        finally:
+            sock.close()
+        time.sleep(interval)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Spawn helper — extracted from start_llama_server() for testability
 # ---------------------------------------------------------------------------
 
@@ -737,7 +870,8 @@ def spawn_and_capture(
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True
+            text=True,
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         logger.warning(f"Command not found when starting llama-server: {cmd[0]}: {e}")
@@ -787,8 +921,12 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger
     first_progress_time = None
     try:
         for line in src:
-            dst.write(line)
-            dst.flush()
+            try:
+                dst.write(line)
+                dst.flush()
+            except ValueError:
+                # Destination closed during restart or log rotation — stop writing.
+                break
             # Parse and log prompt processing progress
             try:
                 line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
@@ -1044,8 +1182,46 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
 
 
 
+def _close_and_recreate_http_client(srv=None) -> None:
+    """Close the shared HTTP client and create a fresh one.
+
+    Discards stale connections in the connection pool that may have been
+    established to a previous llama-server instance. After calling this,
+    all internal HTTP calls will use a clean connection pool.
+    """
+    if srv is None:
+        srv = _srv()
+
+    old_client = getattr(srv, "_http_client", None)
+
+    # Create a new client with the same configuration as startup.
+    new_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(5.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    srv._http_client = new_client
+
+    # Schedule the old client for graceful close on the event loop.
+    if old_client is not None:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(old_client.aclose())
+            else:
+                # No running loop — just let it be garbage collected.
+                pass
+        except RuntimeError:
+            # No event loop at all — old client will be garbage collected.
+            pass
+
+
 def stop_llama_server():
-    """Stop the currently running llama-server."""
+    """Stop the currently running llama-server.
+
+    Uses process-group signalling to ensure both the bash wrapper
+    (``start-llama.sh``) and its child ``llama-server`` binary are killed.
+    Verifies that port 8080 is released after stopping.
+    """
     srv = _srv()
 
     if srv.llama_process is not None:
@@ -1057,15 +1233,7 @@ def stop_llama_server():
        is_real_process = hasattr(srv.llama_process, 'terminate') or hasattr(srv.llama_process, 'kill')
        if is_real_process:
            previous_model = srv.current_model
-           srv.llama_process.terminate()
-           try:
-               srv.llama_process.wait(timeout=30)
-           except subprocess.TimeoutExpired:
-               srv.logger.warning("llama-server wrapper did not terminate gracefully, killing...")
-               if hasattr(srv.llama_process, 'kill'):
-                   srv.llama_process.kill()
-               if hasattr(srv.llama_process, 'wait'):
-                   srv.llama_process.wait()
+           _kill_process_group(srv.llama_process, srv.logger)
            srv.llama_process = None
            try:
                if previous_model:
@@ -1074,7 +1242,7 @@ def stop_llama_server():
                pass
            srv.current_model = None
            srv.backend_ready = False
-           srv.logger.info("llama-server stopped")
+           srv.logger.info("llama-server stopped (process group killed)")
        else:
            srv.llama_process = None
            srv.backend_ready = False
@@ -1088,14 +1256,204 @@ def stop_llama_server():
            pass
        srv.llama_log_file = None
 
+    # Refresh the HTTP client to discard stale connections from the old server.
+    _close_and_recreate_http_client(srv)
+
 
 # ---------------------------------------------------------------------------
 # TTS server lifecycle
 # ---------------------------------------------------------------------------
 
 
+def _kill_process_on_port(port: int, logger=None) -> bool:
+    """Find and kill any process holding a TCP port.
+
+    Uses multiple detection strategies:
+    1. ``ss -ltnp`` (preferred, available on most Linux)
+    2. ``fuser`` (fallback)
+    3. ``/proc/net/tcp`` parsing (last resort)
+
+    Args:
+        port: TCP port number.
+        logger: Optional logger for diagnostics.
+
+    Returns:
+        ``True`` if at least one process was killed, ``False`` otherwise.
+    """
+    pid = _find_pid_on_port(port)
+    if pid is None:
+        return False
+
+    killed_any = False
+
+    # Single PID could represent multiple children; kill them all
+    for single_pid in (pid if isinstance(pid, list) else [pid]):
+        if not isinstance(single_pid, int) or single_pid <= 0:
+            continue
+        try:
+            if logger:
+                logger.info(f"Killing process PID {single_pid} holding port {port}")
+            os.kill(single_pid, signal.SIGTERM)
+            # Give it a moment to die gracefully
+            try:
+                os.waitpid(single_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            killed_any = True
+        except (ProcessLookupError, OSError):
+            # Process already gone
+            continue
+
+    if killed_any:
+        # Brief wait for port release
+        _wait_for_port_release(port, timeout=3.0, interval=0.3)
+
+    return killed_any
+
+
+def _find_pid_on_port(port: int) -> int | list[int] | None:
+    """Find the PID(s) of process(es) holding a TCP port.
+
+    Tries detection strategies in order:
+    1. ``ss -ltnp`` (preferred)
+    2. ``fuser`` (fallback)
+    3. ``/proc/net/tcp`` (portable fallback)
+
+    Args:
+        port: TCP port number.
+
+    Returns:
+        A single PID (int), a list of PIDs, or ``None`` if not found.
+    """
+    # Strategy 1: ss -ltnp
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnp"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            pids = _extract_pids_from_ss_output(result.stdout, port)
+            if pids:
+                return pids[0] if len(pids) == 1 else pids
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # Strategy 2: fuser
+    try:
+        result = subprocess.run(
+            ["fuser", f"{port}/tcp"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            pids = []
+            for token in result.stdout.strip().split():
+                try:
+                    pids.append(int(token))
+                except ValueError:
+                    pass
+            if pids:
+                return pids[0] if len(pids) == 1 else pids
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # Strategy 3: /proc/net/tcp parsing
+    pids = _find_pids_via_proc_net_tcp(port)
+    if pids:
+        return pids[0] if len(pids) == 1 else pids
+
+    return None
+
+
+def _extract_pids_from_ss_output(ss_output: str, port: int) -> list[int]:
+    """Extract PIDs from ``ss -ltnp`` output for a given port.
+
+    ``ss -ltnp`` output lines look like:
+    ``LISTEN 0 128 0.0.0.0:8081 0.0.0.0:* users:(("tts-server",pid=12345,fd=5))``
+
+    Returns a list of PIDs.
+    """
+    pids = []
+    port_str = f":{port}"
+    dot_port_str = f".{port}"
+    for line in ss_output.splitlines():
+        # Check if line mentions our port
+        if port_str not in line and dot_port_str not in line:
+            continue
+        # Extract pid=N from the users: section
+        pid_matches = re.findall(r"pid=(\d+)", line)
+        for pid_str in pid_matches:
+            try:
+                pids.append(int(pid_str))
+            except ValueError:
+                pass
+    return pids
+
+
+def _find_pids_via_proc_net_tcp(port: int) -> list[int]:
+    """Parse ``/proc/net/tcp`` to find process PIDs holding a port.
+
+    Returns a list of PIDs, or an empty list if not found.
+    Note: ``/proc/net/tcp`` does not directly expose PIDs; we can only
+    identify that the port is in use but not which process.  For finding
+    the PID we rely on ``/proc/*/fd/`` scanning as a fallback.
+    """
+    pids = []
+    hex_port = f"{port:04x}"
+    try:
+        with open("/proc/net/tcp") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                # local_address is column 1 (index 1 after skipping header)
+                local_addr = parts[1]
+                if ":" in local_addr:
+                    addr_port = local_addr.split(":")[1]
+                    if addr_port == hex_port and parts[3] == "0A":
+                        # Port is in LISTEN state but we need to find the PID
+                        # Scan /proc for the socket inode
+                        inode = parts[9] if len(parts) > 9 else ""
+                        if inode and inode.isdigit():
+                            pid = _find_pid_by_inode(int(inode))
+                            if pid:
+                                pids.append(pid)
+    except (FileNotFoundError, PermissionError, Exception):
+        pass
+    return pids
+
+
+def _find_pid_by_inode(inode: int) -> int | None:
+    """Find the PID owning a given socket inode by scanning ``/proc/*/fd/``.
+
+    Returns the PID or ``None``.
+    """
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                fd_dir = f"/proc/{pid}/fd"
+                for fd_entry in os.listdir(fd_dir):
+                    try:
+                        link = os.readlink(f"{fd_dir}/{fd_entry}")
+                        if f"socket:[{inode}]" in link:
+                            return pid
+                    except (OSError, FileNotFoundError):
+                        continue
+            except (PermissionError, FileNotFoundError):
+                continue
+    except (FileNotFoundError, Exception):
+        pass
+    return None
+
+
 def start_tts_server() -> subprocess.Popen | None:
     """Start the qwentts TTS server using the configured start script.
+
+    Before spawning, any process holding the TTS port is killed (zombie
+    cleanup).  After spawning, the function verifies the process stays
+    alive (does not exit immediately due to port conflict).
 
     Returns a subprocess.Popen when successful, None on failure.
     """
@@ -1106,6 +1464,10 @@ def start_tts_server() -> subprocess.Popen | None:
         "tts_start_script",
         str(Path(__file__).parent.parent / "scripts" / "start-qwentts.sh")
     )
+    # Resolve relative config paths against the repo root (Path(__file__).parent.parent.parent)
+    # so they work regardless of the process working directory.
+    if not os.path.isabs(script_path):
+        script_path = str(Path(__file__).parent.parent.parent / script_path)
     tts_port = int(server_cfg.get("tts_server_port", 8081))
     tts_model_path = str(server_cfg.get("tts_model_path", ""))
     tts_codec_path = str(server_cfg.get("tts_codec_path", ""))
@@ -1113,6 +1475,12 @@ def start_tts_server() -> subprocess.Popen | None:
     if not os.path.isfile(script_path):
         srv.logger.warning(f"TTS start script not found: {script_path}")
         return None
+
+    # ------------------------------------------------------------------ #
+    # Pre-start zombie cleanup: kill any orphan process holding the port
+    # ------------------------------------------------------------------ #
+    if _kill_process_on_port(tts_port, logger=srv.logger):
+        srv.logger.info(f"Cleaned up zombie process on port {tts_port}")
 
     env = os.environ.copy()
     env["QWTTS_PORT"] = str(tts_port)
@@ -1132,7 +1500,7 @@ def start_tts_server() -> subprocess.Popen | None:
     srv.logger.info(f"Starting TTS server: {' '.join(cmd)}")
 
     try:
-        proc = subprocess.Popen(cmd, env=env)
+        proc = subprocess.Popen(cmd, env=env, start_new_session=True)
     except FileNotFoundError:
         srv.logger.warning(f"Command not found: {cmd[0]}")
         return None
@@ -1140,12 +1508,33 @@ def start_tts_server() -> subprocess.Popen | None:
         srv.logger.error(f"Failed to start TTS server: {e}")
         return None
 
+    # ------------------------------------------------------------------ #
+    # Spawn verification: check the process didn't exit immediately.
+    # This handles the case where start-qwentts.sh exits with code 1
+    # because the port is still in use (e.g., old zombie not yet dead).
+    # ------------------------------------------------------------------ #
+    try:
+        proc.wait(timeout=0.5)
+        # Process exited before timeout -> it failed
+        exit_code = proc.returncode
+        srv.logger.warning(
+            f"TTS server exited immediately with code {exit_code}"
+        )
+        return None
+    except subprocess.TimeoutExpired:
+        # Process is still running after 0.5s -> likely healthy
+        pass
+
     srv.logger.info(f"Started TTS server (PID: {proc.pid})")
     return proc
 
 
 def stop_tts_server():
-    """Stop the currently running qwentts TTS server."""
+    """Stop the currently running qwentts TTS server.
+
+    Uses process-group signalling to ensure both the bash wrapper
+    (``start-qwentts.sh``) and its child ``qwentts`` binary are killed.
+    """
     srv = _srv()
 
     if srv.tts_process is not None:
@@ -1153,17 +1542,12 @@ def stop_tts_server():
         srv.logger.info(f"Stopping TTS server (PID: {pid})")
         is_real_process = hasattr(srv.tts_process, 'terminate') or hasattr(srv.tts_process, 'kill')
         if is_real_process:
-            srv.tts_process.terminate()
-            try:
-                srv.tts_process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                srv.logger.warning("TTS server did not terminate gracefully, killing...")
-                if hasattr(srv.tts_process, 'kill'):
-                    srv.tts_process.kill()
-                if hasattr(srv.tts_process, 'wait'):
-                    srv.tts_process.wait()
+            _kill_process_group(srv.tts_process, srv.logger)
             srv.tts_process = None
-            srv.logger.info("TTS server stopped")
+            # Reset recovery state since this is an intentional stop, not a failure
+            srv.tts_recovery_state["attempt_timestamps"] = []
+            srv.tts_recovery_state["last_failure"] = None
+            srv.logger.info("TTS server stopped (process group killed)")
         else:
             srv.tts_process = None
             srv.logger.info("TTS server stop skipped (no valid process)")
@@ -1387,5 +1771,165 @@ from .backend_health import (  # noqa: E402, F401
     _probe_model_instance,
     _router_model_health_loop,
 )
+
+
+# ---------------------------------------------------------------------------
+# Slot-scheduled restart (time-based slot count transitions)
+# ---------------------------------------------------------------------------
+
+
+async def restart_services(
+    slot_count: int | None = None,
+    reason: str = "scheduled_slot_change",
+) -> bool:
+    """Gracefully restart llama-server with a new slot count.
+
+    Called by the slot scheduler when a scheduled transition time arrives.
+    The function:
+    1. Updates ``session_slot_pool_size`` in the server config to match
+       the new slot count.
+    2. Stops the TTS server if running (so it can be restarted if needed).
+    3. Stops the current llama-server process using process-group signalling
+       so that child ``llama-server`` binary is also killed (not just the
+       bash wrapper).
+    4. Verifies port 8080 (and port 8081 if TTS was stopped) is released
+       before attempting to start new server instances.
+    5. Restarts llama-server via ``start_llama_server()`` or
+       ``ensure_model_loaded()``, which reads the updated config value.
+    6. Waits for the backend to become ready.
+    7. Handles restart failure gracefully by logging diagnostics and
+       leaving the system in a known safe state (``backend_ready = False``).
+
+    Args:
+        slot_count: The new ``--parallel N`` value.  When ``None``, the
+            current ``session_slot_pool_size`` from config is used.
+        reason: A descriptive label for log messages (default
+            ``"scheduled_slot_change"``).
+
+    Returns:
+        ``True`` if the restart succeeded, ``False`` on failure.
+    """
+    srv = _srv()
+
+    # Resolve the slot count to use.
+    if slot_count is not None:
+        # Update the config so downstream code reads the new value.
+        server_cfg = srv.config.get("server", {})
+        if isinstance(server_cfg, dict):
+            server_cfg["session_slot_pool_size"] = int(slot_count)
+            # Also update the legacy key for backward compatibility.
+            server_cfg["local_max_concurrent_queries"] = int(slot_count)
+    else:
+        server_cfg = srv.config.get("server", {})
+        slot_count = int(server_cfg.get("session_slot_pool_size", 1) or 1)
+
+    srv.logger.info(
+        "restart_services: restarting llama-server with %d slots (reason=%s)",
+        slot_count,
+        reason,
+    )
+
+    server_config = srv.config.get("server", {})
+    llama_port = int(server_config.get("llama_server_port", 8080))
+    tts_port = int(server_config.get("tts_server_port", 8081))
+
+    # Stop TTS server if running (proper child-process cleanup).
+    tts_was_running = srv.tts_process is not None
+    if tts_was_running:
+        srv.logger.info("restart_services: stopping TTS server")
+        srv.stop_tts_server()
+
+    # Stop the current llama-server (kills process group including child binary).
+    srv.stop_llama_server()
+    srv.backend_ready = False
+
+    # Verify ports are released before proceeding.
+    if not _wait_for_port_release(llama_port, timeout=10.0):
+        srv.logger.error(
+            "restart_services: port %d not released after stopping llama-server, "
+            "aborting restart",
+            llama_port,
+        )
+        return False
+
+    if tts_was_running:
+        if not _wait_for_port_release(tts_port, timeout=5.0):
+            srv.logger.warning(
+                "restart_services: port %d not released after stopping TTS server",
+                tts_port,
+            )
+            # Non-fatal: continue with llama restart even if TTS port is slow
+
+    # Set the LLAMA_PARALLEL env var so the start script reads it.
+    os.environ["LLAMA_PARALLEL"] = str(slot_count)
+
+    # Determine which model to reload.
+    router_mode = bool(server_config.get("llama_router_mode", False))
+    current_model = getattr(srv, "current_model", None)
+
+    try:
+        if router_mode:
+            # Router mode: start llama-server with no specific model.
+            srv.llama_process = srv.start_llama_server(None)
+            if srv.llama_process is None:
+                srv.logger.error(
+                    "restart_services: failed to start router-mode llama-server"
+                )
+                return False
+
+            timeout = int(server_config.get("llama_startup_timeout", 300) or 300)
+            if not await srv.wait_for_llama_server(timeout):
+                srv.logger.error(
+                    "restart_services: router-mode llama-server did not become ready"
+                )
+                srv.stop_llama_server()
+                return False
+
+            # Reload current model if we know it.
+            if current_model:
+                if not await srv.router_load_model(current_model):
+                    srv.logger.warning(
+                        "restart_services: failed to reload model %s",
+                        current_model,
+                    )
+
+            srv.backend_ready = True
+            srv.logger.info(
+                "restart_services: router-mode restart complete (%d slots)",
+                slot_count,
+            )
+            # Restart TTS server if it was running before the restart.
+            if tts_was_running:
+                srv.logger.info("restart_services: restarting TTS server")
+                proc = start_tts_server()
+                srv.tts_process = proc
+            return True
+        else:
+            # Single-model mode: restart with the current model.
+            if current_model:
+                result = await srv.ensure_model_loaded(current_model)
+                srv.backend_ready = result
+                if result and tts_was_running:
+                    srv.logger.info("restart_services: restarting TTS server")
+                    proc = start_tts_server()
+                    srv.tts_process = proc
+                return result
+            else:
+                # No model loaded yet — start fresh.
+                default_model = srv.config.get("default_model", "gemma4")
+                result = await srv.ensure_model_loaded(default_model)
+                srv.backend_ready = result
+                if result and tts_was_running:
+                    srv.logger.info("restart_services: restarting TTS server")
+                    proc = start_tts_server()
+                    srv.tts_process = proc
+                return result
+    except Exception:
+        srv.logger.exception(
+            "restart_services: exception during restart with %d slots",
+            slot_count,
+        )
+        srv.backend_ready = False
+        return False
 
 

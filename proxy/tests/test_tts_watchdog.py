@@ -266,6 +266,8 @@ class TestTtsWatchdogLifecycle:
     @pytest.mark.asyncio
     async def test_watchdog_task_launched_on_startup(self):
         """TTS watchdog task should be created during server startup."""
+        from unittest.mock import patch
+
         from proxy.server import _startup_launch_watchdog_tasks
 
         import proxy.server as server_mod
@@ -277,26 +279,38 @@ class TestTtsWatchdogLifecycle:
         server_mod.tts_watchdog_task = None
         server_mod.model_health_task = None
 
-        _startup_launch_watchdog_tasks()
-
-        # After startup, a TTS watchdog task reference should exist
-        assert server_mod.tts_watchdog_task is not None
-        assert isinstance(server_mod.tts_watchdog_task, asyncio.Task)
-
-        # Cleanup
-        server_mod.tts_watchdog_task.cancel()
-        try:
-            await server_mod.tts_watchdog_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        server_mod.tts_watchdog_task = None
-        if server_mod.backend_watchdog_task is not None:
-            server_mod.backend_watchdog_task.cancel()
+        # Do NOT run the real watchdog loops: their self-heal paths perform
+        # port-based zombie cleanup (kill whatever holds 8080/8081) which can
+        # SIGTERM a real running proxy stack, and the model-health loop can
+        # trigger unload/reload recovery against the live backend
+        # (LP-0MS9LJIAE008Q3AK). Use inert stand-ins that only verify task
+        # creation.
+        async def _inert_loop():
             try:
-                await server_mod.backend_watchdog_task
-            except (asyncio.CancelledError, Exception):
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
                 pass
-            server_mod.backend_watchdog_task = None
+
+        with patch.object(server_mod, "_backend_watchdog_loop", side_effect=_inert_loop):
+            with patch.object(server_mod, "_tts_watchdog_loop", side_effect=_inert_loop):
+                with patch.object(server_mod, "_router_model_health_loop", side_effect=_inert_loop):
+                    _startup_launch_watchdog_tasks()
+
+                    # After startup, a TTS watchdog task reference should exist
+                    assert server_mod.tts_watchdog_task is not None
+                    assert isinstance(server_mod.tts_watchdog_task, asyncio.Task)
+
+        # Cleanup: cancel ALL launched tasks (incl. model_health_task) so no
+        # watchdog loop survives in the pytest process.
+        for task_attr in ("tts_watchdog_task", "backend_watchdog_task", "model_health_task"):
+            task = getattr(server_mod, task_attr, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                setattr(server_mod, task_attr, None)
 
     @pytest.mark.asyncio
     async def test_watchdog_cancelled_on_shutdown(self):

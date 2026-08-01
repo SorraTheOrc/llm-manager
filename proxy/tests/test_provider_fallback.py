@@ -1936,7 +1936,7 @@ async def test_local_model_not_loaded_remote_fallback_returns_503_returns_model_
     server_module.backend_ready = True
     server_module.current_model = "some-other-model"
     server_module.background_loads = {}
-    server_module.logger = MagicMock()
+    monkeypatch.setattr(server_module, "logger", MagicMock())  # restore after test (LP-0MS9MBV4M005VSTX)
     server_module.schedule_background_load = MagicMock(return_value=True)
     server_module._model_loading_response = MagicMock(
         return_value=Response(
@@ -2027,7 +2027,7 @@ async def test_router_transient_not_loaded_then_loaded_prefers_local_before_remo
     server_module.backend_ready = True
     server_module.current_model = "some-other-model"
     server_module.background_loads = {}
-    server_module.logger = MagicMock()
+    monkeypatch.setattr(server_module, "logger", MagicMock())  # restore after test (LP-0MS9MBV4M005VSTX)
     server_module.schedule_background_load = MagicMock(return_value=True)
 
     # First fast-check says not loaded, grace-window check says loaded.
@@ -2125,7 +2125,7 @@ async def test_router_loading_status_but_router_load_model_already_loaded_prefer
     server_module.backend_ready = True
     server_module.current_model = "some-other-model"
     server_module.background_loads = {}
-    server_module.logger = MagicMock()
+    monkeypatch.setattr(server_module, "logger", MagicMock())  # restore after test (LP-0MS9MBV4M005VSTX)
     server_module.schedule_background_load = MagicMock(return_value=True)
 
     async def mock_router_is_model_loaded(_model_name):

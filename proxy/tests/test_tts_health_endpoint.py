@@ -50,6 +50,7 @@ def _make_mock_server(
     backend_ready=True,
     backend_reachable=True,
     self_healing=False,
+    gpu_wedge_detected=False,
     current_model="test-model",
 ):
     """Build a mock server object with the specified TTS/llama state."""
@@ -92,6 +93,11 @@ def _make_mock_server(
 
     # Router models
     srv._extract_router_model_ids = MagicMock(return_value=None)
+
+    # Explicitly set wedge state: a MagicMock would auto-create a truthy
+    # attribute, flipping /health status to "degraded" (see handlers.py
+    # getattr(srv, "gpu_wedge_detected", False)).
+    srv.gpu_wedge_detected = gpu_wedge_detected
 
     return srv
 

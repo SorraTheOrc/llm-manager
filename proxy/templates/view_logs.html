@@ -461,7 +461,9 @@
 
         if (sessionInfo) {
           var activeCount = sessions.filter(function(s) { return s.active; }).length;
+          var limitedNote = sessions.length > 0 ? ' (most recent)' : '';
           sessionInfo.textContent = sessions.length + ' session' + (sessions.length !== 1 ? 's' : '') +
+            limitedNote +
             (activeCount > 0 ? ' (' + activeCount + ' active)' : '');
         }
       } catch (err) {

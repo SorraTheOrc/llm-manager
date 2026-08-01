@@ -276,6 +276,20 @@ def log_response_chunk(
                     if preview:
                         parts.append(f"request={preview}")
                 srv.logger.info(" ".join(parts))
+
+                # Log a WARNING when the upstream provider truncated the response
+                # due to reaching its max_tokens (LP-0MS4C6E2L004HLLZ).
+                if finish_reason == "length":
+                    _parts = ["Response truncated: finish_reason=length"]
+                    if session_id:
+                        _parts.append(f"session={session_id}")
+                    if model:
+                        _parts.append(f"model={model}")
+                    if isinstance(usage, dict):
+                        ct = usage.get("completion_tokens")
+                        if ct is not None:
+                            _parts.append(f"completion_tokens={ct}")
+                    srv.logger.warning(" ".join(_parts))
     except Exception:
         pass
 
@@ -735,6 +749,11 @@ async def _try_acquire_local_dispatch(
             for existing_key, record in list(srv.local_dispatch_records.items()):
                 if not record.get("active") and record.get("expires_at", 0) <= now:
                     del srv.local_dispatch_records[existing_key]
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(existing_key)
+                    except Exception:
+                        pass
 
             own_record = srv.local_dispatch_records.get(session_key)
             own_has_lease = (
@@ -816,6 +835,13 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
                     pass
     except Exception:
         raise
+    # Free the slot registry entry
+    if session_id:
+        try:
+            from proxy.session import _free_slot_assignment
+            _free_slot_assignment(session_id)
+        except Exception:
+            pass
     return removed
 
 

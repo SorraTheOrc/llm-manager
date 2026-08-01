@@ -1,0 +1,416 @@
+# Benchmark: slot_count=2  session=2  turn=2
+# Prompt: Extend the To-Do application to support priority and due date.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 252s  Tokens: 2981  TPS: 27.4
+# ============================================================
+
+We'll extend the To-Do CLI application in Rust to support priority and due date, with backward-compatible migration, filtering, sorting, and comprehensive tests.
+
+## `Cargo.toml`
+
+```toml
+[package]
+name = "todo-extended"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+```
+
+## `src/main.rs`
+
+```rust
+use chrono::NaiveDate;
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::process;
+
+/// A simple but powerful To-Do list manager.
+#[derive(Parser)]
+#[command(name = "todo")]
+#[command(about = "Manage your tasks from the command line")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Add a new task
+    Add {
+        /// Task title
+        title: String,
+
+        /// Priority: low, medium, high
+        #[arg(long, default_value = "low")]
+        priority: Priority,
+
+        /// Due date in YYYY-MM-DD format (or empty)
+        #[arg(long)]
+        due: Option<String>,
+    },
+
+    /// List all tasks, optionally filtered and sorted
+    List {
+        /// Filter by priority
+        #[arg(long)]
+        priority: Option<Priority>,
+
+        /// Show only tasks due before this date
+        #[arg(long, value_name = "DATE")]
+        due_before: Option<String>,
+
+        /// Sort by field: due_date or priority
+        #[arg(long)]
+        sort: Option<SortField>,
+    },
+
+    /// Mark a task as completed
+    Complete {
+        /// Task ID
+        id: usize,
+    },
+
+    /// Remove a task
+    Remove {
+        /// Task ID
+        id: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+enum Priority {
+    Low,
+    Medium,
+    High,
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Priority::Low => write!(f, "low"),
+            Priority::Medium => write!(f, "medium"),
+            Priority::High => write!(f, "high"),
+        }
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(Priority::Low),
+            "medium" => Ok(Priority::Medium),
+            "high" => Ok(Priority::High),
+            _ => Err(format!("Invalid priority: {}. Use low, medium, or high.", s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortField {
+    DueDate,
+    Priority,
+}
+
+impl std::str::FromStr for SortField {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "due_date" | "due" => Ok(SortField::DueDate),
+            "priority" => Ok(SortField::Priority),
+            _ => Err(format!("Invalid sort field: {}. Use due_date or priority.", s)),
+        }
+    }
+}
+
+/// A single task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Task {
+    id: usize,
+    title: String,
+    completed: bool,
+    #[serde(default)]
+    priority: Priority,
+    #[serde(default, with = "date_opt")]
+    due_date: Option<NaiveDate>,
+}
+
+// Custom serialisation for Option<NaiveDate> to allow empty string as None
+mod date_opt {
+    use chrono::NaiveDate;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(date: &Option<NaiveDate>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(d) => serializer.serialize_str(&d.format("%Y-%m-%d").to_string()),
+            None => serializer.serialize_str(""),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// The entire task list stored in a file.
+#[derive(Debug, Serialize, Deserialize)]
+struct TaskStore {
+    tasks: Vec<Task>,
+}
+
+impl TaskStore {
+    const FILENAME: &'static str = "tasks.json";
+
+    /// Load from file, migrating old entries that lack priority/due_date.
+    fn load() -> Self {
+        if Path::new(Self::FILENAME).exists() {
+            let content = fs::read_to_string(Self::FILENAME).unwrap_or_else(|e| {
+                eprintln!("Failed to read tasks file: {e}");
+                process::exit(1);
+            });
+            let mut store: Self = serde_json::from_str(&content).unwrap_or_else(|e| {
+                eprintln!("Failed to parse tasks file: {e}");
+                process::exit(1);
+            });
+            // Ensure all tasks have valid defaults (migration).
+            for task in &mut store.tasks {
+                if task.due_date.is_none() {
+                    // due_date remains None (already default)
+                }
+                // priority is defaulted via serde(default)
+            }
+            // Reassign sequential IDs (optional but keeps consistency).
+            for (i, task) in store.tasks.iter_mut().enumerate() {
+                task.id = i + 1;
+            }
+            store
+        } else {
+            TaskStore { tasks: Vec::new() }
+        }
+    }
+
+    /// Save to file.
+    fn save(&self) {
+        let content = serde_json::to_string_pretty(self).unwrap();
+        fs::write(Self::FILENAME, content).unwrap_or_else(|e| {
+            eprintln!("Failed to write tasks file: {e}");
+            process::exit(1);
+        });
+    }
+
+    /// Add a new task and return its ID.
+    fn add(&mut self, title: String, priority: Priority, due_date: Option<NaiveDate>) -> usize {
+        let id = self.tasks.len() + 1;
+        self.tasks.push(Task {
+            id,
+            title,
+            completed: false,
+            priority,
+            due_date,
+        });
+        self.save();
+        id
+    }
+
+    /// Complete a task by ID.
+    fn complete(&mut self, id: usize) -> bool {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+            task.completed = true;
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a task by ID.
+    fn remove(&mut self, id: usize) -> bool {
+        let index = self.tasks.iter().position(|t| t.id == id);
+        if let Some(idx) = index {
+            self.tasks.remove(idx);
+            // re‑assign IDs
+            for (i, task) in self.tasks.iter_mut().enumerate() {
+                task.id = i + 1;
+            }
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// List tasks with optional filters and sort order.
+    fn list(
+        &self,
+        priority_filter: Option<Priority>,
+        due_before: Option<NaiveDate>,
+        sort: Option<SortField>,
+    ) -> Vec<&Task> {
+        let mut tasks: Vec<&Task> = self.tasks.iter().collect();
+
+        // Apply filters
+        if let Some(ref p) = priority_filter {
+            tasks.retain(|t| t.priority == *p);
+        }
+        if let Some(date) = due_before {
+            tasks.retain(|t| match t.due_date {
+                Some(d) => d < date,
+                None => false, // tasks without due date are not included
+            });
+        }
+
+        // Sort
+        if let Some(ref s) = sort {
+            tasks.sort_by(|a, b| match s {
+                SortField::DueDate => {
+                    // None dates are sorted after Some dates
+                    match (a.due_date, b.due_date) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                        (Some(da), Some(db)) => da.cmp(&db),
+                    }
+                }
+                SortField::Priority => priority_order(&a.priority).cmp(&priority_order(&b.priority)),
+            });
+        }
+
+        tasks
+    }
+}
+
+fn priority_order(p: &Priority) -> u8 {
+    match p {
+        Priority::High => 0,
+        Priority::Medium => 1,
+        Priority::Low => 2,
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let mut store = TaskStore::load();
+
+    match cli.command {
+        Commands::Add { title, priority, due } => {
+            let due_date = due
+                .filter(|s| !s.is_empty())
+                .map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").unwrap_or_else(|_| {
+                    eprintln!("Invalid date format. Use YYYY-MM-DD.");
+                    process::exit(1);
+                }));
+            let id = store.add(title, priority, due_date);
+            println!("Added task with ID {id}");
+        }
+
+        Commands::List {
+            priority,
+            due_before,
+            sort,
+        } => {
+            // Parse due_before date
+            let due_before_date = due_before
+                .filter(|s| !s.is_empty())
+                .map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").unwrap_or_else(|_| {
+                    eprintln!("Invalid date format for --due-before. Use YYYY-MM-DD.");
+                    process::exit(1);
+                }));
+
+            let tasks = store.list(priority, due_before_date, sort);
+            if tasks.is_empty() {
+                println!("No tasks found.");
+            } else {
+                // Print header
+                println!("{:<4} {:<20} {:<8} {:<10} {:<8}", "ID", "Title", "Completed", "Priority", "Due Date");
+                println!("{}", "-".repeat(60));
+                for task in tasks {
+                    let completed = if task.completed { "✓" } else { " " };
+                    let due = match task.due_date {
+                        Some(d) => d.format("%Y-%m-%d").to_string(),
+                        None => String::new(),
+                    };
+                    // Truncate title for display
+                    let title = if task.title.len() > 20 {
+                        format!("{}...", &task.title[..17])
+                    } else {
+                        task.title.clone()
+                    };
+                    println!(
+                        "{:<4} {:<20} {:<8} {:<10} {:<8}",
+                        task.id,
+                        title,
+                        completed,
+                        task.priority.to_string(),
+                        due
+                    );
+                }
+            }
+        }
+
+        Commands::Complete { id } => {
+            if store.complete(id) {
+                println!("Completed task {id}");
+            } else {
+                eprintln!("Task with ID {id} not found.");
+                process::exit(1);
+            }
+        }
+
+        Commands::Remove { id } => {
+            if store.remove(id) {
+                println!("Removed task {id}");
+            } else {
+                eprintln!("Task with ID {id} not found.");
+                process::exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    // Helper to create a Task
+    fn make_task(id: usize, title: &str, completed: bool, priority: Priority, due: Option<&str>) -> Task {
+        Task {
+            id,
+            title: title.to_string(),
+            completed,
+            priority,
+            due_date: due.and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+        }
+    }
+
+    fn sample_tasks() -> Vec<Task> {
+        vec![
+            make_task(1, "Buy groceries", false, Priority::Medium, Some("2026-08-15")),
+            make_task(2, "Read book", false, Priority::Low, None),
+            make_task(3, "Write report", true, Priority::High

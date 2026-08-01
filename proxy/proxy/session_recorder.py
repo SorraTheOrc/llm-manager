@@ -42,6 +42,11 @@ VALID_DIRECTIONS = {DIR_CLIENT_TO_PROXY, DIR_PROXY_TO_PROVIDER, DIR_PROVIDER_TO_
 
 DEFAULT_RECORDING_PATH = "proxy/session-recordings/"
 
+# Maximum number of sessions returned by list_sessions() and related
+# endpoints. Prevents the web UI dropdown from being overwhelmed with
+# hundreds of stale sessions.
+MAX_SESSION_DROPDOWN_COUNT = 15
+
 # ---------------------------------------------------------------------------
 # SessionRecorder
 # ---------------------------------------------------------------------------
@@ -539,7 +544,7 @@ class SessionRecorder:
             return []
 
         sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
-        return sessions
+        return sessions[:MAX_SESSION_DROPDOWN_COUNT]
 
     @staticmethod
     def _sanitise_session_id(session_id: str) -> str:

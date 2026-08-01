@@ -16,6 +16,7 @@ from proxy.session import (
     _restore_slot_snapshot,
     _save_slot_snapshot,
     _slot_filename_for_session,
+    _slot_failure_state,
     _slot_id_for_session,
     _slot_persistence_enabled,
 )
@@ -51,20 +52,26 @@ class TestSlotPersistenceEnabled:
 
 
 class TestSlotIdForSession:
-    """Verifies slot ID is deterministic and within pool bounds."""
+    """Verifies tracked slot assignment works correctly."""
 
-    def test_deterministic_across_calls(self):
-        """Same session_id + pool_size produces same slot_id every time."""
+    @pytest.fixture(autouse=True)
+    def _clear_registry(self):
+        """Clear the module-level slot registry before each test."""
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
+
+    def test_same_session_gets_same_slot(self):
+        """Same session_id + pool_size produces same slot_id every call."""
         sid_a = _slot_id_for_session("session-foo", 4)
         sid_b = _slot_id_for_session("session-foo", 4)
         assert sid_a == sid_b
         assert 0 <= sid_a < 4
 
-    def test_different_sessions_may_map_to_different_slots(self):
-        """Different session IDs may produce different slot IDs."""
+    def test_different_sessions_get_different_slots(self):
+        """Different session IDs get different slots when pool has room."""
         sid1 = _slot_id_for_session("session-alpha", 4)
         sid2 = _slot_id_for_session("session-beta", 4)
-        # They could collide by chance, but should be valid
+        assert sid1 != sid2, "Two fresh sessions should get different slots"
         assert 0 <= sid1 < 4
         assert 0 <= sid2 < 4
 
@@ -73,14 +80,36 @@ class TestSlotIdForSession:
         sid = _slot_id_for_session("anything", 1)
         assert sid == 0
 
-    def test_pool_size_matches_session_distribution(self):
-        """With pool_size=N, all returned IDs are in [0, N-1]."""
-        for pool in [1, 2, 3, 4, 8]:
-            for session in [f"session-{i}" for i in range(100)]:
-                sid = _slot_id_for_session(session, pool)
-                assert 0 <= sid < pool, (
-                    f"session={session} pool={pool} got sid={sid}"
-                )
+    def test_slots_assigned_round_robin(self):
+        """Slots are assigned lowest-numbered free slot first."""
+        s1 = _slot_id_for_session("sess-a", 4)
+        s2 = _slot_id_for_session("sess-b", 4)
+        s3 = _slot_id_for_session("sess-c", 4)
+        s4 = _slot_id_for_session("sess-d", 4)
+        # All should be different and within range
+        assert len({s1, s2, s3, s4}) == 4
+        assert all(0 <= s < 4 for s in (s1, s2, s3, s4))
+
+    def test_returns_none_when_pool_exhausted(self):
+        """When all slots are assigned, returns None."""
+        _slot_id_for_session("sess-a", 2)
+        _slot_id_for_session("sess-b", 2)
+        # Third session should get None (pool of 2 exhausted)
+        assert _slot_id_for_session("sess-c", 2) is None
+
+    def test_freed_slot_reused(self):
+        """After freeing a slot, it becomes available for a new session."""
+        from proxy.session import _free_slot_assignment
+
+        s1 = _slot_id_for_session("sess-a", 2)
+        s2 = _slot_id_for_session("sess-b", 2)
+        assert s1 != s2
+
+        _free_slot_assignment("sess-a")
+        # A new session should be able to use the freed slot
+        s3 = _slot_id_for_session("sess-c", 2)
+        assert 0 <= s3 < 2
+        assert s3 != s2  # Should not conflict with sess-b
 
     def test_empty_session_id_returns_none(self):
         """Empty session_id returns None."""
@@ -150,6 +179,81 @@ class TestBuildSlotContext:
         }
         _, _, timeout = _build_slot_context(config, "test-session")
         assert timeout == 3.0
+
+    def test_large_context_skips_persistence(self):
+        """Contexts above session_slot_max_prompt_tokens skip persistence."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_prompt_tokens": 100,
+        }
+        body = {"messages": [{"role": "user", "content": "x" * 20000}]}  # ~5000 tokens
+        slot_id, filename, _ = _build_slot_context(config, "test-session", body)
+        assert slot_id is None
+        assert filename is None
+
+    def test_small_context_persists(self):
+        """Contexts within session_slot_max_prompt_tokens persist normally."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_prompt_tokens": 100,
+        }
+        body = {"messages": [{"role": "user", "content": "hi"}]}  # ~1 token
+        slot_id, filename, _ = _build_slot_context(config, "test-session", body)
+        assert slot_id is not None
+        assert filename is not None
+
+    def test_adaptive_timeout_scales_with_context(self):
+        """Timeout scales with context when per-token add-on is configured."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_timeout_seconds": 3.0,
+            "session_slot_timeout_per_token_seconds": 0.001,
+            "session_slot_max_timeout_seconds": 60.0,
+        }
+        body = {"messages": [{"role": "user", "content": "x" * 20000}]}  # ~5000 tokens
+        _, _, timeout = _build_slot_context(config, "test-session", body)
+        assert timeout > 3.0
+        assert timeout <= 60.0
+
+    def test_circuit_breaker_disables_slot(self):
+        """A slot in failure cooldown has persistence skipped."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_consecutive_failures": 3,
+            "session_slot_failure_cooldown_seconds": 300,
+        }
+        # Fresh session maps to the lowest free slot (0); trip the breaker
+        slot_id, _, _ = _build_slot_context(config, "breaker-session")
+        assert slot_id is not None
+        _slot_failure_state[slot_id] = (3, __import__("time").time())
+        try:
+            s2, f2, _ = _build_slot_context(config, "breaker-session")
+            assert s2 is None
+            assert f2 is None
+        finally:
+            _slot_failure_state.pop(slot_id, None)
+
+    def test_circuit_breaker_resets_after_cooldown(self):
+        """A slot whose cooldown expired is allowed to persist again."""
+        config = {
+            "session_slot_save_path": "/tmp/slots",
+            "session_slot_pool_size": 4,
+            "session_slot_max_consecutive_failures": 3,
+            "session_slot_failure_cooldown_seconds": 300,
+        }
+        slot_id, _, _ = _build_slot_context(config, "breaker-session-2")
+        assert slot_id is not None
+        _slot_failure_state[slot_id] = (3, __import__("time").time() - 400)
+        try:
+            s2, f2, _ = _build_slot_context(config, "breaker-session-2")
+            assert s2 is not None
+            assert f2 is not None
+        finally:
+            _slot_failure_state.pop(slot_id, None)
 
 
 # ===================================================================
@@ -229,6 +333,80 @@ class TestSlotSaveRestoreMocked:
                 timeout=3.0,
             )
             assert result is False
+
+    @pytest.mark.asyncio
+    async def test_http_failure_feeds_circuit_breaker(self):
+        """A non-200 response records a slot failure for the circuit breaker."""
+        with patch("proxy.session.httpx.AsyncClient") as mock_client_cls:
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 500
+            mock_resp.text = "boom"
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            _slot_failure_state.pop(7, None)
+            try:
+                result = await _save_slot_snapshot(
+                    llama_port=8080,
+                    slot_id=7,
+                    filename="/tmp/slots/test.bin",
+                    timeout=3.0,
+                )
+                assert result is False
+                count, _ = _slot_failure_state.get(7, (0, 0.0))
+                assert count == 1
+            finally:
+                _slot_failure_state.pop(7, None)
+
+    @pytest.mark.asyncio
+    async def test_timeout_feeds_circuit_breaker(self):
+        """A ReadTimeout exception records a slot failure for the circuit breaker."""
+        import httpx
+
+        with patch("proxy.session.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(
+                side_effect=httpx.ReadTimeout("ReadTimeout")
+            )
+            mock_client_cls.return_value = mock_client
+
+            _slot_failure_state.pop(8, None)
+            try:
+                result = await _save_slot_snapshot(
+                    llama_port=8080,
+                    slot_id=8,
+                    filename="/tmp/slots/test.bin",
+                    timeout=3.0,
+                )
+                assert result is False
+                count, _ = _slot_failure_state.get(8, (0, 0.0))
+                assert count == 1
+            finally:
+                _slot_failure_state.pop(8, None)
+
+    @pytest.mark.asyncio
+    async def test_success_resets_circuit_breaker(self):
+        """A successful save clears the slot's failure state."""
+        with patch("proxy.session.httpx.AsyncClient") as mock_client_cls:
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 200
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            _slot_failure_state[9] = (2, 0.0)
+            try:
+                result = await _save_slot_snapshot(
+                    llama_port=8080,
+                    slot_id=9,
+                    filename="/tmp/slots/test.bin",
+                    timeout=3.0,
+                )
+                assert result is True
+                assert 9 not in _slot_failure_state
+            finally:
+                _slot_failure_state.pop(9, None)
 
     @pytest.mark.asyncio
     async def test_save_with_model_payload(self):
@@ -358,24 +536,33 @@ class TestLifecycleExportsLLamaParallel:
 
 
 class TestSlotDistributionConsistency:
-    """Verify slot distribution is consistent and valid for all pool sizes."""
+    """Verify tracked slot assignment works correctly within pool limits."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_registry(self):
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
 
     def test_pool_size_two_coverage(self):
-        """With pool_size=2, at least some sessions map to each slot."""
-        slot0_count = 0
-        slot1_count = 0
-        for i in range(100):
-            sid = _slot_id_for_session(f"session-{i}", 2)
-            if sid == 0:
-                slot0_count += 1
-            else:
-                slot1_count += 1
-        assert slot0_count > 0
-        assert slot1_count > 0
+        """With pool_size=2, first two sessions get slots 0 and 1."""
+        from proxy.session import _free_slot_assignment
+
+        sid0 = _slot_id_for_session("sess-0", 2)
+        sid1 = _slot_id_for_session("sess-1", 2)
+        # All slots occupied now
+        assert _slot_id_for_session("sess-2", 2) is None
+
+        # Free one slot and verify it can be reused
+        _free_slot_assignment("sess-0")
+        assert _slot_id_for_session("sess-2", 2) is not None
 
     def test_pool_size_equals_parallel(self):
-        """Simulate alignment: pool_size=N matches --parallel N → all IDs valid."""
+        """Only up to pool_size distinct sessions get valid slots."""
         for pool_size in [1, 2, 4]:
-            for i in range(50):
+            from proxy.session import _slot_owners
+            _slot_owners.clear()
+            for i in range(pool_size):
                 sid = _slot_id_for_session(f"test-{i}", pool_size)
-                assert 0 <= sid < pool_size
+                assert 0 <= sid < pool_size, f"i={i} pool={pool_size} sid={sid}"
+            # Pool exhausted — next session gets None
+            assert _slot_id_for_session(f"test-{pool_size}", pool_size) is None

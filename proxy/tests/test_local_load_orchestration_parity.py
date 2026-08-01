@@ -98,7 +98,10 @@ def mock_srv(monkeypatch, mock_config):
     monkeypatch.setattr(server, "schedule_background_load", lambda model: True)
     monkeypatch.setattr(server, "ensure_model_loaded", AsyncMock(return_value=True))
 
-    server.logger = MagicMock()
+    # Use monkeypatch so server.logger is restored after the test; a plain
+    # assignment leaks the MagicMock and breaks later caplog-based tests
+    # (LP-0MS9MBV4M005VSTX, LP-0MS9MBVCC00948J4).
+    monkeypatch.setattr(server, "logger", MagicMock())
     server.proxy_to_local = AsyncMock(return_value=Response("local", status_code=200))
     server.proxy_to_remote = AsyncMock(return_value=Response("remote", status_code=200))
 

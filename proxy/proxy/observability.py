@@ -22,12 +22,16 @@ HTTP JSON parsing and URL building patterns found in both
   endpoints.
 - ``_query_slots(client, llama_port, timeout)`` — Query the ``/slots``
   endpoint, returning ``(available_slots, total_slots)``.
+- ``_query_slots_detail(llama_port, timeout, model)`` — Query the ``/slots``
+  endpoint with an optional ``model`` query parameter, returning a list of
+  per-slot dicts with keys ``slot_id``, ``is_processing``, and ``n_decoded``.
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +59,7 @@ backend_signal_counts: dict = {
     "timeout_failures": 0,
     "other_failures": 0,
     "concurrency_rejects": 0,
+    "gpu_wedge": 0,
 }
 
 
@@ -152,12 +157,133 @@ async def _query_slots(client, llama_port: int, timeout: float = 2.0) -> tuple:
     return 0, 0
 
 
+async def _query_slots_detail(
+    llama_port: int,
+    timeout: float = 2.0,
+    model: str | None = None,
+    _client: httpx.AsyncClient | None = None,
+) -> list[dict]:
+    """Query the llama-server ``/slots`` endpoint and return per-slot details.
+
+    By default creates its own ``httpx.AsyncClient`` for each call,
+    avoiding shared-client state issues.  Uses httpx's built-in timeout
+    (not ``asyncio.wait_for``) to avoid cancellation-related bugs with
+    httpx's internal connection management (Python 3.12+).
+
+    Args:
+        llama_port: Port llama-server is listening on.
+        timeout: Request timeout in seconds.
+        model: Optional model name to filter slots.  Many llama-server
+            instances require ``?model=...`` on the ``/slots`` endpoint
+            and return HTTP 400 without it.
+        _client: Internal — for testing only.  Pass a mock client to
+            avoid real HTTP calls in unit tests.
+
+    Returns a list of dicts, one per slot, with keys:
+
+    - ``slot_id`` (int) — slot identifier from the response.
+    - ``is_processing`` (bool) — whether the slot is actively processing.
+    - ``n_decoded`` (int or ``None``) — the number of decoded tokens so far.
+
+    Returns an empty list on any failure (HTTP error, connection error,
+    timeout, or unexpected response shape).
+    """
+    try:
+        url = _build_llama_url(llama_port, "/slots")
+        if model:
+            url = f"{url}?model={model}"
+        if _client is not None:
+            slots_resp = await _client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+                slots_resp = await client.get(url)
+        if slots_resp.status_code == 200:
+            slots_data = await _safe_parse_json_response(slots_resp)
+            if isinstance(slots_data, list):
+                result = []
+                for i, slot in enumerate(slots_data):
+                    is_processing = bool(slot.get("is_processing", False))
+                    next_token = slot.get("next_token")
+                    n_decoded = None
+                    if isinstance(next_token, dict):
+                        n_decoded = next_token.get("n_decoded")
+                    elif isinstance(next_token, list) and len(next_token) > 0:
+                        first = next_token[0]
+                        if isinstance(first, dict):
+                            n_decoded = first.get("n_decoded")
+                    result.append({
+                        "slot_id": slot.get("id", i),
+                        "is_processing": is_processing,
+                        "n_decoded": n_decoded,
+                    })
+                return result
+    except Exception as exc:
+        _srv().logger.debug(
+            "Slot detail query failed [%s] for %s?model=%s: %s",
+            type(exc).__name__, _build_llama_url(llama_port, "/slots"),
+            model or "(none)", exc,
+        )
+    return []
+
+
 # ===================================================================
 # SSE clients for real-time broadcasts
 # ===================================================================
 
 sse_clients: set[asyncio.Queue] = set()
 log_tail_clients: set[asyncio.Queue] = set()
+
+
+# ===================================================================
+# Last-known slot details cache
+#
+# Shared module-level cache so that both ``_periodic_broadcast_loop()`` and
+# per-connection SSE handlers (``ui.status_events()``) can survive transient
+# timeouts when llama-server is busy generating tokens.
+# ===================================================================
+
+_last_slot_details_cache: list[dict] = []
+"""Last successful result from ``_query_slots_detail()``.
+
+Updated by ``_periodic_broadcast_loop()`` on each successful query.
+Read by ``status_events()`` in ``proxy.ui`` as a fallback when the
+initial /slots query times out.
+"""
+
+
+_slot_progress_cache: dict[int, dict] = {}
+"""Per-slot progress data parsed from llama-server log lines.
+
+Maps ``slot_id`` to ``{"n_tokens": int, "progress": float,"timestamp": float}``.
+Used as a supplemental source of token counts when the ``/slots`` HTTP
+endpoint is unresponsive during busy token generation.
+
+Populated by ``_update_slot_progress_from_log()`` which is called by
+``_periodic_broadcast_loop()`` on each iteration.
+"""
+
+
+_slot_stable_tracker: dict[int, dict] = {}
+"""Tracks n_tokens stability to detect when generation is complete.
+
+Maps ``slot_id`` to ``{"n_tokens": int, "stable_since": float}``.
+When ``n_tokens`` stops increasing for > 3 seconds, generation is
+considered complete (streaming response to client).  Used to set
+``generation_done`` in enriched slot details.
+"""
+
+
+_processing_slot_assignments: dict[int, str] = {}
+"""Mapping from llama-server processing slot_id to session_id.
+
+Populated by ``_update_processing_slot_assignments()`` which matches
+progress data (llama-server slot_id) against active dispatch leases
+(session_id).  This is a separate namespace from ``_slot_owners`` in
+``proxy.session``, which tracks *persistence* slot numbers for session
+state save/restore.
+
+Cleaned up when dispatch leases expire.
+"""
 
 
 # ===================================================================
@@ -520,6 +646,296 @@ async def query_llama_status() -> dict:
     return result
 
 
+# ===================================================================
+# Slot progress cache – supplemental token counts from llama-server log
+# ===================================================================
+
+
+def _update_slot_progress_from_log() -> None:
+    """Read the tail of llama-server.log and extract per-slot progress data.
+
+    llama-server writes progress lines like::
+
+        slot update_slots: id=5 n_tokens=4096 progress=0.17
+
+    These are parsed by ``extract_progress_data()`` (from ``handlers``)
+    and stored in the module-level ``_slot_progress_cache`` keyed by
+    ``slot_id``.
+
+    When the log file cannot be read (e.g. not yet created, missing
+    permissions) the cache is simply not updated — no exception is raised.
+    """
+    srv = _srv()
+    try:
+        log_dir = getattr(srv, "log_dir", None)
+        if log_dir is None:
+            log_path = Path(__file__).parent / "logs" / "llama-server.log"
+        else:
+            log_path = Path(log_dir) / "llama-server.log"
+
+        if not log_path.exists():
+            return
+
+        # Read the last 64KB to find progress lines
+        stat = log_path.stat()
+        read_size = min(65536, stat.st_size)
+        with open(log_path, "rb") as f:
+            if read_size < stat.st_size:
+                f.seek(stat.st_size - read_size)
+            # Skip to first newline to avoid partial-line reads
+            if read_size < stat.st_size:
+                f.readline()
+            tail = f.read().decode("utf-8", errors="replace")
+
+        now = time.time()
+        for line in tail.splitlines():
+            result = _extract_progress_data_from_log(line)
+            if result is not None:
+                slot_id, n_tokens, progress = result
+                _slot_progress_cache[slot_id] = {
+                    "n_tokens": n_tokens,
+                    "progress": progress,
+                    "timestamp": now,
+                }
+
+        # Prune entries older than 60 seconds (generations don't last that
+        # long, and stale entries would show bogus token counts).
+        stale = [sid for sid, data in _slot_progress_cache.items()
+                 if now - data["timestamp"] > 60.0]
+        for sid in stale:
+            _slot_progress_cache.pop(sid, None)
+    except Exception:
+        pass
+
+
+def _extract_progress_data_from_log(line: str) -> tuple | None:
+    """Lightweight inline parser for llama-server progress log lines.
+
+    Extracts ``(slot_id, n_tokens, progress)`` from lines like::
+
+        slot update_slots: id=5 n_tokens=4096 progress=0.17
+
+    Returns ``None`` if the line does not contain valid progress data.
+    """
+    if not isinstance(line, str):
+        return None
+    text = line.strip()
+    if not text or "n_tokens" not in text or "progress" not in text:
+        return None
+    try:
+        m_slot = re.search(
+            r'slot\s+update_slots:.*?id\s+(\d+)|slot\s+(\d+)',
+            text, flags=re.IGNORECASE,
+        )
+        m_tokens = re.search(r'\bn_tokens\s*=\s*(\d+)\b', text, flags=re.IGNORECASE)
+        m_progress = re.search(
+            r'\bprogress\s*=\s*([0-9]+(?:\.[0-9]+)?)\b',
+            text, flags=re.IGNORECASE,
+        )
+        if not m_tokens or not m_progress:
+            return None
+        slot_id = int(m_slot.group(1)) if m_slot and m_slot.group(1) is not None else (
+            int(m_slot.group(2)) if m_slot else 0
+        )
+        return (slot_id, int(m_tokens.group(1)), float(m_progress.group(1)))
+    except Exception:
+        return None
+
+
+def _update_processing_slot_assignments(srv, slot_details=None) -> None:
+    """Update ``_processing_slot_assignments`` by matching active dispatch
+    leases against slots that are processing (from progress cache OR
+    ``/slots`` API).
+
+    Each active dispatch session is paired with a processing slot that
+    has recent progress data or is reported as processing by the
+    ``/slots`` endpoint, in order of dispatch start time.  This gives
+    us a working ``{llama_server_slot_id: session_id}`` mapping for the
+    UI without relying on the persistence slot registry.
+
+    Args:
+        srv: The server module (from ``_srv()``).
+        slot_details: Current slot details from ``_query_slots_detail()``
+            or ``_last_slot_details_cache``.  When provided, slots that
+            are ``is_processing == True`` but lack progress cache entries
+            are included as candidates for pairing.
+    """
+    global _processing_slot_assignments
+    try:
+        now = time.time()
+        # Get active dispatch sessions sorted by start time
+        records = getattr(srv, "local_dispatch_records", {})
+
+        active_sessions: list[str] = []
+        for sid_key, info in list(records.items()):
+            if info.get("active"):
+                active_sessions.append((info.get("started_at", 0), sid_key))
+        active_sessions.sort(key=lambda x: x[0])  # oldest first
+
+        # Collect candidate slots from TWO sources:
+        # 1. Slots with recent progress data in the cache
+        # 2. Slots that /slots reports as processing (may not have progress yet)
+        candidate_slots: set[int] = set()
+
+        # Source 1: progress cache (recent, within 60s)
+        for sid, data in _slot_progress_cache.items():
+            if now - data.get("timestamp", 0) < 60.0:
+                candidate_slots.add(sid)
+
+        # Source 2: /slots API reports as processing
+        if slot_details:
+            for sd in slot_details:
+                if sd.get("is_processing"):
+                    sid = sd.get("slot_id")
+                    if sid is not None:
+                        candidate_slots.add(sid)
+
+        candidate_sorted = sorted(candidate_slots)
+
+        # Build reverse: session_id -> slot_id for already-mapped entries
+        session_to_slot: dict[str, int] = {
+            s: p for p, s in _processing_slot_assignments.items()
+        }
+
+        # Assign unmatched sessions to unmatched candidate slots
+        i = 0
+        for _, session_id in active_sessions:
+            if session_id in session_to_slot:
+                continue  # already mapped
+            # Find next candidate slot not yet assigned
+            while i < len(candidate_sorted):
+                ps = candidate_sorted[i]
+                i += 1
+                if ps not in _processing_slot_assignments:
+                    _processing_slot_assignments[ps] = session_id
+                    session_to_slot[session_id] = ps
+                    break
+
+        # Clean up: remove assignments for sessions no longer active
+        session_ids = {s for _, s in active_sessions}
+        stale = [
+            ps for ps, s in _processing_slot_assignments.items()
+            if s not in session_ids
+        ]
+        for ps in stale:
+            _processing_slot_assignments.pop(ps, None)
+
+        # Clean up: remove assignments for slots no longer in candidate set
+        stale_candidates = [
+            ps for ps in _processing_slot_assignments
+            if ps not in candidate_sorted
+        ]
+        for ps in stale_candidates:
+            _processing_slot_assignments.pop(ps, None)
+    except Exception:
+        pass
+
+
+def _build_slot_to_session_map(srv, slot_details=None) -> dict:
+    """Return the current ``_processing_slot_assignments`` mapping from
+    llama-server processing slot_id to session_id.
+
+    This is populated by ``_update_processing_slot_assignments()`` which
+    matches progress data (llama-server slot) against active dispatch
+    leases (session_id).  It is separate from ``_slot_owners`` in
+    ``proxy.session``, which tracks *persistence* slot numbers for
+    session state save/restore.
+
+    Args:
+        srv: The server module (from ``_srv()``).
+        slot_details: Optional list of slot dicts from ``/slots`` API.
+            Passed through to ``_update_processing_slot_assignments``.
+    """
+    _update_processing_slot_assignments(srv, slot_details=slot_details)
+    return dict(_processing_slot_assignments)
+
+
+def _enrich_slot_details_with_progress(slot_details: list[dict],
+                                        srv=None) -> list[dict]:
+    """Merge log-parsed progress n_tokens into slot_details.
+
+    For each slot in *slot_details*, if the progress cache has a
+    fresher *n_tokens* value than the API's *n_decoded*, override
+    *n_decoded* with the progress value (and mark *is_processing* if
+    progress is > 0).
+
+    Also injects ``n_tokens``, ``progress``, ``total_tokens``, and
+    ``session_id`` into each slot dict so the frontend can display
+    "Processed x of y (z%)" with the owning session.
+
+    Args:
+        slot_details: List of slot dicts from ``_query_slots_detail()``
+            or ``_last_slot_details_cache``.
+        srv: Optional server module. If provided, ``session_id`` is
+            resolved from dispatch records.
+
+    Returns:
+        The same list (modified in-place) with enriched token counts.
+    """
+    if not slot_details:
+        return slot_details
+
+    # Build slot→session mapping once for this batch
+    slot_to_session: dict = {}
+    if srv is not None:
+        try:
+            slot_to_session = _build_slot_to_session_map(srv, slot_details=slot_details)
+        except Exception:
+            pass
+
+    now = time.time()
+    for slot in slot_details:
+        sid = slot.get("slot_id")
+        if sid is None:
+            continue
+
+        # Attach session_id if we found an active dispatch for this slot
+        if sid in slot_to_session:
+            slot["session_id"] = slot_to_session[sid]
+
+        prog = _slot_progress_cache.get(sid)
+        if prog is None:
+            continue
+        # Only use progress data if it's recent (within 60 seconds)
+        if now - prog["timestamp"] > 60.0:
+            continue
+        n_tokens = prog["n_tokens"]
+        pct = prog["progress"]
+
+        # Inject progress fields for frontend display
+        slot["n_tokens"] = n_tokens
+        slot["progress"] = round(pct, 3)
+        if pct > 0:
+            slot["total_tokens"] = int(round(n_tokens / pct))
+        else:
+            slot["total_tokens"] = None
+
+        # Use the larger of API n_decoded and log n_tokens
+        api_n_decoded = slot.get("n_decoded")
+        if n_tokens is not None and (
+            api_n_decoded is None or n_tokens > api_n_decoded
+        ):
+            slot["n_decoded"] = n_tokens
+
+        # --- Generation-complete detection via n_tokens stability ---
+        # When n_tokens stops increasing for > 3s, generation is done
+        # and the session is streaming the response to the client.
+        stable = _slot_stable_tracker.get(sid)
+        if stable and stable["n_tokens"] == n_tokens:
+            # n_tokens hasn't changed — check how long it's been stable
+            if now - stable["stable_since"] > 3.0:
+                slot["generation_done"] = True
+                slot["is_processing"] = False
+        else:
+            # n_tokens increased (or first sighting) — reset tracker
+            _slot_stable_tracker[sid] = {"n_tokens": n_tokens, "stable_since": now}
+            slot["generation_done"] = False
+            # Mark as processing if progress > 0
+            if pct > 0:
+                slot["is_processing"] = True
+    return slot_details
+
+
 
 async def _periodic_broadcast_loop():
     """Periodically broadcast current counts/tokens to connected log-tail clients.
@@ -528,6 +944,11 @@ async def _periodic_broadcast_loop():
     Also queries llama-server for status and broadcasts stats.
     """
     srv = _srv()
+    # Cache the last successful slot query result so that transient
+    # timeouts (e.g. during busy token generation) don't blank the UI.
+    # Use the module-level cache so that ``status_events()`` in ``proxy.ui``
+    # can also survive timeouts on initial SSE connection.
+    global _last_slot_details_cache
     try:
         while True:
             try:
@@ -557,6 +978,39 @@ async def _periodic_broadcast_loop():
                         except asyncio.QueueFull:
                             continue
 
+                # --- Per-slot data query (best-effort) ---
+                slot_details: list[dict] = []
+                server_running = llama_status.get("llama_server_running")
+                if server_running:
+                    try:
+                        server_cfg = srv.config.get("server", {})
+                        llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                        # Use current_model as the model param for /slots
+                        model_name = srv.current_model or None
+                        # 5s timeout: llama-server may be slow to respond
+                        # to /slots when busy generating tokens.
+                        slot_details = await _query_slots_detail(
+                            llama_port, timeout=5.0, model=model_name,
+                        )
+                    except Exception:
+                        pass
+
+                # Read llama-server log for supplemental progress data
+                _update_slot_progress_from_log()
+
+                # Preserve last known slot data when query fails or llama-server
+                # is too busy to respond (ReadTimeout during token generation).
+                if slot_details:
+                    _last_slot_details_cache = slot_details
+                else:
+                    slot_details = _last_slot_details_cache
+
+                # Merge log-parsed progress token counts and session IDs into
+                # slot details. This ensures the web UI shows real token counts
+                # even when the /slots endpoint is unresponsive during busy
+                # generation, and identifies the owning session.
+                _enrich_slot_details_with_progress(slot_details, srv=srv)
+
                 if sse_clients:
                     # Snapshot per-model and per-provider queries for SSE broadcast
                     try:
@@ -573,6 +1027,7 @@ async def _periodic_broadcast_loop():
                         "total_sent": total_sent,
                         "total_recv": total_recv,
                         "per_model_queries": per_model_snapshot,
+                        "slots": slot_details,
                     }
                     event_data = json.dumps(status_data)
                     message = f"data: {event_data}\n\n"

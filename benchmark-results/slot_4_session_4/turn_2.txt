@@ -1,0 +1,262 @@
+# Benchmark: slot_count=4  session=4  turn=2
+# Prompt: Extend the To-Do application to support priority and due date.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 238s  Tokens: 2106  TPS: 9.4
+# ============================================================
+
+I'll provide a complete implementation of the extended To-Do application with priority, due date, filtering, sorting, and tests. The code is structured into a main module (`todo.py`) and a test suite (`test_todo.py`). Below is the full code with explanations.
+
+---
+
+## Implementation: `todo.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Extended To-Do Application with priority and due date support.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, date
+from dataclasses import dataclass, field
+from typing import Optional, List
+
+# ------------------------------------------------------------------
+# Data Model
+# ------------------------------------------------------------------
+
+PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
+VALID_PRIORITIES = {'low', 'medium', 'high'}
+DATE_FORMAT = '%Y-%m-%d'   # YYYY-MM-DD
+
+
+@dataclass
+class Task:
+    title: str
+    completed: bool = False
+    priority: str = 'medium'      # low / medium / high
+    due_date: str = ''            # YYYY-MM-DD or empty
+
+    def __post_init__(self):
+        if self.priority not in VALID_PRIORITIES:
+            raise ValueError(f"Invalid priority: {self.priority}")
+        if self.due_date and not self._is_valid_date(self.due_date):
+            raise ValueError(f"Invalid due_date: {self.due_date}")
+
+    @staticmethod
+    def _is_valid_date(d: str) -> bool:
+        try:
+            datetime.strptime(d, DATE_FORMAT)
+            return True
+        except ValueError:
+            return False
+
+    def to_dict(self) -> dict:
+        return {
+            'title': self.title,
+            'completed': self.completed,
+            'priority': self.priority,
+            'due_date': self.due_date,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'Task':
+        # Backward compatibility: fill missing fields with defaults
+        if 'priority' not in d:
+            d['priority'] = 'medium'
+        if 'due_date' not in d:
+            d['due_date'] = ''
+        # migration on read: handle old format where completed might be missing
+        if 'completed' not in d:
+            d['completed'] = False
+        return cls(
+            title=d['title'],
+            completed=d['completed'],
+            priority=d['priority'],
+            due_date=d['due_date'],
+        )
+
+
+# ------------------------------------------------------------------
+# Storage
+# ------------------------------------------------------------------
+
+class TaskStore:
+    def __init__(self, filepath: str = 'tasks.json'):
+        self.filepath = filepath
+
+    def load(self) -> List[Task]:
+        """Load tasks from file. Returns empty list if file doesn't exist."""
+        if not os.path.exists(self.filepath):
+            return []
+        with open(self.filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return [Task.from_dict(item) for item in data]
+
+    def save(self, tasks: List[Task]) -> None:
+        """Save tasks to file."""
+        with open(self.filepath, 'w', encoding='utf-8') as f:
+            json.dump([t.to_dict() for t in tasks], f, indent=2, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------
+# CLI Helpers
+# ------------------------------------------------------------------
+
+def priority_sort_key(task: Task) -> int:
+    return PRIORITY_ORDER.get(task.priority, 99)
+
+
+def due_date_sort_key(task: Task) -> str:
+    # Empty dates sort after all real dates
+    return task.due_date if task.due_date else '9999-99-99'
+
+
+def filter_by_priority(tasks: List[Task], priority: str) -> List[Task]:
+    return [t for t in tasks if t.priority == priority]
+
+
+def filter_by_due_before(tasks: List[Task], due_before: str) -> List[Task]:
+    """Keep tasks with due_date not empty and <= due_before."""
+    try:
+        cutoff = datetime.strptime(due_before, DATE_FORMAT).date()
+    except ValueError:
+        print(f"Invalid date format: {due_before} (use YYYY-MM-DD)")
+        sys.exit(1)
+    result = []
+    for t in tasks:
+        if not t.due_date:
+            continue   # no due date -> exclude
+        try:
+            td = datetime.strptime(t.due_date, DATE_FORMAT).date()
+            if td <= cutoff:
+                result.append(t)
+        except ValueError:
+            pass   # malformed date, ignore
+    return result
+
+
+def display_tasks(tasks: List[Task], header: bool = True) -> None:
+    """Print tasks in a table format."""
+    if not tasks:
+        print("No tasks found.")
+        return
+    # Column widths
+    max_title = max(len(t.title) for t in tasks) if tasks else 10
+    max_title = max(max_title, 6)  # at least "Title"
+    total_width = max_title + 12 + 8 + 12  # title, done, priority, due date
+    sep = '-' * total_width
+
+    if header:
+        print(sep)
+        print(f"{'Title':<{max_title}} {'Done':<6} {'Priority':<10} {'Due Date':<12}")
+        print(sep)
+    for t in tasks:
+        done = '[x]' if t.completed else '[ ]'
+        due = t.due_date if t.due_date else ''
+        print(f"{t.title:<{max_title}} {done:<6} {t.priority:<10} {due:<12}")
+    if header:
+        print(sep)
+
+
+# ------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------
+
+def cmd_add(args, store: TaskStore):
+    tasks = store.load()
+    # Check for duplicate title (optional)
+    if any(t.title == args.title for t in tasks):
+        print(f"Task '{args.title}' already exists.")
+        sys.exit(1)
+    task = Task(
+        title=args.title,
+        priority=args.priority,
+        due_date=args.due_date or '',
+    )
+    tasks.append(task)
+    store.save(tasks)
+    print(f"Added task: {task.title}")
+
+
+def cmd_list(args, store: TaskStore):
+    tasks = store.load()
+
+    # Apply filters
+    if args.priority:
+        tasks = filter_by_priority(tasks, args.priority)
+    if args.due_before:
+        tasks = filter_by_due_before(tasks, args.due_before)
+
+    # Apply sorting
+    if args.sort == 'priority':
+        tasks.sort(key=priority_sort_key)
+    elif args.sort == 'due_date':
+        tasks.sort(key=due_date_sort_key)
+
+    display_tasks(tasks)
+
+
+def cmd_complete(args, store: TaskStore):
+    tasks = store.load()
+    for t in tasks:
+        if t.title == args.title:
+            t.completed = True
+            store.save(tasks)
+            print(f"Completed task: {t.title}")
+            return
+    print(f"Task '{args.title}' not found.")
+
+
+def cmd_remove(args, store: TaskStore):
+    tasks = store.load()
+    new_tasks = [t for t in tasks if t.title != args.title]
+    if len(new_tasks) == len(tasks):
+        print(f"Task '{args.title}' not found.")
+    else:
+        store.save(new_tasks)
+        print(f"Removed task: {args.title}")
+
+
+# ------------------------------------------------------------------
+# Argument parser
+# ------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="To-Do Application with Priority and Due Dates\n"
+                    "Store tasks in a JSON file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # add
+    add_parser = subparsers.add_parser('add', help='Add a new task')
+    add_parser.add_argument('title', help='Title of the task')
+    add_parser.add_argument('--priority', '-p', default='medium',
+                            choices=['low', 'medium', 'high'],
+                            help='Priority (default: medium)')
+    add_parser.add_argument('--due-date', '-d', type=str, default='',
+                            help='Due date in YYYY-MM-DD format (optional)')
+
+    # list
+    list_parser = subparsers.add_parser('list', help='List tasks')
+    list_parser.add_argument('--priority', type=str,
+                             choices=['low', 'medium', 'high'],
+                             help='Filter by priority')
+    list_parser.add_argument('--due-before', type=str,
+                             help='Filter tasks due before YYYY-MM-DD')
+    list_parser.add_argument('--sort', type=str,
+                             choices=['priority', 'due_date'],
+                             help='Sort tasks by priority or due date')
+
+    # complete
+    complete_parser = subparsers.add_parser('complete', help='Mark a task as completed')
+    complete_parser.add_argument('title', help='Title of the task to complete

@@ -1,0 +1,428 @@
+# Benchmark: slot_count=2  session=0  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 295s  Tokens: 3346  TPS: 30.9
+# ============================================================
+
+Here's a complete, production-ready implementation following your requirements. The code is structured as a Python package, includes comprehensive type hints, docstrings, error handling, and a full test suite using `pytest`.
+
+### 📁 Project Structure
+```
+todo_app/
+├── __init__.py
+├── __main__.py
+├── cli.py
+├── storage.py
+tests/
+└── test_todo.py
+```
+
+---
+
+### `todo_app/storage.py`
+Core business logic and JSON persistence layer.
+
+```python
+"""Core storage and task management logic for the To-Do app."""
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+@dataclass
+class Task:
+    """Represents a single to-do task."""
+    id: int
+    title: str
+    completed: bool
+
+def load_tasks(filepath: str) -> list[Task]:
+    """Load tasks from a JSON file. Returns empty list if file doesn't exist or is invalid."""
+    if not os.path.exists(filepath):
+        return []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return [Task(**t) for t in data]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"Warning: Could not parse tasks file. Starting fresh. Error: {e}")
+        return []
+
+def save_tasks(filepath: str, tasks: list[Task]) -> None:
+    """Save tasks to a JSON file with pretty formatting."""
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump([asdict(t) for t in tasks], f, indent=2)
+
+def add_task(tasks: list[Task], title: str) -> Task:
+    """Add a new task to the list. Raises ValueError if title is empty."""
+    if not title.strip():
+        raise ValueError("Task title cannot be empty.")
+    new_id = max((t.id for t in tasks), default=0) + 1
+    new_task = Task(id=new_id, title=title.strip(), completed=False)
+    tasks.append(new_task)
+    return new_task
+
+def get_task(tasks: list[Task], task_id: int) -> Optional[Task]:
+    """Retrieve a task by ID."""
+    for t in tasks:
+        if t.id == task_id:
+            return t
+    return None
+
+def complete_task(tasks: list[Task], task_id: int) -> bool:
+    """Mark a task as complete. Returns True if found and updated."""
+    task = get_task(tasks, task_id)
+    if task:
+        task.completed = True
+        return True
+    return False
+
+def delete_task(tasks: list[Task], task_id: int) -> bool:
+    """Delete a task by ID. Returns True if found and removed."""
+    for i, t in enumerate(tasks):
+        if t.id == task_id:
+            tasks.pop(i)
+            return True
+    return False
+```
+
+---
+
+### `todo_app/cli.py`
+Argument parsing and command routing.
+
+```python
+"""CLI interface for the To-Do application."""
+import argparse
+import sys
+from argparse import Namespace
+from .storage import load_tasks, save_tasks, add_task, complete_task, delete_task, Task
+
+DEFAULT_FILE = "tasks.json"
+
+def _format_task(task: Task) -> str:
+    """Format a task for display."""
+    status = "✓" if task.completed else " "
+    return f"[{status}] {task.id}. {task.title}"
+
+def _get_tasks(filepath: str) -> list[Task]:
+    """Load tasks from storage."""
+    return load_tasks(filepath)
+
+def cmd_add(args: Namespace) -> None:
+    """Handle the 'add' subcommand."""
+    filepath = args.file
+    tasks = _get_tasks(filepath)
+    try:
+        new_task = add_task(tasks, args.title)
+        save_tasks(filepath, tasks)
+        print(f"Added: {_format_task(new_task)}")
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_list(args: Namespace) -> None:
+    """Handle the 'list' subcommand."""
+    filepath = args.file
+    tasks = _get_tasks(filepath)
+    if not tasks:
+        print("No tasks found.")
+        return
+    print("Your Tasks:")
+    for t in tasks:
+        print(f"  {_format_task(t)}")
+
+def cmd_complete(args: Namespace) -> None:
+    """Handle the 'complete' subcommand."""
+    filepath = args.file
+    tasks = _get_tasks(filepath)
+    if complete_task(tasks, args.id):
+        save_tasks(filepath, tasks)
+        print(f"Task {args.id} marked as complete.")
+    else:
+        print(f"Error: Task {args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_delete(args: Namespace) -> None:
+    """Handle the 'delete' subcommand."""
+    filepath = args.file
+    tasks = _get_tasks(filepath)
+    if delete_task(tasks, args.id):
+        save_tasks(filepath, tasks)
+        print(f"Task {args.id} deleted.")
+    else:
+        print(f"Error: Task {args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple CLI To-Do application with JSON storage. Use --help for usage info."
+    )
+    parser.add_argument(
+        "--file", "-f",
+        default=DEFAULT_FILE,
+        help="Path to the JSON storage file (default: tasks.json)"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Title of the task")
+    add_parser.set_defaults(func=cmd_add)
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List all tasks")
+    list_parser.set_defaults(func=cmd_list)
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as complete")
+    complete_parser.add_argument("id", type=int, help="ID of the task to complete")
+    complete_parser.set_defaults(func=cmd_complete)
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="ID of the task to delete")
+    delete_parser.set_defaults(func=cmd_delete)
+
+    return parser
+
+def main() -> None:
+    """Entry point for the CLI."""
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+```
+
+---
+
+### `todo_app/__init__.py`
+Package initialization and public API exposure.
+
+```python
+"""A simple CLI-based To-Do application with JSON storage."""
+from .storage import Task, load_tasks, save_tasks, add_task, complete_task, delete_task
+from .cli import main, build_parser
+
+__all__ = [
+    "Task",
+    "load_tasks",
+    "save_tasks",
+    "add_task",
+    "complete_task",
+    "delete_task",
+    "main",
+    "build_parser",
+]
+```
+
+---
+
+### `todo_app/__main__.py`
+Allows running the package as a script: `python -m todo_app`
+
+```python
+"""Allow running the package as a script: python -m todo_app"""
+from .cli import main
+main()
+```
+
+---
+
+### `tests/test_todo.py`
+Comprehensive unit tests using `pytest` and temporary files.
+
+```python
+"""Unit tests for the To-Do application."""
+import sys
+import pytest
+from pathlib import Path
+from todo_app.storage import (
+    load_tasks, save_tasks, add_task, get_task, complete_task, delete_task, Task
+)
+from todo_app.cli import build_parser
+
+@pytest.fixture
+def tasks_file(tmp_path: Path) -> Path:
+    """Create a temporary tasks file."""
+    return tmp_path / "tasks.json"
+
+@pytest.fixture
+def initial_tasks(tasks_file: Path) -> list[Task]:
+    """Create a file with some initial tasks."""
+    tasks = [
+        Task(id=1, title="Buy groceries", completed=False),
+        Task(id=2, title="Read a book", completed=True),
+    ]
+    save_tasks(str(tasks_file), tasks)
+    return tasks
+
+class TestStorageCRUD:
+    def test_load_nonexistent_file(self, tasks_file: Path):
+        assert load_tasks(str(tasks_file)) == []
+
+    def test_load_valid_file(self, initial_tasks: list[Task], tasks_file: Path):
+        loaded = load_tasks(str(tasks_file))
+        assert len(loaded) == 2
+        assert loaded[0].id == 1
+        assert loaded[0].title == "Buy groceries"
+        assert loaded[1].completed is True
+
+    def test_save_and_load_roundtrip(self, tasks_file: Path):
+        tasks = [Task(id=1, title="Test", completed=False)]
+        save_tasks(str(tasks_file), tasks)
+        loaded = load_tasks(str(tasks_file))
+        assert len(loaded) == 1
+        assert loaded[0].title == "Test"
+
+    def test_add_new_task(self, initial_tasks: list[Task]):
+        new_task = add_task(initial_tasks, "New task")
+        assert new_task.id == 3
+        assert new_task.title == "New task"
+        assert new_task.completed is False
+        assert len(initial_tasks) == 3
+
+    def test_add_task_increments_id(self, initial_tasks: list[Task]):
+        add_task(initial_tasks, "Task A")
+        add_task(initial_tasks, "Task B")
+        assert initial_tasks[-1].id == 4
+        assert initial_tasks[-2].id == 3
+
+    def test_add_task_empty_title_raises(self, initial_tasks: list[Task]):
+        with pytest.raises(ValueError, match="cannot be empty"):
+            add_task(initial_tasks, "   ")
+
+    def test_add_task_strips_whitespace(self, initial_tasks: list[Task]):
+        new_task = add_task(initial_tasks, "  Trimmed  ")
+        assert new_task.title == "Trimmed"
+
+    def test_complete_existing_task(self, initial_tasks: list[Task]):
+        assert complete_task(initial_tasks, 1) is True
+        assert initial_tasks[0].completed is True
+
+    def test_complete_nonexistent_task(self, initial_tasks: list[Task]):
+        assert complete_task(initial_tasks, 99) is False
+        assert initial_tasks[0].completed is False
+
+    def test_delete_existing_task(self, initial_tasks: list[Task]):
+        assert delete_task(initial_tasks, 2) is True
+        assert len(initial_tasks) == 1
+        assert initial_tasks[0].id == 1
+
+    def test_delete_nonexistent_task(self, initial_tasks: list[Task]):
+        assert delete_task(initial_tasks, 99) is False
+        assert len(initial_tasks) == 2
+
+    def test_delete_preserves_order(self, initial_tasks: list[Task]):
+        delete_task(initial_tasks, 1)
+        assert initial_tasks[0].id == 2
+
+    def test_find_by_id(self, initial_tasks: list[Task]):
+        task = get_task(initial_tasks, 2)
+        assert task is not None
+        assert task.title == "Read a book"
+
+    def test_find_nonexistent(self, initial_tasks: list[Task]):
+        assert get_task(initial_tasks, 99) is None
+
+class TestCLI:
+    def test_add_command(self, capsys, tmp_path: Path):
+        filepath = tmp_path / "test.json"
+        parser = build_parser()
+        args = parser.parse_args(["add", "--file", str(filepath), "Learn pytest"])
+        args.func(args)
+        captured = capsys.readouterr()
+        assert "Added:" in captured.out
+        assert "1. Learn pytest" in captured.out
+
+    def test_list_command(self, capsys, tmp_path: Path):
+        filepath = tmp_path / "test.json"
+        save_tasks(str(filepath), [Task(id=1, title="Test", completed=False)])
+
+        parser = build_parser()
+        args = parser.parse_args(["list", "--file", str(filepath)])
+        args.func(args)
+        captured = capsys.readouterr()
+        assert "Test" in captured.out
+
+    def test_complete_command(self, capsys, tmp_path: Path):
+        filepath = tmp_path / "test.json"
+        save_tasks(str(filepath), [Task(id=1, title="Test", completed=False)])
+
+        parser = build_parser()
+        args = parser.parse_args(["complete", "--file", str(filepath), "1"])
+        args.func(args)
+        captured = capsys.readouterr()
+        assert "marked as complete" in captured.out
+
+        loaded = load_tasks(str(filepath))
+        assert loaded[0].completed is True
+
+    def test_delete_command(self, capsys, tmp_path: Path):
+        filepath = tmp_path / "test.json"
+        save_tasks(str(filepath), [Task(id=1, title="Test", completed=False)])
+
+        parser = build_parser()
+        args = parser.parse_args(["delete", "--file", str(filepath), "1"])
+        args.func(args)
+        captured = capsys.readouterr()
+        assert "deleted" in captured.out
+
+        loaded = load_tasks(str(filepath))
+        assert len(loaded) == 0
+
+    def test_invalid_command_exit_code(self, tmp_path: Path):
+        filepath = tmp_path / "test.json"
+        parser = build_parser()
+        args = parser.parse_args(["complete", "--file", str(filepath), "999"])
+        with pytest.raises(SystemExit) as exc_info:
+            args.func(args)
+        assert exc_info.value.code == 1
+```
+
+---
+
+### 🚀 Usage & Testing Instructions
+
+1. **Install dependencies** (if not already installed):
+   ```bash
+   pip install pytest
+   ```
+
+2. **Run the CLI**:
+   ```bash
+   # Add a task
+   python -m todo_app add "Buy groceries"
+   python -m todo_app add "Write tests"
+
+   # List tasks
+   python -m todo_app list
+
+   # Complete a task
+   python -m todo_app complete 1
+
+   # Delete a task
+   python -m todo_app delete 2
+
+   # Show help (built-in argparse)
+   python -m todo_app --help
+   python -m todo_app add --help
+   ```
+
+3. **Run tests**:
+   ```bash
+   pytest tests/test_todo.py -v
+   ```
+
+### ✅ Design Highlights
+- **Pure JSON storage**: Lightweight, human-readable, no external dependencies.
+- **Auto-increment IDs**: Safely handles gaps (e.g., after deletion) by computing `max(id) + 1`.
+- **Input validation**: Strips whitespace, rejects empty titles, validates JSON on load.
+- **Error handling**: Graceful fallback on corrupted/missing files; CLI exits with code `1` on errors and prints to `stderr`.
+- **Testability**: All logic is decoupled from I/O. Tests use `tmp_path` for isolation and `capsys` for CLI output verification.
+- **Importable module**: `from todo_app import Task, add_task, complete_task` works seamlessly in other Python projects.

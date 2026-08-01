@@ -1,0 +1,352 @@
+# Benchmark: slot_count=6  session=4  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 524s  Tokens: 2674  TPS: 17.1
+# ============================================================
+
+Here's a complete, production-ready implementation following your requirements. It's structured as a single importable module with a CLI interface, plus comprehensive unit tests.
+
+### `todo_app.py`
+```python
+"""CLI-based To-Do Application with JSON storage and full CRUD operations."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Optional
+
+DEFAULT_FILE = Path("tasks.json")
+
+
+class TodoError(Exception):
+    """Base exception for TodoApp errors."""
+
+
+class InvalidTitleError(TodoError):
+    """Raised when the task title is empty or whitespace-only."""
+
+
+@dataclass
+class Task:
+    """Represents a single to-do task."""
+    id: int
+    title: str
+    completed: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Task:
+        return cls(**data)
+
+
+class TodoApp:
+    """Manages tasks with JSON persistence and full CRUD operations."""
+
+    def __init__(self, file: Path = DEFAULT_FILE):
+        self.file = Path(file)
+        self.tasks: List[Task] = self._load()
+
+    def _load(self) -> List[Task]:
+        """Load tasks from JSON file."""
+        if not self.file.exists():
+            return []
+        try:
+            with self.file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [Task.from_dict(task) for task in data]
+        except json.JSONDecodeError as e:
+            raise TodoError(f"Failed to parse {self.file}: {e}") from e
+
+    def _save(self) -> None:
+        """Save current tasks to JSON file."""
+        data = [task.to_dict() for task in self.tasks]
+        with self.file.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def add(self, title: str) -> Task:
+        """Add a new task. Returns the created task."""
+        if not title.strip():
+            raise InvalidTitleError("Title cannot be empty or whitespace")
+        new_id = max((t.id for t in self.tasks), default=0) + 1
+        new_task = Task(id=new_id, title=title.strip())
+        self.tasks.append(new_task)
+        self._save()
+        return new_task
+
+    def list_all(self) -> List[Task]:
+        """Return all tasks."""
+        return self.tasks
+
+    def complete(self, task_id: int) -> Optional[Task]:
+        """Mark a task as completed. Returns the updated task, or None if not found."""
+        for task in self.tasks:
+            if task.id == task_id:
+                task.completed = True
+                self._save()
+                return task
+        return None
+
+    def delete(self, task_id: int) -> Optional[Task]:
+        """Delete a task. Returns the deleted task, or None if not found."""
+        for i, task in enumerate(self.tasks):
+            if task.id == task_id:
+                removed = self.tasks.pop(i)
+                self._save()
+                return removed
+        return None
+
+
+def main() -> None:
+    """Entry point for the CLI."""
+    parser = argparse.ArgumentParser(
+        description="CLI-based To-Do Application",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python todo_app.py add "Buy groceries"
+  python todo_app.py list
+  python todo_app.py complete 1
+  python todo_app.py delete 2
+  python todo_app.py help
+        """
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Task title")
+    add_parser.add_argument("--file", "-f", type=Path, default=DEFAULT_FILE, help="JSON storage file")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List all tasks")
+    list_parser.add_argument("--file", "-f", type=Path, default=DEFAULT_FILE, help="JSON storage file")
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+    complete_parser.add_argument("task_id", type=int, help="ID of the task to complete")
+    complete_parser.add_argument("--file", "-f", type=Path, default=DEFAULT_FILE, help="JSON storage file")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("task_id", type=int, help="ID of the task to delete")
+    delete_parser.add_argument("--file", "-f", type=Path, default=DEFAULT_FILE, help="JSON storage file")
+
+    # explicit help command
+    help_parser = subparsers.add_parser("help", help="Show help message")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == "help":
+        parser.print_help()
+        return
+
+    try:
+        app = TodoApp(file=args.file)
+    except TodoError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command == "add":
+        try:
+            task = app.add(args.title)
+            print(f"Added task #{task.id}: '{task.title}'")
+        except InvalidTitleError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "list":
+        tasks = app.list_all()
+        if not tasks:
+            print("No tasks found.")
+        else:
+            for t in tasks:
+                status = "✓" if t.completed else " "
+                print(f"[{status}] #{t.id} {t.title}")
+    elif args.command == "complete":
+        task = app.complete(args.task_id)
+        if task:
+            print(f"Task #{task.id} marked as completed.")
+        else:
+            print(f"Task #{args.task_id} not found.")
+    elif args.command == "delete":
+        task = app.delete(args.task_id)
+        if task:
+            print(f"Deleted task #{task.id}: '{task.title}'")
+        else:
+            print(f"Task #{args.task_id} not found.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### `test_todo_app.py`
+```python
+"""Unit tests for the CLI To-Do Application."""
+
+import pytest
+from pathlib import Path
+from todo_app import TodoApp, InvalidTitleError, TodoError
+
+
+@pytest.fixture
+def temp_file(tmp_path: Path) -> Path:
+    """Create a temporary JSON file for testing."""
+    return tmp_path / "test_tasks.json"
+
+
+@pytest.fixture
+def app(temp_file: Path) -> TodoApp:
+    """Provide a TodoApp instance backed by a temporary file."""
+    return TodoApp(file=temp_file)
+
+
+# --- ADD TESTS ---
+def test_add_task(app: TodoApp, temp_file: Path) -> None:
+    """Test adding a task creates correct data and persists to disk."""
+    task = app.add("Test Task")
+    assert task.id == 1
+    assert task.title == "Test Task"
+    assert task.completed is False
+    assert temp_file.exists()
+
+    # Verify persistence by reloading
+    app2 = TodoApp(file=temp_file)
+    assert len(app2.tasks) == 1
+    assert app2.tasks[0].id == 1
+
+
+def test_add_task_auto_increment(app: TodoApp) -> None:
+    """Test that task IDs increment correctly."""
+    app.add("Task 1")
+    app.add("Task 2")
+    app.add("Task 3")
+    assert len(app.tasks) == 3
+    assert app.tasks[2].id == 3
+
+
+def test_add_empty_title(app: TodoApp) -> None:
+    """Test that empty or whitespace-only titles raise InvalidTitleError."""
+    with pytest.raises(InvalidTitleError, match="Title cannot be empty"):
+        app.add("   ")
+    with pytest.raises(InvalidTitleError, match="Title cannot be empty"):
+        app.add("")
+
+
+# --- LIST TESTS ---
+def test_list_tasks(app: TodoApp) -> None:
+    """Test listing tasks returns all added tasks."""
+    app.add("Task A")
+    app.add("Task B")
+    tasks = app.list_all()
+    assert len(tasks) == 2
+    assert all(isinstance(t, type(tasks[0])) for t in tasks)
+
+
+def test_list_empty_tasks(app: TodoApp) -> None:
+    """Test listing tasks when none exist."""
+    assert app.list_all() == []
+
+
+# --- COMPLETE TESTS ---
+def test_complete_task(app: TodoApp) -> None:
+    """Test marking a task as completed."""
+    task = app.add("Task 1")
+    completed_task = app.complete(task.id)
+    assert completed_task is not None
+    assert completed_task.completed is True
+
+    # Verify persistence
+    app2 = TodoApp(file=app.file)
+    assert app2.tasks[0].completed is True
+
+
+def test_complete_nonexistent_task(app: TodoApp) -> None:
+    """Test completing a task that doesn't exist."""
+    result = app.complete(999)
+    assert result is None
+
+
+# --- DELETE TESTS ---
+def test_delete_task(app: TodoApp) -> None:
+    """Test deleting a task."""
+    task = app.add("Task 1")
+    deleted_task = app.delete(task.id)
+    assert deleted_task is not None
+    assert deleted_task.title == "Task 1"
+    assert len(app.list_all()) == 0
+
+
+def test_delete_nonexistent_task(app: TodoApp) -> None:
+    """Test deleting a task that doesn't exist."""
+    result = app.delete(999)
+    assert result is None
+
+
+def test_delete_preserves_order_and_ids(app: TodoApp) -> None:
+    """Test that deletion doesn't reassign IDs or break ordering."""
+    app.add("A")
+    app.add("B")
+    app.add("C")
+    app.delete(2)  # Delete B
+    assert len(app.tasks) == 2
+    assert app.tasks[0].id == 1
+    assert app.tasks[1].id == 3
+
+
+# --- ERROR HANDLING TESTS ---
+def test_invalid_json_file(temp_file: Path) -> None:
+    """Test that corrupted JSON raises TodoError."""
+    temp_file.write_text("invalid json {{{")
+    with pytest.raises(TodoError, match="Failed to parse"):
+        TodoApp(file=temp_file)
+```
+
+### How to Run
+
+1. **Install pytest** (if not already installed):
+   ```bash
+   pip install pytest
+   ```
+
+2. **Run the tests**:
+   ```bash
+   pytest test_todo_app.py -v
+   ```
+
+3. **Use the CLI**:
+   ```bash
+   # Add a task
+   python todo_app.py add "Buy groceries"
+
+   # List tasks
+   python todo_app.py list
+
+   # Complete task #1
+   python todo_app.py complete 1
+
+   # Delete task #2
+   python todo_app.py delete 2
+
+   # Show help
+   python todo_app.py help
+   ```
+
+### Design Highlights
+- **Pure Storage Layer**: JSON handling is isolated in `_load()` and `_save()`, making it easy to swap backends later.
+- **Idempotent & Safe**: File writes use `utf-8` encoding. Corrupted JSON is caught and reported cleanly. Titles are stripped and validated to prevent malformed entries.
+- **Importable**: `TodoApp`, `Task`, and custom exceptions are exposed at module level for programmatic use or testing.
+- **Test-Driven**: Tests cover happy paths, edge cases (non-existent IDs, empty titles, corrupted files), persistence verification, and ID stability after deletion.
+- **CLI UX**: Uses `argparse` subcommands with descriptive help text, sensible defaults, and clear success/error messages. The explicit `help` command satisfies the requirement while retaining standard `-h`/`--help` support.

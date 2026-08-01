@@ -1,0 +1,426 @@
+# Benchmark: slot_count=2  session=3  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 75s  Tokens: 3711  TPS: 196.3
+# ============================================================
+
+We'll build a simple, clean To‑Do CLI that stores tasks in a JSON file. The application is structured as a Python package (`todo_cli`) so it can be imported as a module. All CRUD operations are implemented in `storage.py`, the command‑line interface in `cli.py`, and full unit tests are provided.
+
+## Project structure
+
+```
+todo_cli/
+├── __init__.py
+├── storage.py
+├── cli.py
+└── tests/
+    ├── __init__.py
+    └── test_storage.py
+```
+
+- `storage.py` – Core CRUD functions (add, list, complete, delete) with JSON persistence.
+- `cli.py` – Command‑line parser using `argparse` and a `main()` entry point.
+- `__init__.py` – Empty (package marker).
+- `tests/test_storage.py` – Unit tests for all storage operations (uses `tmp_path` fixture).
+
+---
+
+## 1. `storage.py`
+
+```python
+"""
+CRUD operations for a JSON‑based task list.
+
+Each task is a dictionary with keys: id (int), title (str), completed (bool).
+"""
+
+import json
+from typing import List, Dict
+
+Task = Dict[str, object]  # {"id": int, "title": str, "completed": bool}
+
+
+def load_tasks(filepath: str) -> List[Task]:
+    """Load tasks from a JSON file. Returns an empty list if file doesn't exist."""
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_tasks(tasks: List[Task], filepath: str) -> None:
+    """Save a list of tasks to a JSON file."""
+    with open(filepath, 'w') as f:
+        json.dump(tasks, f, indent=2)
+
+
+def add_task(tasks: List[Task], title: str) -> Task:
+    """
+    Add a new task with an auto‑incremented id.
+
+    Returns the created task.
+    """
+    new_id = max((t["id"] for t in tasks), default=0) + 1
+    task = {"id": new_id, "title": title, "completed": False}
+    tasks.append(task)
+    return task
+
+
+def complete_task(tasks: List[Task], task_id: int) -> bool:
+    """
+    Mark a task as completed.
+
+    Returns True if the task was found and updated, False otherwise.
+    """
+    for t in tasks:
+        if t["id"] == task_id:
+            t["completed"] = True
+            return True
+    return False
+
+
+def delete_task(tasks: List[Task], task_id: int) -> bool:
+    """
+    Delete a task by its id.
+
+    Returns True if the task was found and removed, False otherwise.
+    """
+    for i, t in enumerate(tasks):
+        if t["id"] == task_id:
+            tasks.pop(i)
+            return True
+    return False
+
+
+def list_tasks(tasks: List[Task], show_all: bool = True) -> List[Task]:
+    """
+    Return tasks. If show_all is False, return only incomplete tasks.
+    """
+    if show_all:
+        return tasks[:]
+    return [t for t in tasks if not t["completed"]]
+```
+
+---
+
+## 2. `cli.py`
+
+```python
+"""
+Command‑line interface for the To‑Do application.
+
+Usage:
+    python -m todo_cli.cli <command> [options]
+"""
+
+import argparse
+import sys
+import os
+from . import storage
+
+
+DEFAULT_FILE = os.path.join(os.path.expanduser("~"), ".todo.json")
+
+
+def get_storage_path() -> str:
+    """Return the path to the JSON storage file (override with TODO_FILE env var)."""
+    return os.environ.get("TODO_FILE", DEFAULT_FILE)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple CLI To‑Do application.",
+        usage="%(prog)s <command> [options]"
+    )
+    subparsers = parser.add_subparsers(dest="command", help="available commands")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Task title")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument(
+        "--all", "-a",
+        action="store_true",
+        default=True,
+        dest="show_all",
+        help="Show all tasks (default)"
+    )
+    list_parser.add_argument(
+        "--incomplete", "-i",
+        action="store_false",
+        dest="show_all",
+        help="Show only incomplete tasks"
+    )
+
+    # complete
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+    complete_parser.add_argument("id", type=int, help="Task id to complete")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=int, help="Task id to delete")
+
+    # help – we reuse the built-in help, but we also add an explicit one for clarity
+    help_parser = subparsers.add_parser("help", help="Show this help message")
+
+    return parser
+
+
+def main(argv: list = None) -> int:
+    """Main entry point for the CLI. Returns 0 on success, 1 on error."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None or args.command == "help":
+        parser.print_help()
+        return 0
+
+    filepath = get_storage_path()
+    tasks = storage.load_tasks(filepath)
+
+    if args.command == "add":
+        task = storage.add_task(tasks, args.title)
+        storage.save_tasks(tasks, filepath)
+        print(f"Added task [{task['id']}]: {task['title']}")
+
+    elif args.command == "list":
+        result = storage.list_tasks(tasks, show_all=args.show_all)
+        if not result:
+            print("No tasks found.")
+        else:
+            for t in result:
+                status = "✓" if t["completed"] else " "
+                print(f"[{status}] {t['id']}: {t['title']}")
+
+    elif args.command == "complete":
+        if storage.complete_task(tasks, args.id):
+            storage.save_tasks(tasks, filepath)
+            print(f"Task {args.id} marked as completed.")
+        else:
+            print(f"Task {args.id} not found.", file=sys.stderr)
+            return 1
+
+    elif args.command == "delete":
+        if storage.delete_task(tasks, args.id):
+            storage.save_tasks(tasks, filepath)
+            print(f"Task {args.id} deleted.")
+        else:
+            print(f"Task {args.id} not found.", file=sys.stderr)
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+---
+
+## 3. `__init__.py`
+
+```python
+# todo_cli/__init__.py
+# Package marker
+```
+
+---
+
+## 4. `tests/test_storage.py`
+
+```python
+"""
+Unit tests for CRUD operations in storage.py.
+Uses tmp_path fixture from pytest.
+"""
+
+import json
+import pytest
+from todo_cli import storage
+
+
+@pytest.fixture
+def temp_file(tmp_path):
+    """Return a path to a non‑existent temporary file."""
+    return tmp_path / "tasks.json"
+
+
+@pytest.fixture
+def sample_tasks():
+    """Return a list of sample task dicts."""
+    return [
+        {"id": 1, "title": "First task", "completed": False},
+        {"id": 2, "title": "Second task", "completed": True},
+        {"id": 3, "title": "Third task", "completed": False},
+    ]
+
+
+# ---------- load_tasks ----------
+
+def test_load_tasks_file_not_exists(temp_file):
+    """Should return empty list when file does not exist."""
+    assert storage.load_tasks(str(temp_file)) == []
+
+
+def test_load_tasks_empty_file(temp_file):
+    """Should return empty list for empty file."""
+    temp_file.write_text("")
+    assert storage.load_tasks(str(temp_file)) == []
+
+
+def test_load_tasks_invalid_json(temp_file):
+    """Should return empty list for invalid JSON."""
+    temp_file.write_text("not json")
+    assert storage.load_tasks(str(temp_file)) == []
+
+
+def test_load_tasks_valid_file(temp_file, sample_tasks):
+    """Should return the list of tasks for valid JSON."""
+    with open(temp_file, 'w') as f:
+        json.dump(sample_tasks, f)
+    loaded = storage.load_tasks(str(temp_file))
+    assert loaded == sample_tasks
+
+
+# ---------- save_tasks ----------
+
+def test_save_tasks(temp_file, sample_tasks):
+    """Should write tasks to file in JSON format."""
+    storage.save_tasks(sample_tasks, str(temp_file))
+    with open(temp_file, 'r') as f:
+        data = json.load(f)
+    assert data == sample_tasks
+
+
+# ---------- add_task ----------
+
+def test_add_task_increments_id(temp_file):
+    """Should assign id = 1 when list is empty."""
+    tasks = []
+    storage.add_task(tasks, "New task")
+    assert tasks[0]["id"] == 1
+    assert tasks[0]["title"] == "New task"
+    assert tasks[0]["completed"] is False
+
+
+def test_add_task_id_after_existing(temp_file, sample_tasks):
+    """Should assign id = max existing id + 1."""
+    tasks = sample_tasks[:]  # max id = 3
+    storage.add_task(tasks, "Fourth")
+    assert tasks[-1]["id"] == 4
+
+
+# ---------- complete_task ----------
+
+def test_complete_task_success(temp_file, sample_tasks):
+    """Should mark an existing task as completed and return True."""
+    tasks = sample_tasks[:]
+    assert storage.complete_task(tasks, 1) is True
+    assert tasks[0]["completed"] is True
+
+
+def test_complete_task_not_found(temp_file, sample_tasks):
+    """Should return False for a non‑existent id."""
+    tasks = sample_tasks[:]
+    assert storage.complete_task(tasks, 99) is False
+    # Verify no changes
+    assert all(t["completed"] == t["completed"] for t in tasks)
+
+
+# ---------- delete_task ----------
+
+def test_delete_task_success(temp_file, sample_tasks):
+    """Should remove an existing task by id and return True."""
+    tasks = sample_tasks[:]
+    assert storage.delete_task(tasks, 2) is True
+    assert len(tasks) == 2
+    ids = [t["id"] for t in tasks]
+    assert 2 not in ids
+
+
+def test_delete_task_not_found(temp_file, sample_tasks):
+    """Should return False and leave list unchanged for non‑existent id."""
+    tasks = sample_tasks[:]
+    assert storage.delete_task(tasks, 99) is False
+    assert len(tasks) == len(sample_tasks)
+
+
+# ---------- list_tasks ----------
+
+def test_list_all_tasks(temp_file, sample_tasks):
+    """With show_all=True should return all tasks."""
+    result = storage.list_tasks(sample_tasks, show_all=True)
+    assert result == sample_tasks
+
+
+def test_list_incomplete_only(temp_file, sample_tasks):
+    """With show_all=False should return only incomplete tasks."""
+    result = storage.list_tasks(sample_tasks, show_all=False)
+    assert len(result) == 2
+    for t in result:
+        assert t["completed"] is False
+
+
+def test_list_returns_copy(temp_file, sample_tasks):
+    """Should return a new list, not the original reference."""
+    result = storage.list_tasks(sample_tasks, show_all=True)
+    assert result is not sample_tasks
+```
+
+---
+
+## 5. Running the application
+
+**Install dependencies** (only `pytest` for tests):  
+`pip install pytest`
+
+**Run the CLI**:  
+```bash
+# Use with default file (~/.todo.json)
+python -m todo_cli.cli add "Buy milk"
+python -m todo_cli.cli list
+python -m todo_cli.cli complete 1
+python -m todo_cli.cli delete 1
+python -m todo_cli.cli help
+
+# Override storage file
+TODO_FILE=./mytodo.json python -m todo_cli.cli add "Test"
+```
+
+**Run the tests**:  
+```bash
+pytest todo_cli/tests/ -v
+```
+
+---
+
+## Design decisions
+
+- **Pure functions** – `storage.py` operates on lists/dicts; the file path is always passed as an argument. This makes unit tests trivial (no mocking).
+- **Auto‑increment id** – Computed as `max(existing ids) + 1`.
+- **CLI** – Uses `argparse` with subcommands. The `help` subcommand explicitly shows the help (same as `--help`).
+- **Default storage** – `~/.todo.json`; overridable via `TODO_FILE` environment variable.
+- **Type hints** – Used throughout for clarity.
+- **Error handling** – Invalid commands print help; missing tasks return exit code 1.
+
+The application is fully importable as a module, e.g.:
+
+```python
+from todo_cli import storage
+
+tasks = storage.load_tasks("tasks.json")
+storage.add_task(tasks, "Test")
+storage.save_tasks(tasks, "tasks.json")
+```
+
+This provides a solid foundation that can be extended later (e.g., priorities, due dates) while keeping the core simple and testable.

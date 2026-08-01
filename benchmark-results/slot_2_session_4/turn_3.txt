@@ -1,0 +1,664 @@
+# Benchmark: slot_count=2  session=4  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 459s  Tokens: 5977  TPS: 31.1
+# ============================================================
+
+# To-Do Application with Daily and Weekly Views
+
+## `todo.py`
+
+```python
+#!/usr/bin/env python3
+"""
+To-Do Application
+A command-line task manager with daily and weekly views.
+"""
+
+import sys
+import json
+import os
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+import argparse
+
+# Data file for storing tasks
+DATA_FILE = "tasks.json"
+
+def load_tasks() -> List[Dict]:
+    """Load tasks from the data file."""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_tasks(tasks: List[Dict]) -> None:
+    """Save tasks to the data file."""
+    with open(DATA_FILE, 'w') as f:
+        json.dump(tasks, f, indent=2)
+
+def add_task(description: str, due_date: Optional[str] = None, priority: str = 'medium') -> None:
+    """Add a new task."""
+    tasks = load_tasks()
+    task = {
+        "id": len(tasks) + 1,
+        "description": description,
+        "due_date": due_date,
+        "priority": priority,
+        "completed": False,
+        "completed_date": None,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    print(f"Added task #{task['id']}: {description}")
+    if due_date:
+        print(f"Due: {due_date}")
+    print(f"Priority: {priority}")
+
+def complete_task(task_id: int) -> None:
+    """Mark a task as completed."""
+    tasks = load_tasks()
+    for task in tasks:
+        if task['id'] == task_id:
+            task['completed'] = True
+            task['completed_date'] = datetime.now().strftime("%Y-%m-%d")
+            save_tasks(tasks)
+            print(f"Task #{task_id} marked as completed")
+            return
+    print(f"Task #{task_id} not found")
+
+def list_tasks(status: str = 'all') -> None:
+    """List tasks with optional status filter."""
+    tasks = load_tasks()
+    
+    if status == 'active':
+        tasks = [t for t in tasks if not t['completed']]
+    elif status == 'completed':
+        tasks = [t for t in tasks if t['completed']]
+    
+    if not tasks:
+        print(f"No {status} tasks found")
+        return
+    
+    print(f"{'ID':<4} {'Description':<30} {'Due Date':<12} {'Priority':<10} {'Status':<10}")
+    print("-" * 66)
+    
+    for task in tasks:
+        status_str = "✓" if task['completed'] else "○"
+        due_str = task['due_date'] or "No due date"
+        print(f"{task['id']:<4} {task['description']:<30} {due_str:<12} {task['priority']:<10} {status_str:<10}")
+
+def delete_task(task_id: int) -> None:
+    """Delete a task."""
+    tasks = load_tasks()
+    new_tasks = [t for t in tasks if t['id'] != task_id]
+    
+    if len(new_tasks) == len(tasks):
+        print(f"Task #{task_id} not found")
+        return
+    
+    save_tasks(new_tasks)
+    print(f"Task #{task_id} deleted")
+
+def show_daily() -> None:
+    """Show daily summary of tasks."""
+    tasks = load_tasks()
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_dt = datetime.now().date()
+    
+    # Filter tasks with due dates only
+    tasks_with_due = [t for t in tasks if t.get('due_date')]
+    
+    # Categorize tasks
+    due_today = []
+    overdue = []
+    completed_today = []
+    upcoming = []
+    
+    for task in tasks_with_due:
+        due_date_str = task['due_date']
+        due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        
+        if task['completed'] and task.get('completed_date') == today:
+            completed_today.append(task)
+        elif due_date < today_dt:
+            overdue.append(task)
+        elif due_date == today_dt:
+            due_today.append(task)
+        else:
+            upcoming.append(task)
+    
+    # Display summary
+    print(f"\n📅 Daily Overview - {today}")
+    print("=" * 40)
+    
+    # Counts
+    print(f"\n📊 Summary:")
+    print(f"  • Due today: {len(due_today)}")
+    print(f"  • Overdue: {len(overdue)}")
+    print(f"  • Completed today: {len(completed_today)}")
+    print(f"  • Upcoming: {len(upcoming)}")
+    
+    # Overdue tasks
+    if overdue:
+        print(f"\n⚠️  Overdue Tasks ({len(overdue)}):")
+        for task in overdue:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} [{task['priority']}] #{task['id']}: {task['description']} (Due: {task['due_date']})")
+    
+    # Due today
+    if due_today:
+        print(f"\n🎯 Due Today ({len(due_today)}):")
+        for task in due_today:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} [{task['priority']}] #{task['id']}: {task['description']}")
+    
+    # Completed today
+    if completed_today:
+        print(f"\n✅ Completed Today ({len(completed_today)}):")
+        for task in completed_today:
+            print(f"  ✓ #{task['id']}: {task['description']}")
+    
+    # Upcoming
+    if upcoming:
+        print(f"\n📆 Upcoming ({len(upcoming)}):")
+        for task in upcoming:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} [{task['priority']}] #{task['id']}: {task['description']} (Due: {task['due_date']})")
+    
+    if not tasks_with_due:
+        print("\nNo tasks with due dates found.")
+    
+    print()
+
+def show_week() -> None:
+    """Show weekly overview of tasks."""
+    tasks = load_tasks()
+    today = datetime.now().date()
+    week_end = today + timedelta(days=6)
+    
+    # Filter tasks with due dates only
+    tasks_with_due = [t for t in tasks if t.get('due_date')]
+    
+    # Categorize tasks
+    due_today = []
+    overdue = []
+    completed_today = []
+    week_tasks = []  # Tasks due in the next 6 days
+    beyond_week = []  # Tasks due after the week
+    
+    for task in tasks_with_due:
+        due_date_str = task['due_date']
+        due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        
+        if task['completed'] and task.get('completed_date') == today.strftime("%Y-%m-%d"):
+            completed_today.append(task)
+        
+        if due_date < today:
+            overdue.append(task)
+        elif due_date == today:
+            due_today.append(task)
+        elif today < due_date <= week_end:
+            week_tasks.append(task)
+        else:
+            beyond_week.append(task)
+    
+    # Display summary
+    print(f"\n📅 Weekly Overview - {today.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
+    print("=" * 50)
+    
+    # Counts
+    print(f"\n📊 Summary:")
+    print(f"  • Overdue: {len(overdue)}")
+    print(f"  • Due today: {len(due_today)}")
+    print(f"  • This week: {len(week_tasks)}")
+    print(f"  • Completed today: {len(completed_today)}")
+    print(f"  • Beyond this week: {len(beyond_week)}")
+    
+    # Overdue tasks
+    if overdue:
+        print(f"\n⚠️  Overdue Tasks ({len(overdue)}):")
+        for task in overdue:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} [{task['priority']}] #{task['id']}: {task['description']} (Due: {task['due_date']})")
+    
+    # Due today
+    if due_today:
+        print(f"\n🎯 Due Today ({len(due_today)}):")
+        for task in due_today:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} [{task['priority']}] #{task['id']}: {task['description']}")
+    
+    # Week tasks (grouped by day)
+    if week_tasks:
+        print(f"\n📆 This Week ({len(week_tasks)}):")
+        # Group by day
+        days = {}
+        for task in week_tasks:
+            due_date_str = task['due_date']
+            due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+            day_key = due_date.strftime("%A %m/%d")
+            if day_key not in days:
+                days[day_key] = []
+            days[day_key].append(task)
+        
+        for day_key in sorted(days.keys()):
+            print(f"  {day_key}:")
+            for task in days[day_key]:
+                status = "✓" if task['completed'] else "○"
+                print(f"    {status} [{task['priority']}] #{task['id']}: {task['description']}")
+    
+    # Completed today
+    if completed_today:
+        print(f"\n✅ Completed Today ({len(completed_today)}):")
+        for task in completed_today:
+            print(f"  ✓ #{task['id']}: {task['description']}")
+    
+    # Beyond week
+    if beyond_week:
+        print(f"\n📅 Beyond This Week ({len(beyond_week)}):")
+        for task in beyond_week:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} [{task['priority']}] #{task['id']}: {task['description']} (Due: {task['due_date']})")
+    
+    if not tasks_with_due:
+        print("\nNo tasks with due dates found.")
+    
+    print()
+
+def main():
+    parser = argparse.ArgumentParser(description="To-Do Application")
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
+    
+    # Add task command
+    add_parser = subparsers.add_parser('add', help='Add a new task')
+    add_parser.add_argument('description', help='Task description')
+    add_parser.add_argument('--due', '-d', help='Due date (YYYY-MM-DD)', default=None)
+    add_parser.add_argument('--priority', '-p', choices=['low', 'medium', 'high'], default='medium')
+    
+    # Complete task command
+    complete_parser = subparsers.add_parser('complete', help='Complete a task')
+    complete_parser.add_argument('task_id', type=int, help='Task ID to complete')
+    
+    # List tasks command
+    list_parser = subparsers.add_parser('list', help='List tasks')
+    list_parser.add_argument('--status', '-s', choices=['all', 'active', 'completed'], default='all')
+    
+    # Delete task command
+    delete_parser = subparsers.add_parser('delete', help='Delete a task')
+    delete_parser.add_argument('task_id', type=int, help='Task ID to delete')
+    
+    # Daily command
+    daily_parser = subparsers.add_parser('daily', help='Show daily task summary')
+    
+    # Week command
+    week_parser = subparsers.add_parser('week', help='Show weekly task overview')
+    
+    args = parser.parse_args()
+    
+    if args.command == 'add':
+        add_task(args.description, args.due, args.priority)
+    elif args.command == 'complete':
+        complete_task(args.task_id)
+    elif args.command == 'list':
+        list_tasks(args.status)
+    elif args.command == 'delete':
+        delete_task(args.task_id)
+    elif args.command == 'daily':
+        show_daily()
+    elif args.command == 'week':
+        show_week()
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()
+```
+
+## `test_todo.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Tests for To-Do Application
+"""
+
+import unittest
+import os
+import json
+import tempfile
+import shutil
+from datetime import datetime, timedelta
+from unittest.mock import patch, mock_open
+import io
+import sys
+
+# Import the todo module
+import todo
+
+class TestTodoApp(unittest.TestCase):
+    def setUp(self):
+        # Create a temporary directory for test data
+        self.test_dir = tempfile.mkdtemp()
+        self.test_data_file = os.path.join(self.test_dir, "tasks.json")
+        
+        # Patch the DATA_FILE constant
+        self.data_file_patch = patch.object(todo, 'DATA_FILE', self.test_data_file)
+        self.data_file_patch.start()
+        
+        # Clear any existing tasks
+        if os.path.exists(self.test_data_file):
+            os.remove(self.test_data_file)
+    
+    def tearDown(self):
+        # Clean up test directory
+        self.data_file_patch.stop()
+        shutil.rmtree(self.test_dir)
+    
+    def test_add_task(self):
+        """Test adding a task."""
+        todo.add_task("Test task", "2023-12-25", "high")
+        
+        tasks = todo.load_tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]['description'], "Test task")
+        self.assertEqual(tasks[0]['due_date'], "2023-12-25")
+        self.assertEqual(tasks[0]['priority'], "high")
+        self.assertFalse(tasks[0]['completed'])
+    
+    def test_add_task_no_due_date(self):
+        """Test adding a task without a due date."""
+        todo.add_task("Test task", None, "low")
+        
+        tasks = todo.load_tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertIsNone(tasks[0]['due_date'])
+    
+    def test_complete_task(self):
+        """Test completing a task."""
+        todo.add_task("Test task", "2023-12-25")
+        tasks = todo.load_tasks()
+        task_id = tasks[0]['id']
+        
+        todo.complete_task(task_id)
+        
+        tasks = todo.load_tasks()
+        self.assertTrue(tasks[0]['completed'])
+        self.assertIsNotNone(tasks[0]['completed_date'])
+    
+    def test_complete_nonexistent_task(self):
+        """Test completing a non-existent task."""
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.complete_task(999)
+            self.assertIn("not found", mock_stdout.getvalue())
+    
+    def test_list_tasks(self):
+        """Test listing tasks."""
+        todo.add_task("Task 1", "2023-12-25")
+        todo.add_task("Task 2", "2023-12-26", "high")
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.list_tasks('all')
+            output = mock_stdout.getvalue()
+            self.assertIn("Task 1", output)
+            self.assertIn("Task 2", output)
+    
+    def test_delete_task(self):
+        """Test deleting a task."""
+        todo.add_task("Task to delete")
+        tasks = todo.load_tasks()
+        task_id = tasks[0]['id']
+        
+        todo.delete_task(task_id)
+        
+        tasks = todo.load_tasks()
+        self.assertEqual(len(tasks), 0)
+    
+    def test_delete_nonexistent_task(self):
+        """Test deleting a non-existent task."""
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.delete_task(999)
+            self.assertIn("not found", mock_stdout.getvalue())
+
+class TestDailyCommand(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.test_data_file = os.path.join(self.test_dir, "tasks.json")
+        self.data_file_patch = patch.object(todo, 'DATA_FILE', self.test_data_file)
+        self.data_file_patch.start()
+        
+        if os.path.exists(self.test_data_file):
+            os.remove(self.test_data_file)
+    
+    def tearDown(self):
+        self.data_file_patch.stop()
+        shutil.rmtree(self.test_dir)
+    
+    def test_daily_summary_with_tasks(self):
+        """Test daily summary with various task types."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # Add tasks
+        todo.add_task("Overdue task", yesterday, "high")
+        todo.add_task("Due today", today, "medium")
+        todo.add_task("Completed today", today, "low")
+        # Mark the third task as completed today
+        tasks = todo.load_tasks()
+        for task in tasks:
+            if task['description'] == "Completed today":
+                task['completed'] = True
+                task['completed_date'] = today
+                break
+        todo.save_tasks(tasks)
+        
+        todo.add_task("Future task", tomorrow, "low")
+        todo.add_task("No due date task")
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_daily()
+            output = mock_stdout.getvalue()
+            
+            # Check counts
+            self.assertIn("Due today: 1", output)
+            self.assertIn("Overdue: 1", output)
+            self.assertIn("Completed today: 1", output)
+            self.assertIn("Upcoming: 1", output)
+            
+            # Check task descriptions appear
+            self.assertIn("Overdue task", output)
+            self.assertIn("Due today", output)
+            self.assertIn("Completed today", output)
+            self.assertIn("Future task", output)
+    
+    def test_daily_summary_no_tasks(self):
+        """Test daily summary with no tasks."""
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_daily()
+            output = mock_stdout.getvalue()
+            
+            self.assertIn("No tasks with due dates found", output)
+    
+    def test_daily_summary_only_tasks_without_due_dates(self):
+        """Test daily summary with only tasks without due dates."""
+        todo.add_task("No due date task 1")
+        todo.add_task("No due date task 2")
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_daily()
+            output = mock_stdout.getvalue()
+            
+            self.assertIn("No tasks with due dates found", output)
+    
+    def test_daily_summary_all_completed_today(self):
+        """Test daily summary when all tasks are completed today."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        todo.add_task("Completed task 1", today, "high")
+        todo.add_task("Completed task 2", today, "medium")
+        
+        tasks = todo.load_tasks()
+        for task in tasks:
+            task['completed'] = True
+            task['completed_date'] = today
+        todo.save_tasks(tasks)
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_daily()
+            output = mock_stdout.getvalue()
+            
+            self.assertIn("Due today: 0", output)
+            self.assertIn("Overdue: 0", output)
+            self.assertIn("Completed today: 2", output)
+            self.assertIn("Upcoming: 0", output)
+
+class TestWeekCommand(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.test_data_file = os.path.join(self.test_dir, "tasks.json")
+        self.data_file_patch = patch.object(todo, 'DATA_FILE', self.test_data_file)
+        self.data_file_patch.start()
+        
+        if os.path.exists(self.test_data_file):
+            os.remove(self.test_data_file)
+    
+    def tearDown(self):
+        self.data_file_patch.stop()
+        shutil.rmtree(self.test_dir)
+    
+    def test_week_summary_with_tasks(self):
+        """Test weekly summary with various task types."""
+        today = datetime.now().date()
+        yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        next_friday = (today + timedelta(days=4)).strftime("%Y-%m-%d")
+        next_week = (today + timedelta(days=8)).strftime("%Y-%m-%d")
+        
+        # Add tasks
+        todo.add_task("Overdue task", yesterday, "high")
+        todo.add_task("Due today", today.strftime("%Y-%m-%d"), "medium")
+        todo.add_task("Due tomorrow", tomorrow, "low")
+        todo.add_task("Due Friday", next_friday, "medium")
+        todo.add_task("Next week task", next_week, "low")
+        todo.add_task("No due date task")
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_week()
+            output = mock_stdout.getvalue()
+            
+            # Check counts
+            self.assertIn("Overdue: 1", output)
+            self.assertIn("Due today: 1", output)
+            self.assertIn("This week: 2", output)  # tomorrow and Friday
+            self.assertIn("Completed today: 0", output)
+            self.assertIn("Beyond this week: 1", output)
+            
+            # Check task descriptions appear
+            self.assertIn("Overdue task", output)
+            self.assertIn("Due today", output)
+            self.assertIn("Due tomorrow", output)
+            self.assertIn("Due Friday", output)
+            self.assertIn("Next week task", output)
+    
+    def test_week_summary_no_tasks(self):
+        """Test weekly summary with no tasks."""
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_week()
+            output = mock_stdout.getvalue()
+            
+            self.assertIn("No tasks with due dates found", output)
+    
+    def test_week_summary_only_tasks_without_due_dates(self):
+        """Test weekly summary with only tasks without due dates."""
+        todo.add_task("No due date task 1")
+        todo.add_task("No due date task 2")
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_week()
+            output = mock_stdout.getvalue()
+            
+            self.assertIn("No tasks with due dates found", output)
+    
+    def test_week_summary_all_completed_today(self):
+        """Test weekly summary when all tasks are completed today."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        todo.add_task("Completed task 1", today, "high")
+        todo.add_task("Completed task 2", today, "medium")
+        
+        tasks = todo.load_tasks()
+        for task in tasks:
+            task['completed'] = True
+            task['completed_date'] = today
+        todo.save_tasks(tasks)
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_week()
+            output = mock_stdout.getvalue()
+            
+            self.assertIn("Overdue: 0", output)
+            self.assertIn("Due today: 0", output)
+            self.assertIn("This week: 0", output)
+            self.assertIn("Completed today: 2", output)
+            self.assertIn("Beyond this week: 0", output)
+    
+    def test_week_summary_groups_by_day(self):
+        """Test that weekly summary groups tasks by day."""
+        today = datetime.now().date()
+        tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        day_after = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+        
+        todo.add_task("Task due tomorrow", tomorrow, "medium")
+        todo.add_task("Task due day after", day_after, "low")
+        
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+            todo.show_week()
+            output = mock_stdout.getvalue()
+            
+            # Check that days are shown
+            tomorrow_date = (today + timedelta(days=1)).strftime("%A %m/%d")
+            day_after_date = (today + timedelta(days=2)).strftime("%A %m/%d")
+            
+            self.assertIn(tomorrow_date, output)
+            self.assertIn(day_after_date, output)
+            self.assertIn("Task due tomorrow", output)
+            self.assertIn("Task due day after", output)
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+## Key Features
+
+### `todo daily` Command
+- **Categorizes tasks** into: Due today, Overdue, Completed today, and Upcoming
+- **Shows counts** for each category (e.g., "3 tasks due today, 1 overdue")
+- **Only displays tasks with due dates** - tasks without due dates are excluded
+- **Compact, readable format** suitable for morning review with emoji indicators
+- **Shows completion status** with ✓/○ markers
+
+### `todo week` Command
+- **Weekly overview** covering today + next 6 days
+- **Groups tasks by day** for the upcoming week
+- **Shows counts** for: Overdue, Due today, This week, Completed today, and Beyond this week
+- **Only displays tasks with due dates** - tasks without due dates are excluded
+- **Clear visual separation** between different time periods
+
+### Test Coverage
+- **Existing functionality tests**: add, complete, list, delete commands
+- **Daily command tests**: various scenarios including empty task list, no due dates, all completed
+- **Week command tests**: weekly overview with tasks grouped by day, various scenarios
+- **Proper isolation**: each test uses temporary files and mocks to avoid side effects
+- **Edge cases**: nonexistent tasks, tasks without due dates, all tasks completed
+
+### Design Decisions
+- **Data persistence**: Uses JSON file for simplicity and portability
+- **Date handling**: Stores dates as strings in YYYY-MM-DD format for consistency
+- **Task structure**: Includes id, description, due_date, priority, completed status, and timestamps
+- **Extensible**: Easy to add more commands or modify existing ones
+- **No external dependencies**: Uses only Python standard library modules

@@ -8,7 +8,9 @@ backend_health module.
 """
 
 import asyncio
+import subprocess
 import time
+from pathlib import Path
 
 import httpx
 
@@ -19,6 +21,201 @@ import httpx
 def _srv():
     from ..backend_health import _srv as _shared_srv
     return _shared_srv()
+
+
+# ===================================================================
+# GPU-wedge detection (LP-0MS91DHQ9003EGB0)
+#
+# A wedged llama-server is still HTTP-reachable but its GPU kernels never
+# complete: the GPU reads ~100% busy while every slot is idle and no tokens
+# are produced. The existing watchdog/health probes only catch dead or
+# unreachable workers, so the wedge was invisible to self-healing. Detection
+# is proxy-side only (no llama.cpp changes):
+#
+#   signature = gpu_busy_percent >= threshold AND all slots idle
+#
+# sustained for ``llama_gpu_wedge_idle_checks_required`` consecutive health
+# loop iterations. GPU busy is read from sysfs (AMD) with a rocm-smi
+# fallback; when neither is available detection is skipped.
+#
+# False-positive guard (LP-0MS9GA6QL007XTBP):
+#
+# On the Strix Halo APU (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is
+# pinned at 100% regardless of actual GPU state (30/30 samples read 100
+# while power draw showed the GPU idle at ~54W vs ~115W when genuinely
+# computing), so the busy+idle signature fired on every idle period and
+# caused constant unload/reload churn. Power draw (sysfs power1_average in
+# micro-watts, rocm-smi fallback) is now the discriminating signal:
+#
+#   - busy >= threshold AND slots idle AND power >= compute threshold
+#     (or power unavailable, preserving legacy behavior) -> "wedge"
+#   - busy >= threshold AND slots idle AND power < compute threshold
+#     -> "pinned": the counter claims busy while the GPU is NOT computing.
+#     On this hardware class this is indistinguishable from a stalled engine
+#     (the LP-0MS91D782006XIR6 wedge drew only ~53W), so it is never treated
+#     as a wedge; a sustained run of this state disables detection for the
+#     process lifetime (see the model-health loop).
+#
+# Detection is disabled by default (llama_gpu_wedge_detection_enabled:
+# false) because the busy counter cannot discriminate real work from idle on
+# this APU; operators on hardware with a reliable counter may opt in.
+# ===================================================================
+
+
+def _gpu_busy_percent_sysfs() -> float | None:
+    """Read GPU busy % from sysfs (AMD gfx cards). None when unavailable."""
+    try:
+        with open("/sys/class/drm/card0/device/gpu_busy_percent") as f:
+            val = f.read().strip()
+        return float(val)
+    except Exception:
+        return None
+
+
+def _gpu_busy_percent_rocm_smi() -> float | None:
+    """Fallback: parse ``rocm-smi --showuse`` output. None when unavailable."""
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "--showuse"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        ).stdout
+        for line in out.splitlines():
+            if "GPU use (%)" in line:
+                val = line.split(":")[-1].strip().rstrip("%")
+                return float(val)
+    except Exception:
+        return None
+    return None
+
+
+def _read_gpu_busy_percent() -> float | None:
+    """Best-effort GPU busy %: sysfs first, then rocm-smi."""
+    val = _gpu_busy_percent_sysfs()
+    if val is None:
+        val = _gpu_busy_percent_rocm_smi()
+    return val
+
+
+def _gpu_power_draw_sysfs(base: str = "/sys/class/drm/card0/device") -> float | None:
+    """Read GPU power draw in watts from sysfs hwmon power1_average (uW).
+
+    Scans the hwmon nodes under the card0 device dir and returns the first
+    ``power1_average`` found (e.g. amdgpu PPT on the Strix Halo APU). None
+    when unavailable.
+    """
+    try:
+        hwmon_root = Path(base) / "hwmon"
+        for hwmon_dir in sorted(hwmon_root.glob("hwmon*")):
+            power_file = hwmon_dir / "power1_average"
+            if power_file.exists():
+                val = float(power_file.read_text().strip()) / 1_000_000.0
+                if val >= 0:
+                    return val
+    except Exception:
+        return None
+    return None
+
+
+def _gpu_power_draw_rocm_smi() -> float | None:
+    """Fallback: parse ``rocm-smi --showpower`` output (W). None when unavailable."""
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "--showpower"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        ).stdout
+        for line in out.splitlines():
+            if "Power" not in line:
+                continue
+            val_str = line.split(":")[-1].strip().rstrip("W").strip()
+            try:
+                val = float(val_str)
+            except ValueError:
+                continue
+            return val
+    except Exception:
+        return None
+    return None
+
+
+def _read_gpu_power_draw() -> float | None:
+    """Best-effort GPU power draw (W): sysfs first, then rocm-smi."""
+    val = _gpu_power_draw_sysfs()
+    if val is None:
+        val = _gpu_power_draw_rocm_smi()
+    return val
+
+
+def _slots_all_idle(slots_payload) -> bool:
+    """True when every slot in a /slots payload reports is_processing == False."""
+    if not isinstance(slots_payload, list):
+        return False
+    if not slots_payload:
+        return True
+    return all(
+        not bool(s.get("is_processing"))
+        for s in slots_payload
+        if isinstance(s, dict)
+    )
+
+
+# GPU state classification from the wedge probe.
+WEDGE_STATE_NONE = "none"  # no wedge signature
+WEDGE_STATE_WEDGE = "wedge"  # busy + idle + compute-level power (or no power source)
+WEDGE_STATE_PINNED = "pinned"  # busy + idle + low power: counter unreliable/stalled
+
+
+def _gpu_wedge_discriminate(
+    busy_percent: float | None,
+    slots_idle: bool,
+    power_watts: float | None,
+    busy_threshold: float,
+    power_low_threshold: float,
+) -> str:
+    """Classify the GPU state from the wedge probe.
+
+    Returns one of the ``WEDGE_STATE_*`` constants:
+
+    - ``none``: no wedge signature (busy below threshold, a slot is
+      processing, or the busy counter is unavailable).
+    - ``wedge``: busy >= threshold AND all slots idle AND the GPU is drawing
+      compute-level power (or power is unavailable, preserving the legacy
+      busy+idle signature for hardware without power sensors).
+    - ``pinned``: busy >= threshold AND all slots idle AND power draw is low.
+      The busy counter claims the GPU is working while power says it is not -
+      either the counter is pinned/unreliable (Strix Halo APU) or the engine
+      is stalled at idle power (LP-0MS91D782006XIR6). The two are
+      indistinguishable from GPU sensors, so this is never treated as a
+      wedge; the model-health loop disables detection if it persists.
+    """
+    if busy_percent is None or not slots_idle or busy_percent < busy_threshold:
+        return WEDGE_STATE_NONE
+    if power_watts is None or power_watts >= power_low_threshold:
+        return WEDGE_STATE_WEDGE
+    return WEDGE_STATE_PINNED
+
+
+async def _probe_gpu_wedge(
+    host: str, port: int, timeout: float = 5.0
+) -> tuple[float | None, bool, float | None]:
+    """Return ``(gpu_busy_percent, all_slots_idle, gpu_power_watts)`` for a model instance."""
+    busy = _read_gpu_busy_percent()
+    power = _read_gpu_power_draw()
+    slots_idle = False
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        try:
+            resp = await client.get(f"http://{host}:{port}/slots", timeout=timeout)
+            if resp.status_code == 200:
+                slots_idle = _slots_all_idle(resp.json())
+        finally:
+            await client.aclose()
+    except Exception:
+        pass
+    return busy, slots_idle, power
 
 
 # ===================================================================
@@ -276,6 +473,50 @@ async def _backend_watchdog_loop() -> None:
 # Router model health monitoring
 # ===================================================================
 
+async def _unload_and_reload_model(
+    srv,
+    router_host: str,
+    router_port: int,
+    model_id: str,
+    reason: str,
+) -> bool:
+    """Unload and reload a model instance (shared by unreachable and GPU-wedge recovery)."""
+    srv.logger.info("model_health: unloading model %s (%s)", model_id, reason)
+    try:
+        client = (
+            srv._http_client if srv._http_client else httpx.AsyncClient(timeout=10.0)
+        )
+        try:
+            await client.post(
+                f"http://{router_host}:{router_port}/models/unload",
+                json={"model": model_id},
+                timeout=10.0,
+            )
+        finally:
+            if not srv._http_client:
+                await client.aclose()
+    except Exception as exc:
+        srv.logger.warning(
+            "model_health: unload request for %s failed: %s",
+            model_id,
+            exc,
+        )
+
+    srv.logger.info("model_health: reloading model %s", model_id)
+    loaded = await srv.router_load_model(model_id)
+    if loaded:
+        srv.logger.info(
+            "model_health: successfully reloaded model %s",
+            model_id,
+        )
+    else:
+        srv.logger.error(
+            "model_health: failed to reload model %s",
+            model_id,
+        )
+    return bool(loaded)
+
+
 async def _router_model_health_loop() -> None:
     """Periodically check loaded models' reachability in router mode.
 
@@ -299,6 +540,10 @@ async def _router_model_health_loop() -> None:
     consecutive_failures: dict[str, int] = {}
     observed_ports: dict[str, int] = {}
     port_first_seen_at: dict[str, float] = {}
+    wedge_checks: dict[str, int] = {}
+    wedge_pinned_checks: dict[str, int] = {}
+    gpu_wedge_detection_disabled = False
+    gpu_wedge_source_logged = False
 
     while True:
         try:
@@ -347,6 +592,42 @@ async def _router_model_health_loop() -> None:
                 _coerce_float(
                     server_cfg.get("llama_model_health_grace_period_seconds", 15.0),
                     15.0,
+                ),
+            )
+
+            # GPU-wedge detection configuration (LP-0MS91DHQ9003EGB0 /
+            # LP-0MS9GA6QL007XTBP). Disabled by default: gpu_busy_percent is
+            # pinned at 100% on the Strix Halo APU regardless of GPU state, so
+            # the busy+idle signature false-positives on every idle period.
+            gpu_wedge_enabled = bool(
+                server_cfg.get("llama_gpu_wedge_detection_enabled", False)
+            )
+            gpu_wedge_busy_threshold = _coerce_float(
+                server_cfg.get("llama_gpu_wedge_busy_threshold_percent", 90.0),
+                90.0,
+            )
+            gpu_wedge_idle_checks = max(
+                1,
+                _coerce_int(
+                    server_cfg.get("llama_gpu_wedge_idle_checks_required", 2),
+                    2,
+                ),
+            )
+            # Power below this (W) means the GPU is not genuinely computing;
+            # used to distinguish a pinned/unreliable busy counter from a real
+            # wedge and to auto-disable detection on unreliable hardware.
+            gpu_wedge_power_low_threshold = max(
+                0.0,
+                _coerce_float(
+                    server_cfg.get("llama_gpu_wedge_power_low_threshold_watts", 90.0),
+                    90.0,
+                ),
+            )
+            gpu_wedge_pinned_checks = max(
+                1,
+                _coerce_int(
+                    server_cfg.get("llama_gpu_wedge_pinned_checks_required", 4),
+                    4,
                 ),
             )
 
@@ -440,6 +721,114 @@ async def _router_model_health_loop() -> None:
                             consecutive_failures.get(model_id, 0),
                         )
                     consecutive_failures[model_id] = 0
+
+                    # GPU-wedge detection: the instance is reachable but the GPU
+                    # may be wedged (busy with idle slots, no progress).
+                    # Skip embeddings instances, when no GPU busy source exists,
+                    # and after the busy counter was found pinned/unreliable.
+                    if (
+                        gpu_wedge_enabled
+                        and not gpu_wedge_detection_disabled
+                        and "--embeddings" not in args
+                    ):
+                        busy_pct, slots_idle, power_watts = await _probe_gpu_wedge(
+                            router_host, port, timeout=probe_timeout
+                        )
+                        if busy_pct is None:
+                            if not gpu_wedge_source_logged:
+                                srv.logger.warning(
+                                    "model_health: GPU busy source unavailable "
+                                    "(no sysfs gpu_busy_percent, no rocm-smi); "
+                                    "GPU-wedge detection disabled"
+                                )
+                                gpu_wedge_source_logged = True
+                            continue
+                        state = _gpu_wedge_discriminate(
+                            busy_pct,
+                            slots_idle,
+                            power_watts,
+                            gpu_wedge_busy_threshold,
+                            gpu_wedge_power_low_threshold,
+                        )
+                        if state == WEDGE_STATE_NONE:
+                            wedge_checks[model_id] = 0
+                            wedge_pinned_checks[model_id] = 0
+                            if getattr(srv, "gpu_wedge_detected", False):
+                                srv.logger.info(
+                                    "model_health: GPU wedge cleared for model %s "
+                                    "(gpu_busy=%.0f%%)",
+                                    model_id,
+                                    busy_pct if busy_pct is not None else -1.0,
+                                )
+                                srv.gpu_wedge_detected = False
+                                srv.gpu_wedge_detected_at = None
+                                srv.gpu_wedge_last_model = None
+                        elif state == WEDGE_STATE_PINNED:
+                            # Busy counter claims the GPU is working while power
+                            # draw says it is not: either the counter is pinned
+                            # (APU hardware artifact) or the engine is stalled at
+                            # idle power. Both are indistinguishable from GPU
+                            # sensors, so never unload on this evidence; if it
+                            # persists, disable detection for the process.
+                            wedge_checks[model_id] = 0
+                            count = wedge_pinned_checks.get(model_id, 0) + 1
+                            wedge_pinned_checks[model_id] = count
+                            if (
+                                count >= gpu_wedge_pinned_checks
+                                and not gpu_wedge_detection_disabled
+                            ):
+                                gpu_wedge_detection_disabled = True
+                                srv.gpu_wedge_detection_disabled = True
+                                srv.logger.error(
+                                    "model_health: gpu_busy_percent appears pinned/"
+                                    "unreliable for model %s (port %d): busy=%.0f%% "
+                                    "with all slots idle but power %.0fW below compute "
+                                    "threshold %.0fW; disabling GPU-wedge detection "
+                                    "for this process to prevent unload/reload churn",
+                                    model_id,
+                                    port,
+                                    busy_pct,
+                                    power_watts or 0.0,
+                                    gpu_wedge_power_low_threshold,
+                                )
+                        else:  # WEDGE_STATE_WEDGE
+                            wedge_pinned_checks[model_id] = 0
+                            count = wedge_checks.get(model_id, 0) + 1
+                            wedge_checks[model_id] = count
+                            if count >= gpu_wedge_idle_checks:
+                                srv.logger.error(
+                                    "model_health: GPU wedge detected for model %s "
+                                    "(port %d): gpu_busy=%.0f%% with all slots idle "
+                                    "for %d consecutive check(s); triggering recovery",
+                                    model_id,
+                                    port,
+                                    busy_pct,
+                                    count,
+                                )
+                                srv._record_backend_signal("gpu_wedge")
+                                srv.gpu_wedge_detected = True
+                                srv.gpu_wedge_detected_at = time.time()
+                                srv.gpu_wedge_last_model = model_id
+                                await _unload_and_reload_model(
+                                    srv,
+                                    router_host,
+                                    router_port,
+                                    model_id,
+                                    reason=f"gpu_wedge (busy {busy_pct:.0f}%)",
+                                )
+                                wedge_checks[model_id] = 0
+                                port_first_seen_at[model_id] = time.time()
+                            else:
+                                srv.logger.warning(
+                                    "model_health: possible GPU wedge for model %s "
+                                    "(port %d): gpu_busy=%.0f%% with all slots idle "
+                                    "(%d/%d checks)",
+                                    model_id,
+                                    port,
+                                    busy_pct,
+                                    count,
+                                    gpu_wedge_idle_checks,
+                                )
                     continue
 
                 failure_count = consecutive_failures.get(model_id, 0) + 1
@@ -462,41 +851,13 @@ async def _router_model_health_loop() -> None:
                     failure_count,
                 )
 
-                srv.logger.info("model_health: unloading dead model %s", model_id)
-                try:
-                    client = (
-                        srv._http_client
-                        if srv._http_client
-                        else httpx.AsyncClient(timeout=10.0)
-                    )
-                    try:
-                        await client.post(
-                            f"http://{router_host}:{router_port}/models/unload",
-                            json={"model": model_id},
-                            timeout=10.0,
-                        )
-                    finally:
-                        if not srv._http_client:
-                            await client.aclose()
-                except Exception as exc:
-                    srv.logger.warning(
-                        "model_health: unload request for %s failed: %s",
-                        model_id,
-                        exc,
-                    )
-
-                srv.logger.info("model_health: reloading model %s", model_id)
-                loaded = await srv.router_load_model(model_id)
-                if loaded:
-                    srv.logger.info(
-                        "model_health: successfully reloaded model %s",
-                        model_id,
-                    )
-                else:
-                    srv.logger.error(
-                        "model_health: failed to reload model %s",
-                        model_id,
-                    )
+                await _unload_and_reload_model(
+                    srv,
+                    router_host,
+                    router_port,
+                    model_id,
+                    reason="unreachable",
+                )
 
                 # Reset counters and re-apply grace period after recovery attempt
                 consecutive_failures[model_id] = 0
@@ -508,6 +869,8 @@ async def _router_model_health_loop() -> None:
                 consecutive_failures.pop(stale_id, None)
                 observed_ports.pop(stale_id, None)
                 port_first_seen_at.pop(stale_id, None)
+                wedge_checks.pop(stale_id, None)
+                wedge_pinned_checks.pop(stale_id, None)
 
         except asyncio.CancelledError:
             return
