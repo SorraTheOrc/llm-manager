@@ -1,0 +1,618 @@
+# Benchmark: slot_count=8  session=5  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 172s  Tokens: 18000  TPS: 840.6
+# ============================================================
+
+I'll restructure the project into a clean modular layout and add a lightweight FastAPI web interface while keeping the CLI fully intact.
+
+## Project Structure
+
+```
+todo/
+├── __init__.py
+├── core.py              # Business logic
+├── storage.py           # JSON persistence with thread safety
+├── cli.py               # CLI commands (argparse)
+├── web.py               # FastAPI web app
+├── templates/
+│   ├── index.html       # Main task table with filters
+│   └── daily.html       # Daily summary view
+tests/
+├── conftest.py          # Shared temp DB fixture
+├── test_cli.py          # CLI functional tests
+└── test_web.py          # Web route tests (FastAPI TestClient)
+pyproject.toml           # Project metadata & dependencies
+```
+
+---
+
+## 1. `todo/__init__.py`
+
+```python
+# Package marker
+```
+
+## 2. `todo/storage.py`
+
+Thread-safe atomic writes to a JSON file, with corruption recovery.  
+Uses `TODO_DB_PATH` environment variable when set (useful for testing).
+
+```python
+import json
+import os
+import threading
+import tempfile
+import shutil
+from pathlib import Path
+
+_lock = threading.Lock()
+_db_path = Path(os.environ.get("TODO_DB_PATH", Path.home() / ".todo.json"))
+
+
+def load_tasks():
+    with _lock:
+        if not _db_path.exists():
+            return []
+        try:
+            with open(_db_path, "r") as f:
+                data = json.load(f)
+            return data.get("tasks", [])
+        except (json.JSONDecodeError, OSError, KeyError):
+            return []
+
+
+def save_tasks(tasks):
+    with _lock:
+        _db_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", dir=_db_path.parent, delete=False, suffix=".tmp"
+        )
+        try:
+            json.dump({"tasks": tasks}, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp.close()
+            shutil.move(tmp.name, _db_path)
+        except Exception:
+            os.unlink(tmp.name)
+            raise
+```
+
+## 3. `todo/core.py`
+
+Pure logic layer – no I/O knowledge, no web/CLI awareness.
+
+```python
+from datetime import datetime, date
+from . import storage
+
+
+class TaskNotFound(Exception):
+    pass
+
+
+def list_tasks(filter_by="all"):
+    tasks = storage.load_tasks()
+    if filter_by == "active":
+        return [t for t in tasks if not t["done"]]
+    elif filter_by == "completed":
+        return [t for t in tasks if t["done"]]
+    return tasks
+
+
+def add_task(title):
+    tasks = storage.load_tasks()
+    new_id = max([t["id"] for t in tasks], default=0) + 1
+    task = {
+        "id": new_id,
+        "title": title,
+        "done": False,
+        "created_at": datetime.now().isoformat(),
+    }
+    tasks.append(task)
+    storage.save_tasks(tasks)
+    return task
+
+
+def toggle_task(task_id):
+    tasks = storage.load_tasks()
+    for task in tasks:
+        if task["id"] == task_id:
+            task["done"] = not task["done"]
+            storage.save_tasks(tasks)
+            return task
+    raise TaskNotFound(f"Task {task_id} not found")
+
+
+def delete_task(task_id):
+    tasks = storage.load_tasks()
+    new_tasks = [t for t in tasks if t["id"] != task_id]
+    if len(new_tasks) == len(tasks):
+        raise TaskNotFound(f"Task {task_id} not found")
+    storage.save_tasks(new_tasks)
+
+
+def get_daily_tasks():
+    """Tasks created today."""
+    today_str = date.today().isoformat()
+    tasks = storage.load_tasks()
+    return [t for t in tasks if t["created_at"].startswith(today_str)]
+```
+
+## 4. `todo/cli.py`
+
+Keeps the original CLI commands. The `serve` command starts the web UI.
+
+```python
+import argparse
+import sys
+import socket
+
+from . import core
+from . import web
+
+
+def print_tasks(tasks):
+    if not tasks:
+        print("No tasks found.")
+        return
+    print(f"{'ID':<5} {'Done':<6} {'Title'}")
+    print("-" * 40)
+    for t in tasks:
+        status = "[x]" if t["done"] else "[ ]"
+        print(f"{t['id']:<5} {status:<6} {t['title']}")
+    print("-" * 40)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="todo")
+    subparsers = parser.add_subparsers(dest="command", help="sub-command help")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument(
+        "--filter",
+        choices=["all", "active", "completed"],
+        default="all",
+    )
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str)
+
+    # toggle
+    toggle_parser = subparsers.add_parser("toggle", help="Toggle a task")
+    toggle_parser.add_argument("task_id", type=int)
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("task_id", type=int)
+
+    # daily
+    subparsers.add_parser("daily", help="Show daily tasks")
+
+    # serve (web UI)
+    serve_parser = subparsers.add_parser("serve", help="Start web server")
+    serve_parser.add_argument("--port", type=int, default=8080)
+
+    args = parser.parse_args()
+
+    if args.command == "list":
+        tasks = core.list_tasks(args.filter)
+        print_tasks(tasks)
+
+    elif args.command == "add":
+        task = core.add_task(args.title)
+        print(f"Task added: [{task['id']}] {task['title']}")
+
+    elif args.command == "toggle":
+        try:
+            task = core.toggle_task(args.task_id)
+            status = "done" if task["done"] else "not done"
+            print(f"Task {args.task_id} toggled ({status})")
+        except core.TaskNotFound as e:
+            print(e, file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "delete":
+        try:
+            core.delete_task(args.task_id)
+            print(f"Task {args.task_id} deleted")
+        except core.TaskNotFound as e:
+            print(e, file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "daily":
+        tasks = core.get_daily_tasks()
+        print("Daily Tasks:")
+        print_tasks(tasks)
+
+    elif args.command == "serve":
+        port = args.port
+        # Pre‑check port availability for a friendly error message
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError as e:
+                print(f"Error: Port {port} is already in use ({e}).", file=sys.stderr)
+                sys.exit(1)
+
+        import uvicorn
+
+        print(f"Starting server on http://0.0.0.0:{port}")
+        uvicorn.run(
+            "todo.web:app",
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+        )
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 5. `todo/web.py`
+
+FastAPI application with all required routes.
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from pathlib import Path
+
+from . import core
+
+app = FastAPI(title="To-Do App")
+
+template_dir = Path(__file__).parent / "templates"
+template_dir.mkdir(parents=True, exist_ok=True)
+templates = Jinja2Templates(directory=str(template_dir))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def list_tasks(request: Request, filter: str = "all"):
+    """Show all tasks as an HTML table with filtering controls."""
+    tasks = core.list_tasks(filter)
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "tasks": tasks, "current_filter": filter},
+    )
+
+
+@app.post("/add")
+async def add_task(request: Request):
+    """Add a new task (supports form and JSON)."""
+    content_type = request.headers.get("content-type", "")
+    title = None
+
+    if "application/json" in content_type:
+        body = await request.json()
+        title = body.get("title")
+    else:
+        form = await request.form()
+        title = form.get("title")
+
+    if not title or not title.strip():
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+
+    new_task = core.add_task(title.strip())
+
+    if "application/json" in content_type:
+        return JSONResponse(status_code=201, content=new_task)
+    else:
+        return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/toggle/{task_id}")
+async def toggle_task(task_id: int):
+    """Toggle task completion."""
+    try:
+        core.toggle_task(task_id)
+    except core.TaskNotFound:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/delete/{task_id}")
+async def delete_task(task_id: int):
+    """Delete a task."""
+    try:
+        core.delete_task(task_id)
+    except core.TaskNotFound:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/daily", response_class=HTMLResponse)
+async def daily_summary(request: Request):
+    """Daily summary view (same as CLI daily command)."""
+    tasks = core.get_daily_tasks()
+    return templates.TemplateResponse(
+        "daily.html",
+        {"request": request, "tasks": tasks},
+    )
+```
+
+## 6. Templates
+
+### `todo/templates/index.html`
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>To-Do List</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; background: #f5f5f5; }
+        h1 { color: #333; }
+        table { width: 100%; border-collapse: collapse; background: #fff; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f0f0f0; }
+        .filters a { margin-right: 10px; padding: 5px 10px; border: 1px solid #ccc; border-radius: 4px; text-decoration: none; color: #333; }
+        .filters a.active { background: #007bff; color: #fff; border-color: #007bff; }
+        form { margin-bottom: 20px; }
+        input[type=text] { padding: 10px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button.danger { background: #dc3545; }
+        .done { text-decoration: line-through; color: #888; }
+    </style>
+</head>
+<body>
+    <h1>📋 To-Do List</h1>
+
+    <div class="filters">
+        <a href="/?filter=all" class="{{ 'active' if current_filter == 'all' else '' }}">All</a>
+        <a href="/?filter=active" class="{{ 'active' if current_filter == 'active' else '' }}">Active</a>
+        <a href="/?filter=completed" class="{{ 'active' if current_filter == 'completed' else '' }}">Completed</a>
+    </div>
+
+    <form action="/add" method="post">
+        <input type="text" name="title" placeholder="Add a new task..." required>
+        <button type="submit">Add Task</button>
+    </form>
+
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Title</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for task in tasks %}
+            <tr>
+                <td>{{ task.id }}</td>
+                <td class="{{ 'done' if task.done else '' }}">{{ task.title }}</td>
+                <td>{{ "✅ Done" if task.done else "⬜ Pending" }}</td>
+                <td>
+                    <form action="/toggle/{{ task.id }}" method="post" style="display:inline;">
+                        <button type="submit">{{ "Mark Undone" if task.done else "Mark Done" }}</button>
+                    </form>
+                    <form action="/delete/{{ task.id }}" method="post" style="display:inline;">
+                        <button type="submit" class="danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            {% if not tasks %}
+            <tr><td colspan="4">No tasks found.</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+
+    <br>
+    <a href="/daily">View Daily Summary</a>
+</body>
+</html>
+```
+
+### `todo/templates/daily.html`
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Daily Summary</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; background: #f5f5f5; }
+        h1 { color: #333; }
+        ul { list-style: none; padding: 0; }
+        li { padding: 10px; margin: 5px 0; background: #fff; border-radius: 4px; border-left: 5px solid #007bff; }
+        li.done { border-left-color: #28a745; background: #e9ffe9; }
+        .back { margin-top: 20px; display: inline-block; }
+    </style>
+</head>
+<body>
+    <h1>☀️ Daily Summary</h1>
+    <p>Tasks created today:</p>
+    <ul>
+        {% for task in tasks %}
+        <li class="{{ 'done' if task.done else '' }}">
+            {{ task.title }} <em>({{ "Done" if task.done else "Pending" }})</em>
+        </li>
+        {% else %}
+        <li>No tasks for today.</li>
+        {% endfor %}
+    </ul>
+    <a href="/" class="back">← Back to all tasks</a>
+</body>
+</html>
+```
+
+## 7. Tests
+
+### `tests/conftest.py`
+
+Creates an isolated temporary database for every test.
+
+```python
+import pytest
+import json
+from pathlib import Path
+
+@pytest.fixture(autouse=True)
+def todo_temp_db(tmp_path, monkeypatch):
+    """Replace the real JSON storage with an empty temporary file."""
+    db_path = tmp_path / "test_todo.json"
+    db_path.write_text(json.dumps({"tasks": []}))
+    import todo.storage
+    monkeypatch.setattr(todo.storage, "_db_path", db_path)
+    yield
+```
+
+### `tests/test_web.py`
+
+Tests all web routes using FastAPI's built-in `TestClient` (which wraps `httpx`).
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+from todo.web import app
+from todo import core
+
+client = TestClient(app)
+
+
+def test_read_main():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "To-Do List" in response.text
+
+
+def test_add_task_form():
+    response = client.post("/add", data={"title": "Form Task"}, allow_redirects=False)
+    assert response.status_code == 303
+    response = client.get("/")
+    assert "Form Task" in response.text
+
+
+def test_add_task_json():
+    response = client.post("/add", json={"title": "JSON Task"})
+    assert response.status_code == 201
+    data = response.json()
+    assert data["title"] == "JSON Task"
+    assert data["done"] is False
+    assert "id" in data
+
+
+def test_add_empty_task():
+    response = client.post("/add", json={"title": ""})
+    assert response.status_code == 400
+
+
+def test_toggle_task():
+    client.post("/add", data={"title": "Toggler"})
+    tasks = core.list_tasks()
+    task_id = tasks[0]["id"]
+    response = client.post(f"/toggle/{task_id}", allow_redirects=False)
+    assert response.status_code == 303
+    tasks = core.list_tasks()
+    assert tasks[0]["done"] is True
+
+
+def test_toggle_not_found():
+    response = client.post("/toggle/999")
+    assert response.status_code == 404
+
+
+def test_delete_task():
+    client.post("/add", data={"title": "Deletable"})
+    tasks = core.list_tasks()
+    task_id = tasks[0]["id"]
+    response = client.post(f"/delete/{task_id}", allow_redirects=False)
+    assert response.status_code == 303
+    assert len(core.list_tasks()) == 0
+
+
+def test_delete_not_found():
+    response = client.post("/delete/999")
+    assert response.status_code == 404
+
+
+def test_daily():
+    response = client.get("/daily")
+    assert response.status_code == 200
+
+
+def test_filter():
+    client.post("/add", data={"title": "Task 1"})
+    client.post("/add", data={"title": "Task 2"})
+    tasks = core.list_tasks()
+    core.toggle_task(tasks[0]["id"])
+
+    response = client.get("/?filter=active")
+    assert "Task 1" not in response.text
+    assert "Task 2" in response.text
+
+    response = client.get("/?filter=completed")
+    assert "Task 1" in response.text
+    assert "Task 2" not in response.text
+```
+
+### `tests/test_cli.py`
+
+Verifies the CLI commands still work correctly.
+
+```python
+import sys
+from todo.cli import main
+
+
+def test_add_and_list(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["todo", "add", "CLI Task"])
+    main()
+    captured = capsys.readouterr()
+    assert "CLI Task" in captured.out
+
+    monkeypatch.setattr(sys, "argv", ["todo", "list"])
+    main()
+    captured = capsys.readouterr()
+    assert "CLI Task" in captured.out
+
+
+def test_toggle_delete(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["todo", "add", "Delete Me"])
+    main()
+    captured = capsys.readouterr()
+
+    from todo import core
+    tasks = core.list_tasks()
+    task_id = tasks[0]["id"]
+
+    monkeypatch.setattr(sys, "argv", ["todo", "toggle", str(task_id)])
+    main()
+    captured = capsys.readouterr()
+    assert "toggled" in captured.out
+
+    monkeypatch.setattr(sys, "argv", ["todo", "delete", str(task_id)])
+    main()
+    captured = capsys.readouterr()
+    assert "deleted" in captured.out
+
+
+def test_daily(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["todo", "daily"])
+    main()
+    captured = capsys.readouterr()
+    assert "Daily Tasks" in captured.out
+```
+
+## 8. `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project

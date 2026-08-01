@@ -1,0 +1,283 @@
+# Benchmark: slot_count=2  session=3  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 1996  TPS: 12.2
+# ============================================================
+
+We'll implement the full To-Do application in Python, extending it with `daily` and `week` commands while preserving all basic functionality. The app uses JSON storage, supports due dates, completion tracking, and provides compact summaries for morning reviews.
+
+```python
+#!/usr/bin/env python3
+"""
+Simple To-Do application with daily and weekly summary commands.
+
+Usage:
+    todo add <description> [--due YYYY-MM-DD]
+    todo list [--all] [--done] [--pending]
+    todo done <id>
+    todo delete <id>
+    todo daily
+    todo week
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, date, timedelta
+
+DATA_FILE = os.path.expanduser("~/.todo.json")
+
+# ---------- Task helpers ----------
+
+def load_tasks():
+    """Load tasks from the JSON data file."""
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
+
+def save_tasks(tasks):
+    """Save tasks to the JSON data file."""
+    with open(DATA_FILE, "w") as f:
+        json.dump(tasks, f, indent=2)
+
+def generate_id(tasks):
+    """Return a new unique ID for a task."""
+    if not tasks:
+        return 1
+    return max(t["id"] for t in tasks) + 1
+
+def get_today_str():
+    """Return today's date as YYYY-MM-DD."""
+    return date.today().isoformat()
+
+def get_task_by_id(tasks, task_id):
+    """Return the task dict with the given ID, or None."""
+    for t in tasks:
+        if t["id"] == task_id:
+            return t
+    return None
+
+def format_task_short(task):
+    """Return a compact string representation of a task."""
+    desc = task["description"]
+    due = task.get("due_date", "")
+    done_mark = "[x]" if task.get("done") else "[ ]"
+    if due:
+        due_str = f" (due {due})"
+    else:
+        due_str = ""
+    return f"{done_mark} #{task['id']} {desc}{due_str}"
+
+# ---------- Commands ----------
+
+def add_task(args):
+    """Add a new task."""
+    tasks = load_tasks()
+    new_task = {
+        "id": generate_id(tasks),
+        "description": args.description,
+        "due_date": args.due,          # None if not provided
+        "done": False,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+    }
+    tasks.append(new_task)
+    save_tasks(tasks)
+    print(f"Added task #{new_task['id']}: {args.description}")
+
+def list_tasks(args):
+    """List tasks with optional filters."""
+    tasks = load_tasks()
+    today = get_today_str()
+
+    if args.all:
+        filtered = tasks
+    elif args.done:
+        filtered = [t for t in tasks if t.get("done")]
+    elif args.pending:
+        filtered = [t for t in tasks if not t.get("done")]
+    else:
+        # default: show pending only
+        filtered = [t for t in tasks if not t.get("done")]
+
+    if not filtered:
+        print("No tasks to show.")
+        return
+
+    for t in sorted(filtered, key=lambda x: x["id"]):
+        due = t.get("due_date", "")
+        status = "✓" if t.get("done") else " "
+        completion = ""
+        if t.get("completed_at"):
+            completion = f" completed {t['completed_at'][:10]}"
+        due_str = f" (due {due})" if due else ""
+        print(f"[{status}] #{t['id']} {t['description']}{due_str}{completion}")
+
+def done_task(args):
+    """Mark a task as done."""
+    tasks = load_tasks()
+    task = get_task_by_id(tasks, args.task_id)
+    if not task:
+        print(f"Error: no task with id {args.task_id}")
+        sys.exit(1)
+    if task.get("done"):
+        print(f"Task #{args.task_id} is already done.")
+        return
+    task["done"] = True
+    task["completed_at"] = datetime.now().isoformat()
+    save_tasks(tasks)
+    print(f"Task #{args.task_id} marked as done.")
+
+def delete_task(args):
+    """Delete a task by ID."""
+    tasks = load_tasks()
+    task = get_task_by_id(tasks, args.task_id)
+    if not task:
+        print(f"Error: no task with id {args.task_id}")
+        sys.exit(1)
+    tasks.remove(task)
+    save_tasks(tasks)
+    print(f"Deleted task #{args.task_id}")
+
+def daily_summary(args):
+    """Show a compact summary of today's tasks."""
+    tasks = load_tasks()
+    today = get_today_str()
+
+    overdue = []
+    due_today = []
+    completed_today = []
+
+    for t in tasks:
+        due = t.get("due_date")
+        done = t.get("done", False)
+        completed = t.get("completed_at", "")
+
+        if not due:
+            continue  # skip tasks without due date
+
+        if done and completed[:10] == today:
+            completed_today.append(t)
+        elif not done:
+            if due == today:
+                due_today.append(t)
+            elif due < today:
+                overdue.append(t)
+
+    # Print summary
+    print(f"📅 Daily Overview – {today}")
+    print()
+
+    # Counts line
+    parts = []
+    if due_today:
+        parts.append(f"{len(due_today)} task(s) due today")
+    if overdue:
+        parts.append(f"{len(overdue)} overdue")
+    if completed_today:
+        parts.append(f"{len(completed_today)} completed today")
+    if parts:
+        print("  " + ", ".join(parts))
+    else:
+        print("  Nothing scheduled for today.")
+    print()
+
+    # Section: Overdue
+    if overdue:
+        print("  ⚠ Overdue:")
+        for t in sorted(overdue, key=lambda x: x["due_date"]):
+            print(f"    {format_task_short(t)}")
+        print()
+
+    # Section: Due today
+    if due_today:
+        print("  📌 Due today:")
+        for t in sorted(due_today, key=lambda x: x["description"]):
+            print(f"    {format_task_short(t)}")
+        print()
+
+    # Section: Completed today
+    if completed_today:
+        print("  ✅ Completed today:")
+        for t in sorted(completed_today, key=lambda x: x["id"]):
+            print(f"    {format_task_short(t)}")
+        print()
+
+def week_summary(args):
+    """Show a compact overview of the coming week (today + next 6 days)."""
+    tasks = load_tasks()
+    today = date.today()
+
+    overdue = []
+    completed_today = []
+    day_buckets = { (today + timedelta(days=i)).isoformat(): [] for i in range(7) }
+
+    for t in tasks:
+        due = t.get("due_date")
+        done = t.get("done", False)
+        completed = t.get("completed_at", "")
+
+        if not due:
+            continue
+
+        if done and completed[:10] == get_today_str():
+            completed_today.append(t)
+        elif not done:
+            if due < get_today_str():
+                overdue.append(t)
+            elif due in day_buckets:
+                day_buckets[due].append(t)
+
+    # Print header
+    print(f"📅 Weekly Overview – {get_today_str()} (+6 days)")
+    print()
+
+    # Counts
+    total_due_week = sum(len(v) for v in day_buckets.values())
+    parts = []
+    if total_due_week:
+        parts.append(f"{total_due_week} task(s) due this week")
+    if overdue:
+        parts.append(f"{len(overdue)} overdue")
+    if completed_today:
+        parts.append(f"{len(completed_today)} completed today")
+    if parts:
+        print("  " + ", ".join(parts))
+    else:
+        print("  Nothing scheduled this week.")
+    print()
+
+    # Overdue section
+    if overdue:
+        print("  ⚠ Overdue:")
+        for t in sorted(overdue, key=lambda x: x["due_date"]):
+            print(f"    {format_task_short(t)}")
+        print()
+
+    # Day-by-day breakdown
+    day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+    for i in range(7):
+        d = today + timedelta(days=i)
+        ds = d.isoformat()
+        tasks_due = day_buckets[ds]
+        if not tasks_due:
+            continue
+        day_label = f"{day_names[d.weekday()]} {ds}"
+        print(f"  {day_label}:")
+        for t in sorted(tasks_due, key=lambda x: x["description"]):
+            print(f"    {format_task_short(t)}")
+        print()
+
+    # Completed today section (also shown in daily, but useful here)
+    if completed_today:
+        print("  ✅ Completed today:")
+        for t in sorted(completed_today, key=lambda x: x["id"]):
+            print(f"    {format_task_short(t)}

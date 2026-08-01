@@ -6,6 +6,21 @@ import pytest
 from proxy import server
 
 
+@pytest.fixture(autouse=True)
+def _restore_http_client():
+    """Restore the shared server HTTP client after each test.
+
+    Tests in this module replace ``server._http_client`` with fakes
+    (MockClient/NonJsonClient) to simulate backend responses. Without
+    restoration the fake leaks into later tests that call
+    ``_close_and_recreate_http_client()``, which expects a real httpx client
+    with ``aclose()`` (LP-0MS9MBVJK003D3RR).
+    """
+    original = getattr(server, "_http_client", None)
+    yield
+    server._http_client = original
+
+
 class MockResp:
     def __init__(self, status_code=200, json_data=None):
         self.status_code = status_code

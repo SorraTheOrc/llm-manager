@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
+from proxy.slot_scheduler import SlotScheduler
 
 # Global state
 llama_process: subprocess.Popen | None = None
@@ -113,6 +114,12 @@ provider_fallback_count: dict = {}
 _dispatch_cleanup_task: asyncio.Task | None = None
 
 
+# Lazy self-import helper returns this module (avoids circular imports)
+def _srv():
+    import sys
+    return sys.modules[__name__]
+
+
 async def _release_lease_on_session_eviction(session_id: str) -> None:
     """Callback invoked when a session is evicted from the session manager.
 
@@ -200,6 +207,11 @@ tts_recovery_state: dict = {
 
 # Background model health monitoring task (started in lifespan)
 model_health_task: asyncio.Task | None = None
+
+# Slot scheduler for time-based slot count transitions (LP-0MRXZU90M007WNWT)
+slot_scheduler: SlotScheduler | None = None
+# Module-level draining flag, set by the slot scheduler during drain windows
+draining: bool = False
 
 # Token counting
 token_counts: dict = {}
@@ -615,6 +627,38 @@ def _startup_start_dispatch_cleanup():
             logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
 
 
+def _startup_launch_slot_scheduler():
+    """Start the slot scheduler background task.
+
+    Creates a ``SlotScheduler`` instance from the current config and
+    starts its background time-check loop.  When no schedule is configured,
+    the scheduler is a no-op.
+    """
+    global slot_scheduler, draining
+    try:
+        scheduler = SlotScheduler(_srv())
+        if scheduler.enabled:
+            slot_scheduler = scheduler
+            loop = asyncio.get_running_loop()
+            loop.create_task(scheduler.start())
+            # Distribute draining state so router can check it without
+            # importing the full scheduler.
+            draining = False
+            logger.info(
+                "Slot scheduler: configured with %d entries, drain=%d min",
+                len(scheduler._config.entries),
+                scheduler._config.drain_minutes,
+            )
+        else:
+            slot_scheduler = None
+            draining = False
+            logger.debug("Slot scheduler: no schedule configured, disabled")
+    except Exception as e:
+        logger.warning("Failed to start slot scheduler: %s", e)
+        slot_scheduler = None
+        draining = False
+
+
 def _startup_register_session_routes(app):
     """Register session recording admin routes on the FastAPI app.
 
@@ -702,6 +746,15 @@ def _shutdown_tts_server():
     stop_tts_server()
 
 
+async def _shutdown_slot_scheduler():
+    """Stop the slot scheduler background task."""
+    global slot_scheduler, draining
+    if slot_scheduler is not None:
+        await slot_scheduler.stop()
+        slot_scheduler = None
+    draining = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler.
@@ -727,6 +780,7 @@ async def lifespan(app: FastAPI):
     _startup_start_session_cleanup()
     _startup_start_dispatch_cleanup()
     _startup_register_session_routes(app)
+    _startup_launch_slot_scheduler()
 
     yield
 
@@ -739,6 +793,7 @@ async def lifespan(app: FastAPI):
     _shutdown_tts_server()
     await _shutdown_http_client()
     _shutdown_llama_server()
+    await _shutdown_slot_scheduler()
 
 
 app = FastAPI(
@@ -790,8 +845,45 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
 async def view_logs(request: Request):
     return await _ui_view_logs(request)
 
+def _drain_check():
+    """Return a 503 response if the proxy is in drain mode, or None."""
+    global draining, slot_scheduler
+    if draining is True:
+        drain_retry_after = 15
+        if slot_scheduler is not None and hasattr(slot_scheduler, '_config'):
+            drain_retry_after = max(15, slot_scheduler._config.drain_minutes * 60)
+        logger.info(
+            "drain_active: refusing new request, retry_after=%ds",
+            drain_retry_after,
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "draining",
+                    "message": (
+                        "Draining workloads for scheduled slot-count change "
+                        "\u2014 please retry shortly"
+                    ),
+                },
+                "status": 503,
+                "retry_after": drain_retry_after,
+            },
+            headers={
+                "Retry-After": str(drain_retry_after),
+                "Cache-Control": "no-store",
+            },
+        )
+    return None
+
+
 @app.post("/v1/embeddings")
 async def create_embeddings(request: Request):
+    drain_resp = _drain_check()
+    if drain_resp:
+        return drain_resp
     return await _ui_create_embeddings(request)
 
 @app.api_route(
@@ -799,6 +891,9 @@ async def create_embeddings(request: Request):
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
 )
 async def proxy_openai_api(request: Request, path: str):
+    drain_resp = _drain_check()
+    if drain_resp:
+        return drain_resp
     return await _ui_proxy_openai_api(request, path)
 
 @app.post("/admin/switch-model/{model_name}")
@@ -944,9 +1039,11 @@ from .lifecycle import (  # noqa: E402, F401
     router_load_model,
     router_preload_models,
     router_wait_for_model,
+    restart_services,
     schedule_background_load,
     start_llama_server,
     stop_llama_server,
+    stop_tts_server,
     wait_for_llama_server,
 )
 from .observability import (  # noqa: E402, F401

@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -488,6 +489,66 @@ def _slot_persistence_enabled(slot_path: Path | str | None, slot_pool_size: int)
     return bool(slot_path and slot_pool_size > 0)
 
 
+# ---------------------------------------------------------------------------
+# Slot persistence safeguards (LP-0MS91DHPZ001VWQO)
+#
+# llama-server serializes the whole KV cache on slot save/restore, so large
+# contexts can take longer than the client timeout (ReadTimeout). A copy that
+# never completes leaves the GPU busy with idle slots, degrading all local
+# inference. These safeguards are proxy-side only (no llama.cpp changes):
+#
+#   1. Context-size gating: skip persistence when the request context exceeds
+#      ``session_slot_max_prompt_tokens``.
+#   2. Adaptive timeout: scale the save/restore timeout with context size
+#      (``session_slot_timeout_per_token_seconds``, capped at
+#      ``session_slot_max_timeout_seconds``).
+#   3. Circuit breaker: after ``session_slot_max_consecutive_failures``
+#      failures, stop issuing save/restore for a slot until the cooldown
+#      (``session_slot_failure_cooldown_seconds``) expires.
+# ---------------------------------------------------------------------------
+
+_slot_failure_state: dict[int, tuple[int, float]] = {}
+"""{slot_id: (consecutive_failures, last_failure_epoch)} for the circuit breaker."""
+
+
+def _record_slot_success(slot_id: int) -> None:
+    """Reset the failure state for *slot_id* after a successful save/restore."""
+    _slot_failure_state.pop(slot_id, None)
+
+
+def _record_slot_failure(slot_id: int) -> None:
+    """Increment the consecutive-failure counter for *slot_id*."""
+    count, _ = _slot_failure_state.get(slot_id, (0, time.time()))
+    _slot_failure_state[slot_id] = (count + 1, time.time())
+
+
+def _estimate_slot_prompt_tokens(body_json: dict | None) -> int:
+    """Estimate request context tokens for slot persistence decisions."""
+    if not isinstance(body_json, dict):
+        return 0
+    from proxy.provider import _estimate_prompt_tokens_for_routing
+    return _estimate_prompt_tokens_for_routing(body_json) or 0
+
+
+def _slot_in_failure_cooldown(slot_id: int, server_config: dict) -> bool:
+    """True when a slot has exceeded the failure threshold within the cooldown window."""
+    failures, last_fail = _slot_failure_state.get(slot_id, (0, 0.0))
+    max_failures = int(server_config.get("session_slot_max_consecutive_failures", 3) or 3)
+    cooldown = float(server_config.get("session_slot_failure_cooldown_seconds", 300.0) or 300.0)
+    if failures < max_failures:
+        return False
+    remaining = cooldown - (time.time() - last_fail)
+    if remaining > 0:
+        logger.warning(
+            "slot persistence disabled slot=%s consecutive_failures=%s cooldown_remaining=%.0fs",
+            slot_id, failures, remaining,
+        )
+        return True
+    # Cooldown expired - allow retries again
+    _slot_failure_state.pop(slot_id, None)
+    return False
+
+
 def _truncate_body(body: str, maxlen: int = 500) -> str:
     """Truncate *body* to *maxlen* characters, appending '...' if truncated.
 
@@ -516,6 +577,10 @@ async def _call_slot_endpoint(
       (≤500 char) response body.
     - A DEBUG-level log with exc_info=True is emitted for every exception,
       capturing the full stack trace for post-hoc diagnosis.
+
+    Failures feed the circuit breaker (``_slot_failure_state``) so repeated
+    timeouts disable persistence for the slot instead of piling doomed
+    KV-cache copies onto the GPU (LP-0MS91DHPZ001VWQO).
     """
     if not filename:
         return False
@@ -536,7 +601,9 @@ async def _call_slot_endpoint(
                 response.status_code,
                 _truncate_body(body),
             )
+            _record_slot_failure(slot_id)
             return False
+        _record_slot_success(slot_id)
         return True
     except Exception as exc:
         # Log exception type name in the warning so empty __str__ values
@@ -550,6 +617,8 @@ async def _call_slot_endpoint(
             exc_type,
             detail,
         )
+        # Feed the circuit breaker so repeated timeouts disable persistence.
+        _record_slot_failure(slot_id)
         # Debug log with full traceback for post-hoc diagnosis.
         srv.logger.debug(
             "slot_%s failed slot=%s",
@@ -616,11 +685,53 @@ def _sanitize_session_id(session_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id)
 
 
+# ---------------------------------------------------------------------------
+# Slot assignment registry
+#
+# Tracks which session_id currently owns each slot number, replacing the
+# previous hash-based deterministic mapping. Slots are assigned on demand
+# (lowest-numbered free slot first) so that session_id ↔ slot_number is
+# transparent and doesn't rely on a digest.
+# ---------------------------------------------------------------------------
+
+_slot_owners: dict[int, str] = {}
+"""Active slot assignments: ``{slot_id: session_id}``."""
+
+
 def _slot_id_for_session(session_id: str, pool_size: int) -> int | None:
+    """Return the slot number assigned to *session_id*.
+
+    If the session already has an assigned slot, returns it.
+    Otherwise assigns the lowest-numbered free slot in ``[0, pool_size)``.
+    Returns ``None`` when *session_id* is empty or *pool_size* ≤ 0.
+    """
     if not session_id or pool_size <= 0:
         return None
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % int(pool_size)
+
+    # Check existing assignment
+    for sid, owner in list(_slot_owners.items()):
+        if owner == session_id:
+            return sid
+
+    # Find the lowest-numbered free slot
+    used = set(_slot_owners.keys())
+    for sid in range(pool_size):
+        if sid not in used:
+            _slot_owners[sid] = session_id
+            return sid
+
+    # All slots occupied — pool is exhausted
+    return None
+
+
+def _free_slot_assignment(session_id: str) -> None:
+    """Release the slot assigned to *session_id*, if any."""
+    if not session_id:
+        return
+    for sid, owner in list(_slot_owners.items()):
+        if owner == session_id:
+            _slot_owners.pop(sid, None)
+            return
 
 
 def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
@@ -631,7 +742,23 @@ def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
 def _build_slot_context(
     server_config: dict,
     session_id: str | None,
+    body_json: dict | None = None,
 ) -> tuple[int | None, str | None, float]:
+    """Build the slot context for a request, applying persistence safeguards.
+
+    Returns ``(None, None, timeout)`` — disabling slot persistence for this
+    request — when any of these apply (LP-0MS91DHPZ001VWQO):
+
+    - the request context exceeds ``session_slot_max_prompt_tokens``
+      (saves serialize the whole KV cache, so large contexts ReadTimeout
+      and can wedge the GPU), or
+    - the slot is in circuit-breaker cooldown after repeated save/restore
+      failures.
+
+    When ``session_slot_timeout_per_token_seconds`` is configured, the
+    returned timeout scales with the estimated context size, capped at
+    ``session_slot_max_timeout_seconds``.
+    """
     slot_path = server_config.get("session_slot_save_path")
     slot_pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
     slot_timeout = float(server_config.get("session_slot_timeout_seconds", 3.0) or 3.0)
@@ -641,6 +768,31 @@ def _build_slot_context(
     slot_id = _slot_id_for_session(session_id, slot_pool_size)
     if slot_id is None:
         return None, None, slot_timeout
+
+    # 1) Context-size gating: skip persistence for oversized contexts.
+    max_prompt_tokens = int(server_config.get("session_slot_max_prompt_tokens", 0) or 0)
+    per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)
+    need_estimate = max_prompt_tokens > 0 or per_token > 0
+    estimated = _estimate_slot_prompt_tokens(body_json) if need_estimate else 0
+    if max_prompt_tokens > 0 and estimated > max_prompt_tokens:
+        logger.info(
+            "slot persistence skipped session=%s estimated_tokens=%d max_prompt_tokens=%d reason=context_too_large",
+            session_id[:8] if session_id else "unknown",
+            estimated,
+            max_prompt_tokens,
+        )
+        return None, None, slot_timeout
+
+    # 2) Adaptive timeout: scale with context size so legitimate saves of
+    #    medium contexts don't spuriously time out.
+    if per_token > 0:
+        max_timeout = float(server_config.get("session_slot_max_timeout_seconds", 60.0) or 60.0)
+        slot_timeout = min(slot_timeout + per_token * estimated, max_timeout)
+
+    # 3) Circuit breaker: stop issuing saves/restores for a failing slot.
+    if _slot_in_failure_cooldown(slot_id, server_config):
+        return None, None, slot_timeout
+
     return slot_id, _slot_filename_for_session(session_id, slot_dir), slot_timeout
 
 
@@ -684,6 +836,9 @@ async def _invalidate_session_and_slot(
                         pass
         except Exception:
             pass
+    # Free the slot registry entry
+    _free_slot_assignment(session_id)
+
     # Clear cached ratio entries for this session (LP-0MRMMBZ7T007ER59)
     if session_id:
         try:
@@ -761,7 +916,7 @@ class SessionSingleFlightCoordinator:
                 self._states[session_id] = state
             return state
 
-    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int):
+    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int, queue_timeout_seconds: float | None = None):
         @asynccontextmanager
         async def _guard():
             if not session_id:
@@ -786,7 +941,19 @@ class SessionSingleFlightCoordinator:
                     is_waiting = True
                     _record_single_flight_queue()
 
-            await state["lock"].acquire()
+            try:
+                if queue_timeout_seconds is not None and queue_timeout_seconds > 0:
+                    await asyncio.wait_for(
+                        state["lock"].acquire(), timeout=queue_timeout_seconds
+                    )
+                else:
+                    await state["lock"].acquire()
+            except asyncio.TimeoutError:
+                async with self._state_lock:
+                    if is_waiting:
+                        state["waiters"] = max(0, state["waiters"] - 1)
+                _record_single_flight_reject()
+                raise SessionSingleFlightRejected("queue_timeout")
             async with self._state_lock:
                 if is_waiting:
                     state["waiters"] = max(0, state["waiters"] - 1)

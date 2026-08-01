@@ -584,6 +584,46 @@ class TestListAndRetrieve:
         sessions = recorder.list_sessions()
         assert sessions == []
 
+    @pytest.mark.asyncio
+    async def test_list_sessions_limited_to_15(self, recorder, temp_recording_dir):
+        """list_sessions returns at most 15 sessions when many exist."""
+        # Create 20 sessions to exceed the limit
+        for i in range(20):
+            session_id = f"sess-limit-{i:03d}"
+            await recorder.record_request(session_id, "client_to_proxy", {"seq": i})
+
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) <= 15, f"Expected at most 15 sessions, got {len(sessions)}"
+        # Verify the 15 most recent sessions are returned (by last_activity)
+        if len(sessions) == 15:
+            session_ids = [s["session_id"] for s in sessions]
+            # Session IDs were created in order, so the last 15 should be sess-limit-005 through sess-limit-019
+            expected = [f"sess-limit-{i:03d}" for i in range(5, 20)]
+            assert set(session_ids) == set(expected), f"Expected sessions {expected}, got {session_ids}"
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_under_limit_returns_all(self, recorder, temp_recording_dir):
+        """list_sessions returns all sessions when fewer than 15 exist."""
+        for i in range(5):
+            session_id = f"sess-under-{i:03d}"
+            await recorder.record_request(session_id, "client_to_proxy", {"seq": i})
+
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 5, f"Expected 5 sessions, got {len(sessions)}"
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_exactly_15_returns_all(self, recorder, temp_recording_dir):
+        """list_sessions returns all 15 sessions when exactly 15 exist."""
+        for i in range(15):
+            session_id = f"sess-exact-{i:03d}"
+            await recorder.record_request(session_id, "client_to_proxy", {"seq": i})
+
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 15, f"Expected 15 sessions, got {len(sessions)}"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration integration (AC5)

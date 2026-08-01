@@ -1,0 +1,56 @@
+# Benchmark: slot_count=1  session=2  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 242s  Tokens: 264  TPS: 8.3
+# ============================================================
+
+We'll add a web UI to the existing To-Do application using **FastAPI** (a simple, modern Python framework). The implementation follows a clean module structure, keeps the CLI fully functional, and includes tests for all web routes.
+
+## Project Structure
+
+```
+todo_app/
+├── __init__.py
+├── todo.py          # Task model & TodoList manager (JSON persistence)
+├── cli.py           # CLI entry point (including the new `serve` command)
+├── web.py           # FastAPI web application
+└── tests/
+    └── test_web.py  # Tests for web routes using httpx
+```
+
+No external CSS/JS – inline styles only.
+
+---
+
+## Dependencies
+
+Add to your `requirements.txt` or install with pip:
+
+```
+fastapi
+uvicorn[standard]
+pytest
+httpx
+```
+
+The `tests` module uses `fastapi.testclient` which is built on `httpx`.
+
+---
+
+## Implementation Files
+
+### 1. `todo_app/todo.py` – Data Model & Manager
+
+```python
+import json
+import os
+from datetime import date, datetime
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Any
+
+TODO_FILE = "todo.json"
+
+@datac

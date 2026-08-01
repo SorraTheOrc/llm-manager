@@ -1,0 +1,122 @@
+# Benchmark: slot_count=8  session=1  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 171s  Tokens: 18001  TPS: 3466.0
+# ============================================================
+
+Here's a complete CLI to‑do application with the requested `daily` and `week` commands, plus a full test suite.
+
+**Features**
+- `todo add <text> due:YYYY-MM-DD` – adds a task with an optional due date
+- `todo list` – lists all tasks
+- `todo complete <id>` – marks a task done
+- `todo delete <id>` – deletes a task
+- `todo daily` – shows today’s due tasks, overdue tasks, and tasks completed today (tasks without a due date are omitted)
+- `todo week` – shows a seven‑day overview (today + next 6 days) with per‑day counts and a final summary
+
+**File: `todo.py`**  
+```python
+#!/usr/bin/env python3
+# todo.py – CLI To‑Do application with daily/weekly summaries
+
+import sys
+import json
+import os
+from datetime import date, timedelta
+
+DATA_FILE = os.environ.get('TODO_DATA_FILE', os.path.expanduser("~/.todo_tasks.json"))
+
+# ----------------------------------------------------------------------
+# Persistence helpers
+# ----------------------------------------------------------------------
+
+def load_tasks():
+    if not os.path.exists(DATA_FILE):
+        return []
+    try:
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+def save_tasks(tasks):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(tasks, f, indent=2)
+
+# ----------------------------------------------------------------------
+# CRUD commands
+# ----------------------------------------------------------------------
+
+def add_task(text, due_date=None):
+    tasks = load_tasks()
+    new_id = max([t.get('id', 0) for t in tasks], default=0) + 1
+    task = {
+        "id": new_id,
+        "text": text,
+        "due_date": due_date,
+        "done": False,
+        "completed_at": None,
+        "created_at": date.today().isoformat()
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    print(f"Added task #{new_id}: {text}")
+
+def list_tasks(tasks=None):
+    if tasks is None:
+        tasks = load_tasks()
+    if not tasks:
+        print("No tasks found.")
+        return
+    print(f"{'ID':<4} {'Done':<8} {'Due':<12} Task")
+    print('-' * 50)
+    for t in tasks:
+        status = '✓' if t.get('done') else ' '
+        due = t.get('due_date', '') or '-'
+        print(f"{t['id']:<4} [ {status} ]{'':<4} {due:<12} {t['text']}")
+
+def complete_task(task_id):
+    tasks = load_tasks()
+    for t in tasks:
+        if t['id'] == task_id:
+            if not t.get('done'):
+                t['done'] = True
+                t['completed_at'] = date.today().isoformat()
+                save_tasks(tasks)
+                print(f"Completed task #{task_id}")
+            else:
+                print(f"Task #{task_id} already completed")
+            return
+    print(f"Task #{task_id} not found")
+
+def delete_task(task_id):
+    tasks = load_tasks()
+    before = len(tasks)
+    tasks = [t for t in tasks if t['id'] != task_id]
+    if len(tasks) == before:
+        print(f"Task #{task_id} not found")
+        return
+    save_tasks(tasks)
+    print(f"Deleted task #{task_id}")
+
+# ----------------------------------------------------------------------
+# Daily command
+# ----------------------------------------------------------------------
+
+def show_daily():
+    """Print a compact morning summary: due today, overdue, completed today."""
+    tasks = load_tasks()
+    today = date.today().isoformat()
+
+    # Only tasks that explicitly have a due_date
+    tasks_with_due = [t for t in tasks if t.get('due_date') is not None]
+
+    due_today = [t for t in tasks_with_due if t['due_date'] == today and not t.get('done')]
+    overdue = [t for t in tasks_with_due if t['due_date'] < today and not t.get('done')]
+    completed_today = [t for t in tasks_with_due if t.get('completed_at') == today and t.get('done')]
+
+    print("📅 Daily Summary")
+    print(f"   {date.today().strftime('%A, %b %d, %Y')}")

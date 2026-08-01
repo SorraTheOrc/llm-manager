@@ -390,3 +390,68 @@ async def test_normal_stream_unaffected(monkeypatch):
     assert any("[DONE]" in c or "finish_reason" in c for c in collected), (
         "Expected [DONE] or finish_reason in normal stream output"
     )
+
+
+@pytest.mark.asyncio
+async def test_grace_margin_extra_heartbeat_cycle(monkeypatch):
+    """
+    With the < check instead of <=, the stream gets one extra heartbeat
+    cycle before forced termination. This test verifies that at the budget
+    boundary (remaining_budget == heartbeat_interval), the stream continues
+    for one more cycle.
+
+    AC for LP-0MS1566WA003ZDSH: Verify the stream gets one extra heartbeat
+    cycle before timeout.
+    """
+    from proxy.router import proxy_to_local
+
+    srv_module, router_mod = _setup_basic_mocks(monkeypatch)
+    # Use very short intervals so the test runs fast:
+    # stream_idle_timeout=0.1, heartbeat=0.05
+    # Budget = 0.1. After heartbeat 1: budget=0.05. With <=: 0.05 <= 0.05 -> break.
+    # With <: 0.05 < 0.05 -> False, continue, then next cycle budget=0.0 < 0.05 -> break.
+    # So with <, we get one extra heartbeat (4 heartbeats vs 3 with <=)
+    monkeypatch.setattr(srv_module, "config", _make_config(
+        stream_idle_timeout=0.1,
+        max_runtime=3600,
+        heartbeat_interval=0.05,
+    ))
+
+    # Response yields one chunk then hangs
+    chunk1 = 'data: {"choices":[{"delta":{"content":"hello"},"index":0}]}\n\n'
+    mock_response = MockHangAfterChunksResponse([chunk1])
+    mock_client = MockStreamingAsyncClient(mock_response)
+
+    with patch("proxy.router.httpx.AsyncClient", return_value=mock_client):
+        mock_req = await _make_mock_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": True,
+        })
+        resp = await proxy_to_local(mock_req, "v1/chat/completions")
+
+    assert resp is not None
+    assert resp.status_code == 200
+
+    collected = await _collect_stream(resp)
+
+    # Count heartbeat events - with grace margin we should have at least one
+    # heartbeat after the last content chunk before the finish_reason
+    heartbeat_count = sum(
+        1 for c in collected
+        if '"type":"heartbeat"' in c or '"type": "heartbeat"' in c
+    )
+    # With stream_idle_timeout=0.1 and heartbeat=0.05, the budget starts at 0.1
+    # - First heartbeat: 0.05 < 0.05? No -> continue (this is the grace margin)
+    # - Second heartbeat: 0.0 < 0.05? Yes -> break
+    # So with the <%s change, we should see 2 heartbeats after content
+    # Before (<=), we'd see 0 heartbeats after content (0.05 <= 0.05 breaks immediately)
+    # The content chunk itself resets the budget, so heartbeats after content count
+    chunks_after_content = collected[1:]  # skip content chunk
+    hb_after_content = sum(
+        1 for c in chunks_after_content
+        if '"type":"heartbeat"' in c or '"type": "heartbeat"' in c
+    )
+    assert hb_after_content >= 1, (
+        f"Expected at least 1 heartbeat after content (grace margin), got {hb_after_content}"
+    )

@@ -1,0 +1,301 @@
+# Benchmark: slot_count=12  session=0  turn=2
+# Prompt: Extend the To-Do application to support priority and due date.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 352s  Tokens: 2731  TPS: 13.8
+# ============================================================
+
+Here is the complete, refactored implementation with backward compatibility, filtering, sorting, and tests.
+
+### `todo.py`
+```python
+#!/usr/bin/env python3
+"""
+Priority & Due-Date Enhanced To-Do CLI
+Supports filtering, sorting, and automatic migration of legacy task files.
+"""
+
+import argparse
+import json
+import os
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional
+
+DATA_FILE = "tasks.json"
+
+# Priority ordering constants
+PRIORITY_MAP = {"low": 0, "medium": 1, "high": 2}
+PRIORITY_NAMES = {v: k for k, v in PRIORITY_MAP.items()}
+
+@dataclass
+class Task:
+    title: str
+    completed: bool = False
+    priority: str = "medium"
+    due_date: str = ""  # Format: YYYY-MM-DD or empty string
+
+
+def load_tasks() -> List[Task]:
+    """Load tasks from JSON file, migrating legacy formats automatically."""
+    if not os.path.exists(DATA_FILE):
+        return []
+    
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        raw_data = json.load(f)
+    
+    tasks = []
+    for item in raw_data:
+        # Backward compatibility: inject defaults if keys are missing
+        priority = item.get("priority", "medium")
+        due_date = item.get("due_date", "")
+        completed = item.get("completed", False)
+        
+        tasks.append(Task(
+            title=item["title"],
+            completed=completed,
+            priority=priority,
+            due_date=due_date
+        ))
+    return tasks
+
+
+def save_tasks(tasks: List[Task]) -> None:
+    """Persist tasks to JSON file."""
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump([asdict(t) for t in tasks], f, indent=2)
+
+
+def add_task(title: str, priority: str, due_date: str) -> None:
+    """Add a new task to the list."""
+    tasks = load_tasks()
+    tasks.append(Task(title=title, priority=priority, due_date=due_date))
+    save_tasks(tasks)
+    print(f"✅ Added task: '{title}'")
+
+
+def complete_task(index: int) -> None:
+    """Toggle completion status of a task by 1-based index."""
+    tasks = load_tasks()
+    if 0 <= index < len(tasks):
+        tasks[index].completed = not tasks[index].completed
+        save_tasks(tasks)
+        status = "completed" if tasks[index].completed else "pending"
+        print(f"✅ Task {index + 1} marked as '{status}'")
+    else:
+        print("❌ Invalid task index. Please provide a number between 1 and the total tasks.")
+
+
+def list_tasks(priority_filter: Optional[str] = None, due_before: Optional[str] = None, sort_by: Optional[str] = None) -> None:
+    """List tasks with optional filtering and sorting."""
+    tasks = load_tasks()
+    
+    # --- Filtering ---
+    if priority_filter:
+        tasks = [t for t in tasks if t.priority == priority_filter]
+        
+    if due_before:
+        # Only consider tasks that actually have a due date
+        tasks = [t for t in tasks if t.due_date and t.due_date < due_before]
+        
+    # --- Sorting ---
+    if sort_by == "due_date":
+        # Sort ascending by date, push tasks with no due date to the end
+        tasks.sort(key=lambda t: (t.due_date == "", t.due_date))
+    elif sort_by == "priority":
+        # Sort descending by priority (high first), then alphabetically by title
+        tasks.sort(key=lambda t: (-PRIORITY_MAP.get(t.priority, 1), t.title))
+        
+    # --- Display ---
+    if not tasks:
+        print("📭 No tasks found matching your criteria.")
+        return
+        
+    print(f"{'ID':<4} {'Title':<25} {'Priority':<10} {'Due Date':<12} {'Status'}")
+    print("-" * 70)
+    for i, t in enumerate(tasks):
+        status = "✅ Done" if t.completed else "⏳ Pending"
+        due_display = t.due_date if t.due_date else "None"
+        print(f"{i + 1:<4} {t.title:<25} {t.priority:<10} {due_display:<12} {status}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="📋 To-Do List CLI with Priority & Due Date Support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python todo.py add "Buy groceries" --priority high --due 2024-12-31
+  python todo.py list
+  python todo.py list --priority high --sort priority
+  python todo.py list --due-before 2025-01-01 --sort due_date
+  python todo.py complete 1
+        """
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # ADD command
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", help="Task title")
+    add_parser.add_argument("--priority", choices=list(PRIORITY_MAP.keys()), default="medium",
+                            help="Task priority (default: medium)")
+    add_parser.add_argument("--due", dest="due_date", help="Due date in YYYY-MM-DD format")
+    
+    # LIST command
+    list_parser = subparsers.add_parser("list", help="List tasks with filters & sorting")
+    list_parser.add_argument("--priority", choices=list(PRIORITY_MAP.keys()),
+                             help="Filter by priority level")
+    list_parser.add_argument("--due-before", help="Filter tasks due before a date (YYYY-MM-DD)")
+    list_parser.add_argument("--sort", choices=["due_date", "priority"],
+                             help="Sort order")
+                             
+    # COMPLETE command
+    done_parser = subparsers.add_parser("complete", help="Toggle task completion status")
+    done_parser.add_argument("index", type=int, help="Task number (1-based)")
+    
+    args = parser.parse_args()
+    
+    if args.command == "add":
+        add_task(args.title, args.priority, args.due_date or "")
+    elif args.command == "list":
+        list_tasks(args.priority, args.due_before, args.sort)
+    elif args.command == "complete":
+        complete_task(args.index)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### `test_todo.py`
+```python
+import pytest
+import json
+import os
+import tempfile
+from unittest.mock import patch
+from todo import Task, load_tasks, save_tasks, list_tasks, PRIORITY_MAP
+
+@pytest.fixture
+def temp_data_file():
+    """Create a temporary JSON file for tests."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write("[]")
+        temp_path = f.name
+    yield temp_path
+    os.unlink(temp_path)
+
+@pytest.fixture(autouse=True)
+def mock_data_file(temp_data_file):
+    """Override DATA_FILE path for all tests in this module."""
+    import todo
+    original_file = todo.DATA_FILE
+    todo.DATA_FILE = temp_data_file
+    yield
+    todo.DATA_FILE = original_file
+
+def test_add_and_list(temp_data_file):
+    from todo import add_task, list_tasks, load_tasks
+    add_task("Test Task", "high", "2025-01-01")
+    tasks = load_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].title == "Test Task"
+    assert tasks[0].priority == "high"
+    assert tasks[0].due_date == "2025-01-01"
+
+def test_migration_legacy_format(temp_data_file):
+    """Ensure old files without priority/due_date load correctly."""
+    legacy_data = [{"title": "Old Task", "completed": False}]
+    with open(temp_data_file, "w") as f:
+        json.dump(legacy_data, f)
+        
+    tasks = load_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].priority == "medium"  # Default fallback
+    assert tasks[0].due_date == ""       # Empty fallback
+
+def test_filter_priority(temp_data_file):
+    from todo import add_task
+    add_task("Low Task", "low", "")
+    add_task("High Task", "high", "")
+    add_task("Med Task", "medium", "")
+    
+    with patch('sys.stdout', new_callable=lambda: __import__('io').StringIO()) as fake_out:
+        list_tasks(priority_filter="high")
+        output = fake_out.getvalue()
+        assert "High Task" in output
+        assert "Low Task" not in output
+        assert "Med Task" not in output
+
+def test_filter_due_before(temp_data_file):
+    from todo import add_task
+    add_task("Early", "medium", "2024-01-01")
+    add_task("Late", "medium", "2026-12-31")
+    add_task("None", "medium", "")
+    
+    with patch('sys.stdout', new_callable=lambda: __import__('io').StringIO()) as fake_out:
+        list_tasks(due_before="2025-01-01")
+        output = fake_out.getvalue()
+        assert "Early" in output
+        assert "Late" not in output
+        assert "None" not in output  # Tasks without dates excluded
+
+def test_sort_priority(temp_data_file):
+    from todo import add_task
+    add_task("Z-Task", "low", "")
+    add_task("A-Task", "high", "")
+    add_task("M-Task", "medium", "")
+    
+    with patch('sys.stdout', new_callable=lambda: __import__('io').StringIO()) as fake_out:
+        list_tasks(sort_by="priority")
+        output = fake_out.getvalue()
+        lines = [l for l in output.split("\n") if "Task" in l]
+        assert len(lines) == 3
+        assert "A-Task" in lines[0]  # High first
+        assert "M-Task" in lines[1]  # Medium second
+        assert "Z-Task" in lines[2]  # Low last
+
+def test_sort_due_date(temp_data_file):
+    from todo import add_task
+    add_task("Future", "medium", "2027-01-01")
+    add_task("Today", "medium", "2024-05-20")
+    add_task("NoDate", "medium", "")
+    
+    with patch('sys.stdout', new_callable=lambda: __import__('io').StringIO()) as fake_out:
+        list_tasks(sort_by="due_date")
+        output = fake_out.getvalue()
+        lines = [l for l in output.split("\n") if "Task" in l or "NoDate" in l]
+        assert "NoDate" in lines[-1]  # Empty dates push to end
+        assert lines.index(next(l for l in lines if "Today" in l)) < lines.index(next(l for l in lines if "Future" in l))
+```
+
+### Key Improvements & Design Decisions
+
+1. **Data Model**: Used `dataclasses` for type safety and cleaner serialization. `priority` and `due_date` are explicit fields.
+2. **Backward Compatibility**: `load_tasks()` automatically injects defaults (`medium`, `""`) when legacy JSON lacks these keys. No manual migration script required.
+3. **Filtering Logic**:
+   - `--priority`: Exact match.
+   - `--due-before`: Excludes tasks with empty `due_date` to avoid ambiguous comparisons. Uses string comparison which works correctly for `YYYY-MM-DD` format.
+4. **Sorting Logic**:
+   - `--sort priority`: Descending order (High → Low). Ties broken alphabetically by title.
+   - `--sort due_date`: Ascending order. Tasks without dates are pushed to the end using a tuple key `(has_no_date, date)`.
+5. **CLI UX**: Updated help text with examples, clear column alignment, and emoji indicators for status.
+6. **Testing**: Pytest fixtures isolate file state. Tests cover migration, filtering, and sorting edge cases. Mocked `sys.stdout` to verify output without cluttering test runs.
+
+### Usage Examples
+```bash
+# Add tasks
+python todo.py add "Submit report" --priority high --due 2024-12-15
+python todo.py add "Review PRs" --priority medium
+python todo.py add "Team meeting" --priority low --due 2024-11-01
+
+# List all
+python todo.py list
+
+# Filter & Sort
+python todo.py list --priority high --sort priority
+python todo.py list --due-before 2025-01-01 --sort due_date
+```

@@ -1,0 +1,276 @@
+# Benchmark: slot_count=6  session=4  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 302s  Tokens: 1806  TPS: 50.5
+# ============================================================
+
+```python
+# pyproject.toml
+[project]
+name = "todo"
+version = "0.1.0"
+description = "A To-Do application with CLI and Web UI"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "python-multipart>=0.0.6",
+]
+[project.optional-dependencies]
+test = [
+    "httpx>=0.25.0",
+    "pytest>=7.0.0",
+]
+[project.scripts]
+todo = "todo.cli:main"
+```
+
+```python
+# todo/__init__.py
+from .models import Task
+from .storage import load_tasks, save_tasks, set_data_file
+```
+
+```python
+# todo/__main__.py
+from .cli import main
+main()
+```
+
+```python
+# todo/models.py
+import uuid
+from datetime import datetime
+
+
+class Task:
+    def __init__(self, description, due_date=None, completed=False, id=None, created_at=None):
+        self.id = id or str(uuid.uuid4())[:8]
+        self.description = description
+        self.due_date = due_date
+        self.completed = completed
+        self.created_at = created_at or datetime.now().isoformat()
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'description': self.description,
+            'due_date': self.due_date,
+            'completed': self.completed,
+            'created_at': self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data['id'],
+            description=data['description'],
+            due_date=data.get('due_date'),
+            completed=data['completed'],
+            created_at=data['created_at'],
+        )
+```
+
+```python
+# todo/storage.py
+import json
+import os
+from pathlib import Path
+from .models import Task
+
+_DATA_FILE = None
+
+
+def get_data_file():
+    return _DATA_FILE if _DATA_FILE is not None else Path.home() / '.todo' / 'tasks.json'
+
+
+def set_data_file(path):
+    global _DATA_FILE
+    _DATA_FILE = Path(path)
+
+
+def load_tasks():
+    data_file = get_data_file()
+    if not data_file.exists():
+        return []
+    try:
+        with open(data_file, 'r') as f:
+            data = json.load(f)
+        return [Task.from_dict(item) for item in data]
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+
+def save_tasks(tasks):
+    data_file = get_data_file()
+    data_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(data_file, 'w') as f:
+        json.dump([t.to_dict() for t in tasks], f, indent=2)
+```
+
+```python
+# todo/cli.py
+import argparse
+import sys
+from datetime import date
+from .storage import load_tasks, save_tasks
+from .models import Task
+
+
+def cmd_list(args):
+    tasks = load_tasks()
+    if not tasks:
+        print("No tasks found.")
+        return
+    print(f"{'ID':8} {'Completed':10} {'Due Date':12} Description")
+    print("-" * 60)
+    for t in tasks:
+        status = "[x]" if t.completed else "[ ]"
+        due = t.due_date if t.due_date else "-"
+        print(f"{t.id:8} {status:10} {due:12} {t.description}")
+
+
+def cmd_add(args):
+    tasks = load_tasks()
+    task = Task(description=args.description, due_date=args.due)
+    tasks.append(task)
+    save_tasks(tasks)
+    print(f"Added task: {task.description} [{task.id}]")
+
+
+def cmd_toggle(args):
+    tasks = load_tasks()
+    for t in tasks:
+        if t.id == args.id:
+            t.completed = not t.completed
+            status = "completed" if t.completed else "uncompleted"
+            print(f"Task '{t.description}' marked as {status}.")
+            save_tasks(tasks)
+            return
+    print(f"Error: Task with ID '{args.id}' not found.")
+
+
+def cmd_delete(args):
+    tasks = load_tasks()
+    original_len = len(tasks)
+    tasks = [t for t in tasks if t.id != args.id]
+    if len(tasks) == original_len:
+        print(f"Error: Task with ID '{args.id}' not found.")
+    else:
+        save_tasks(tasks)
+        print(f"Deleted task '{args.id}'.")
+
+
+def cmd_daily(args):
+    tasks = load_tasks()
+    today = date.today().isoformat()
+    daily_tasks = [t for t in tasks if t.due_date == today and not t.completed]
+    overdue_tasks = [t for t in tasks if t.due_date and t.due_date < today and not t.completed]
+    print("Daily View")
+    print("=========")
+    print(f"\nDue Today ({today}):")
+    if daily_tasks:
+        for t in daily_tasks:
+            print(f"  - {t.description} [{t.id}]")
+    else:
+        print("  (none)")
+
+    print(f"\nOverdue:")
+    if overdue_tasks:
+        for t in overdue_tasks:
+            print(f"  - {t.description} (due {t.due_date}) [{t.id}]")
+    else:
+        print("  (none)")
+
+
+def cmd_serve(args):
+    port = args.port
+    from .web import app
+    import uvicorn
+    print(f"Starting Todo server on http://0.0.0.0:{port}")
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    except KeyboardInterrupt:
+        print("\nServer stopped by user.")
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"Error: Port {port} is already in use.")
+            sys.exit(1)
+        else:
+            raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Todo Application")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    subparsers.add_parser("list", help="List all tasks")
+
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("description", type=str, help="Task description")
+    add_parser.add_argument("--due", type=str, default=None, help="Due date (YYYY-MM-DD)")
+
+    toggle_parser = subparsers.add_parser("toggle", help="Toggle task completion")
+    toggle_parser.add_argument("id", type=str, help="Task ID")
+
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("id", type=str, help="Task ID")
+
+    subparsers.add_parser("daily", help="Show daily summary")
+
+    serve_parser = subparsers.add_parser("serve", help="Start the web server")
+    serve_parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
+
+    args = parser.parse_args()
+
+    if args.command == "list":
+        cmd_list(args)
+    elif args.command == "add":
+        cmd_add(args)
+    elif args.command == "toggle":
+        cmd_toggle(args)
+    elif args.command == "delete":
+        cmd_delete(args)
+    elif args.command == "daily":
+        cmd_daily(args)
+    elif args.command == "serve":
+        cmd_serve(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```python
+# todo/web.py
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from .storage import load_tasks, save_tasks
+from .models import Task
+from datetime import date
+from html import escape
+
+app = FastAPI()
+
+
+def render_page(tasks, filter_type="all"):
+    if filter_type == "active":
+        tasks = [t for t in tasks if not t.completed]
+    elif filter_type == "completed":
+        tasks = [t for t in tasks if t.completed]
+    elif filter_type == "daily":
+        today = date.today().isoformat()
+        tasks = [t for t in tasks if t.due_date == today and not t.completed]
+
+    rows_html = ""
+    for t in tasks:
+        safe_desc = escape(t.description)
+        due_cell = f"<td>{escape(t.due_date)}</td>" if t.due_date else "<td>-</td>"
+        status_class = "completed" if t.completed else ""
+        completed_cell = f"

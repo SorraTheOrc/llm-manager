@@ -9,11 +9,22 @@ To run manually when tts-server is running:
   pytest proxy/tests/test_tts_integration.py -v
 """
 
+import os
+
 import httpx
 import pytest
 from proxy.server import app
 
 pytestmark = pytest.mark.tts_integration
+
+# These tests exercise the LIVE tts-server (localhost:8081), which shares the
+# GPU with llama-server. They are opt-in and disabled by default so a routine
+# `pytest` run never touches running services (see LP-0MS6R13CP009VO24).
+if os.getenv("RUN_LIVE_TTS", "0") != "1":
+    pytest.skip(
+        "live TTS integration tests are disabled; set RUN_LIVE_TTS=1 to run on demand",
+        allow_module_level=True,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers

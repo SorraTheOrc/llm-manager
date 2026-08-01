@@ -1,0 +1,317 @@
+# Benchmark: slot_count=4  session=1  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 386s  Tokens: 2605  TPS: 22.1
+# ============================================================
+
+Here's a complete, production-ready implementation following your requirements. The code is split into two files: `todo_cli.py` (main application) and `test_todo_cli.py` (unit tests).
+
+### 📁 `todo_cli.py`
+```python
+"""
+todo_cli.py - A simple CLI To-Do application with JSON storage.
+
+Usage:
+    python todo_cli.py add <title>
+    python todo_cli.py list [--filter all|active|completed]
+    python todo_cli.py complete <id>
+    python todo_cli.py delete <id>
+    python todo_cli.py help
+"""
+
+from __future__ import annotations
+
+import json
+import argparse
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List
+
+
+@dataclass
+class Task:
+    """Represents a single to-do task."""
+    id: int
+    title: str
+    completed: bool = False
+
+
+class TodoManager:
+    """Manages task CRUD operations using a JSON file for persistence."""
+
+    def __init__(self, db_path: str = "tasks.json"):
+        self.db_path = Path(db_path)
+        self._initialize_db()
+
+    def _initialize_db(self) -> None:
+        if not self.db_path.exists():
+            self._save({"tasks": [], "next_id": 1})
+
+    def _load(self) -> dict:
+        if not self.db_path.exists():
+            return {"tasks": [], "next_id": 1}
+        try:
+            with open(self.db_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if not isinstance(data, dict) or "tasks" not in data or "next_id" not in data:
+                    raise ValueError("Invalid database format.")
+                return data
+        except json.JSONDecodeError:
+            raise RuntimeError("Corrupted database file. Please fix or delete it.")
+
+    def _save(self, data: dict) -> None:
+        with open(self.db_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def add_task(self, title: str) -> int:
+        """Add a new task and return its auto-incremented ID."""
+        if not title or not title.strip():
+            raise ValueError("Task title cannot be empty.")
+        
+        data = self._load()
+        new_id = data["next_id"]
+        data["tasks"].append(Task(id=new_id, title=title.strip(), completed=False))
+        data["next_id"] = new_id + 1
+        self._save(data)
+        return new_id
+
+    def list_tasks(self, status: str = "all") -> List[Task]:
+        """List tasks filtered by status: 'all', 'active', or 'completed'."""
+        data = self._load()
+        tasks = [Task(**t) for t in data["tasks"]]
+        
+        if status == "active":
+            return [t for t in tasks if not t.completed]
+        elif status == "completed":
+            return [t for t in tasks if t.completed]
+        return tasks
+
+    def complete_task(self, task_id: int) -> bool:
+        """Mark a task as completed. Returns True if found, else False."""
+        data = self._load()
+        for i, task_data in enumerate(data["tasks"]):
+            if task_data["id"] == task_id:
+                data["tasks"][i]["completed"] = True
+                self._save(data)
+                return True
+        return False
+
+    def delete_task(self, task_id: int) -> bool:
+        """Delete a task by ID. Returns True if found, else False."""
+        data = self._load()
+        original_len = len(data["tasks"])
+        data["tasks"] = [t for t in data["tasks"] if t["id"] != task_id]
+        
+        if len(data["tasks"]) == original_len:
+            return False
+        self._save(data)
+        return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple CLI To-Do application with JSON storage.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  todo add "Buy groceries"
+  todo list
+  todo list --filter active
+  todo complete 1
+  todo delete 1
+        """
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # help command
+    subparsers.add_parser("help", help="Show usage information")
+
+    # add command
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", type=str, help="Title of the task")
+
+    # list command
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument(
+        "-f", "--filter",
+        choices=["all", "active", "completed"],
+        default="all",
+        help="Filter tasks by status (default: all)"
+    )
+
+    # complete command
+    complete_parser = subparsers.add_parser("complete", help="Mark a task as completed")
+    complete_parser.add_argument("task_id", type=int, help="ID of the task to complete")
+
+    # delete command
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("task_id", type=int, help="ID of the task to delete")
+
+    args = parser.parse_args()
+
+    if args.command == "help" or not args.command:
+        parser.print_help()
+        return
+
+    manager = TodoManager()
+
+    try:
+        if args.command == "add":
+            task_id = manager.add_task(args.title)
+            print(f"✅ Task added with ID: {task_id}")
+        elif args.command == "list":
+            tasks = manager.list_tasks(args.filter)
+            if not tasks:
+                print("No tasks found.")
+            else:
+                print(f"{'ID':<5} | {'Status':<10} | {'Title'}")
+                print("-" * 40)
+                for t in tasks:
+                    status = "✅ Done" if t.completed else "⏳ Pending"
+                    print(f"{t.id:<5} | {status:<10} | {t.title}")
+        elif args.command == "complete":
+            if manager.complete_task(args.task_id):
+                print(f"✅ Task {args.task_id} marked as completed.")
+            else:
+                print(f"❌ Task with ID {args.task_id} not found.")
+        elif args.command == "delete":
+            if manager.delete_task(args.task_id):
+                print(f"🗑️ Task {args.task_id} deleted.")
+            else:
+                print(f"❌ Task with ID {args.task_id} not found.")
+    except ValueError as e:
+        print(f"❌ Input error: {e}")
+    except RuntimeError as e:
+        print(f"❌ Database error: {e}")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 🧪 `test_todo_cli.py`
+```python
+"""Unit tests for todo_cli module."""
+
+import json
+import pytest
+from pathlib import Path
+from todo_cli import TodoManager, Task
+
+
+class TestTodoManager:
+    """Tests for the TodoManager CRUD operations."""
+
+    def setup_method(self, tmp_path: Path):
+        self.db_path = tmp_path / "test_tasks.json"
+        self.manager = TodoManager(db_path=str(self.db_path))
+
+    # --- ADD ---
+    def test_add_task(self):
+        task_id = self.manager.add_task("Buy milk")
+        assert task_id == 1
+        tasks = self.manager.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].title == "Buy milk"
+        assert tasks[0].completed is False
+
+    def test_add_task_with_whitespace_only_raises(self):
+        with pytest.raises(ValueError, match="cannot be empty"):
+            self.manager.add_task("   ")
+
+    def test_add_task_auto_increments_id(self):
+        id1 = self.manager.add_task("Task 1")
+        id2 = self.manager.add_task("Task 2")
+        assert id2 == id1 + 1
+
+    # --- LIST ---
+    def test_list_tasks_all(self):
+        self.manager.add_task("Task 1")
+        self.manager.add_task("Task 2")
+        tasks = self.manager.list_tasks("all")
+        assert len(tasks) == 2
+
+    def test_list_tasks_active(self):
+        self.manager.add_task("Task 1")
+        self.manager.add_task("Task 2")
+        self.manager.complete_task(1)
+        active = self.manager.list_tasks("active")
+        assert len(active) == 1
+        assert active[0].id == 2
+
+    def test_list_tasks_completed(self):
+        self.manager.add_task("Task 1")
+        self.manager.complete_task(1)
+        completed = self.manager.list_tasks("completed")
+        assert len(completed) == 1
+        assert completed[0].completed is True
+
+    # --- COMPLETE ---
+    def test_complete_task(self):
+        tid = self.manager.add_task("Task 1")
+        assert self.manager.complete_task(tid) is True
+        tasks = self.manager.list_tasks()
+        assert tasks[0].completed is True
+
+    def test_complete_task_not_found(self):
+        assert self.manager.complete_task(999) is False
+
+    # --- DELETE ---
+    def test_delete_task(self):
+        tid = self.manager.add_task("Task 1")
+        assert self.manager.delete_task(tid) is True
+        assert len(self.manager.list_tasks()) == 0
+
+    def test_delete_task_not_found(self):
+        assert self.manager.delete_task(999) is False
+
+    # --- PERSISTENCE & ERROR HANDLING ---
+    def test_persistence_across_instances(self, tmp_path: Path):
+        self.manager.add_task("Persistent task")
+        fresh_manager = TodoManager(db_path=str(self.db_path))
+        tasks = fresh_manager.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].title == "Persistent task"
+
+    def test_corrupted_json_raises_runtime_error(self, tmp_path: Path):
+        db_path = tmp_path / "corrupted.json"
+        db_path.write_text("{ invalid json }")
+        manager = TodoManager(db_path=str(db_path))
+        with pytest.raises(RuntimeError, match="Corrupted database"):
+            manager.list_tasks()
+```
+
+### 🚀 How to Run
+
+1. **Install pytest** (if not already installed):
+   ```bash
+   pip install pytest
+   ```
+
+2. **Run tests**:
+   ```bash
+   pytest test_todo_cli.py -v
+   ```
+
+3. **Use the CLI**:
+   ```bash
+   python todo_cli.py help
+   python todo_cli.py add "Learn Python CLI design"
+   python todo_cli.py list
+   python todo_cli.py complete 1
+   python todo_cli.py list --filter completed
+   python todo_cli.py delete 1
+   ```
+
+### ✅ Design Highlights
+- **Modular Architecture**: `TodoManager` handles all business logic and storage. It can be imported and used programmatically without invoking the CLI.
+- **Type Safety**: Full type hints for parameters and return types. Uses `dataclass` for clean task representation.
+- **Robust Error Handling**: Validates inputs, catches JSON corruption, and provides clear CLI error messages.
+- **Test-Driven**: Comprehensive `pytest` suite covering all CRUD operations, edge cases, persistence, and failure modes.
+- **Zero Dependencies**: Uses only Python standard library modules (`json`, `argparse`, `pathlib`, `dataclasses`).

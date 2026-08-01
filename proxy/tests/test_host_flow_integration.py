@@ -74,7 +74,7 @@ class TestHostFlowMocked:
         monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
         call_count = 0
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             nonlocal call_count
             call_count += 1
             if "start-llama.sh" in cmd[0]:
@@ -94,7 +94,7 @@ class TestHostFlowMocked:
         monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
         call_count = 0
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             nonlocal call_count
             call_count += 1
             if "podman" in cmd[0] or call_count > 1:
@@ -130,7 +130,7 @@ class TestHostFlowMocked:
         monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
         host_cmds = []
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             if "start-llama.sh" in cmd[0]:
                 host_cmds.append(cmd)
                 return FakeProc()
@@ -153,7 +153,7 @@ class TestHostFlowMocked:
         monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
         cmds = []
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             cmds.append(cmd[0])
             return FakeProc()
 
@@ -170,7 +170,7 @@ class TestHostFlowMocked:
         monkeypatch.setattr(lifecycle, "_srv", lambda: dummy)
         monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
 
-        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None):
+        def fake_popen(cmd, env=None, stdout=None, stderr=None, text=None, start_new_session=False):
             if "start-llama.sh" in cmd[0]:
                 return FakeProc()
             raise FileNotFoundError(cmd[0])

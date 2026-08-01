@@ -1,0 +1,59 @@
+# Benchmark: slot_count=1  session=4  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 302s  Tokens: 341  TPS: 1.6
+# ============================================================
+
+We'll implement a complete to‑do application with both CLI and a lightweight web UI (FastAPI). The project is structured as a Python package `todo` with modules for storage, CLI, web UI, and tests.
+
+## Project Structure
+
+```
+todo/
+├── __init__.py
+├── storage.py      # JSON file-based storage
+├── cli.py          # Command-line interface (add, list, toggle, delete, daily, serve)
+├── web.py          # FastAPI web application
+└── test_web.py     # Tests for web routes
+```
+
+## Implementation
+
+### storage.py
+
+Stores tasks in a JSON file (default `~/.todo.json`). Provides CRUD operations and a daily summary function.
+
+```python
+import json
+import os
+from datetime import date, datetime
+from typing import Optional
+
+TASKS_FILE = os.path.expanduser("~/.todo.json")
+
+def load_tasks():
+    if not os.path.exists(TASKS_FILE):
+        return []
+    with open(TASKS_FILE, "r") as f:
+        return json.load(f)
+
+def save_tasks(tasks):
+    with open(TASKS_FILE, "w") as f:
+        json.dump(tasks, f, indent=2)
+
+def next_id(tasks):
+    return max([t["id"] for t in tasks], default=0) + 1
+
+def add_task(title: str, due_date: Optional[str] = None):
+    tasks = load_tasks()
+    new_task = {
+        "id": next_id(tasks),
+        "title": title,
+        "done": False,
+        "created_at": datetime.now().isoformat(),
+        "due_date": due_date
+    }
+    tasks.append(new

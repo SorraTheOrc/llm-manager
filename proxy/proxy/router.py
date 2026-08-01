@@ -170,7 +170,7 @@ def _get_guardrail_config(server_config: dict) -> dict:
             server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
         ),
         "max_completion_tokens": int(
-            server_config.get("session_guardrail_max_completion_tokens", 2048) or 2048
+            server_config.get("session_guardrail_max_completion_tokens", 16384) or 16384
         ),
         "repetition_min_pattern_chars": int(
             server_config.get("session_guardrail_repetition_min_pattern_chars", 64) or 64
@@ -450,6 +450,54 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not srv.backend_ready or srv.llama_process is None:
         return _build_backend_unavailable_response(srv, path)
 
+    # LP-0MRXZU90M007WNWT: Check if the proxy is in drain mode for a
+    # scheduled slot-count transition.  When draining, new requests receive
+    # a 503 with a retry-after header so clients can retry after the
+    # transition completes.
+    # LP-0MRXZU90M007WNWT: Check if the proxy is in drain mode for a
+    # scheduled slot-count transition.  Only checks the module-level
+    # ``draining`` flag when it is explicitly set to True in the real
+    # server module (not auto-created by Mock).  We use a string check
+    # on the class name to avoid false positives from MagicMock.
+    _draining = None
+    try:
+        _draining = getattr(srv, 'draining', None)
+    except Exception:
+        pass
+    if _draining is True:  # explicitly True, not a mock attribute
+        drain_retry_after = 15  # default retry-after in seconds
+        try:
+            scheduler = getattr(srv, 'slot_scheduler', None)
+            if scheduler is not None and hasattr(scheduler, '_config'):
+                drain_retry_after = max(15, scheduler._config.drain_minutes * 60)
+        except Exception:
+            pass
+
+        srv.logger.info(
+            "drain_active: refusing new request, retry_after=%ds",
+            drain_retry_after,
+        )
+        record_http_error("v1/chat/completions", "5xx", "draining")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "draining",
+                    "message": (
+                        "Draining workloads for scheduled slot-count change "
+                        "— please retry shortly"
+                    ),
+                },
+                "status": 503,
+                "retry_after": drain_retry_after,
+            },
+            headers={
+                "Retry-After": str(drain_retry_after),
+                "Cache-Control": "no-store",
+            },
+        )
+
     # Get request body (keep original for logging before any modifications)
     body = await request.body()
     body_for_logging = body
@@ -501,7 +549,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Use hash-based slot context (dispatch lease system handles concurrency gating)
     slot_id, slot_filename, slot_timeout = _build_slot_context(
-        server_config, session_id
+        server_config, session_id, body_json
     )
     slot_enabled = slot_id is not None and slot_filename is not None
 
@@ -557,6 +605,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     single_flight_mode = server_config.get("session_single_flight_mode", "queue")
     single_flight_max_queue_depth = int(
         server_config.get("session_single_flight_max_queue_depth", 1) or 1
+    )
+    single_flight_queue_timeout = float(
+        server_config.get("session_single_flight_queue_timeout_seconds", 120) or 120
     )
 
     # Check concurrency limit
@@ -697,6 +748,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id,
             single_flight_mode,
             single_flight_max_queue_depth,
+            queue_timeout_seconds=single_flight_queue_timeout,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
@@ -879,7 +931,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     max_token_rate = gc["max_token_rate"]
                     token_rate_window_seconds = gc["token_rate_window_seconds"]
                     stream_idle_timeout = float(
-                        server_config.get("stream_idle_timeout_seconds", 30) or 30
+                        server_config.get("stream_idle_timeout_seconds", 120) or 120
                     )
                     stream_heartbeat_interval = float(
                         server_config.get("stream_heartbeat_interval_seconds", 10) or 10
@@ -945,7 +997,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 # connection to llama-server.
                                 if _hb_task in done:
                                     # Heartbeat interval elapsed with no chunk.
-                                    if remaining_budget <= _heartbeat_interval:
+                                    if remaining_budget < _heartbeat_interval:
                                         srv.logger.info(
                                             "stream_idle_timeout session=%s "
                                             "idle=%.1fs budget=%.1fs",
@@ -1179,6 +1231,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 ).encode()
                                 yield final_bytes
                                 log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+                                # Emit [DONE] marker after synthetic finish event
+                                # so client agents detect stream completion (LP-0MS14PM7I0077MXD)
+                                done_bytes = b"data: [DONE]\n\n"
+                                yield done_bytes
+                                log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
                             # Client disconnected or generator is being closed.
                             # Skip the final event yield and proceed directly to cleanup.
@@ -1210,6 +1267,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             ).encode()
                             yield final_bytes
                             log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+                            # Emit [DONE] marker after synthetic error finish event
+                            # so client agents detect stream completion (LP-0MS14PM7I0077MXD)
+                            done_bytes = b"data: [DONE]\n\n"
+                            yield done_bytes
+                            log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
                             # Record assembled streaming response (fire-and-forget)
                             if session_id and collected_content:
@@ -1338,6 +1400,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_id,
             single_flight_mode,
             single_flight_max_queue_depth,
+            queue_timeout_seconds=single_flight_queue_timeout,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:

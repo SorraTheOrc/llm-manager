@@ -6,6 +6,7 @@ Uses lazy server import (_srv()) to avoid circular imports.
 """
 
 import asyncio
+import httpx
 import json
 from pathlib import Path
 
@@ -14,9 +15,11 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from proxy.lifecycle import _extract_router_model_ids
+from proxy.observability import _build_llama_url, _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
 from proxy.router_helpers import _get_per_model_queries
+from proxy.session_recorder import MAX_SESSION_DROPDOWN_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +251,41 @@ async def status_events():
 
             per_model_queries = await _get_per_model_queries(srv)
 
+            # --- Per-slot data query (best-effort) ---
+            slot_details = []
+            if llama_status.get("llama_server_running"):
+                try:
+                    server_cfg = srv.config.get("server", {})
+                    llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                    model_name = srv.current_model or None
+                    # 5s timeout: llama-server may be slow to respond
+                    # to /slots when busy generating tokens.
+                    slot_details = await _query_slots_detail(
+                        llama_port, timeout=5.0, model=model_name,
+                    )
+                except Exception:
+                    pass
+            # Preserve last known slot data when query fails or llama-server
+            # is too busy to respond (ReadTimeout during token generation).
+            # Use the shared module-level cache from _periodic_broadcast_loop()
+            # so that a page-reload during a busy generation still shows real data.
+            # Read llama-server log for supplemental progress data so the
+            # initial SSE payload shows real token counts even when /slots
+            # endpoint is unresponsive during busy generation.
+            from proxy.observability import (
+                _last_slot_details_cache as _slot_cache,
+                _update_slot_progress_from_log,
+                _enrich_slot_details_with_progress,
+            )
+            _update_slot_progress_from_log()
+            if slot_details:
+                # In-place update is fine because we're extending the list variable
+                _slot_cache.clear()
+                _slot_cache.extend(slot_details)
+            else:
+                slot_details = list(_slot_cache)
+            _enrich_slot_details_with_progress(slot_details, srv=srv)
+
             initial_status = json.dumps({
                 "type": "status",
                 "current_model": srv.current_model,
@@ -258,6 +296,7 @@ async def status_events():
                 "total_sent": total_sent,
                 "total_recv": total_recv,
                 "per_model_queries": per_model_queries,
+                "slots": slot_details,
             })
             yield f"data: {initial_status}\n\n"
 
@@ -1014,6 +1053,12 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
     # Sort all sessions by last_activity descending — the most recently updated
     # session appears at the top regardless of active/inactive status.
     merged.sort(key=lambda s: s.get("last_activity", s.get("response_time", "")), reverse=True)
+
+    # Limit to MAX_SESSION_DROPDOWN_COUNT most recently updated sessions to
+    # prevent the web UI dropdown from being overwhelmed by hundreds of stale
+    # sessions. This is the definitive limit point — it ensures the API response
+    # never exceeds this count regardless of how many live or recorded sessions exist.
+    merged = merged[:MAX_SESSION_DROPDOWN_COUNT]
 
     result = {"sessions": merged, "count": len(merged)}
     if model_filter:

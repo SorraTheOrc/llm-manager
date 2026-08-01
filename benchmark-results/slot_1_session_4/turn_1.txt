@@ -1,0 +1,339 @@
+# Benchmark: slot_count=1  session=4  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 22s  Tokens: 2911  TPS: 189.2
+# ============================================================
+
+```python
+#!/usr/bin/env python3
+"""
+todo.py - A simple CLI to-do application with JSON file storage.
+
+Usage:
+    todo add <title>
+    todo list
+    todo complete <id>
+    todo delete <id>
+    todo help
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import List, Dict, Any
+
+# Default storage file location
+DEFAULT_FILE = "tasks.json"
+
+
+def get_filepath() -> str:
+    """Return the file path from environment variable or default."""
+    return os.environ.get("TODO_FILE", DEFAULT_FILE)
+
+
+def load_tasks(filepath: str) -> List[Dict[str, Any]]:
+    """Load tasks from JSON file. Returns [] if file does not exist."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            else:
+                return []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_tasks(tasks: List[Dict[str, Any]], filepath: str) -> None:
+    """Save tasks list to JSON file."""
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=2)
+
+
+def next_id(tasks: List[Dict[str, Any]]) -> int:
+    """Return next free ID (max existing ID + 1). Returns 1 if list empty."""
+    if not tasks:
+        return 1
+    return max(task["id"] for task in tasks) + 1
+
+
+def add_task(title: str, filepath: str) -> Dict[str, Any]:
+    """Add a new task with given title. Returns the created task."""
+    tasks = load_tasks(filepath)
+    task = {
+        "id": next_id(tasks),
+        "title": title.strip(),
+        "completed": False,
+    }
+    tasks.append(task)
+    save_tasks(tasks, filepath)
+    return task
+
+
+def list_tasks(filepath: str) -> List[Dict[str, Any]]:
+    """Return all tasks from storage."""
+    return load_tasks(filepath)
+
+
+def complete_task(task_id: int, filepath: str) -> bool:
+    """Mark a task as completed. Returns True if task was found."""
+    tasks = load_tasks(filepath)
+    for task in tasks:
+        if task["id"] == task_id:
+            task["completed"] = True
+            save_tasks(tasks, filepath)
+            return True
+    return False
+
+
+def delete_task(task_id: int, filepath: str) -> bool:
+    """Delete a task by ID. Returns True if task was found and removed."""
+    tasks = load_tasks(filepath)
+    new_tasks = [task for task in tasks if task["id"] != task_id]
+    if len(new_tasks) == len(tasks):
+        return False
+    save_tasks(new_tasks, filepath)
+    return True
+
+
+def print_help() -> None:
+    """Display usage information."""
+    print(__doc__)
+
+
+def format_task_list(tasks: List[Dict[str, Any]]) -> str:
+    """Return a formatted string of tasks for display."""
+    if not tasks:
+        return "No tasks found."
+    lines = []
+    for task in tasks:
+        status = "[x]" if task["completed"] else "[ ]"
+        lines.append(f"{task['id']}. {status} {task['title']}")
+    return "\n".join(lines)
+
+
+def main(args: List[str] = None) -> None:
+    """Main entry point for CLI."""
+    parser = argparse.ArgumentParser(
+        description="Simple To-Do application.",
+        add_help=False,
+    )
+    parser.add_argument("command", nargs="?", help="Command: add, list, complete, delete, help")
+    parser.add_argument("argument", nargs="?", help="Task title or ID")
+    parser.add_argument("extra", nargs="*", help="Additional arguments (ignored)")
+
+    parsed = parser.parse_args(args)
+
+    cmd = parsed.command
+    filepath = get_filepath()
+
+    if cmd == "add":
+        if not parsed.argument:
+            print("Error: 'add' requires a title.", file=sys.stderr)
+            sys.exit(1)
+        task = add_task(parsed.argument, filepath)
+        print(f"Added task {task['id']}: {task['title']}")
+
+    elif cmd == "list":
+        tasks = list_tasks(filepath)
+        print(format_task_list(tasks))
+
+    elif cmd == "complete":
+        if not parsed.argument or not parsed.argument.isdigit():
+            print("Error: 'complete' requires a numeric task ID.", file=sys.stderr)
+            sys.exit(1)
+        task_id = int(parsed.argument)
+        if complete_task(task_id, filepath):
+            print(f"Task {task_id} completed.")
+        else:
+            print(f"Error: Task {task_id} not found.", file=sys.stderr)
+            sys.exit(1)
+
+    elif cmd == "delete":
+        if not parsed.argument or not parsed.argument.isdigit():
+            print("Error: 'delete' requires a numeric task ID.", file=sys.stderr)
+            sys.exit(1)
+        task_id = int(parsed.argument)
+        if delete_task(task_id, filepath):
+            print(f"Task {task_id} deleted.")
+        else:
+            print(f"Error: Task {task_id} not found.", file=sys.stderr)
+            sys.exit(1)
+
+    elif cmd == "help" or cmd is None:
+        print_help()
+        if cmd is None:
+            print("\n(No command given. Use 'todo help' for usage.)")
+
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```python
+# tests/test_todo.py
+"""
+Unit tests for todo.py CRUD operations.
+Uses temporary files to avoid modifying real data.
+"""
+
+import json
+import os
+import pytest
+from pathlib import Path
+from todo import (
+    add_task,
+    list_tasks,
+    complete_task,
+    delete_task,
+    load_tasks,
+    save_tasks,
+    next_id,
+    format_task_list,
+)
+
+
+@pytest.fixture
+def tmp_file(tmp_path: Path) -> str:
+    """Return a temporary file path for testing."""
+    return str(tmp_path / "test_tasks.json")
+
+
+def test_add_increments_id(tmp_file: str):
+    """Adding tasks should produce sequential IDs."""
+    task1 = add_task("First task", tmp_file)
+    task2 = add_task("Second task", tmp_file)
+
+    assert task1["id"] == 1
+    assert task2["id"] == 2
+    assert task1["title"] == "First task"
+    assert not task1["completed"]
+
+
+def test_list_empty(tmp_file: str):
+    """List should return empty list when no tasks exist."""
+    assert list_tasks(tmp_file) == []
+
+
+def test_list_after_add(tmp_file: str):
+    """List should contain added tasks."""
+    add_task("Task A", tmp_file)
+    add_task("Task B", tmp_file)
+    tasks = list_tasks(tmp_file)
+    assert len(tasks) == 2
+
+
+def test_complete_existing(tmp_file: str):
+    """Complete should mark task as completed and return True."""
+    add_task("Task to complete", tmp_file)
+    result = complete_task(1, tmp_file)
+    assert result is True
+    tasks = load_tasks(tmp_file)
+    assert tasks[0]["completed"] is True
+
+
+def test_complete_nonexistent(tmp_file: str):
+    """Complete on missing ID should return False."""
+    result = complete_task(99, tmp_file)
+    assert result is False
+
+
+def test_delete_existing(tmp_file: str):
+    """Delete should remove task and return True."""
+    add_task("Task to delete", tmp_file)
+    result = delete_task(1, tmp_file)
+    assert result is True
+    tasks = load_tasks(tmp_file)
+    assert tasks == []
+
+
+def test_delete_nonexistent(tmp_file: str):
+    """Delete on missing ID should return False."""
+    result = delete_task(99, tmp_file)
+    assert result is False
+
+
+def test_next_id_empty():
+    """next_id should return 1 for empty list."""
+    assert next_id([]) == 1
+
+
+def test_next_id_nonempty():
+    """next_id should return max(id)+1."""
+    tasks = [{"id": 5, "title": "x", "completed": False}]
+    assert next_id(tasks) == 6
+
+
+def test_format_task_list_empty():
+    """Empty list should produce 'No tasks found.'."""
+    assert format_task_list([]) == "No tasks found."
+
+
+def test_format_task_list_with_tasks():
+    """Formatted list should display tasks with status."""
+    tasks = [
+        {"id": 1, "title": "Buy milk", "completed": False},
+        {"id": 2, "title": "Write report", "completed": True},
+    ]
+    expected = "1. [ ] Buy milk\n2. [x] Write report"
+    assert format_task_list(tasks) == expected
+
+
+def test_save_and_load_roundtrip(tmp_file: str):
+    """Saving then loading should return identical data."""
+    original = [
+        {"id": 1, "title": "Test", "completed": False},
+    ]
+    save_tasks(original, tmp_file)
+    loaded = load_tasks(tmp_file)
+    assert loaded == original
+
+
+def test_load_missing_file(tmp_file: str):
+    """Loading a non-existent file should return []."""
+    assert load_tasks(tmp_file) == []
+
+
+def test_load_corrupt_file(tmp_file: str):
+    """Loading a file with invalid JSON should return []."""
+    with open(tmp_file, "w") as f:
+        f.write("not json")
+    assert load_tasks(tmp_file) == []
+```
+
+## Installation & Usage
+
+1. Save the first block as `todo.py` and the second as `tests/test_todo.py`.
+2. Run tests with `pytest tests/`.
+3. Use the CLI: `python todo.py add "Buy groceries"` or make it executable.
+4. Environment variable `TODO_FILE` can set a custom storage path; defaults to `tasks.json` in current directory.
+
+**Example session**:
+```
+$ python todo.py add "Learn Python"
+Added task 1: Learn Python
+$ python todo.py add "Write tests"
+Added task 2: Write tests
+$ python todo.py list
+1. [ ] Learn Python
+2. [ ] Write tests
+$ python todo.py complete 1
+Task 1 completed.
+$ python todo.py list
+1. [x] Learn Python
+2. [ ] Write tests
+$ python todo.py delete 2
+Task 2 deleted.
+$ python todo.py list
+1. [x] Learn Python
+```

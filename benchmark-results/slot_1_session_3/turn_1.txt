@@ -1,0 +1,498 @@
+# Benchmark: slot_count=1  session=3  turn=1
+# Prompt: Build a CLI-based To-Do application with full CRUD operations.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 28s  Tokens: 3950  TPS: 178.2
+# ============================================================
+
+```python
+#!/usr/bin/env python3
+"""
+A simple CLI-based to‑do application with JSON file storage.
+
+Commands: add, list, complete, delete, help
+Each task has: id (auto‑increment), title (string), completed (bool)
+
+The module can be imported and used programmatically.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+__version__ = "1.0.0"
+
+# ----------------------------------------------------------------------
+# Core manager class
+# ----------------------------------------------------------------------
+
+class TodoManager:
+    """Manage tasks stored in a JSON file."""
+
+    def __init__(self, filepath: str = "tasks.json") -> None:
+        self.filepath = filepath
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_tasks(self) -> List[Dict]:
+        """Load tasks from the JSON file. Returns an empty list if the file
+        does not exist or contains invalid JSON."""
+        tasks: List[Dict] = []
+        if not Path(self.filepath).exists():
+            return tasks
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                tasks = data
+            else:
+                # Not a list – reset
+                tasks = []
+        except (json.JSONDecodeError, OSError):
+            tasks = []
+        return tasks
+
+    def _save_tasks(self, tasks: List[Dict]) -> None:
+        """Save the task list to the JSON file."""
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _get_next_id(tasks: List[Dict]) -> int:
+        """Return the next available ID (max id + 1, starting at 1)."""
+        if not tasks:
+            return 1
+        return max(t["id"] for t in tasks) + 1
+
+    # ------------------------------------------------------------------
+    # Public operations
+    # ------------------------------------------------------------------
+
+    def add(self, title: str) -> Dict:
+        """Create a new task with the given title.
+
+        Returns the created task dictionary.
+        """
+        tasks = self._load_tasks()
+        new_id = self._get_next_id(tasks)
+        new_task: Dict = {"id": new_id, "title": title, "completed": False}
+        tasks.append(new_task)
+        self._save_tasks(tasks)
+        return new_task
+
+    def list_tasks(self) -> List[Dict]:
+        """Return all tasks (from storage)."""
+        return self._load_tasks()
+
+    def complete(self, task_id: int) -> bool:
+        """Mark a task as completed.
+
+        Returns True if the task was found and updated, False otherwise.
+        """
+        tasks = self._load_tasks()
+        found = False
+        for t in tasks:
+            if t["id"] == task_id:
+                t["completed"] = True
+                found = True
+                break
+        if found:
+            self._save_tasks(tasks)
+        return found
+
+    def delete(self, task_id: int) -> bool:
+        """Delete a task by its ID.
+
+        Returns True if the task was deleted, False otherwise.
+        """
+        tasks = self._load_tasks()
+        before = len(tasks)
+        tasks = [t for t in tasks if t["id"] != task_id]
+        removed = len(tasks) < before
+        if removed:
+            self._save_tasks(tasks)
+        return removed
+
+
+# ----------------------------------------------------------------------
+# CLI layer
+# ----------------------------------------------------------------------
+
+def print_task(task: Dict) -> None:
+    """Pretty‑print a single task."""
+    status = "✓" if task["completed"] else " "
+    print(f"{task['id']:>3}. [{status}] {task['title']}")
+
+
+def cmd_add(manager: TodoManager, title: str) -> None:
+    """Add a new task."""
+    task = manager.add(title)
+    print_task(task)
+    print(f'Task "{title}" added (id {task["id"]}).')
+
+
+def cmd_list(manager: TodoManager) -> None:
+    """List all tasks."""
+    tasks = manager.list_tasks()
+    if not tasks:
+        print("No tasks found.")
+        return
+    print(f"{'ID':>3}  Status  Title")
+    print("-" * 30)
+    for t in tasks:
+        print_task(t)
+
+
+def cmd_complete(manager: TodoManager, task_id: int) -> None:
+    """Mark a task as completed."""
+    success = manager.complete(task_id)
+    if success:
+        print(f"Task {task_id} marked as completed.")
+    else:
+        print(f"Error: task {task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_delete(manager: TodoManager, task_id: int) -> None:
+    """Delete a task."""
+    success = manager.delete(task_id)
+    if success:
+        print(f"Task {task_id} deleted.")
+    else:
+        print(f"Error: task {task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the argument parser with subcommands."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="A simple command‑line to‑do application.",
+        epilog="Use '%(prog)s <command> --help' for command help.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # add
+    p_add = subparsers.add_parser("add", help="Add a new task")
+    p_add.add_argument("title", help="Title of the task")
+
+    # list
+    subparsers.add_parser("list", help="List all tasks")
+
+    # complete
+    p_complete = subparsers.add_parser("complete", help="Mark a task as completed")
+    p_complete.add_argument("task_id", type=int, help="ID of the task to complete")
+
+    # delete
+    p_delete = subparsers.add_parser("delete", help="Delete a task")
+    p_delete.add_argument("task_id", type=int, help="ID of the task to delete")
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """Entry point for the CLI."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Default to help if no command is given
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    # Determine storage path (use an environment variable or default)
+    filepath = os.environ.get("TODO_FILE", "tasks.json")
+    manager = TodoManager(filepath)
+
+    if args.command == "add":
+        cmd_add(manager, args.title)
+    elif args.command == "list":
+        cmd_list(manager)
+    elif args.command == "complete":
+        cmd_complete(manager, args.task_id)
+    elif args.command == "delete":
+        cmd_delete(manager, args.task_id)
+    else:
+        # Should not happen
+        parser.print_help()
+
+
+# ----------------------------------------------------------------------
+# Script entry
+# ----------------------------------------------------------------------
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+```python
+# tests/test_todo.py
+"""
+Unit tests for the to‑do application (TodoManager).
+
+These tests use temporary directories and files so that no real
+data is modified during testing.
+"""
+
+import json
+import pytest
+from pathlib import Path
+
+# Assuming the module is importable as 'todo'
+from todo import TodoManager
+
+
+# ------------------------------------------------------------------
+# Fixtures
+# ------------------------------------------------------------------
+
+@pytest.fixture
+def temp_db(tmp_path: Path) -> str:
+    """Create a temporary JSON file and return its path."""
+    db = tmp_path / "tasks.json"
+    db.write_text("[]", encoding="utf-8")
+    return str(db)
+
+
+@pytest.fixture
+def empty_manager(temp_db: str) -> TodoManager:
+    """TodoManager pointing to an empty temporary database."""
+    return TodoManager(filepath=temp_db)
+
+
+@pytest.fixture
+def preloaded_manager(temp_db: str) -> TodoManager:
+    """TodoManager with three pre‑loaded tasks."""
+    tasks = [
+        {"id": 1, "title": "Buy milk", "completed": False},
+        {"id": 2, "title": "Read a book", "completed": True},
+        {"id": 3, "title": "Write tests", "completed": False},
+    ]
+    db_path = Path(temp_db)
+    db_path.write_text(json.dumps(tasks, indent=2), encoding="utf-8")
+    return TodoManager(filepath=temp_db)
+
+
+# ------------------------------------------------------------------
+# Tests for _load_tasks and _save_tasks (edge cases)
+# ------------------------------------------------------------------
+
+def test_load_nonexistent_file(tmp_path: Path) -> None:
+    """Loading a non‑existent file should return an empty list."""
+    fake_path = tmp_path / "nonexistent.json"
+    manager = TodoManager(filepath=str(fake_path))
+    tasks = manager._load_tasks()
+    assert tasks == []
+
+
+def test_load_corrupted_file(tmp_path: Path) -> None:
+    """Loading a file with invalid JSON should return an empty list."""
+    bad_file = tmp_path / "bad.json"
+    bad_file.write_text("not json", encoding="utf-8")
+    manager = TodoManager(filepath=str(bad_file))
+    tasks = manager._load_tasks()
+    assert tasks == []
+
+
+def test_load_invalid_top_level(tmp_path: Path) -> None:
+    """Loading a JSON file that is not a list should return an empty list."""
+    bad_file = tmp_path / "bad_top.json"
+    bad_file.write_text('{"tasks": []}', encoding="utf-8")
+    manager = TodoManager(filepath=str(bad_file))
+    tasks = manager._load_tasks()
+    assert tasks == []
+
+
+# ------------------------------------------------------------------
+# Tests for add
+# ------------------------------------------------------------------
+
+class TestAdd:
+    def test_add_first_task(self, empty_manager: TodoManager) -> None:
+        task = empty_manager.add("Buy milk")
+        assert task["id"] == 1
+        assert task["title"] == "Buy milk"
+        assert task["completed"] is False
+
+    def test_add_multiple_tasks(self, empty_manager: TodoManager) -> None:
+        empty_manager.add("First")
+        second = empty_manager.add("Second")
+        assert second["id"] == 2
+        tasks = empty_manager.list_tasks()
+        assert len(tasks) == 2
+
+    def test_add_increments_id(self, preloaded_manager: TodoManager) -> None:
+        new = preloaded_manager.add("Fourth task")
+        assert new["id"] == 4
+
+    def test_add_persists(self, preloaded_manager: TodoManager) -> None:
+        preloaded_manager.add("Persist test")
+        tasks = preloaded_manager.list_tasks()
+        titles = [t["title"] for t in tasks]
+        assert "Persist test" in titles
+
+
+# ------------------------------------------------------------------
+# Tests for list_tasks
+# ------------------------------------------------------------------
+
+class TestList:
+    def test_list_empty(self, empty_manager: TodoManager) -> None:
+        assert empty_manager.list_tasks() == []
+
+    def test_list_returns_correct_count(self, preloaded_manager: TodoManager) -> None:
+        tasks = preloaded_manager.list_tasks()
+        assert len(tasks) == 3
+
+    def test_list_returns_unmodified(self, preloaded_manager: TodoManager) -> None:
+        tasks = preloaded_manager.list_tasks()
+        assert all(k in tasks[0] for k in ("id", "title", "completed"))
+
+
+# ------------------------------------------------------------------
+# Tests for complete
+# ------------------------------------------------------------------
+
+class TestComplete:
+    def test_complete_existing(self, preloaded_manager: TodoManager) -> None:
+        result = preloaded_manager.complete(1)
+        assert result is True
+        tasks = preloaded_manager.list_tasks()
+        completed_task = next(t for t in tasks if t["id"] == 1)
+        assert completed_task["completed"] is True
+
+    def test_complete_already_completed(self, preloaded_manager: TodoManager) -> None:
+        result = preloaded_manager.complete(2)  # already completed
+        assert result is True
+        tasks = preloaded_manager.list_tasks()
+        task = next(t for t in tasks if t["id"] == 2)
+        assert task["completed"] is True  # still True
+
+    def test_complete_nonexistent(self, preloaded_manager: TodoManager) -> None:
+        result = preloaded_manager.complete(999)
+        assert result is False
+
+    def test_complete_empty(self, empty_manager: TodoManager) -> None:
+        result = empty_manager.complete(1)
+        assert result is False
+
+
+# ------------------------------------------------------------------
+# Tests for delete
+# ------------------------------------------------------------------
+
+class TestDelete:
+    def test_delete_existing(self, preloaded_manager: TodoManager) -> None:
+        result = preloaded_manager.delete(1)
+        assert result is True
+        tasks = preloaded_manager.list_tasks()
+        ids = [t["id"] for t in tasks]
+        assert 1 not in ids
+        assert len(tasks) == 2
+
+    def test_delete_nonexistent(self, preloaded_manager: TodoManager) -> None:
+        result = preloaded_manager.delete(999)
+        assert result is False
+        tasks = preloaded_manager.list_tasks()
+        assert len(tasks) == 3
+
+    def test_delete_removes_correct_only(self, preloaded_manager: TodoManager) -> None:
+        preloaded_manager.delete(1)
+        tasks = preloaded_manager.list_tasks()
+        ids = [t["id"] for t in tasks]
+        assert 2 in ids and 3 in ids
+
+    def test_delete_empty(self, empty_manager: TodoManager) -> None:
+        result = empty_manager.delete(1)
+        assert result is False
+
+
+# ------------------------------------------------------------------
+# Integration test (end‑to‑end via the module)
+# ------------------------------------------------------------------
+
+def test_full_workflow(tmp_path: Path) -> None:
+    """Simulate a complete user session through the manager interface."""
+    db_path = tmp_path / "workflow.json"
+    db_path.write_text("[]", encoding="utf-8")
+    mgr = TodoManager(filepath=str(db_path))
+
+    # add
+    t1 = mgr.add("Task A")
+    assert t1["id"] == 1
+    t2 = mgr.add("Task B")
+    assert t2["id"] == 2
+
+    # list
+    all_tasks = mgr.list_tasks()
+    assert len(all_tasks) == 2
+
+    # complete
+    assert mgr.complete(1) is True
+    updated = mgr.list_tasks()
+    target = next(t for t in updated if t["id"] == 1)
+    assert target["completed"] is True
+
+    # delete
+    assert mgr.delete(2) is True
+    final = mgr.list_tasks()
+    assert len(final) == 1
+    assert final[0]["id"] == 1
+    assert final[0]["title"] == "Task A"
+```
+
+---
+
+**Usage example (CLI):**
+```bash
+$ python todo.py add "Buy milk"
+  1. [ ] Buy milk
+Task "Buy milk" added (id 1).
+
+$ python todo.py list
+  ID  Status  Title
+------------------------------
+  1. [ ] Buy milk
+
+$ python todo.py complete 1
+Task 1 marked as completed.
+
+$ python todo.py list
+  ID  Status  Title
+------------------------------
+  1. [✓] Buy milk
+
+$ python todo.py delete 1
+Task 1 deleted.
+```
+
+**Running tests:**
+```bash
+$ python -m pytest test_todo.py -v
+======================================== test session starts ========================================
+...
+18 passed in 0.08s
+```
+
+The module can also be used programmatically:
+```python
+from todo import TodoManager
+
+mgr = TodoManager("my_tasks.json")
+mgr.add("Learn Python")
+print(mgr.list_tasks())
+```

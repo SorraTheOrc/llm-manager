@@ -288,6 +288,29 @@ def _get_large_context_threshold(config: dict) -> int:
         return 0
 
 
+def _get_warm_cache_threshold(config: dict) -> int:
+    """Read the warm-cache total-context threshold from config.
+
+    When ``estimated_tokens`` exceeds this value, local is bypassed even
+    if the cache is warm (because total context is too large for the local
+    model slot).
+
+    Supports both nested and flat config keys for production and test
+    compatibility.  Config default: 100000.
+
+    Returns 0 when not configured (disabled).
+    """
+    val = config.get("local_large_context_warm_cache_threshold")
+    if val is None:
+        val = config.get("server", {}).get(
+            "local_large_context_warm_cache_threshold", 0
+        )
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
 async def _estimate_effective_prompt_tokens_for_routing(
     request,
     body_json: dict,
@@ -349,19 +372,32 @@ def _should_skip_local(
     body_json: dict,
     cold_cache_threshold: int,
     estimated_tokens: int | None = None,
+    warm_cache_threshold: int = 0,
 ) -> bool:
     """Determine whether a local provider should be skipped due to large context.
 
-    Uses the cached-tokens ratio from the last local response for this
-    (model, session) pair. If the ratio is < 1 (cache not fully warm)
-    and estimated tokens exceed the threshold, the local provider is
-    bypassed and the request routes to the next remote provider.
+    Implements a two-tier check:
+
+    1. **Warm-cache threshold (hard cap):** If ``estimated_tokens`` exceeds
+       ``warm_cache_threshold``, bypass local regardless of cache state.
+       This prevents routing excessively large total contexts to local even
+       when the cache is warm.
+
+    2. **Cold-cache new-token check:** Calculates the number of uncached
+       tokens: ``new_tokens = int(estimated_tokens * (1 - cached_ratio))``.
+       If ``new_tokens > cold_cache_threshold``, the prefill is too
+       expensive, so bypass local.  Otherwise route local.
+
+    This replaces the old binary ``ratio < 1.0`` check which was effectively
+    always true (there is always new content in a conversation), causing
+    every request above the threshold to bypass local even when the actual
+    prefill cost was trivial.
 
     A ratio of 0.0 (default for unknown sessions) means conservative
-    behavior: bypass if tokens exceed threshold.
+    behavior: bypass if new_tokens exceed threshold.
 
-    A ratio of 1.0 means the cache was fully warm on the last request,
-    so the local provider is always used regardless of context size.
+    A ratio of 1.0 means the cache was fully warm, so new_tokens = 0 and
+    local is always used (unless warm_cache_threshold blocks it).
 
     A threshold of 0 disables the bypass entirely.
 
@@ -371,6 +407,7 @@ def _should_skip_local(
         body_json: The parsed request body.
         cold_cache_threshold: Token threshold for bypass. 0 = disabled.
         estimated_tokens: Optional pre-computed estimate.
+        warm_cache_threshold: Hard cap on total context. 0 = disabled.
 
     Returns:
         True if local should be skipped, False for normal local routing.
@@ -379,12 +416,19 @@ def _should_skip_local(
         return False
     if estimated_tokens is None:
         estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
-    # If estimated tokens are below threshold, always route local
+
+    # Check 1: Warm-cache threshold (hard cap on total context)
+    if warm_cache_threshold > 0 and estimated_tokens > warm_cache_threshold:
+        return True
+
+    # If estimated tokens are below cold cache threshold, always route local
     if estimated_tokens <= cold_cache_threshold:
         return False
-    # Check cached-tokens ratio: only bypass if ratio < 1 (not fully warm)
+
+    # Check 2: Dynamic new-token calculation
     ratio = _get_cached_ratio(model_name, session_id)
-    return ratio < 1.0
+    new_tokens = int(estimated_tokens * (1 - ratio))
+    return new_tokens > cold_cache_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -1652,6 +1696,7 @@ async def proxy_with_fallback(
                 # local response instead of inferred cache-cold state.
                 _llama_model = provider_cfg.get("llama_model", "")
                 _cold_threshold = _get_large_context_threshold(config)
+                _warm_threshold = _get_warm_cache_threshold(config)
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,
@@ -1663,32 +1708,54 @@ async def proxy_with_fallback(
                 _multiplier = float(model_config.get("token_estimate_multiplier", 1.0))
                 if _multiplier != 1.0:
                     _estimated_tokens = int(_estimated_tokens * _multiplier)
+                # Compute once for reuse in logs and reason detection
+                _routing_cached_ratio = _get_cached_ratio(_llama_model, _session_id)
+                _routing_new_tokens = int(
+                    _estimated_tokens * (1 - _routing_cached_ratio)
+                )
                 logger.info(
                     "routing_check provider=%s model=%s "
-                    "estimated_tokens=%d threshold=%d messages=%d cached_ratio=%.2f",
+                    "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
+                    "new_tokens=%d cached_ratio=%.2f messages=%d",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
                     _cold_threshold,
+                    _warm_threshold,
+                    _routing_new_tokens,
+                    _routing_cached_ratio,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
-                    _get_cached_ratio(_llama_model, _session_id),
                 )
-                if _should_skip_local(
+                _skip_local = _should_skip_local(
                     _llama_model,
                     _session_id,
                     body_json,
                     _cold_threshold,
                     estimated_tokens=_estimated_tokens,
-                ):
+                    warm_cache_threshold=_warm_threshold,
+                )
+                if _skip_local:
+                    # Determine reason: warm_cache_threshold triggers when
+                    # estimated_tokens > warm_cache_threshold (total context
+                    # too large regardless of cache state).  Otherwise the
+                    # cold-cache new-token check triggered.
+                    if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
+                        _skip_reason = "warm_cache_bypass"
+                    else:
+                        _skip_reason = "large_context_bypass"
                     logger.info(
-                        "routing_skip_local provider=%s model=%s estimated_tokens=%d "
-                        "threshold=%d cached_ratio=%.2f "
-                        "→ skipping local, routing to next remote provider",
+                        "routing_skip_local provider=%s model=%s "
+                        "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
+                        "new_tokens=%d cached_ratio=%.2f "
+                        "reason=%s → skipping local, routing to next remote provider",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
                         _cold_threshold,
-                        _get_cached_ratio(_llama_model, _session_id),
+                        _warm_threshold,
+                        _routing_new_tokens,
+                        _routing_cached_ratio,
+                        _skip_reason,
                     )
                     _record_attempt(
                         attempts,
@@ -1696,9 +1763,13 @@ async def proxy_with_fallback(
                         type=provider_type,
                         status="cached_tokens_skip",
                         estimated_tokens=_estimated_tokens,
-                        threshold=_cold_threshold,
+                        cold_threshold=_cold_threshold,
+                        warm_threshold=_warm_threshold,
+                        new_tokens=_routing_new_tokens,
+                        cached_ratio=_routing_cached_ratio,
+                        reason=_skip_reason,
                     )
-                    fallback_reason = "large_context_bypass"
+                    fallback_reason = _skip_reason
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     continue

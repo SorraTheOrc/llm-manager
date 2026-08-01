@@ -1,0 +1,251 @@
+# Benchmark: slot_count=12  session=0  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 1896s  Tokens: 1796  TPS: 2.4
+# ============================================================
+
+# To-Do Application: Daily & Week Commands Implementation
+
+## Implementation
+
+### `todo.py`
+
+```python
+#!/usr/bin/env python3
+"""A simple CLI To-Do application with daily and weekly overview commands."""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Default storage file
+DEFAULT_STORAGE = os.path.expanduser("~/.todo_tasks.json")
+
+
+def load_tasks(storage_file=DEFAULT_STORAGE):
+    """Load tasks from storage file."""
+    if not os.path.exists(storage_file):
+        return []
+    try:
+        with open(storage_file, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def save_tasks(tasks, storage_file=DEFAULT_STORAGE):
+    """Save tasks to storage file."""
+    with open(storage_file, 'w') as f:
+        json.dump(tasks, f, indent=2)
+
+
+def add_task(args):
+    """Add a new task."""
+    tasks = load_tasks(args.storage_file)
+    
+    # Validate due date if provided
+    due_date = None
+    if args.due:
+        try:
+            due_date = datetime.strptime(args.due, '%Y-%m-%d').strftime('%Y-%m-%d')
+        except ValueError:
+            print("Error: Invalid date format. Use YYYY-MM-DD.")
+            sys.exit(1)
+    
+    task = {
+        'id': datetime.now().strftime('%Y%m%d%H%M%S%f'),
+        'title': args.title,
+        'due_date': due_date,
+        'completed': False,
+        'completed_date': None,
+        'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
+    tasks.append(task)
+    save_tasks(tasks, args.storage_file)
+    print(f"Added: {args.title}")
+    if due_date:
+        print(f"Due: {due_date}")
+
+
+def list_tasks(args):
+    """List all tasks."""
+    tasks = load_tasks(args.storage_file)
+    
+    if not tasks:
+        print("No tasks found.")
+        return
+    
+    # Filter by completion status if specified
+    if args.status == 'completed':
+        tasks = [t for t in tasks if t['completed']]
+    elif args.status == 'pending':
+        tasks = [t for t in tasks if not t['completed']]
+    
+    # Filter by due date if specified
+    if args.due_before:
+        tasks = [t for t in tasks if t['due_date'] and t['due_date'] <= args.due_before]
+    
+    if not tasks:
+        print("No matching tasks found.")
+        return
+    
+    print(f"{'ID':<12} {'Title':<30} {'Due':<12} {'Status':<10}")
+    print("-" * 64)
+    
+    for task in tasks:
+        status = "Done" if task['completed'] else "Pending"
+        due = task['due_date'] or "No due date"
+        print(f"{task['id']:<12} {task['title']:<30} {due:<12} {status:<10}")
+
+
+def complete_task(args):
+    """Mark a task as completed."""
+    tasks = load_tasks(args.storage_file)
+    found = False
+    
+    for task in tasks:
+        if task['id'] == args.id or task['title'] == args.id:
+            task['completed'] = True
+            task['completed_date'] = datetime.now().strftime('%Y-%m-%d')
+            found = True
+            print(f"Completed: {task['title']}")
+            break
+    
+    if not found:
+        print(f"Task not found: {args.id}")
+        sys.exit(1)
+    
+    save_tasks(tasks, args.storage_file)
+
+
+def delete_task(args):
+    """Delete a task."""
+    tasks = load_tasks(args.storage_file)
+    new_tasks = []
+    found = False
+    
+    for task in tasks:
+        if task['id'] == args.id or task['title'] == args.id:
+            found = True
+        else:
+            new_tasks.append(task)
+    
+    if not found:
+        print(f"Task not found: {args.id}")
+        sys.exit(1)
+    
+    save_tasks(new_tasks, args.storage_file)
+    print(f"Deleted task: {args.id}")
+
+
+def daily_tasks(args):
+    """Show daily summary of tasks."""
+    tasks = load_tasks(args.storage_file)
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # Filter tasks with due dates only - tasks without due dates are excluded
+    tasks_with_dates = [t for t in tasks if t.get('due_date')]
+    
+    # Tasks due today
+    due_today = [t for t in tasks_with_dates if t['due_date'] == today]
+    
+    # Overdue tasks (due before today and not completed)
+    overdue = [t for t in tasks_with_dates if t['due_date'] < today and not t['completed']]
+    
+    # Completed today
+    completed_today = [t for t in tasks if t.get('completed_date') == today]
+    
+    # Print summary
+    print(f"📅 Daily Overview - {datetime.now().strftime('%A, %B %d, %Y')}")
+    print("=" * 40)
+    
+    # Count summary
+    total_due = len(due_today)
+    total_overdue = len(overdue)
+    total_completed = len(completed_today)
+    
+    print(f"\n📊 Summary: {total_due} tasks due today, {total_overdue} overdue")
+    
+    # Overdue section
+    if overdue:
+        print(f"\n⏰ Overdue ({len(overdue)}):")
+        for task in overdue:
+            print(f"  ❌ {task['title']} (was due: {task['due_date']})")
+    
+    # Due today section
+    if due_today:
+        print(f"\n📌 Due Today ({len(due_today)}):")
+        for task in due_today:
+            status = "✓" if task['completed'] else "○"
+            print(f"  {status} {task['title']}")
+    
+    # Completed today section
+    if completed_today:
+        print(f"\n✅ Completed Today ({len(completed_today)}):")
+        for task in completed_today:
+            print(f"  ✔ {task['title']}")
+    
+    # If no tasks in any category
+    if not overdue and not due_today and not completed_today:
+        print(f"\n✨ No tasks for today!")
+        print("   Enjoy your free time or plan ahead!")
+
+
+def week_tasks(args):
+    """Show weekly overview of tasks (today + next 6 days)."""
+    tasks = load_tasks(args.storage_file)
+    today = datetime.now().strftime('%Y-%m-%d')
+    week_end = (datetime.now() + timedelta(days=6)).strftime('%Y-%m-%d')
+    
+    # Filter tasks with due dates only - tasks without due dates are excluded
+    tasks_with_dates = [t for t in tasks if t.get('due_date')]
+    
+    # Tasks due this week (today + next 6 days)
+    week_tasks_list = [
+        t for t in tasks_with_dates
+        if today <= t['due_date'] <= week_end
+    ]
+    
+    # Overdue tasks (due before today and not completed)
+    overdue = [t for t in tasks_with_dates if t['due_date'] < today and not t['completed']]
+    
+    # Completed this week
+    week_completed = [
+        t for t in tasks
+        if t.get('completed_date') and today <= t['completed_date'] <= week_end
+    ]
+    
+    # Print summary
+    print(f"📅 Weekly Overview - {datetime.now().strftime('%A, %B %d')}")
+    print(f"   to {(datetime.now() + timedelta(days=6)).strftime('%A, %B %d')}")
+    print("=" * 45)
+    
+    # Count summary
+    total_due = len(week_tasks_list)
+    total_overdue = len(overdue)
+    total_completed = len(week_completed)
+    
+    print(f"\n📊 Summary: {total_due} tasks due this week, {total_overdue} overdue")
+    
+    # Group by day for better readability
+    days = {}
+    for task in week_tasks_list:
+        if task['due_date'] not in days:
+            days[task['due_date']] = []
+        days[task['due_date']].append(task)
+    
+    # Overdue section
+    if overdue:
+        print(f"\n⏰ Overdue ({len(overdue)}):")
+        for task in overdue:
+            print(f"  ❌ {task['title']} (due: {task['due_date']})")
+    
+    # Daily breakdown
+    if

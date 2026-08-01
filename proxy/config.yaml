@@ -227,6 +227,38 @@ server:
   llama_model_health_probe_timeout_seconds: 5
   llama_model_health_probe_backoff_seconds: 0.5
   llama_model_health_grace_period_seconds: 15
+  # --- GPU-wedge self-healing (LP-0MS91DHQ9003EGB0) ---
+  # A wedged llama-server is still HTTP-reachable but its GPU kernels never
+  # complete (GPU ~100% busy with all slots idle, no tokens produced). The
+  # model-health loop detects this signature and unloads/reloads the model.
+  # Detection reads gpu_busy_percent from sysfs (AMD) with a rocm-smi
+  # fallback; when neither is available detection is skipped.
+  #
+  # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
+  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is pinned at 100% regardless
+  # of actual GPU state (30/30 samples read 100 while power draw showed the
+  # GPU idle at ~54W vs ~115W when computing). The busy+idle signature
+  # therefore false-positives on every idle period, causing constant
+  # unload/reload churn (144 unloads in one day, killing in-flight requests).
+  # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle
+  # power) is indistinguishable from normal idle from GPU sensors, so the
+  # busy counter cannot be trusted. Enable only on hardware with a reliable
+  # busy counter; the power-draw discriminator below reduces false positives
+  # and auto-disables detection when the counter is found pinned.
+  llama_gpu_wedge_detection_enabled: false
+  # GPU busy % at or above which the GPU is considered busy.
+  llama_gpu_wedge_busy_threshold_percent: 90
+  # Consecutive health-loop checks with the wedge signature before recovery.
+  # With the default 10s interval, 2 checks bounds detection to ~20-30s.
+  llama_gpu_wedge_idle_checks_required: 2
+  # Power draw (W) below which the GPU is considered NOT genuinely computing.
+  # busy>=threshold + idle slots + power below this = pinned/unreliable busy
+  # counter (or stalled engine) -> never unloads; detection auto-disables if
+  # this state persists for llama_gpu_wedge_pinned_checks_required checks.
+  llama_gpu_wedge_power_low_threshold_watts: 90
+  # Consecutive pinned-counter observations (busy high + idle + low power)
+  # before GPU-wedge detection is disabled for the process lifetime.
+  llama_gpu_wedge_pinned_checks_required: 4
   llama_model_load_timeout: 600
   llama_models_max: 2
   llama_request_timeout: 1500
@@ -289,6 +321,12 @@ server:
   local_dispatch_lease_timeout_seconds: 60
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
+  # Session single-flight queue timeout (LP-0MS14PM88007NNUJ).
+  # When a session has an active in-flight request and mode is "queue",
+  # subsequent requests wait for this duration before being rejected.
+  # Prevents stuck requests from starving subsequent requests indefinitely.
+  # Default: 120 seconds.
+  session_single_flight_queue_timeout_seconds: 120
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   # Number of parallel sessions (GPU contexts) for local dispatch.
   # Controls how many concurrent Pi agent sessions can hold dispatch leases
@@ -308,11 +346,70 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  session_slot_pool_size: 2
+  session_slot_pool_size: 4
+
+  # -----------------------------------------------------------------------
+  # Slot schedule (LP-0MRXZU90M007WNWT)
+  # -----------------------------------------------------------------------
+  # Time-based slot count scheduling. When enabled, the proxy automatically
+  # varies the number of concurrent slots (``--parallel N``) based on the
+  # time of day. Before each transition, the proxy drains in-flight workloads
+  # and sends 503 responses to new requests during the drain window.
+  #
+  # Disabled by default (no schedule → static slot count from
+  # ``session_slot_pool_size`` above).
+  #
+  # Fields:
+  #   enabled:        Set to true to activate scheduling.
+  #   drain_minutes:  How long before a transition to start refusing new
+  #                   requests and drain in-flight workloads (default: 3).
+  #   entries:        List of transition rules. Each entry has:
+  #     time:         "HH:MM" format (24-hour). The time at which the new
+  #                   slot count becomes active.
+  #     slots:        The ``--parallel N`` value to apply from this time
+  #                   onward until the next entry.
+  #
+  # Example (peak hours 10:00-11:59 = 4 slots, off-peak = 8):
+  #   slot_schedule:
+  #     enabled: true
+  #     drain_minutes: 3
+  #     entries:
+  #       - time: "10:00"
+  #         slots: 4
+  #       - time: "12:00"
+  #         slots: 8
+  #
+  # Entries with the same slot count as the current value are skipped
+  # (no unnecessary restart). Midnight wrapping is supported.
+  slot_schedule:
+    enabled: true
+    drain_minutes: 3
+    entries:
+      - time: "23:59"
+        slots: 8
+      - time: "10:00"
+        slots: 4
+
   session_slot_timeout_seconds: 3.0
+  # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
+  # Skip slot save/restore when the request context exceeds this many
+  # estimated tokens. llama-server serializes the whole KV cache on save,
+  # so large contexts ReadTimeout and can wedge the GPU. 0 disables the
+  # check (persistence is attempted for every context size).
+  session_slot_max_prompt_tokens: 12288
+  # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
+  # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
+  # 0 disables the add-on (fixed timeout only).
+  session_slot_timeout_per_token_seconds: 0.001
+  session_slot_max_timeout_seconds: 60
+  # Circuit breaker: after this many consecutive save/restore failures for
+  # a slot, stop issuing persistence calls for that slot until the cooldown
+  # expires. Prevents piling doomed KV-cache copies onto a wedged GPU.
+  session_slot_max_consecutive_failures: 3
+  session_slot_failure_cooldown_seconds: 300
   slot_unavailable_retry_after: 5
   session_guardrail_max_runtime_seconds: 1800
-  session_guardrail_max_completion_tokens: 2048
+  session_guardrail_max_completion_tokens: 16384
   session_guardrail_repetition_min_pattern_chars: 64
   session_guardrail_repetition_min_repeats: 10
   session_guardrail_invalidate_on_cutoff: true
@@ -323,8 +420,10 @@ server:
   # When the upstream stops sending data without emitting a [DONE] event
   # or closing the connection, the proxy waits this long for the next
   # chunk before synthesising a final finish_reason:stop event and ending
-  # the stream.  Default: 30 seconds.
-  stream_idle_timeout_seconds: 30
+  # the stream.  Increased from 30 to 120 for local Qwen3 reasoning models
+  # which can have long pauses during complex reasoning (LP-0MS14PM7J003XPS8).
+  # Default: 120 seconds.
+  stream_idle_timeout_seconds: 120
 
   # Upstream stall idle timeout (LP-0MRE52D3C001KP1H).
   # When the remote upstream stops sending data mid-stream without closing

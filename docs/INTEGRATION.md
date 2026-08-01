@@ -83,6 +83,50 @@ python3 -m pytest proxy/tests/ -v
 python3 -m pytest tests/ proxy/tests/ -v
 ```
 
+## On-demand live-server tests (opt-in, disabled by default)
+
+Tests that spawn and kill real OS processes, or exercise the **live** proxy /
+llama-server / TTS server, are **opt-in** so a routine `pytest` run can never
+accidentally kill a running service, crash it via GPU contention, or close an
+SSH session (see LP-0MS6R13CP009VO24). They follow the same convention as the
+`e2e_live` / `RUN_LIVE_HOST_FLOW` gates.
+
+- **pytest markers:** `e2e_live` (live proxy), `tts_integration` (live TTS),
+  `live_port_kill` (spawns/kills real OS processes) — defined in
+  `proxy/pytest.ini`.
+- **Environment gates:**
+
+  | Variable | Enables |
+  |----------|---------|
+  | `RUN_LIVE_PROXY_E2E=1` | Live proxy E2E tests (`test_plan_fallback_live_e2e.py`, `test_embeddings_integration.py`, `test_embeddings_concurrent.py`, `test_model_audit_plan_routing.py`) |
+  | `RUN_LIVE_TTS=1` | Live TTS server tests (`test_tts_integration.py`) |
+  | `RUN_LIVE_HOST_FLOW=1` | Live host-flow tests (`test_host_flow_live_e2e.py`) |
+  | `LIVE_PORT_KILL_TESTS=1` | Shell script that spawns and kills real processes (`tests/test_start_proxy_restart.sh`) |
+
+Examples:
+
+```bash
+# start-proxy.sh restart port-cleanup integration test (spawns real listeners
+# and kills them with kill/fuser -k on random ports)
+LIVE_PORT_KILL_TESTS=1 bash tests/test_start_proxy_restart.sh
+
+# Embeddings/chat integration tests against the live proxy (real inference)
+RUN_LIVE_PROXY_E2E=1 python3 -m pytest proxy/tests/test_embeddings_integration.py -v
+RUN_LIVE_PROXY_E2E=1 python3 -m pytest proxy/tests/test_embeddings_concurrent.py -v
+
+# TTS integration tests against the live tts-server
+RUN_LIVE_TTS=1 python3 -m pytest proxy/tests/test_tts_integration.py -v
+```
+
+Without the env var each module prints a SKIP notice. The default `pytest` run
+never executes these tests.
+
+The embeddings integration tests (`test_embeddings_integration.py`) poll the
+proxy until the embeddings alias answers with a 200 instead of relying on a
+single tight-timeout request, and use generous health-check timeouts, so a
+healthy-but-loaded proxy (e.g. concurrent chat streams contending for the
+single GPU) does not cause spurious failures or skips (see LP-0MS9FM27K007NCNE).
+
 ## CI integration
 
 To run the live tests in CI, the CI runner must have:

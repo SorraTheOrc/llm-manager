@@ -20,6 +20,7 @@ import pytest
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 from proxy.proxy_remote import (
+    _delta_has_content,
     _handle_remote_non_streaming,
     _handle_remote_streaming,
 )
@@ -631,4 +632,274 @@ async def test_streaming_empty_via_stop_async_iteration(mock_request, mock_srv):
     )
     assert client.stream.call_count == 2, (
         f"Expected 2 stream() calls, got {client.stream.call_count}"
+    )
+
+
+# ===================================================================
+# Unit tests: _delta_has_content helper (LP-0MS8XAPXT009W3CL)
+# ===================================================================
+
+
+def test_delta_has_content_content_only():
+    """Content-only deltas: non-empty content counts as meaningful output."""
+    assert _delta_has_content({"content": "Hello"}) is True
+    assert _delta_has_content({"content": "  Hello  "}) is True
+    assert _delta_has_content({"content": ""}) is False
+    assert _delta_has_content({"content": "   "}) is False
+    assert _delta_has_content({"content": None}) is False
+
+
+def test_delta_has_content_tool_calls_only():
+    """Tool-call deltas count as meaningful output even with no content."""
+    tc = [{
+        "index": 0,
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": ""},
+    }]
+    assert _delta_has_content({"tool_calls": tc}) is True
+    assert _delta_has_content({"tool_calls": []}) is False
+    assert _delta_has_content({"tool_calls": None}) is False
+
+
+def test_delta_has_content_reasoning_only():
+    """Reasoning-content deltas count as meaningful output."""
+    assert _delta_has_content({"reasoning_content": "thinking"}) is True
+    assert _delta_has_content({"reasoning_content": ""}) is False
+    assert _delta_has_content({"reasoning_content": "   "}) is False
+    assert _delta_has_content({"reasoning_content": None}) is False
+
+
+def test_delta_has_content_mixed():
+    """Mixed deltas count if ANY meaningful field is present."""
+    assert _delta_has_content({
+        "content": "Hello",
+        "tool_calls": [],
+        "reasoning_content": "",
+    }) is True
+    assert _delta_has_content({
+        "content": "",
+        "tool_calls": [{"index": 0}],
+        "reasoning_content": "",
+    }) is True
+    assert _delta_has_content({
+        "content": "",
+        "tool_calls": [],
+        "reasoning_content": "thinking",
+    }) is True
+
+
+def test_delta_has_content_truly_empty():
+    """A delta with no meaningful fields is classified as empty."""
+    assert _delta_has_content({}) is False
+    assert _delta_has_content({
+        "content": "",
+        "tool_calls": [],
+        "reasoning_content": "",
+    }) is False
+    assert _delta_has_content({
+        "content": None,
+        "tool_calls": None,
+        "reasoning_content": None,
+    }) is False
+
+
+def test_delta_has_content_non_dict():
+    """Non-dict deltas never count as content."""
+    assert _delta_has_content(None) is False
+    assert _delta_has_content("not a dict") is False
+    assert _delta_has_content([]) is False
+
+
+# ===================================================================
+# AC: Tool-call-only and reasoning-only streams are not empty
+# (LP-0MS8XAPXT009W3CL)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_only_no_retry(mock_request, mock_srv):
+    """AC1: Tool-call-only stream passes through with no retry and no error.
+
+    deepseek-v4-flash streams tool calls as delta.tool_calls chunks with
+    content always null/\"\". The proxy must NOT classify this as an empty
+    response: no empty-response retry, no duplicated stream, and no
+    synthetic finish_reason: error event.
+    """
+    tool_call_chunks = [
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"get_weather","arguments":""}}]},"index":0}]}\n\n',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\": \\"Paris\\"}"}}]},"index":0}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"","reasoning_content":null},"finish_reason":"tool_calls","index":0}]}\n\n',
+    ]
+
+    mock_resp = _make_streaming_mock_response(
+        status_code=200,
+        aiter_chunks=tool_call_chunks,
+    )
+    client = _make_client(stream_responses=[mock_resp])
+    mock_srv.config = {}
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client):
+        with patch("proxy.proxy_remote._srv", return_value=mock_srv):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+                            result = await _handle_remote_streaming(
+                                request=mock_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(30.0),
+                                upstream_idle_timeout_seconds=1.0,
+                            )
+
+                            collected = [chunk async for chunk in result.body_iterator]
+
+    assert isinstance(result, StreamingResponse)
+    # No retry: stream() called exactly once
+    assert client.stream.call_count == 1, (
+        f"Expected 1 stream() call (no empty-retry), got {client.stream.call_count}"
+    )
+    # All chunks forwarded unchanged (no duplication, no synthetic error)
+    assert collected == tool_call_chunks, (
+        f"Expected tool-call chunks forwarded unchanged, got {len(collected)} chunks"
+    )
+    collected_text = b"".join(collected).decode("utf-8", errors="replace")
+    assert '"finish_reason":"error"' not in collected_text.replace(" ", ""), (
+        f"Tool-call stream must not emit synthetic finish_reason: error, got: {collected_text[:300]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_reasoning_only_no_retry(mock_request, mock_srv):
+    """AC2: Reasoning-only stream is not flagged empty.
+
+    A stream producing only non-empty delta.reasoning_content chunks and
+    ending with finish_reason: stop must pass through without retry.
+    """
+    reasoning_chunks = [
+        b'data: {"choices":[{"delta":{"reasoning_content":"Let me think about this"},"index":0}]}\n\n',
+        b'data: {"choices":[{"delta":{"reasoning_content":"Step two of the plan"},"index":0}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop","index":0}]}\n\n',
+    ]
+
+    mock_resp = _make_streaming_mock_response(
+        status_code=200,
+        aiter_chunks=reasoning_chunks,
+    )
+    client = _make_client(stream_responses=[mock_resp])
+    mock_srv.config = {}
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client):
+        with patch("proxy.proxy_remote._srv", return_value=mock_srv):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+                            result = await _handle_remote_streaming(
+                                request=mock_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(30.0),
+                                upstream_idle_timeout_seconds=1.0,
+                            )
+
+                            collected = [chunk async for chunk in result.body_iterator]
+
+    assert isinstance(result, StreamingResponse)
+    # No retry: stream() called exactly once
+    assert client.stream.call_count == 1, (
+        f"Expected 1 stream() call (no empty-retry), got {client.stream.call_count}"
+    )
+    # All chunks forwarded unchanged (loop breaks at finish_reason chunk)
+    assert collected == reasoning_chunks, (
+        f"Expected reasoning chunks forwarded unchanged, got {len(collected)} chunks"
+    )
+    collected_text = b"".join(collected).decode("utf-8", errors="replace")
+    assert '"finish_reason":"error"' not in collected_text.replace(" ", ""), (
+        f"Reasoning-only stream must not emit synthetic finish_reason: error, got: {collected_text[:300]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_retry_log_includes_diagnostics(mock_request, mock_srv):
+    """AC6: Empty-retry log records whether tool_calls/reasoning were observed.
+
+    When the empty-response retry DOES fire (genuinely empty stream), the
+    log message must include saw_tool_calls / saw_reasoning diagnostics to
+    aid future diagnosis.
+    """
+    empty_stream_chunks = [
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+    valid_stream_chunks = [
+        b'data: {"choices":[{"delta":{"content":"Retry works"},"index":0}]}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+
+    first_resp = _make_streaming_mock_response(
+        status_code=200,
+        aiter_chunks=empty_stream_chunks,
+    )
+    second_resp = _make_streaming_mock_response(
+        status_code=200,
+        aiter_chunks=valid_stream_chunks,
+    )
+
+    client = _make_client(stream_responses=[first_resp, second_resp])
+    mock_srv.config = {}
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client):
+        with patch("proxy.proxy_remote._srv", return_value=mock_srv):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+                            result = await _handle_remote_streaming(
+                                request=mock_request,
+                                target_url="https://api.example.com/v1/chat/completions",
+                                headers={"Authorization": "Bearer test"},
+                                body=b'{"stream": true, "model": "test"}',
+                                body_json={"stream": True, "model": "test"},
+                                model_name="test-model",
+                                remote_timeout=httpx.Timeout(30.0),
+                                upstream_idle_timeout_seconds=1.0,
+                            )
+
+                            collected = [chunk async for chunk in result.body_iterator]
+
+    assert isinstance(result, StreamingResponse)
+    collected_text = b"".join(collected).decode("utf-8", errors="replace")
+    assert "Retry works" in collected_text, (
+        f"Expected content from retry stream, got: {collected_text[:200]}"
+    )
+
+    # The empty-retry INFO log must include tool_calls/reasoning diagnostics
+    empty_retry_logs = [
+        call for call in mock_srv.logger.info.call_args_list
+        if "Empty response detected" in str(call.args[0])
+    ]
+    assert len(empty_retry_logs) == 1, (
+        f"Expected exactly one 'Empty response detected' log, got {len(empty_retry_logs)}"
+    )
+    log_fmt, *log_args = empty_retry_logs[0].args
+    assert "saw_tool_calls=%s" in log_fmt, (
+        f"Empty-retry log missing saw_tool_calls placeholder: {log_fmt}"
+    )
+    assert "saw_reasoning=%s" in log_fmt, (
+        f"Empty-retry log missing saw_reasoning placeholder: {log_fmt}"
+    )
+    # For a genuinely empty stream both diagnostic flags must be False
+    assert log_args[-2] is False, (
+        f"Expected saw_tool_calls=False for empty stream, got {log_args[-2]}"
+    )
+    assert log_args[-1] is False, (
+        f"Expected saw_reasoning=False for empty stream, got {log_args[-1]}"
     )

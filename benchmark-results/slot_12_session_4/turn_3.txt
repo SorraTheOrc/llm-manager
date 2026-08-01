@@ -1,0 +1,319 @@
+# Benchmark: slot_count=12  session=4  turn=3
+# Prompt: Add a 'daily' command to the To-Do application.
+
+Requirements:
+- `todo daily` sh...
+# Resolved model: local-qwen3/Qwen3
+# Duration: 1788s  Tokens: 2600  TPS: 2.9
+# ============================================================
+
+Here's a complete, production-ready implementation. It includes a robust CLI with existing CRUD functionality, the new `daily` and `week` commands, and comprehensive pytest tests.
+
+### `todo.py`
+```python
+#!/usr/bin/env python3
+"""Simple CLI To-Do application with daily/weekly overview commands."""
+
+import argparse
+import json
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Optional
+
+DEFAULT_DB = "tasks.json"
+
+def get_db_path() -> Path:
+    return Path(DEFAULT_DB)
+
+def load_tasks() -> List[Dict]:
+    """Load tasks from JSON file."""
+    path = get_db_path()
+    if not path.exists():
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_tasks(tasks: List[Dict]) -> None:
+    """Save tasks to JSON file."""
+    path = get_db_path()
+    with open(path, "w") as f:
+        json.dump(tasks, f, indent=2)
+
+def today_iso() -> str:
+    return date.today().isoformat()
+
+def add_task(title: str, due: Optional[str] = None) -> None:
+    """Add a new task with optional due date."""
+    tasks = load_tasks()
+    new_id = max([t["id"] for t in tasks], default=0) + 1
+    task = {
+        "id": new_id,
+        "title": title,
+        "due": due,
+        "completed": False,
+        "completed_date": None,
+        "created": today_iso()
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    suffix = f" (due: {due})" if due else ""
+    print(f"Added: {title}{suffix}")
+
+def list_tasks() -> None:
+    """List all tasks."""
+    tasks = load_tasks()
+    if not tasks:
+        print("No tasks found.")
+        return
+    
+    print(f"{'ID':<4} {'Status':<8} {'Due':<12} {'Title'}")
+    print("-" * 60)
+    for t in tasks:
+        status = "✓" if t["completed"] else "○"
+        due = t["due"] or "—"
+        print(f"{t['id']:<4} {status:<8} {due:<12} {t['title']}")
+
+def complete_task(task_id: int) -> None:
+    """Mark a task as completed."""
+    tasks = load_tasks()
+    for t in tasks:
+        if t["id"] == task_id:
+            t["completed"] = True
+            t["completed_date"] = today_iso()
+            save_tasks(tasks)
+            print(f"Completed: {t['title']}")
+            return
+    print(f"Task {task_id} not found.")
+
+def delete_task(task_id: int) -> None:
+    """Delete a task."""
+    tasks = load_tasks()
+    new_tasks = [t for t in tasks if t["id"] != task_id]
+    if len(new_tasks) == len(tasks):
+        print(f"Task {task_id} not found.")
+    else:
+        save_tasks(new_tasks)
+        print(f"Deleted task {task_id}.")
+
+def show_daily() -> None:
+    """Show daily summary: due today, overdue, completed today."""
+    tasks = load_tasks()
+    today = today_iso()
+    
+    # Only consider tasks with a due date
+    tasks_with_due = [t for t in tasks if t.get("due")]
+    
+    due_today = [t for t in tasks_with_due if t["due"] == today and not t["completed"]]
+    overdue = [t for t in tasks_with_due if t["due"] < today and not t["completed"]]
+    completed_today = [t for t in tasks_with_due if t["completed"] and t.get("completed_date") == today]
+    
+    print(f"📅 Daily Summary ({today})")
+    print(f"   Due today: {len(due_today)} | Overdue: {len(overdue)} | Completed today: {len(completed_today)}")
+    print()
+    
+    if not due_today and not overdue and not completed_today:
+        print("   No tasks for today.")
+        return
+        
+    print("   📋 Tasks:")
+    for t in due_today:
+        print(f"   [ ] {t['title']} (due: {t['due']})")
+    for t in overdue:
+        print(f"   [!] {t['title']} (overdue: {t['due']})")
+    for t in completed_today:
+        print(f"   [x] {t['title']} (completed: {t['completed_date']})")
+
+def show_week() -> None:
+    """Show weekly overview: today + next 6 days."""
+    tasks = load_tasks()
+    today = date.today()
+    end_date = today + timedelta(days=6)
+    today_str = today.isoformat()
+    end_str = end_date.isoformat()
+    
+    # Filter tasks with due dates in range [today, today+6]
+    tasks_in_week = [
+        t for t in tasks 
+        if t.get("due") and today_str <= t["due"] <= end_str
+    ]
+    
+    print(f"📅 Week Overview ({today_str} - {end_str})")
+    print(f"   Tasks due: {len(tasks_in_week)}")
+    print()
+    
+    if not tasks_in_week:
+        print("   No tasks scheduled this week.")
+        return
+        
+    print("   📋 Tasks:")
+    for t in tasks_in_week:
+        status = "✓" if t["completed"] else "○"
+        print(f"   [{status}] {t['title']} (due: {t['due']})")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Simple To-Do CLI")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # add
+    add_p = subparsers.add_parser("add", help="Add a new task")
+    add_p.add_argument("title", help="Task title")
+    add_p.add_argument("-d", "--due", help="Due date (YYYY-MM-DD)")
+    
+    # list
+    subparsers.add_parser("list", help="List all tasks")
+    
+    # complete
+    comp_p = subparsers.add_parser("complete", help="Mark task as complete")
+    comp_p.add_argument("id", type=int, help="Task ID")
+    
+    # delete
+    del_p = subparsers.add_parser("delete", help="Delete a task")
+    del_p.add_argument("id", type=int, help="Task ID")
+    
+    # daily
+    subparsers.add_parser("daily", help="Show daily summary")
+    
+    # week
+    subparsers.add_parser("week", help="Show weekly overview (today + 6 days)")
+    
+    args = parser.parse_args()
+    
+    if args.command == "add":
+        add_task(args.title, args.due)
+    elif args.command == "list":
+        list_tasks()
+    elif args.command == "complete":
+        complete_task(args.id)
+    elif args.command == "delete":
+        delete_task(args.id)
+    elif args.command == "daily":
+        show_daily()
+    elif args.command == "week":
+        show_week()
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+```
+
+### `test_todo.py`
+```python
+#!/usr/bin/env python3
+"""Pytest tests for daily and week commands."""
+
+import json
+import pytest
+from datetime import date, timedelta
+from pathlib import Path
+from todo import (
+    load_tasks, save_tasks, add_task, show_daily, show_week,
+    today_iso, DEFAULT_DB
+)
+
+@pytest.fixture
+def task_dir(tmp_path):
+    """Override DB path for isolated testing."""
+    import todo
+    todo.DEFAULT_DB = str(tmp_path / "tasks.json")
+    yield tmp_path
+    todo.DEFAULT_DB = DEFAULT_DB
+
+def _create_task_id(title, due, completed=False, completed_date=None):
+    tasks = load_tasks()
+    new_id = max([t["id"] for t in tasks], default=0) + 1
+    return {
+        "id": new_id,
+        "title": title,
+        "due": due,
+        "completed": completed,
+        "completed_date": completed_date,
+        "created": today_iso()
+    }
+
+def test_daily_summary_includes_counts(task_dir, capfd):
+    today = today_iso()
+    yesterday = (date.today() - timedelta(days=2)).isoformat()
+    tomorrow = (date.today() + timedelta(days=5)).isoformat()
+    
+    save_tasks([
+        _create_task_id("Due today", today),
+        _create_task_id("Overdue task", yesterday),
+        _create_task_id("Completed today", today, completed=True, completed_date=today),
+        _create_task_id("No due date", None),
+        _create_task_id("Future task", tomorrow),
+        _create_task_id("Already completed", yesterday, completed=True, completed_date=(date.today()-timedelta(days=1)).isoformat()),
+    ])
+    
+    show_daily()
+    out = capfd.readouterr().out
+    
+    assert "Daily Summary" in out
+    assert "Due today: 1" in out
+    assert "Overdue: 1" in out
+    assert "Completed today: 1" in out
+    assert "Due today" in out
+    assert "Overdue task" in out
+    assert "Completed today" in out
+    assert "No due date" not in out  # Excluded correctly
+    assert "Future task" not in out  # Excluded correctly
+    assert "Already completed" not in out  # Completed yesterday, not today
+
+def test_daily_empty(task_dir, capfd):
+    save_tasks([])
+    show_daily()
+    out = capfd.readouterr().out
+    
+    assert "Daily Summary" in out
+    assert "No tasks for today." in out
+
+def test_week_summary_range(task_dir, capfd):
+    today = date.today()
+    save_tasks([
+        _create_task_id("Today", today.isoformat()),
+        _create_task_id("Day 2", (today + timedelta(days=2)).isoformat()),
+        _create_task_id("Day 6", (today + timedelta(days=6)).isoformat()),
+        _create_task_id("Day 7 (outside)", (today + timedelta(days=7)).isoformat()),
+        _create_task_id("Yesterday (outside)", (today - timedelta(days=1)).isoformat()),
+        _create_task_id("No due", None),
+    ])
+    
+    show_week()
+    out = capfd.readouterr().out
+    
+    assert "Week Overview" in out
+    assert "Tasks due: 3" in out
+    assert "Today" in out
+    assert "Day 2" in out
+    assert "Day 6" in out
+    assert "Day 7 (outside)" not in out
+    assert "Yesterday (outside)" not in out
+    assert "No due" not in out
+
+def test_week_completed_status(task_dir, capfd):
+    today = date.today()
+    save_tasks([
+        _create_task_id("Done", today.isoformat(), completed=True),
+        _create_task_id("Pending", today.isoformat(), completed=False),
+    ])
+    
+    show_week()
+    out = capfd.readouterr().out
+    
+    assert "[✓] Done" in out
+    assert "[○] Pending" in out
+```
+
+### Key Features & Design Decisions
+1. **Compact Morning Review Format**: Grouped by status with clear counts, emoji indicators, and minimal whitespace.
+2. **Strict Due Date Filtering**: Both `daily` and `week` explicitly filter out tasks without a `due` field, as requested.
+3. **Completion Tracking**: Added `completed_date` field to accurately track what was finished today vs earlier.
+4. **Backwards Compatible**: All original commands (`add`, `list`, `complete`, `delete`) remain fully functional with identical signatures.
+5. **Test Isolation**: Tests use `tmp_path` and override `DEFAULT_DB` to prevent interference with your main task file. Run with: `pytest test_todo.py -v`
+6. **Date Handling**: Uses ISO format (`YYYY-MM-DD`) for reliable sorting and comparison without timezone complications.
+
+### Integration Notes
+- If you already have a custom storage layer, replace `load_tasks()`/`save_tasks()` with your existing calls.
+- The `show_daily()` and `show_week()` functions are pure (except for DB reads), making them easy to drop into existing codebases.
+- Add `-d YYYY-MM-DD` to `todo add` to set due dates: `todo add "Review report" -d 2024-06-15`

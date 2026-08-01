@@ -1,0 +1,124 @@
+# Benchmark: slot_count=4  session=3  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 122s  Tokens: 18000  TPS: 4093.3
+# ============================================================
+
+```python
+# todo/__init__.py
+"""
+A simple To-Do application with CLI and Web UI.
+"""
+from .core import TaskManager
+from .models import Task
+from .storage import TaskStore
+
+__all__ = ["TaskManager", "Task", "TaskStore"]
+```
+
+```python
+# todo/models.py
+from dataclasses import dataclass, asdict, field
+from datetime import datetime
+from typing import List
+
+
+@dataclass
+class Task:
+    id: int
+    title: str
+    completed: bool = False
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+```
+
+```python
+# todo/storage.py
+import json
+from pathlib import Path
+from typing import List
+from .models import Task
+
+
+class TaskStore:
+    """Handles JSON file persistence for tasks."""
+
+    def __init__(self, data_dir: Path = None):
+        self.data_dir = data_dir or Path.home() / ".todo"
+        self.data_file = self.data_dir / "tasks.json"
+        self._ensure_dir()
+
+    def _ensure_dir(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        if not self.data_file.exists():
+            self.data_file.write_text("[]")
+
+    def load(self) -> List[Task]:
+        with open(self.data_file, "r") as f:
+            data = json.load(f)
+        return [Task(**task) for task in data]
+
+    def save(self, tasks: List[Task]):
+        with open(self.data_file, "w") as f:
+            json.dump([asdict(task) for task in tasks], f, indent=2)
+```
+
+```python
+# todo/core.py
+from datetime import datetime, date
+from typing import Optional, List
+from .models import Task
+from .storage import TaskStore
+
+
+class TaskManager:
+    """Business logic for the To-Do application."""
+
+    def __init__(self, store: TaskStore = None):
+        self.store = store or TaskStore()
+
+    def add_task(self, title: str) -> Task:
+        tasks = self.store.load()
+        task_id = max([t.id for t in tasks], default=0) + 1
+        new_task = Task(id=task_id, title=title)
+        tasks.append(new_task)
+        self.store.save(tasks)
+        return new_task
+
+    def toggle_task(self, task_id: int) -> Optional[Task]:
+        tasks = self.store.load()
+        for task in tasks:
+            if task.id == task_id:
+                task.completed = not task.completed
+                task.updated_at = datetime.now().isoformat()
+                self.store.save(tasks)
+                return task
+        return None
+
+    def delete_task(self, task_id: int) -> bool:
+        tasks = self.store.load()
+        new_tasks = [t for t in tasks if t.id != task_id]
+        if len(new_tasks) != len(tasks):
+            self.store.save(new_tasks)
+            return True
+        return False
+
+    def list_tasks(self, filter: str = "all") -> List[Task]:
+        tasks = self.store.load()
+        if filter == "completed":
+            return [t for t in tasks if t.completed]
+        elif filter == "pending":
+            return [t for t in tasks if not t.completed]
+        return tasks
+
+    def daily_summary(self) -> dict:
+        tasks = self.store.load()
+        today = date.today().isoformat()
+        created_today = [t for t in tasks if t.created_at.startswith(today)]
+        completed_today = [
+            t for t in tasks if t.completed and t.updated_at.startswith(today)
+        ]
+        total_pending = len([t for t

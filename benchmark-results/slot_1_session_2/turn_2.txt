@@ -1,0 +1,223 @@
+# Benchmark: slot_count=1  session=2  turn=2
+# Prompt: Extend the To-Do application to support priority and due date.
+
+Requirements:
+- ...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 220s  Tokens: 1818  TPS: 19.0
+# ============================================================
+
+We'll implement the extended To‑Do application in Python. The following single‑file solution includes:
+
+- A `Task` dataclass for title, completed, priority and due_date.
+- A `TaskManager` that loads/saves tasks from a JSON file, with automatic migration of legacy entries (missing fields → default `priority="medium"`, `due_date=""`).
+- A CLI using `argparse` with `add`, `list`, `complete`, `delete` and `help` commands.
+- New features:
+  - `--priority` and `--due-date` options for `add`.
+  - `--priority`, `--due-before` filters and `--sort` sorting for `list`.
+  - Columns for priority and due_date in the list output.
+- Unit tests verifying filtering, sorting and migration.
+
+All code is self‑contained and keeps backward compatibility with existing task files.
+
+```python
+#!/usr/bin/env python3
+"""
+Extended To-Do Application with priority and due date.
+
+Usage:
+    todo.py add <title> [--priority low|medium|high] [--due-date YYYY-MM-DD]
+    todo.py list [--priority low|medium|high] [--due-before YYYY-MM-DD]
+                [--sort due_date|priority]
+    todo.py complete <index>
+    todo.py delete <index>
+    todo.py help
+"""
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import List, Optional, Tuple
+import unittest
+import io
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Task:
+    title: str
+    completed: bool = False
+    priority: str = "medium"   # low, medium, high
+    due_date: str = ""         # YYYY-MM-DD or empty
+
+    PRIORITY_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "completed": self.completed,
+            "priority": self.priority,
+            "due_date": self.due_date,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "Task":
+        # migrate legacy entries
+        data.setdefault("priority", "medium")
+        data.setdefault("due_date", "")
+        return Task(
+            title=data["title"],
+            completed=data["completed"],
+            priority=data["priority"],
+            due_date=data["due_date"],
+        )
+
+# ---------------------------------------------------------------------------
+# Task storage and operations
+# ---------------------------------------------------------------------------
+
+class TaskManager:
+    def __init__(self, filepath: str = "tasks.json"):
+        self.filepath = Path(filepath)
+        self.tasks: List[Task] = []
+        self.load()
+
+    def load(self) -> None:
+        """Load tasks from JSON file. If file doesn't exist, start empty."""
+        if not self.filepath.exists():
+            self.tasks = []
+            return
+        try:
+            with open(self.filepath, "r") as f:
+                raw = json.load(f)
+            self.tasks = [Task.from_dict(item) for item in raw]
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error reading task file: {e}", file=sys.stderr)
+            self.tasks =We'll extend a basic To‑Do application with priority and due date support, filtering, sorting, backward compatibility, and a suite of tests. The implementation is cleanly separated into a `Task` dataclass, a `TodoList` manager (with JSON persistence), a CLI (argparse), and a test module.
+
+## Updated Implementation
+
+```python
+#!/usr/bin/env python3
+"""
+To-Do Application with priorities and due dates.
+
+Commands: add, list, complete, delete
+List supports --priority, --due-before, --sort (due_date, priority)
+Backward compatibility: existing tasks without priority/due_date get defaults.
+"""
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+
+# ----------------------------------------------------------------------
+# Data model
+# ----------------------------------------------------------------------
+@dataclass
+class Task:
+    title: str
+    completed: bool = False
+    priority: str = "medium"  # low / medium / high
+    due_date: str = ""        # "YYYY-MM-DD" or empty
+
+    def __post_init__(self):
+        # Validate priority
+        if self.priority not in ("low", "medium", "high"):
+            raise ValueError(f"Invalid priority: {self.priority}")
+        # Validate due_date format if set
+        if self.due_date:
+            try:
+                datetime.strptime(self.due_date, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"Invalid due_date format: {self.due_date} (use YYYY-MM-DD)")
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            title=d.get("title", ""),
+            completed=d.get("completed", False),
+            priority=d.get("priority", "medium"),
+            due_date=d.get("due_date", ""),
+        )
+
+
+# ----------------------------------------------------------------------
+# Storage and logic
+# ----------------------------------------------------------------------
+class TodoList:
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path or Path("tasks.json")
+        self.tasks: List[Task] = []
+        self.load()
+
+    def load(self):
+        """Read tasks from JSON file, migrating missing fields."""
+        if not self.path.exists():
+            self.tasks = []
+            return
+        with open(self.path, "r") as f:
+            data = json.load(f)
+        self.tasks = [Task.from_dict(item) for item in data]
+
+    def save(self):
+        """Write tasks to JSON file."""
+        with open(self.path, "w") as f:
+            json.dump([task.to_dict() for task in self.tasks], f, indent=2)
+
+    def add(self, title: str, priority: str = "medium", due_date: str = ""):
+        task = Task(title=title, priority=priority, due_date=due_date)
+        self.tasks.append(task)
+        self.save()
+        return task
+
+    def complete(self, index: int) -> Optional[Task]:
+        """Mark task at 1‑based index as completed. Returns the task or None."""
+        if 0 < index <= len(self.tasks):
+            task = self.tasks[index - 1]
+            task.completed = True
+            self.save()
+            return task
+        return None
+
+    def delete(self, index: int) -> Optional[Task]:
+        """Delete task at 1‑based index. Returns the task or None."""
+        if 0 < index <= len(self.tasks):
+            task = self.tasks.pop(index - 1)
+            self.save()
+            return task
+        return None
+
+    def list_tasks(
+        self,
+        priority: Optional[str] = None,
+        due_before: Optional[str] = None,
+        sort_by: Optional[str] = None,
+    ) -> List[Task]:
+        """Return filtered (and optionally sorted) tasks."""
+        result = self.tasks
+
+        # Filter by priority
+        if priority:
+            result = [t for t in result if t.priority == priority]
+
+        # Filter by due_before (only tasks with a due_date)
+        if due_before:
+            try:
+                limit = datetime.strptime(due_before, "%Y-%m-%d").date()
+            except ValueError:
+               

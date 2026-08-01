@@ -1,0 +1,189 @@
+# Benchmark: slot_count=8  session=0  turn=4
+# Prompt: Add a lightweight web UI to the To-Do application.
+
+Requirements:
+- Use a simple...
+# Resolved model: opencode/deepseek-v4-flash-free
+# Duration: 241s  Tokens: 1157  TPS: 12.0
+# ============================================================
+
+I'll implement a complete To-Do application with a CLI and a web UI using FastAPI, ensuring the CLI remains fully functional. The application uses a JSON file for persistent storage.
+
+Below is the module structure and code for all files. You can run the app via `todo serve --port 8080` to start the web server, while CLI commands `todo add`, `todo toggle`, `todo delete`, and `todo daily` continue to work.
+
+## File: `todo/__init__.py`
+
+```python
+"""To-Do application package."""
+```
+
+## File: `todo/storage.py`
+
+```python
+import json
+import os
+from datetime import date, datetime
+from pathlib import Path
+from typing import List, Optional
+from uuid import uuid4
+
+STORAGE_FILE = Path.home() / ".todo.json"
+
+
+class Task:
+    def __init__(self, id: str, title: str, done: bool = False, created_at: str = None):
+        self.id = id
+        self.title = title
+        self.done = done
+        self.created_at = created_at or datetime.now().isoformat()
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "done": self.done,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data["id"],
+            title=data["title"],
+            done=data["done"],
+            created_at=data.get("created_at"),
+        )
+
+
+class TodoStore:
+    def __init__(self, filepath: Path = STORAGE_FILE):
+        self.filepath = filepath
+        self._tasks: List[Task] = []
+        self._load()
+
+    def _load(self):
+        if self.filepath.exists():
+            try:
+                with open(self.filepath, "r") as f:
+                    data = json.load(f)
+                self._tasks = [Task.from_dict(t) for t in data]
+            except (json.JSONDecodeError, KeyError):
+                self._tasks = []
+        else:
+            self._tasks = []
+
+    def _save(self):
+        with open(self.filepath, "w") as f:
+            json.dump([t.to_dict() for t in self._tasks], f, indent=2)
+
+    def all(self) -> List[Task]:
+        return self._tasks
+
+    def add(self, title: str) -> Task:
+        task = Task(id=str(uuid4()), title=title)
+        self._tasks.append(task)
+        self._save()
+        return task
+
+    def get(self, task_id: str) -> Optional[Task]:
+        for t in self._tasks:
+            if t.id == task_id:
+                return t
+        return None
+
+    def toggle(self, task_id: str) -> Optional[Task]:
+        task = self.get(task_id)
+        if task:
+            task.done = not task.done
+            self._save()
+        return task
+
+    def delete(self, task_id: str) -> bool:
+        task = self.get(task_id)
+        if task:
+            self._tasks.remove(task)
+            self._save()
+            return True
+        return False
+
+    def daily(self, dt: date = None) -> List[Task]:
+        if dt is None:
+            dt = date.today()
+        return [
+            t for t in self._tasks
+            if datetime.fromisoformat(t.created_at).date() == dt
+        ]
+```
+
+## File: `todo/cli.py`
+
+```python
+import click
+from datetime import date
+from .storage import TodoStore
+
+store = TodoStore()
+
+
+@click.group()
+def cli():
+    """Simple To-Do application."""
+    pass
+
+
+@cli.command()
+@click.argument("title")
+def add(title):
+    """Add a new task."""
+    task = store.add(title)
+    click.echo(f"Added task [{task.id}] {task.title}")
+
+
+@cli.command()
+@click.argument("task_id")
+def toggle(task_id):
+    """Toggle task completion."""
+    task = store.toggle(task_id)
+    if task:
+        status = "done" if task.done else "undone"
+        click.echo(f"Task {task_id} is now {status}")
+    else:
+        click.echo(f"Task {task_id} not found", err=True)
+
+
+@cli.command()
+@click.argument("task_id")
+def delete(task_id):
+    """Delete a task."""
+    if store.delete(task_id):
+        click.echo(f"Deleted task {task_id}")
+    else:
+        click.echo(f"Task {task_id} not found", err=True)
+
+
+@cli.command()
+def daily():
+    """Show tasks created today."""
+    today = date.today()
+    tasks = store.daily(today)
+    if not tasks:
+        click.echo("No tasks for today.")
+    else:
+        for t in tasks:
+            status = "✓" if t.done else "✗"
+            click.echo(f"{status} [{t.id}] {t.title}")
+
+
+@cli.command()
+@click.option("--port", default=8080, help="Port to listen on")
+def serve(port):
+    """Start the web UI."""
+    from .web import app
+    import uvicorn
+    import sys
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except OSError as e:
+        click.echo(f"Error: Could not start server on port {port}: {e}", err=True)
+        sys.exit(1)
