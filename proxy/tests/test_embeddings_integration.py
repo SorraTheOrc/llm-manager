@@ -21,7 +21,10 @@ if os.getenv("RUN_LIVE_PROXY_E2E", "0") != "1":
 def _require_local_proxy(base: str):
     """Skip integration tests when a local proxy instance is not running."""
     try:
-        r = requests.get(f"{base}/health", timeout=2)
+        # Generous health timeout: a healthy-but-loaded proxy (e.g. concurrent
+        # chat streams contending for the single GPU) may answer /health slowly,
+        # and we must not spuriously skip (see LP-0MS9FM27K007NCNE).
+        r = requests.get(f"{base}/health", timeout=5)
         if r.status_code != 200:
             pytest.skip(f"local proxy not healthy at {base}/health")
     except RequestException:
@@ -79,7 +82,9 @@ def test_embeddings_alias_returns_openai_format():
     _require_local_proxy(base)
     wait_for_embeddings(base, timeout=60)
     payload = {"model": "embeddings", "input": "hello world"}
-    resp = requests.post(url, json=payload, timeout=10)
+    # Generous request timeout: embeddings can be slow on a loaded GPU even
+    # after wait_for_embeddings() warm-up (see LP-0MS9FM27K007NCNE).
+    resp = requests.post(url, json=payload, timeout=30)
     assert resp.status_code == 200, f"unexpected status: {resp.status_code} {resp.text}"
     body = resp.json()
     # Basic OpenAI embeddings response sanity checks

@@ -546,16 +546,19 @@ class TestStartupLaunchTtsServer:
     """Tests for startup TTS server launch with zombie cleanup."""
 
     @pytest.mark.asyncio
-    async def test_does_not_start_when_tts_disabled(self):
+    async def test_does_not_start_when_tts_disabled(self, monkeypatch):
         """Should not start TTS when tts_enabled=false."""
         from proxy.server import _startup_launch_tts_server
         import proxy.server as server_mod
 
         loop = asyncio.get_running_loop()
 
-        server_mod.config = _make_mock_config(tts_enabled=False)
-        server_mod.logger = MagicMock()
-        server_mod.tts_process = None
+        # monkeypatch auto-restores module globals after the test. Leaving
+        # server.logger as a MagicMock breaks later caplog-based tests
+        # (LP-0MS9MBV4M005VSTX, LP-0MS9MBVCC00948J4).
+        monkeypatch.setattr(server_mod, "config", _make_mock_config(tts_enabled=False))
+        monkeypatch.setattr(server_mod, "logger", MagicMock())
+        monkeypatch.setattr(server_mod, "tts_process", None)
 
         start_tts_called = [False]
 
@@ -576,16 +579,18 @@ class TestStartupLaunchTtsServer:
         server_mod.tts_process = None
 
     @pytest.mark.asyncio
-    async def test_startup_handles_start_tts_failure(self):
+    async def test_startup_handles_start_tts_failure(self, monkeypatch):
         """Startup should log warning when start_tts_server returns None."""
         from proxy.server import _startup_launch_tts_server
         import proxy.server as server_mod
 
         loop = asyncio.get_running_loop()
 
-        server_mod.config = _make_mock_config(tts_enabled=True)
-        server_mod.logger = MagicMock()
-        server_mod.tts_process = None
+        # monkeypatch auto-restores module globals after the test (see
+        # test_does_not_start_when_tts_disabled).
+        monkeypatch.setattr(server_mod, "config", _make_mock_config(tts_enabled=True))
+        monkeypatch.setattr(server_mod, "logger", MagicMock())
+        monkeypatch.setattr(server_mod, "tts_process", None)
 
         with patch("proxy.lifecycle.start_tts_server", return_value=None):
             with patch("proxy.lifecycle.wait_for_tts_server", AsyncMock()):

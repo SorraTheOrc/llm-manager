@@ -121,6 +121,12 @@ RUN_LIVE_TTS=1 python3 -m pytest proxy/tests/test_tts_integration.py -v
 Without the env var each module prints a SKIP notice. The default `pytest` run
 never executes these tests.
 
+The embeddings integration tests (`test_embeddings_integration.py`) poll the
+proxy until the embeddings alias answers with a 200 instead of relying on a
+single tight-timeout request, and use generous health-check timeouts, so a
+healthy-but-loaded proxy (e.g. concurrent chat streams contending for the
+single GPU) does not cause spurious failures or skips (see LP-0MS9FM27K007NCNE).
+
 ## CI integration
 
 To run the live tests in CI, the CI runner must have:

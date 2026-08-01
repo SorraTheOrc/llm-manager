@@ -4,7 +4,7 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_ensure_model_loaded_emits_switching_then_ready():
+async def test_ensure_model_loaded_emits_switching_then_ready(monkeypatch):
     from proxy import server
 
     events = []
@@ -18,6 +18,12 @@ async def test_ensure_model_loaded_emits_switching_then_ready():
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
+
+    # monkeypatch restores module globals after the test. ensure_model_loaded
+    # assigns server.llama_process = <mocked start_llama_server return value>
+    # and server.current_model; leaking them breaks later tests that call
+    # srv.llama_process.poll() (test_version_footer LP-0MS9MBVJK003D3RR).
+    monkeypatch.setattr(server, "llama_process", None)
 
     with patch.object(server, "config", {"server": {"llama_router_mode": False}}):
         with patch.object(server, "model_switch_lock", DummyLock()):
@@ -40,7 +46,7 @@ async def test_ensure_model_loaded_emits_switching_then_ready():
 
 
 @pytest.mark.asyncio
-async def test_ensure_model_loaded_does_not_update_current_model_on_failure():
+async def test_ensure_model_loaded_does_not_update_current_model_on_failure(monkeypatch):
     from proxy import server
 
     events = []
@@ -54,6 +60,8 @@ async def test_ensure_model_loaded_does_not_update_current_model_on_failure():
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
+
+    monkeypatch.setattr(server, "llama_process", None)
 
     with patch.object(server, "config", {"server": {"llama_router_mode": False}}):
         with patch.object(server, "model_switch_lock", DummyLock()):
