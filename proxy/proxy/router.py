@@ -315,6 +315,58 @@ async def _update_session_and_slot(
                 exc_info=True,
             )
 
+    # Update per-session cached-tokens ratio from REAL usage data
+    # (LP-0MS9GAN2P009KK6G). The final usage chunk in the local response
+    # reports prompt_tokens + prompt_tokens_details.cached_tokens; use the
+    # true cache-hit fraction when available. The save-success 1.0 below
+    # remains the fallback when no usage data is present.
+    _real_usage_applied = False
+    if session_id and srv.current_model:
+        try:
+            from proxy.provider import (
+                _extract_cached_tokens_from_usage,
+                _extract_usage_from_sse_text,
+                update_cached_ratio,
+            )
+            _full_text = None
+            if collected_content is not None and collected_content:
+                _full_text = "".join(collected_content)
+            elif hasattr(response, "content") and isinstance(
+                getattr(response, "content", None), (bytes, str)
+            ):
+                _full_text = response.content.decode(
+                    "utf-8", errors="replace"
+                )
+            _usage = None
+            if _full_text:
+                # Streaming SSE path: the final chunk carries a usage event.
+                _usage = _extract_usage_from_sse_text(_full_text)
+                if _usage is None:
+                    # Buffered path: JSON body with a top-level usage field.
+                    try:
+                        _body = json.loads(_full_text)
+                        if isinstance(_body, dict) and isinstance(
+                            _body.get("usage"), dict
+                        ):
+                            _usage = _body["usage"]
+                    except Exception:
+                        _usage = None
+            if isinstance(_usage, dict):
+                _cached = _extract_cached_tokens_from_usage(_usage)
+                _prompt = int(_usage.get("prompt_tokens", 0) or 0)
+                if _prompt > 0:
+                    update_cached_ratio(
+                        srv.current_model,
+                        session_id,
+                        cached_tokens=_cached,
+                        prompt_tokens=_prompt,
+                    )
+                    _real_usage_applied = True
+        except Exception:
+            srv.logger.debug(
+                "update_cached_ratio from usage failed", exc_info=True
+            )
+
     # Save slot snapshot if enabled
     if slot_save_allowed and slot_enabled and upstream_status < 400:
         try:
@@ -332,7 +384,8 @@ async def _update_session_and_slot(
                     slot_id,
                 )
                 # Update per-session cached-tokens ratio (LP-0MRMMBZ7T007ER59)
-                if session_id and srv.current_model:
+                # as a FALLBACK when no real usage data was reported.
+                if session_id and srv.current_model and not _real_usage_applied:
                     try:
                         from proxy.provider import update_cached_ratio
                         update_cached_ratio(

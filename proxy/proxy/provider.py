@@ -167,9 +167,24 @@ def _extract_cached_tokens_from_sse_text(sse_text: str) -> int:
 
     Returns 0 when no usage data is found.
     """
+    usage = _extract_usage_from_sse_text(sse_text)
+    return _extract_cached_tokens_from_usage(usage)
+
+
+def _extract_usage_from_sse_text(sse_text: str) -> dict | None:
+    """Extract the full usage dict from SSE response text.
+
+    Parses each ``data:`` line looking for a ``usage`` field. The usage
+    event is typically carried in the final chunk of an SSE stream
+    alongside ``finish_reason``. Returns the LAST usage dict found (the
+    final chunk is authoritative) or None when absent.
+
+    (LP-0MS9GAN2P009KK6G: wire real cached_tokens from local responses)
+    """
     if not sse_text:
-        return 0
+        return None
     import json
+    last_usage: dict | None = None
     for line in sse_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -179,13 +194,11 @@ def _extract_cached_tokens_from_sse_text(sse_text: str) -> int:
             continue
         try:
             data = json.loads(payload)
-            if isinstance(data, dict) and "usage" in data:
-                cached = _extract_cached_tokens_from_usage(data.get("usage"))
-                if cached > 0:
-                    return cached
+            if isinstance(data, dict) and isinstance(data.get("usage"), dict):
+                last_usage = data["usage"]
         except (json.JSONDecodeError, Exception):
             continue
-    return 0
+    return last_usage
 
 
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
@@ -1716,7 +1729,7 @@ async def proxy_with_fallback(
                 logger.info(
                     "routing_check provider=%s model=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                    "new_tokens=%d cached_ratio=%.2f messages=%d",
+                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
@@ -1725,6 +1738,7 @@ async def proxy_with_fallback(
                     _routing_new_tokens,
                     _routing_cached_ratio,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
+                    _session_id or "unknown",
                 )
                 _skip_local = _should_skip_local(
                     _llama_model,
@@ -1747,7 +1761,8 @@ async def proxy_with_fallback(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                         "new_tokens=%d cached_ratio=%.2f "
-                        "reason=%s → skipping local, routing to next remote provider",
+                        "reason=%s → skipping local, routing to next remote provider "
+                        "session=%s",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -1756,6 +1771,7 @@ async def proxy_with_fallback(
                         _routing_new_tokens,
                         _routing_cached_ratio,
                         _skip_reason,
+                        _session_id or "unknown",
                     )
                     _record_attempt(
                         attempts,
