@@ -290,7 +290,7 @@ server:
   # When the slot cache is cold (invalidated) and estimated prompt tokens exceed
   # this value, local routing is bypassed and the request falls through to the
   # next remote provider immediately. Set to 0 to disable.
-  local_large_context_cold_cache_threshold: 30000
+  local_large_context_cold_cache_threshold: 60000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
@@ -353,7 +353,7 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  session_slot_pool_size: 4
+  session_slot_pool_size: 6
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
@@ -395,7 +395,7 @@ server:
       - time: "23:59"
         slots: 8
       - time: "10:00"
-        slots: 4
+        slots: 6
 
   session_slot_timeout_seconds: 3.0
   # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
