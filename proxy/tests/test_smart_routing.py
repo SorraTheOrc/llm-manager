@@ -6,6 +6,7 @@ cache-cold state machine.
 cached_tokens-based routing)
 """
 
+import pytest
 from proxy.provider import (
     _estimate_prompt_tokens_for_routing,
     _get_warm_cache_threshold,
@@ -31,31 +32,31 @@ class TestLastCachedRatio:
 
     def test_update_cached_ratio(self):
         """Updating ratio should store it."""
-        from proxy.provider import update_cached_ratio, _last_cached_ratio
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=80, prompt_tokens=100)
         assert _last_cached_ratio[("Qwen3", "sess_a")] == 0.8
 
     def test_fully_cached_ratio(self):
         """Prompt with all tokens cached should give ratio of 1.0."""
-        from proxy.provider import update_cached_ratio, _last_cached_ratio
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=100, prompt_tokens=100)
         assert _last_cached_ratio[("Qwen3", "sess_a")] == 1.0
 
     def test_zero_cached_tokens(self):
         """No cached tokens should give ratio of 0.0."""
-        from proxy.provider import update_cached_ratio, _last_cached_ratio
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=0, prompt_tokens=100)
         assert _last_cached_ratio[("Qwen3", "sess_a")] == 0.0
 
     def test_zero_prompt_tokens_defaults_to_zero(self):
         """Zero prompt tokens should not cause division by zero; defaults to 0.0."""
-        from proxy.provider import update_cached_ratio, _last_cached_ratio
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=0, prompt_tokens=0)
         assert _last_cached_ratio[("Qwen3", "sess_a")] == 0.0
 
     def test_multiple_models_independent(self):
         """Different models should have independent ratios."""
-        from proxy.provider import update_cached_ratio, _last_cached_ratio
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=80, prompt_tokens=100)
         update_cached_ratio("gemma4", "sess_a", cached_tokens=10, prompt_tokens=100)
         assert _last_cached_ratio[("Qwen3", "sess_a")] == 0.8
@@ -63,7 +64,7 @@ class TestLastCachedRatio:
 
     def test_multiple_sessions_independent(self):
         """Different sessions should have independent ratios."""
-        from proxy.provider import update_cached_ratio, _last_cached_ratio
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=80, prompt_tokens=100)
         update_cached_ratio("Qwen3", "sess_b", cached_tokens=10, prompt_tokens=100)
         assert _last_cached_ratio[("Qwen3", "sess_a")] == 0.8
@@ -147,6 +148,57 @@ class TestExtractCachedTokens:
         from proxy.provider import _extract_cached_tokens_from_usage
         body = {"choices": [{"message": {"content": "Hello"}}], "usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 70}}}
         assert _extract_cached_tokens_from_usage(body.get("usage")) == 70
+
+    def test_extract_usage_dict_from_sse_text(self):
+        """Extract the full usage dict (prompt_tokens + cached_tokens) from SSE text."""
+        from proxy.provider import _extract_usage_from_sse_text
+        sse = (
+            'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n'
+            'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],'
+            '"usage":{"prompt_tokens":41721,"completion_tokens":100,'
+            '"prompt_tokens_details":{"cached_tokens":33792}}}\n\n'
+            'data: [DONE]\n\n'
+        )
+        usage = _extract_usage_from_sse_text(sse)
+        assert usage is not None
+        assert usage["prompt_tokens"] == 41721
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 33792
+
+    def test_extract_usage_dict_from_sse_text_no_usage(self):
+        """SSE text without a usage event yields None (no real cached_tokens)."""
+        from proxy.provider import _extract_usage_from_sse_text
+        sse = (
+            'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n'
+            'data: [DONE]\n\n'
+        )
+        assert _extract_usage_from_sse_text(sse) is None
+
+    def test_extract_usage_dict_from_sse_text_empty(self):
+        """Empty SSE text yields None."""
+        from proxy.provider import _extract_usage_from_sse_text
+        assert _extract_usage_from_sse_text("") is None
+
+    def test_usage_fraction_matches_expected_ratio(self):
+        """Real cached_tokens=33792 / prompt_tokens=41721 → ratio approx 33792/41721."""
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
+        update_cached_ratio("Qwen3", "sess_real", cached_tokens=33792, prompt_tokens=41721)
+        assert _last_cached_ratio[("Qwen3", "sess_real")] == pytest.approx(33792 / 41721)
+
+    def test_zero_prompt_tokens_no_raise_ratio_zero(self):
+        """prompt_tokens=0 must not raise; ratio defaults to 0.0."""
+        from proxy.provider import _last_cached_ratio, update_cached_ratio
+        update_cached_ratio("Qwen3", "sess_zero", cached_tokens=5, prompt_tokens=0)
+        assert _last_cached_ratio[("Qwen3", "sess_zero")] == 0.0
+
+    def test_ratio_key_matches_routing_reads(self):
+        """Keys use (model_name, session_id) exactly as _get_cached_ratio reads them."""
+        from proxy.provider import _get_cached_ratio, update_cached_ratio
+        update_cached_ratio("Qwen3", "sess_real", cached_tokens=33792, prompt_tokens=41721)
+        assert _get_cached_ratio("Qwen3", "sess_real") == pytest.approx(33792 / 41721)
+        # Different session under same model → cold (0.0)
+        assert _get_cached_ratio("Qwen3", "other_session") == 0.0
+        # Different model under same session → cold (0.0)
+        assert _get_cached_ratio("gemma4", "sess_real") == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -608,9 +660,9 @@ class TestProductionWiring:
 
     def test_invalidation_no_session_id(self):
         """_invalidate_session_and_slot with None session_id should not crash."""
-        from proxy.session import _invalidate_session_and_slot
-
         import asyncio
+
+        from proxy.session import _invalidate_session_and_slot
         # Should not raise
         asyncio.run(_invalidate_session_and_slot(
             session_id=None,
