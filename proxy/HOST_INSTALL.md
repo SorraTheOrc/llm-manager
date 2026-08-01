@@ -49,6 +49,11 @@ Important: your existing setup uses a container image where `llama-server` is pr
    # Try starting the server with your normal start script to confirm the proxy fallback will work
    proxy/scripts/start-proxy.sh qwen3
 
+   # Optional: add --verbose to log per-chunk SSE data (STREAM CHUNK lines at
+   # INFO level) for debugging stream issues. Default operation logs chunks at
+   # DEBUG level only, keeping proxy.log small (LP-0MS9GAN2P002NR4M).
+   proxy/scripts/start-proxy.sh qwen3 --verbose
+
 4) Restart the proxy service and verify (if you use a system service unit you created)
 
    sudo systemctl daemon-reload

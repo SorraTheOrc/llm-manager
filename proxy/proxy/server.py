@@ -968,7 +968,24 @@ async def debug_prompt(request: Request, alias: str = "", full: bool = False):
 
 def main():
     """Main entry point."""
+    import argparse
+    import os
+
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="LLM proxy server")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO "
+            "level). Equivalent to LLAMA_PROXY_VERBOSE=1 or config "
+            "logging.verbose_chunks: true."
+        ),
+    )
+    args, _ = parser.parse_known_args()
+    if args.verbose:
+        os.environ["LLAMA_PROXY_VERBOSE"] = "1"
 
     # Load config for server settings
     cfg = load_config()

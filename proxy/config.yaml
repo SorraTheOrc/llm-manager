@@ -66,6 +66,13 @@ logging:
   level: INFO
   retention_days: 90
   rotation_hours: 6
+  # Verbose per-chunk SSE logging (LP-0MS9GAN2P002NR4M).
+  # When false (default), STREAM CHUNK lines are logged at DEBUG level and
+  # are not written to proxy.log at the default INFO level, cutting log
+  # volume by >99% over a 24h window.
+  # Set to true (or start with `--verbose` / LLAMA_PROXY_VERBOSE=1) to write
+  # per-chunk SSE data to proxy.log for debugging stream issues.
+  verbose_chunks: false
 
 # ---------------------------------------------------------------------------
 # Session Recording

@@ -213,6 +213,12 @@ def log_response_chunk(
     The ContentOnlyConsoleHandler no longer displays streaming content to the
     console (LP-0MR90HJED005WI1Z). Raw JSON is written to the log file only.
 
+    Per-chunk ``STREAM CHUNK | ...`` lines are logged at DEBUG level by
+    default so normal (INFO-level) operation does not write millions of
+    chunk lines per day (LP-0MS9GAN2P002NR4M). When verbose chunk logging is
+    enabled (config ``logging.verbose_chunks`` or ``LLAMA_PROXY_VERBOSE=1``),
+    they are emitted at INFO level for debugging stream issues.
+
     If the chunk contains a ``finish_reason`` in any ``choices[]`` entry,
     an enhanced ``Stream finished: reason=<reason>`` log line is emitted
     so the stop reason (and optional token usage) appears in both console
@@ -225,7 +231,10 @@ def log_response_chunk(
     srv = _srv()
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
-        srv.logger.info(f"STREAM CHUNK | {chunk_str}")
+        if getattr(srv, "verbose_chunks", False):
+            srv.logger.info(f"STREAM CHUNK | {chunk_str}")
+        else:
+            srv.logger.debug(f"STREAM CHUNK | {chunk_str}")
     except Exception:
         pass
 

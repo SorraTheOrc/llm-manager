@@ -843,6 +843,30 @@ python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
 LLAMA_PROXY_DEV=1 python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
 ```
 
+### Verbose per-chunk SSE logging (`--verbose`)
+
+By default the proxy logs per-chunk SSE data (`STREAM CHUNK | data: ...` lines) at
+DEBUG level, so they are **not** written to `proxy.log` at the default INFO level.
+This cuts log volume by >99% over a 24h window (previously ~920MB/6h) and reduces
+proxy CPU spent on log I/O (LP-0MS9GAN2P002NR4M).
+
+Enable verbose chunk logging for debugging stream issues with any of:
+
+```bash
+# start-proxy.sh flag (recommended)
+./scripts/start-proxy.sh --verbose
+
+# Environment variable (works with any launcher, including direct uvicorn)
+LLAMA_PROXY_VERBOSE=1 ./scripts/start-proxy.sh
+
+# Config key in config.yaml
+#   logging:
+#     verbose_chunks: true
+```
+
+Lifecycle lines (`Stream started:`, `Stream finished:`, truncation warnings) remain
+at INFO level in all modes, and chunk content is always suppressed from the console.
+
 Note on start-proxy.sh hardening
 
 The bundled `proxy/scripts/start-proxy.sh` script now prefers the virtualenv Python interpreter (`.venv/bin/python3`) when available, falls back to the system `python3`, and will set `PYTHONPATH` to the repository root if it is not already set to avoid import errors when running from the repository checkout.
