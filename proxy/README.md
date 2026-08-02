@@ -51,6 +51,30 @@ The proxy logs every incoming request at **INFO** level via the `llama-proxy` lo
 
 The body preview automatically filters out messages with `role: "system"` to prevent sensitive system-prompt content from leaking into proxy logs. Only `role: "user"` and `role: "assistant"` messages are included in the preview.
 
+### Usage analysis (proxy-usage-analysis skill)
+
+The `proxy-usage-analysis` skill turns the last 24h of proxy logs into
+per-session daytime/nighttime CSVs and a Markdown report with data-backed
+configuration recommendations (fallback reasons, slot contention, context
+pressure, day/night comparison). It parses the structured INFO lines the
+proxy emits — `Stream started`/`Stream finished` (with authoritative
+`tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
+and `local_dispatch_denied` — streaming large logs line by line.
+
+```bash
+python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+    --log-dir /var/log/llama-proxy \
+    --hours 24 \
+    --output-dir usage-reports
+```
+
+Outputs (in `--output-dir`): `daytime_sessions.csv`, `nighttime_sessions.csv`
+(one row per session; day/night split derived from the `slot_schedule` in
+`config.yaml`), and `report.md` (aggregates + recommendations).
+
+See `~/.pi/agent/skills/proxy-usage-analysis/SKILL.md` for usage details and
+interpretation guidance.
+
 ## Host-first deployment
 
 The repository supports two deployment models for running llama-server:
