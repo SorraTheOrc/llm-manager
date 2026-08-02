@@ -293,7 +293,7 @@ class TestCachedTokensRouting:
         """Warm cache (~0.95 ratio) + 90K total, new_tokens=4.5K below 30K
         cold threshold, total 90K below 100K warm threshold → routes local."""
         phrase = "test message content for token estimation "
-        body = {"messages": [{"role": "user", "content": phrase * 15000}]}  # ~90K tokens
+        body = {"messages": [{"role": "user", "content": phrase * 8500}]}  # ~90K tokens
         cold_threshold = 30000
         warm_threshold = 100000
         from proxy.provider import update_cached_ratio

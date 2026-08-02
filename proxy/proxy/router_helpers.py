@@ -905,6 +905,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Normal idle timeout for inactive records
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # Free the slot registry entry so the slot can be
+                    # reused by a new session (LP-0MSB0RP7F000U0WJ)
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(sid)
+                    except Exception:
+                        pass
                     try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout",
@@ -916,6 +923,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Abandoned/orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # Free the slot registry entry so the slot can be
+                    # reused by a new session (LP-0MSB0RP7F000U0WJ)
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(sid)
+                    except Exception:
+                        pass
                     # Decrement local_active_queries for orphaned records
                     # that never completed through the normal request path
                     # (LP-0MRKVN93I000XXXX: cleanup orphaned active queries)
