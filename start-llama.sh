@@ -164,6 +164,7 @@ if [[ "$router_mode" -eq 1 ]]; then
     --host 0.0.0.0
     --no-mmap
     -ngl "$GLOBAL_NGL"
+    --threads "${LLAMA_THREADS:-8}"
     --port $PORT
   )
 
