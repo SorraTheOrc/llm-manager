@@ -207,6 +207,7 @@ def log_response_chunk(
     model: str | None = None,
     provider: str | None = None,
     body_json: dict | bytes | None = None,
+    entry: str | None = None,
 ) -> None:
     """Log streaming response chunk.
 
@@ -222,8 +223,10 @@ def log_response_chunk(
     If the chunk contains a ``finish_reason`` in any ``choices[]`` entry,
     an enhanced ``Stream finished: reason=<reason>`` log line is emitted
     so the stop reason (and optional token usage) appears in both console
-    and file logs. When *session_id*, *model*, and *provider* are provided,
-    they are appended to the log line.
+    and file logs. When *session_id*, *model*, *provider*, and *entry* are
+    provided, they are appended to the log line. *entry* carries the config
+    entry name (e.g. ``opencode-go-2-deepseek``) so per-account traffic is
+    attributable (LP-0MSC7F7BG0043TE1); it is omitted when absent.
 
     When *body_json* is provided, a request preview (first 80 characters of
     the first non-system user message) is included in the finished line.
@@ -280,6 +283,8 @@ def log_response_chunk(
                     parts.append(f"provider={provider}")
                 if model:
                     parts.append(f"model={model}")
+                if entry:
+                    parts.append(f"entry={entry}")
                 if body_json is not None:
                     preview = _get_request_preview(body_json)
                     if preview:
@@ -294,6 +299,8 @@ def log_response_chunk(
                         _parts.append(f"session={session_id}")
                     if model:
                         _parts.append(f"model={model}")
+                    if entry:
+                        _parts.append(f"entry={entry}")
                     if isinstance(usage, dict):
                         ct = usage.get("completion_tokens")
                         if ct is not None:

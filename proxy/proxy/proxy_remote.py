@@ -375,6 +375,12 @@ async def proxy_to_remote(
     if not model_name:
         model_name = _srv().current_model or model_config.get("name") or model_config.get("id") or "unknown"
 
+    # Config entry name for stream-level log attribution (LP-0MSC7F7BG0043TE1).
+    # Distinct from model_name (the body model ID): multiple config entries can
+    # share the same provider+model, so entry=<name> lets per-account traffic
+    # be distinguished in logs. None when the config entry has no name.
+    entry_name = model_config.get("name")
+
     # Resolve session ID from headers for recording (LP-0MR8FEKK6005V9ML)
     _remote_session_id = (
         request.headers.get("x-session-id")
@@ -453,6 +459,7 @@ async def proxy_to_remote(
                 resolved_model=_resolved_model_header,
                 session_id=_remote_session_id,
                 provider=_provider_name,
+                entry=entry_name,
                 upstream_idle_timeout_seconds=_upstream_idle_timeout,
                 upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
                 pool_client=_pool_client,
@@ -462,6 +469,7 @@ async def proxy_to_remote(
             model_name, remote_timeout,
             resolved_model=_resolved_model_header,
             provider=_provider_name,
+            entry=entry_name,
             upstream_idle_timeout_seconds=_upstream_idle_timeout,
             upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
             pool_client=_pool_client,
@@ -514,6 +522,7 @@ async def _handle_remote_streaming(
     resolved_model: str | None = None,
     session_id: str | None = None,
     provider: str | None = None,
+    entry: str | None = None,
     upstream_idle_timeout_seconds: float | None = None,
     upstream_retry_connect_timeout_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
@@ -687,11 +696,12 @@ async def _handle_remote_streaming(
         try:
             _request_preview = _get_request_preview(body_json)
             _srv().logger.info(
-                "Stream started: provider=%s model=%s session=%s request=%s",
+                "Stream started: provider=%s model=%s session=%s request=%s%s",
                 provider or "remote",
                 model_name,
                 session_id or "unknown",
                 _request_preview or "",
+                f" entry={entry}" if entry else "",
             )
         except Exception:
             pass
@@ -764,7 +774,7 @@ async def _handle_remote_streaming(
                         if collected_chunks is not None:
                             collected_chunks.append(_final_error_bytes)
                         yield _final_error_bytes
-                        log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                         break
 
                     # Reset stream state for the new connection
@@ -811,7 +821,7 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(_final_error_bytes)
                 yield _final_error_bytes
-                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
 
             if _retry_count >= max_retries:
@@ -853,7 +863,7 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(_final_error_bytes)
                 yield _final_error_bytes
-                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
 
             if _should_retry:
@@ -1008,7 +1018,7 @@ async def _handle_remote_streaming(
                     if collected_chunks is not None:
                         collected_chunks.append(chunk)
                     yield chunk
-                    log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                    log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
 
                     if saw_done or saw_finish:
                         break
@@ -1040,7 +1050,7 @@ async def _handle_remote_streaming(
                         if collected_chunks is not None:
                             collected_chunks.append(_final_empty_error_bytes)
                         yield _final_empty_error_bytes
-                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                     # Has content (with or without retries) or retries exhausted — stop outer loop
                     break
 
@@ -1073,7 +1083,7 @@ async def _handle_remote_streaming(
                         if collected_chunks is not None:
                             collected_chunks.append(_final_empty_error_bytes)
                         yield _final_empty_error_bytes
-                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                     else:
                         # Stream had content but ended without [DONE] — yield stop
                         _final_stop_obj = {
@@ -1087,7 +1097,7 @@ async def _handle_remote_streaming(
                         if collected_chunks is not None:
                             collected_chunks.append(_final_stop_bytes)
                         yield _final_stop_bytes
-                        log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
             except httpx.ReadTimeout:
                 # httpx ReadTimeout before idle timeout (edge case) — retry
@@ -1113,11 +1123,12 @@ async def _handle_remote_streaming(
                 try:
                     _error_type = type(exc).__name__
                     _srv().logger.warning(
-                        "Stream error: session=%s provider=%s model=%s error=%s",
+                        "Stream error: session=%s provider=%s model=%s error=%s%s",
                         session_id or "unknown",
                         provider or "remote",
                         model_name,
                         _error_type,
+                        f" entry={entry}" if entry else "",
                     )
                 except Exception:
                     pass
@@ -1132,7 +1143,7 @@ async def _handle_remote_streaming(
                 if collected_chunks is not None:
                     collected_chunks.append(_final_bytes)
                 yield _final_bytes
-                log_response_chunk(_final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                log_response_chunk(_final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
             finally:
                 # Clean up the current connection (client+cm) after each
