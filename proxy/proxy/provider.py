@@ -324,6 +324,96 @@ def _get_warm_cache_threshold(config: dict) -> int:
         return 0
 
 
+def _get_local_model_ctx_size(config: dict) -> int:
+    """Read the local model's total context size (across all slots).
+
+    Mirrors the per-model ``ctx-size`` in models.ini for the local model
+    (LP-0MSAZXXDY005AWA1). Used to compute the actual per-slot context
+    (ctx_size / active_slots) which clamps the large-context routing
+    thresholds. 0 disables the clamp.
+    """
+    val = config.get("local_model_ctx_size")
+    if val is None:
+        val = config.get("server", {}).get("local_model_ctx_size", 0)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _get_active_local_slots(config: dict) -> int:
+    """Return the number of currently active local slots.
+
+    Prefers the live slot scheduler (schedule-aware) when available;
+    otherwise falls back to ``session_slot_pool_size`` from config.
+    Returns 1 as a safe default when nothing is configured.
+    """
+    # Live slot scheduler (schedule-aware; e.g. 6 day / 8 night).
+    try:
+        import proxy.server as _srv
+
+        scheduler = getattr(_srv, "slot_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "get_active_slot"):
+            slots = scheduler.get_active_slot()
+            if slots and int(slots) > 0:
+                return int(slots)
+    except Exception:
+        pass
+
+    server_cfg = config.get("server", config)
+    try:
+        val = server_cfg.get("session_slot_pool_size")
+        if val is not None and int(val) > 0:
+            return int(val)
+    except (ValueError, TypeError):
+        pass
+    return 1
+
+
+# Output-token headroom reserved below the per-slot context when clamping
+# routing thresholds (LP-0MSAZXXDY005AWA1). Ensures prompts routed local
+# leave room for the model's completion tokens in the KV slot.
+_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096
+
+
+def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
+    """Return (cold, warm) thresholds clamped to the actual per-slot context.
+
+    The configured cold/warm thresholds were tuned assuming a fixed per-slot
+    context (e.g. 65000). When the real per-slot context is smaller
+    (``local_model_ctx_size`` / active slots, minus output headroom), prompts
+    larger than the slot capacity would be routed local and truncate with
+    ``finish_reason=length`` (context exhaustion) — surfaced by pi as the
+    misleading "maximum output token limit" error (LP-0MSAZXXDY005AWA1).
+
+    Clamping the effective thresholds to the actual per-slot context makes
+    oversized prompts fall through to remote BEFORE context exhaustion.
+
+    Returns the configured thresholds unchanged when ``local_model_ctx_size``
+    is 0 (clamp disabled) or per-slot context cannot be computed.
+    """
+    cold = _get_large_context_threshold(config)
+    warm = _get_warm_cache_threshold(config)
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return cold, warm
+
+    slots = _get_active_local_slots(config)
+    if slots <= 0:
+        return cold, warm
+
+    per_slot = ctx_size // slots
+    if per_slot <= _LOCAL_ROUTING_OUTPUT_HEADROOM:
+        return cold, warm
+
+    cap = per_slot - _LOCAL_ROUTING_OUTPUT_HEADROOM
+    if cold > 0:
+        cold = min(cold, cap)
+    if warm > 0:
+        warm = min(warm, cap)
+    return cold, warm
+
+
 async def _estimate_effective_prompt_tokens_for_routing(
     request,
     body_json: dict,
@@ -1708,8 +1798,12 @@ async def proxy_with_fallback(
                 # (LP-0MRP44W7I0085I6N). Uses cached_tokens ratio from the last
                 # local response instead of inferred cache-cold state.
                 _llama_model = provider_cfg.get("llama_model", "")
-                _cold_threshold = _get_large_context_threshold(config)
-                _warm_threshold = _get_warm_cache_threshold(config)
+                # Clamp configured thresholds to the actual per-slot context so
+                # prompts that cannot fit the KV slot fall through to remote
+                # BEFORE context exhaustion (LP-0MSAZXXDY005AWA1).
+                _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
+                    config
+                )
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,

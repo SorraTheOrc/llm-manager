@@ -272,7 +272,7 @@ INI
 }
 
 test_global_ngl_defaults_to_99() {
-    echo "Test: Production models.ini [global] ngl is set to 99"
+    echo "Test: Production models.ini [global] ngl matches running server"
 
     local result
     result=$(awk 'BEGIN { found=0; val="" }
@@ -280,7 +280,10 @@ test_global_ngl_defaults_to_99() {
     found && /^ngl/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
     END { if (val != "") print val }' "$MODELS_INI")
 
-    [ "$result" = "99" ] && pass "Production [global] ngl is 99 (got: $result)" || fail "expected [global] ngl=99, got: $result"
+    # ngl=80 was set in commit 64d8aeb (benchmarking and fine tuning) and
+    # matches the running llama-server (-ngl 80). The test previously
+    # expected 99 which was the pre-benchmark value (LP-0MSB1ILZI003FFAU).
+    [ "$result" = "80" ] && pass "Production [global] ngl is 80 (got: $result)" || fail "expected [global] ngl=80, got: $result"
 
     cleanup_tmp
 }
@@ -308,6 +311,35 @@ INI
 }
 
 # ---------------------------------------------------------------
+# Test: Production models.ini has per-model ctx-size (LP-0MSAZXXDY005AWA1)
+# ---------------------------------------------------------------
+# llama.cpp router only cascades `[*]` sections as the global preset;
+# a `[global]` section is parsed as a model named "global" and its keys
+# are never applied to other models. Per-model ctx-size must therefore
+# live in each model's own section.
+# ---------------------------------------------------------------
+test_per_model_ctx_size_present() {
+    echo "Test: Production models.ini [Qwen3] has per-model ctx-size"
+
+    local ctx
+    ctx=$(awk 'BEGIN { found=0; ctx="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "qwen3") found=1 }
+    found && /^ctx-size/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); ctx=$0; exit }
+    END { if (ctx != "") print ctx }' "$MODELS_INI")
+
+    [ -n "$ctx" ] && pass "[Qwen3] ctx-size=$ctx present in models.ini" || fail "[Qwen3] ctx-size missing from models.ini"
+
+    # ctx-size must not live only in [global] (which llama.cpp ignores)
+    local global_ctx
+    global_ctx=$(awk 'BEGIN { found=0; ctx="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "global") found=1 }
+    found && /^ctx-size/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); ctx=$0; exit }
+    END { if (ctx != "") print ctx }' "$MODELS_INI")
+
+    [ -z "$global_ctx" ] && pass "[global] carries no ctx-size (only per-model sections)" || fail "[global] still has ctx-size=$global_ctx (ignored by llama.cpp router)"
+}
+
+# ---------------------------------------------------------------
 # Test: Script exists and is executable
 # ---------------------------------------------------------------
 test_script_exists() {
@@ -324,6 +356,7 @@ echo "start-llama.sh models.ini configuration tests"
 echo "=========================================="
 
 test_script_exists
+test_per_model_ctx_size_present
 test_global_ngl_from_models_ini
 test_global_ngl_defaults_to_99
 test_global_ngl_zero_disables_gpu
