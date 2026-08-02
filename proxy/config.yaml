@@ -475,10 +475,15 @@ server:
   # for the next chunk before detecting a stall, closing the connection,
   # and retrying with bounded exponential backoff.
   # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
-  # Reduced from 60s to 30s for faster stall detection (LP-0MRFEXXVC001RYKB).
-  # Operators with long-thinking models may increase this value.
-  # Default: 30 seconds.
-  upstream_idle_timeout_seconds: 30
+  # Raised from 30s to 120s to tolerate long reasoning pauses from remote
+  # reasoning models (e.g. opencode-go/deepseek-v4-flash on large contexts)
+  # which can pause >30s between chunks while still being alive
+  # (LP-0MS9FR9LG002AJ4C). Matches the local stream_idle_timeout_seconds
+  # (120s) used for Qwen3 reasoning pauses (LP-0MS14PM7J003XPS8).
+  # Since retries now only occur while zero content has been delivered, a
+  # genuinely dead upstream fails fast once content starts flowing.
+  # Default: 120 seconds.
+  upstream_idle_timeout_seconds: 120
 
   # Cross-request stall circuit breaker (LP-0MRFEXXVC001RYKB).
   # Tracks stall frequency per provider within a sliding time window.

@@ -440,8 +440,11 @@ async def proxy_to_remote(
         )
 
     # Read upstream idle timeout from config (LP-0MRE52D3C001KP1H)
+    # Default raised 60 -> 120 to tolerate long reasoning pauses on remote
+    # upstreams (LP-0MS9FR9LG002AJ4C). Keep in sync with the fallback in
+    # _handle_remote_streaming and proxy/config.yaml.
     _upstream_idle_timeout = float(
-        server_config.get("upstream_idle_timeout_seconds", 60) or 60
+        server_config.get("upstream_idle_timeout_seconds", 120) or 120
     )
     # Read upstream retry connect timeout from config (LP-0MRE8FYKV008WOTB)
     _upstream_retry_connect_timeout = float(
@@ -535,6 +538,11 @@ async def _handle_remote_streaming(
     - Automatic retry: on stall detection (asyncio.TimeoutError) or httpx
       ReadTimeout, retries the same provider with bounded exponential backoff
       (1s, 2s, 4s; max 3 retries).
+    - Content-aware retry (LP-0MS9FR9LG002AJ4C): Tier-1 retries only occur
+      while zero content-bearing chunks have been delivered. Once any content
+      has been sent to the client, a stall terminates the stream immediately
+      with a synthetic ``finish_reason: error`` (no whole-request retry) so
+      the client can retry with full context.
     - Fallthrough: after max retries exhausted, yields a synthetic
       ``finish_reason: error`` event so the caller (provider.py fallback chain)
       can route to the next provider.
@@ -544,11 +552,11 @@ async def _handle_remote_streaming(
         try:
             upstream_idle_timeout_seconds = float(
                 _srv().config.get("server", {}).get(
-                    "upstream_idle_timeout_seconds", 60
-                ) or 60
+                    "upstream_idle_timeout_seconds", 120
+                ) or 120
             )
         except Exception:
-            upstream_idle_timeout_seconds = 60.0
+            upstream_idle_timeout_seconds = 120.0
 
     # Resolve upstream_retry_connect_timeout_seconds from parameter or config
     if upstream_retry_connect_timeout_seconds is None:
@@ -715,6 +723,11 @@ async def _handle_remote_streaming(
         _current_cm = cm
         _current_response = response
         _should_retry = False
+        # After-content termination flag (LP-0MS9FR9LG002AJ4C): set when a
+        # stall/ReadTimeout occurs after content-bearing chunks were already
+        # delivered; the stream then terminates immediately with a synthetic
+        # finish_reason: error instead of restarting the whole request.
+        _terminate_after_content = False
 
         # Outer loop: retry on stall/ReadTimeout (initial attempt counts as
         # iteration 0; retries are iterations 1..max_retries) or
@@ -1056,8 +1069,17 @@ async def _handle_remote_streaming(
 
                 # If we break out of the inner loop without saw_done/saw_finish
                 # and without disconnect, it's a stall (asyncio.TimeoutError).
-                # Set retry flag to reconnect with backoff.
-                _should_retry = True
+                # Content-aware retry (LP-0MS9FR9LG002AJ4C): only retry while
+                # zero content-bearing chunks were delivered. Once any content
+                # has been sent to the client, restarting the whole request
+                # would re-send a huge prompt and duplicate output, so the
+                # stream terminates immediately instead.
+                if _has_content:
+                    _terminate_after_content = True
+                else:
+                    # Zero content delivered — safe to retry the whole request
+                    # with bounded exponential backoff.
+                    _should_retry = True
 
             except StopAsyncIteration:
                 # Normal exhaustion of the upstream iterator (no [DONE] received).
@@ -1100,7 +1122,9 @@ async def _handle_remote_streaming(
                         log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
             except httpx.ReadTimeout:
-                # httpx ReadTimeout before idle timeout (edge case) — retry
+                # httpx ReadTimeout before idle timeout (edge case). Content-
+                # aware retry: only retry while zero content was delivered
+                # (LP-0MS9FR9LG002AJ4C); after content, terminate immediately.
                 try:
                     _srv().logger.warning(
                         "Upstream ReadTimeout session=%s provider=%s model=%s",
@@ -1110,7 +1134,10 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                _should_retry = True
+                if _has_content:
+                    _terminate_after_content = True
+                else:
+                    _should_retry = True
             except GeneratorExit:
                 # Client disconnected or generator is being closed.
                 # Skip the final event yield and proceed directly to cleanup.
@@ -1162,6 +1189,48 @@ async def _handle_remote_streaming(
                                 await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (TimeoutError, Exception):
                                 pass
+
+            # After-content stall/ReadTimeout: terminate the stream immediately
+            # with a synthetic finish_reason: error instead of restarting the
+            # whole request (LP-0MS9FR9LG002AJ4C). The client sees a clear
+            # terminal state quickly and can retry with full context.
+            if _terminate_after_content:
+                try:
+                    _srv().logger.warning(
+                        "Upstream stall after content delivered: terminating "
+                        "stream without retry session=%s provider=%s model=%s "
+                        "timeout=%.1fs",
+                        session_id or "unknown",
+                        provider or "remote",
+                        model_name,
+                        upstream_idle_timeout_seconds,
+                    )
+                except Exception:
+                    pass
+                # Record the stall in the Tier 3 circuit breaker so repeated
+                # stalls (before or after content) accumulate toward provider
+                # cooldown (LP-0MRFEXXVC001RYKB).
+                try:
+                    _config = _srv().config if hasattr(_srv(), 'config') else {}
+                    _check_stall_circuit_breaker(
+                        provider or "remote",
+                        _config,
+                    )
+                except Exception:
+                    pass
+                _final_error_obj = {
+                    "choices": [
+                        {"delta": {}, "finish_reason": "error", "index": 0}
+                    ]
+                }
+                _final_error_bytes = (
+                    f"data: {json.dumps(_final_error_obj)}\n\n"
+                ).encode()
+                if collected_chunks is not None:
+                    collected_chunks.append(_final_error_bytes)
+                yield _final_error_bytes
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
+                break
 
             if saw_done or saw_finish or disconnected:
                 # Don't break if we're about to handle an empty-response retry;

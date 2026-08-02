@@ -210,13 +210,12 @@ async def test_stall_detection_triggers_retry(mock_request):
     AC3: On stall detection, the proxy automatically retries the request to
     the same provider with bounded exponential backoff.
     """
-    first_chunks = [
-        b'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n',
-    ]
-    # First response yields one chunk then hangs (stall)
+    # First response yields no content then hangs (zero-content stall).
+    # Tier-1 retries only occur while zero content has been delivered
+    # (LP-0MS9FR9LG002AJ4C).
     first_resp = _make_mock_response(
         status_code=200,
-        aiter_chunks=first_chunks,
+        aiter_chunks=[],
         hang_after=True,
     )
     # Second response (retry) succeeds fully
@@ -364,13 +363,9 @@ async def test_max_retries_exhausted_yields_finish_reason_error(mock_request):
     AC5: Session state preserved — full request body is re-sent on retry.
     AC8: After max retries exhausted, falls through with finish_reason: error.
     """
-    # All 4 attempts (initial + 3 retries) stall after first chunk
-    chunks_per_attempt = [
-        [b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n'],
-        [b'data: {"choices":[{"delta":{"content":"B"},"index":0}]}\n\n'],
-        [b'data: {"choices":[{"delta":{"content":"C"},"index":0}]}\n\n'],
-        [b'data: {"choices":[{"delta":{"content":"D"},"index":0}]}\n\n'],
-    ]
+    # All 4 attempts (initial + 3 retries) stall before delivering content
+    # (zero-content stalls, so retries still occur — LP-0MS9FR9LG002AJ4C).
+    chunks_per_attempt = [[], [], [], []]
 
     responses = []
     for attempt_chunks in chunks_per_attempt:
@@ -537,17 +532,15 @@ async def test_retry_connection_setup_has_bounded_timeout(mock_request):
     AC3: Normal initial connections continue to use the existing adaptive timeout.
     AC5: After max retries exhausted, yields finish_reason: error.
 
-    The first stream returns some chunks then stalls. The retry connection's
+    The first stream returns no content then stalls. The retry connection's
     __aenter__() hangs forever — this should be caught by asyncio.wait_for
     with upstream_retry_connect_timeout_seconds, NOT by the longer httpx remote_timeout.
     """
-    # First attempt: yields one chunk then hangs (stall)
-    first_chunks = [
-        b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
-    ]
+    # First attempt: no content, then hangs (zero-content stall so the
+    # retry machinery still engages — LP-0MS9FR9LG002AJ4C)
     first_resp = _make_mock_response(
         status_code=200,
-        aiter_chunks=first_chunks,
+        aiter_chunks=[],
         hang_after=True,
     )
 
@@ -620,12 +613,11 @@ async def test_retry_connection_timeout_fires_before_httpx_timeout(mock_request)
     retry connection setup should be caught by asyncio.wait_for within the
     much shorter upstream_retry_connect_timeout_seconds (0.05s in test).
     """
-    first_chunks = [
-        b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
-    ]
+    # First attempt: no content, then hangs (zero-content stall so the
+    # retry machinery still engages — LP-0MS9FR9LG002AJ4C)
     first_resp = _make_mock_response(
         status_code=200,
-        aiter_chunks=first_chunks,
+        aiter_chunks=[],
         hang_after=True,
     )
 
@@ -705,13 +697,11 @@ async def test_retry_connection_uses_new_config_key(mock_request):
     Verifies that setting only upstream_retry_connect_timeout_seconds (not
     upstream_idle_timeout_seconds) controls the retry connection timeout.
     """
-    # First attempt: yields one chunk then hangs (stall)
-    first_chunks = [
-        b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
-    ]
+    # First attempt: no content, then hangs (zero-content stall so the
+    # retry machinery still engages — LP-0MS9FR9LG002AJ4C)
     first_resp = _make_mock_response(
         status_code=200,
-        aiter_chunks=first_chunks,
+        aiter_chunks=[],
         hang_after=True,
     )
 
@@ -779,13 +769,11 @@ async def test_retry_config_keys_are_used(mock_request):
     Uses a custom config with faster retry timing to verify the
     config values are actually read and applied.
     """
-    # First attempt yields one chunk then hangs
-    first_chunks = [
-        b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n',
-    ]
+    # First attempt: no content, then hangs (zero-content stall so the
+    # retry machinery still engages — LP-0MS9FR9LG002AJ4C)
     first_resp = _make_mock_response(
         status_code=200,
-        aiter_chunks=first_chunks,
+        aiter_chunks=[],
         hang_after=True,
     )
 
