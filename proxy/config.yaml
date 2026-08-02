@@ -23,8 +23,8 @@
 #                     ranges (e.g. "22:00-02:00") wrap past midnight.
 #                     Omit the field (or use an empty list) to leave a
 #                     provider unrestricted. Malformed entries are logged and
-#                     ignored (fail-open). No provider is currently timed in
-#                     this config; the field is documented for future use.
+#                     ignored (fail-open). The deepseek-v4-flash provider is
+#                     currently timed to off-peak UTC windows (see its entries).
 #                     Example:
 #                       - name: deepseek-v4-flash
 #                         type: remote
@@ -178,6 +178,7 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - plan*
     force_full_prompt: true
@@ -214,6 +215,7 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - author
     force_full_prompt: true
@@ -251,6 +253,7 @@ models:
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-v4-flash
         model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
     force_full_prompt: true
