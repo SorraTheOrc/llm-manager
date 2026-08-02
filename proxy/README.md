@@ -582,6 +582,10 @@ When a fallback occurs:
   ```
   Fallback triggered for model=v1/chat/completions, from=remote-primary, to=remote-fallback, reason=HTTP 502
   ```
+- **HTTP 400 (remote)**: A per-fallback INFO log line includes the response body snippet (first 512 chars) so the rejection reason (e.g. missing `tool_call_id`) is discoverable, and `proxy_http_errors_total{endpoint,status="400",reason=...}` is incremented (LP-0MSC1BNP90017L9K):
+  ```
+  Remote HTTP 400 from provider=remote-primary model=v1/chat/completions reason=HTTP 400 body_snippet={"error": ...}
+  ```
 
 #### Migration Guide
 

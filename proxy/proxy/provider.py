@@ -1368,6 +1368,42 @@ def _handle_http_error_with_cooldown(
     return cooldown
 
 
+def _observe_http_error_400(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    path: str,
+    body_text: str,
+    fallback_reason: str,
+) -> None:
+    """Observability for remote HTTP 400 rejections (LP-0MSC1BNP90017L9K).
+
+    Emits a per-fallback INFO log line containing the response body snippet
+    (first 512 chars) and increments ``proxy_http_errors_total{status=400}``
+    with the fallback reason, so rejection causes are discoverable without
+    code changes. Best-effort: never raises.
+    """
+    try:
+        if int(response.status_code) != 400 or provider_type != "remote":
+            return
+        snippet = (body_text or "")[:512]
+        logger.info(
+            "Remote HTTP 400 from provider=%s model=%s reason=%s body_snippet=%s",
+            provider_name,
+            path,
+            fallback_reason,
+            snippet,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", fallback_reason)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _handle_empty_response_with_cooldown(
     response: Response,
     provider_name: str,
@@ -1607,6 +1643,9 @@ async def proxy_with_remote_fallback(
                 prev_provider = provider_name
                 if response.status_code != 429:
                     all_slot_exhaustion = False
+                _observe_http_error_400(
+                    response, provider_name, provider_type, path, body_text, fallback_reason,
+                )
                 continue
 
             # Treat empty successful responses as failures to allow fallback
@@ -2148,6 +2187,9 @@ async def proxy_with_fallback(
                     prev_provider = provider_name
                     if response.status_code != 429:
                         all_slot_exhaustion = False
+                    _observe_http_error_400(
+                        response, provider_name, provider_type, path, body_text, fallback_reason,
+                    )
                     continue
 
             # Treat empty successful responses as failures to allow fallback
