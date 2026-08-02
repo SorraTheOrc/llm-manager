@@ -1,0 +1,298 @@
+{
+  "endpoints": [
+    {
+      "name": "opencode-deepseek-free",
+      "url": "https://opencode.ai/zen/v1/chat/completions",
+      "model": "deepseek-v4-flash-free",
+      "probes": [
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "control",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "content_null_toolcalls",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "content_null_reasoning_toolcalls",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "missing_tool_call_id",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "mismatched_tool_call_id",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "missing_id_type",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "truncated_arguments",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        },
+        {
+          "endpoint": "opencode-deepseek-free",
+          "shape": "empty_tool_calls",
+          "status": 429,
+          "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+        }
+      ]
+    },
+    {
+      "name": "opencode-go-deepseek",
+      "url": "https://opencode.ai/zen/go/v1/chat/completions",
+      "model": "deepseek-v4-flash",
+      "probes": [
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "control",
+          "status": 200,
+          "body": "{\"id\":\"407e1d4d-2e07-49e6-bdaf-9566c44943c7\",\"object\":\"chat.completion\",\"created\":1785697105,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to user. User previously said \\\"Say hi.\\\" Assistant called\"}}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":129,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00002254\"}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "content_null_toolcalls",
+          "status": 200,
+          "body": "{\"id\":\"01703039-3bd4-4ec7-865c-5019b8127748\",\"object\":\"chat.completion\",\"created\":1785697108,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. The user said \\\"Say hi.\\\" We\"}}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00000498\"}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "content_null_reasoning_toolcalls",
+          "status": 200,
+          "body": "{\"id\":\"b9c85f7e-bcc4-4805-ae85-bedb98117222\",\"object\":\"chat.completion\",\"created\":1785697110,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. They said \\\"Say hi.\\\" We invoked\"}}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00000498\"}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "missing_tool_call_id",
+          "status": 400,
+          "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: messages[2]: missing field `tool_call_id` at line 1 column 239\"}}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "mismatched_tool_call_id",
+          "status": 400,
+          "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id', The following tool_call_ids did not have response messages: call_NOPE\"}}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "missing_id_type",
+          "status": 400,
+          "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: messages[1]: missing field `id` at line 1 column 174\"}}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "truncated_arguments",
+          "status": 200,
+          "body": "{\"id\":\"6ba81af3-ba62-4ec0-b46d-c25066485e4f\",\"object\":\"chat.completion\",\"created\":1785697117,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to user. The user said \\\"Thanks.\\\" after we said\"}}],\"usage\":{\"prompt_tokens\":151,\"completion_tokens\":16,\"total_tokens\":167,\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":151,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00002562\"}"
+        },
+        {
+          "endpoint": "opencode-go-deepseek",
+          "shape": "empty_tool_calls",
+          "status": 400,
+          "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] Invalid 'messages[1].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead.\"}}"
+        }
+      ]
+    },
+    {
+      "name": "deepseek-v4-flash",
+      "url": "https://api.deepseek.com/v1/chat/completions",
+      "model": "deepseek-v4-flash",
+      "probes": [
+        {
+          "endpoint": "deepseek-v4-flash",
+          "shape": "control",
+          "status": 200,
+          "body": "{\"id\":\"3a7ac054-ad52-4752-98e9-53333e3d3f68\",\"object\":\"chat.completion\",\"created\":1785697121,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. The user said \\\"Thanks.\\\" after we\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":16},\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":129},\"system_fingerprint\":\"fp_a18b46594c_prod0820_fp8_kvcac"
+        },
+        {
+          "endpoint": "deepseek-v4-flash",
+          "shape": "content_null_toolcalls",
+          "status": 200,
+          "body": "{\"id\":\"74431dfb-cd7d-4ec5-b455-e002faf9c026\",\"object\":\"chat.completion\",\"created\":1785697123,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. They said \\\"Say hi.\\\" We invoked\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16},\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1},\"system_fingerprint\":\"fp_a18b46594c_prod0820_fp8_kvcac"
+        },
+        {
+          "endpoint": "deepseek-v4-flash",
+          "shape": "content_null_reasoning_toolcalls",
+          "status": 200,
+          "body": "{\"id\":\"4fb836a1-b870-49a3-8919-d98675db58e3\",\"object\":\"chat.completion\",\"created\":1785697125,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. The user said \\\"Thanks.\\\" after we\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16},\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1},\"system_fingerprint\":\"fp_a18b46594c_prod0820_fp8_kvc"
+        },
+        {
+          "endpoint": "deepseek-v4-flash",
+          "shape": "missing_tool_call_id",
+          "status": 400,
+          "body": "{\"error\":{\"message\":\"Failed to deserialize the JSON body into the target type: messages[2]: missing field `tool_call_id` at line 1 column 239\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+        }
+      ]
+    }
+  ],
+  "results": [
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "control",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "content_null_toolcalls",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "content_null_reasoning_toolcalls",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "missing_tool_call_id",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "mismatched_tool_call_id",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "missing_id_type",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "truncated_arguments",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-deepseek-free",
+      "shape": "empty_tool_calls",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "control",
+      "status": 200,
+      "body": "{\"id\":\"407e1d4d-2e07-49e6-bdaf-9566c44943c7\",\"object\":\"chat.completion\",\"created\":1785697105,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to user. User previously said \\\"Say hi.\\\" Assistant called\"}}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":129,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00002254\"}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "content_null_toolcalls",
+      "status": 200,
+      "body": "{\"id\":\"01703039-3bd4-4ec7-865c-5019b8127748\",\"object\":\"chat.completion\",\"created\":1785697108,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. The user said \\\"Say hi.\\\" We\"}}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00000498\"}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "content_null_reasoning_toolcalls",
+      "status": 200,
+      "body": "{\"id\":\"b9c85f7e-bcc4-4805-ae85-bedb98117222\",\"object\":\"chat.completion\",\"created\":1785697110,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. They said \\\"Say hi.\\\" We invoked\"}}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00000498\"}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "missing_tool_call_id",
+      "status": 400,
+      "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: messages[2]: missing field `tool_call_id` at line 1 column 239\"}}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "mismatched_tool_call_id",
+      "status": 400,
+      "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id', The following tool_call_ids did not have response messages: call_NOPE\"}}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "missing_id_type",
+      "status": 400,
+      "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: messages[1]: missing field `id` at line 1 column 174\"}}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "truncated_arguments",
+      "status": 200,
+      "body": "{\"id\":\"6ba81af3-ba62-4ec0-b46d-c25066485e4f\",\"object\":\"chat.completion\",\"created\":1785697117,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"logprobs\":null,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to user. The user said \\\"Thanks.\\\" after we said\"}}],\"usage\":{\"prompt_tokens\":151,\"completion_tokens\":16,\"total_tokens\":167,\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":151,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":16}},\"cost\":\"0.00002562\"}"
+    },
+    {
+      "endpoint": "opencode-go-deepseek",
+      "shape": "empty_tool_calls",
+      "status": 400,
+      "body": "{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] Invalid 'messages[1].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead.\"}}"
+    },
+    {
+      "endpoint": "deepseek-v4-flash",
+      "shape": "control",
+      "status": 200,
+      "body": "{\"id\":\"3a7ac054-ad52-4752-98e9-53333e3d3f68\",\"object\":\"chat.completion\",\"created\":1785697121,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. The user said \\\"Thanks.\\\" after we\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":16},\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":129},\"system_fingerprint\":\"fp_a18b46594c_prod0820_fp8_kvcac"
+    },
+    {
+      "endpoint": "deepseek-v4-flash",
+      "shape": "content_null_toolcalls",
+      "status": 200,
+      "body": "{\"id\":\"74431dfb-cd7d-4ec5-b455-e002faf9c026\",\"object\":\"chat.completion\",\"created\":1785697123,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. They said \\\"Say hi.\\\" We invoked\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16},\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1},\"system_fingerprint\":\"fp_a18b46594c_prod0820_fp8_kvcac"
+    },
+    {
+      "endpoint": "deepseek-v4-flash",
+      "shape": "content_null_reasoning_toolcalls",
+      "status": 200,
+      "body": "{\"id\":\"4fb836a1-b870-49a3-8919-d98675db58e3\",\"object\":\"chat.completion\",\"created\":1785697125,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"We need to respond to the user. The user said \\\"Thanks.\\\" after we\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":129,\"completion_tokens\":16,\"total_tokens\":145,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":16},\"prompt_cache_hit_tokens\":128,\"prompt_cache_miss_tokens\":1},\"system_fingerprint\":\"fp_a18b46594c_prod0820_fp8_kvc"
+    },
+    {
+      "endpoint": "deepseek-v4-flash",
+      "shape": "missing_tool_call_id",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"Failed to deserialize the JSON body into the target type: messages[2]: missing field `tool_call_id` at line 1 column 239\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+    }
+  ],
+  "rejected_matrix": {
+    "control": [
+      "opencode-deepseek-free"
+    ],
+    "content_null_toolcalls": [
+      "opencode-deepseek-free"
+    ],
+    "content_null_reasoning_toolcalls": [
+      "opencode-deepseek-free"
+    ],
+    "missing_tool_call_id": [
+      "opencode-deepseek-free",
+      "opencode-go-deepseek",
+      "deepseek-v4-flash"
+    ],
+    "mismatched_tool_call_id": [
+      "opencode-deepseek-free",
+      "opencode-go-deepseek"
+    ],
+    "missing_id_type": [
+      "opencode-deepseek-free",
+      "opencode-go-deepseek"
+    ],
+    "truncated_arguments": [
+      "opencode-deepseek-free"
+    ],
+    "empty_tool_calls": [
+      "opencode-deepseek-free",
+      "opencode-go-deepseek"
+    ]
+  }
+}
