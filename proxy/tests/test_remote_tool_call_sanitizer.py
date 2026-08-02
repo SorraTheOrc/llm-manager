@@ -55,12 +55,6 @@ def _valid_history():
 # ---------------------------------------------------------------------------
 
 
-def test_sanitizer_red_before_implementation():
-    """The sanitizer helper must exist (red until F5 implements it)."""
-    with pytest.raises((ImportError, ModuleNotFoundError)):
-        _sanitize([])
-
-
 def test_valid_tool_call_sequence_unchanged():
     """Valid tool-call sequences must pass through unchanged (regression guard)."""
     history = _valid_history()

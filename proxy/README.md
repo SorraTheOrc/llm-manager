@@ -397,6 +397,26 @@ programmatically by inspecting the `aliases` field of each model entry.
 - `api_key_env`: Environment variable containing the API key
 - `headers`: Additional headers to include (optional)
 
+#### Remote request sanitization
+
+Before a chat-completions request is forwarded to a remote provider, the proxy
+sanitizes the request shape and the accumulated message history
+(LP-0MSC1BNP90017L9K):
+
+- **Top-level fields**: a conservative OpenAI-compatible allowlist is kept;
+  local/experimental fields are stripped (logged at INFO).
+- **Message history** (`_sanitize_remote_messages`, always-on): malformed
+  tool-call/tool-result sequences that remote providers reject with HTTP 400
+  are repaired or pruned — never sent as-is:
+  - repair: assistant `content: null` → `""` when `tool_calls` present; missing
+    `type` → `"function"`; missing `function.arguments` → `""`
+  - prune: tool messages with missing or dangling `tool_call_id`; assistant
+    `tool_calls` entries missing `id`; empty `tool_calls` arrays
+  - strip: non-standard `reasoning_content` from assistant messages
+  - preserve: truncated `function.arguments` JSON and valid tool-call
+    sequences (RCA showed these are accepted by the remote chain)
+  - every mutation is logged at DEBUG
+
 ### Audit Model Configuration
 
 The audit skill (`skill/audit/`) uses the `audit_model` and `audit_model_fallbacks`

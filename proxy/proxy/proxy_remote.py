@@ -156,6 +156,126 @@ def _sanitize_remote_chat_payload(path: str, payload: dict[str, Any]) -> dict[st
     return sanitized
 
 
+def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
+    """Sanitize accumulated chat message history for remote sends.
+
+    Remote providers (opencode zen/go, api.deepseek.com) reject malformed
+    tool-call/tool-result sequences with HTTP 400 (LP-0MSC1BNP90017L9K).
+    RCA (F1) confirmed the rejected shapes:
+
+      - tool message missing ``tool_call_id``
+      - tool message with dangling ``tool_call_id`` (no matching assistant tool_calls)
+      - assistant ``tool_calls`` entry missing ``id``
+      - empty ``tool_calls`` array
+
+    Hybrid policy (always-on, no config flag):
+
+      - **Repair** where unambiguous: assistant ``content: null`` -> ``""``
+        when ``tool_calls`` present; missing ``function.arguments`` -> ``""``;
+        missing ``type`` -> ``"function"``.
+      - **Prune** where not: tool messages with missing/dangling
+        ``tool_call_id``; assistant ``tool_calls`` entries missing ``id``;
+        empty ``tool_calls`` arrays (key removed).
+      - **Strip** non-standard ``reasoning_content`` from assistant messages
+        (not part of the OpenAI-compatible schema).
+      - **Preserve** truncated ``function.arguments`` JSON — RCA showed it is
+        accepted by both zen/go and deepseek; do not alter valid semantics.
+
+    Valid tool-call sequences pass through unchanged (regression guards:
+    LP-0MS8XAPXT009W3CL, LP-0MQP3Q8DN0047J1H).
+
+    Each mutation is logged at DEBUG for diagnosability.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    def _log(action: str, index: int, detail: str) -> None:
+        try:
+            _srv().logger.debug(
+                "[remote] sanitizer: %s messages[%d] %s", action, index, detail,
+            )
+        except Exception:
+            pass
+
+    # First pass: sanitize assistant messages and collect valid tool_call ids.
+    valid_tool_call_ids: set[str] = set()
+    sanitized: list[Any] = []
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            sanitized.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            cleaned = dict(msg)
+            # Strip non-standard reasoning_content on remote sends.
+            if "reasoning_content" in cleaned:
+                _log("strip", index, "reasoning_content")
+                del cleaned["reasoning_content"]
+
+            tool_calls = cleaned.get("tool_calls")
+            if isinstance(tool_calls, list):
+                if not tool_calls:
+                    # Empty tool_calls array -> 400; remove the key entirely.
+                    _log("prune", index, "empty tool_calls array")
+                    del cleaned["tool_calls"]
+                else:
+                    # Repair content:null -> "" when tool_calls present.
+                    if cleaned.get("content") is None:
+                        _log("repair", index, "content null -> ''")
+                        cleaned["content"] = ""
+
+                    valid_entries: list[Any] = []
+                    for entry in tool_calls:
+                        if not isinstance(entry, dict):
+                            _log("prune", index, "non-dict tool_calls entry")
+                            continue
+                        if not entry.get("id"):
+                            # RCA: missing id -> 400 on both zen/go and deepseek.
+                            _log("prune", index, "tool_calls entry missing id")
+                            continue
+                        entry = dict(entry)
+                        if not entry.get("type"):
+                            _log("repair", index, f"tool_calls[{entry.get('id')}] missing type -> 'function'")
+                            entry["type"] = "function"
+                        fn = entry.get("function")
+                        if not isinstance(fn, dict):
+                            _log("prune", index, f"tool_calls[{entry.get('id')}] missing function")
+                            continue
+                        fn = dict(fn)
+                        if not fn.get("name"):
+                            _log("prune", index, f"tool_calls[{entry.get('id')}] missing function.name")
+                            continue
+                        if "arguments" not in fn:
+                            _log("repair", index, f"tool_calls[{entry.get('id')}] missing arguments -> ''")
+                            fn["arguments"] = ""
+                        entry["function"] = fn
+                        valid_entries.append(entry)
+                        valid_tool_call_ids.add(str(entry["id"]))
+
+                    if valid_entries:
+                        cleaned["tool_calls"] = valid_entries
+                    else:
+                        _log("prune", index, "all tool_calls entries invalid")
+                        del cleaned["tool_calls"]
+            sanitized.append(cleaned)
+        else:
+            sanitized.append(msg)
+
+    # Second pass: prune tool messages with missing or dangling tool_call_id.
+    result: list[Any] = []
+    for index, msg in enumerate(sanitized):
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if not tool_call_id:
+                _log("prune", index, "tool message missing tool_call_id")
+                continue
+            if str(tool_call_id) not in valid_tool_call_ids:
+                _log("prune", index, f"tool message dangling tool_call_id {tool_call_id}")
+                continue
+        result.append(msg)
+    return result
+
+
 async def proxy_to_remote(
     request: Request,
     path: str,
@@ -228,6 +348,13 @@ async def proxy_to_remote(
 
     # Sanitize request-shape for remote compatibility before model override.
     body_json = _sanitize_remote_chat_payload(path, body_json)
+
+    # Sanitize accumulated tool-call/tool-result message history before remote
+    # sends (LP-0MSC1BNP90017L9K): remote providers reject malformed tool-call
+    # sequences with HTTP 400 (missing/dangling tool_call_id, missing id/type,
+    # empty tool_calls). Always-on; repairs where unambiguous, prunes otherwise.
+    if isinstance(body_json.get("messages"), list):
+        body_json["messages"] = _sanitize_remote_messages(body_json["messages"])
 
     # Override model name in body if provider config specifies an upstream model ID.
     # This allows the proxy to present a different model name to the remote API
