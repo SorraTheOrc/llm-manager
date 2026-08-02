@@ -505,6 +505,7 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
+| `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
 
 #### Example: Remote Fallback
 
@@ -544,6 +545,48 @@ models:
 ```
 
 In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to the remote provider.
+
+#### Timed Access (`available_times`)
+
+Each provider entry may optionally restrict *when* it may be used with an
+`available_times` list of `"HH:MM-HH:MM"` windows. This is useful for
+providers with peak-hour pricing (e.g. DeepSeek charges peak rates between
+01:00–04:00 and 06:00–10:00 UTC) — operators can keep the provider in the
+fallback chain but only allow the proxy to route to it when it is cheap.
+
+- **UTC only** — windows are interpreted in **UTC**, never server local time.
+- **End-exclusive** — a `"10:00-12:00"` window includes 10:00 but excludes 12:00.
+- **Overnight ranges** — `"22:00-02:00"` wraps past midnight (covers 22:00–23:59 and 00:00–01:59).
+- **Multiple windows** — a provider is eligible if the current UTC time falls inside *any* of its windows.
+- **Backward compatible** — a provider without `available_times` (or with an empty list) is unrestricted and behaves exactly as before.
+- **Fail-open parsing** — malformed window strings are logged and ignored. If *every* window is malformed the provider is treated as unrestricted, so a config typo never breaks proxy startup.
+
+Example — use DeepSeek only outside its peak-pricing windows:
+
+```yaml
+models:
+  plan:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: deepseek-v4-flash
+        type: remote
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["10:00-12:00", "14:00-16:00"]
+    aliases:
+      - plan*
+```
+
+During fallback resolution, a provider whose current UTC time is **outside**
+all its windows is skipped exactly like a provider in cooldown — it is *not*
+marked with a failure count or cooldown, and becomes eligible again as soon
+as a window reopens. Both selection entry points (`resolve_provider()` and the
+fallback loops used by `proxy_with_fallback` / `proxy_with_remote_fallback`)
+honor the windows, so local-first chains, remote fallback, and concurrency-
+limit remote fallback all behave consistently.
 
 #### Unavailability Detection
 
@@ -593,6 +636,7 @@ repeatedly across requests is quarantined after the threshold is exceeded.
 When all providers are exhausted:
 - **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 (Too Many Requests) with `Content-Type: text/plain` and body `"Model server busy: 0/<total_slots> slots available. Retry later."` (no `Retry-After` header).
 - **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
+- **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable — `error` is `"All providers unavailable: no provider is available during the current scheduled time window"` and the `diagnostics` entries carry `status: "outside_time_window"` instead of the generic `"All providers exhausted"`. Mixed cases (a provider in cooldown or an error plus a time-window skip) keep the generic message, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible.
 
 #### Observability
 

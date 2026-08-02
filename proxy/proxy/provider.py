@@ -7,12 +7,15 @@ Provides:
 - `resolve_provider()`: Select the next available provider for a model config
 - `proxy_with_remote_fallback()`: Remote provider fallback loop
 - Cooldown tracking: Mark providers as temporarily unavailable after failures
+- Timed access: Skip providers outside their configured `available_times` UTC
+  windows (LP-0MS4ETBNO0022QAC)
 """
 
 import asyncio
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -43,6 +46,26 @@ _BACKOFF_MAX_SECONDS = 45.0
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details.
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+
+# ---------------------------------------------------------------------------
+# Timed access to models (LP-0MS4ETBNO0022QAC)
+#
+# Provider entries may carry an optional ``available_times`` list of
+# "HH:MM-HH:MM" windows (interpreted in UTC, end exclusive, overnight ranges
+# wrap past midnight). A provider whose current UTC time is outside all of its
+# windows is skipped during fallback resolution exactly like a provider in
+# cooldown. Providers without ``available_times`` remain unrestricted
+# (backward compatible).
+#
+# Malformed window strings are logged and treated as unrestricted (fail-open)
+# so a config typo never breaks proxy startup.
+# ---------------------------------------------------------------------------
+
+# Lazy parse cache: tuple(raw window strings) -> tuple((start_min, end_min), ...)
+# or None when the provider is unrestricted. Keyed by the raw strings so the
+# unhashable provider dict is never used as a key.
+_NOT_CACHED = object()
+_WINDOW_PARSE_CACHE: dict[tuple[str, ...], tuple[tuple[int, int], ...] | None] = {}
 
 # ---------------------------------------------------------------------------
 # Three-tier retry system (LP-0MRE8G94H005ZBLV, LP-0MRFEXXVC001RYKB)
@@ -569,6 +592,12 @@ def resolve_provider(
             continue
         if _is_provider_unavailable(name):
             continue
+        if not _is_within_allowed_window(provider_cfg):
+            logger.info(
+                "Skipping provider=%s: outside its available_times window (UTC)",
+                name,
+            )
+            continue
         return provider_cfg
 
     return None
@@ -697,6 +726,116 @@ def _is_provider_unavailable(provider_name: str) -> bool:
         del _provider_unavailable_until[provider_name]
         return False
     return True
+
+
+def _parse_window(window_str: str) -> tuple[int, int] | None:
+    """Parse a single ``"HH:MM-HH:MM"`` window string (UTC).
+
+    Returns ``(start_minutes, end_minutes)`` since midnight, or ``None`` for
+    malformed input. End times are exclusive; overnight ranges (``end < start``)
+    wrap past midnight.
+    """
+    try:
+        start_str, end_str = window_str.split("-", 1)
+        start_h, start_m = start_str.split(":")
+        end_h, end_m = end_str.split(":")
+        start_h, start_m, end_h, end_m = int(start_h), int(start_m), int(end_h), int(end_m)
+        if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
+            return None
+        if not (0 <= start_m <= 59 and 0 <= end_m <= 59):
+            return None
+        return (start_h * 60 + start_m, end_h * 60 + end_m)
+    except Exception:
+        return None
+
+
+def _parse_available_times(provider_cfg: dict) -> tuple[tuple[int, int], ...] | None:
+    """Parse a provider's ``available_times`` into window tuples.
+
+    Returns ``None`` when the provider has no usable windows (unrestricted),
+    otherwise a tuple of ``(start_minutes, end_minutes)`` windows in config
+    order. Malformed entries are logged and skipped; if *every* entry is
+    malformed the provider is treated as unrestricted (fail-open). Parsed
+    results are cached per unique list of raw strings.
+    """
+    raw = provider_cfg.get("available_times")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "available_times for provider %r must be a list of \"HH:MM-HH:MM\" "
+            "windows; ignoring (fail-open)",
+            provider_cfg.get("name", "?"),
+        )
+        return None
+
+    key = tuple(str(w) for w in raw)
+    cached = _WINDOW_PARSE_CACHE.get(key, _NOT_CACHED)
+    if cached is not _NOT_CACHED:
+        return cached
+
+    windows: list[tuple[int, int]] = []
+    for entry in raw:
+        parsed = _parse_window(str(entry))
+        if parsed is None:
+            logger.warning(
+                "Invalid available_times entry %r for provider %r; ignoring "
+                "(fail-open)",
+                entry, provider_cfg.get("name", "?"),
+            )
+            continue
+        windows.append(parsed)
+
+    result: tuple[tuple[int, int], ...] | None = tuple(windows) if windows else None
+    _WINDOW_PARSE_CACHE[key] = result
+    return result
+
+
+def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = None) -> bool:
+    """Return ``True`` when the provider may be used at the given UTC time.
+
+    Providers without ``available_times`` are always allowed (backward
+    compatible). Windows are ``"HH:MM-HH:MM"`` interpreted in **UTC**; window
+    start is inclusive, end is exclusive, and overnight ranges
+    (``"22:00-02:00"``) wrap past midnight. When *now_utc* is omitted the
+    current UTC wall-clock time is used.
+    """
+    windows = _parse_available_times(provider_cfg)
+    if windows is None:
+        return True
+    if now_utc is None:
+        now_utc = datetime.now(UTC)
+    current_min = now_utc.hour * 60 + now_utc.minute
+    for start_min, end_min in windows:
+        if start_min < end_min:
+            if start_min <= current_min < end_min:
+                return True
+        else:
+            # Overnight window wraps past midnight
+            if current_min >= start_min or current_min < end_min:
+                return True
+    return False
+
+
+def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
+    """Return ``{name, type}`` pairs for providers whose ``available_times``
+    window excludes the current UTC time.
+
+    Used to record ``outside_time_window`` diagnostics when a fallback chain is
+    exhausted. Providers actually attempted this request cannot be outside
+    their window (they were selected), so this set is exactly the providers
+    skipped solely due to time windows.
+    """
+    result: list[dict[str, str]] = []
+    for p in model_config.get("providers") or []:
+        if isinstance(p, dict) and not _is_within_allowed_window(p):
+            result.append({
+                "name": p.get("name", "unknown"),
+                "type": p.get("type", "remote"),
+            })
+    return result
 
 
 def _parse_retry_after(response: Response) -> float | None:
@@ -900,6 +1039,42 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         except Exception:
             pass
 
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
+def _build_time_window_exhausted_response(
+    attempts: list[dict[str, Any]],
+    unavailable: dict[str, int],
+    any_provider_tried: bool,
+) -> Response | None:
+    """Return a distinguishable 503 when every provider was skipped solely due
+    to its configured ``available_times`` window.
+
+    The distinguishable response is used only when time windows are the *only*
+    reason nothing could be used: no provider was actually tried (no errors, no
+    cooldown recorded this request) and no provider is currently in cooldown.
+    Otherwise ``None`` is returned and the caller falls through to the generic
+    exhausted response (whose diagnostics still expose any
+    ``outside_time_window`` skips).
+    """
+    if any_provider_tried or unavailable:
+        return None
+    if not any(a.get("status") == "outside_time_window" for a in attempts):
+        return None
+
+    payload = {
+        "error": "All providers unavailable: no provider is available during the current scheduled time window",
+        "retry_after": 60,
+    }
+    if attempts:
+        try:
+            payload["diagnostics"] = attempts
+        except Exception:
+            pass
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
@@ -1115,6 +1290,12 @@ def _resolve_provider_with_exclusions(
         if name in excluded_provider_names:
             continue
         if _is_provider_unavailable(name):
+            continue
+        if not _is_within_allowed_window(provider_cfg):
+            logger.info(
+                "Skipping provider=%s: outside its available_times window (UTC)",
+                name,
+            )
             continue
         return provider_cfg
     return None
@@ -1703,6 +1884,26 @@ async def proxy_with_remote_fallback(
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
 
+    # Record time-window skips as distinct diagnostics so operators can tell
+    # whether providers were excluded by their available_times windows rather
+    # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
+    for skipped in _providers_outside_window(model_config):
+        _record_attempt(
+            attempts,
+            provider=skipped["name"],
+            type=skipped["type"],
+            status="outside_time_window",
+        )
+
+    # Distinguishable exhaustion: when time windows are the *only* reason no
+    # provider could be used, surface a specific message instead of the generic
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    time_window_exhausted = _build_time_window_exhausted_response(
+        attempts, unavailable, any_provider_tried,
+    )
+    if time_window_exhausted is not None:
+        return time_window_exhausted
+
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
 
@@ -1797,6 +1998,8 @@ async def proxy_with_fallback(
                 if candidate_name in attempted_provider_names:
                     continue
                 if candidate.get("type") != "remote":
+                    continue
+                if not _is_within_allowed_window(candidate):
                     continue
                 provider_cfg = candidate
                 break
@@ -2388,6 +2591,26 @@ async def proxy_with_fallback(
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
+
+    # Record time-window skips as distinct diagnostics so operators can tell
+    # whether providers were excluded by their available_times windows rather
+    # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
+    for skipped in _providers_outside_window(model_config):
+        _record_attempt(
+            attempts,
+            provider=skipped["name"],
+            type=skipped["type"],
+            status="outside_time_window",
+        )
+
+    # Distinguishable exhaustion: when time windows are the *only* reason no
+    # provider could be used, surface a specific message instead of the generic
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    time_window_exhausted = _build_time_window_exhausted_response(
+        attempts, unavailable, any_provider_tried,
+    )
+    if time_window_exhausted is not None:
+        return time_window_exhausted
 
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)

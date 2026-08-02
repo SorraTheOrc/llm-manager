@@ -13,6 +13,26 @@
 #                        X-Resolved-Model header; falls back to name)
 #   For local:  llama_model
 #
+# Timed access (optional, both local and remote):
+#   available_times - List of "HH:MM-HH:MM" windows (24-hour, **UTC**)
+#                     during which this provider may be used. A provider
+#                     whose current UTC time is outside all its windows is
+#                     skipped during fallback resolution, exactly like a
+#                     provider in cooldown; it becomes eligible again when a
+#                     window reopens. Windows are end-exclusive and overnight
+#                     ranges (e.g. "22:00-02:00") wrap past midnight.
+#                     Omit the field (or use an empty list) to leave a
+#                     provider unrestricted. Malformed entries are logged and
+#                     ignored (fail-open). No provider is currently timed in
+#                     this config; the field is documented for future use.
+#                     Example:
+#                       - name: deepseek-v4-flash
+#                         type: remote
+#                         endpoint: https://api.deepseek.com
+#                         api_key_env: DEEPSEEK_API_KEY
+#                         model: deepseek-v4-flash
+#                         available_times: ["10:00-12:00", "14:00-16:00"]
+#
 # Example with providers list:
 #   mimo-v2.5:
 #     providers:
