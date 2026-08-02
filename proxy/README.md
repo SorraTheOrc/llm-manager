@@ -62,18 +62,19 @@ proxy emits — `Stream started`/`Stream finished` (with authoritative
 and `local_dispatch_denied` — streaming large logs line by line.
 
 To run it, invoke the skill (`/skill:proxy-usage-analysis`); it writes
-`usage-reports/{daytime_sessions,nighttime_sessions}.csv` and
-`usage-reports/report.md` in the current directory. Operators can instead
-call the underlying script directly:
+`~/proxy-usage-reports/{daytime_sessions,nighttime_sessions}.csv` and
+`~/proxy-usage-reports/report.md` by default (override with `--output-dir`).
+Operators can instead call the underlying script directly:
 
 ```bash
 python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
     --log-dir /var/log/llama-proxy \
     --hours 24 \
-    --output-dir usage-reports
+    --output-dir ~/proxy-usage-reports
 ```
 
-Outputs (in `--output-dir`): `daytime_sessions.csv`, `nighttime_sessions.csv`
+Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
+`daytime_sessions.csv`, `nighttime_sessions.csv`
 (one row per session; day/night split derived from the `slot_schedule` in
 `config.yaml`), and `report.md` (aggregates + recommendations).
 
