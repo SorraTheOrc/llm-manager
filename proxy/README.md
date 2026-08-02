@@ -61,6 +61,11 @@ proxy emits — `Stream started`/`Stream finished` (with authoritative
 `tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
 
+To run it, invoke the skill (`/skill:proxy-usage-analysis`); it writes
+`usage-reports/{daytime_sessions,nighttime_sessions}.csv` and
+`usage-reports/report.md` in the current directory. Operators can instead
+call the underlying script directly:
+
 ```bash
 python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
     --log-dir /var/log/llama-proxy \
