@@ -186,3 +186,209 @@ Enrich the synthetic `finish_reason: error` event with a structured
 - `proxy/docs/error-analysis-2026-08-03/` — harness outputs: `errors.csv`,
   `counts.csv`/`counts.json`, `evidence.txt`, `summary.md` (F1)
 - `proxy/docs/sse-error-emission-audit.md` — emission-site audit (F3)
+
+---
+
+# Recommendation 1 — Recovery-first silent continue (LP-0MSDP2PDB004GV86)
+
+## Goal
+
+When an upstream provider fails mid-stream, the proxy first tries to
+**recover automatically** — re-route to the next healthy provider — so the
+agent session does not stop and the operator does not have to type
+"continue". Recovery is bounded and content-aware; when recovery is
+impossible the proxy escalates to the informative error (Recommendation 2).
+
+## Safe vs unsafe recovery windows (content-delivered boundary)
+
+Reuse the existing content-delivered boundary (LP-0MS9FR9LG002AJ4C,
+`_has_content` / `_terminate_after_content` in `proxy_remote.py`).
+
+| Window | When | Safe to re-route? | Rationale |
+|---|---|---|---|
+| Pre-content failure | No `content`/`tool_calls`/`reasoning_content` chunk forwarded yet (audit sites 1, 2, 4, 5 and pre-content stalls at site 3) | **Yes** | Re-sending the request is cheap (no duplicate output); the client has not received any assistant content, so the re-routed response is indistinguishable from a first attempt |
+| After-content failure | At least one content-bearing chunk already forwarded (audit site 6/7 — the Aug 3 dominant case, 120/127) | **No** | Re-sending would duplicate output already visible to the client and re-bill the full prompt; must terminate (current behaviour) and escalate to the informative error |
+| Non-timeout stream exception | `RemoteProtocolError`, `NameError` etc. (audit sites 6/8) | **Only if zero content** | Same boundary applies; non-timeout errors after content must not re-route |
+
+## Bounded retry / re-route policy
+
+- **Re-route attempts:** cap re-routes per request at the number of
+  *remaining* providers in the configured chain (`proxy/config.yaml`
+  `providers` list) — never loop back to an already-failed provider in the
+  same request. Aug 3 chains are 4-5 providers long (local-qwen3 →
+  opencode-deepseek-free → opencode-go-2-deepseek → opencode-go-deepseek →
+  deepseek-v4-flash); a re-route consumes at most 4 extra attempts.
+- **Per-provider cooldown:** reuse the existing Tier-2/Tier-3 mechanisms
+  (`mark_provider_unavailable`, `_check_stall_circuit_breaker`,
+  LP-0MRFEXXVC001RYKB, LP-0MRGU0I91006ODFD) — a provider that failed
+  mid-stream enters cooldown so a later request does not immediately try it
+  again. Aug 3 evidence: 429 cooldown already suppressed repeat fallbacks
+  (4 events); the same pattern extends to stall/ReadTimeout failures.
+- **No infinite loops:** if every provider in the chain fails or is in
+  cooldown, stop re-routing and escalate (Recommendation 2).
+
+## Escalation
+
+When recovery is exhausted (all providers failed/in cooldown) **or** the
+failure is after-content, emit the informative-error SSE event
+(Recommendation 2) — never a silent stream abort.
+
+## Architecture fit (no client-side changes)
+
+- The re-route decision must be made **inside** `_handle_remote_streaming()`
+  (proxy_remote.py) or signalled back to the fallback loop
+  (`proxy_with_remote_fallback()`, provider.py L1893). Today the streaming
+  generator runs detached from the fallback chain once a 2xx
+  `StreamingResponse` is returned (`_handle_streaming_success`,
+  provider.py L1587); a recovery signal (e.g. a special internal chunk or an
+  exception carrying the provider name) would let the fallback loop pick the
+  next provider and re-issue the request with the same session.
+- Pre-content re-route is a request-level retry on a *different* provider —
+  the client sees a normal stream either way. No client cooperation needed.
+
+## Quantified impact (Aug 3)
+
+- **~4–7 of 127 client-visible stream errors avoided (3–6%)** — the
+  pre-content window (empty responses, connect failures, pre-content stall
+  exhaustion).
+- **120/127 NOT avoidable** — after-content stalls; recovery is unsafe there
+  by design.
+- Cheap to build; prevents session stops in the pre-content window; the
+  main value is architectural (it is the prerequisite for the informative
+  error escalation path).
+
+## Follow-up implementation work item (spec)
+
+**Title:** Recovery-first silent continue for pre-content mid-stream failures
+
+**Scope:** `proxy/proxy/proxy_remote.py` (signal recoverable pre-content
+failures), `proxy/proxy/provider.py` (`proxy_with_remote_fallback` re-route
+on signal, bounded by remaining providers + per-provider cooldown),
+`proxy/config.yaml` docs.
+
+**ACs (draft):**
+1. Pre-content stall/empty-response/connect failure on a remote provider
+   re-routes to the next provider in the configured chain without a
+   client-visible break, bounded by remaining providers.
+2. After-content failures never re-route (content-delivered boundary
+   preserved; existing LP-0MS9FR9LG002AJ4C tests still pass).
+3. Providers that fail mid-stream enter the existing cooldown/circuit-breaker
+   mechanisms; no infinite recovery loops.
+4. When all providers fail/cooldown, the request escalates to the
+   informative-error event (Recommendation 2) instead of aborting silently.
+5. Full test suite passes; new hermetic tests for the re-route decision
+   (pre-content vs after-content, bounded attempts, cooldown).
+
+---
+
+# Recommendation 2 — Informative-error SSE fallback (LP-0MSDP2PH20079WQ7)
+
+## Goal
+
+When recovery is genuinely impossible (Recommendation 1 exhausted, or
+after-content failure where re-routing is unsafe), the synthetic SSE error
+carries a **structured, human/agent-readable payload** instead of an
+unspecified `finish_reason: error`. The client keeps working today
+(backward compatible) and a future client can render the detail.
+
+## Structured payload schema
+
+Enrich the synthetic event (all 8 audit sites) with an `error` object
+inside `choices[0]`:
+
+```json
+{
+  "choices": [{
+    "delta": {},
+    "finish_reason": "error",
+    "index": 0,
+    "error": {
+      "type": "stall_after_content",
+      "message": "Upstream idle timeout after content delivered (120s no data)",
+      "provider": "opencode-go",
+      "model": "deepseek-v4-flash",
+      "entry": "opencode-go-2-deepseek",
+      "suggested_action": "Retry the request with full context, or route to a healthier provider"
+    }
+  }]
+}
+```
+
+Field semantics:
+
+| Field | Source | Example |
+|---|---|---|
+| `type` | Failure class (see below) | `stall_after_content`, `stall_exhausted`, `empty_response`, `stream_exception`, `upstream_http` |
+| `message` | Human-readable one-liner with the underlying exception/timeout | "Upstream idle timeout after content delivered (120s no data)" |
+| `provider` | The provider that failed (already in scope at every site) | `opencode-go` |
+| `model` | The model name (already in scope) | `deepseek-v4-flash` |
+| `entry` | Config entry name (already logged; LP-0MSC7F7BG0043TE1) | `opencode-go-2-deepseek` |
+| `suggested_action` | Static map from `type` + retry context | see below |
+
+`suggested_action` mapping (static, per failure type):
+
+- `stall_after_content` → "Upstream paused >120s after output started; retry the
+  request with full context"
+- `stall_exhausted` → "Upstream stalled repeatedly; provider placed in cooldown; the
+  next provider in the chain will be used"
+- `empty_response` → "Upstream returned no content; retried N times; check upstream
+  status or route manually"
+- `stream_exception` → "Proxy stream error (NameError/RemoteProtocolError); check
+  proxy/llama-server logs"
+- `upstream_http` → "Upstream HTTP <status> (<type>); see proxy logs"
+
+## Trigger conditions (used only when recovery is impossible)
+
+1. **Recovery exhausted:** every provider in the chain failed or is in
+   cooldown (Recommendation 1 escalation).
+2. **Content already delivered:** stall/exception after the content
+   boundary (audit sites 6/7, 8-after-content) — re-routing is unsafe, so
+   emit the enriched error immediately.
+3. **Non-timeout exceptions** where retry is not attempted (audit site 6)
+   — enrich instead of a bare finish.
+
+## Backward compatibility
+
+- The client (pi/opencode-go) today reads `choices[0].finish_reason` and
+  treats `error` as terminal; adding the `error` object key changes nothing
+  for it — no client-side change required (constraint satisfied).
+- The event shape `{"choices":[{"delta":{},"finish_reason":"error",
+  "index":0, ...}]}` remains valid SSE for any OpenAI-style decoder.
+- A future client build can read `choices[0].error` to render the detail.
+
+## Minimal enrichment point
+
+A single shared helper (e.g. `_build_stream_error_event(provider, model,
+entry, error_type, message, suggested_action)` in `proxy_remote.py`)
+replacing the 8 duplicated dict literals (audit: LP-0MSDP2P9X002A12I). All
+sites already have `provider`, `model_name`, `entry`, the exception type, and
+retry counters in scope. `router.py` imports the same helper for the local
+path. Lowest risk: no per-site logic, no behavioural change to the
+`finish_reason` field.
+
+## Quantified impact (Aug 3)
+
+- **127/127 client-visible stream errors (100%)** would carry the enriched
+  payload — the complement of the recovery-first avoidance number.
+- The dominant class (after-content stalls, 120/127) is exactly the case
+  where this fallback is required (recovery is unsafe), so the two
+  recommendations compose: recovery-first for the small pre-content window,
+  informative error for everything else.
+
+## Follow-up implementation work item (spec)
+
+**Title:** Informative-error SSE payload for synthetic finish_reason:error
+
+**Scope:** `proxy/proxy/proxy_remote.py` (shared helper + 7 sites),
+`proxy/proxy/router.py` (1 site), docs.
+
+**ACs (draft):**
+1. All 8 synthetic `finish_reason: error` emission sites emit the enriched
+   event via one shared helper; event includes `error.type`, `error.message`,
+   `error.provider`, `error.model`, `error.entry`, `error.suggested_action`.
+2. Existing clients are unaffected: `finish_reason` semantics unchanged;
+   no client-side change required.
+3. `suggested_action` maps from the failure type (stall/empty/exception/http)
+   per the schema above.
+4. Full test suite passes; new hermetic tests assert the enriched event
+   shape at each site class (unit-level generator tests).
