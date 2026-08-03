@@ -393,6 +393,80 @@ def _get_active_local_slots(config: dict) -> int:
     return 1
 
 
+# Default fraction of the effective per-slot context at which the proxy
+# emits a session-context-pressure warning suggesting compaction
+# (LP-0MSDCLQ2W001LGWC). Configurable via ``context_pressure_warn_ratio``
+# on the server config; 0 disables the warning.
+_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
+
+
+def _get_context_pressure_warn_ratio(config: dict) -> float:
+    """Read the context-pressure warning ratio from config.
+
+    Supports both nested (server.*) and flat keys. 0 disables the warning.
+    Defaults to ``_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO`` (0.8).
+    """
+    val = config.get("context_pressure_warn_ratio")
+    if val is None:
+        val = config.get("server", {}).get(
+            "context_pressure_warn_ratio", _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
+        )
+    try:
+        ratio = float(val or 0)
+    except (ValueError, TypeError):
+        return _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
+    return max(0.0, ratio)
+
+
+def context_pressure_ratio(estimated_tokens: int, ctx_size: int, slots: int) -> float:
+    """Fraction of the effective per-slot context consumed by a session.
+
+    Uses the same per-slot computation as the routing clamp
+    (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``); returns 0.0
+    when the computation is not meaningful (ctx_size <= 0 or per-slot leaves
+    no room for output tokens).
+
+    Args:
+        estimated_tokens: Session estimated prompt/context tokens.
+        ctx_size: Total local model context (``local_model_ctx_size``).
+        slots: Active local slot count.
+
+    Returns:
+        A float ratio (0.0 when disabled; > 1.0 when the session exceeds
+        the effective per-slot context).
+    """
+    cap = effective_per_slot_threshold(ctx_size, slots)
+    if cap <= 0 or estimated_tokens <= 0:
+        return 0.0
+    return estimated_tokens / cap
+
+
+def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
+    """Whether a session at ``estimated_tokens`` should trigger the
+    context-pressure compaction warning.
+
+    Uses the effective per-slot context (clamped with output headroom) and
+    the configured ``context_pressure_warn_ratio`` (default 0.8). Returns
+    False when the clamp is disabled (ctx_size 0), the ratio is 0, or the
+    session is below the ratio.
+
+    Args:
+        estimated_tokens: Session estimated prompt/context tokens.
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        True when the session should be flagged for compaction.
+    """
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0 or estimated_tokens <= 0:
+        return False
+    slots = _get_active_local_slots(config)
+    ratio = _get_context_pressure_warn_ratio(config)
+    if ratio <= 0:
+        return False
+    return context_pressure_ratio(estimated_tokens, ctx_size, slots) >= ratio
+
+
 # Output-token headroom reserved below the per-slot context when clamping
 # routing thresholds (LP-0MSAZXXDY005AWA1). Ensures prompts routed local
 # leave room for the model's completion tokens in the KV slot.
@@ -2199,6 +2273,31 @@ async def proxy_with_fallback(
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
                 )
+                # Context-pressure compaction signal (LP-0MSDCLQ2W001LGWC):
+                # KV reads scale linearly with context (20 KB/token at f16),
+                # so sessions approaching the per-slot limit decode at a
+                # fraction of their earlier speed. Warn so agents/operators
+                # compact before decode degrades.
+                if should_warn_context_pressure(_estimated_tokens, config):
+                    _per_slot = effective_per_slot_threshold(
+                        _get_local_model_ctx_size(config),
+                        _get_active_local_slots(config),
+                    )
+                    logger.warning(
+                        "context_pressure session=%s estimated_tokens=%d "
+                        "per_slot_ctx=%d ratio=%.2f >= %.2f; consider "
+                        "compacting the session history to reduce local decode "
+                        "cost (KV read scales with context)",
+                        _session_id or "unknown",
+                        _estimated_tokens,
+                        _per_slot,
+                        context_pressure_ratio(
+                            _estimated_tokens,
+                            _get_local_model_ctx_size(config),
+                            _get_active_local_slots(config),
+                        ),
+                        _get_context_pressure_warn_ratio(config),
+                    )
                 _skip_local = _should_skip_local(
                     _llama_model,
                     _session_id,

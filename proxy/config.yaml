@@ -357,6 +357,13 @@ server:
   # (ctx_size / active_slots) which clamps the large-context routing
   # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
   local_model_ctx_size: 262144
+  # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
+  # When a session's estimated context reaches this fraction of the
+  # effective per-slot context (ctx_size / slots - 4096 headroom), the
+  # proxy logs a context_pressure WARNING suggesting session compaction.
+  # KV reads scale linearly with context, so sessions at ~80% of the
+  # per-slot limit decode far slower than short sessions. 0 disables.
+  context_pressure_warn_ratio: 0.8
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context

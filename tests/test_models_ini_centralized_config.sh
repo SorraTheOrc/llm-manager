@@ -340,6 +340,115 @@ test_per_model_ctx_size_present() {
 }
 
 # ---------------------------------------------------------------
+# Test: Production models.ini [Qwen3] has per-model cache-type-k/v
+# (LP-0MSDCLQ2W001LGWC: KV-cache quantization for decode speed)
+# ---------------------------------------------------------------
+# KV cache type is a first-class llama-server preset option
+# (LLAMA_ARG_CACHE_TYPE_K / _V); router mode reads it directly from
+# models.ini, so it must live in the model's own section like ctx-size.
+# ---------------------------------------------------------------
+test_per_model_cache_type_present() {
+    echo "Test: Production models.ini [Qwen3] has per-model cache-type-k/v"
+
+    local ctk ctv
+    ctk=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "qwen3") found=1 }
+    found && /^cache-type-k/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$MODELS_INI")
+
+    ctv=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "qwen3") found=1 }
+    found && /^cache-type-v/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$MODELS_INI")
+
+    [ -n "$ctk" ] && pass "[Qwen3] cache-type-k=$ctk present in models.ini" || fail "[Qwen3] cache-type-k missing from models.ini"
+    [ -n "$ctv" ] && pass "[Qwen3] cache-type-v=$ctv present in models.ini" || fail "[Qwen3] cache-type-v missing from models.ini"
+    [ "$ctk" = "q8_0" ] && pass "[Qwen3] cache-type-k is q8_0 (got: $ctk)" || fail "[Qwen3] cache-type-k expected q8_0, got: $ctk"
+    [ "$ctv" = "q8_0" ] && pass "[Qwen3] cache-type-v is q8_0 (got: $ctv)" || fail "[Qwen3] cache-type-v expected q8_0, got: $ctv"
+}
+
+# ---------------------------------------------------------------
+# Test: start-llama.sh reads cache-type from models.ini (single-model)
+# ---------------------------------------------------------------
+test_cache_type_override_from_models_ini() {
+    echo "Test: CACHE_TYPE_K/V are read from models.ini"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[qwen3]
+hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M
+ctx-size = 131072
+cache-type-k = q4_0
+cache-type-v = q8_0
+INI
+
+    local output rc=0
+    output=$(LLAMA_MODELS_PRESET="$TESTS_TMPDIR/models.ini" bash "$SCRIPT" qwen3 2>&1 || rc=$?) || true
+
+    echo "$output" | grep -q "CACHE_TYPE_K=q4_0" && pass "CACHE_TYPE_K=q4_0 from models.ini" || fail "CACHE_TYPE_K not read from models.ini (output: $(echo "$output" | grep 'CACHE_TYPE_K='))"
+    echo "$output" | grep -q "CACHE_TYPE_V=q8_0" && pass "CACHE_TYPE_V=q8_0 from models.ini" || fail "CACHE_TYPE_V not read from models.ini (output: $(echo "$output" | grep 'CACHE_TYPE_V='))"
+
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: cache-type flags are passed to llama-server (single-model)
+# ---------------------------------------------------------------
+test_cache_type_flags_passed() {
+    echo "Test: --cache-type-k/--cache-type-v are passed to llama-server"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[qwen3]
+hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M
+ctx-size = 131072
+cache-type-k = q4_0
+cache-type-v = q8_0
+INI
+
+    # Intercept the llama-server invocation: use a fake binary that records args
+    cat > "$TESTS_TMPDIR/llama-server" << 'FAKE'
+#!/usr/bin/env bash
+echo "ARGS: $*"
+exit 0
+FAKE
+    chmod +x "$TESTS_TMPDIR/llama-server"
+
+    local output rc=0
+    output=$(LLAMA_SERVER_BIN="$TESTS_TMPDIR/llama-server" LLAMA_MODELS_PRESET="$TESTS_TMPDIR/models.ini" bash "$SCRIPT" qwen3 2>&1 || rc=$?) || true
+
+    echo "$output" | grep -q "ARGS:.*--cache-type-k q4_0" && pass "--cache-type-k q4_0 passed to llama-server" || fail "--cache-type-k missing from llama-server args (output: $(echo "$output" | grep 'ARGS:') )"
+    echo "$output" | grep -q "ARGS:.*--cache-type-v q8_0" && pass "--cache-type-v q8_0 passed to llama-server" || fail "--cache-type-v missing from llama-server args (output: $(echo "$output" | grep 'ARGS:') )"
+
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: cache-type defaults to f16 (llama-server default) when unset
+# ---------------------------------------------------------------
+test_cache_type_default_when_unset() {
+    echo "Test: cache-type defaults to f16 when not in models.ini"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[qwen3]
+hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M
+ctx-size = 131072
+INI
+
+    local output rc=0
+    output=$(LLAMA_MODELS_PRESET="$TESTS_TMPDIR/models.ini" bash "$SCRIPT" qwen3 2>&1 || rc=$?) || true
+
+    echo "$output" | grep -q "CACHE_TYPE_K=f16 (default)" && pass "CACHE_TYPE_K=f16 (default) when unset" || fail "CACHE_TYPE_K default missing (output: $(echo "$output" | grep 'CACHE_TYPE_K='))"
+    echo "$output" | grep -q "CACHE_TYPE_V=f16 (default)" && pass "CACHE_TYPE_V=f16 (default) when unset" || fail "CACHE_TYPE_V default missing (output: $(echo "$output" | grep 'CACHE_TYPE_V='))"
+
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
 # Test: Script exists and is executable
 # ---------------------------------------------------------------
 test_script_exists() {
@@ -357,6 +466,7 @@ echo "=========================================="
 
 test_script_exists
 test_per_model_ctx_size_present
+test_per_model_cache_type_present
 test_global_ngl_from_models_ini
 test_global_ngl_defaults_to_99
 test_global_ngl_zero_disables_gpu
@@ -364,6 +474,9 @@ test_get_quantization
 test_get_quantization_no_suffix
 test_ctx_override_from_models_ini
 test_quant_override_from_models_ini
+test_cache_type_override_from_models_ini
+test_cache_type_flags_passed
+test_cache_type_default_when_unset
 test_logging_shows_source
 test_logging_shows_quant_source
 test_logging_shows_quant_fallback

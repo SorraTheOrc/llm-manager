@@ -58,3 +58,45 @@ The router exposes:
 - During active self-healing, requests return `503` with `Retry-After: 30` and a `backend_recovery_in_progress` error payload.
 - Backend crash-path signals are exposed via `/health` and `/admin/metrics` in `backend_signals`, and current recovery progress is reported in `backend_recovery`.
 - Repro fault injection script: `proxy/scripts/fault-injection-backend-crash.sh` captures health/metrics snapshots and log signatures during a forced backend crash.
+
+## KV-cache quantization (LP-0MSDCLQ2W001LGWC)
+
+KV-cache data type is a first-class llama-server preset option, so it is configured
+per-model in `models.ini` (in the model's own section, like `ctx-size`):
+
+```ini
+[Qwen3]
+cache-type-k = q8_0
+cache-type-v = q8_0
+```
+
+Allowed values (lowercase): `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`.
+`f16` is the llama-server default; `q8_0` roughly halves KV read cost per decoded
+token and is the recommended default for large-context sessions; `q4_0` saves more
+VRAM at a small quality cost.
+
+Rationale (LP-0MSDCLQ2W001LGWC): decode is memory-bandwidth-bound on the Strix Halo
+iGPU (~256 GB/s shared). Each decoded token reads the model weights plus the session
+KV, and the KV term grows linearly with context (at f16, ~20 KB/token → ~1.1 GB at a
+57K-token session). Quantizing KV to q8_0 cuts that term roughly in half, improving
+large-context decode throughput ~1.2–1.4x without changing ctx-size or slot count.
+
+For single-model (non-router) startup, `start-llama.sh` reads `cache-type-k` /
+`cache-type-v` from `models.ini` and passes `--cache-type-k` / `--cache-type-v` to
+llama-server (defaulting to f16 when unset).
+
+## Session context-pressure warning (LP-0MSDCLQ2W001LGWC)
+
+Sessions with contexts near the per-slot limit decode far slower (KV reads scale
+with context), and compaction is performed by the agents, not the proxy. The proxy
+emits a `context_pressure` WARNING at routing time when a session's estimated
+context reaches the configured fraction of the effective per-slot context
+(`ctx_size / slots - 4096` output headroom).
+
+```yaml
+server:
+  context_pressure_warn_ratio: 0.8  # 0 disables; default 0.8
+```
+
+The warning names the session and the ratio so operators/agents can compact before
+decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
