@@ -19,6 +19,12 @@ Usage::
 
 Outputs (written to ``--output-dir``):
 
+**The default ``--output-dir`` is a repo artifacts location** —
+``proxy/docs/error-analysis-2026-08-03/`` (the committed Aug 3 snapshot).
+This harness is distinct from the skill's daily analyzer
+(``analyze_proxy_usage.py``), whose default output is ``~/proxy-usage-reports``
+(home dir); this harness's artifacts are committed to the repo:
+
 - ``errors.csv`` — one row per error event (timestamp, type, provider,
   model, session, entry, error detail, status, attempt, signal, source
   log file, evidence line).
