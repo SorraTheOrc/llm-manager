@@ -412,7 +412,6 @@ sanitizes the request shape and the accumulated message history
     `type` → `"function"`; missing `function.arguments` → `""`
   - prune: tool messages with missing or dangling `tool_call_id`; assistant
     `tool_calls` entries missing `id`; empty `tool_calls` arrays
-  - strip: non-standard `reasoning_content` from assistant messages
   - preserve: truncated `function.arguments` JSON and valid tool-call
     sequences (RCA showed these are accepted by the remote chain)
   - every mutation is logged at DEBUG

@@ -71,13 +71,51 @@ def test_content_null_repaired_when_tool_calls_present():
     assert len(result[1].get("tool_calls", [])) == 1, "valid tool_call preserved"
 
 
-def test_reasoning_content_stripped_on_remote_sends():
-    """Non-standard reasoning_content must be stripped from assistant messages."""
+def test_reasoning_content_preserved_on_remote_sends():
+    """reasoning_content must be PRESERVED on remote sends (LP-0MSCGTYWA006NAZC).
+
+    Console Go (opencode.ai/zen/go) runs thinking mode and requires the
+    assistant reasoning_content it previously generated to be echoed back in
+    the next request; stripping it causes HTTP 400. Both zen/go and
+    api.deepseek.com accept reasoning_content (RCA probe, LP-0MSC4UJXU008HVV5).
+    """
     history = _valid_history()
     history[1]["reasoning_content"] = "thinking about ls"
     result = _sanitize(copy.deepcopy(history))
-    assert "reasoning_content" not in result[1], (
-        "reasoning_content must be stripped for remote compatibility"
+    assert result[1]["reasoning_content"] == "thinking about ls", (
+        "reasoning_content must be preserved for thinking-mode round-trips"
+    )
+
+
+def test_reasoning_content_preserved_alone_without_tool_calls():
+    """A pure reasoning turn (no tool_calls) keeps its reasoning_content."""
+    messages = [
+        {"role": "user", "content": "think about it"},
+        {"role": "assistant", "content": "", "reasoning_content": "deep thought"},
+    ]
+    result = _sanitize(copy.deepcopy(messages))
+    assert result[1]["reasoning_content"] == "deep thought"
+
+
+def test_reasoning_content_preserved_while_tool_call_repairs_apply():
+    """reasoning_content + tool_calls: preserve reasoning, still repair content.
+
+    Regression guard for the AC: a multi-turn request carrying assistant
+    reasoning_content AND tool_calls must pass through with reasoning preserved
+    while the original RCA repairs (content:null -> '', missing type ->
+    'function') still apply.
+    """
+    history = _valid_history()
+    history[1]["content"] = None
+    del history[1]["tool_calls"][0]["type"]
+    history[1]["reasoning_content"] = "thinking about ls"
+    result = _sanitize(copy.deepcopy(history))
+    assert result[1]["reasoning_content"] == "thinking about ls", (
+        "reasoning_content must survive alongside tool-call repairs"
+    )
+    assert result[1]["content"] == "", "content:null must still be repaired"
+    assert result[1]["tool_calls"][0]["type"] == "function", (
+        "missing type must still be repaired to 'function'"
     )
 
 

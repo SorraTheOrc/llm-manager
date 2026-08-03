@@ -176,8 +176,6 @@ def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
       - **Prune** where not: tool messages with missing/dangling
         ``tool_call_id``; assistant ``tool_calls`` entries missing ``id``;
         empty ``tool_calls`` arrays (key removed).
-      - **Strip** non-standard ``reasoning_content`` from assistant messages
-        (not part of the OpenAI-compatible schema).
       - **Preserve** truncated ``function.arguments`` JSON — RCA showed it is
         accepted by both zen/go and deepseek; do not alter valid semantics.
 
@@ -207,11 +205,6 @@ def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
         role = msg.get("role")
         if role == "assistant":
             cleaned = dict(msg)
-            # Strip non-standard reasoning_content on remote sends.
-            if "reasoning_content" in cleaned:
-                _log("strip", index, "reasoning_content")
-                del cleaned["reasoning_content"]
-
             tool_calls = cleaned.get("tool_calls")
             if isinstance(tool_calls, list):
                 if not tool_calls:
