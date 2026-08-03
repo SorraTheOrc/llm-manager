@@ -37,6 +37,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help=f"log directory (default: {DEFAULT_LOG_DIR})")
+    parser.add_argument(
+        "--llama-log-dir",
+        default=DEFAULT_LOG_DIR,
+        help=(
+            "directory containing llama-server.log* for decode/prompt-eval speed "
+            f"stats (default: {DEFAULT_LOG_DIR}; falls back to --log-dir)"
+        ),
+    )
     parser.add_argument("--hours", type=float, default=DEFAULT_HOURS, help=f"analysis window in hours (default: {DEFAULT_HOURS})")
     parser.add_argument("--start", help="window start, ISO 'YYYY-MM-DD HH:MM:SS' (overrides --hours)")
     parser.add_argument("--end", help="window end, ISO 'YYYY-MM-DD HH:MM:SS' (defaults to now)")
@@ -79,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
             window_end=window_end,
             output_dir=Path(args.output_dir).expanduser(),
             config=config,
+            llama_log_dir=Path(args.llama_log_dir),
         )
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -89,12 +98,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.quiet:
         data = reporting.summary_to_json(run.summary)
+        decode = data.get("decode_speed") or {}
+        decode_summary = (
+            f", decode speed {decode.get('samples', 0)} samples "
+            f"(median {decode.get('median_tok_s', '-')} tok/s)"
+        )
         print(
             f"Analyzed {len(run.files)} log file(s) from {args.log_dir}: "
             f"{data['sessions']} sessions, {data['total_requests']} requests "
             f"(local {data['local_requests']} / remote {data['remote_requests']}), "
             f"{data['fallback_events']} fallback events "
-            f"({data['fallback_rate'] * 100:.1f}%)."
+            f"({data['fallback_rate'] * 100:.1f}%){decode_summary}."
         )
         print(f"Outputs written to {args.output_dir}: "
               f"daytime_sessions.csv, nighttime_sessions.csv, report.md")

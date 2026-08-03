@@ -675,10 +675,15 @@ class TestEndToEnd:
             "initial_model",
             "remote_move_time",
             "fallback_reason",
+            "decode_tok_s",
         ]:
             assert col in header, f"missing CSV column {col}"
 
+        # decode_tok_s is derivable for S1/S2 (local completion tokens +
+        # local active span) and empty for sessions with no local traffic.
         by_id = {r["session_id"]: r for r in rows}
+        assert by_id[fixtures.S1]["decode_tok_s"] != ""
+        assert by_id[fixtures.S2]["decode_tok_s"] != ""
         # S2 fell back: move time + reason populated; S1 local-only: empty.
         assert by_id[fixtures.S2]["fallback_reason"] == "local_concurrency_limit"
         assert by_id[fixtures.S2]["remote_move_time"] != ""
@@ -691,6 +696,10 @@ class TestEndToEnd:
         md = report_md.read_text()
         for section in ["# Proxy Usage Analysis", "## Recommendations", "local_concurrency_limit"]:
             assert section in md
+        # No llama-server logs in this fixture dir → speed sections render empty.
+        assert "## Decode speed" in md
+        assert "## Prompt eval speed" in md
+        assert "No llama-server eval timing samples" in md
 
         # Night CSV has no rows (all sessions start during day hours).
         with night_csv.open() as f:

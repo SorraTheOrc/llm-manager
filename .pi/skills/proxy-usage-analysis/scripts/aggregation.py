@@ -64,6 +64,9 @@ class SessionStats:
     slots: int | None
     dispatch_denied: int
     routing_skips: int
+    # Decode speed derived from local streams: total local completion tokens /
+    # local active span (first→last local stream event). None when not derivable.
+    decode_tok_s: float | None = None
 
     @property
     def fell_back(self) -> bool:
@@ -82,6 +85,8 @@ class AnalysisResult:
     lines_skipped: int
     total_lines: int
     dispatch_denied_events: List[LogEvent] = field(default_factory=list)
+    # llama-server decode/prompt-eval speed stats (set by reporting.run_analysis).
+    speed: object | None = None
 
     @property
     def total_requests(self) -> int:
@@ -114,6 +119,10 @@ class _SessionBuilder:
         self.last_seen: datetime | None = None
         self.dispatch_denied = 0
         self.routing_skips: List[LogEvent] = []
+        # Local-only stream tracking (decode-speed fallback derivation).
+        self.local_first: datetime | None = None
+        self.local_last: datetime | None = None
+        self.local_completion = 0
 
     def add(self, ev: LogEvent) -> None:
         self.last_seen = ev.ts
@@ -125,6 +134,13 @@ class _SessionBuilder:
             self.routing_skips.append(ev)
         elif ev.kind == "dispatch_denied":
             self.dispatch_denied += 1
+        if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
+            if self.local_first is None or ev.ts < self.local_first:
+                self.local_first = ev.ts
+            if self.local_last is None or ev.ts > self.local_last:
+                self.local_last = ev.ts
+            if ev.kind == "stream_finished" and ev.completion is not None:
+                self.local_completion += ev.completion
 
 
 def _mean(values: list) -> float | None:
@@ -201,6 +217,15 @@ def _build_session(
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
 
+    # Decode speed fallback: total local completion tokens / local active span
+    # (first→last local stream event). Only derivable with local completions
+    # and a positive span; conservative (includes inter-request gaps).
+    decode_tok_s: float | None = None
+    if builder.local_completion > 0 and builder.local_first is not None and builder.local_last is not None:
+        span = (builder.local_last - builder.local_first).total_seconds()
+        if span > 0:
+            decode_tok_s = round(builder.local_completion / span, 1)
+
     return SessionStats(
         session_id=builder.session_id,
         start=start,
@@ -224,6 +249,7 @@ def _build_session(
         slots=period.slots if period else None,
         dispatch_denied=builder.dispatch_denied,
         routing_skips=len(builder.routing_skips),
+        decode_tok_s=decode_tok_s,
     )
 
 

@@ -43,6 +43,7 @@ Options:
 | Flag | Default | Purpose |
 |---|---|---|
 | `--log-dir` | `/var/log/llama-proxy` | Directory containing `proxy.log*` |
+| `--llama-log-dir` | `/var/log/llama-proxy` | Directory containing `llama-server.log*` for decode/prompt-eval speed stats (falls back to `--log-dir` when omitted) |
 | `--hours` | `24` | Analysis window length |
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
@@ -63,7 +64,9 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Day / Night**
   columns), fallback-reason and routing-skip breakdowns, per-model
-  breakdown, and highlighted recommendations. Every day/night count carries
+  breakdown, **Decode speed** and **Prompt eval speed** sections (median /
+  p90 / p10 tok/s from llama-server eval-timing lines, split Total / Day /
+  Night), and highlighted recommendations. Every day/night count carries
   its share of the metric's total (e.g. `285 (74.4%)`), and each
   recommendation's evidence cites the total plus the day/night split.
 
@@ -71,7 +74,8 @@ CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
 (provider + model), time of move to a remote model (empty if never fell
 back), fallback reason (empty if never fell back), bucket, slots,
-local/remote request counts, dispatch denials.
+local/remote request counts, dispatch denials, decode tok/s (derived from
+local completion tokens ÷ local active span; empty when not derivable).
 
 ## How it works
 
@@ -91,6 +95,17 @@ local/remote request counts, dispatch denials.
    session start time; nothing is hardcoded.
 5. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
+6. **Decode/prompt-eval speed** — llama-server eval-timing lines
+   (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
+   are streamed from `llama-server.log*`, filtered to the Qwen3 child port
+   (discovered per file from the `name=Qwen3 on port <port>` spawn line;
+   the port changes on every restart). Samples are bucketed Total / Day /
+   Night via the slot schedule and summarised as median / p90 / p10 tok/s.
+   Because llama-server.log lines carry no timestamps, each sample is
+   bucketed by its log file's last-write time (approximate; documented in
+   the report). The per-session CSV `decode_tok_s` column is derived from
+   proxy.log instead (local completion tokens ÷ local active span) and stays
+   empty when not derivable.
 
 ## Interpreting the report
 
@@ -125,8 +140,10 @@ python3 -m pytest tests -q
 ```
 
 The suite covers log-line parsing, session aggregation, fallback attribution,
-day/night bucketing, recommendation rules, and an end-to-end run, using
-fixtures copied from real `/var/log/llama-proxy/proxy.log` lines.
+day/night bucketing, recommendation rules, llama-server eval-timing parsing
+(decode + prompt eval, Qwen3 port filtering, day/night speed stats), and an
+end-to-end run, using fixtures copied from real `/var/log/llama-proxy`
+lines (`proxy.log` and `llama-server.log`).
 
 ## Limitations
 
@@ -139,3 +156,11 @@ fixtures copied from real `/var/log/llama-proxy/proxy.log` lines.
   window; the day/night bucket is keyed by its first in-window stream.
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
+- llama-server.log eval-timing lines carry no timestamps, so the speed
+  section's window filtering and day/night split are approximate: each
+  sample is bucketed by its log file's last-write time. Files whose Qwen3
+  child port cannot be discovered are counted and skipped (never fatal).
+- The per-session CSV `decode_tok_s` is a session-level average over the
+  local active span (first→last local stream event); it includes
+  inter-request gaps, so it is a conservative lower bound of the true decode
+  rate. It is empty for sessions with no local completions.

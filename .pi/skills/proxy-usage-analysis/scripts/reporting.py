@@ -22,9 +22,11 @@ from pathlib import Path
 import aggregation
 import bucketing
 import config_loader
+import llama_log_parser
 import log_parser
 import recommendations
 from aggregation import AnalysisResult, SessionStats
+from llama_log_parser import DAY, NIGHT, TOTAL
 
 CSV_COLUMNS = [
     "session_id",
@@ -46,6 +48,7 @@ CSV_COLUMNS = [
     "local_requests",
     "remote_requests",
     "dispatch_denied",
+    "decode_tok_s",
 ]
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -82,6 +85,7 @@ def _session_row(s: SessionStats) -> dict:
         "local_requests": str(s.local_requests),
         "remote_requests": str(s.remote_requests),
         "dispatch_denied": str(s.dispatch_denied),
+        "decode_tok_s": f"{s.decode_tok_s:.1f}" if s.decode_tok_s is not None else "",
     }
 
 
@@ -114,7 +118,11 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def build_report(summary: AnalysisResult, config: dict | None) -> str:
+def build_report(
+    summary: AnalysisResult,
+    config: dict | None,
+    speed: llama_log_parser.SpeedStats | None = None,
+) -> str:
     recs = recommendations.generate_recommendations(summary, config)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
     sessions = list(summary.sessions.values())
@@ -229,6 +237,9 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
         ap(f"| {provider} | {model} | {count} | {day} ({_pct(day, count):.1f}%) | "
            f"{night} ({_pct(night, count):.1f}%) | {reqs} | {fb} |")
 
+    _append_speed_section(ap, "Decode speed", "decode", speed)
+    _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
+
     ap("")
     ap("## Recommendations")
     ap("")
@@ -265,11 +276,58 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
         "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
         "use this report's `large_context_bypass` data. See the skill's SKILL.md for interpretation."
     )
+    ap(
+        "- Decode/prompt-eval speeds come from llama-server eval-timing lines, filtered to the Qwen3 "
+        "child port (discovered per log file). llama-server.log lines carry no timestamps, so the "
+        "day/night split and window filtering are approximate: each sample is bucketed by its log "
+        "file's last-write time. Files whose Qwen3 port cannot be discovered are skipped."
+    )
     return "\n".join(lines) + "\n"
 
 
 def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
+
+
+def _speed_cell(value: float | None) -> str:
+    return f"{value:.1f}" if value is not None else "-"
+
+
+def _append_speed_section(
+    ap,
+    title: str,
+    kind: str,
+    speed: llama_log_parser.SpeedStats | None,
+) -> None:
+    """Append a speed section (``## Decode speed`` / ``## Prompt eval speed``)
+    to the report, one row per (model, bucket) with samples / median / p90 / p10.
+    """
+    ap("")
+    ap(f"## {title}")
+    ap("")
+    if speed is None:
+        ap("_No llama-server eval timing samples in window._")
+        return
+    buckets = speed.decode if kind == "decode" else speed.prompt_eval
+    total = buckets[TOTAL]
+    if total.count == 0:
+        ap("_No llama-server eval timing samples in window._")
+        return
+    ap("| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |")
+    ap("|---|---|---|---|---|---|")
+    for bucket_key in (TOTAL, DAY, NIGHT):
+        b = buckets[bucket_key]
+        if b.count == 0:
+            continue
+        # All samples are from the single local model (Qwen3); keep the model
+        # name generic so a future second local model renders per-model rows.
+        label = {"total": "Total", "day": "Day", "night": "Night"}[bucket_key]
+        ap(f"| Qwen3 | {label} | {b.count} | {_speed_cell(b.median)} | "
+           f"{_speed_cell(b.p90)} | {_speed_cell(b.p10)} |")
+    if speed.files_skipped:
+        ap("")
+        ap(f"_Note: {speed.files_skipped} llama-server log file(s) skipped "
+           "(Qwen3 child port not found)._")
 
 
 def _bucket_key(bucket: str | None) -> str:
@@ -352,11 +410,20 @@ def run_analysis(
     window_end: datetime,
     output_dir: Path,
     config: dict | None = None,
+    llama_log_dir: Path | None = None,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
-    the CSVs and report into ``output_dir``."""
+    the CSVs and report into ``output_dir``.
+
+    ``llama_log_dir`` defaults to ``log_dir`` (the proxy and llama-server
+    logs live in the same directory). llama-server eval-timing samples are
+    parsed for the decode/prompt-eval speed sections; missing or unparseable
+    llama-server files are skipped, never fatal.
+    """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
+    if llama_log_dir is None:
+        llama_log_dir = log_dir
     if config is None:
         config = config_loader.load_proxy_config(config_loader.find_config_path())
     schedule = bucketing.schedule_from_config(config, (config or {}).get("session_slot_pool_size"))
@@ -367,10 +434,15 @@ def run_analysis(
     )
     summary = aggregation.aggregate(events, window_start, window_end, schedule)
 
+    llama_files = llama_log_parser.discover_llama_logs(llama_log_dir, window_start)
+    summary.speed = llama_log_parser.build_speed_stats(
+        llama_files, window_start, window_end, schedule
+    )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csvs(summary, output_dir)
     report_path = output_dir / "report.md"
-    report_path.write_text(build_report(summary, config), encoding="utf-8")
+    report_path.write_text(build_report(summary, config, summary.speed), encoding="utf-8")
     return AnalysisRun(summary=summary, files=files)
 
 
@@ -398,4 +470,20 @@ def summary_to_json(summary: AnalysisResult) -> dict:
         "day_sessions": sum(1 for s in sessions if s.bucket != "night"),
         "night_sessions": sum(1 for s in sessions if s.bucket == "night"),
         "recommendations": len(recommendations.generate_recommendations(summary, None)),
+        "decode_speed": _speed_json(summary.speed) if summary.speed else None,
+        "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
+    }
+
+
+def _speed_json(speed: llama_log_parser.SpeedStats, kind: str = "decode") -> dict:
+    """JSON-friendly speed summary (total bucket only)."""
+    buckets = speed.decode if kind == "decode" else speed.prompt_eval
+    b = buckets[TOTAL]
+    return {
+        "samples": b.count,
+        "median_tok_s": b.median,
+        "p90_tok_s": b.p90,
+        "p10_tok_s": b.p10,
+        "files_parsed": speed.files_parsed,
+        "files_skipped": speed.files_skipped,
     }

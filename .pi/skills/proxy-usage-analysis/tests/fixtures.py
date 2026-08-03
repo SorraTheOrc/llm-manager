@@ -135,6 +135,60 @@ WARNING_LINE_IGNORED = (
 
 MALFORMED_LINE = "garbage without a timestamp prefix"
 
+# --- llama-server eval-timing lines (real lines from /var/log/llama-proxy) ---
+#
+# Router-mode parent/child log: child lines carry a ``[<port>]`` prefix and
+# the Qwen3 child port changes on every restart (discovered from the
+# ``name=Qwen3 on port <port>`` spawn line). Eval timing lines carry no
+# timestamp.
+
+QWEN3_PORT = 32999
+
+QWEN3_SPAWN_LINE = (
+    "srv          load: spawning server instance with name=Qwen3 on port 32999"
+)
+
+PROMPT_EVAL_REAL = (
+    "[32999] prompt eval time =   29504.01 ms / 11449 tokens "
+    "(    2.58 ms per token,   388.05 tokens per second)"
+)
+
+DECODE_EVAL_REAL = (
+    "[32999]        eval time =    3776.71 ms /   153 tokens "
+    "(   24.68 ms per token,    40.51 tokens per second)"
+)
+
+PROMPT_EVAL_REAL2 = (
+    "[32999] prompt eval time =     190.91 ms /    19 tokens "
+    "(   10.05 ms per token,    99.53 tokens per second)"
+)
+
+DECODE_EVAL_REAL2 = (
+    "[32999]        eval time =    1868.57 ms /    77 tokens "
+    "(   24.27 ms per token,    41.21 tokens per second)"
+)
+
+# No port prefix (non-router / standalone llama-server output).
+PROMPT_EVAL_NO_PORT = (
+    "prompt eval time =     190.91 ms /    19 tokens "
+    "(   10.05 ms per token,    99.53 tokens per second)"
+)
+
+# ``total time`` lines carry no tok/s and must be ignored.
+TOTAL_TIME_LINE = (
+    "[32999]       total time =   33280.72 ms / 11602 tokens"
+)
+
+# Non-eval llama-server lines the parser must ignore.
+SLOT_PRINT_TIMING_IGNORED = "[32999] slot print_timing: id  3 | task 2 | "
+SLOT_RELEASE_IGNORED = (
+    "[32999] slot      release: id  3 | task 2 | stop processing: "
+    "n_tokens = 11601, truncated = 0"
+)
+SRV_LOAD_IGNORED = "srv          load: spawning server instance with name=mxbai-embed on port 51973"
+MALFORMED_EVAL_LINE = "[32999] eval time = not-a-number ms / many tokens"
+
+
 # --- Config fixture (proxy/config.yaml fragment, real values) ---------------
 
 CONFIG_FRAGMENT = """\
