@@ -353,10 +353,10 @@ server:
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
-  # ctx-size = 131072). Used to compute the actual per-slot context
+  # ctx-size = 262144). Used to compute the actual per-slot context
   # (ctx_size / active_slots) which clamps the large-context routing
   # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
-  local_model_ctx_size: 131072
+  local_model_ctx_size: 262144
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
@@ -364,10 +364,10 @@ server:
   # mirroring provider.py) for the static session_slot_pool_size AND every
   # slot_schedule entry. When the threshold falls below
   # min_local_routing_threshold (default 10000), a WARNING is logged at
-  # startup. A threshold this
-  # small means every realistic agent session exceeds the clamp, silently
-  # bypassing ALL local traffic to remote (the 2026-08-02 failure mode,
-  # LP-0MSAOQTJS000FFVM). Set to 0 to disable the minimum check.
+  # startup. A threshold this small means every realistic agent session
+  # exceeds the clamp, silently bypassing ALL local traffic to remote
+  # (the 2026-08-02 failure mode, LP-0MSAOJTJS000FFVM). Set to 0 to disable
+  # the minimum check.
   #
   # Set min_local_routing_threshold_fatal: true to make startup FAIL (raise)
   # instead of warning when the threshold is below the minimum.
@@ -429,7 +429,7 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  session_slot_pool_size: 3
+  session_slot_pool_size: 4
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
@@ -469,9 +469,9 @@ server:
     drain_minutes: 3
     entries:
       - time: "23:59"
-        slots: 3
+        slots: 4
       - time: "10:00"
-        slots: 3
+        slots: 4
 
   session_slot_timeout_seconds: 3.0
   # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
