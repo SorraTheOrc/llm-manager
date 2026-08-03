@@ -867,6 +867,36 @@ Tier-1 per-stream retries are **content-aware** (LP-0MS9FR9LG002AJ4C): a stall (
 
 Streaming empty-response detection (`_delta_has_content` in `proxy/proxy_remote.py`) classifies a stream delta as meaningful output when it contains non-empty `content`, a non-empty `tool_calls` list, or non-empty `reasoning_content`. Tool-call-only streams (e.g. deepseek-v4-flash emitting `delta.tool_calls` with `content` always `null`/`""`) and reasoning-only streams therefore pass through unchanged instead of triggering the empty-response retry or the synthetic `finish_reason: error` fallback. A stream is retried as empty only when it produces none of those fields. When an empty-response retry does fire, the log records `saw_tool_calls` / `saw_reasoning` diagnostics to aid future diagnosis.
 
+#### Error handling strategy (recovery-first + informative-error fallback)
+
+The proxy's stream error handling follows a **recovery-first** strategy with an
+**informative-error fallback** (recommendations from the Aug 3 error analysis,
+LP-0MSDFKCK4007CPMY):
+
+1. **Recover first** — on a pre-content mid-stream failure (empty response,
+   connect failure, pre-content stall), the proxy attempts to **silently
+   continue** by re-routing to the next healthy provider in the configured
+   chain, bounded by the number of remaining providers and respecting the
+   content-delivered boundary (never re-route once any `content`,
+   `tool_calls`, or `reasoning_content` chunk has been forwarded). Providers
+   that fail mid-stream enter the existing per-provider cooldown / stall
+   circuit breaker so recovery cannot loop forever. See
+   **LP-0MSDRRDWK009QT4E**.
+2. **Informative error only when recovery is impossible** — when every
+   provider has failed/is in cooldown, or content was already delivered
+   (re-routing is unsafe), the synthetic `finish_reason: error` SSE event
+   carries a structured `error` payload:
+   `{type, message, provider, model, entry, suggested_action}`. This is
+   backward compatible — existing clients still see `finish_reason: error`
+   (unchanged) — while a future client can render the detail. See
+   **LP-0MSDRRJPF0052STT**.
+
+Both changes are tracked as follow-up work items from the analysis; see
+`proxy/docs/error-analysis-2026-08-03.md` for the full taxonomy, quantified
+impact (recovery-first avoids the pre-content window; informative-error
+covers 100% of client-visible errors), and the emission-site audit
+(`proxy/docs/sse-error-emission-audit.md`).
+
 ### Local Stream Timeout Configuration
 
 The proxy uses a separate idle timeout for **local model** (llama-server) streaming, distinct from the remote upstream timeout above. This timeout governs pauses between tokens from the local inference engine, which can be significantly longer during complex reasoning chains (LP-0MS14PM7J003XPS8).
