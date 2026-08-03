@@ -398,6 +398,32 @@ def _get_active_local_slots(config: dict) -> int:
 # leave room for the model's completion tokens in the KV slot.
 _LOCAL_ROUTING_OUTPUT_HEADROOM = 4096
 
+# Default minimum effective per-slot large-context routing threshold.
+# Below this, every realistic agent session exceeds the clamp and ALL local
+# traffic silently bypasses to remote (LP-0MSAOQTJS000FFVM failure mode).
+# Configurable via ``min_local_routing_threshold`` on the server config.
+_DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD = 10000
+
+
+def effective_per_slot_threshold(ctx_size: int, slots: int) -> int:
+    """Compute the effective per-slot large-context routing threshold.
+
+    Mirrors the clamp applied by ``_effective_large_context_thresholds``:
+    ``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM`` (LP-0MSAZXXDY005AWA1).
+
+    Returns 0 when the computation is not meaningful:
+    - ``ctx_size`` <= 0 (clamp disabled)
+    - ``slots`` <= 0
+    - per-slot context does not leave room for output tokens
+      (per_slot <= headroom)
+    """
+    if ctx_size <= 0 or slots <= 0:
+        return 0
+    per_slot = ctx_size // slots
+    if per_slot <= _LOCAL_ROUTING_OUTPUT_HEADROOM:
+        return 0
+    return per_slot - _LOCAL_ROUTING_OUTPUT_HEADROOM
+
 
 def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     """Return (cold, warm) thresholds clamped to the actual per-slot context.
@@ -418,23 +444,120 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     cold = _get_large_context_threshold(config)
     warm = _get_warm_cache_threshold(config)
     ctx_size = _get_local_model_ctx_size(config)
-    if ctx_size <= 0:
-        return cold, warm
-
     slots = _get_active_local_slots(config)
-    if slots <= 0:
+
+    cap = effective_per_slot_threshold(ctx_size, slots)
+    if cap <= 0:
         return cold, warm
 
-    per_slot = ctx_size // slots
-    if per_slot <= _LOCAL_ROUTING_OUTPUT_HEADROOM:
-        return cold, warm
-
-    cap = per_slot - _LOCAL_ROUTING_OUTPUT_HEADROOM
     if cold > 0:
         cold = min(cold, cap)
     if warm > 0:
         warm = min(warm, cap)
     return cold, warm
+
+
+def _collect_local_slot_counts(config: dict) -> list[int]:
+    """All slot counts the proxy may run with: static pool + schedule entries.
+
+    Returns the static ``session_slot_pool_size`` (when > 0) followed by the
+    ``slots`` value of every entry in an enabled ``slot_schedule``. Slot counts
+    are de-duplicated while preserving order.
+    """
+    server_cfg = config.get("server", config)
+    counts: list[int] = []
+    try:
+        pool = int(server_cfg.get("session_slot_pool_size", 0) or 0)
+    except (ValueError, TypeError):
+        pool = 0
+    if pool > 0:
+        counts.append(pool)
+
+    try:
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        schedule = SlotScheduleConfig.from_server_config(server_cfg)
+    except Exception:
+        schedule = None
+    if schedule is not None and schedule.enabled:
+        for entry in schedule.entries:
+            if entry.slots > 0 and entry.slots not in counts:
+                counts.append(entry.slots)
+    return counts
+
+
+def _get_min_local_routing_threshold(config: dict) -> int:
+    """Read the minimum effective per-slot routing threshold from config.
+
+    Supports both nested and flat config keys. Defaults to
+    ``_DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD`` (10000). An explicit 0 disables
+    the minimum check (consistent with ``local_model_ctx_size: 0`` disabling
+    the clamp).
+    """
+    val = config.get("min_local_routing_threshold")
+    if val is None:
+        val = config.get("server", {}).get(
+            "min_local_routing_threshold", _DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD
+        )
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return _DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD
+
+
+def validate_local_routing_config(config: dict) -> list[str]:
+    """Validate the ctx-size / slot-count routing clamp configuration.
+
+    Computes the effective per-slot large-context routing threshold
+    (``local_model_ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``,
+    mirroring ``_effective_large_context_thresholds``) for EVERY slot count
+    the proxy may run with — the static ``session_slot_pool_size`` AND all
+    ``slot_schedule`` entries — and reports a problem when the threshold
+    falls below the configured minimum (default 10000 tokens).
+
+    A threshold this small means every realistic agent session exceeds the
+    clamp, silently bypassing ALL local traffic to remote providers (the
+    2026-08-02 failure mode, LP-0MSAOQTJS000FFVM).
+
+    Returns a list of human-readable problem descriptions (empty when the
+    config is consistent). When ``min_local_routing_threshold_fatal`` is
+    set, each problem is prefixed with ``FATAL: `` so callers can fail
+    startup; otherwise callers log a WARNING.
+    """
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return []  # clamp disabled; nothing to validate
+
+    min_threshold = _get_min_local_routing_threshold(config)
+    if min_threshold <= 0:
+        return []  # minimum check disabled (min_local_routing_threshold: 0)
+
+    fatal = bool(
+        config.get("server", {}).get("min_local_routing_threshold_fatal", False)
+        or config.get("min_local_routing_threshold_fatal", False)
+    )
+
+    problems: list[str] = []
+    for slots in _collect_local_slot_counts(config):
+        threshold = effective_per_slot_threshold(ctx_size, slots)
+        if threshold <= 0:
+            # Per-slot context leaves no room for output tokens; the clamp
+            # leaves thresholds unchanged rather than clamping, so nothing
+            # below the minimum can be derived here.
+            continue
+        if threshold < min_threshold:
+            msg = (
+                f"local_model_ctx_size={ctx_size} with {slots} slots yields "
+                f"effective per-slot large-context routing threshold "
+                f"{threshold} ({ctx_size}//{slots} - "
+                f"{_LOCAL_ROUTING_OUTPUT_HEADROOM} headroom), below the "
+                f"minimum of {min_threshold}. Every prompt above {threshold} "
+                f"tokens bypasses local to remote, silently disabling local "
+                f"routing (LP-0MSAOQTJS000FFVM). Increase ctx-size or reduce "
+                f"slots."
+            )
+            problems.append(f"FATAL: {msg}" if fatal else msg)
+    return problems
 
 
 async def _estimate_effective_prompt_tokens_for_routing(

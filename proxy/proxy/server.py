@@ -325,6 +325,30 @@ async def _capture_rocm_version() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _startup_validate_local_routing_config(config: dict) -> None:
+    """Validate the ctx-size / slot-count routing clamp configuration.
+
+    Mirrors the effective-threshold math in provider.py (LP-0MSAZXXDY005AWA1)
+    so a misconfigured ctx/slot combination cannot silently move ALL local
+    traffic to remote providers (LP-0MSAOQTJS000FFVM / LP-0MSCABA5K0010LW2).
+
+    Logs a WARNING per problem by default; raises ValueError at startup when
+    ``min_local_routing_threshold_fatal`` is enabled (hard floor).
+    """
+    from proxy.provider import validate_local_routing_config
+
+    problems = validate_local_routing_config(config)
+    for problem in problems:
+        if problem.startswith("FATAL: "):
+            logger.error("Local routing config validation FAILED: %s", problem)
+        else:
+            logger.warning("Local routing config validation: %s", problem)
+    if any(p.startswith("FATAL: ") for p in problems):
+        raise ValueError(
+            "Local routing config validation failed: " + "; ".join(problems)
+        )
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -334,6 +358,7 @@ def _startup_config_logging():
     global config, logger
     config = load_config()
     logger = setup_logging(config)
+    _startup_validate_local_routing_config(config)
     logger.info("Starting LLama Proxy Server")
     return config, logger
 

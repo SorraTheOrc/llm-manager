@@ -357,6 +357,23 @@ server:
   # (ctx_size / active_slots) which clamps the large-context routing
   # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
   local_model_ctx_size: 131072
+
+  # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
+  # Startup validation that computes the effective per-slot large-context
+  # routing threshold (local_model_ctx_size // slots - 4096 output headroom,
+  # mirroring provider.py) for the static session_slot_pool_size AND every
+  # slot_schedule entry. When the threshold falls below
+  # min_local_routing_threshold (default 10000) for the static
+  # session_slot_pool_size AND every slot_schedule entry. When the threshold
+  # falls below the minimum, a WARNING is logged at startup. A threshold this
+  # small means every realistic agent session exceeds the clamp, silently
+  # bypassing ALL local traffic to remote (the 2026-08-02 failure mode,
+  # LP-0MSAOQTJS000FFVM). Set to 0 to disable the minimum check.
+  #
+  # Set min_local_routing_threshold_fatal: true to make startup FAIL (raise)
+  # instead of warning when the threshold is below the minimum.
+  min_local_routing_threshold: 10000
+  min_local_routing_threshold_fatal: false
   llama_router_mode: true
   max_concurrent_queries: 16
   # Local-model concurrency limit (LP-0MR5MAJNM005R905).

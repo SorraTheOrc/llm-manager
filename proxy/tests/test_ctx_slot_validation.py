@@ -1,0 +1,202 @@
+"""
+Config-consistency validation for ctx-size / slot-count routing clamp.
+
+Regression for LP-0MSCABA5K0010LW2 (and the original failure LP-0MSAOQTJS000FFVM):
+setting [Qwen3] ctx-size = 65536 while the slot schedule remained at 6 slots
+silently collapsed the large-context routing threshold to 6826 tokens (65536//6
+- 4096 headroom). Every agent session (17K-62K estimated tokens) exceeded the
+clamp, so ALL traffic was bypassed to remote providers.
+
+This test module verifies the startup config validation that catches this
+misconfiguration before it reaches production.
+"""
+import pytest
+
+from proxy.provider import (
+    validate_local_routing_config,
+    effective_per_slot_threshold,
+    _LOCAL_ROUTING_OUTPUT_HEADROOM,
+)
+
+
+class TestEffectivePerSlotThreshold:
+    """Core computation reused by both _effective_large_context_thresholds and
+    the validation function."""
+
+    def test_normal_case(self):
+        """ctx=262144, slots=4 → per_slot=65536, threshold=61440."""
+        assert effective_per_slot_threshold(262144, 4) == 61440
+
+    def test_zero_slots(self):
+        assert effective_per_slot_threshold(131072, 0) == 0
+
+    def test_headroom_exceeded(self):
+        """ctx=65536, slots=6 → per_slot=10922, threshold=6826."""
+        assert effective_per_slot_threshold(65536, 6) == 6826
+
+    def test_headroom_not_met(self):
+        """ctx=4096, slots=1 → per_slot=4096 == headroom → 0 (no room for
+        output tokens, clamp is not meaningful)."""
+        assert effective_per_slot_threshold(4096, 1) == 0
+        assert effective_per_slot_threshold(4000, 1) == 0
+
+    def test_exact_headroom(self):
+        """ctx=8192, slots=1 → per_slot=8192, threshold=8192 - 4096 = 4096."""
+        assert effective_per_slot_threshold(8192, 1) == 4096
+
+
+class TestValidateLocalRoutingConfig:
+    """Validate the ctx-size / slot-count routing clamp configuration.
+
+    Each test exercises the validation function against a config that mirrors
+    what the proxy reads at startup.
+    """
+
+    def test_no_ctx_size_skips_validation(self):
+        """When local_model_ctx_size is 0 or absent, nothing is validated."""
+        config = {"server": {}}
+        assert validate_local_routing_config(config) == []
+
+    def test_ctx_65536_slots_6_rejected(self):
+        """AC1 / AC3: ctx 65536 with 6 slots → effective = 6826 < 10000."""
+        config = {"server": {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 6,
+        }}
+        problems = validate_local_routing_config(config)
+        assert len(problems) >= 1
+        assert "65536" in problems[0]
+        assert "6" in problems[0]
+        assert "6826" in problems[0]
+        assert "10000" in problems[0]
+
+    def test_ctx_131072_slots_3_passes(self):
+        """AC3: ctx 131072 with 3 slots → effective = 39594 ≥ 10000."""
+        config = {"server": {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_ctx_262144_slots_4_passes(self):
+        """Current production: ctx 262144 with 4 slots → effective = 61440."""
+        config = {"server": {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 4,
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_schedule_aware_all_entries_checked(self):
+        """AC2: ALL slot_schedule entries are checked, not just static pool."""
+        config = {"server": {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 3,  # ok: 65536//3 - 4096 = 21832
+            "slot_schedule": {
+                "enabled": True,
+                "entries": [
+                    {"time": "10:00", "slots": 6},  # bad: 6826
+                    {"time": "23:59", "slots": 4},  # bad: 12288
+                ],
+            },
+        }}
+        problems = validate_local_routing_config(config)
+        # 4 slots → 16384 - 4096 = 12288 ≥ 10000 → ok
+        # 6 slots → 10922 - 4096 = 6826 < 10000 → bad
+        # So one problem for the 6-slot entry
+        assert len(problems) == 1
+        assert "6" in problems[0]
+
+    def test_schedule_aware_best_case_ok(self):
+        """When all schedule entries pass, no problems reported."""
+        config = {"server": {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 6,  # ok
+            "slot_schedule": {
+                "enabled": True,
+                "entries": [
+                    {"time": "10:00", "slots": 6},  # ok: 39594
+                    {"time": "23:59", "slots": 4},  # ok: 57832
+                ],
+            },
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_custom_minimum_threshold(self):
+        """AC1: minimum is configurable via min_local_routing_threshold."""
+        config = {"server": {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,  # effective = 39594
+            "min_local_routing_threshold": 50000,  # higher than 39594
+        }}
+        problems = validate_local_routing_config(config)
+        assert len(problems) == 1
+        assert "50000" in problems[0]
+
+    def test_fatal_threshold_configured(self):
+        """When min_local_routing_threshold_fatal is true, validation should
+        indicate that startup must fail (return flag)."""
+        config = {"server": {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 6,
+            "min_local_routing_threshold": 10000,
+            "min_local_routing_threshold_fatal": True,
+        }}
+        result = validate_local_routing_config(config)
+        assert len(result) >= 1
+        assert result[0].endswith("FATAL") or "fatal" in result[0].lower()
+
+    def test_min_threshold_zero_disables_check(self):
+        """min_local_routing_threshold: 0 disables the minimum check
+        (consistent with local_model_ctx_size: 0 disabling the clamp)."""
+        config = {"server": {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 6,
+            "min_local_routing_threshold": 0,
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_no_schedule_only_static_checked(self):
+        """Without slot_schedule, only static pool size is validated."""
+        config = {"server": {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 4,
+            # no slot_schedule key at all
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_disabled_schedule_only_static_checked(self):
+        """Disabled slot_schedule: only static pool size is validated."""
+        config = {"server": {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 4,
+            "slot_schedule": {
+                "enabled": False,
+                "entries": [],
+            },
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_flat_config_keys(self):
+        """Validation also works with flat config (test compat)."""
+        config = {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 6,
+            "min_local_routing_threshold": 10000,
+        }
+        problems = validate_local_routing_config(config)
+        assert len(problems) >= 1
+        assert "6826" in problems[0]
+
+    def test_problem_message_is_helpful(self):
+        """Error messages must be actionable: include ctx, slots, effective
+        threshold, minimum, and explain the consequence."""
+        config = {"server": {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 6,
+        }}
+        problems = validate_local_routing_config(config)
+        msg = problems[0]
+        assert "ctx-size" in msg.lower() or "65536" in msg
+        assert "slot" in msg.lower() or "6" in msg
+        assert "threshold" in msg.lower() or "effective" in msg
+        assert "remote" in msg.lower() or "bypass" in msg or "bypassed" in msg
