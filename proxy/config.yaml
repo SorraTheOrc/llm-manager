@@ -363,9 +363,8 @@ server:
   # routing threshold (local_model_ctx_size // slots - 4096 output headroom,
   # mirroring provider.py) for the static session_slot_pool_size AND every
   # slot_schedule entry. When the threshold falls below
-  # min_local_routing_threshold (default 10000) for the static
-  # session_slot_pool_size AND every slot_schedule entry. When the threshold
-  # falls below the minimum, a WARNING is logged at startup. A threshold this
+  # min_local_routing_threshold (default 10000), a WARNING is logged at
+  # startup. A threshold this
   # small means every realistic agent session exceeds the clamp, silently
   # bypassing ALL local traffic to remote (the 2026-08-02 failure mode,
   # LP-0MSAOQTJS000FFVM). Set to 0 to disable the minimum check.
