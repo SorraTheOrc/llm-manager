@@ -1,6 +1,6 @@
 ---
 name: proxy-usage-analysis
-description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/proxy.log*) into per-session daytime/nighttime CSVs and a Markdown report with data-backed configuration recommendations. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'generate the daily proxy report'."
+description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/proxy.log*) into per-session daytime/nighttime CSVs and a Markdown report with data-backed configuration recommendations and an error taxonomy with remediation recommendations. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
 ---
 
 # Proxy Usage Analysis
@@ -8,7 +8,9 @@ description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/pro
 Turn the last 24 hours of llama-proxy session and fallback activity into a
 digestible per-session CSV record (split into daytime / nighttime buckets per
 the slot schedule) and an operator-facing Markdown report with highlighted,
-data-backed recommendations.
+data-backed recommendations — including an **error taxonomy** and quantified
+**remediation recommendations** for any proxy errors observed in the window
+(generalized from the Aug 3 error-analysis plan, LP-0MSDFKCK4007CPMY).
 
 ## When to use
 
@@ -18,6 +20,11 @@ data-backed recommendations.
 - Investigating slot counts (6 daytime / 8 nighttime), context limits, or
   routing thresholds: the report's fallback-reason breakdown and context
   pressure stats show whether configuration changes are warranted.
+- An error spike occurred (e.g. `Stream finished: reason=error`, `slot_save`
+  ReadTimeouts, `backend_retry` timeouts, upstream 429s): the report's
+  **Error analysis** section categorizes every error event and recommends
+  remediation (recovery-first silent continue, informative-error fallback,
+  ctx-size pressure, upstream 429 cooldown), quantified from the window.
 
 ## Inputs
 
@@ -60,15 +67,22 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
   sessions in the window (local-only and fallback).
 - `nighttime_sessions.csv` — one row per **nighttime** session (00:00–09:59,
   8 slots).
+- `errors.csv` — one row per **error event** in the window (stream finish
+  errors, stream errors, `slot_save` failures, `backend_retry` timeouts,
+  upstream HTTP errors), with error type, timestamp, provider/model, session,
+  config entry, error detail, HTTP status, retry attempt/signal, source log
+  file, and the raw evidence line.
+- `errors.json` — aggregated error counts by type plus the window bounds.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Day / Night**
   columns), fallback-reason and routing-skip breakdowns, per-model
-  breakdown, **Decode speed** and **Prompt eval speed** sections (median /
-  p90 / p10 tok/s from llama-server eval-timing lines, split Total / Day /
-  Night), and highlighted recommendations. Every day/night count carries
-  its share of the metric's total (e.g. `285 (74.4%)`), and each
-  recommendation's evidence cites the total plus the day/night split.
+  breakdown, **Error analysis** (when the window has error events),
+  **Decode speed** and **Prompt eval speed** sections (median / p90 / p10
+  tok/s from llama-server eval-timing lines, split Total / Day / Night),
+  and highlighted recommendations. Every day/night count carries its share
+  of the metric's total (e.g. `285 (74.4%)`), and each recommendation's
+  evidence cites the total plus the day/night split.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
@@ -84,8 +98,9 @@ local completion tokens ÷ local active span; empty when not derivable).
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`. Unparseable lines are
-   counted and skipped, never fatal.
+   `routing_skip_local`, `local_dispatch_denied`, plus the error lines
+   (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
+   error`). Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
@@ -95,7 +110,14 @@ local completion tokens ÷ local active span; empty when not derivable).
    session start time; nothing is hardcoded.
 5. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
-6. **Decode/prompt-eval speed** — llama-server eval-timing lines
+6. **Error taxonomy** — error events (`Stream finished: reason=error`,
+   `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
+   error`) are parsed in the same streaming pass, collected per window, and
+   rendered into the report's **Error analysis** section plus
+   `errors.csv`/`errors.json`. Remediation recommendations (recovery-first,
+   informative-error, ctx-size pressure, 429 cooldown) are generated from
+   these events and link to the relevant work items.
+7. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
    (discovered per file from the `name=Qwen3 on port <port>` spawn line;
@@ -131,6 +153,20 @@ local completion tokens ÷ local active span; empty when not derivable).
   `local_model_ctx_size / slots` can force `large_context_bypass`.
 - **Day vs night**: a large fallback-rate gap between buckets suggests the
   slot schedule under-serves one period.
+- **Error analysis** (see the **Error analysis** section and `errors.csv`):
+  - `Stream finished: reason=error` — the client-visible synthetic error
+    event (no payload). Remediation: recovery-first silent continue
+    (LP-0MSDP2PDB004GV86) + informative-error fallback
+    (LP-0MSDP2PH20079WQ7).
+  - `Stream error:` — proxy-side stream exception (e.g. `NameError`).
+  - `slot_save failed` — local llama-server slot persistence
+    ReadTimeouts; usually context pressure → raise local ctx-size
+    (LP-0MSAOQTJS000FFVM).
+  - `backend_retry` — upstream connect/read timeouts during retry backoff;
+    transient unless clustered.
+  - `upstream error status=429` (`FreeUsageLimitError`) — the 3-hour
+    per-model cooldown (LP-0MRGU0I91006ODFD) should suppress repeat
+    fallbacks; persistent 429s indicate an upstream quota issue.
 
 ## Testing
 

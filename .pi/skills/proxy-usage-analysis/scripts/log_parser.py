@@ -28,12 +28,21 @@ RE_PROVIDER = re.compile(r"\bprovider=(\S+)")
 RE_MODEL = re.compile(r"\bmodel=(\S+)")
 RE_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.-]+)")
 RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
+RE_ENTRY = re.compile(r"\bentry=(\S+)")
+RE_ERROR_DETAIL = re.compile(r"\berror=([^\s,}]+)")
 RE_FALLBACK = re.compile(
     r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), reason=([\w ]+)$"
 )
 # routing_skip_local reason sits between "reason=" and the "→" arrow.
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
+
+# Error-line extractors.
+RE_BACKEND_ATTEMPT = re.compile(r"attempt=(\d+/\d+)")
+RE_BACKEND_SIGNAL = re.compile(r"signal=([\w_]+)")
+RE_UPSTREAM_STATUS = re.compile(r"status=(\d+)")
+# upstream error type appears in the JSON body as {"type":"error","error":{"type":"<Type>",...}}.
+RE_UPSTREAM_BODY_TYPE = re.compile(r'"type":"(FreeUsageLimitError|[A-Za-z]+Error)"')
 
 # Rotated log naming: proxy.log.YYYY-MM-DD_HH (the timestamp is the rotation time).
 ROTATED_NAME_RE = re.compile(r"^proxy\.log\.(\d{4})-(\d{2})-(\d{2})_(\d{2})$")
@@ -43,6 +52,12 @@ STREAM_FINISHED = "Stream finished"
 FALLBACK = "Fallback triggered"
 ROUTING_SKIP = "routing_skip_local"
 DISPATCH_DENIED = "local_dispatch_denied"
+
+# Error-line prefixes (WARNING level structured lines the parser recognizes).
+STREAM_ERROR = "Stream error:"
+SLOT_SAVE_FAILED = "slot_save failed"
+BACKEND_RETRY = "backend_retry"
+UPSTREAM_ERROR = "[remote] upstream error"
 
 # Events within this many seconds *before* a session's first remote stream are
 # candidates for attributing a session-less "Fallback triggered" line to that
@@ -57,8 +72,10 @@ class LogEvent:
     """One parsed structured log line.
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
-    ``routing_skip``, ``dispatch_denied``. Only the fields relevant to each
-    kind are populated.
+    ``routing_skip``, ``dispatch_denied``, or an error kind (``stream_error``,
+    ``stream_finish_error``, ``slot_save_error``, ``backend_retry``,
+    ``upstream_http_error``). Only the fields relevant to each kind are
+    populated.
     """
 
     kind: str
@@ -74,6 +91,14 @@ class LogEvent:
     dst: str | None = None
     owner: str | None = None
     active: int | None = None
+    # Error-taxonomy fields (populated for error kinds only).
+    error: str | None = None
+    entry: str | None = None
+    status: int | None = None
+    attempt: str | None = None
+    signal: str | None = None
+    src_file: str | None = None
+    raw: str | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -120,15 +145,30 @@ def parse_log_line(line: str) -> LogEvent | None:
         prompt = completion = total = None
         if tokens:
             prompt, completion, total = (int(v) for v in tokens.groups())
+        reason = _first(RE_ROUTING_SKIP_REASON, msg) or _first(
+            re.compile(r"\breason=(\w+)"), msg
+        )
+        # ``Stream finished: reason=error`` is the client-visible synthetic
+        # error event (no error payload); keep it distinct from normal finishes.
+        if reason == "error":
+            return LogEvent(
+                "stream_finish_error",
+                ts,
+                provider=_first(RE_PROVIDER, msg),
+                model=_first(RE_MODEL, msg),
+                session=_session_from(msg),
+                reason=reason,
+                error="finish_reason:error",
+                entry=_first(RE_ENTRY, msg),
+                raw=line,
+            )
         return LogEvent(
             "stream_finished",
             ts,
             provider=_first(RE_PROVIDER, msg),
             model=_first(RE_MODEL, msg),
             session=_session_from(msg),
-            reason=_first(RE_ROUTING_SKIP_REASON, msg) or _first(
-                re.compile(r"\breason=(\w+)"), msg
-            ),
+            reason=reason,
             prompt=prompt,
             completion=completion,
             total=total,
@@ -154,6 +194,46 @@ def parse_log_line(line: str) -> LogEvent | None:
         return LogEvent(
             "dispatch_denied", ts, session=session, owner=owner, active=int(active)
         )
+    if msg.startswith(STREAM_ERROR):
+        # "Stream error: session=... provider=... model=... error=NameError"
+        return LogEvent(
+            "stream_error",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            error=_first(RE_ERROR_DETAIL, msg),
+            raw=line,
+        )
+    if msg.startswith(SLOT_SAVE_FAILED):
+        # "slot_save failed slot=2 error=ReadTimeout/ReadTimeout"
+        return LogEvent(
+            "slot_save_error",
+            ts,
+            error=_first(RE_ERROR_DETAIL, msg),
+            raw=line,
+        )
+    if msg.startswith(BACKEND_RETRY):
+        # "backend_retry path=... stream=True attempt=1/8 delay=... signal=... error=..."
+        return LogEvent(
+            "backend_retry",
+            ts,
+            error=_first(RE_ERROR_DETAIL, msg),
+            attempt=_first(RE_BACKEND_ATTEMPT, msg),
+            signal=_first(RE_BACKEND_SIGNAL, msg),
+            raw=line,
+        )
+    if msg.startswith(UPSTREAM_ERROR):
+        # "[remote] upstream error status=429 url=... body={"type":"error","error":{"type":"FreeUsageLimitError",...}}"
+        status_m = RE_UPSTREAM_STATUS.search(msg)
+        body_type = RE_UPSTREAM_BODY_TYPE.search(msg)
+        return LogEvent(
+            "upstream_http_error",
+            ts,
+            error=body_type.group(1) if body_type else None,
+            status=int(status_m.group(1)) if status_m else None,
+            raw=line,
+        )
     return None
 
 
@@ -172,6 +252,7 @@ def iter_events(path: Path, window_start: datetime, window_end: datetime) -> Ite
             if ev is None:
                 continue
             if window_start <= ev.ts <= window_end:
+                ev.src_file = path.name
                 yield ev
 
 

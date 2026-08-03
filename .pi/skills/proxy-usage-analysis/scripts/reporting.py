@@ -12,6 +12,7 @@ Outputs (per acceptance criteria):
 from __future__ import annotations
 
 import csv
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -89,9 +90,9 @@ def _session_row(s: SessionStats) -> dict:
     }
 
 
-def _write_csv(path: Path, rows: list[dict]) -> None:
+def _write_csv(path: Path, rows: list[dict], fieldnames: list[str] | None = None) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames or CSV_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -107,6 +108,72 @@ def write_csvs(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
     _write_csv(day_path, day_rows)
     _write_csv(night_path, night_rows)
     return day_path, night_path
+
+
+ERROR_CSV_COLUMNS = [
+    "error_type",
+    "timestamp",
+    "provider",
+    "model",
+    "session",
+    "entry",
+    "error_detail",
+    "status",
+    "attempt",
+    "signal",
+    "source_file",
+    "evidence",
+]
+
+
+ERROR_TYPE_LABELS = {
+    "stream_finish_error": "Stream finished: reason=error",
+    "stream_error": "Stream error",
+    "slot_save_error": "slot_save failed",
+    "backend_retry": "backend_retry",
+    "upstream_http_error": "upstream HTTP error",
+}
+
+
+def _error_row(e: log_parser.LogEvent) -> dict:
+    return {
+        "error_type": e.kind,
+        "timestamp": _fmt_ts(e.ts),
+        "provider": e.provider or "",
+        "model": e.model or "",
+        "session": e.session or "",
+        "entry": e.entry or "",
+        "error_detail": e.error or "",
+        "status": str(e.status) if e.status is not None else "",
+        "attempt": e.attempt or "",
+        "signal": e.signal or "",
+        "source_file": e.src_file or "",
+        "evidence": (e.raw or "").strip(),
+    }
+
+
+def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
+    """Write ``errors.csv`` (one row per error event) and ``errors.json``
+    (aggregated counts by error type); returns their paths."""
+    events = sorted(summary.error_events, key=lambda e: e.ts)
+    csv_path = out_dir / "errors.csv"
+    if events:
+        _write_csv(csv_path, [_error_row(e) for e in events], fieldnames=ERROR_CSV_COLUMNS)
+    else:
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=ERROR_CSV_COLUMNS)
+            writer.writeheader()
+
+    json_path = out_dir / "errors.json"
+    by_type = dict(summary.error_counts.most_common())
+    payload = {
+        "total": len(events),
+        "by_type": by_type,
+        "window_start": _fmt_ts(summary.window_start),
+        "window_end": _fmt_ts(summary.window_end),
+    }
+    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return csv_path, json_path
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +277,8 @@ def build_report(
             ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% | "
                f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
 
+    _append_error_section(ap, summary)
+
     if summary.routing_skip_reason_counts:
         ap("")
         ap("## routing_skip_local reasons")
@@ -283,6 +352,46 @@ def build_report(
         "file's last-write time. Files whose Qwen3 port cannot be discovered are skipped."
     )
     return "\n".join(lines) + "\n"
+
+
+def _append_error_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Error analysis`` section to the report.
+
+    Taxonomy table (error type, count, affected providers/models, evidence
+    excerpt) plus a pointer to the remediation recommendations and the
+    ``errors.csv`` / ``errors.json`` artifacts. The section is omitted when
+    the window has no error events.
+    """
+    if not summary.error_events:
+        return
+    ap("")
+    ap("## Error analysis")
+    ap("")
+    ap("| Error type | Count | Affected providers/models | Evidence excerpt |")
+    ap("|---|---|---|---|")
+    counts = summary.error_counts
+    pm = summary.error_provider_model_counts
+    for kind, count in counts.most_common():
+        affected = ", ".join(
+            f"{p}/{m}" if p and m else (p or m or "-")
+            for (k, p, m), _ in pm.most_common(6)
+            if k == kind and (p or m)
+        )
+        if not affected:
+            affected = "-"
+        first = next((e for e in summary.error_events if e.kind == kind), None)
+        excerpt = ""
+        if first and first.raw:
+            excerpt = first.raw.strip()
+            if len(excerpt) > 100:
+                excerpt = excerpt[:100] + "…"
+        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {count} | {affected} | `{excerpt}` |")
+    ap("")
+    ap(
+        f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
+        "and the remediation recommendations below (recovery-first silent continue, informative-error "
+        "fallback, ctx-size pressure, upstream 429 cooldown)."
+    )
 
 
 def _pct(part: int, total: int) -> float:
@@ -441,6 +550,7 @@ def run_analysis(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csvs(summary, output_dir)
+    write_error_artifacts(summary, output_dir)
     report_path = output_dir / "report.md"
     report_path.write_text(build_report(summary, config, summary.speed), encoding="utf-8")
     return AnalysisRun(summary=summary, files=files)
@@ -469,6 +579,8 @@ def summary_to_json(summary: AnalysisResult) -> dict:
         "unattributed_events": summary.unattributed_events,
         "day_sessions": sum(1 for s in sessions if s.bucket != "night"),
         "night_sessions": sum(1 for s in sessions if s.bucket == "night"),
+        "errors": len(summary.error_events),
+        "errors_by_type": dict(summary.error_counts.most_common()),
         "recommendations": len(recommendations.generate_recommendations(summary, None)),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,

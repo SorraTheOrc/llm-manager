@@ -162,6 +162,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     slot_counts_str = _slot_counts_str(day_slots, night_slots)
     cfg_ctx = (config or {}).get("local_model_ctx_size")
 
+    recs.extend(_error_recommendations(result))
+
     # --- 1. Slot pool contention ------------------------------------------
     contention = sum(reason_counts[r] for r in SLOT_CONTENTION_REASONS)
     if contention >= MIN_EVENTS and _pct(contention, total_fallbacks) >= REASON_SHARE * 100:
@@ -358,6 +360,107 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                     f"events per request); {_dn(total_fallbacks, day_fb_total, night_fb_total)}. "
                     "No slot contention, large-context, or warm-cache issues detected."
                 ),
+            )
+        )
+
+    return recs
+
+
+def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
+    """Remediation recommendations driven by the parsed error events.
+
+    Mirrors the Aug 3 error-analysis plan (LP-0MSDFKCK4007CPMY): stream
+    finish errors point at recovery-first silent continue and informative-
+    error fallback; slot_save ReadTimeouts point at local ctx-size pressure;
+    upstream 429s point at the FreeUsageLimitError cooldown; backend_retry
+    timeouts are informational (upstream instability).
+    """
+    recs: list[Recommendation] = []
+    if not result.error_events:
+        return recs
+
+    counts = result.error_counts
+    total = len(result.error_events)
+
+    stream_finish = counts.get("stream_finish_error", 0)
+    stream_err = counts.get("stream_error", 0)
+    slot_save = counts.get("slot_save_error", 0)
+    backend_retry = counts.get("backend_retry", 0)
+    upstream_429 = counts.get("upstream_http_error", 0)
+
+    if stream_finish > 0:
+        provider_detail = ""
+        pm = Counter(
+            (e.provider, e.model)
+            for e in result.error_events
+            if e.kind == "stream_finish_error" and (e.provider or e.model)
+        )
+        if pm:
+            top = ", ".join(f"{p}/{m}" if p and m else (p or m) for (p, m), _ in pm.most_common(3))
+            provider_detail = f" Affected: {top}."
+        recs.append(
+            Recommendation(
+                severity="high",
+                title="Stream finish errors: adopt recovery-first + informative-error strategy",
+                detail=(
+                    f"{stream_finish} stream(s) ended with the synthetic `finish_reason: error` event "
+                    "(no error payload), which the client surfaces as an unspecified error. Recommended "
+                    "proxy-side remediation: (1) recovery-first silent continue — re-route to the next "
+                    "healthy provider before content is delivered (see LP-0MSDP2PDB004GV86); (2) when "
+                    "recovery is impossible, emit an informative error (type/message/provider/suggested "
+                    "action) in the synthetic SSE event (see LP-0MSDP2PH20079WQ7). No client-side change "
+                    "required."
+                ),
+                evidence=(
+                    f"{stream_finish} of {total} error events ({_pct(stream_finish, total):.1f}%) were "
+                    f"`stream_finish_error` ({stream_err} `stream_error` proxy exceptions)."
+                    f"{provider_detail} Follow-ups: LP-0MSDP2PDB004GV86 (recovery-first), "
+                    "LP-0MSDP2PH20079WQ7 (informative error)."
+                ),
+            )
+        )
+
+    if slot_save > 0:
+        recs.append(
+            Recommendation(
+                severity="medium",
+                title="slot_save failures (ReadTimeout): local context pressure",
+                detail=(
+                    f"{slot_save} `slot_save failed` event(s) (typically ReadTimeout/ReadTimeout) indicate "
+                    "the local llama-server slot persistence is struggling, often under large-context "
+                    "pressure. Consider raising the local model ctx-size (models.ini) or the routing "
+                    "thresholds so fewer oversized prompts hit local slots. See LP-0MSAOQTJS000FFVM "
+                    "(evaluate increasing local ctx-size)."
+                ),
+                evidence=f"{slot_save} of {total} error events ({_pct(slot_save, total):.1f}%) were `slot_save_error`.",
+            )
+        )
+
+    if upstream_429 > 0:
+        recs.append(
+            Recommendation(
+                severity="medium",
+                title="Upstream HTTP 429 (FreeUsageLimitError): cooldown active",
+                detail=(
+                    f"{upstream_429} upstream 429 `FreeUsageLimitError` event(s) observed. The proxy's "
+                    "3-hour per-model cooldown (LP-0MRGU0I91006ODFD) should suppress repeat fallbacks to "
+                    "the affected model; if 429s persist, check the upstream provider quota."
+                ),
+                evidence=f"{upstream_429} of {total} error events ({_pct(upstream_429, total):.1f}%) were `upstream_http_error` status=429.",
+            )
+        )
+
+    if backend_retry > 0:
+        recs.append(
+            Recommendation(
+                severity="info",
+                title="backend_retry timeouts: upstream instability",
+                detail=(
+                    f"{backend_retry} `backend_retry` event(s) (ConnectTimeout/ReadError) show upstream "
+                    "connectivity issues during the retry backoff. These are transient unless they "
+                    "cluster; monitor the next window and check upstream health if they persist."
+                ),
+                evidence=f"{backend_retry} of {total} error events ({_pct(backend_retry, total):.1f}%) were `backend_retry`.",
             )
         )
 

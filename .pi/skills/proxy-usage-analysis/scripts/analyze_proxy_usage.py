@@ -103,15 +103,17 @@ def main(argv: list[str] | None = None) -> int:
             f", decode speed {decode.get('samples', 0)} samples "
             f"(median {decode.get('median_tok_s', '-')} tok/s)"
         )
+        errors = data.get("errors") or 0
         print(
             f"Analyzed {len(run.files)} log file(s) from {args.log_dir}: "
             f"{data['sessions']} sessions, {data['total_requests']} requests "
             f"(local {data['local_requests']} / remote {data['remote_requests']}), "
             f"{data['fallback_events']} fallback events "
-            f"({data['fallback_rate'] * 100:.1f}%){decode_summary}."
+            f"({data['fallback_rate'] * 100:.1f}%), "
+            f"{errors} error event(s){decode_summary}."
         )
         print(f"Outputs written to {args.output_dir}: "
-              f"daytime_sessions.csv, nighttime_sessions.csv, report.md")
+              f"daytime_sessions.csv, nighttime_sessions.csv, errors.csv, report.md")
     return 0
 
 

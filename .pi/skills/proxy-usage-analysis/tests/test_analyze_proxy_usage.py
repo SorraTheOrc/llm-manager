@@ -31,6 +31,18 @@ from tests import fixtures  # noqa: E402
 WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
 WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
 
+# Error fixtures live on Aug 3 (10:00-14:00 window covers all five error types).
+ERROR_WINDOW_START = datetime(2026, 8, 3, 10, 0, 0)
+ERROR_WINDOW_END = datetime(2026, 8, 3, 15, 0, 0)
+
+ERROR_LINES = [
+    fixtures.STREAM_FINISHED_ERROR,
+    fixtures.STREAM_ERROR_LINE,
+    fixtures.SLOT_SAVE_FAILED,
+    fixtures.BACKEND_RETRY_TIMEOUT,
+    fixtures.UPSTREAM_429,
+]
+
 
 def _schedule() -> bucketing.SlotSchedule:
     return bucketing.schedule_from_entries([("23:59", 8), ("10:00", 6)])
@@ -143,6 +155,75 @@ class TestLogLineParsing:
     def test_session_unknown_is_unattributed(self):
         ev = log_parser.parse_log_line(fixtures.STREAM_STARTED_SESSION_UNKNOWN)
         assert ev.session is None
+
+
+class TestErrorLineParsing:
+    """Error events are parsed into distinct error kinds with the fields the
+    taxonomy needs (error type, provider/model, session, entry, evidence)."""
+
+    def test_stream_finished_reason_error(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_FINISHED_ERROR)
+        assert ev is not None
+        assert ev.kind == "stream_finish_error"
+        assert ev.error == "finish_reason:error"
+        assert ev.session == "019fc52e-05a0-78d5-b59d-bcb91055b787"
+        assert ev.provider == "opencode"
+        assert ev.model == "deepseek-v4-flash-free"
+        assert ev.entry == "opencode-deepseek-free"
+        assert ev.raw and "Stream finished: reason=error" in ev.raw
+
+    def test_stream_error_line(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_ERROR_LINE)
+        assert ev is not None
+        assert ev.kind == "stream_error"
+        assert ev.error == "NameError"
+        assert ev.provider == "local"
+        assert ev.model == "Qwen3"
+        assert ev.session == "019fc754-d847-75af-86ea-991480e799d0"
+
+    def test_slot_save_failed(self):
+        ev = log_parser.parse_log_line(fixtures.SLOT_SAVE_FAILED)
+        assert ev is not None
+        assert ev.kind == "slot_save_error"
+        assert ev.error == "ReadTimeout/ReadTimeout"
+
+    def test_backend_retry(self):
+        ev = log_parser.parse_log_line(fixtures.BACKEND_RETRY_TIMEOUT)
+        assert ev is not None
+        assert ev.kind == "backend_retry"
+        assert ev.error == "ConnectTimeout"
+        assert ev.attempt == "1/8"
+        assert ev.signal == "connect_failures"
+
+    def test_upstream_429(self):
+        ev = log_parser.parse_log_line(fixtures.UPSTREAM_429)
+        assert ev is not None
+        assert ev.kind == "upstream_http_error"
+        assert ev.status == 429
+        assert ev.error == "FreeUsageLimitError"
+
+    def test_slot_save_success_is_ignored(self):
+        assert log_parser.parse_log_line(fixtures.SLOT_SAVE_SUCCESS) is None
+
+    def test_stream_finished_stop_is_not_error(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_FINISHED_STOP)
+        assert ev is not None
+        assert ev.kind == "stream_finished"
+        assert ev.reason == "stop"
+
+    def test_iter_events_attaches_source_file(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.2026-08-03_13").write_text(fixtures.STREAM_ERROR_LINE + "\n")
+        events = list(
+            log_parser.iter_events(
+                log_dir / "proxy.log.2026-08-03_13",
+                ERROR_WINDOW_START,
+                ERROR_WINDOW_END,
+            )
+        )
+        assert len(events) == 1
+        assert events[0].src_file == "proxy.log.2026-08-03_13"
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +426,71 @@ class TestSessionAggregation:
         assert res.sessions["night1"].slots == 8
 
 
+class TestErrorAggregation:
+    """Error events are collected into ``AnalysisResult.error_events`` and
+    countable by error type / provider / model."""
+
+    def test_error_events_collected(self):
+        res = aggregation.aggregate(
+            _events(ERROR_LINES), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        kinds = sorted(e.kind for e in res.error_events)
+        assert kinds == [
+            "backend_retry",
+            "slot_save_error",
+            "stream_error",
+            "stream_finish_error",
+            "upstream_http_error",
+        ]
+        assert res.error_events[0].raw
+        assert res.error_events[0].ts >= ERROR_WINDOW_START
+        assert res.error_events[0].ts <= ERROR_WINDOW_END
+
+    def test_error_counts_by_type(self):
+        res = aggregation.aggregate(
+            _events(ERROR_LINES * 2), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        counts = res.error_counts
+        assert counts["stream_finish_error"] == 2
+        assert counts["stream_error"] == 2
+        assert counts["slot_save_error"] == 2
+        assert counts["backend_retry"] == 2
+        assert counts["upstream_http_error"] == 2
+
+    def test_error_provider_model_breakdown(self):
+        res = aggregation.aggregate(
+            _events(ERROR_LINES), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        breakdown = res.error_provider_model_counts
+        # stream_finish_error: opencode / deepseek-v4-flash-free; stream_error: local / Qwen3.
+        assert breakdown[("stream_finish_error", "opencode", "deepseek-v4-flash-free")] == 1
+        assert breakdown[("stream_error", "local", "Qwen3")] == 1
+        # slot_save / backend_retry / upstream carry no provider/model.
+        assert breakdown[("slot_save_error", None, None)] == 1
+        assert breakdown[("backend_retry", None, None)] == 1
+        assert breakdown[("upstream_http_error", None, None)] == 1
+
+    def test_error_events_outside_window_excluded(self):
+        res = aggregation.aggregate(
+            _events(ERROR_LINES), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        # All fixtures are inside the Aug 3 10:00-15:00 window; also verify a
+        # window that excludes them yields no error events.
+        res2 = aggregation.aggregate(
+            _events(ERROR_LINES),
+            datetime(2026, 8, 1, 0, 0),
+            datetime(2026, 8, 1, 23, 59),
+            _schedule(),
+        )
+        assert res2.error_events == []
+
+    def test_error_events_not_counted_as_lines_skipped(self):
+        res = aggregation.aggregate(
+            _events(ERROR_LINES), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        assert res.lines_skipped == 0
+
+
 # ---------------------------------------------------------------------------
 # Day/night bucketing from the slot schedule
 # ---------------------------------------------------------------------------
@@ -522,6 +668,89 @@ class TestRecommendations:
         )
         recs = recommendations.generate_recommendations(res, config=None)
         assert any(r.severity == "info" and "remote" in r.title.lower() for r in recs)
+
+
+class TestErrorRecommendations:
+    """Error-driven remediation recommendations are quantified from the
+    parsed error events and link to the known follow-up work items."""
+
+    @staticmethod
+    def _res_with_errors(errors: list[log_parser.LogEvent]) -> aggregation.AnalysisResult:
+        res = aggregation.AnalysisResult(
+            window_start=ERROR_WINDOW_START,
+            window_end=ERROR_WINDOW_END,
+            sessions={},
+            fallback_events=[],
+            routing_skip_events=[],
+            dispatch_denied_count=0,
+            unattributed_events=0,
+            lines_skipped=0,
+            total_lines=0,
+            error_events=errors,
+        )
+        return res
+
+    def test_stream_errors_trigger_recovery_first_recommendation(self):
+        errors = [
+            log_parser.LogEvent("stream_finish_error", ERROR_WINDOW_START, provider="opencode-go", model="deepseek-v4-flash")
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title.lower() for r in recs)
+        assert "recovery-first" in titles, f"expected recovery-first recommendation, got: {titles}"
+        assert "LP-0MSDP2PDB004GV86" in " | ".join(r.detail for r in recs)
+
+    def test_slot_save_errors_trigger_ctx_pressure_recommendation(self):
+        errors = [
+            log_parser.LogEvent("slot_save_error", ERROR_WINDOW_START, error="ReadTimeout/ReadTimeout")
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title.lower() for r in recs)
+        assert "slot_save" in titles, f"expected slot_save recommendation, got: {titles}"
+        assert "LP-0MSAOQTJS000FFVM" in " | ".join(r.detail for r in recs)
+
+    def test_upstream_429_triggers_cooldown_recommendation(self):
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="FreeUsageLimitError", status=429)
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title.lower() for r in recs)
+        assert "429" in titles, f"expected 429/cooldown recommendation, got: {titles}"
+        assert "LP-0MRGU0I91006ODFD" in " | ".join(r.detail for r in recs)
+
+    def test_backend_retry_errors_are_informational(self):
+        errors = [
+            log_parser.LogEvent("backend_retry", ERROR_WINDOW_START, error="ConnectTimeout")
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        assert any(r.severity == "info" and "backend_retry" in r.title.lower() for r in recs)
+
+    def test_error_recommendations_cite_evidence_with_counts(self):
+        errors = [
+            log_parser.LogEvent("stream_finish_error", ERROR_WINDOW_START, provider="opencode-go", model="deepseek-v4-flash")
+            for _ in range(5)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        stream_recs = [r for r in recs if "recovery-first" in r.title.lower()]
+        assert stream_recs, "expected a recovery-first recommendation"
+        assert "5" in stream_recs[0].evidence
+        assert stream_recs[0].evidence  # evidence non-empty
+
+    def test_no_error_events_do_not_trigger_error_recommendations(self):
+        res = self._res_with_errors([])
+        recs = recommendations.generate_recommendations(res, config=None)
+        for r in recs:
+            assert "recovery-first" not in r.title.lower()
+            assert "slot_save" not in r.title.lower()
+            assert "429" not in r.title.lower()
 
     def test_low_fallback_reports_no_change_needed(self):
         res = _result_with_sessions([_session("a"), _session("b"), _session("c")])
@@ -743,6 +972,62 @@ class TestEndToEnd:
         assert data["fallback_events"] >= 1
         # Round-trips through json.
         json.dumps(data)
+
+    def test_error_report_section_and_artifacts(self, tmp_path):
+        log_dir = tmp_path / "logs_err"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(ERROR_LINES) + "\n")
+        out_dir = tmp_path / "out_err"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=ERROR_WINDOW_START,
+            window_end=ERROR_WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        assert len(result.summary.error_events) == 5
+
+        report_md = (out_dir / "report.md").read_text()
+        assert "## Error analysis" in report_md
+        assert "stream_finish_error" in report_md
+        assert "opencode/deepseek-v4-flash-free" in report_md
+        assert "slot_save_error" in report_md
+        assert "upstream_http_error" in report_md
+        assert "FreeUsageLimitError" in report_md
+
+        errors_csv = out_dir / "errors.csv"
+        assert errors_csv.exists()
+        with errors_csv.open() as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 5
+        header = set(rows[0].keys())
+        for col in ["error_type", "timestamp", "provider", "model", "session", "entry", "evidence"]:
+            assert col in header, f"missing errors.csv column {col}"
+        by_type = {r["error_type"]: r for r in rows}
+        assert by_type["stream_finish_error"]["provider"] == "opencode"
+        assert by_type["upstream_http_error"]["status"] == "429"
+
+        errors_json = out_dir / "errors.json"
+        assert errors_json.exists()
+        data = json.loads(errors_json.read_text())
+        assert data["total"] == 5
+        assert data["by_type"]["stream_finish_error"] == 1
+        assert data["by_type"]["upstream_http_error"] == 1
+
+    def test_error_json_summary_counts(self, tmp_path):
+        log_dir = tmp_path / "logs_err2"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(ERROR_LINES) + "\n")
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=ERROR_WINDOW_START,
+            window_end=ERROR_WINDOW_END,
+            output_dir=tmp_path / "out_err2",
+            config=None,
+        )
+        data = reporting.summary_to_json(result.summary)
+        assert data["errors"] == 5
+        assert data["errors_by_type"]["stream_finish_error"] == 1
 
     def test_empty_log_dir(self, tmp_path):
         log_dir = tmp_path / "empty"

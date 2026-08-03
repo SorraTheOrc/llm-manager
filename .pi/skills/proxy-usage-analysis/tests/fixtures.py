@@ -111,6 +111,42 @@ DISPATCH_DENIED = (
     "owner=019fc27d active=4"
 )
 
+# --- Error events (real lines from /var/log/llama-proxy, Aug 3 window) ------
+
+# Stream finished with reason=error (client-visible synthetic error; carries
+# session, provider, model, and the config entry name).
+STREAM_FINISHED_ERROR = (
+    "2026-08-03 10:13:14,159 - INFO - Stream finished: reason=error "
+    "session=019fc52e-05a0-78d5-b59d-bcb91055b787 provider=opencode "
+    "model=deepseek-v4-flash-free entry=opencode-deepseek-free "
+    "request=[{'type': 'text', 'text': 'The conversation history before this point was compac..."
+)
+
+# Stream error (proxy-side stream exception; WARNING level).
+STREAM_ERROR_LINE = (
+    "2026-08-03 12:47:13,378 - WARNING - Stream error: "
+    "session=019fc754-d847-75af-86ea-991480e799d0 provider=local model=Qwen3 error=NameError"
+)
+
+# slot_save failure (local llama-server slot persistence ReadTimeout).
+SLOT_SAVE_FAILED = (
+    "2026-08-03 13:39:43,255 - WARNING - slot_save failed slot=2 error=ReadTimeout/ReadTimeout"
+)
+
+# backend_retry (upstream connect/read timeout during retry backoff).
+BACKEND_RETRY_TIMEOUT = (
+    "2026-08-03 12:37:15,723 - WARNING - backend_retry path=v1/chat/completions stream=True "
+    "attempt=1/8 delay=0.216s signal=connect_failures error=ConnectTimeout"
+)
+
+# Upstream HTTP 429 (FreeUsageLimitError).
+UPSTREAM_429 = (
+    "2026-08-03 13:58:04,053 - WARNING - [remote] upstream error status=429 "
+    "url=https://opencode.ai/zen/v1/chat/completions "
+    "body={\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\","
+    "\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
+)
+
 # --- Lines the parser must ignore -------------------------------------------
 
 ROUTING_CHECK_IGNORED = (
@@ -134,6 +170,16 @@ WARNING_LINE_IGNORED = (
 )
 
 MALFORMED_LINE = "garbage without a timestamp prefix"
+
+# Error-like lines that are NOT errors and must be ignored.
+SLOT_SAVE_SUCCESS = (
+    "2026-08-03 11:14:46,530 - INFO - slot_save success session=ad21516e slot=0"
+)
+STREAM_FINISHED_STOP = (
+    "2026-08-03 11:14:46,531 - INFO - Stream finished: reason=stop "
+    "session=019fc52e-05a0-78d5-b59d-bcb91055b787 provider=opencode "
+    "model=deepseek-v4-flash-free entry=opencode-deepseek-free request=[]"
+)
 
 # --- llama-server eval-timing lines (real lines from /var/log/llama-proxy) ---
 #

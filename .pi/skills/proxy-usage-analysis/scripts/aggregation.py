@@ -85,6 +85,9 @@ class AnalysisResult:
     lines_skipped: int
     total_lines: int
     dispatch_denied_events: List[LogEvent] = field(default_factory=list)
+    # Parsed error events (stream errors, slot_save failures, backend_retry
+    # timeouts, upstream HTTP errors) inside the window.
+    error_events: List[LogEvent] = field(default_factory=list)
     # llama-server decode/prompt-eval speed stats (set by reporting.run_analysis).
     speed: object | None = None
 
@@ -107,6 +110,16 @@ class AnalysisResult:
     @property
     def routing_skip_reason_counts(self) -> Counter:
         return Counter(e.reason for e in self.routing_skip_events if e.reason)
+
+    @property
+    def error_counts(self) -> Counter:
+        """Error events grouped by error type (event kind)."""
+        return Counter(e.kind for e in self.error_events)
+
+    @property
+    def error_provider_model_counts(self) -> Counter:
+        """Error events grouped by (error type, provider, model)."""
+        return Counter((e.kind, e.provider, e.model) for e in self.error_events)
 
 
 class _SessionBuilder:
@@ -269,6 +282,7 @@ def aggregate(
     fallback_events: List[LogEvent] = []
     routing_skip_events: List[LogEvent] = []
     dispatch_denied_events: List[LogEvent] = []
+    error_events: List[LogEvent] = []
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -277,6 +291,15 @@ def aggregate(
     for ev in events:
         total_lines += 1
         if not (window_start <= ev.ts <= window_end):
+            continue
+        if ev.kind in (
+            "stream_error",
+            "stream_finish_error",
+            "slot_save_error",
+            "backend_retry",
+            "upstream_http_error",
+        ):
+            error_events.append(ev)
             continue
         if ev.kind == "fallback":
             fallback_events.append(ev)
@@ -321,4 +344,5 @@ def aggregate(
         lines_skipped=lines_skipped,
         total_lines=total_lines,
         dispatch_denied_events=dispatch_denied_events,
+        error_events=error_events,
     )
