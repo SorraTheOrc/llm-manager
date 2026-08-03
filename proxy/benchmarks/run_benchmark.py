@@ -25,6 +25,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -133,6 +134,16 @@ class BenchmarkConfig:
 # ---------------------------------------------------------------------------
 
 
+def _p95(values: list[float]) -> float | None:
+    """Compute the 95th percentile of a list of values (nearest-rank)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    # Nearest-rank: rank = ceil(0.95 * N), 1-indexed
+    rank = max(1, math.ceil(0.95 * len(ordered)))
+    return round(ordered[rank - 1], 4)
+
+
 def _get_project_root() -> Path:
     """Return the project root directory (two levels up from proxy/benchmarks/)."""
     return Path(__file__).resolve().parent.parent.parent
@@ -168,6 +179,11 @@ def _parse_models_ini(config_path: str | None = None) -> dict:
                 if current_section in models:
                     if key == "hf-repo" and ":" in value:
                         models[current_section]["quantization"] = value.split(":")[1]
+                    elif key == "ctx-size":
+                        try:
+                            models[current_section]["ctx_size"] = int(value)
+                        except ValueError:
+                            pass
                 elif current_section == "global":
                     if key == "ctx-size":
                         try:
@@ -405,6 +421,11 @@ async def run_benchmark_async(
         ),
         "total_prompt_tokens": sum(r.prompt_tokens for r in completed),
         "total_completion_tokens": sum(r.completion_tokens for r in completed),
+        "p95_total_duration_seconds": _p95([r.total_duration_seconds for r in completed]),
+        "p95_time_to_first_token_seconds": _p95(
+            [r.time_to_first_token_seconds for r in completed if r.time_to_first_token_seconds]
+        ),
+        "p95_tokens_per_second": _p95([r.tokens_per_second for r in completed]),
     }
 
     # Capture memory snapshot
@@ -504,6 +525,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to JSON file with prompts array (optional)",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate prompts/config and write schema JSON without sending requests",
+    )
+    parser.add_argument(
         "--snapshot-script",
         type=str,
         default=None,
@@ -528,7 +554,12 @@ def main(argv: list[str] | None = None) -> None:
     # Load prompts
     if args.prompts:
         with open(args.prompts) as f:
-            prompts = json.load(f)
+            loaded = json.load(f)
+        # Support both list-of-prompts and dict-of-named-prompts (fixtures file)
+        if isinstance(loaded, dict):
+            prompts = list(loaded.values())
+        else:
+            prompts = loaded
     else:
         prompts = DEFAULT_PROMPTS
 
@@ -567,6 +598,31 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Concurrency: {config.concurrency}")
     print(f"  Base URL:    {config.base_url}")
     print()
+
+    if args.dry_run:
+        # Validate prompts and emit schema JSON without sending requests.
+        print("DRY RUN — validating prompts, no requests will be sent.\n")
+        for i, p in enumerate(prompts):
+            est = len(p) // 3
+            print(f"  Prompt {i + 1}: {len(p):,} chars  (~{est:,} tokens)")
+        if config.ctx_size:
+            over = [i for i, p in enumerate(prompts) if len(p) // 3 > config.ctx_size]
+            if over:
+                print(f"  WARNING: prompts {[i + 1 for i in over]} exceed ctx_size {config.ctx_size}")
+        result = {
+            "config": config.to_dict() | {"dry_run": True},
+            "requests": [],
+            "summary": {
+                "total_requests": 0,
+                "completed": 0,
+                "errors": 0,
+                "dry_run": True,
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        output_path.write_text(json.dumps(result, indent=2))
+        print(f"\nDry run complete — schema JSON written to: {output_path}")
+        return
 
     if args.snapshot_script:
         snapshot_dir = output_path.parent
