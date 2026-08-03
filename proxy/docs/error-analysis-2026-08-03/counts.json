@@ -1,0 +1,22 @@
+{
+  "assertions": {
+    "failures": [],
+    "passed": true
+  },
+  "by_type": {
+    "backend_retry": 93,
+    "slot_save_error": 17,
+    "stream_error": 6,
+    "stream_finish_error": 127,
+    "upstream_http_error": 112
+  },
+  "stream_finish_error_split": {
+    "local/Qwen3": 6,
+    "opencode-go/deepseek-v4-flash": 93,
+    "opencode/deepseek-v4-flash-free": 28
+  },
+  "total_error_events": 355,
+  "upstream_429_free_usage_limit": 4,
+  "window_end": "2026-08-04 00:00:00",
+  "window_start": "2026-08-03 00:00:00"
+}
