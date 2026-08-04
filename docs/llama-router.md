@@ -100,3 +100,23 @@ server:
 
 The warning names the session and the ratio so operators/agents can compact before
 decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
+
+## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
+
+The smart-routing clamp (`_effective_large_context_thresholds` in
+`proxy/proxy/provider.py`) estimates prompt tokens with tiktoken (cl100k) via
+`count_text_tokens`. Benchmark measurements (2026-08-04) found tiktoken
+**undercounts Qwen3-native tokens by ~1.69x for dense prose**: a 90930-char
+fixture estimates 22732 tokens but Qwen3's tokenizer produces 38529.
+
+Consequences:
+- A prompt can pass the clamp check (est < per_slot − 4096) yet exceed the KV
+  slot at decode time → llama-server HTTP 400 → remote fallback. Measured on
+  4x65.5K (60K fixture: est 45357 < clamp 61440, actual 77060 > 65536 slot) and
+  8x32.8K (30K fixture: est 22732 < clamp 28672, actual 38529 > 32768 slot).
+- Effective local capacity for dense prose is ~39K tokens regardless of slot
+  size until the estimator is corrected.
+
+Mitigations (see follow-up LP-0MSEGPO77005CYCQ): use the Qwen3-native tokenizer
+in routing estimates, or set `token_estimate_multiplier` (~1.69) on the
+plan/author/code model entries. No multiplier is currently set.

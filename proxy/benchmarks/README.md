@@ -194,6 +194,23 @@ python -m proxy.benchmarks.slot_benchmark --slots 6 --phase warm
 python -m proxy.benchmarks.slot_benchmark --slots 6 --phase cold --clean-cache
 ```
 
+### Measured findings (ctx-size eval F2/F3, 2026-08-04)
+
+1. **Routing-estimate tokenizer mismatch**: the large-prompt fixtures (seeded
+   prose, `large_prompts.json`) tokenize ~1.69x higher under Qwen3's native
+   tokenizer than tiktoken cl100k estimates (90930 chars → est 22732, actual
+   38529). Prompts can pass the routing clamp yet exceed the KV slot → llama-server
+   HTTP 400 → remote fallback. See `docs/llama-router.md`.
+2. **Cold vs warm collapse**: a 30K local prefill takes 222.7s cold (re-prefill
+   storm) vs 8.6s warm — measure both phases, report the warm (steady-state)
+   number as production-representative.
+3. **Large local prefills are slow**: a 60K prompt (~77K actual tokens) takes
+   ~600s to prefill locally in cold AND warm; >2-min prefills can trip the proxy's
+   dispatch-lease orphan_cleanup (restarting the prefill). Configs admitting
+   >40K prompts expose this.
+4. **KV memory is total-ctx-bound, not slot-bound** (q8_0, 10 layers): 131072
+   total ctx → 1362.7 MiB KV; 262144 → ~2720 MiB, regardless of slot split.
+
 ## Gating Policy
 
 The following thresholds define minimum acceptable criteria for candidate
