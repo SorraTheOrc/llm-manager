@@ -264,7 +264,7 @@ class TestP95:
         rb = self._rb()
         assert rb._p95([0.123456, 0.654321]) == 0.6543
 
-    def test_summary_includes_p95_fields(self):
+    def test_summary_includes_p95_fields(self, monkeypatch):
         """run_benchmark_async summary must include P95 fields."""
         rb = self._rb()
         import asyncio
@@ -289,7 +289,6 @@ class TestP95:
                 time_to_first_token_seconds=0.05 + idx * 0.01,
             )
 
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             rb, "httpx", types.SimpleNamespace(AsyncClient=lambda **kw: FakeAsyncClient())
         )
@@ -539,3 +538,66 @@ class TestInlineProgress:
         result = asyncio.run(rb.run_benchmark_async(config))
         assert [r["request_index"] for r in result["requests"]] == [0, 1, 2]
         assert result["summary"]["completed"] == 3
+
+
+class TestSendSingleRequestCompletedPath:
+    """Regression: completed-path RequestResult must use the dataclass field
+    name ``time_to_first_token_seconds`` (LP-0MSC95VX1009RBDS).
+
+    The old code passed ``time_to_first_token=`` which raised
+    ``TypeError: RequestResult.__init__() got an unexpected keyword argument``
+    on every completed request, so the F2 baseline sweep recorded all requests
+    as errors even when the proxy returned HTTP 200.
+    """
+
+    def test_completed_response_builds_result(self, monkeypatch):
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        import asyncio
+        import types
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "usage": {"prompt_tokens": 38529, "completion_tokens": 8},
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, **kw):
+                self.resp = FakeResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, json=None, timeout=None):
+                return self.resp
+
+        monkeypatch.setattr(
+            rb, "httpx", types.SimpleNamespace(AsyncClient=FakeAsyncClient)
+        )
+
+        config = rb.BenchmarkConfig(
+            run_type="baseline",
+            model="plan",
+            prompts=["p"],
+            num_requests=1,
+            concurrency=1,
+            timeout=5.0,
+        )
+        result = asyncio.run(rb.send_single_request(
+            FakeAsyncClient(), config, "prompt", 0
+        ))
+        assert result.status == "completed"
+        assert result.prompt_tokens == 38529
+        assert result.completion_tokens == 8
+        assert result.time_to_first_token_seconds is not None
+        d = result.to_dict()
+        assert "time_to_first_token_seconds" in d
+        assert "error" not in d or d["error"] is None

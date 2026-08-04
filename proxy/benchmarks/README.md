@@ -53,7 +53,7 @@ python -m proxy.benchmarks.run_benchmark --candidate --config models.ini
 # Custom parameters
 python -m proxy.benchmarks.run_benchmark --candidate \
     --base-url http://localhost:8000 \
-    --model Qwen3 \
+    --model plan \
     --num-requests 20 \
     --concurrency 4 \
     --max-tokens 256 \
@@ -73,7 +73,7 @@ python -m proxy.benchmarks.run_benchmark --candidate \
 | `--config` | — | Path to `models.ini` (for quantization info) |
 | `--output` | `<run_type>_<timestamp>.json` | Output file path |
 | `--base-url` | `http://localhost:8000` | Proxy base URL |
-| `--model` | `Qwen3` | Model name to benchmark |
+| `--model` | `plan` | Model name to benchmark. Use a configured alias (`plan`, `author`, `code`) — `Qwen3` does NOT resolve to a model config, so requests bypass `proxy_with_fallback` smart routing (no routing clamp, no remote fallback) and are dispatched directly to local. |
 | `--num-requests` | `5` | Number of requests to send |
 | `--concurrency` | `1` | Concurrent request count |
 | `--max-tokens` | `128` | Max tokens per response |
@@ -144,7 +144,7 @@ that the output JSON schema is consumable by `compare_results.py`:
 ```bash
 python -m proxy.benchmarks.run_benchmark --baseline --dry-run \
     --prompts proxy/benchmarks/large_prompts.json \
-    --output /tmp/dry_run_sweep.json --model Qwen3
+    --output /tmp/dry_run_sweep.json --model plan
 ```
 
 Completes in well under 15 minutes (typically <1s). `ctx_size` is read from
@@ -164,7 +164,7 @@ bash proxy/benchmarks/prometheus_snapshot.sh --output /tmp/metrics.txt --interva
 python -m proxy.benchmarks.run_benchmark --baseline \
     --prompts proxy/benchmarks/large_prompts.json \
     --num-requests 4 --max-tokens 128 \
-    --output /tmp/large_prompt_sweep.json --model Qwen3
+    --output /tmp/large_prompt_sweep.json --model plan
 
 # 3. Inspect the summary (prefill throughput = t/s, TTFT, P95):
 python -m proxy.benchmarks.compare_results /tmp/dry_run_sweep.json /tmp/large_prompt_sweep.json

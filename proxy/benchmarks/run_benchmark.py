@@ -313,7 +313,7 @@ async def send_single_request(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             tokens_per_second=round(tps, 2),
-            time_to_first_token=time_to_first_token,
+            time_to_first_token_seconds=time_to_first_token,
         )
 
     except httpx.TimeoutException as e:
