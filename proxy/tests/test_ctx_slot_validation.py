@@ -70,8 +70,9 @@ class TestValidateLocalRoutingConfig:
         assert "6826" in problems[0]
         assert "10000" in problems[0]
 
-    def test_ctx_131072_slots_3_passes(self):
-        """AC3: ctx 131072 with 3 slots → effective = 39594 ≥ 10000."""
+    def test_ctx_131072_slots_3_passes_option_c(self):
+        """Live config (Option C restored per LP-0MSEGPO77005CYCQ F4):
+        ctx 131072 with 3 slots → effective = 39594 ≥ 10000."""
         config = {"server": {
             "local_model_ctx_size": 131072,
             "session_slot_pool_size": 3,
@@ -79,7 +80,8 @@ class TestValidateLocalRoutingConfig:
         assert validate_local_routing_config(config) == []
 
     def test_ctx_262144_slots_4_passes(self):
-        """Current production: ctx 262144 with 4 slots → effective = 61440."""
+        """Rejected candidate 4x65.5K (no longer live, but still a valid
+        combination per validation): ctx 262144 with 4 slots → 61440."""
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,

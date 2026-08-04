@@ -360,10 +360,24 @@ server:
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
-  # ctx-size = 262144). Used to compute the actual per-slot context
+  # ctx-size = 131072). Used to compute the actual per-slot context
   # (ctx_size / active_slots) which clamps the large-context routing
   # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
-  local_model_ctx_size: 262144
+  #
+  # Option C (3x43.7K = 131072/3, pool 3, schedule 3/3) restored per
+  # LP-0MSEGPO77005CYCQ F4: the ctx-size evaluation (LP-0MSAOQTJS000FFVM)
+  # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
+  # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
+  local_model_ctx_size: 131072
+  # Token estimate multiplier (LP-0MSEGPO77005CYCQ F2, AC1).
+  # tiktoken (cl100k) undercounts Qwen3 native tokens ~1.69x for dense prose
+  # (60K fixture: tiktoken est 47680 vs actual ~77060, ratio 1.69). Applied
+  # consistently to BOTH the routing estimate (provider.py) and the slot
+  # persistence estimate (session.py) via _get_token_estimate_multiplier, so
+  # the routing clamp and the persistence cap compare Qwen3-native token
+  # counts. Per-model token_estimate_multiplier overrides this server-level
+  # value for routing. Set to 1.0 to disable.
+  token_estimate_multiplier: 1.69
   # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
   # When a session's estimated context reaches this fraction of the
   # effective per-slot context (ctx_size / slots - 4096 headroom), the
@@ -443,7 +457,8 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  session_slot_pool_size: 4
+  # Option C (3 slots) restored per LP-0MSEGPO77005CYCQ F4.
+  session_slot_pool_size: 3
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
@@ -483,17 +498,25 @@ server:
     drain_minutes: 3
     entries:
       - time: "23:59"
-        slots: 4
+        slots: 3
       - time: "10:00"
-        slots: 4
+        slots: 3
 
   session_slot_timeout_seconds: 3.0
   # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
   # Skip slot save/restore when the request context exceeds this many
   # estimated tokens. llama-server serializes the whole KV cache on save,
-  # so large contexts ReadTimeout and can wedge the GPU. 0 disables the
-  # check (persistence is attempted for every context size).
-  session_slot_max_prompt_tokens: 12288
+  # so large contexts ReadTimeout and can wedge the GPU.
+  #
+  # DYNAMIC DERIVATION (LP-0MSEGPO77005CYCQ F3, amended AC2): when this key
+  # is absent or 0, the cap is derived from the effective per-slot clamp
+  # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
+  # source as the routing clamp (effective_per_slot_threshold in provider.py)
+  # — so it auto-adapts to slot-count/ctx-size changes (e.g. Option C day
+  # 3-slot → 39594; night 8-slot → 12288) instead of freezing at a static
+  # value. Set to a non-zero value to use an explicit static override.
+  # 0 = dynamic derivation (current live config).
+  session_slot_max_prompt_tokens: 0
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
   # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
   # 0 disables the add-on (fixed timeout only).
