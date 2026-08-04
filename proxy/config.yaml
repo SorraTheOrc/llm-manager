@@ -340,6 +340,13 @@ server:
   # prompts which cannot physically fit the KV slot are never routed local
   # (LP-0MSAZXXDY005AWA1). If this configured value is higher than the clamp,
   # the clamp wins.
+  #
+  # CAVEAT (ctx-size eval F2/F3, LP-0MSAOQTJS000FFVM): prompt token estimates
+  # use tiktoken (cl100k), which undercounts Qwen3-native tokens ~1.69x for
+  # dense prose. A prompt can pass this clamp yet exceed the KV slot at decode
+  # time -> llama-server HTTP 400 -> remote fallback. See docs/llama-router.md
+  # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
+  # tokenizer).
   local_large_context_cold_cache_threshold: 60000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
