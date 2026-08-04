@@ -300,6 +300,35 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         return max(1, total_bytes // 1)
 
 
+def _get_token_estimate_multiplier(config: dict, model_config: dict | None = None) -> float:
+    """Server-level ``token_estimate_multiplier`` with per-model override.
+
+    Accounts for tokenizer mismatch between tiktoken (cl100k) and the local
+    model's native tokenizer. The ctx-size evaluation (LP-0MSAOQTJS000FFVM)
+    found cl100k undercounts Qwen3 native tokens ~1.69x for dense prose, so
+    routing clamps and the persistence cap must compare Qwen3-native token
+    counts (LP-0MSEGPO77005CYCQ F2).
+
+    Resolution order:
+    1. Per-model ``token_estimate_multiplier`` on the model entry (wins).
+    2. Server-level ``token_estimate_multiplier`` in the server config.
+    3. 1.0 (no adjustment) when neither is set.
+    """
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    try:
+        server_mult = float(server_cfg.get("token_estimate_multiplier", 1.0) or 1.0)
+    except (ValueError, TypeError):
+        server_mult = 1.0
+    if model_config:
+        try:
+            model_mult = float(model_config.get("token_estimate_multiplier", 1.0) or 1.0)
+        except (ValueError, TypeError):
+            model_mult = 1.0
+        if model_mult != 1.0:
+            return model_mult
+    return server_mult
+
+
 def _get_large_context_threshold(config: dict) -> int:
     """Read the large-context fallback threshold from config.
 
@@ -2448,11 +2477,13 @@ async def proxy_with_fallback(
                     request,
                     body_json,
                 )
-                # Apply model-level token estimate multiplier to account for
-                # tokenizer mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
-                # can differ by ~13-15%).  Configurable via token_estimate_multiplier
-                # on the model entry in config.yaml.
-                _multiplier = float(model_config.get("token_estimate_multiplier", 1.0))
+                # Apply token estimate multiplier to account for tokenizer
+                # mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
+                # undercounts ~1.69x — LP-0MSAOQTJS000FFVM F2/F3). Server-level
+                # token_estimate_multiplier is applied, with a per-model
+                # token_estimate_multiplier override winning (F2
+                # LP-0MSEGPO77005CYCQ).
+                _multiplier = _get_token_estimate_multiplier(config, model_config)
                 if _multiplier != 1.0:
                     _estimated_tokens = int(_estimated_tokens * _multiplier)
                 # Compute once for reuse in logs and reason detection

@@ -522,12 +522,28 @@ def _record_slot_failure(slot_id: int) -> None:
     _slot_failure_state[slot_id] = (count + 1, time.time())
 
 
-def _estimate_slot_prompt_tokens(body_json: dict | None) -> int:
-    """Estimate request context tokens for slot persistence decisions."""
+def _estimate_slot_prompt_tokens(
+    body_json: dict | None,
+    server_config: dict | None = None,
+) -> int:
+    """Estimate request context tokens for slot persistence decisions.
+
+    Applies the server-level ``token_estimate_multiplier`` (same source as
+    the routing estimate, see ``_get_token_estimate_multiplier``) so the
+    persistence cap compares Qwen3-native token counts consistently with the
+    routing clamp (LP-0MSEGPO77005CYCQ F2).
+    """
     if not isinstance(body_json, dict):
         return 0
-    from proxy.provider import _estimate_prompt_tokens_for_routing
-    return _estimate_prompt_tokens_for_routing(body_json) or 0
+    from proxy.provider import (
+        _estimate_prompt_tokens_for_routing,
+        _get_token_estimate_multiplier,
+    )
+    estimate = _estimate_prompt_tokens_for_routing(body_json) or 0
+    multiplier = _get_token_estimate_multiplier(server_config or {})
+    if multiplier != 1.0:
+        estimate = int(estimate * multiplier)
+    return estimate
 
 
 def _slot_in_failure_cooldown(slot_id: int, server_config: dict) -> bool:
@@ -771,9 +787,24 @@ def _build_slot_context(
 
     # 1) Context-size gating: skip persistence for oversized contexts.
     max_prompt_tokens = int(server_config.get("session_slot_max_prompt_tokens", 0) or 0)
+    # Dynamic derivation (LP-0MSEGPO77005CYCQ F3): when the static config
+    # key is absent/0, derive the cap from the effective per-slot clamp — the
+    # SAME source as the routing clamp (local_model_ctx_size // active_slots
+    # - output headroom) — so it auto-adapts to slot-count/ctx-size changes
+    # instead of freezing at a static value.
+    if max_prompt_tokens <= 0:
+        from proxy.provider import (
+            _get_active_local_slots,
+            _get_local_model_ctx_size,
+            effective_per_slot_threshold,
+        )
+        max_prompt_tokens = effective_per_slot_threshold(
+            _get_local_model_ctx_size(server_config),
+            _get_active_local_slots(server_config),
+        )
     per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)
     need_estimate = max_prompt_tokens > 0 or per_token > 0
-    estimated = _estimate_slot_prompt_tokens(body_json) if need_estimate else 0
+    estimated = _estimate_slot_prompt_tokens(body_json, server_config) if need_estimate else 0
     if max_prompt_tokens > 0 and estimated > max_prompt_tokens:
         logger.info(
             "slot persistence skipped session=%s estimated_tokens=%d max_prompt_tokens=%d reason=context_too_large",
