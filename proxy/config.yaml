@@ -188,12 +188,12 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
+      - name: opencode-mimo-v2.5-free
         type: remote
         provider: opencode
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
+        model: mimo-v2.5-free
         forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
