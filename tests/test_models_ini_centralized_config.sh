@@ -271,7 +271,7 @@ INI
     cleanup_tmp
 }
 
-test_global_ngl_defaults_to_99() {
+test_global_ngl_defaults_to_80() {
     echo "Test: Production models.ini [global] ngl matches running server"
 
     local result
@@ -468,7 +468,7 @@ test_script_exists
 test_per_model_ctx_size_present
 test_per_model_cache_type_present
 test_global_ngl_from_models_ini
-test_global_ngl_defaults_to_99
+test_global_ngl_defaults_to_80
 test_global_ngl_zero_disables_gpu
 test_get_quantization
 test_get_quantization_no_suffix
