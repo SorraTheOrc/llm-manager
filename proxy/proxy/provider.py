@@ -1473,6 +1473,15 @@ def _is_local_lease_active_response(response) -> bool:
         return False
 
 
+def _has_next_provider(model_config: dict, attempted_provider_names: set[str]) -> bool:
+    """True if at least one more provider remains untried (and not in cooldown).
+
+    Used to gate pre-content streaming pre-flight: re-route is only worthwhile
+    when the chain has a remaining provider to fall back to (LP-0MSETOTWY000SU0Z).
+    """
+    return _resolve_provider_with_exclusions(model_config, attempted_provider_names) is not None
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
@@ -1582,6 +1591,173 @@ def _record_attempt(attempts: list[dict[str, Any]], **fields) -> None:
     diagnostic payload (status code, body snippet, cooldown, etc.).
     """
     attempts.append(dict(fields))
+
+
+class StreamingPreContentError(Exception):
+    """Raised when a remote streaming response fails before delivering any
+    content-bearing chunk (stall-exhausted, empty response, or stream error).
+
+    The fallback chain catches this, marks the provider unavailable (Tier-2
+    cooldown), and routes to the next provider in the chain
+    (LP-0MSETOTWY000SU0Z / proxy/docs/error-analysis-2026-08-03.md
+    Recommendation 1).
+    """
+
+    def __init__(self, provider_name: str, reason: str):
+        self.provider_name = provider_name
+        self.reason = reason
+        super().__init__(f"pre-content stream failure for {provider_name}: {reason}")
+
+
+def _classify_stream_chunk(chunk: bytes) -> tuple[bool, bool, bool]:
+    """Classify one raw SSE chunk for pre-content recovery pre-flight.
+
+    Returns ``(has_content, is_terminal_error, is_done)`` where:
+    - ``has_content``: the chunk carries a content-bearing delta (non-empty
+      content, tool_calls, or reasoning_content — mirrors proxy_remote's
+      ``_delta_has_content`` semantics, LP-0MS8XAPXT009W3CL).
+    - ``is_terminal_error``: a choice carries ``finish_reason: "error"``.
+    - ``is_done``: a ``[DONE]`` marker or ``finish_reason: "stop"``.
+
+    Keep-alive comments (``: keep-alive``) and non-``data:`` lines are
+    ignored, so a stalled-but-alive stream yields (False, False, False) until
+    either content or a terminal event arrives.
+    """
+    has_content = False
+    is_terminal_error = False
+    is_done = False
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        return False, False, False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            is_done = True
+            continue
+        try:
+            j = json.loads(payload)
+        except Exception:
+            continue
+        for choice in j.get("choices", []):
+            if not isinstance(choice, dict):
+                continue
+            fr = choice.get("finish_reason")
+            if fr == "error":
+                is_terminal_error = True
+            elif fr == "stop":
+                is_done = True
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            c = delta.get("content")
+            if isinstance(c, str) and c.strip():
+                has_content = True
+            tc = delta.get("tool_calls")
+            if isinstance(tc, list) and tc:
+                has_content = True
+            rc = delta.get("reasoning_content")
+            if isinstance(rc, str) and rc.strip():
+                has_content = True
+    return has_content, is_terminal_error, is_done
+
+
+async def _preflight_streaming_response(
+    response: Response,
+    request,
+    provider_name: str,
+) -> Response:
+    """Pre-consume a 2xx streaming response up to the first content-bearing
+    chunk or a terminal event, so a pre-content failure can re-route.
+
+    Reads the response body iterator chunk-by-chunk (buffering what it sees)
+    until one of:
+    - a content-bearing chunk arrives → returns a wrapped response that
+      replays the buffered chunks then continues the original iterator;
+    - a terminal ``finish_reason: error`` event arrives with zero content →
+      raises :class:`StreamingPreContentError`;
+    - the stream ends with zero content (empty response) → raises
+      :class:`StreamingPreContentError`;
+    - a stream exception occurs with zero content → raises
+      :class:`StreamingPreContentError`.
+
+    ``[DONE]`` / ``finish_reason: stop`` markers are consumed but do NOT
+    terminate the pre-flight: the upstream generator retries empty responses
+    internally (LP-0MRF77A0E0026B9T) and only yields a terminal error event
+    once those retries are exhausted, so the pre-flight keeps consuming until
+    content or that terminal error.
+
+    Args:
+        response: The candidate response from the remote provider.
+        request: The client request (for disconnect checks).
+        provider_name: Config entry name, used for the error signal.
+
+    Returns:
+        The (possibly wrapped) response to stream to the client.
+    """
+    if not _is_streaming_response(response) or int(getattr(response, "status_code", 0) or 0) >= 400:
+        return response
+
+    original = response.body_iterator
+    buffered: list[bytes] = []
+    saw_content = False
+    disconnected = False
+    try:
+        while True:
+            try:
+                if await request.is_disconnected():
+                    disconnected = True
+                    break
+            except Exception:
+                pass
+            try:
+                chunk = await original.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as exc:
+                if not saw_content:
+                    raise StreamingPreContentError(
+                        provider_name,
+                        f"stream_exception:{type(exc).__name__}",
+                    ) from exc
+                break
+            buffered.append(chunk)
+            has_content, is_terminal_error, _is_done = _classify_stream_chunk(chunk)
+            if has_content:
+                saw_content = True
+                break
+            if is_terminal_error:
+                raise StreamingPreContentError(provider_name, "finish_reason:error")
+            # [DONE] / finish_reason: stop with zero content is NOT terminal
+            # here — the generator retries empty responses internally and only
+            # yields a terminal error event once those retries are exhausted
+            # (LP-0MRF77A0E0026B9T). Keep consuming.
+    except GeneratorExit:
+        raise
+
+    if disconnected:
+        # Client is gone — hand the (partially consumed) response back as-is;
+        # re-routing to another provider would be wasteful.
+        return response
+
+    if not saw_content:
+        raise StreamingPreContentError(provider_name, "empty_response")
+
+    async def _replay_and_continue():
+        for c in buffered:
+            yield c
+        async for c in original:
+            yield c
+
+    return StreamingResponse(
+        _replay_and_continue(),
+        media_type=response.media_type,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+    )
 
 
 def _handle_streaming_success(
@@ -1963,6 +2139,31 @@ async def proxy_with_remote_fallback(
                     continue
 
             response = await ptr(request, path, provider_cfg)
+
+            # Pre-flight remote streaming responses: detect a pre-content
+            # finish_reason: error / empty / stream-exception so the fallback
+            # chain re-routes to the next provider instead of surfacing a
+            # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
+            if provider_type == "remote" and _has_next_provider(
+                model_config, attempted_provider_names
+            ):
+                try:
+                    response = await _preflight_streaming_response(
+                        response, request, provider_name
+                    )
+                except StreamingPreContentError as exc:
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_error",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
 
             # Shared primitive: handle streaming success
             stream_result = _handle_streaming_success(
@@ -2376,6 +2577,31 @@ async def proxy_with_fallback(
                         continue
 
                 response = await ptr_remote(request, path, provider_cfg)
+
+            # Pre-flight remote streaming responses: detect a pre-content
+            # finish_reason: error / empty / stream-exception so the fallback
+            # chain re-routes to the next provider instead of surfacing a
+            # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
+            if provider_type == "remote" and _has_next_provider(
+                model_config, attempted_provider_names
+            ):
+                try:
+                    response = await _preflight_streaming_response(
+                        response, request, provider_name
+                    )
+                except StreamingPreContentError as exc:
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_error",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
 
             # Shared primitive: handle streaming success
             stream_result = _handle_streaming_success(

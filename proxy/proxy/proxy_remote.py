@@ -485,6 +485,76 @@ async def proxy_to_remote(
         )
 
 
+def _build_stream_error_event(
+    provider: str | None = None,
+    model: str | None = None,
+    entry: str | None = None,
+    error_type: str = "stream_error",
+    message: str = "Upstream stream error",
+    suggested_action: str | None = None,
+    session_id: str | None = None,
+) -> dict:
+    """Build an enriched synthetic ``finish_reason: error`` SSE event.
+
+    Replaces the previously bare ``{"delta": {}, "finish_reason": "error"}``
+    payload (LP-0MSETOTWY000SU0Z / proxy/docs/error-analysis-2026-08-03.md
+    Recommendation 2). The event keeps ``finish_reason: error`` and an empty
+    ``delta`` (backward compatible with existing clients) and adds a
+    structured ``error`` object (type/message/provider/model/entry/
+    suggested_action/session_id) so the operator/agent can act instead of
+    seeing an unspecified error.
+
+    Args:
+        provider: The provider brand (e.g. ``opencode-go``) that failed.
+        model: The model id (e.g. ``deepseek-v4-flash``).
+        entry: The config entry name (e.g. ``opencode-go-2-deepseek``).
+        error_type: Failure class (stall_exhausted, empty_response,
+            stream_exception, stall_after_content, ...).
+        message: Human-readable one-liner with the underlying cause.
+        suggested_action: Static remediation guidance for this failure type.
+        session_id: The proxy session id, when available.
+
+    Returns:
+        The SSE event dict (one ``choices`` entry with finish_reason: error
+        and an ``error`` payload).
+    """
+    error_payload: dict[str, Any] = {
+        "type": error_type,
+        "message": message,
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+    }
+    if entry:
+        error_payload["entry"] = entry
+    if suggested_action:
+        error_payload["suggested_action"] = suggested_action
+    if session_id:
+        error_payload["session_id"] = session_id
+    return {
+        "choices": [
+            {
+                "delta": {},
+                "finish_reason": "error",
+                "index": 0,
+                "error": error_payload,
+            }
+        ]
+    }
+
+
+def _stream_error_event_bytes(
+    provider: str | None = None,
+    model: str | None = None,
+    entry: str | None = None,
+    error_type: str = "stream_error",
+    message: str = "Upstream stream error",
+    suggested_action: str | None = None,
+    session_id: str | None = None,
+) -> bytes:
+    """Serialize :func:`_build_stream_error_event` to an SSE ``data:`` chunk."""
+    return f"data: {json.dumps(_build_stream_error_event(provider=provider, model=model, entry=entry, error_type=error_type, message=message, suggested_action=suggested_action, session_id=session_id))}\n\n".encode()
+
+
 def _delta_has_content(delta: dict) -> bool:
     """True if a stream delta carries meaningful output.
 
@@ -769,11 +839,15 @@ async def _handle_remote_streaming(
                         except Exception:
                             pass
                         # Yield error and exit
-                        _final_error_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "error", "index": 0}
-                            ]
-                        }
+                        _final_error_obj = _build_stream_error_event(
+                            provider=provider,
+                            model=model_name,
+                            entry=entry,
+                            error_type="empty_response",
+                            message="Retry returned a non-streaming/HTTP error after an empty upstream response",
+                            suggested_action="Upstream returned no content; check upstream status or route manually",
+                            session_id=session_id,
+                        )
                         _final_error_bytes = (
                             f"data: {json.dumps(_final_error_obj)}\n\n"
                         ).encode()
@@ -816,11 +890,15 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                _final_error_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="empty_response",
+                    message=f"Empty upstream response after {_empty_retry_count} retries",
+                    suggested_action="Upstream returned no content; check upstream status or route manually",
+                    session_id=session_id,
+                )
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
                 ).encode()
@@ -858,11 +936,15 @@ async def _handle_remote_streaming(
                 except Exception:
                     pass
 
-                _final_error_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="stall_exhausted",
+                    message=f"Upstream stalled repeatedly ({_retry_count} retries exhausted; idle timeout {upstream_idle_timeout_seconds:.0f}s)",
+                    suggested_action="Provider placed in cooldown; the next provider in the chain will be used",
+                    session_id=session_id,
+                )
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
                 ).encode()
@@ -1045,11 +1127,15 @@ async def _handle_remote_streaming(
                     # so the caller (provider.py fallback chain) can route to
                     # the next provider.
                     if not _has_content:
-                        _final_empty_error_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "error", "index": 0}
-                            ]
-                        }
+                        _final_empty_error_obj = _build_stream_error_event(
+                            provider=provider,
+                            model=model_name,
+                            entry=entry,
+                            error_type="empty_response",
+                            message="Upstream stream completed with no content",
+                            suggested_action="Upstream returned no content; check upstream status or route manually",
+                            session_id=session_id,
+                        )
                         _final_empty_error_bytes = (
                             f"data: {json.dumps(_final_empty_error_obj)}\n\n"
                         ).encode()
@@ -1087,11 +1173,15 @@ async def _handle_remote_streaming(
                     # If no content (and retries exhausted/exhausted above), yield
                     # synthetic error so the fallback chain can activate.
                     if not _has_content:
-                        _final_empty_error_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "error", "index": 0}
-                            ]
-                        }
+                        _final_empty_error_obj = _build_stream_error_event(
+                            provider=provider,
+                            model=model_name,
+                            entry=entry,
+                            error_type="empty_response",
+                            message="Upstream closed without delivering content",
+                            suggested_action="Upstream returned no content; check upstream status or route manually",
+                            session_id=session_id,
+                        )
                         _final_empty_error_bytes = (
                             f"data: {json.dumps(_final_empty_error_obj)}\n\n"
                         ).encode()
@@ -1152,11 +1242,15 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                _final_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="stream_exception",
+                    message=f"Proxy stream error ({_error_type}); upstream may be unhealthy",
+                    suggested_action="Check proxy/upstream logs; the next provider in the chain may be used",
+                    session_id=session_id,
+                )
                 _final_bytes = (
                     f"data: {json.dumps(_final_obj)}\n\n"
                 ).encode()
@@ -1211,11 +1305,15 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                _final_error_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="stall_after_content",
+                    message=f"Upstream idle timeout after content delivered ({upstream_idle_timeout_seconds:.0f}s no data)",
+                    suggested_action="Retry the request with full context, or route to a healthier provider",
+                    session_id=session_id,
+                )
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
                 ).encode()

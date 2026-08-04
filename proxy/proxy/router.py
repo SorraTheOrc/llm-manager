@@ -1310,14 +1310,22 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 pass
                             # Synthesize a final SSE event so the client receives a
                             # proper finish_reason marker even on stream error.
-                            final_obj = {
-                                "choices": [
-                                    {"delta": {}, "finish_reason": "error", "index": 0}
-                                ]
-                            }
-                            final_bytes = (
-                                f"data: {json.dumps(final_obj)}\n\n"
-                            ).encode()
+                            final_obj = _build_stream_error_event(
+                                provider="local",
+                                model=model_name,
+                                error_type="stream_exception",
+                                message=f"Local stream error ({_error_type}); llama-server may be unhealthy",
+                                suggested_action="Check llama-server logs; the request may be retried",
+                                session_id=session_id,
+                            )
+                            final_bytes = _stream_error_event_bytes(
+                                provider="local",
+                                model=model_name,
+                                error_type="stream_exception",
+                                message=f"Local stream error ({_error_type}); llama-server may be unhealthy",
+                                suggested_action="Check llama-server logs; the request may be retried",
+                                session_id=session_id,
+                            )
                             yield final_bytes
                             log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                             # Emit [DONE] marker after synthetic error finish event
@@ -1621,6 +1629,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
 # Backward-compatibility re-exports for tests
 from .proxy_remote import (  # noqa: E402, F401
+    _build_stream_error_event,
+    _stream_error_event_bytes,
     proxy_to_remote,
 )
 from .router_helpers import (  # noqa: E402, F811
