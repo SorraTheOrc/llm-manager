@@ -112,6 +112,8 @@ class BenchmarkConfig:
     max_tokens: int = DEFAULT_MAX_TOKENS
     timeout: float = DEFAULT_TIMEOUT
     snapshot_script: str | None = None
+    proxy_restart_time: str | None = None
+    llama_ready_time: str | None = None
 
     def to_dict(self):
         return {
@@ -126,6 +128,8 @@ class BenchmarkConfig:
             "max_tokens": self.max_tokens,
             "timeout": self.timeout,
             "snapshot_script": self.snapshot_script,
+            "proxy_restart_time": self.proxy_restart_time,
+            "llama_ready_time": self.llama_ready_time,
         }
 
 
@@ -535,6 +539,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path to prometheus_snapshot.sh script (optional)",
     )
+    parser.add_argument(
+        "--proxy-restart-time",
+        type=str,
+        default=None,
+        help="ISO timestamp of proxy start (recorded in JSON config for measurement windows)",
+    )
+    parser.add_argument(
+        "--llama-ready-time",
+        type=str,
+        default=None,
+        help="ISO timestamp of llama-server ready (recorded in JSON config for measurement windows)",
+    )
 
     args = parser.parse_args(argv)
     return args
@@ -589,6 +605,8 @@ def main(argv: list[str] | None = None) -> None:
         max_tokens=args.max_tokens,
         timeout=args.timeout,
         snapshot_script=args.snapshot_script,
+        proxy_restart_time=args.proxy_restart_time,
+        llama_ready_time=args.llama_ready_time,
     )
 
     print(f"Running benchmark ({run_type})...")

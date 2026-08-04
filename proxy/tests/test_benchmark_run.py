@@ -353,6 +353,31 @@ class TestDryRun:
         assert data["summary"]["dry_run"] is True
         assert data["summary"]["total_requests"] == 0
 
+    def test_dry_run_records_restart_timestamps(self, tmp_path):
+        """--proxy-restart-time/--llama-ready-time are recorded in JSON config
+        so measurement windows are reproducible (F2 methodology)."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        out = tmp_path / "dry_run_ts.json"
+        prompts_file = tmp_path / "prompts.json"
+        prompts_file.write_text(json.dumps(["short"]))
+
+        rb.main([
+            "--baseline",
+            "--dry-run",
+            "--prompts", str(prompts_file),
+            "--output", str(out),
+            "--model", "Qwen3",
+            "--proxy-restart-time", "2026-08-04T02:44:48Z",
+            "--llama-ready-time", "2026-08-04T02:45:27Z",
+        ])
+
+        data = json.loads(out.read_text())
+        assert data["config"]["proxy_restart_time"] == "2026-08-04T02:44:48Z"
+        assert data["config"]["llama_ready_time"] == "2026-08-04T02:45:27Z"
+
     def test_dry_run_accepts_dict_prompts(self, tmp_path):
         """--prompts with a dict (named fixtures) is flattened to a list."""
         rb = _import_run_benchmark()
