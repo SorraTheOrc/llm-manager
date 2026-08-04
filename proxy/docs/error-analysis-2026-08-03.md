@@ -51,20 +51,37 @@ errors). Each one stops the agent session with an unspecified error.
 
 ### 2. Pre-content stall, retries exhausted — ~3 of 127 (minor)
 
-**Evidence:** 3 `Upstream stall: max retries exhausted` warning lines, all
-`opencode-go/deepseek-v4-flash`.
+**Evidence (evidence.txt `stream_finish_error` section, session/provider/model):**
+
+```
+2026-08-03 … - WARNING - Upstream stall: max retries exhausted … session=019fc… provider=opencode-go model=deepseek-v4-flash
+```
+
+3 `Upstream stall: max retries exhausted` warning lines, all
+`opencode-go/deepseek-v4-flash` (session+entry evidence in
+`proxy/docs/error-analysis-2026-08-03/errors.csv` rows with `error_detail`
+`stall_exhausted`).
 
 **Root cause (confidence: MEDIUM):** Tier-1 stall retries (`_retry_count >=
 max_retries`, default 3; `proxy_remote.py` L863) exhausted before any content
 was delivered. The upstream repeatedly stalled on connect/read.
 
+**Related work items:** the content-aware retry boundary
+(LP-0MS9FR9LG002AJ4C) and upstream cooldown handling
+(LP-0MRGU0I91006ODFD) directly target this window; recovery-first
+recommendation LP-0MSDP2PDB004GV86 quantifies the avoidance (see below).
+
 ### 3. Local stream exceptions — 6 (NameError ×3, RemoteProtocolError ×3)
 
-**Evidence:**
+**Evidence (evidence.txt `stream_error` section — full 6 lines):**
 
 ```
-2026-08-03 00:00:56,367 - WARNING - Stream error: session=019fc48a-... provider=local model=Qwen3 error=NameError
-2026-08-03 17:01:35,360 - WARNING - Stream error: ... provider=local model=Qwen3 error=RemoteProtocolError
+2026-08-03 00:00:56,367 - WARNING - Stream error: session=019fc48a-… provider=local model=Qwen3 error=NameError
+2026-08-03 12:47:13,378 - WARNING - Stream error: session=019fc754-… provider=local model=Qwen3 error=NameError
+2026-08-03 12:54:59,822 - WARNING - Stream error: session=f04af558-… provider=local model=Qwen3 error=NameError
+2026-08-03 17:01:35,360 - WARNING - Stream error: session=019fc83a-… provider=local model=Qwen3 error=RemoteProtocolError
+2026-08-03 17:01:35,363 - WARNING - Stream error: session=019fc831-… provider=local model=Qwen3 error=RemoteProtocolError
+2026-08-03 17:01:35,368 - WARNING - Stream error: session=019fc312-… provider=local model=Qwen3 error=RemoteProtocolError
 ```
 
 **Root cause (confidence: MEDIUM):** local llama-server stream exceptions
@@ -72,7 +89,12 @@ was delivered. The upstream repeatedly stalled on connect/read.
 path). `RemoteProtocolError` at 17:01:35 ×3 in three sessions suggests a
 llama-server connection drop (possibly restart or slot churn); `NameError` at
 00:00/12:47/12:54 is a proxy-side code bug worth investigating
-(see follow-up recommendation R4).
+(see follow-up recommendation R4 / LP-0MSDRRPV0001TCLX).
+
+**Related work items:** the local ctx-size increase
+(LP-0MSAOQTJS000FFVM) addresses the slot pressure that degrades local
+availability; follow-up tuning work item LP-0MSDRRPV0001TCLX tracks the
+`NameError` investigation.
 
 ### 4. Upstream HTTP errors — 112 (handled by fallback, not client-visible)
 
@@ -102,10 +124,25 @@ llama-server connection drop (possibly restart or slot churn); `NameError` at
 | `ConnectTimeout` | 13 | `connect_failures` |
 | `ReadError` | 5 | `read_failures` |
 
+**Evidence (evidence.txt `backend_retry` section — sample lines):**
+
+```
+2026-08-03 00:01:24,113 - WARNING - backend_retry path=v1/chat/completions stream=True attempt=4/8 delay=1.818s signal=timeout_failures error=ReadTimeout
+2026-08-03 00:15:59,668 - WARNING - backend_retry path=v1/chat/completions stream=True attempt=1/8 delay=0.208s signal=timeout_failures error=ReadTimeout
+2026-08-03 00:25:05,545 - WARNING - backend_retry path=v1/chat/completions stream=True attempt=1/8 delay=0.251s signal=timeout_failures error=ReadTimeout
+```
+
+Full 93 lines in `proxy/docs/error-analysis-2026-08-03/evidence.txt`.
+
 **Root cause (confidence: MEDIUM):** upstream connect/read timeouts during
 the Tier-2 retry backoff (`backend_retry ... attempt=N/8`). Transient unless
 clustered; correlated with the opencode-go stalls above (upstream unresponsive
 for extended periods).
+
+**Related work items:** the upstream cooldown / retry-accounting work item
+LP-0MRGU0I91006ODFD governs the Tier-2 backoff; the content-aware retry
+boundary LP-0MS9FR9LG002AJ4C stops retrying once content is delivered (the
+dominant stall case).
 
 ### 6. `slot_save failed` — 17, all `ReadTimeout/ReadTimeout`
 
