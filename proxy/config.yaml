@@ -558,8 +558,13 @@ server:
   # (120s) used for Qwen3 reasoning pauses (LP-0MS14PM7J003XPS8).
   # Since retries now only occur while zero content has been delivered, a
   # genuinely dead upstream fails fast once content starts flowing.
-  # Default: 120 seconds.
-  upstream_idle_timeout_seconds: 120
+  # Raised from 120 to 240s (LP-0MSF5I7XN009ENWQ / LP-0MSF1PUM90099ZSW F4):
+  # opencode-go/deepseek-v4-flash frequently pause >120s mid-generation while
+  # still alive, so the lower bound produced false stalls (~31% of requests).
+  # Trade-off: true failures are detected more slowly (up to 240s of silence).
+  # The stall-gap distribution analysis (LP-0MSF5IAXE005BG33) will refine this.
+  # Default: 240 seconds.
+  upstream_idle_timeout_seconds: 240
 
   # Cross-request stall circuit breaker (LP-0MRFEXXVC001RYKB).
   # Tracks stall frequency per provider within a sliding time window.

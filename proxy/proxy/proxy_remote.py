@@ -433,11 +433,12 @@ async def proxy_to_remote(
         )
 
     # Read upstream idle timeout from config (LP-0MRE52D3C001KP1H)
-    # Default raised 60 -> 120 to tolerate long reasoning pauses on remote
-    # upstreams (LP-0MS9FR9LG002AJ4C). Keep in sync with the fallback in
-    # _handle_remote_streaming and proxy/config.yaml.
+    # Default raised 60 -> 120 -> 240 to tolerate long reasoning pauses on
+    # remote upstreams (LP-0MS9FR9LG002AJ4C; LP-0MSF5I7XN009ENWQ raises the
+    # default to 240s for LP-0MSF1PUM90099ZSW F4). Keep in sync with the
+    # fallback in _handle_remote_streaming and proxy/config.yaml.
     _upstream_idle_timeout = float(
-        server_config.get("upstream_idle_timeout_seconds", 120) or 120
+        server_config.get("upstream_idle_timeout_seconds", 240) or 240
     )
     # Read upstream retry connect timeout from config (LP-0MRE8FYKV008WOTB)
     _upstream_retry_connect_timeout = float(
@@ -615,11 +616,11 @@ async def _handle_remote_streaming(
         try:
             upstream_idle_timeout_seconds = float(
                 _srv().config.get("server", {}).get(
-                    "upstream_idle_timeout_seconds", 120
-                ) or 120
+                    "upstream_idle_timeout_seconds", 240
+                ) or 240
             )
         except Exception:
-            upstream_idle_timeout_seconds = 120.0
+            upstream_idle_timeout_seconds = 240.0
 
     # Resolve upstream_retry_connect_timeout_seconds from parameter or config
     if upstream_retry_connect_timeout_seconds is None:

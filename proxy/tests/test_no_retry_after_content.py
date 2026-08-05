@@ -9,7 +9,7 @@ re-sent the whole multi-hundred-KB request up to 3 more times, and finally
 surfaced a synthetic `finish_reason: error`.
 
 Fix (this work item):
-1. `upstream_idle_timeout_seconds` raised 30 -> 120 (config + code default) so
+1. `upstream_idle_timeout_seconds` raised 30 -> 120 -> 240 (config + code default) so
    long-but-alive reasoning pauses no longer misfire stall detection.
 2. Tier-1 retries only occur while ZERO content-bearing chunks have been
    delivered. Once any content has been sent to the client, a stall (idle
@@ -21,7 +21,7 @@ Tests cover:
 (a) idle-timeout tuning behavior (long chunk gaps tolerated),
 (b) no-retry-after-content policy,
 (c) retry-before-content still works,
-(d) config defaults (code-level fallback is 120),
+(d) config defaults (code-level fallback is 240),
 (e) content-detection edge cases (reasoning_content / tool_calls count as
     content, so a stall after those also does not retry),
 (f) Tier-3 circuit breaker still records after-content stalls.
@@ -418,9 +418,9 @@ async def test_raised_idle_timeout_tolerates_long_chunk_gap(mock_request):
     treated as a stall — the stream completes normally on a single connection.
 
     Simulates the real-world 60-90s reasoning pauses on large prompts
-    proportionally: the default upstream idle timeout is raised to 120s (from
-    30s), so gaps up to ~90s are tolerated. Here a 0.4s gap with a 1.0s idle
-    timeout (same 40% / 75% ratio) must not kill or retry the stream.
+    proportionally: the default upstream idle timeout is raised to 240s (from
+    120s), so gaps up to ~180s are tolerated. Here a 0.4s gap with a 1.0s idle
+    timeout (same ratio) must not kill or retry the stream.
     """
     chunks = [
         _content_chunk("Hello"),
@@ -471,17 +471,18 @@ async def test_raised_idle_timeout_tolerates_long_chunk_gap(mock_request):
 
 
 # ===================================================================
-# (d) Config defaults: code-level fallback is 120
+# (d) Config defaults: code-level fallback is 240
 # ===================================================================
 
 
 @pytest.mark.asyncio
-async def test_config_default_idle_timeout_is_120(mock_request):
+async def test_config_default_idle_timeout_is_240(mock_request):
     """When the config key is absent, the code-level fallback default for
-    upstream_idle_timeout_seconds is 120 (matching the config value).
+    upstream_idle_timeout_seconds is 240 (matching the config value).
 
     AC: Config defaults — the fallback used by _handle_remote_streaming when
-    the key is missing is 120 seconds.
+    the key is missing is 240 seconds (LP-0MSF5I7XN009ENWQ raises the default
+    from 120 to 240 for LP-0MSF1PUM90099ZSW F4).
     """
     real_wait_for = asyncio.wait_for
     captured_timeouts = []
@@ -525,11 +526,11 @@ async def test_config_default_idle_timeout_is_120(mock_request):
     assert isinstance(result, StreamingResponse)
     assert len(collected) >= 1, "Stream should complete"
     assert captured_timeouts, "wait_for should have been called for chunk reads"
-    # The chunk-read wait_for uses the resolved fallback default (120.0).
-    # Nothing else in this flow uses 120, so its presence uniquely identifies
+    # The chunk-read wait_for uses the resolved fallback default (240.0).
+    # Nothing else in this flow uses 240, so its presence uniquely identifies
     # the per-chunk idle timeout.
-    assert 120.0 in captured_timeouts, (
-        f"Expected fallback idle timeout 120.0 in {captured_timeouts}"
+    assert 240.0 in captured_timeouts, (
+        f"Expected fallback idle timeout 240.0 in {captured_timeouts}"
     )
 
 
