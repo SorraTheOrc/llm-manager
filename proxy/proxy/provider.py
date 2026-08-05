@@ -799,7 +799,8 @@ def resolve_provider(
     - Is not the `failed_provider` (if specified)
     - Does not share the failed provider's failure domain (same endpoint /
       brand — LP-0MSG45I8Q0020N1F)
-    - Is not in cooldown (if marked unavailable)
+    - Is not in cooldown (entry name OR provider brand —
+      LP-0MSG45LOO007K236)
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
@@ -838,7 +839,15 @@ def resolve_provider(
                 failed_domain,
             )
             continue
-        if _is_provider_unavailable(name):
+        cooldown_key = _entry_cooldown_key(provider_cfg)
+        if cooldown_key is not None:
+            remaining = _provider_cooldown_remaining(cooldown_key)
+            logger.info(
+                "Skipping provider=%s: %s in cooldown (%ds remaining)",
+                name,
+                cooldown_key,
+                remaining,
+            )
             continue
         if not _is_within_allowed_window(provider_cfg):
             logger.info(
@@ -956,6 +965,31 @@ def _reset_provider_failure_count(provider_name: str) -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _provider_cooldown_remaining(provider_name: str) -> int:
+    """Return the remaining cooldown seconds for a provider key.
+
+    Returns 0 when the provider is not in cooldown or its cooldown has
+    expired.  Expired entries are cleaned up lazily.
+
+    A cooldown with less than one second remaining still reports ``1`` so
+    entries are not treated as expired early (the exponential-backoff base
+    cooldown is 1.0s).
+
+    This check is global — it reads from the shared module-level dict, so
+    any session calling this function sees the same cooldown state. There is
+    no per-session isolation of cooldown state.
+    """
+    expiry = _provider_unavailable_until.get(provider_name)
+    if expiry is None:
+        return 0
+    remaining = expiry - time.time()
+    if remaining <= 0:
+        # Cooldown expired — clean up entry
+        del _provider_unavailable_until[provider_name]
+        return 0
+    return int(remaining) if remaining >= 1 else 1
+
+
 def _is_provider_unavailable(provider_name: str) -> bool:
     """Check if a provider is currently in cooldown.
 
@@ -966,14 +1000,29 @@ def _is_provider_unavailable(provider_name: str) -> bool:
     any session calling this function sees the same cooldown state. There is
     no per-session isolation of cooldown state.
     """
-    expiry = _provider_unavailable_until.get(provider_name)
-    if expiry is None:
-        return False
-    if time.time() >= expiry:
-        # Cooldown expired — clean up entry
-        del _provider_unavailable_until[provider_name]
-        return False
-    return True
+    return _provider_cooldown_remaining(provider_name) > 0
+
+
+def _entry_cooldown_key(provider_cfg: dict) -> str | None:
+    """Return the cooldown key under which a provider entry is unavailable.
+
+    Checks BOTH the entry name and the provider brand (LP-0MSG45LOO007K236):
+    the Tier-3 stall circuit breaker marks the provider BRAND (e.g.
+    ``opencode-go``) unavailable via ``mark_provider_unavailable()``, but the
+    fallback resolvers previously only checked the ENTRY name
+    (``opencode-go-2-deepseek``).  The brand key was never consulted, so the
+    breaker cooldown never blocked the entries pointing at the broken gateway.
+
+    Returns the cooldown key (entry name or brand) that is currently cooling
+    down, or ``None`` if the entry is eligible.
+    """
+    name = provider_cfg.get("name", "")
+    if _is_provider_unavailable(name):
+        return name
+    brand = provider_cfg.get("provider")
+    if brand and _is_provider_unavailable(brand):
+        return brand
+    return None
 
 
 def _parse_window(window_str: str) -> tuple[int, int] | None:
@@ -1628,7 +1677,15 @@ def _resolve_provider_with_exclusions(
                 _failure_domain_key(provider_cfg),
             )
             continue
-        if _is_provider_unavailable(name):
+        cooldown_key = _entry_cooldown_key(provider_cfg)
+        if cooldown_key is not None:
+            remaining = _provider_cooldown_remaining(cooldown_key)
+            logger.info(
+                "Skipping provider=%s: %s in cooldown (%ds remaining)",
+                name,
+                cooldown_key,
+                remaining,
+            )
             continue
         if not _is_within_allowed_window(provider_cfg):
             logger.info(
@@ -2274,15 +2331,24 @@ def _resolve_reasoning_content_promotion(
 
 def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
     """Log diagnostic details about which providers are in cooldown and return
-    the mapping of provider name to remaining cooldown seconds.
+    the mapping of provider key to remaining cooldown seconds.
+
+    Includes BOTH entry-name and provider-brand cooldown keys so a Tier-3
+    stall circuit breaker trip (which marks the brand unavailable) is visible
+    when all providers are exhausted (LP-0MSG45LOO007K236).
     """
     unavailable: dict[str, int] = {}
     try:
-        provider_names = [p.get("name") for p in model_config.get("providers", []) if isinstance(p, dict)]
-        for n in provider_names:
-            exp = _provider_unavailable_until.get(n)
-            if exp:
-                unavailable[n] = int(max(0, exp - time.time()))
+        providers = model_config.get("providers", []) or []
+        for p in providers:
+            if not isinstance(p, dict):
+                continue
+            for key in (p.get("name"), p.get("provider")):
+                if not key:
+                    continue
+                remaining = _provider_cooldown_remaining(key)
+                if remaining > 0:
+                    unavailable[key] = remaining
         logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
     except Exception:
         pass
