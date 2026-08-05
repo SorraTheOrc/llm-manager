@@ -18,6 +18,7 @@ import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException, Response
@@ -796,6 +797,8 @@ def resolve_provider(
     Iterates through the model's ordered `providers` list and returns the
     first provider that:
     - Is not the `failed_provider` (if specified)
+    - Does not share the failed provider's failure domain (same endpoint /
+      brand — LP-0MSG45I8Q0020N1F)
     - Is not in cooldown (if marked unavailable)
 
     Args:
@@ -812,9 +815,28 @@ def resolve_provider(
     if not providers:
         return None
 
+    # When a provider failed, also skip any OTHER entry sharing its failure
+    # domain (normalized endpoint, or brand for local providers) so the chain
+    # hops to a genuinely different gateway rather than retrying the same one
+    # through a second API key (LP-0MSG45I8Q0020N1F).
+    failed_domain: str | None = None
+    if failed_provider:
+        for candidate in providers:
+            if isinstance(candidate, dict) and candidate.get("name") == failed_provider:
+                failed_domain = _failure_domain_key(candidate)
+                break
+
     for provider_cfg in providers:
         name = provider_cfg.get("name", "")
         if failed_provider and name == failed_provider:
+            continue
+        if failed_domain is not None and _failure_domain_key(provider_cfg) == failed_domain:
+            logger.info(
+                "Skipping provider=%s: same failure domain as %s (%s)",
+                name,
+                failed_provider,
+                failed_domain,
+            )
             continue
         if _is_provider_unavailable(name):
             continue
@@ -1502,27 +1524,109 @@ def _is_local_lease_active_response(response) -> bool:
         return False
 
 
-def _has_next_provider(model_config: dict, attempted_provider_names: set[str]) -> bool:
+def _has_next_provider(
+    model_config: dict,
+    attempted_provider_names: set[str],
+    excluded_domains: set[str] | None = None,
+) -> bool:
     """True if at least one more provider remains untried (and not in cooldown).
 
     Used to gate pre-content streaming pre-flight: re-route is only worthwhile
     when the chain has a remaining provider to fall back to (LP-0MSETOTWY000SU0Z).
+    Accepts already-failed failure domains so same-gateway siblings are not
+    counted as a usable fallback (LP-0MSG45I8Q0020N1F).
     """
-    return _resolve_provider_with_exclusions(model_config, attempted_provider_names) is not None
+    return (
+        _resolve_provider_with_exclusions(
+            model_config,
+            attempted_provider_names,
+            excluded_domains,
+        )
+        is not None
+    )
+
+
+def _failure_domain_key(provider_cfg: dict) -> str:
+    """Return a canonical failure-domain key for a provider entry.
+
+    Remote entries key on the normalized ``endpoint`` URL: scheme and host
+    lowercased, default ports dropped, trailing slash and fragment stripped,
+    path case and query strings preserved. Local / no-endpoint entries fall
+    back to the ``provider`` brand, then to the entry name (last resort so
+    entries without either never share a key).
+
+    Entries that share a failure-domain key are treated as ONE failure domain:
+    a stall/terminal error on one entry excludes the whole domain from the
+    fallback chain / mid-stream re-route (LP-0MSG45I8Q0020N1F).
+    """
+    endpoint = provider_cfg.get("endpoint")
+    if endpoint:
+        normalized = _normalize_endpoint_for_failure_domain(str(endpoint))
+        if normalized:
+            return normalized
+    brand = provider_cfg.get("provider")
+    if brand:
+        return str(brand)
+    return str(provider_cfg.get("name") or "unknown")
+
+
+def _normalize_endpoint_for_failure_domain(endpoint: str) -> str | None:
+    """Normalize an endpoint URL into a canonical failure-domain key.
+
+    Lowercases scheme+host, drops default ports (80/443), strips a trailing
+    slash and any fragment, preserves path case and query strings. Returns
+    ``None`` when the URL cannot be parsed.
+    """
+    try:
+        parsed = urlsplit(endpoint)
+    except Exception:
+        return None
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.lower()
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    port = parsed.port
+    if port and port == default_port:
+        netloc = host
+    elif port:
+        netloc = f"{host}:{port}"
+    else:
+        netloc = host
+    path = parsed.path.rstrip("/")
+    # Keep query strings; drop the fragment.
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
+    excluded_domains: set[str] | None = None,
 ) -> dict | None:
-    """Resolve next available provider while excluding names tried this request."""
+    """Resolve next available provider while excluding names tried this request
+    and any entry sharing an already-failed failure domain.
+
+    ``excluded_domains`` holds failure-domain keys (see ``_failure_domain_key``)
+    that already stalled / terminally failed during THIS request, so the chain
+    skips straight past same-gateway API-key siblings (LP-0MSG45I8Q0020N1F).
+    """
     providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
 
+    excluded_domains = excluded_domains or set()
+
     for provider_cfg in providers:
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
+            continue
+        if _failure_domain_key(provider_cfg) in excluded_domains:
+            logger.info(
+                "Skipping provider=%s: same failure domain as an already-failed "
+                "entry (domain=%s)",
+                name,
+                _failure_domain_key(provider_cfg),
+            )
             continue
         if _is_provider_unavailable(name):
             continue
@@ -2223,13 +2327,20 @@ async def proxy_with_remote_fallback(
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
+    # Failure-domain keys already failed/stalled THIS request — same-gateway
+    # API-key siblings are skipped so re-route hops to a different gateway
+    # (LP-0MSG45I8Q0020N1F). Per-request only; cross-request quarantine stays
+    # with the Tier-3 stall circuit breaker (LP-0MSG45LOO007K236).
+    attempted_domains: set[str] = set()
 
     # Preserve first model-loading response so single-provider models
     # do not collapse into generic "All providers exhausted".
     first_model_loading_response: Response | None = None
 
     while True:
-        provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
+        provider_cfg = _resolve_provider_with_exclusions(
+            model_config, attempted_provider_names, attempted_domains,
+        )
         if provider_cfg is None:
             break
 
@@ -2268,7 +2379,7 @@ async def proxy_with_remote_fallback(
             # chain re-routes to the next provider instead of surfacing a
             # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
             if provider_type == "remote" and _has_next_provider(
-                model_config, attempted_provider_names
+                model_config, attempted_provider_names, attempted_domains,
             ):
                 try:
                     response = await _preflight_streaming_response(
@@ -2276,6 +2387,7 @@ async def proxy_with_remote_fallback(
                     )
                 except StreamingPreContentError as exc:
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -2294,6 +2406,11 @@ async def proxy_with_remote_fallback(
                     # request to the next provider; the buffered intermediate
                     # output is discarded (never reaches the client).
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
+                    # entry's failure domain is skipped for the rest of this
+                    # request so the re-route hops straight to a different
+                    # gateway instead of retrying via another API-key sibling.
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -2354,6 +2471,7 @@ async def proxy_with_remote_fallback(
                     fallback_reason = "free_usage_limit"
                     prev_provider = provider_name
                     mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -2371,6 +2489,7 @@ async def proxy_with_remote_fallback(
                     response, provider_name, provider_type,
                     cooldown_seconds, attempts, body_text,
                 )
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
                 if response.status_code != 429:
@@ -2403,6 +2522,7 @@ async def proxy_with_remote_fallback(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text,
                     )
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -2425,6 +2545,7 @@ async def proxy_with_remote_fallback(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -2538,9 +2659,16 @@ async def proxy_with_fallback(
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
+    # Failure-domain keys already failed/stalled THIS request — same-gateway
+    # API-key siblings are skipped so re-route hops to a different gateway
+    # (LP-0MSG45I8Q0020N1F). Per-request only; cross-request quarantine stays
+    # with the Tier-3 stall circuit breaker (LP-0MSG45LOO007K236).
+    attempted_domains: set[str] = set()
 
     while True:
-        provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
+        provider_cfg = _resolve_provider_with_exclusions(
+            model_config, attempted_provider_names, attempted_domains,
+        )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Local lease-active is expected contention, not provider failure.
             # For transparent fallback, allow trying the next remote provider
@@ -2551,6 +2679,8 @@ async def proxy_with_fallback(
                     continue
                 candidate_name = candidate.get("name", "")
                 if candidate_name in attempted_provider_names:
+                    continue
+                if _failure_domain_key(candidate) in attempted_domains:
                     continue
                 if candidate.get("type") != "remote":
                     continue
@@ -2742,7 +2872,7 @@ async def proxy_with_fallback(
             # chain re-routes to the next provider instead of surfacing a
             # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
             if provider_type == "remote" and _has_next_provider(
-                model_config, attempted_provider_names
+                model_config, attempted_provider_names, attempted_domains,
             ):
                 try:
                     response = await _preflight_streaming_response(
@@ -2750,6 +2880,7 @@ async def proxy_with_fallback(
                     )
                 except StreamingPreContentError as exc:
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -2768,6 +2899,11 @@ async def proxy_with_fallback(
                     # request to the next provider; the buffered intermediate
                     # output is discarded (never reaches the client).
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
+                    # entry's failure domain is skipped for the rest of this
+                    # request so the re-route hops straight to a different
+                    # gateway instead of retrying via another API-key sibling.
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -2898,6 +3034,7 @@ async def proxy_with_fallback(
                             continue
 
                         mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "slot_exhaustion"
                         prev_provider = provider_name
                         total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
@@ -2912,6 +3049,7 @@ async def proxy_with_fallback(
                         continue
                 else:
                     mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "slot_exhaustion"
                     prev_provider = provider_name
                     total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
@@ -3006,6 +3144,7 @@ async def proxy_with_fallback(
                         fallback_reason = "free_usage_limit"
                         prev_provider = provider_name
                         mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                         _record_attempt(
                             attempts,
                             provider=provider_name,
@@ -3023,6 +3162,7 @@ async def proxy_with_fallback(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text,
                     )
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
                     if response.status_code != 429:
@@ -3097,6 +3237,7 @@ async def proxy_with_fallback(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text,
                             )
+                            attempted_domains.add(_failure_domain_key(provider_cfg))
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
                             all_slot_exhaustion = False
@@ -3107,6 +3248,7 @@ async def proxy_with_fallback(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text,
                         )
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "empty_response"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
@@ -3129,6 +3271,7 @@ async def proxy_with_fallback(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -3211,6 +3354,7 @@ async def proxy_with_fallback(
                         media_type="application/json",
                     )
                 mark_provider_unavailable(provider_name, cooldown_seconds)
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTPException {exc.status_code}"
                 prev_provider = provider_name
                 _record_attempt(

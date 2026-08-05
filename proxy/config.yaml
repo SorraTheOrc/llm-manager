@@ -13,6 +13,19 @@
 #                        X-Resolved-Model header; falls back to name)
 #   For local:  llama_model
 #
+# Failure-domain grouping (LP-0MSG45I8Q0020N1F):
+#   Provider entries that share the same normalized endpoint form a SINGLE
+#   failure domain and are treated as one unit during mid-stream re-route /
+#   fallback resolution. When one entry of a gateway stalls or terminally
+#   fails, the chain skips every other entry on the same endpoint for the
+#   remainder of that request, hopping straight to the first entry of a
+#   different gateway. Entries on different endpoints are never grouped
+#   (e.g. https://opencode.ai/zen and https://opencode.ai/zen/go are distinct
+#   failure domains). Local / no-endpoint entries key on the `provider` brand
+#   (falling back to the entry name). Per-entry cooldowns and the ordered
+#   chain are unchanged; this grouping is per-request only (cross-request
+#   quarantine remains with the Tier-3 stall circuit breaker).
+#
 # Timed access (optional, both local and remote):
 #   available_times - List of "HH:MM-HH:MM" windows (24-hour, **UTC**)
 #                     during which this provider may be used. A provider
