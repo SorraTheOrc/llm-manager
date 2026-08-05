@@ -16,7 +16,9 @@ data-backed recommendations — including an **error taxonomy** and quantified
 
 - An operator wants a quick daily read on whether the local models
   (llama-server via the proxy) are used well, how much traffic fell back to
-  remote providers, why, and what to change.
+  remote providers, why, and what to change. The **Local model utilization**
+  section answers "how much of the time was the local model busy?" (busy %,
+  idle %, streams, concurrency, hourly/day-night profile).
 - Investigating slot counts (6 daytime / 8 nighttime), context limits, or
   routing thresholds: the report's fallback-reason breakdown and context
   pressure stats show whether configuration changes are warranted.
@@ -78,11 +80,14 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
   dispatch denials, context sizes — each with **Total / Day / Night**
   columns), fallback-reason and routing-skip breakdowns, per-model
   breakdown, **Error analysis** (when the window has error events),
-  **Decode speed** and **Prompt eval speed** sections (median / p90 / p10
-  tok/s from llama-server eval-timing lines, split Total / Day / Night),
-  and highlighted recommendations. Every day/night count carries its share
-  of the metric's total (e.g. `285 (74.4%)`), and each recommendation's
-  evidence cites the total plus the day/night split.
+  **Local model utilization** (busy time %, idle time, streams served, avg
+  stream duration, total compute, avg/peak concurrency, hourly busy profile,
+  day/night split — when the window has local traffic), **Decode speed** and
+  **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
+  eval-timing lines, split Total / Day / Night), and highlighted
+  recommendations. Every day/night count carries its share of the metric's
+  total (e.g. `285 (74.4%)`), and each recommendation's evidence cites the
+  total plus the day/night split.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
@@ -105,19 +110,28 @@ local completion tokens ÷ local active span; empty when not derivable).
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
    lines (payloads in logs are truncated and never used for sizes).
-4. **Day/night bucketing** — derived from the `slot_schedule` in
+4. **Local model utilization (busy time)** — local `Stream started` /
+   `Stream finished` events are collected across a 1h margin beyond the
+   window (so streams crossing the window boundary pair correctly), paired
+   per session (FIFO), clipped back to the window, and merged. Busy time is
+   the union of active intervals (at least one slot generating), total
+   compute is the sum of clipped stream durations (slot-seconds), and peak
+   concurrency comes from a sweep over interval endpoints. Busy seconds are
+   attributed to hours and to day/night periods (slot schedule) by
+   splitting at hour and period boundaries.
+5. **Day/night bucketing** — derived from the `slot_schedule` in
    `proxy/config.yaml` (10:00 → 6 slots day, 23:59 → 8 slots night), keyed by
    session start time; nothing is hardcoded.
-5. **Recommendations** — rule-based heuristics, each citing the data that
+6. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
-6. **Error taxonomy** — error events (`Stream finished: reason=error`,
+7. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
    rendered into the report's **Error analysis** section plus
    `errors.csv`/`errors.json`. Remediation recommendations (recovery-first,
    informative-error, ctx-size pressure, 429 cooldown) are generated from
    these events and link to the relevant work items.
-7. **Decode/prompt-eval speed** — llama-server eval-timing lines
+8. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
    (discovered per file from the `name=Qwen3 on port <port>` spawn line;
@@ -151,6 +165,18 @@ local completion tokens ÷ local active span; empty when not derivable).
     (credentials, rate limits) — not slot-related.
 - **Context pressure**: sessions whose max context approaches
   `local_model_ctx_size / slots` can force `large_context_bypass`.
+- **Local model utilization**: busy time is the share of the window with at
+  least one local slot generating. A low busy % with high fallback volume
+  means the router is diverting requests before they reach local (see
+  fallback reasons), not that local is underprovisioned. `warm_cache_bypass`
+  is the largest lever: despite the name it fires when the *estimated
+  context* exceeds the effective warm-cache threshold (the per-slot clamp,
+  `local_model_ctx_size // slots - headroom`, inflated by
+  `token_estimate_multiplier`), so large-context sessions never reach local.
+  Concurrency bursts beyond `session_slot_pool_size` show as
+  `local_concurrency_limit` / `local_lease_active` fallbacks. Note the
+  slots-vs-context trade-off: more slots shrink per-slot context and *raise*
+  bypass volume, so do not add slots without a matching ctx-size increase.
 - **Day vs night**: a large fallback-rate gap between buckets suggests the
   slot schedule under-serves one period.
 - **Error analysis** (see the **Error analysis** section and `errors.csv`):
@@ -190,6 +216,12 @@ lines (`proxy.log` and `llama-server.log`).
   drain window; those are expected, not errors.
 - A session is included when it has at least one `Stream started` inside the
   window; the day/night bucket is keyed by its first in-window stream.
+- Busy-time pairing reads local `Stream started`/`Stream finished` events
+  within a 1h margin of the window (see `BUSY_WINDOW_MARGIN`); a stream that
+  started more than 1h before the window start is not paired, and streams
+  whose start has no logged finish (aborted/still running) are counted in
+  `unfinished_streams` and excluded — busy time is a conservative lower
+  bound.
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
 - llama-server.log eval-timing lines carry no timestamps, so the speed

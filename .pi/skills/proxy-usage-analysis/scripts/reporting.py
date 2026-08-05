@@ -309,6 +309,8 @@ def build_report(
     _append_speed_section(ap, "Decode speed", "decode", speed)
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
 
+    _append_busy_section(ap, summary, schedule)
+
     ap("")
     ap("## Recommendations")
     ap("")
@@ -392,6 +394,73 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
         "fallback, ctx-size pressure, upstream 429 cooldown)."
     )
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as ``Hh MMm`` (or ``Ns`` when under a minute)."""
+    seconds = round(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _busy_cell(busy: float, window: float) -> str:
+    return f"{_fmt_duration(busy)} ({busy / window * 100:.1f}%)" if window else f"{_fmt_duration(busy)}"
+
+
+def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
+    """Append the ``## Local model utilization`` section to the report.
+
+    Covers busy/idle time over the window (union of active local streams,
+    clipped to the window), total compute (slot-seconds), concurrency, and
+    the day/night + hourly busy profile. The section is omitted when the
+    window has no local traffic.
+    """
+    if summary.busy is None:
+        return
+    b = summary.busy
+    ap("")
+    ap("## Local model utilization")
+    ap("")
+    ap("Busy = at least one local slot actively generating (local streams paired "
+       "per session, clipped to the window, overlapping streams merged).")
+    ap("")
+    ap("| Metric | Total | Day | Night |")
+    ap("|---|---|---|---|")
+    day_win = b.day_window_seconds or 0.0
+    night_win = b.night_window_seconds or 0.0
+    ap(f"| Busy time | {_busy_cell(b.busy_seconds, b.window_seconds)} | "
+       f"{_busy_cell(b.day_busy_seconds, day_win)} | {_busy_cell(b.night_busy_seconds, night_win)} |")
+    ap(f"| Idle time | {_busy_cell(b.idle_seconds, b.window_seconds)} | "
+       f"{_busy_cell(day_win - b.day_busy_seconds, day_win)} | "
+       f"{_busy_cell(night_win - b.night_busy_seconds, night_win)} |")
+    ap(f"| Streams served | {b.streams} | - | - |")
+    ap(f"| Avg stream duration | {b.avg_stream_duration:.1f}s | - | - |")
+    ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
+    ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
+    ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
+    if b.hourly_busy:
+        ap("")
+        ap("Busy seconds by hour:")
+        ap("")
+        ap("| Hour | Busy |")
+        ap("|---|---|")
+        for hour, seconds in b.hourly_busy:
+            ap(f"| {hour:02d}:00-{hour + 1:02d}:00 | {_fmt_duration(seconds)} |")
+    if b.unfinished_streams:
+        ap("")
+        ap(f"_Note: {b.unfinished_streams} local stream(s) started without a logged "
+           "`Stream finished` in the available logs (aborted or still running); "
+           "their compute time is unknown, so busy time is a conservative lower bound._")
+    ap("")
+    ap("Method: streams are paired per session (FIFO) across the full log with a "
+       f"1h margin beyond the window ({log_parser.BUSY_WINDOW_MARGIN}), then clipped "
+       "to the window so boundary-crossing streams are counted exactly; day/night "
+       "split follows the slot schedule.")
 
 
 def _pct(part: int, total: int) -> float:
@@ -539,7 +608,10 @@ def run_analysis(
 
     files = log_parser.discover_log_files(log_dir, window_start)
     events = chain.from_iterable(
-        log_parser.iter_events(f, window_start, window_end) for f in files
+        log_parser.iter_events(
+            f, window_start, window_end, margin=log_parser.BUSY_WINDOW_MARGIN
+        )
+        for f in files
     )
     summary = aggregation.aggregate(events, window_start, window_end, schedule)
 
@@ -582,8 +654,33 @@ def summary_to_json(summary: AnalysisResult) -> dict:
         "errors": len(summary.error_events),
         "errors_by_type": dict(summary.error_counts.most_common()),
         "recommendations": len(recommendations.generate_recommendations(summary, None)),
+        "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
+    }
+
+
+def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
+    """JSON-friendly local-model utilization summary (None when no local traffic)."""
+    if busy is None:
+        return None
+    return {
+        "window_seconds": busy.window_seconds,
+        "busy_seconds": busy.busy_seconds,
+        "busy_pct": round(busy.busy_pct, 1),
+        "idle_seconds": round(busy.idle_seconds, 1),
+        "idle_pct": round(busy.idle_pct, 1),
+        "total_compute_seconds": busy.total_compute_seconds,
+        "streams": busy.streams,
+        "avg_stream_duration_seconds": busy.avg_stream_duration,
+        "peak_concurrency": busy.peak_concurrency,
+        "avg_concurrency": busy.avg_concurrency,
+        "unfinished_streams": busy.unfinished_streams,
+        "day_busy_seconds": busy.day_busy_seconds,
+        "night_busy_seconds": busy.night_busy_seconds,
+        "day_window_seconds": busy.day_window_seconds,
+        "night_window_seconds": busy.night_window_seconds,
+        "hourly_busy": busy.hourly_busy,
     }
 
 

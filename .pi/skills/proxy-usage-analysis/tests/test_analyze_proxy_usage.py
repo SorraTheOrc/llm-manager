@@ -853,6 +853,157 @@ class TestConfigLoader:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Local model utilization (busy-time) stats
+# ---------------------------------------------------------------------------
+
+
+def _local_event(kind: str, ts: datetime, session: str = "s1") -> log_parser.LogEvent:
+    """A local stream start/finish event with the fields busy-time needs."""
+    return log_parser.LogEvent(
+        kind,
+        ts,
+        provider="local",
+        model="Qwen3",
+        session=session,
+    )
+
+
+class TestBusyStats:
+    def test_sequential_streams_single_session(self):
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 15), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 25), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.streams == 2
+        assert busy.busy_seconds == 10.0
+        assert busy.total_compute_seconds == 10.0
+        assert busy.peak_concurrency == 1
+        assert busy.avg_concurrency == 1.0
+        assert busy.avg_stream_duration == 5.0
+        assert busy.unfinished_streams == 0
+        assert busy.busy_pct == pytest.approx(10.0 / 3600 * 100)
+
+    def test_overlapping_streams_two_sessions(self):
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        # Union is 14:00:00-14:00:20; the two streams overlap for 5s.
+        assert busy.busy_seconds == 20.0
+        assert busy.total_compute_seconds == 25.0
+        assert busy.peak_concurrency == 2
+        assert busy.avg_concurrency == pytest.approx(25.0 / 20.0)
+
+    def test_streams_crossing_window_boundaries_are_clipped(self):
+        events = [
+            # Started before the window, finished inside.
+            _local_event("stream_started", datetime(2026, 8, 2, 13, 59, 50), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            # Started inside, finished after the window.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 59, 55), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 15, 0, 5), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.busy_seconds == 10.0  # 5s clipped at the start + 5s clipped at the end
+        assert busy.streams == 2
+        assert busy.peak_concurrency == 1
+
+    def test_unfinished_streams_excluded_with_caveat_count(self):
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 30, 0), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.streams == 1
+        assert busy.busy_seconds == 10.0
+        assert busy.unfinished_streams == 1
+
+    def test_no_local_traffic_returns_none(self):
+        events = [
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 0), provider="opencode-go"),
+            log_parser.LogEvent("stream_finished", datetime(2026, 8, 2, 14, 0, 5), provider="opencode-go"),
+        ]
+        assert aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule()) is None
+
+    def test_remote_streams_do_not_count_towards_busy(self):
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 20), provider="opencode-go"),
+            log_parser.LogEvent("stream_finished", datetime(2026, 8, 2, 14, 0, 25), provider="opencode-go"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.streams == 1
+        assert busy.busy_seconds == 10.0
+
+    def test_hourly_and_day_night_attribution(self):
+        # Window 09:00-11:00; schedule 10:00 -> 6 slots (day), else 8 (night).
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 9, 30, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 9, 30, 10), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 15), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, start, end, _schedule())
+        assert busy is not None
+        assert busy.busy_seconds == 25.0
+        assert busy.night_busy_seconds == 10.0
+        assert busy.day_busy_seconds == 15.0
+        assert busy.night_window_seconds == 3600.0
+        assert busy.day_window_seconds == 3600.0
+        hourly = dict(busy.hourly_busy)
+        assert hourly[9] == 10.0
+        assert hourly[10] == 15.0
+
+    def test_aggregate_populates_busy(self):
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream started: provider=local model=Qwen3 session=s2 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert res.busy is not None
+        assert res.busy.streams == 2
+        assert res.busy.busy_seconds == 20.0
+        assert res.busy.peak_concurrency == 2
+
+
+class TestIterEventsMargin:
+    def test_margin_yields_events_just_outside_window(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_file = log_dir / "proxy.log"
+        log_file.write_text(
+            "2026-08-02 13:59:50,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]\n"
+            "2026-08-02 15:00:05,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]\n"
+        )
+        # Without a margin both lines fall outside the window.
+        events = list(log_parser.iter_events(log_file, WINDOW_START, WINDOW_END))
+        assert len(events) == 0
+        # With a margin both boundary-crossing events are yielded.
+        events = list(
+            log_parser.iter_events(log_file, WINDOW_START, WINDOW_END, margin=timedelta(minutes=1))
+        )
+        assert len(events) == 2
+        assert {e.kind for e in events} == {"stream_started", "stream_finished"}
+
+
 class TestEndToEnd:
     def _write_logs(self, tmp_path: Path) -> Path:
         log_dir = tmp_path / "logs"
@@ -923,8 +1074,12 @@ class TestEndToEnd:
 
         # Report contains the key sections.
         md = report_md.read_text()
-        for section in ["# Proxy Usage Analysis", "## Recommendations", "local_concurrency_limit"]:
+        for section in ["# Proxy Usage Analysis", "## Recommendations", "local_concurrency_limit", "## Local model utilization"]:
             assert section in md
+        # Busy-time section reflects the fixture streams: S1 2s (14:00:10-12)
+        # + S2 5s (14:01:00-05) = 7s busy over a 1h window (0.2%).
+        util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "7s" in util and "0.2%" in util
         # No llama-server logs in this fixture dir → speed sections render empty.
         assert "## Decode speed" in md
         assert "## Prompt eval speed" in md
@@ -970,6 +1125,12 @@ class TestEndToEnd:
         assert isinstance(data, dict)
         assert data["sessions"] == 2
         assert data["fallback_events"] >= 1
+        # Local-model utilization stats are exposed.
+        busy = data["local_busy"]
+        assert busy["streams"] == 2
+        assert busy["busy_seconds"] == 7.0
+        assert busy["busy_pct"] == pytest.approx(7.0 / 3600 * 100, abs=0.01)
+        assert busy["peak_concurrency"] == 1
         # Round-trips through json.
         json.dumps(data)
 

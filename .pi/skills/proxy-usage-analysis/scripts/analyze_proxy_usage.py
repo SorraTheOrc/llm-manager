@@ -104,13 +104,21 @@ def main(argv: list[str] | None = None) -> int:
             f"(median {decode.get('median_tok_s', '-')} tok/s)"
         )
         errors = data.get("errors") or 0
+        busy = data.get("local_busy")
+        busy_summary = ""
+        if busy:
+            busy_summary = (
+                f", local model busy {busy['busy_pct']:.1f}% "
+                f"({busy['busy_seconds']:.0f}s of {busy['window_seconds']:.0f}s "
+                f"window, peak concurrency {busy['peak_concurrency']})"
+            )
         print(
             f"Analyzed {len(run.files)} log file(s) from {args.log_dir}: "
             f"{data['sessions']} sessions, {data['total_requests']} requests "
             f"(local {data['local_requests']} / remote {data['remote_requests']}), "
             f"{data['fallback_events']} fallback events "
             f"({data['fallback_rate'] * 100:.1f}%), "
-            f"{errors} error event(s){decode_summary}."
+            f"{errors} error event(s){decode_summary}{busy_summary}."
         )
         print(f"Outputs written to {args.output_dir}: "
               f"daytime_sessions.csv, nighttime_sessions.csv, errors.csv, report.md")

@@ -90,6 +90,8 @@ class AnalysisResult:
     error_events: List[LogEvent] = field(default_factory=list)
     # llama-server decode/prompt-eval speed stats (set by reporting.run_analysis).
     speed: object | None = None
+    # Local-model utilization (busy time etc.); None when no local traffic.
+    busy: BusyStats | None = None
 
     @property
     def total_requests(self) -> int:
@@ -120,6 +122,49 @@ class AnalysisResult:
     def error_provider_model_counts(self) -> Counter:
         """Error events grouped by (error type, provider, model)."""
         return Counter((e.kind, e.provider, e.model) for e in self.error_events)
+
+
+@dataclass
+class BusyStats:
+    """Local-model utilization over the analysis window.
+
+    "Busy" means at least one local slot is actively generating: streams are
+    paired per session (FIFO across the full event stream, not just the
+    window), each pair is clipped to ``[window_start, window_end]``, and the
+    clipped intervals are merged so overlapping streams do not double-count.
+
+    ``total_compute_seconds`` is the sum of all clipped stream durations
+    (slot-seconds, i.e. the integral of concurrency); ``busy_seconds`` is the
+    union of active intervals. ``avg_concurrency`` = total / busy.
+    """
+
+    window_seconds: float
+    busy_seconds: float
+    total_compute_seconds: float
+    streams: int
+    peak_concurrency: int
+    avg_concurrency: float
+    avg_stream_duration: float
+    unfinished_streams: int
+    # Busy seconds attributed to day/night periods (from the slot schedule)
+    # and to each hour of the window (hour-of-day -> seconds).
+    day_busy_seconds: float
+    night_busy_seconds: float
+    day_window_seconds: float
+    night_window_seconds: float
+    hourly_busy: list[tuple[int, float]]
+
+    @property
+    def busy_pct(self) -> float:
+        return (self.busy_seconds / self.window_seconds * 100.0) if self.window_seconds else 0.0
+
+    @property
+    def idle_seconds(self) -> float:
+        return max(0.0, self.window_seconds - self.busy_seconds)
+
+    @property
+    def idle_pct(self) -> float:
+        return (self.idle_seconds / self.window_seconds * 100.0) if self.window_seconds else 0.0
 
 
 class _SessionBuilder:
@@ -266,6 +311,145 @@ def _build_session(
     )
 
 
+def _segment_boundaries(
+    start: datetime,
+    end: datetime,
+    schedule: bucketing.SlotSchedule,
+) -> list[datetime]:
+    """All timestamps inside ``(start, end)`` where the hour-of-day or the
+    day/night period (slot schedule) changes. Used to attribute busy seconds
+    to hours and day/night buckets exactly."""
+    boundaries = {start, end}
+    t = start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    while t < end:
+        boundaries.add(t)
+        t += timedelta(hours=1)
+    for period in schedule.periods:
+        for minutes in (period.start_minutes, period.end_minutes):
+            day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+            while day <= end:
+                cand = day + timedelta(minutes=minutes)
+                if start < cand < end:
+                    boundaries.add(cand)
+                day += timedelta(days=1)
+    return sorted(boundaries)
+
+
+
+
+
+def _attribute_interval(
+    interval_start: datetime,
+    interval_end: datetime,
+    schedule: bucketing.SlotSchedule,
+    day_busy: dict[str, float],
+    hourly: dict[int, float],
+) -> None:
+    """Add one merged busy interval's seconds to the day/night and hourly
+    buckets it overlaps, splitting at hour and period boundaries."""
+    b = _segment_boundaries(interval_start, interval_end, schedule)
+    for lo, hi in zip(b, b[1:]):
+        if hi <= lo:
+            continue
+        mid = lo + (hi - lo) / 2
+        label = schedule.period_for(mid).label if schedule.periods else "day"
+        day_busy[label] = day_busy.get(label, 0.0) + (hi - lo).total_seconds()
+        hourly[mid.hour] = hourly.get(mid.hour, 0.0) + (hi - lo).total_seconds()
+
+
+def compute_busy_stats(
+    local_events: Iterable[LogEvent],
+    window_start: datetime,
+    window_end: datetime,
+    schedule: bucketing.SlotSchedule,
+) -> BusyStats | None:
+    """Compute local-model utilization from local stream events.
+
+    ``local_events`` may span a margin beyond the window (see
+    ``log_parser.iter_events(margin=...)``); each stream is clipped back to
+    ``[window_start, window_end]``. Streams whose start has no paired finish
+    are counted in ``unfinished_streams`` (their compute time is unknown, so
+    busy time is a conservative lower bound). Returns ``None`` when there is
+    no local traffic in the window.
+    """
+    started: dict[str, list[datetime]] = {}
+    finished: dict[str, list[datetime]] = {}
+    for ev in local_events:
+        if ev.session is None:
+            continue
+        bucket = started if ev.kind == "stream_started" else finished
+        bucket.setdefault(ev.session, []).append(ev.ts)
+
+    intervals: list[tuple[datetime, datetime]] = []
+    unfinished = 0
+    for session_id, starts in started.items():
+        ss = sorted(starts)
+        ff = sorted(finished.get(session_id, []))
+        for b, e in zip(ss, ff):
+            cb, ce = max(b, window_start), min(e, window_end)
+            if ce > cb:
+                intervals.append((cb, ce))
+        unfinished += max(0, len(ss) - len(ff))
+    if not intervals:
+        return None
+
+    intervals.sort()
+    merged: list[list[datetime]] = []
+    for cb, ce in intervals:
+        if merged and cb <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], ce)
+        else:
+            merged.append([cb, ce])
+
+    busy_seconds = sum((e - s).total_seconds() for s, e in merged)
+    total_compute = sum((e - s).total_seconds() for s, e in intervals)
+    window_seconds = (window_end - window_start).total_seconds()
+
+    # Peak concurrency via a sweep over interval endpoints.
+    sweep: list[tuple[datetime, int]] = []
+    for s, e in intervals:
+        sweep.append((s, +1))
+        sweep.append((e, -1))
+    sweep.sort(key=lambda x: (x[0], x[1]))
+    cur = peak = 0
+    for _t, delta in sweep:
+        cur += delta
+        peak = max(peak, cur)
+
+    day_busy: dict[str, float] = {}
+    hourly: dict[int, float] = {}
+    for s, e in merged:
+        _attribute_interval(s, e, schedule, day_busy, hourly)
+
+    day_window = night_window = 0.0
+    bounds = _segment_boundaries(window_start, window_end, schedule)
+    for lo, hi in zip(bounds, bounds[1:]):
+        if hi <= lo:
+            continue
+        mid = lo + (hi - lo) / 2
+        label = schedule.period_for(mid).label if schedule.periods else "day"
+        if label == "night":
+            night_window += (hi - lo).total_seconds()
+        else:
+            day_window += (hi - lo).total_seconds()
+
+    return BusyStats(
+        window_seconds=window_seconds,
+        busy_seconds=round(busy_seconds, 1),
+        total_compute_seconds=round(total_compute, 1),
+        streams=len(intervals),
+        peak_concurrency=peak,
+        avg_concurrency=round(total_compute / busy_seconds, 2) if busy_seconds else 0.0,
+        avg_stream_duration=round(total_compute / len(intervals), 1) if intervals else 0.0,
+        unfinished_streams=unfinished,
+        day_busy_seconds=round(day_busy.get("day", 0.0), 1),
+        night_busy_seconds=round(day_busy.get("night", 0.0), 1),
+        day_window_seconds=round(day_window, 1),
+        night_window_seconds=round(night_window, 1),
+        hourly_busy=sorted(hourly.items()),
+    )
+
+
 def aggregate(
     events: Iterable[LogEvent],
     window_start: datetime,
@@ -287,11 +471,17 @@ def aggregate(
     unattributed = 0
     lines_skipped = 0
     total_lines = 0
+    # Local stream events across the (margin-widened) event stream for the
+    # busy-time calculation; ``iter_events`` yields a margin beyond the window
+    # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
+    local_stream_events: List[LogEvent] = []
 
     for ev in events:
-        total_lines += 1
+        if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
+            local_stream_events.append(ev)
         if not (window_start <= ev.ts <= window_end):
             continue
+        total_lines += 1
         if ev.kind in (
             "stream_error",
             "stream_finish_error",
@@ -333,6 +523,8 @@ def aggregate(
             continue
         sessions[sid] = _build_session(builder, routing_skips, fallback_events, schedule)
 
+    busy = compute_busy_stats(local_stream_events, window_start, window_end, schedule)
+
     return AnalysisResult(
         window_start=window_start,
         window_end=window_end,
@@ -345,4 +537,5 @@ def aggregate(
         total_lines=total_lines,
         dispatch_denied_events=dispatch_denied_events,
         error_events=error_events,
+        busy=busy,
     )

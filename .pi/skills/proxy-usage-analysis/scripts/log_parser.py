@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -63,6 +63,12 @@ UPSTREAM_ERROR = "[remote] upstream error"
 # candidates for attributing a session-less "Fallback triggered" line to that
 # session.
 FALLBACK_ATTRIBUTION_WINDOW_SECONDS = 60
+
+# Margin (each side) by which ``iter_events`` widens the window so the
+# local-model busy-time analysis can pair ``Stream started``/``Stream finished``
+# events that cross the window boundary. 1h generously covers long generations
+# that overrun the window end; rotated logs bound the pre-window side anyway.
+BUSY_WINDOW_MARGIN = timedelta(hours=1)
 
 LOCAL_PROVIDER = "local"
 
@@ -237,13 +243,26 @@ def parse_log_line(line: str) -> LogEvent | None:
     return None
 
 
-def iter_events(path: Path, window_start: datetime, window_end: datetime) -> Iterator[LogEvent]:
+def iter_events(
+    path: Path,
+    window_start: datetime,
+    window_end: datetime,
+    margin: timedelta = timedelta(0),
+) -> Iterator[LogEvent]:
     """Stream-parse ``path`` line by line, yielding only events whose
-    timestamp falls inside ``[window_start, window_end]``.
+    timestamp falls inside ``[window_start - margin, window_end + margin]``.
 
     The file is never loaded into memory: lines are read one at a time and a
     cheap prefix check skips non-log lines before regex parsing.
+
+    ``margin`` widens the yield window on both sides so the local-model
+    utilization (busy-time) analysis can pair ``Stream started``/``Stream
+    finished`` events that cross the analysis window boundary (the caller
+    clips them back to ``[window_start, window_end]``). Defaults to zero so
+    callers that only care about in-window events are unchanged.
     """
+    lo = window_start - margin
+    hi = window_end + margin
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             if len(line) < 24 or not line[:4].isdigit():
@@ -251,7 +270,7 @@ def iter_events(path: Path, window_start: datetime, window_end: datetime) -> Ite
             ev = parse_log_line(line)
             if ev is None:
                 continue
-            if window_start <= ev.ts <= window_end:
+            if lo <= ev.ts <= hi:
                 ev.src_file = path.name
                 yield ev
 
