@@ -1638,27 +1638,56 @@ class StreamingPreContentError(Exception):
         super().__init__(f"pre-content stream failure for {provider_name}: {reason}")
 
 
-def _classify_stream_chunk(chunk: bytes) -> tuple[bool, bool, bool]:
+class StreamingRecoverableAfterReasoningError(Exception):
+    """Raised when a remote streaming response stalls AFTER delivering
+    reasoning_content but BEFORE any final-answer content (and with zero
+    tool_calls) was delivered.
+
+    This is the mid-stream re-route signal (LP-0MSF1PUM90099ZSW): the client
+    has not committed to a final answer (no final content chunk forwarded, no
+    tool-result round-trip), so the fallback chain can re-route the SAME
+    request to the next provider instead of surfacing an error that tells the
+    client to retry.
+
+    Tool-call-only stalls do NOT use this exception: once tool_calls are
+    delivered, re-routing would make the model re-plan the request, so they
+    terminate via the existing enriched-error path (operator decision Q1).
+    """
+
+    def __init__(self, provider_name: str, reason: str):
+        self.provider_name = provider_name
+        self.reason = reason
+        super().__init__(f"mid-stream stall after reasoning for {provider_name}: {reason}")
+
+
+def _classify_stream_chunk(chunk: bytes) -> tuple[bool, bool, bool, bool, bool]:
     """Classify one raw SSE chunk for pre-content recovery pre-flight.
 
-    Returns ``(has_content, is_terminal_error, is_done)`` where:
-    - ``has_content``: the chunk carries a content-bearing delta (non-empty
-      content, tool_calls, or reasoning_content — mirrors proxy_remote's
-      ``_delta_has_content`` semantics, LP-0MS8XAPXT009W3CL).
+    Returns ``(has_final_content, has_tool_calls, has_reasoning,
+    is_terminal_error, is_done)`` where:
+    - ``has_final_content``: the chunk carries a non-empty final-answer
+      ``content`` delta — the commit point for mid-stream re-route
+      (LP-0MSF1PUM90099ZSW).
+    - ``has_tool_calls``: the chunk carries a non-empty ``tool_calls`` delta
+      (intermediate; terminate-eligible).
+    - ``has_reasoning``: the chunk carries a non-empty ``reasoning_content``
+      delta (intermediate; re-route-eligible).
     - ``is_terminal_error``: a choice carries ``finish_reason: "error"``.
     - ``is_done``: a ``[DONE]`` marker or ``finish_reason: "stop"``.
 
     Keep-alive comments (``: keep-alive``) and non-``data:`` lines are
-    ignored, so a stalled-but-alive stream yields (False, False, False) until
-    either content or a terminal event arrives.
+    ignored, so a stalled-but-alive stream yields all-False until either
+    content or a terminal event arrives.
     """
-    has_content = False
+    has_final_content = False
+    has_tool_calls = False
+    has_reasoning = False
     is_terminal_error = False
     is_done = False
     try:
         text = chunk.decode("utf-8", errors="replace")
     except Exception:
-        return False, False, False
+        return False, False, False, False, False
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -1684,14 +1713,14 @@ def _classify_stream_chunk(chunk: bytes) -> tuple[bool, bool, bool]:
                 continue
             c = delta.get("content")
             if isinstance(c, str) and c.strip():
-                has_content = True
+                has_final_content = True
             tc = delta.get("tool_calls")
             if isinstance(tc, list) and tc:
-                has_content = True
+                has_tool_calls = True
             rc = delta.get("reasoning_content")
             if isinstance(rc, str) and rc.strip():
-                has_content = True
-    return has_content, is_terminal_error, is_done
+                has_reasoning = True
+    return has_final_content, has_tool_calls, has_reasoning, is_terminal_error, is_done
 
 
 async def _preflight_streaming_response(
@@ -1699,15 +1728,27 @@ async def _preflight_streaming_response(
     request,
     provider_name: str,
 ) -> Response:
-    """Pre-consume a 2xx streaming response up to the first content-bearing
-    chunk or a terminal event, so a pre-content failure can re-route.
+    """Pre-consume a 2xx streaming response up to the commit point or a
+    terminal event, so a mid-stream failure can re-route.
 
-    Reads the response body iterator chunk-by-chunk (buffering what it sees)
-    until one of:
-    - a content-bearing chunk arrives → returns a wrapped response that
-      replays the buffered chunks then continues the original iterator;
-    - a terminal ``finish_reason: error`` event arrives with zero content →
-      raises :class:`StreamingPreContentError`;
+    Reads the response body iterator chunk-by-chunk, buffering intermediate
+    chunks (reasoning_content / tool_calls) WITHOUT forwarding them, until one
+    of:
+    - the commit point: a final-answer ``content`` chunk arrives → returns a
+      wrapped response that replays the buffered chunks in order then
+      continues the original iterator (LP-0MSF1PUM90099ZSW commit point);
+    - a terminal ``finish_reason: error`` event arrives with only
+      reasoning_content delivered (zero tool_calls, zero final content) →
+      raises :class:`StreamingRecoverableAfterReasoningError` so the fallback
+      chain re-routes to the next provider (buffer discarded);
+    - a terminal ``finish_reason: error`` event arrives with zero content of
+      any kind → raises :class:`StreamingPreContentError` (existing behavior,
+      LP-0MSETOTWY000SU0Z);
+    - a terminal ``finish_reason: error`` event arrives with tool_calls
+      delivered → returns the wrapped response as-is (replay buffer +
+      continue): the enriched error event reaches the client and the chain
+      does NOT re-route (operator decision Q1, tool-call-only stalls
+      terminate);
     - the stream ends with zero content (empty response) → raises
       :class:`StreamingPreContentError`;
     - a stream exception occurs with zero content → raises
@@ -1732,7 +1773,9 @@ async def _preflight_streaming_response(
 
     original = response.body_iterator
     buffered: list[bytes] = []
-    saw_content = False
+    saw_final_content = False
+    saw_tool_calls = False
+    saw_reasoning = False
     disconnected = False
     try:
         while True:
@@ -1747,18 +1790,39 @@ async def _preflight_streaming_response(
             except StopAsyncIteration:
                 break
             except Exception as exc:
-                if not saw_content:
+                if not (saw_final_content or saw_tool_calls or saw_reasoning):
                     raise StreamingPreContentError(
                         provider_name,
                         f"stream_exception:{type(exc).__name__}",
                     ) from exc
                 break
             buffered.append(chunk)
-            has_content, is_terminal_error, _is_done = _classify_stream_chunk(chunk)
-            if has_content:
-                saw_content = True
+            (
+                has_final_content,
+                has_tool_calls,
+                has_reasoning,
+                is_terminal_error,
+                _is_done,
+            ) = _classify_stream_chunk(chunk)
+            # Accumulate what has been delivered so far (buffered intermediate
+            # chunks count toward the stall classification decision).
+            saw_final_content = saw_final_content or has_final_content
+            saw_tool_calls = saw_tool_calls or has_tool_calls
+            saw_reasoning = saw_reasoning or has_reasoning
+            if has_final_content:
+                saw_final_content = True
                 break
             if is_terminal_error:
+                if saw_tool_calls:
+                    # Tool-call-only stall: terminate via the enriched error
+                    # (replay buffer + continue; the error event is in the
+                    # stream). No re-route (operator decision Q1).
+                    break
+                if saw_reasoning:
+                    raise StreamingRecoverableAfterReasoningError(
+                        provider_name,
+                        "stall_after_reasoning",
+                    )
                 raise StreamingPreContentError(provider_name, "finish_reason:error")
             # [DONE] / finish_reason: stop with zero content is NOT terminal
             # here — the generator retries empty responses internally and only
@@ -1772,7 +1836,7 @@ async def _preflight_streaming_response(
         # re-routing to another provider would be wasteful.
         return response
 
-    if not saw_content:
+    if not (saw_final_content or saw_tool_calls or saw_reasoning):
         raise StreamingPreContentError(provider_name, "empty_response")
 
     async def _replay_and_continue():
@@ -1823,6 +1887,32 @@ def _handle_streaming_success(
             )
         return result
     return None
+
+
+def _prepend_sse_comment(response: Response, comment: str) -> Response:
+    """Return a StreamingResponse whose body emits *comment* (an SSE comment
+    line, e.g. ``: re-route provider=a->b reason=stall_after_reasoning``)
+    before the original body bytes.
+
+    If *response* is not a streaming response, the comment is dropped (the
+    client gets the JSON/other body as-is) — the marker is best-effort.
+    """
+    if not _is_streaming_response(response):
+        return response
+    original = response.body_iterator
+    comment_bytes = (comment if comment.endswith("\n\n") else comment + "\n\n").encode()
+
+    async def _with_comment():
+        yield comment_bytes
+        async for c in original:
+            yield c
+
+    return StreamingResponse(
+        _with_comment(),
+        media_type=response.media_type,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+    )
 
 
 def _build_fallback_success_response(
@@ -2123,6 +2213,10 @@ async def proxy_with_remote_fallback(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # SSE comment emitted on the next successful streaming response after a
+    # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
+    # the next provider is resolved.
+    _pending_reroute: str | None = None
 
     ptr = _get_proxy_to_remote()
 
@@ -2193,6 +2287,30 @@ async def proxy_with_remote_fallback(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     continue
+                except StreamingRecoverableAfterReasoningError as exc:
+                    # Mid-stream re-route (LP-0MSF1PUM90099ZSW): reasoning was
+                    # delivered but no final content / no tool_calls, so the
+                    # client has not committed to an answer. Re-route the SAME
+                    # request to the next provider; the buffered intermediate
+                    # output is discarded (never reaches the client).
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_reroute",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _pending_reroute = f": re-route provider={provider_name}->{{to}} reason={exc.reason}"
+                    logger.warning(
+                        "Mid-stream re-route: provider=%s model=%s reason=%s "
+                        "(no final content committed; routing to next provider)",
+                        provider_name, path, exc.reason,
+                    )
+                    continue
 
             # Shared primitive: handle streaming success
             stream_result = _handle_streaming_success(
@@ -2200,6 +2318,12 @@ async def proxy_with_remote_fallback(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                if _pending_reroute:
+                    stream_result = _prepend_sse_comment(
+                        stream_result,
+                        _pending_reroute.format(to=provider_name),
+                    )
+                    _pending_reroute = None
                 return stream_result
 
             # Safely extract a small body snippet for diagnostics
@@ -2376,6 +2500,10 @@ async def proxy_with_fallback(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # SSE comment emitted on the next successful streaming response after a
+    # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
+    # the next provider is resolved.
+    _pending_reroute: str | None = None
 
     # Accumulate slot counts when local providers report slot exhaustion
     total_slots_sum = 0
@@ -2633,6 +2761,30 @@ async def proxy_with_fallback(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     continue
+                except StreamingRecoverableAfterReasoningError as exc:
+                    # Mid-stream re-route (LP-0MSF1PUM90099ZSW): reasoning was
+                    # delivered but no final content / no tool_calls, so the
+                    # client has not committed to an answer. Re-route the SAME
+                    # request to the next provider; the buffered intermediate
+                    # output is discarded (never reaches the client).
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_reroute",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _pending_reroute = f": re-route provider={provider_name}->{{to}} reason={exc.reason}"
+                    logger.warning(
+                        "Mid-stream re-route: provider=%s model=%s reason=%s "
+                        "(no final content committed; routing to next provider)",
+                        provider_name, path, exc.reason,
+                    )
+                    continue
 
             # Shared primitive: handle streaming success
             stream_result = _handle_streaming_success(
@@ -2642,6 +2794,12 @@ async def proxy_with_fallback(
             if stream_result is not None:
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
+                if _pending_reroute:
+                    stream_result = _prepend_sse_comment(
+                        stream_result,
+                        _pending_reroute.format(to=provider_name),
+                    )
+                    _pending_reroute = None
                 return stream_result
 
             # Capture the first non-success response so we can return it when
