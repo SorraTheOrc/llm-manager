@@ -66,27 +66,67 @@ test.describe('Slot Status Section', () => {
   });
 
   test('shows idle slots from SSE data', async ({ page }) => {
+    // Deterministic fake EventSource: only the synthetic all-idle payload is
+    // seen by the UI (no real /events stream to race with). The inlined stub
+    // is serializable into the browser context and matches the sibling
+    // deterministic tests in this spec (LP-0MSHWZPHY0058NRA). A pure-idle
+    // payload keeps this distinct from 'slot cards show correct status
+    // colors', which covers the mixed idle/processing states.
+    await page.addInitScript(({ payload, delayMs }) => {
+      const listeners = { message: [] };
+      window.EventSource = function () {
+        const es = {
+          onmessage: null,
+          addEventListener(type, cb) {
+            (listeners[type] || (listeners[type] = [])).push(cb);
+          },
+          dispatchEvent(evt) {
+            if (evt.type === 'message') {
+              if (es.onmessage) es.onmessage.call(es, evt);
+              (listeners.message || []).forEach((cb) => cb.call(es, evt));
+            }
+            return true;
+          },
+          close() {},
+        };
+        setTimeout(() => {
+          es.dispatchEvent(
+            new MessageEvent('message', { data: JSON.stringify(payload) })
+          );
+        }, delayMs);
+        return es;
+      };
+    }, {
+      payload: {
+        type: 'status',
+        slots: [
+          { slot_id: 0, is_processing: false },
+          { slot_id: 1, is_processing: false }
+        ],
+        llama_server_running: true,
+        current_model: 'test-model',
+        n_ctx: 4096,
+        kv_cache_tokens: 128,
+        total_sent: 0,
+        total_recv: 0,
+        per_model_queries: {}
+      },
+      delayMs: 100,
+    });
+
     await page.goto('/');
 
-    // Wait for SSE to deliver slot data
-    await page.waitForTimeout(3000);
-
-    // Check that slot cards are rendered
+    // Slot cards are rendered from the SSE payload
     const slotCards = page.locator('.slot-card');
-    const cardCount = await slotCards.count();
+    await expect(slotCards).toHaveCount(2);
 
-    if (cardCount > 0) {
-      // If there are slots, verify they have required elements
-      const firstCard = slotCards.first();
-
-      // Slot should have an identifier
-      await expect(firstCard.locator('.slot-id')).toBeVisible();
-
-      // Slot should have a status indicator
-      const statusBadge = firstCard.locator('.slot-status-badge');
+    // Each slot card shows its identifier and an Idle status badge
+    for (let i = 0; i < 2; i++) {
+      const card = slotCards.nth(i);
+      await expect(card.locator('.slot-id')).toBeVisible();
+      const statusBadge = card.locator('.slot-status-badge');
       await expect(statusBadge).toBeVisible();
-      const statusText = await statusBadge.textContent();
-      expect(['Idle', 'Processing']).toContain(statusText);
+      await expect(statusBadge).toHaveText('Idle');
     }
   });
 
