@@ -32,10 +32,9 @@ import re
 import subprocess
 import sys
 import time
-import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
@@ -157,10 +156,10 @@ def build_user_prompt(index: int = 0) -> str:
     ensuring real processing work rather than a trivial answer.
     """
     return (
-        f"How many numbers appear in Part 2? Count them carefully and provide "
-        f"the exact total. Explain your reasoning step by step, then state "
-        f"the final answer as 'Total: <number>'. "
-        f"If you do not see Part 2 data, say 'NO DATA'."
+        "How many numbers appear in Part 2? Count them carefully and provide "
+        "the exact total. Explain your reasoning step by step, then state "
+        "the final answer as 'Total: <number>'. "
+        "If you do not see Part 2 data, say 'NO DATA'."
     )
 
 
@@ -357,8 +356,8 @@ def _kill_llama_server() -> None:
 
 def _wait_for_llama_server(timeout: int = 300) -> None:
     """Wait until llama-server responds on its health endpoint."""
-    from urllib.request import urlopen
     from urllib.error import URLError
+    from urllib.request import urlopen
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -375,7 +374,7 @@ def _wait_for_llama_server(timeout: int = 300) -> None:
 
 def _wait_for_proxy(timeout: int = 120) -> None:
     """Wait until the proxy responds to a health check."""
-    from urllib.request import urlopen, URLError
+    from urllib.request import URLError, urlopen
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -392,13 +391,39 @@ def _wait_for_proxy(timeout: int = 120) -> None:
     print("  WARNING: proxy did not become ready within timeout")
 
 
+def _slot_cache_dir() -> Path:
+    """Return the slot-cache directory from config (session_slot_save_path).
+
+    Falls back to <repo>/slot-cache when the config value is missing or the
+    key is absent, so clear_slot_cache() never raises on malformed config.
+    """
+    try:
+        content = _read_config()
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("session_slot_save_path:") or line.startswith(
+                "  session_slot_save_path:"
+            ):
+                value = line.split(":", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return Path(value).expanduser()
+    except Exception:
+        pass
+    return PROJECT_ROOT / "slot-cache"
+
+
 def clear_slot_cache() -> None:
-    """Delete cached slot files to ensure clean-slate measurements."""
-    """Delete cached slot files to ensure clean-slate measurements."""
-    if not SLOT_CACHE_DIR.exists():
+    """Delete cached slot files to ensure clean-slate measurements.
+
+    Opt-in via --clean-cache (default OFF) so production's warm slot-cache
+    persistence is preserved for representative warm-phase measurements.
+    """
+    cache_dir = _slot_cache_dir()
+    if not cache_dir.exists():
+        print(f"  Slot cache dir not found: {cache_dir}")
         return
     count = 0
-    for f in SLOT_CACHE_DIR.iterdir():
+    for f in cache_dir.iterdir():
         if f.suffix == ".bin":
             f.unlink()
             count += 1
@@ -448,6 +473,9 @@ class SlotRunResult:
     end_time: str = ""
     gpu_memory_bytes: int | None = None
     error: str | None = None
+    phase: str = "cold"  # 'cold' or 'warm' measurement phase
+    proxy_restart_time: str | None = None  # ISO timestamp of proxy restart
+    llama_ready_time: str | None = None  # ISO timestamp of llama-server ready
 
     def summary(self) -> dict:
         completed = [r for r in self.results if r.status == "completed"]
@@ -484,6 +512,9 @@ class SlotRunResult:
                 total_requests=len(self.results),
                 prompt_tokens_target=TARGET_PROMPT_TOKENS,
                 output_tokens_target=TARGET_OUTPUT_TOKENS,
+                phase=self.phase,
+                proxy_restart_time=self.proxy_restart_time,
+                llama_ready_time=self.llama_ready_time,
             ),
             requests=[r.to_dict() for r in self.results],
             summary=self.summary(),
@@ -772,7 +803,7 @@ async def run_slot_benchmark(
 ) -> SlotRunResult:
     """Execute a benchmark run for a given slot count."""
     result = SlotRunResult(slot_count=slot_count)
-    result.start_time = datetime.now(timezone.utc).isoformat()
+    result.start_time = datetime.now(UTC).isoformat()
 
     print(f"\n{'='*60}")
     print(f"  Slot count: {slot_count}")
@@ -785,8 +816,6 @@ async def run_slot_benchmark(
 
     # Clear slot cache for clean measurements
     clear_slot_cache()
-
-    total = num_requests + warmup
 
     async with httpx.AsyncClient(timeout=TARGET_RESPONSE_TIME_S * 2) as client:
         # Create all tasks with staggered start delays.
@@ -878,7 +907,7 @@ async def run_slot_benchmark(
         # Sort results back to request_index order
         result.results.sort(key=lambda r: r.request_index)
 
-    result.end_time = datetime.now(timezone.utc).isoformat()
+    result.end_time = datetime.now(UTC).isoformat()
 
     # Capture GPU memory snapshot
     result.gpu_memory_bytes = _capture_gpu_memory()
@@ -926,7 +955,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "prompt_tokens_target": TARGET_PROMPT_TOKENS,
         "output_tokens_target": TARGET_OUTPUT_TOKENS,
         "target_response_time_seconds": TARGET_RESPONSE_TIME_S,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "runs": [
             dict(
                 slot_count=r.slot_count,
@@ -950,7 +979,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "=" * 72,
         f"  Target: {TARGET_PROMPT_TOKENS:,} prompt tokens, ~{TARGET_RESPONSE_TIME_S}s response",
         f"  Requests per run: {TOTAL_REQUESTS_PER_RUN}  |  Warmup: 0 (use --warmup to enable)",
-        f"  Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"  Date: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
         f"{'Slots':>6}  {'Completed':>10}  {'Errors':>7}  {'Avg Dur':>8}  {'Min Dur':>8}  {'Max Dur':>8}  {'Avg TPS':>8}  {'Avg TTFT':>9}  {'GPU Mem':>10}",
         "-" * 80,
@@ -1006,6 +1035,8 @@ async def run_test_mode(
     slot_count: int = 6,
     base_url: str = f"http://localhost:{PROXY_PORT}",
     skip_restart: bool = False,
+    clean_cache: bool = False,
+    phase: str = "cold",
 ) -> None:
     """Send a single small 'Say Hi' request to verify proxy/llama-server connectivity.
 
@@ -1016,15 +1047,21 @@ async def run_test_mode(
         slot_count: Slot count to configure (only used when restarting).
         base_url: Proxy base URL.
         skip_restart: If True, skip config update and service restart.
+        clean_cache: If True, clear slot cache before restart. Default: False.
+        phase: Measurement phase ('cold' or 'warm'). Default: 'cold'.
     """
     print(f"\n{'='*60}")
-    print(f"  TEST MODE: Sending a single small prompt")
+    print(f"  TEST MODE: Sending a single small prompt (phase={phase})")
     print(f"{'='*60}")
 
     if not skip_restart:
-        print("  Updating config to slot count {slot_count}...")
+        print(f"  Updating config to slot count {slot_count}...")
         set_slot_count(slot_count)
-        clear_slot_cache()
+        # Only clear slot cache when --clean-cache is explicitly set
+        if clean_cache:
+            clear_slot_cache()
+        else:
+            print("  Slot cache preserved (--clean-cache not set)")
         restart_services(slot_count)
     else:
         print("  Skipping config update and restart (--skip-restart)")
@@ -1039,7 +1076,7 @@ async def run_test_mode(
     ]
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        print(f"  Sending: 'Say Hi'")
+        print("  Sending: 'Say Hi'")
         req = await send_request(
             client, messages, index=0, base_url=base_url,
             max_tokens=20, timeout=120.0,
@@ -1047,7 +1084,7 @@ async def run_test_mode(
         )
 
     if req.status == "completed":
-        print(f"  ✓ Test passed!")
+        print("  ✓ Test passed!")
         print(f"      Duration: {req.total_duration_seconds:.1f}s")
         print(f"      Prompt tokens: {req.prompt_tokens}")
         print(f"      Completion tokens: {req.completion_tokens}")
@@ -1058,7 +1095,7 @@ async def run_test_mode(
         print(f"  ✗ Test FAILED: {req.error}")
 
     print(f"\n{'='*60}")
-    print(f"  TEST MODE COMPLETE")
+    print("  TEST MODE COMPLETE")
     print(f"{'='*60}")
 
 
@@ -1107,6 +1144,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--warmup", action="store_true",
         help="Include 1 warmup request before measured requests (default: no warmup)",
     )
+    parser.add_argument(
+        "--clean-cache", action="store_true",
+        help="Clear slot cache before run (default: OFF — preserves warm cache)",
+    )
+    parser.add_argument(
+        "--phase", type=str, choices=["cold", "warm"], default="cold",
+        help="Measurement phase: 'cold' (first runs post-restart) or 'warm' (steady-state). Default: cold",
+    )
 
     return parser.parse_args(argv)
 
@@ -1147,6 +1192,8 @@ def main(argv: list[str] | None = None) -> None:
             slot_count=args.slots or SLOT_COUNTS[0],
             base_url=f"http://localhost:{PROXY_PORT}",
             skip_restart=args.skip_restart,
+            clean_cache=args.clean_cache,
+            phase=args.phase,
         ))
         return
 
@@ -1172,10 +1219,27 @@ def main(argv: list[str] | None = None) -> None:
 
         # 2. Restart services
         if not args.skip_restart:
-            clear_slot_cache()
+            # Only clear slot cache when --clean-cache is explicitly set
+            # Default is OFF to preserve warm cache for realistic measurements
+            if args.clean_cache:
+                clear_slot_cache()
+            else:
+                print("  Slot cache preserved (--clean-cache not set)")
+
+            # Record restart timestamps for reproducible measurements
+            from datetime import datetime
+            proxy_restart_time = datetime.now(UTC).isoformat()
+            print(f"  Proxy restart recorded at: {proxy_restart_time}")
+
             restart_services(slot_count)
+
+            # Record llama-server ready timestamp
+            llama_ready_time = datetime.now(UTC).isoformat()
+            print(f"  Llama-server ready at: {llama_ready_time}")
         else:
             print("  Skipping restart (--skip-restart)")
+            proxy_restart_time = None
+            llama_ready_time = None
 
         # Determine warmup count
         warmup_count = WARMUP_REQUESTS if args.warmup else 0
@@ -1187,6 +1251,10 @@ def main(argv: list[str] | None = None) -> None:
             user_prompt=user_prompt,
             warmup=warmup_count,
         ))
+        # Attach metadata for JSON output
+        run_result.phase = args.phase
+        run_result.proxy_restart_time = proxy_restart_time
+        run_result.llama_ready_time = llama_ready_time
         all_results.append(run_result)
 
         # 4. Quick inline summary
@@ -1218,7 +1286,7 @@ def main(argv: list[str] | None = None) -> None:
     report_path = generate_report(all_results, output_dir)
 
     # Restore original slot count (6 = current production value)
-    print(f"\nRestoring slot count to 6...")
+    print("\nRestoring slot count to 6...")
     set_slot_count(6)
     if not args.skip_restart:
         restart_services(6)
@@ -1230,6 +1298,112 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Report: {report_path}")
     print(f"  Summary: {output_dir / 'slot_benchmark_summary.txt'}")
     print(f"{'='*72}")
+
+
+# ---------------------------------------------------------------------------
+# Large-prompt fixture generation
+# ---------------------------------------------------------------------------
+
+def generate_large_prompt_fixture(token_target: int, seed: int = 42) -> str:
+    """Generate a large prompt fixture targeting approximately token_target tokens.
+
+    Uses deterministic content generation (seeded RNG) for reproducibility.
+    English prose at ~3 chars/token, with paragraph breaks for realism.
+
+    Args:
+        token_target: Target token count (e.g., 30000, 60000, 90000, 120000).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        A string of approximately token_target tokens of English prose.
+    """
+    import random
+    random.seed(seed)
+
+    # Paragraph templates for realistic content
+    paragraphs = [
+        "The quick brown fox jumps over the lazy dog. This classic pangram contains every letter of the English alphabet and has been used for decades in typing practice and font displays.",
+        "Machine learning models require substantial computational resources to train. The attention mechanism in transformer architectures allows parallel processing of sequence data, enabling efficient training on large datasets.",
+        "Data centers consume significant amounts of electricity for both computation and cooling. Modern facilities use advanced power management systems and renewable energy sources to reduce their environmental impact.",
+        "Natural language processing has evolved significantly with the development of large language models. These models can understand and generate human-like text across diverse domains and languages.",
+        "Cloud computing services provide scalable infrastructure for applications of all sizes. Organizations can leverage distributed computing resources without maintaining physical hardware in-house.",
+        "The study of algorithms and data structures remains fundamental to computer science education. Efficient algorithms enable solutions to complex problems while minimizing resource consumption.",
+        "Software engineering practices such as version control, code review, and continuous integration help maintain code quality in collaborative development environments.",
+        "Network security is critical for protecting digital assets and user privacy. Firewalls, encryption, and access controls form the foundation of secure network architecture.",
+        "Database systems manage large volumes of structured and unstructured data. Modern databases support distributed architectures for high availability and fault tolerance.",
+        "Artificial intelligence research continues to advance rapidly, with breakthroughs in areas such as computer vision, speech recognition, and autonomous systems.",
+        "The internet of things connects billions of devices worldwide, creating new opportunities for automation and data collection. Edge computing brings processing closer to data sources.",
+        "Cybersecurity threats evolve continuously, requiring adaptive defense strategies. Organizations must implement comprehensive security frameworks including threat detection, incident response, and recovery planning.",
+        "Quantum computing promises to solve certain problems exponentially faster than classical computers. While still in early stages, quantum algorithms for optimization and cryptography show significant potential.",
+        "DevOps practices bridge the gap between development and operations teams. Automation of deployment pipelines and infrastructure management improves reliability and reduces time to market.",
+        "Mobile application development requires consideration of diverse devices, operating systems, and network conditions. Responsive design and offline-first architecture improve user experience.",
+    ]
+
+    # Calculate approximate chars needed (~3 chars per token)
+    chars_target = token_target * 3
+    current_length = 0
+    result_parts = []
+    paragraph_idx = 0
+
+    while current_length < chars_target:
+        paragraph = paragraphs[paragraph_idx % len(paragraphs)]
+        # Add some variation with random numbers
+        num_numbers = random.randint(5, 20)
+        numbers = ", ".join(str(random.randint(1, 999999)) for _ in range(num_numbers))
+        content = f"{paragraph} Additional data: {numbers}."
+        result_parts.append(content)
+        current_length += len(content)
+        paragraph_idx += 1
+
+    return "\n\n".join(result_parts)
+
+
+def load_large_prompt_fixture(fixture_path: str | Path, key: str | None = None) -> str | dict:
+    """Load large-prompt fixtures from a JSON file.
+
+    Supports two formats:
+    - Top-level keys: {"30k": "...", "60k": "..."} -> returns dict when key=None
+    - Nested under 'prompts': {"prompts": {"30k": "...", "60k": "..."}}
+
+    Args:
+        fixture_path: Path to the JSON fixture file.
+        key: Specific key to load. If None, returns the entire prompts dict.
+
+    Returns:
+        A single prompt string (if key specified) or dict of all prompts.
+
+    Raises:
+        FileNotFoundError: If fixture_path does not exist.
+        KeyError: If key is not found in the fixture.
+    """
+    fixture_path = Path(fixture_path)
+    if not fixture_path.exists():
+        raise FileNotFoundError(f"Fixture file not found: {fixture_path}")
+
+    data = json.loads(fixture_path.read_text())
+
+    # Check for nested 'prompts' key first
+    if "prompts" in data:
+        data = data["prompts"]
+
+    if key is None:
+        return data
+
+    if key in data:
+        return data[key]
+    raise KeyError(f"Key '{key}' not found in fixture file. Available: {list(data.keys())}")
+
+
+def save_large_prompt_fixture(fixture_path: str | Path, prompts: dict) -> None:
+    """Save large-prompt fixtures to a JSON file.
+
+    Args:
+        fixture_path: Path to save the JSON fixture file.
+        prompts: Dict of prompt_name -> prompt_text.
+    """
+    fixture_path = Path(fixture_path)
+    fixture_path.parent.mkdir(parents=True, exist_ok=True)
+    fixture_path.write_text(json.dumps(prompts, indent=2))
 
 
 if __name__ == "__main__":

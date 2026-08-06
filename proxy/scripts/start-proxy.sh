@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--verbose] [uvicorn-args...]
 #
 # Flags:
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
+#   --verbose   Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO level)
 #
 # Automatically resolves required API keys from:
 #   1. Environment variables (already set)
@@ -47,6 +48,7 @@ fi
 # Determine port: default 8000 unless overridden by --port or PROXY_PORT/PORT env var
 PORT="${PROXY_PORT:-${PORT:-8000}}"
 RESTART=0
+VERBOSE=0
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
@@ -69,12 +71,24 @@ for arg in "$@"; do
       --restart)
         RESTART=1
         ;;
+      --verbose)
+        # Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO
+        # level). Consumed here rather than passed to uvicorn, which rejects
+        # unknown CLI flags (LP-0MS9GAN2P002NR4M).
+        VERBOSE=1
+        ;;
       *)
         UVICORN_ARGS+=("$arg")
         ;;
     esac
   fi
 done
+
+# Translate --verbose into the env var read by proxy/utils.setup_logging
+if [ "$VERBOSE" -eq 1 ]; then
+  export LLAMA_PROXY_VERBOSE=1
+  echo "Verbose mode enabled: per-chunk SSE logging at INFO level" >&2
+fi
 
 # Ports used by backend services (llama-server on 8080, TTS on 8081)
 LLAMA_PORT=8080

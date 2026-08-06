@@ -10,6 +10,10 @@ httpx>=0.26.0
 # Configuration
 pyyaml>=6.0
 
+# Token counting (primary path for routing/guardrail token estimation;
+# see proxy/utils.py count_text_tokens and LP-0MRDE669Y003V1SO)
+tiktoken>=0.13.0
+
 # Type hints support
 typing-extensions>=4.9.0
 

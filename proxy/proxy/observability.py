@@ -40,7 +40,6 @@ from typing import Any
 import httpx
 
 
-
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
 # ---------------------------------------------------------------------------
@@ -131,18 +130,26 @@ def _build_llama_url(llama_port: int, endpoint: str) -> str:
     return f"http://localhost:{llama_port}{endpoint}"
 
 
-async def _query_slots(client, llama_port: int, timeout: float = 2.0) -> tuple:
+async def _query_slots(
+    client, llama_port: int, timeout: float = 2.0, model: str | None = None
+) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
     Returns a ``(available_slots, total_slots)`` tuple.  Both default to
     ``0`` on any failure (HTTP error, connection error, timeout, or
     unexpected response shape).
 
+    Many llama-server instances require ``?model=...`` on the ``/slots``
+    endpoint and return HTTP 400 without it (LP-0MSHFGO0M003Q5BL), so
+    pass *model* when the current model is known.
+
     The 2.0-second default timeout matches the original inline query in
     ``get_llama_local_status()``.
     """
     try:
         url = _build_llama_url(llama_port, "/slots")
+        if model:
+            url = f"{url}?model={model}"
         slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
         if slots_resp.status_code == 200:
             slots_data = await _safe_parse_json_response(slots_resp)

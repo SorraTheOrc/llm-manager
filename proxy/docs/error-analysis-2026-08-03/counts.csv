@@ -1,0 +1,8 @@
+error_type,provider,model,count
+backend_retry,,,93
+slot_save_error,,,17
+stream_error,local,Qwen3,6
+stream_finish_error,opencode-go,deepseek-v4-flash,93
+stream_finish_error,opencode,deepseek-v4-flash-free,28
+stream_finish_error,local,Qwen3,6
+upstream_http_error,,,112

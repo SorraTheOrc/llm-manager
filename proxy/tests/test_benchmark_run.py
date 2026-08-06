@@ -226,6 +226,223 @@ class TestBenchmarkRequestBuilder:
 
 
 # ---------------------------------------------------------------------------
+# P95 percentile computation (ctx-size eval F1: LP-0MSC95VTC008GVR7)
+# ---------------------------------------------------------------------------
+
+
+class TestP95:
+    """Verify the _p95 helper computes the 95th percentile correctly."""
+
+    def _rb(self):
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+        return rb
+
+    def test_p95_empty(self):
+        rb = self._rb()
+        assert rb._p95([]) is None
+
+    def test_p95_single_value(self):
+        rb = self._rb()
+        assert rb._p95([5.0]) == 5.0
+
+    def test_p95_sorted(self):
+        rb = self._rb()
+        # 20 values 1..20; 95th percentile rank = ceil(0.95*20) = 19 -> value 19
+        assert rb._p95(list(range(1, 21))) == 19.0
+
+    def test_p95_unsorted(self):
+        rb = self._rb()
+        values = list(range(1, 21))
+        import random
+
+        random.Random(42).shuffle(values)
+        assert rb._p95(values) == 19.0
+
+    def test_p95_rounds_to_4dp(self):
+        rb = self._rb()
+        assert rb._p95([0.123456, 0.654321]) == 0.6543
+
+    def test_summary_includes_p95_fields(self, monkeypatch):
+        """run_benchmark_async summary must include P95 fields."""
+        rb = self._rb()
+        import asyncio
+        import types
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        async def fake_send(client, config, prompt, idx):
+            return rb.RequestResult(
+                request_index=idx,
+                prompt=prompt,
+                status="completed",
+                total_duration_seconds=float(idx + 1),
+                prompt_tokens=10,
+                completion_tokens=20,
+                tokens_per_second=float(100 + idx),
+                time_to_first_token_seconds=0.05 + idx * 0.01,
+            )
+
+        monkeypatch.setattr(
+            rb, "httpx", types.SimpleNamespace(AsyncClient=lambda **kw: FakeAsyncClient())
+        )
+        monkeypatch.setattr(rb, "send_single_request", fake_send)
+        monkeypatch.setattr(rb, "_get_memory_snapshot", lambda: {})
+
+        config = rb.BenchmarkConfig(
+            run_type="baseline",
+            model="Qwen3",
+            prompts=["p1"],
+            num_requests=3,
+            concurrency=1,
+            timeout=5.0,
+        )
+        result = asyncio.run(rb.run_benchmark_async(config))
+        s = result["summary"]
+        assert "p95_total_duration_seconds" in s
+        assert "p95_time_to_first_token_seconds" in s
+        assert "p95_tokens_per_second" in s
+        # durations are 1,2,3 -> P95 of 3 values = 3.0
+        assert s["p95_total_duration_seconds"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# --dry-run support (ctx-size eval F1: LP-0MSC95VTC008GVR7)
+# ---------------------------------------------------------------------------
+
+
+class TestDryRun:
+    """Verify --dry-run validates prompts and writes schema JSON without requests."""
+
+    def test_parse_args_dry_run_default_false(self):
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+        args = rb.parse_args(["--baseline", "--dry-run"])
+        assert args.dry_run is True
+
+    def test_dry_run_writes_schema_json(self, tmp_path):
+        """main() with --dry-run writes a JSON file consumable by compare_results."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        out = tmp_path / "dry_run.json"
+        prompts_file = tmp_path / "prompts.json"
+        prompts_file.write_text(json.dumps(["short prompt", "x" * 3000]))
+
+        rb.main([
+            "--baseline",
+            "--dry-run",
+            "--prompts", str(prompts_file),
+            "--output", str(out),
+            "--model", "Qwen3",
+        ])
+
+        assert out.exists()
+        data = json.loads(out.read_text())
+        assert data["config"]["run_type"] == "baseline"
+        assert data["config"]["dry_run"] is True
+        assert data["requests"] == []
+        assert data["summary"]["dry_run"] is True
+        assert data["summary"]["total_requests"] == 0
+
+    def test_dry_run_records_restart_timestamps(self, tmp_path):
+        """--proxy-restart-time/--llama-ready-time are recorded in JSON config
+        so measurement windows are reproducible (F2 methodology)."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        out = tmp_path / "dry_run_ts.json"
+        prompts_file = tmp_path / "prompts.json"
+        prompts_file.write_text(json.dumps(["short"]))
+
+        rb.main([
+            "--baseline",
+            "--dry-run",
+            "--prompts", str(prompts_file),
+            "--output", str(out),
+            "--model", "Qwen3",
+            "--proxy-restart-time", "2026-08-04T02:44:48Z",
+            "--llama-ready-time", "2026-08-04T02:45:27Z",
+        ])
+
+        data = json.loads(out.read_text())
+        assert data["config"]["proxy_restart_time"] == "2026-08-04T02:44:48Z"
+        assert data["config"]["llama_ready_time"] == "2026-08-04T02:45:27Z"
+
+    def test_dry_run_accepts_dict_prompts(self, tmp_path):
+        """--prompts with a dict (named fixtures) is flattened to a list."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        out = tmp_path / "dry_run2.json"
+        prompts_file = tmp_path / "fixtures.json"
+        prompts_file.write_text(json.dumps({"30k": "a" * 9000, "60k": "b" * 18000}))
+
+        rb.main([
+            "--baseline",
+            "--dry-run",
+            "--prompts", str(prompts_file),
+            "--output", str(out),
+            "--model", "Qwen3",
+        ])
+
+        data = json.loads(out.read_text())
+        assert data["config"]["dry_run"] is True
+
+    def test_parse_models_ini_per_model_ctx_size(self, tmp_path):
+        """ctx-size inside a model section (not [global]) is parsed."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        ini = tmp_path / "models.ini"
+        ini.write_text(
+            "[global]\n"
+            "ngl = 80\n"
+            "\n"
+            "[Qwen3]\n"
+            "hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M\n"
+            "ctx-size = 131072\n"
+        )
+        models = rb._parse_models_ini(str(ini))
+        assert models["Qwen3"]["ctx_size"] == 131072
+        assert models["Qwen3"]["quantization"] == "Q5_K_M"
+
+    def test_dry_run_warns_on_prompt_exceeding_ctx(self, tmp_path, capsys):
+        """Dry-run warns when a prompt's estimated tokens exceed ctx_size."""
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        out = tmp_path / "dry_run3.json"
+        prompts_file = tmp_path / "big.json"
+        prompts_file.write_text(json.dumps(["x" * 6000]))  # ~2000 tokens est
+        ini = tmp_path / "models.ini"
+        ini.write_text("[Qwen3]\nhf-repo = a/b:Q5_K_M\nctx-size = 1024\n")
+
+        rb.main([
+            "--baseline",
+            "--dry-run",
+            "--prompts", str(prompts_file),
+            "--output", str(out),
+            "--model", "Qwen3",
+            "--config", str(ini),
+        ])
+        captured = capsys.readouterr()
+        assert "exceed ctx_size 1024" in captured.out
+
+
+# ---------------------------------------------------------------------------
 # Inline per-request progress (LP-0MRWU82H5003KV47)
 # ---------------------------------------------------------------------------
 
@@ -346,3 +563,66 @@ class TestInlineProgress:
         result = asyncio.run(rb.run_benchmark_async(config))
         assert [r["request_index"] for r in result["requests"]] == [0, 1, 2]
         assert result["summary"]["completed"] == 3
+
+
+class TestSendSingleRequestCompletedPath:
+    """Regression: completed-path RequestResult must use the dataclass field
+    name ``time_to_first_token_seconds`` (LP-0MSC95VX1009RBDS).
+
+    The old code passed ``time_to_first_token=`` which raised
+    ``TypeError: RequestResult.__init__() got an unexpected keyword argument``
+    on every completed request, so the F2 baseline sweep recorded all requests
+    as errors even when the proxy returned HTTP 200.
+    """
+
+    def test_completed_response_builds_result(self, monkeypatch):
+        rb = _import_run_benchmark()
+        if rb is None:
+            pytest.skip("run_benchmark module not importable from current sys.path")
+
+        import asyncio
+        import types
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "usage": {"prompt_tokens": 38529, "completion_tokens": 8},
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, **kw):
+                self.resp = FakeResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, json=None, timeout=None):
+                return self.resp
+
+        monkeypatch.setattr(
+            rb, "httpx", types.SimpleNamespace(AsyncClient=FakeAsyncClient)
+        )
+
+        config = rb.BenchmarkConfig(
+            run_type="baseline",
+            model="plan",
+            prompts=["p"],
+            num_requests=1,
+            concurrency=1,
+            timeout=5.0,
+        )
+        result = asyncio.run(rb.send_single_request(
+            FakeAsyncClient(), config, "prompt", 0
+        ))
+        assert result.status == "completed"
+        assert result.prompt_tokens == 38529
+        assert result.completion_tokens == 8
+        assert result.time_to_first_token_seconds is not None
+        d = result.to_dict()
+        assert "time_to_first_token_seconds" in d
+        assert "error" not in d or d["error"] is None

@@ -25,6 +25,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -111,6 +112,8 @@ class BenchmarkConfig:
     max_tokens: int = DEFAULT_MAX_TOKENS
     timeout: float = DEFAULT_TIMEOUT
     snapshot_script: str | None = None
+    proxy_restart_time: str | None = None
+    llama_ready_time: str | None = None
 
     def to_dict(self):
         return {
@@ -125,12 +128,24 @@ class BenchmarkConfig:
             "max_tokens": self.max_tokens,
             "timeout": self.timeout,
             "snapshot_script": self.snapshot_script,
+            "proxy_restart_time": self.proxy_restart_time,
+            "llama_ready_time": self.llama_ready_time,
         }
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _p95(values: list[float]) -> float | None:
+    """Compute the 95th percentile of a list of values (nearest-rank)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    # Nearest-rank: rank = ceil(0.95 * N), 1-indexed
+    rank = max(1, math.ceil(0.95 * len(ordered)))
+    return round(ordered[rank - 1], 4)
 
 
 def _get_project_root() -> Path:
@@ -168,6 +183,11 @@ def _parse_models_ini(config_path: str | None = None) -> dict:
                 if current_section in models:
                     if key == "hf-repo" and ":" in value:
                         models[current_section]["quantization"] = value.split(":")[1]
+                    elif key == "ctx-size":
+                        try:
+                            models[current_section]["ctx_size"] = int(value)
+                        except ValueError:
+                            pass
                 elif current_section == "global":
                     if key == "ctx-size":
                         try:
@@ -297,7 +317,7 @@ async def send_single_request(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             tokens_per_second=round(tps, 2),
-            time_to_first_token=time_to_first_token,
+            time_to_first_token_seconds=time_to_first_token,
         )
 
     except httpx.TimeoutException as e:
@@ -405,6 +425,11 @@ async def run_benchmark_async(
         ),
         "total_prompt_tokens": sum(r.prompt_tokens for r in completed),
         "total_completion_tokens": sum(r.completion_tokens for r in completed),
+        "p95_total_duration_seconds": _p95([r.total_duration_seconds for r in completed]),
+        "p95_time_to_first_token_seconds": _p95(
+            [r.time_to_first_token_seconds for r in completed if r.time_to_first_token_seconds]
+        ),
+        "p95_tokens_per_second": _p95([r.tokens_per_second for r in completed]),
     }
 
     # Capture memory snapshot
@@ -504,10 +529,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to JSON file with prompts array (optional)",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate prompts/config and write schema JSON without sending requests",
+    )
+    parser.add_argument(
         "--snapshot-script",
         type=str,
         default=None,
         help="Path to prometheus_snapshot.sh script (optional)",
+    )
+    parser.add_argument(
+        "--proxy-restart-time",
+        type=str,
+        default=None,
+        help="ISO timestamp of proxy start (recorded in JSON config for measurement windows)",
+    )
+    parser.add_argument(
+        "--llama-ready-time",
+        type=str,
+        default=None,
+        help="ISO timestamp of llama-server ready (recorded in JSON config for measurement windows)",
     )
 
     args = parser.parse_args(argv)
@@ -528,7 +570,12 @@ def main(argv: list[str] | None = None) -> None:
     # Load prompts
     if args.prompts:
         with open(args.prompts) as f:
-            prompts = json.load(f)
+            loaded = json.load(f)
+        # Support both list-of-prompts and dict-of-named-prompts (fixtures file)
+        if isinstance(loaded, dict):
+            prompts = list(loaded.values())
+        else:
+            prompts = loaded
     else:
         prompts = DEFAULT_PROMPTS
 
@@ -558,6 +605,8 @@ def main(argv: list[str] | None = None) -> None:
         max_tokens=args.max_tokens,
         timeout=args.timeout,
         snapshot_script=args.snapshot_script,
+        proxy_restart_time=args.proxy_restart_time,
+        llama_ready_time=args.llama_ready_time,
     )
 
     print(f"Running benchmark ({run_type})...")
@@ -567,6 +616,31 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Concurrency: {config.concurrency}")
     print(f"  Base URL:    {config.base_url}")
     print()
+
+    if args.dry_run:
+        # Validate prompts and emit schema JSON without sending requests.
+        print("DRY RUN — validating prompts, no requests will be sent.\n")
+        for i, p in enumerate(prompts):
+            est = len(p) // 3
+            print(f"  Prompt {i + 1}: {len(p):,} chars  (~{est:,} tokens)")
+        if config.ctx_size:
+            over = [i for i, p in enumerate(prompts) if len(p) // 3 > config.ctx_size]
+            if over:
+                print(f"  WARNING: prompts {[i + 1 for i in over]} exceed ctx_size {config.ctx_size}")
+        result = {
+            "config": config.to_dict() | {"dry_run": True},
+            "requests": [],
+            "summary": {
+                "total_requests": 0,
+                "completed": 0,
+                "errors": 0,
+                "dry_run": True,
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        output_path.write_text(json.dumps(result, indent=2))
+        print(f"\nDry run complete — schema JSON written to: {output_path}")
+        return
 
     if args.snapshot_script:
         snapshot_dir = output_path.parent

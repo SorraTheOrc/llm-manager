@@ -155,3 +155,71 @@ async def test_llama_local_status_running_and_switch():
                         assert j.get("llama_server_running") is True
                         assert isinstance(j.get("available_slots"), int)
                         assert isinstance(j.get("total_slots"), int)
+
+
+# ======================================================================
+# _query_slots model-param regression tests (LP-0MSHFGO0M003Q5BL)
+# ======================================================================
+
+
+class TestQuerySlotsModelParam:
+    """Regression tests for /llama/local/status slot counts with ?model=.
+
+    LP-0MSHFGO0M003Q5BL: the status endpoint reported total_slots=0 because
+    ``_query_slots`` queried llama-server ``/slots`` without the required
+    ``?model=`` parameter (llama-server returns HTTP 400 without it).
+    """
+
+    @pytest.mark.asyncio
+    async def test_passes_model_param_in_url(self):
+        """The model name is appended to the /slots URL as ?model=..."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from proxy.observability import _query_slots
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=200)
+        mock_response.json = MagicMock(return_value=[{"is_processing": False}])
+        mock_client.get.return_value = mock_response
+
+        await _query_slots(mock_client, 8080, timeout=2.0, model="Qwen3")
+
+        # The URL must carry ?model=Qwen3 (llama-server 400s without it)
+        call_url = mock_client.get.call_args.args[0]
+        assert call_url == "http://localhost:8080/slots?model=Qwen3"
+
+    @pytest.mark.asyncio
+    async def test_counts_available_and_total_slots(self):
+        """Available/total slots reflect the real slot array when model is passed."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from proxy.observability import _query_slots
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=200)
+        mock_response.json = MagicMock(
+            return_value=[
+                {"is_processing": False},
+                {"is_processing": True},
+                {"is_processing": False},
+            ]
+        )
+        mock_client.get.return_value = mock_response
+
+        available, total = await _query_slots(mock_client, 8080, timeout=2.0, model="Qwen3")
+        assert (available, total) == (2, 3)
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_zero_on_http_400(self):
+        """Without a model param a 400 response yields (0, 0) — the original bug."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from proxy.observability import _query_slots
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock(status_code=400)
+        mock_response.json = MagicMock(return_value={"error": {"message": "model name is missing"}})
+        mock_client.get.return_value = mock_response
+
+        available, total = await _query_slots(mock_client, 8080, timeout=2.0)
+        assert (available, total) == (0, 0)

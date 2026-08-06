@@ -207,17 +207,26 @@ def log_response_chunk(
     model: str | None = None,
     provider: str | None = None,
     body_json: dict | bytes | None = None,
+    entry: str | None = None,
 ) -> None:
     """Log streaming response chunk.
 
     The ContentOnlyConsoleHandler no longer displays streaming content to the
     console (LP-0MR90HJED005WI1Z). Raw JSON is written to the log file only.
 
+    Per-chunk ``STREAM CHUNK | ...`` lines are logged at DEBUG level by
+    default so normal (INFO-level) operation does not write millions of
+    chunk lines per day (LP-0MS9GAN2P002NR4M). When verbose chunk logging is
+    enabled (config ``logging.verbose_chunks`` or ``LLAMA_PROXY_VERBOSE=1``),
+    they are emitted at INFO level for debugging stream issues.
+
     If the chunk contains a ``finish_reason`` in any ``choices[]`` entry,
     an enhanced ``Stream finished: reason=<reason>`` log line is emitted
     so the stop reason (and optional token usage) appears in both console
-    and file logs. When *session_id*, *model*, and *provider* are provided,
-    they are appended to the log line.
+    and file logs. When *session_id*, *model*, *provider*, and *entry* are
+    provided, they are appended to the log line. *entry* carries the config
+    entry name (e.g. ``opencode-go-2-deepseek``) so per-account traffic is
+    attributable (LP-0MSC7F7BG0043TE1); it is omitted when absent.
 
     When *body_json* is provided, a request preview (first 80 characters of
     the first non-system user message) is included in the finished line.
@@ -225,7 +234,10 @@ def log_response_chunk(
     srv = _srv()
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
-        srv.logger.info(f"STREAM CHUNK | {chunk_str}")
+        if getattr(srv, "verbose_chunks", False):
+            srv.logger.info(f"STREAM CHUNK | {chunk_str}")
+        else:
+            srv.logger.debug(f"STREAM CHUNK | {chunk_str}")
     except Exception:
         pass
 
@@ -271,6 +283,8 @@ def log_response_chunk(
                     parts.append(f"provider={provider}")
                 if model:
                     parts.append(f"model={model}")
+                if entry:
+                    parts.append(f"entry={entry}")
                 if body_json is not None:
                     preview = _get_request_preview(body_json)
                     if preview:
@@ -285,6 +299,8 @@ def log_response_chunk(
                         _parts.append(f"session={session_id}")
                     if model:
                         _parts.append(f"model={model}")
+                    if entry:
+                        _parts.append(f"entry={entry}")
                     if isinstance(usage, dict):
                         ct = usage.get("completion_tokens")
                         if ct is not None:
@@ -727,6 +743,14 @@ async def _try_acquire_local_dispatch(
     Expired lease records (inactive and past their *expires_at* threshold)
     are cleaned before the occupancy check, freeing their slots.
 
+    Lock ordering: ``local_active_queries_lock`` is acquired before
+    ``local_dispatch_records_lock`` so the records-based occupancy count
+    and the ``local_active_queries`` counter check are atomic with respect
+    to all counter mutators. This matches the lock order used by
+    ``_increment_local_active_queries``/``_decrement_local_active_queries``
+    and prevents a TOCTOU false 503 under concurrent anonymous-session
+    increments (LP-0MS8ZM98R000M8AN).
+
     When *body_json* is provided, the lease timeout is extended adaptively
     based on the estimated prompt token count. This prevents mid-stream
     lease expiry during the cache prefill phase for large-context requests
@@ -743,44 +767,52 @@ async def _try_acquire_local_dispatch(
     lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
     now = time.monotonic()
 
+    # Lock ordering: acquire local_active_queries_lock BEFORE
+    # local_dispatch_records_lock so the occupancy count (records) and the
+    # active-counter check are atomic w.r.t. all counter mutators
+    # (_increment_local_active_queries / _decrement_local_active_queries,
+    # which themselves take the active lock first). This closes the TOCTOU
+    # window in which an anonymous-session increment could land between the
+    # records count and the counter check and falsely deny an explicit
+    # session that had a free slot (LP-0MS8ZM98R000M8AN).
     try:
-        async with srv.local_dispatch_records_lock:
-            # ... (cleaning, checking, acquiring logic)
-            for existing_key, record in list(srv.local_dispatch_records.items()):
-                if not record.get("active") and record.get("expires_at", 0) <= now:
-                    del srv.local_dispatch_records[existing_key]
-                    try:
-                        from proxy.session import _free_slot_assignment
-                        _free_slot_assignment(existing_key)
-                    except Exception:
-                        pass
+        async with srv.local_active_queries_lock:
+            async with srv.local_dispatch_records_lock:
+                # ... (cleaning, checking, acquiring logic)
+                for existing_key, record in list(srv.local_dispatch_records.items()):
+                    if not record.get("active") and record.get("expires_at", 0) <= now:
+                        del srv.local_dispatch_records[existing_key]
+                        try:
+                            from proxy.session import _free_slot_assignment
+                            _free_slot_assignment(existing_key)
+                        except Exception:
+                            pass
 
-            own_record = srv.local_dispatch_records.get(session_key)
-            own_has_lease = (
-                own_record is not None
-                and (
-                    own_record.get("active")
-                    or own_record.get("expires_at", 0) > now
+                own_record = srv.local_dispatch_records.get(session_key)
+                own_has_lease = (
+                    own_record is not None
+                    and (
+                        own_record.get("active")
+                        or own_record.get("expires_at", 0) > now
+                    )
                 )
-            )
 
-            if not own_has_lease:
-                occupied_by_others = 0
-                first_occupied_owner = None
-                for existing_key, record in srv.local_dispatch_records.items():
-                    if existing_key == session_key:
-                        continue
-                    if record.get("active") or record.get("expires_at", 0) > now:
-                        occupied_by_others += 1
-                        if first_occupied_owner is None:
-                            first_occupied_owner = existing_key
+                if not own_has_lease:
+                    occupied_by_others = 0
+                    first_occupied_owner = None
+                    for existing_key, record in srv.local_dispatch_records.items():
+                        if existing_key == session_key:
+                            continue
+                        if record.get("active") or record.get("expires_at", 0) > now:
+                            occupied_by_others += 1
+                            if first_occupied_owner is None:
+                                first_occupied_owner = existing_key
 
-                if occupied_by_others >= max_local:
-                    active_count = getattr(srv, "local_active_queries", 0)
-                    retry_after = max(1.0, lease_timeout)
-                    return (False, first_occupied_owner, active_count, retry_after)
+                    if occupied_by_others >= max_local:
+                        active_count = getattr(srv, "local_active_queries", 0)
+                        retry_after = max(1.0, lease_timeout)
+                        return (False, first_occupied_owner, active_count, retry_after)
 
-            async with srv.local_active_queries_lock:
                 if srv.local_active_queries >= max_local and not own_has_lease:
                     active_owner = None
                     for ek, er in srv.local_dispatch_records.items():
@@ -796,14 +828,14 @@ async def _try_acquire_local_dispatch(
 
                 srv.local_active_queries += 1
 
-            srv.local_dispatch_records[session_key] = {
-                "backend": backend,
-                "started_at": now,
-                "active": True,
-                "expires_at": now + lease_timeout,
-            }
+                srv.local_dispatch_records[session_key] = {
+                    "backend": backend,
+                    "started_at": now,
+                    "active": True,
+                    "expires_at": now + lease_timeout,
+                }
 
-        return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
+            return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
     except Exception:
         return (True, None, 0, 1.0)
 
@@ -880,6 +912,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Normal idle timeout for inactive records
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # Free the slot registry entry so the slot can be
+                    # reused by a new session (LP-0MSB0RP7F000U0WJ)
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(sid)
+                    except Exception:
+                        pass
                     try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout",
@@ -891,6 +930,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Abandoned/orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # Free the slot registry entry so the slot can be
+                    # reused by a new session (LP-0MSB0RP7F000U0WJ)
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(sid)
+                    except Exception:
+                        pass
                     # Decrement local_active_queries for orphaned records
                     # that never completed through the normal request path
                     # (LP-0MRKVN93I000XXXX: cleanup orphaned active queries)

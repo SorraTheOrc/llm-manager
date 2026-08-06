@@ -7,7 +7,7 @@ consistently across environments.
 """
 import asyncio
 from collections.abc import Callable, Mapping
-from typing import Any, Optional
+from typing import Any
 
 try:
     from starlette.testclient import TestClient as _StarletteTestClient

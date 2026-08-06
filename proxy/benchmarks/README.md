@@ -53,7 +53,7 @@ python -m proxy.benchmarks.run_benchmark --candidate --config models.ini
 # Custom parameters
 python -m proxy.benchmarks.run_benchmark --candidate \
     --base-url http://localhost:8000 \
-    --model Qwen3 \
+    --model plan \
     --num-requests 20 \
     --concurrency 4 \
     --max-tokens 256 \
@@ -73,7 +73,7 @@ python -m proxy.benchmarks.run_benchmark --candidate \
 | `--config` | — | Path to `models.ini` (for quantization info) |
 | `--output` | `<run_type>_<timestamp>.json` | Output file path |
 | `--base-url` | `http://localhost:8000` | Proxy base URL |
-| `--model` | `Qwen3` | Model name to benchmark |
+| `--model` | `plan` | Model name to benchmark. Use a configured alias (`plan`, `author`, `code`) — `Qwen3` does NOT resolve to a model config, so requests bypass `proxy_with_fallback` smart routing (no routing clamp, no remote fallback) and are dispatched directly to local. |
 | `--num-requests` | `5` | Number of requests to send |
 | `--concurrency` | `1` | Concurrent request count |
 | `--max-tokens` | `128` | Max tokens per response |
@@ -117,6 +117,99 @@ bash proxy/benchmarks/prometheus_snapshot.sh \
     --interval 10 \
     --admin-port 8080
 ```
+
+## Large-prompt prefill validation (ctx-size evaluation)
+
+The harness supports validating prefill at 30K–120K token prompt sizes before
+any configuration evaluation is trusted (F1: LP-0MSC95VTC008GVR7).
+
+### Fixtures
+
+Large-prompt fixtures live in `proxy/benchmarks/large_prompts.json` — a JSON
+dict of named prompts (`30k`, `60k`, `90k`, `120k`) generated deterministically
+(seeded RNG, English prose ≈3 chars/token) by
+`generate_large_prompt_fixture()`. Regenerate with:
+
+```python
+from benchmarks.slot_benchmark import generate_large_prompt_fixture, save_large_prompt_fixture
+prompts = {f"{n//1000}k": generate_large_prompt_fixture(token_target=n) for n in (30000, 60000, 90000, 120000)}
+save_large_prompt_fixture("proxy/benchmarks/large_prompts.json", prompts)
+```
+
+### Dry-run sweep (no requests sent)
+
+Validates that all large prompts load, fit within the configured ctx-size, and
+that the output JSON schema is consumable by `compare_results.py`:
+
+```bash
+python -m proxy.benchmarks.run_benchmark --baseline --dry-run \
+    --prompts proxy/benchmarks/large_prompts.json \
+    --output /tmp/dry_run_sweep.json --model plan
+```
+
+Completes in well under 15 minutes (typically <1s). `ctx_size` is read from
+the per-model `ctx-size` in `models.ini`; prompts whose estimated token count
+exceeds ctx-size produce a warning.
+
+### Live prefill sweep with memory capture
+
+Reproducible command sequence to drive real prefill at 30K–120K and capture
+GPU/KV memory during the run:
+
+```bash
+# 1. (Optional) record GPU/system memory during the run in a background shell:
+bash proxy/benchmarks/prometheus_snapshot.sh --output /tmp/metrics.txt --interval 10 &
+
+# 2. Send one request per large prompt size (adjust --num-requests as needed):
+python -m proxy.benchmarks.run_benchmark --baseline \
+    --prompts proxy/benchmarks/large_prompts.json \
+    --num-requests 4 --max-tokens 128 \
+    --output /tmp/large_prompt_sweep.json --model plan
+
+# 3. Inspect the summary (prefill throughput = t/s, TTFT, P95):
+python -m proxy.benchmarks.compare_results /tmp/dry_run_sweep.json /tmp/large_prompt_sweep.json
+```
+
+Note: `prometheus_snapshot.sh` captures GPU VRAM (rocm-smi) and system memory
+always; `llama_kv_cache_used_bytes`/`llama_kv_cache_capacity_bytes` from
+`/metrics` require llama-server to be started with `--metrics`. The `/slots`
+endpoint exposes per-slot `n_ctx`/`n_past` regardless.
+
+### slot_benchmark.py cold vs warm phases
+
+The slot-count benchmark (`slot_benchmark.py`) supports production-
+representative measurements:
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--clean-cache` | OFF | Clear slot cache before a run. Default OFF preserves production's warm `slot-save-path` persistence; use `--clean-cache` only for cold-start characterization. |
+| `--phase cold\|warm` | `cold` | Records which measurement phase produced the JSON output. Warm = steady-state (≥30 min live traffic / ≥20 completed local turns); cold = first runs post-restart. |
+| restart timestamps | — | `proxy_restart_time` and `llama_ready_time` ISO timestamps are recorded in each run's JSON `config` for reproducible measurement windows. |
+
+```bash
+# Warm steady-state run, preserving the live slot cache:
+python -m proxy.benchmarks.slot_benchmark --slots 6 --phase warm
+
+# Cold-start run with a clean slate:
+python -m proxy.benchmarks.slot_benchmark --slots 6 --phase cold --clean-cache
+```
+
+### Measured findings (ctx-size eval F2/F3, 2026-08-04)
+
+1. **Routing-estimate tokenizer mismatch**: the large-prompt fixtures (seeded
+   prose, `large_prompts.json`) tokenize ~1.69x higher under Qwen3's native
+   tokenizer than tiktoken cl100k estimates (90930 chars → est 22732, actual
+   38529). Prompts can pass the routing clamp yet exceed the KV slot → llama-server
+   HTTP 400 → remote fallback. See `docs/llama-router.md`.
+2. **Cold vs warm collapse**: a 30K local prefill takes 222.7s cold (re-prefill
+   storm) vs 8.6s warm — measure both phases, report the warm (steady-state)
+   number as production-representative.
+3. **Large local prefills are slow**: a 60K prompt (~77K actual tokens) takes
+   ~600s to prefill locally in cold AND warm; >2-min prefills can trip the proxy's
+   dispatch-lease orphan_cleanup (restarting the prefill). Configs admitting
+   >40K prompts expose this.
+4. **KV memory is total-ctx-bound, not slot-bound** (q8_0, 10 layers): 131072
+   total ctx → 1362.7 MiB KV; 262144 → ~2720 MiB, regardless of slot split.
 
 ## Gating Policy
 

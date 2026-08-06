@@ -73,6 +73,40 @@ get_ctx_size() {
 }
 
 ##
+# Helper: read a generic per-model key from models.ini (single value)
+# Usage: get_model_key <model-name> <key> [models-ini-path]
+# Returns the value, or empty string if not found.
+##
+get_model_key() {
+  local target_model="$1"
+  local target_key="$2"
+  local ini_file="${3:-models.ini}"
+
+  if [[ ! -f "$ini_file" ]]; then
+    return 1
+  fi
+
+  # Use awk to find the matching [section] and extract the key
+  # Case-insensitive section and key matching
+  awk -v target="$target_model" -v key="$target_key" 'BEGIN { found=0; val="" }
+  /^\[/ {
+    gsub(/\[|\]/, "")
+    if (tolower($0) == tolower(target)) {
+      found=1
+    } else {
+      found=0
+    }
+  }
+  found && tolower($1) == tolower(key) {
+    sub(/^[^=]*=/, "")
+    gsub(/^[ \t]+|[ \t]+$/, "")
+    val=$0
+    exit
+  }
+  END { if (val != "") print val }' "$ini_file"
+}
+
+##
 # Helper: read hf-repo from models.ini for a given model name
 # Usage: get_hf_repo <model-name> [models-ini-path]
 ##
@@ -164,6 +198,7 @@ if [[ "$router_mode" -eq 1 ]]; then
     --host 0.0.0.0
     --no-mmap
     -ngl "$GLOBAL_NGL"
+    --threads "${LLAMA_THREADS:-8}"
     --port $PORT
   )
 
@@ -297,6 +332,26 @@ else
 fi
 
 ##
+# Override CACHE_TYPE_K/V from models.ini if available (single source of truth)
+# (LP-0MSDCLQ2W001LGWC: KV-cache quantization for decode speed)
+# llama-server defaults to f16 when the flags are absent.
+##
+CACHE_TYPE_K=$(get_model_key "$model" "cache-type-k" "$MODELS_INI_FILE" 2>/dev/null || true)
+CACHE_TYPE_V=$(get_model_key "$model" "cache-type-v" "$MODELS_INI_FILE" 2>/dev/null || true)
+if [[ -n "$CACHE_TYPE_K" ]]; then
+  echo "Read cache-type-k=$CACHE_TYPE_K from $MODELS_INI_FILE for model '$model'"
+else
+  CACHE_TYPE_K="f16 (default)"
+  echo "No cache-type-k found in $MODELS_INI_FILE for model '$model'; using f16 (default)"
+fi
+if [[ -n "$CACHE_TYPE_V" ]]; then
+  echo "Read cache-type-v=$CACHE_TYPE_V from $MODELS_INI_FILE for model '$model'"
+else
+  CACHE_TYPE_V="f16 (default)"
+  echo "No cache-type-v found in $MODELS_INI_FILE for model '$model'; using f16 (default)"
+fi
+
+##
 # Log the config
 ##
 echo "Server Environment"
@@ -309,6 +364,8 @@ echo "REPOID=$REPOID"
 echo "MODEL=$MODEL"
 echo "QUANTIZATION=$QUANTIZATION"
 echo "CONTEXT=$CONTEXT"
+echo "CACHE_TYPE_K=$CACHE_TYPE_K"
+echo "CACHE_TYPE_V=$CACHE_TYPE_V"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo
 echo "TEMP=$TEMP"
@@ -349,7 +406,7 @@ echo "Using llama-server binary: $LLAMA_BIN"
     --batch-size $BATCH_SIZE
     --ubatch-size ${UBATCH_SIZE:-$BATCH_SIZE}
     -np "$LLAMA_PARALLEL"
-    -ngl "$GLOBAL_NGL"
+    -ngl "${GLOBAL_NGL:-0}"
     --no-mmap
     --parallel "$LLAMA_PARALLEL"
     $EXTRA_CMD_SWITCHES
@@ -358,6 +415,13 @@ echo "Using llama-server binary: $LLAMA_BIN"
     --host 0.0.0.0
     --port $PORT
   )
+
+if [[ "$CACHE_TYPE_K" != "f16 (default)" ]]; then
+  LLAMA_CMD+=(--cache-type-k "$CACHE_TYPE_K")
+fi
+if [[ "$CACHE_TYPE_V" != "f16 (default)" ]]; then
+  LLAMA_CMD+=(--cache-type-v "$CACHE_TYPE_V")
+fi
 
 if [[ -n "${LLAMA_SLOT_SAVE_PATH:-}" ]]; then
   mkdir -p "$LLAMA_SLOT_SAVE_PATH"

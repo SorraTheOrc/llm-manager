@@ -28,19 +28,42 @@ test.describe('Diagnostic Tests', () => {
     console.log('Has statusMessage element:', statusMessageExists);
   });
 
-  test('check SSE endpoint directly', async ({ request }) => {
-    // Test the /events endpoint directly
-    const response = await request.get('/events', {
-      headers: {
-        'Accept': 'text/event-stream'
+  test('check SSE endpoint directly', async ({ page }) => {
+    // /events is an infinite SSE stream; request.get() awaits the full body
+    // and would never resolve. Instead, open the stream in the browser, read
+    // the first chunk (proving the endpoint is live and SSE-formatted), then
+    // abort the connection (LP-0MSGA6SKI0085UO6).
+    await page.goto('/');
+    const result = await page.evaluate(async () => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(`${location.origin}/events`, {
+          headers: { 'Accept': 'text/event-stream' },
+          signal: controller.signal,
+        });
+        const reader = response.body.getReader();
+        const { value } = await reader.read();
+        const firstChunk = value ? new TextDecoder().decode(value) : '';
+        return {
+          status: response.status,
+          contentType: response.headers.get('content-type'),
+          firstChunk,
+        };
+      } finally {
+        clearTimeout(timeout);
+        controller.abort();
       }
     });
-    
-    console.log('SSE endpoint status:', response.status());
-    console.log('SSE content-type:', response.headers()['content-type']);
-    
+
+    console.log('SSE endpoint status:', result.status);
+    console.log('SSE content-type:', result.contentType);
+    console.log('SSE first chunk:', JSON.stringify(result.firstChunk));
+
     // We can't easily read SSE with request API, but we can check it exists
-    expect(response.status()).toBe(200);
+    expect(result.status).toBe(200);
+    expect(result.contentType || '').toContain('text/event-stream');
+    expect(result.firstChunk.length).toBeGreaterThan(0);
   });
 
   test('check JavaScript for SSE code', async ({ page }) => {

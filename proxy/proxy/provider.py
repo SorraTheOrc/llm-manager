@@ -7,14 +7,18 @@ Provides:
 - `resolve_provider()`: Select the next available provider for a model config
 - `proxy_with_remote_fallback()`: Remote provider fallback loop
 - Cooldown tracking: Mark providers as temporarily unavailable after failures
+- Timed access: Skip providers outside their configured `available_times` UTC
+  windows (LP-0MS4ETBNO0022QAC)
 """
 
 import asyncio
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException, Response
@@ -43,6 +47,26 @@ _BACKOFF_MAX_SECONDS = 45.0
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details.
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+
+# ---------------------------------------------------------------------------
+# Timed access to models (LP-0MS4ETBNO0022QAC)
+#
+# Provider entries may carry an optional ``available_times`` list of
+# "HH:MM-HH:MM" windows (interpreted in UTC, end exclusive, overnight ranges
+# wrap past midnight). A provider whose current UTC time is outside all of its
+# windows is skipped during fallback resolution exactly like a provider in
+# cooldown. Providers without ``available_times`` remain unrestricted
+# (backward compatible).
+#
+# Malformed window strings are logged and treated as unrestricted (fail-open)
+# so a config typo never breaks proxy startup.
+# ---------------------------------------------------------------------------
+
+# Lazy parse cache: tuple(raw window strings) -> tuple((start_min, end_min), ...)
+# or None when the provider is unrestricted. Keyed by the raw strings so the
+# unhashable provider dict is never used as a key.
+_NOT_CACHED = object()
+_WINDOW_PARSE_CACHE: dict[tuple[str, ...], tuple[tuple[int, int], ...] | None] = {}
 
 # ---------------------------------------------------------------------------
 # Three-tier retry system (LP-0MRE8G94H005ZBLV, LP-0MRFEXXVC001RYKB)
@@ -167,9 +191,24 @@ def _extract_cached_tokens_from_sse_text(sse_text: str) -> int:
 
     Returns 0 when no usage data is found.
     """
+    usage = _extract_usage_from_sse_text(sse_text)
+    return _extract_cached_tokens_from_usage(usage)
+
+
+def _extract_usage_from_sse_text(sse_text: str) -> dict | None:
+    """Extract the full usage dict from SSE response text.
+
+    Parses each ``data:`` line looking for a ``usage`` field. The usage
+    event is typically carried in the final chunk of an SSE stream
+    alongside ``finish_reason``. Returns the LAST usage dict found (the
+    final chunk is authoritative) or None when absent.
+
+    (LP-0MS9GAN2P009KK6G: wire real cached_tokens from local responses)
+    """
     if not sse_text:
-        return 0
+        return None
     import json
+    last_usage: dict | None = None
     for line in sse_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -179,13 +218,11 @@ def _extract_cached_tokens_from_sse_text(sse_text: str) -> int:
             continue
         try:
             data = json.loads(payload)
-            if isinstance(data, dict) and "usage" in data:
-                cached = _extract_cached_tokens_from_usage(data.get("usage"))
-                if cached > 0:
-                    return cached
+            if isinstance(data, dict) and isinstance(data.get("usage"), dict):
+                last_usage = data["usage"]
         except (json.JSONDecodeError, Exception):
             continue
-    return 0
+    return last_usage
 
 
 def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
@@ -264,6 +301,35 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         return max(1, total_bytes // 1)
 
 
+def _get_token_estimate_multiplier(config: dict, model_config: dict | None = None) -> float:
+    """Server-level ``token_estimate_multiplier`` with per-model override.
+
+    Accounts for tokenizer mismatch between tiktoken (cl100k) and the local
+    model's native tokenizer. The ctx-size evaluation (LP-0MSAOQTJS000FFVM)
+    found cl100k undercounts Qwen3 native tokens ~1.69x for dense prose, so
+    routing clamps and the persistence cap must compare Qwen3-native token
+    counts (LP-0MSEGPO77005CYCQ F2).
+
+    Resolution order:
+    1. Per-model ``token_estimate_multiplier`` on the model entry (wins).
+    2. Server-level ``token_estimate_multiplier`` in the server config.
+    3. 1.0 (no adjustment) when neither is set.
+    """
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    try:
+        server_mult = float(server_cfg.get("token_estimate_multiplier", 1.0) or 1.0)
+    except (ValueError, TypeError):
+        server_mult = 1.0
+    if model_config:
+        try:
+            model_mult = float(model_config.get("token_estimate_multiplier", 1.0) or 1.0)
+        except (ValueError, TypeError):
+            model_mult = 1.0
+        if model_mult != 1.0:
+            return model_mult
+    return server_mult
+
+
 def _get_large_context_threshold(config: dict) -> int:
     """Read the large-context fallback threshold from config.
 
@@ -309,6 +375,293 @@ def _get_warm_cache_threshold(config: dict) -> int:
         return max(0, int(val or 0))
     except (ValueError, TypeError):
         return 0
+
+
+def _get_local_model_ctx_size(config: dict) -> int:
+    """Read the local model's total context size (across all slots).
+
+    Mirrors the per-model ``ctx-size`` in models.ini for the local model
+    (LP-0MSAZXXDY005AWA1). Used to compute the actual per-slot context
+    (ctx_size / active_slots) which clamps the large-context routing
+    thresholds. 0 disables the clamp.
+    """
+    val = config.get("local_model_ctx_size")
+    if val is None:
+        val = config.get("server", {}).get("local_model_ctx_size", 0)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _get_active_local_slots(config: dict) -> int:
+    """Return the number of currently active local slots.
+
+    Prefers the live slot scheduler (schedule-aware) when available;
+    otherwise falls back to ``session_slot_pool_size`` from config.
+    Returns 1 as a safe default when nothing is configured.
+    """
+    # Live slot scheduler (schedule-aware; e.g. 6 day / 8 night).
+    try:
+        import proxy.server as _srv
+
+        scheduler = getattr(_srv, "slot_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "get_active_slot"):
+            slots = scheduler.get_active_slot()
+            if slots and int(slots) > 0:
+                return int(slots)
+    except Exception:
+        pass
+
+    server_cfg = config.get("server", config)
+    try:
+        val = server_cfg.get("session_slot_pool_size")
+        if val is not None and int(val) > 0:
+            return int(val)
+    except (ValueError, TypeError):
+        pass
+    return 1
+
+
+# Default fraction of the effective per-slot context at which the proxy
+# emits a session-context-pressure warning suggesting compaction
+# (LP-0MSDCLQ2W001LGWC). Configurable via ``context_pressure_warn_ratio``
+# on the server config; 0 disables the warning.
+_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
+
+
+def _get_context_pressure_warn_ratio(config: dict) -> float:
+    """Read the context-pressure warning ratio from config.
+
+    Supports both nested (server.*) and flat keys. 0 disables the warning.
+    Defaults to ``_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO`` (0.8).
+    """
+    val = config.get("context_pressure_warn_ratio")
+    if val is None:
+        val = config.get("server", {}).get(
+            "context_pressure_warn_ratio", _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
+        )
+    try:
+        ratio = float(val or 0)
+    except (ValueError, TypeError):
+        return _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
+    return max(0.0, ratio)
+
+
+def context_pressure_ratio(estimated_tokens: int, ctx_size: int, slots: int) -> float:
+    """Fraction of the effective per-slot context consumed by a session.
+
+    Uses the same per-slot computation as the routing clamp
+    (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``); returns 0.0
+    when the computation is not meaningful (ctx_size <= 0 or per-slot leaves
+    no room for output tokens).
+
+    Args:
+        estimated_tokens: Session estimated prompt/context tokens.
+        ctx_size: Total local model context (``local_model_ctx_size``).
+        slots: Active local slot count.
+
+    Returns:
+        A float ratio (0.0 when disabled; > 1.0 when the session exceeds
+        the effective per-slot context).
+    """
+    cap = effective_per_slot_threshold(ctx_size, slots)
+    if cap <= 0 or estimated_tokens <= 0:
+        return 0.0
+    return estimated_tokens / cap
+
+
+def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
+    """Whether a session at ``estimated_tokens`` should trigger the
+    context-pressure compaction warning.
+
+    Uses the effective per-slot context (clamped with output headroom) and
+    the configured ``context_pressure_warn_ratio`` (default 0.8). Returns
+    False when the clamp is disabled (ctx_size 0), the ratio is 0, or the
+    session is below the ratio.
+
+    Args:
+        estimated_tokens: Session estimated prompt/context tokens.
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        True when the session should be flagged for compaction.
+    """
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0 or estimated_tokens <= 0:
+        return False
+    slots = _get_active_local_slots(config)
+    ratio = _get_context_pressure_warn_ratio(config)
+    if ratio <= 0:
+        return False
+    return context_pressure_ratio(estimated_tokens, ctx_size, slots) >= ratio
+
+
+# Output-token headroom reserved below the per-slot context when clamping
+# routing thresholds (LP-0MSAZXXDY005AWA1). Ensures prompts routed local
+# leave room for the model's completion tokens in the KV slot.
+_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096
+
+# Default minimum effective per-slot large-context routing threshold.
+# Below this, every realistic agent session exceeds the clamp and ALL local
+# traffic silently bypasses to remote (LP-0MSAOQTJS000FFVM failure mode).
+# Configurable via ``min_local_routing_threshold`` on the server config.
+_DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD = 10000
+
+
+def effective_per_slot_threshold(ctx_size: int, slots: int) -> int:
+    """Compute the effective per-slot large-context routing threshold.
+
+    Mirrors the clamp applied by ``_effective_large_context_thresholds``:
+    ``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM`` (LP-0MSAZXXDY005AWA1).
+
+    Returns 0 when the computation is not meaningful:
+    - ``ctx_size`` <= 0 (clamp disabled)
+    - ``slots`` <= 0
+    - per-slot context does not leave room for output tokens
+      (per_slot <= headroom)
+    """
+    if ctx_size <= 0 or slots <= 0:
+        return 0
+    per_slot = ctx_size // slots
+    if per_slot <= _LOCAL_ROUTING_OUTPUT_HEADROOM:
+        return 0
+    return per_slot - _LOCAL_ROUTING_OUTPUT_HEADROOM
+
+
+def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
+    """Return (cold, warm) thresholds clamped to the actual per-slot context.
+
+    The configured cold/warm thresholds were tuned assuming a fixed per-slot
+    context (e.g. 65000). When the real per-slot context is smaller
+    (``local_model_ctx_size`` / active slots, minus output headroom), prompts
+    larger than the slot capacity would be routed local and truncate with
+    ``finish_reason=length`` (context exhaustion) — surfaced by pi as the
+    misleading "maximum output token limit" error (LP-0MSAZXXDY005AWA1).
+
+    Clamping the effective thresholds to the actual per-slot context makes
+    oversized prompts fall through to remote BEFORE context exhaustion.
+
+    Returns the configured thresholds unchanged when ``local_model_ctx_size``
+    is 0 (clamp disabled) or per-slot context cannot be computed.
+    """
+    cold = _get_large_context_threshold(config)
+    warm = _get_warm_cache_threshold(config)
+    ctx_size = _get_local_model_ctx_size(config)
+    slots = _get_active_local_slots(config)
+
+    cap = effective_per_slot_threshold(ctx_size, slots)
+    if cap <= 0:
+        return cold, warm
+
+    if cold > 0:
+        cold = min(cold, cap)
+    if warm > 0:
+        warm = min(warm, cap)
+    return cold, warm
+
+
+def _collect_local_slot_counts(config: dict) -> list[int]:
+    """All slot counts the proxy may run with: static pool + schedule entries.
+
+    Returns the static ``session_slot_pool_size`` (when > 0) followed by the
+    ``slots`` value of every entry in an enabled ``slot_schedule``. Slot counts
+    are de-duplicated while preserving order.
+    """
+    server_cfg = config.get("server", config)
+    counts: list[int] = []
+    try:
+        pool = int(server_cfg.get("session_slot_pool_size", 0) or 0)
+    except (ValueError, TypeError):
+        pool = 0
+    if pool > 0:
+        counts.append(pool)
+
+    try:
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        schedule = SlotScheduleConfig.from_server_config(server_cfg)
+    except Exception:
+        schedule = None
+    if schedule is not None and schedule.enabled:
+        for entry in schedule.entries:
+            if entry.slots > 0 and entry.slots not in counts:
+                counts.append(entry.slots)
+    return counts
+
+
+def _get_min_local_routing_threshold(config: dict) -> int:
+    """Read the minimum effective per-slot routing threshold from config.
+
+    Supports both nested and flat config keys. Defaults to
+    ``_DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD`` (10000). An explicit 0 disables
+    the minimum check (consistent with ``local_model_ctx_size: 0`` disabling
+    the clamp).
+    """
+    val = config.get("min_local_routing_threshold")
+    if val is None:
+        val = config.get("server", {}).get(
+            "min_local_routing_threshold", _DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD
+        )
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return _DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD
+
+
+def validate_local_routing_config(config: dict) -> list[str]:
+    """Validate the ctx-size / slot-count routing clamp configuration.
+
+    Computes the effective per-slot large-context routing threshold
+    (``local_model_ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``,
+    mirroring ``_effective_large_context_thresholds``) for EVERY slot count
+    the proxy may run with — the static ``session_slot_pool_size`` AND all
+    ``slot_schedule`` entries — and reports a problem when the threshold
+    falls below the configured minimum (default 10000 tokens).
+
+    A threshold this small means every realistic agent session exceeds the
+    clamp, silently bypassing ALL local traffic to remote providers (the
+    2026-08-02 failure mode, LP-0MSAOQTJS000FFVM).
+
+    Returns a list of human-readable problem descriptions (empty when the
+    config is consistent). When ``min_local_routing_threshold_fatal`` is
+    set, each problem is prefixed with ``FATAL: `` so callers can fail
+    startup; otherwise callers log a WARNING.
+    """
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return []  # clamp disabled; nothing to validate
+
+    min_threshold = _get_min_local_routing_threshold(config)
+    if min_threshold <= 0:
+        return []  # minimum check disabled (min_local_routing_threshold: 0)
+
+    fatal = bool(
+        config.get("server", {}).get("min_local_routing_threshold_fatal", False)
+        or config.get("min_local_routing_threshold_fatal", False)
+    )
+
+    problems: list[str] = []
+    for slots in _collect_local_slot_counts(config):
+        threshold = effective_per_slot_threshold(ctx_size, slots)
+        if threshold <= 0:
+            # Per-slot context leaves no room for output tokens; the clamp
+            # leaves thresholds unchanged rather than clamping, so nothing
+            # below the minimum can be derived here.
+            continue
+        if threshold < min_threshold:
+            msg = (
+                f"local_model_ctx_size={ctx_size} with {slots} slots yields "
+                f"effective per-slot large-context routing threshold "
+                f"{threshold} ({ctx_size}//{slots} - "
+                f"{_LOCAL_ROUTING_OUTPUT_HEADROOM} headroom), below the "
+                f"minimum of {min_threshold}. Every prompt above {threshold} "
+                f"tokens bypasses local to remote, silently disabling local "
+                f"routing (LP-0MSAOQTJS000FFVM). Increase ctx-size or reduce "
+                f"slots."
+            )
+            problems.append(f"FATAL: {msg}" if fatal else msg)
+    return problems
 
 
 async def _estimate_effective_prompt_tokens_for_routing(
@@ -444,7 +797,10 @@ def resolve_provider(
     Iterates through the model's ordered `providers` list and returns the
     first provider that:
     - Is not the `failed_provider` (if specified)
-    - Is not in cooldown (if marked unavailable)
+    - Does not share the failed provider's failure domain (same endpoint /
+      brand — LP-0MSG45I8Q0020N1F)
+    - Is not in cooldown (entry name OR provider brand —
+      LP-0MSG45LOO007K236)
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
@@ -460,11 +816,44 @@ def resolve_provider(
     if not providers:
         return None
 
+    # When a provider failed, also skip any OTHER entry sharing its failure
+    # domain (normalized endpoint, or brand for local providers) so the chain
+    # hops to a genuinely different gateway rather than retrying the same one
+    # through a second API key (LP-0MSG45I8Q0020N1F).
+    failed_domain: str | None = None
+    if failed_provider:
+        for candidate in providers:
+            if isinstance(candidate, dict) and candidate.get("name") == failed_provider:
+                failed_domain = _failure_domain_key(candidate)
+                break
+
     for provider_cfg in providers:
         name = provider_cfg.get("name", "")
         if failed_provider and name == failed_provider:
             continue
-        if _is_provider_unavailable(name):
+        if failed_domain is not None and _failure_domain_key(provider_cfg) == failed_domain:
+            logger.info(
+                "Skipping provider=%s: same failure domain as %s (%s)",
+                name,
+                failed_provider,
+                failed_domain,
+            )
+            continue
+        cooldown_key = _entry_cooldown_key(provider_cfg)
+        if cooldown_key is not None:
+            remaining = _provider_cooldown_remaining(cooldown_key)
+            logger.info(
+                "Skipping provider=%s: %s in cooldown (%ds remaining)",
+                name,
+                cooldown_key,
+                remaining,
+            )
+            continue
+        if not _is_within_allowed_window(provider_cfg):
+            logger.info(
+                "Skipping provider=%s: outside its available_times window (UTC)",
+                name,
+            )
             continue
         return provider_cfg
 
@@ -576,6 +965,31 @@ def _reset_provider_failure_count(provider_name: str) -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _provider_cooldown_remaining(provider_name: str) -> int:
+    """Return the remaining cooldown seconds for a provider key.
+
+    Returns 0 when the provider is not in cooldown or its cooldown has
+    expired.  Expired entries are cleaned up lazily.
+
+    A cooldown with less than one second remaining still reports ``1`` so
+    entries are not treated as expired early (the exponential-backoff base
+    cooldown is 1.0s).
+
+    This check is global — it reads from the shared module-level dict, so
+    any session calling this function sees the same cooldown state. There is
+    no per-session isolation of cooldown state.
+    """
+    expiry = _provider_unavailable_until.get(provider_name)
+    if expiry is None:
+        return 0
+    remaining = expiry - time.time()
+    if remaining <= 0:
+        # Cooldown expired — clean up entry
+        del _provider_unavailable_until[provider_name]
+        return 0
+    return int(remaining) if remaining >= 1 else 1
+
+
 def _is_provider_unavailable(provider_name: str) -> bool:
     """Check if a provider is currently in cooldown.
 
@@ -586,14 +1000,139 @@ def _is_provider_unavailable(provider_name: str) -> bool:
     any session calling this function sees the same cooldown state. There is
     no per-session isolation of cooldown state.
     """
-    expiry = _provider_unavailable_until.get(provider_name)
-    if expiry is None:
-        return False
-    if time.time() >= expiry:
-        # Cooldown expired — clean up entry
-        del _provider_unavailable_until[provider_name]
-        return False
-    return True
+    return _provider_cooldown_remaining(provider_name) > 0
+
+
+def _entry_cooldown_key(provider_cfg: dict) -> str | None:
+    """Return the cooldown key under which a provider entry is unavailable.
+
+    Checks BOTH the entry name and the provider brand (LP-0MSG45LOO007K236):
+    the Tier-3 stall circuit breaker marks the provider BRAND (e.g.
+    ``opencode-go``) unavailable via ``mark_provider_unavailable()``, but the
+    fallback resolvers previously only checked the ENTRY name
+    (``opencode-go-2-deepseek``).  The brand key was never consulted, so the
+    breaker cooldown never blocked the entries pointing at the broken gateway.
+
+    Returns the cooldown key (entry name or brand) that is currently cooling
+    down, or ``None`` if the entry is eligible.
+    """
+    name = provider_cfg.get("name", "")
+    if _is_provider_unavailable(name):
+        return name
+    brand = provider_cfg.get("provider")
+    if brand and _is_provider_unavailable(brand):
+        return brand
+    return None
+
+
+def _parse_window(window_str: str) -> tuple[int, int] | None:
+    """Parse a single ``"HH:MM-HH:MM"`` window string (UTC).
+
+    Returns ``(start_minutes, end_minutes)`` since midnight, or ``None`` for
+    malformed input. End times are exclusive; overnight ranges (``end < start``)
+    wrap past midnight.
+    """
+    try:
+        start_str, end_str = window_str.split("-", 1)
+        start_h, start_m = start_str.split(":")
+        end_h, end_m = end_str.split(":")
+        start_h, start_m, end_h, end_m = int(start_h), int(start_m), int(end_h), int(end_m)
+        if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
+            return None
+        if not (0 <= start_m <= 59 and 0 <= end_m <= 59):
+            return None
+        return (start_h * 60 + start_m, end_h * 60 + end_m)
+    except Exception:
+        return None
+
+
+def _parse_available_times(provider_cfg: dict) -> tuple[tuple[int, int], ...] | None:
+    """Parse a provider's ``available_times`` into window tuples.
+
+    Returns ``None`` when the provider has no usable windows (unrestricted),
+    otherwise a tuple of ``(start_minutes, end_minutes)`` windows in config
+    order. Malformed entries are logged and skipped; if *every* entry is
+    malformed the provider is treated as unrestricted (fail-open). Parsed
+    results are cached per unique list of raw strings.
+    """
+    raw = provider_cfg.get("available_times")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "available_times for provider %r must be a list of \"HH:MM-HH:MM\" "
+            "windows; ignoring (fail-open)",
+            provider_cfg.get("name", "?"),
+        )
+        return None
+
+    key = tuple(str(w) for w in raw)
+    cached = _WINDOW_PARSE_CACHE.get(key, _NOT_CACHED)
+    if cached is not _NOT_CACHED:
+        return cached
+
+    windows: list[tuple[int, int]] = []
+    for entry in raw:
+        parsed = _parse_window(str(entry))
+        if parsed is None:
+            logger.warning(
+                "Invalid available_times entry %r for provider %r; ignoring "
+                "(fail-open)",
+                entry, provider_cfg.get("name", "?"),
+            )
+            continue
+        windows.append(parsed)
+
+    result: tuple[tuple[int, int], ...] | None = tuple(windows) if windows else None
+    _WINDOW_PARSE_CACHE[key] = result
+    return result
+
+
+def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = None) -> bool:
+    """Return ``True`` when the provider may be used at the given UTC time.
+
+    Providers without ``available_times`` are always allowed (backward
+    compatible). Windows are ``"HH:MM-HH:MM"`` interpreted in **UTC**; window
+    start is inclusive, end is exclusive, and overnight ranges
+    (``"22:00-02:00"``) wrap past midnight. When *now_utc* is omitted the
+    current UTC wall-clock time is used.
+    """
+    windows = _parse_available_times(provider_cfg)
+    if windows is None:
+        return True
+    if now_utc is None:
+        now_utc = datetime.now(UTC)
+    current_min = now_utc.hour * 60 + now_utc.minute
+    for start_min, end_min in windows:
+        if start_min < end_min:
+            if start_min <= current_min < end_min:
+                return True
+        else:
+            # Overnight window wraps past midnight
+            if current_min >= start_min or current_min < end_min:
+                return True
+    return False
+
+
+def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
+    """Return ``{name, type}`` pairs for providers whose ``available_times``
+    window excludes the current UTC time.
+
+    Used to record ``outside_time_window`` diagnostics when a fallback chain is
+    exhausted. Providers actually attempted this request cannot be outside
+    their window (they were selected), so this set is exactly the providers
+    skipped solely due to time windows.
+    """
+    result: list[dict[str, str]] = []
+    for p in model_config.get("providers") or []:
+        if isinstance(p, dict) and not _is_within_allowed_window(p):
+            result.append({
+                "name": p.get("name", "unknown"),
+                "type": p.get("type", "remote"),
+            })
+    return result
 
 
 def _parse_retry_after(response: Response) -> float | None:
@@ -761,6 +1300,64 @@ def _add_resolved_model_header(response: Response, provider_cfg: dict) -> Respon
     return response
 
 
+def _is_reasoning_content_roundtrip_error(response: Response) -> bool:
+    """True when a response is the upstream thinking-mode reasoning_content 400.
+
+    Remote thinking-mode providers (Console opencode.ai/zen, Console Go
+    opencode.ai/zen/go, api.deepseek.com) reject multi-turn requests with this
+    HTTP 400 when any assistant message lacks the ``reasoning_content`` field
+    (LP-0MSGU3JNU0092AFQ). The message appears both wrapped by the Console
+    gateway ("Error from provider (Console Go): Upstream request failed:
+    [invalid_request_error] The `reasoning_content` ...") and verbatim from
+    api.deepseek.com. Match on the invariant substring rather than the exact
+    body so both variants are caught.
+    """
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return False
+    except Exception:
+        return False
+    body_l = _response_body_text(response).lower()
+    return (
+        "reasoning_content" in body_l
+        and "must be passed back" in body_l
+        and "thinking mode" in body_l
+    )
+
+
+def _build_reasoning_content_roundtrip_error() -> Response:
+    """Build the synthetic error returned instead of the raw upstream 400.
+
+    AC3 (LP-0MSGU3JNU0092AFQ): when the reasoning_content round-trip 400 still
+    occurs after the sanitizer repaired the payload (edge case) and all
+    fallback providers are exhausted, the proxy must not surface the raw
+    upstream body to the client. This synthetic 400 carries the cause and
+    remediation guidance instead.
+    """
+    payload = {
+        "error": {
+            "type": "proxy_error",
+            "code": "reasoning_content_roundtrip",
+            "message": (
+                "Upstream thinking-mode provider rejected the request: an "
+                "assistant message in the conversation history is missing "
+                "`reasoning_content`. The proxy has repaired the payload; if "
+                "this error persists, the conversation history cannot be "
+                "replayed to the thinking-mode provider."
+            ),
+            "suggested_action": (
+                "Retry the request. If it persists, compact the conversation "
+                "history or start a new session."
+            ),
+        }
+    }
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=400,
+        media_type="application/json",
+    )
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -797,6 +1394,42 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         except Exception:
             pass
 
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
+def _build_time_window_exhausted_response(
+    attempts: list[dict[str, Any]],
+    unavailable: dict[str, int],
+    any_provider_tried: bool,
+) -> Response | None:
+    """Return a distinguishable 503 when every provider was skipped solely due
+    to its configured ``available_times`` window.
+
+    The distinguishable response is used only when time windows are the *only*
+    reason nothing could be used: no provider was actually tried (no errors, no
+    cooldown recorded this request) and no provider is currently in cooldown.
+    Otherwise ``None`` is returned and the caller falls through to the generic
+    exhausted response (whose diagnostics still expose any
+    ``outside_time_window`` skips).
+    """
+    if any_provider_tried or unavailable:
+        return None
+    if not any(a.get("status") == "outside_time_window" for a in attempts):
+        return None
+
+    payload = {
+        "error": "All providers unavailable: no provider is available during the current scheduled time window",
+        "retry_after": 60,
+    }
+    if attempts:
+        try:
+            payload["diagnostics"] = attempts
+        except Exception:
+            pass
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
@@ -998,20 +1631,125 @@ def _is_local_lease_active_response(response) -> bool:
         return False
 
 
+def _has_next_provider(
+    model_config: dict,
+    attempted_provider_names: set[str],
+    excluded_domains: set[str] | None = None,
+) -> bool:
+    """True if at least one more provider remains untried (and not in cooldown).
+
+    Used to gate pre-content streaming pre-flight: re-route is only worthwhile
+    when the chain has a remaining provider to fall back to (LP-0MSETOTWY000SU0Z).
+    Accepts already-failed failure domains so same-gateway siblings are not
+    counted as a usable fallback (LP-0MSG45I8Q0020N1F).
+    """
+    return (
+        _resolve_provider_with_exclusions(
+            model_config,
+            attempted_provider_names,
+            excluded_domains,
+        )
+        is not None
+    )
+
+
+def _failure_domain_key(provider_cfg: dict) -> str:
+    """Return a canonical failure-domain key for a provider entry.
+
+    Remote entries key on the normalized ``endpoint`` URL: scheme and host
+    lowercased, default ports dropped, trailing slash and fragment stripped,
+    path case and query strings preserved. Local / no-endpoint entries fall
+    back to the ``provider`` brand, then to the entry name (last resort so
+    entries without either never share a key).
+
+    Entries that share a failure-domain key are treated as ONE failure domain:
+    a stall/terminal error on one entry excludes the whole domain from the
+    fallback chain / mid-stream re-route (LP-0MSG45I8Q0020N1F).
+    """
+    endpoint = provider_cfg.get("endpoint")
+    if endpoint:
+        normalized = _normalize_endpoint_for_failure_domain(str(endpoint))
+        if normalized:
+            return normalized
+    brand = provider_cfg.get("provider")
+    if brand:
+        return str(brand)
+    return str(provider_cfg.get("name") or "unknown")
+
+
+def _normalize_endpoint_for_failure_domain(endpoint: str) -> str | None:
+    """Normalize an endpoint URL into a canonical failure-domain key.
+
+    Lowercases scheme+host, drops default ports (80/443), strips a trailing
+    slash and any fragment, preserves path case and query strings. Returns
+    ``None`` when the URL cannot be parsed.
+    """
+    try:
+        parsed = urlsplit(endpoint)
+    except Exception:
+        return None
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.lower()
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    port = parsed.port
+    if port and port == default_port:
+        netloc = host
+    elif port:
+        netloc = f"{host}:{port}"
+    else:
+        netloc = host
+    path = parsed.path.rstrip("/")
+    # Keep query strings; drop the fragment.
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
+    excluded_domains: set[str] | None = None,
 ) -> dict | None:
-    """Resolve next available provider while excluding names tried this request."""
+    """Resolve next available provider while excluding names tried this request
+    and any entry sharing an already-failed failure domain.
+
+    ``excluded_domains`` holds failure-domain keys (see ``_failure_domain_key``)
+    that already stalled / terminally failed during THIS request, so the chain
+    skips straight past same-gateway API-key siblings (LP-0MSG45I8Q0020N1F).
+    """
     providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
         return None
+
+    excluded_domains = excluded_domains or set()
 
     for provider_cfg in providers:
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
             continue
-        if _is_provider_unavailable(name):
+        if _failure_domain_key(provider_cfg) in excluded_domains:
+            logger.info(
+                "Skipping provider=%s: same failure domain as an already-failed "
+                "entry (domain=%s)",
+                name,
+                _failure_domain_key(provider_cfg),
+            )
+            continue
+        cooldown_key = _entry_cooldown_key(provider_cfg)
+        if cooldown_key is not None:
+            remaining = _provider_cooldown_remaining(cooldown_key)
+            logger.info(
+                "Skipping provider=%s: %s in cooldown (%ds remaining)",
+                name,
+                cooldown_key,
+                remaining,
+            )
+            continue
+        if not _is_within_allowed_window(provider_cfg):
+            logger.info(
+                "Skipping provider=%s: outside its available_times window (UTC)",
+                name,
+            )
             continue
         return provider_cfg
     return None
@@ -1103,6 +1841,237 @@ def _record_attempt(attempts: list[dict[str, Any]], **fields) -> None:
     attempts.append(dict(fields))
 
 
+class StreamingPreContentError(Exception):
+    """Raised when a remote streaming response fails before delivering any
+    content-bearing chunk (stall-exhausted, empty response, or stream error).
+
+    The fallback chain catches this, marks the provider unavailable (Tier-2
+    cooldown), and routes to the next provider in the chain
+    (LP-0MSETOTWY000SU0Z / proxy/docs/error-analysis-2026-08-03.md
+    Recommendation 1).
+    """
+
+    def __init__(self, provider_name: str, reason: str):
+        self.provider_name = provider_name
+        self.reason = reason
+        super().__init__(f"pre-content stream failure for {provider_name}: {reason}")
+
+
+class StreamingRecoverableAfterReasoningError(Exception):
+    """Raised when a remote streaming response stalls AFTER delivering
+    reasoning_content but BEFORE any final-answer content (and with zero
+    tool_calls) was delivered.
+
+    This is the mid-stream re-route signal (LP-0MSF1PUM90099ZSW): the client
+    has not committed to a final answer (no final content chunk forwarded, no
+    tool-result round-trip), so the fallback chain can re-route the SAME
+    request to the next provider instead of surfacing an error that tells the
+    client to retry.
+
+    Tool-call-only stalls do NOT use this exception: once tool_calls are
+    delivered, re-routing would make the model re-plan the request, so they
+    terminate via the existing enriched-error path (operator decision Q1).
+    """
+
+    def __init__(self, provider_name: str, reason: str):
+        self.provider_name = provider_name
+        self.reason = reason
+        super().__init__(f"mid-stream stall after reasoning for {provider_name}: {reason}")
+
+
+def _classify_stream_chunk(chunk: bytes) -> tuple[bool, bool, bool, bool, bool]:
+    """Classify one raw SSE chunk for pre-content recovery pre-flight.
+
+    Returns ``(has_final_content, has_tool_calls, has_reasoning,
+    is_terminal_error, is_done)`` where:
+    - ``has_final_content``: the chunk carries a non-empty final-answer
+      ``content`` delta — the commit point for mid-stream re-route
+      (LP-0MSF1PUM90099ZSW).
+    - ``has_tool_calls``: the chunk carries a non-empty ``tool_calls`` delta
+      (intermediate; terminate-eligible).
+    - ``has_reasoning``: the chunk carries a non-empty ``reasoning_content``
+      delta (intermediate; re-route-eligible).
+    - ``is_terminal_error``: a choice carries ``finish_reason: "error"``.
+    - ``is_done``: a ``[DONE]`` marker or ``finish_reason: "stop"``.
+
+    Keep-alive comments (``: keep-alive``) and non-``data:`` lines are
+    ignored, so a stalled-but-alive stream yields all-False until either
+    content or a terminal event arrives.
+    """
+    has_final_content = False
+    has_tool_calls = False
+    has_reasoning = False
+    is_terminal_error = False
+    is_done = False
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        return False, False, False, False, False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            is_done = True
+            continue
+        try:
+            j = json.loads(payload)
+        except Exception:
+            continue
+        for choice in j.get("choices", []):
+            if not isinstance(choice, dict):
+                continue
+            fr = choice.get("finish_reason")
+            if fr == "error":
+                is_terminal_error = True
+            elif fr == "stop":
+                is_done = True
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            c = delta.get("content")
+            if isinstance(c, str) and c.strip():
+                has_final_content = True
+            tc = delta.get("tool_calls")
+            if isinstance(tc, list) and tc:
+                has_tool_calls = True
+            rc = delta.get("reasoning_content")
+            if isinstance(rc, str) and rc.strip():
+                has_reasoning = True
+    return has_final_content, has_tool_calls, has_reasoning, is_terminal_error, is_done
+
+
+async def _preflight_streaming_response(
+    response: Response,
+    request,
+    provider_name: str,
+) -> Response:
+    """Pre-consume a 2xx streaming response up to the commit point or a
+    terminal event, so a mid-stream failure can re-route.
+
+    Reads the response body iterator chunk-by-chunk, buffering intermediate
+    chunks (reasoning_content / tool_calls) WITHOUT forwarding them, until one
+    of:
+    - the commit point: a final-answer ``content`` chunk arrives → returns a
+      wrapped response that replays the buffered chunks in order then
+      continues the original iterator (LP-0MSF1PUM90099ZSW commit point);
+    - a terminal ``finish_reason: error`` event arrives with only
+      reasoning_content delivered (zero tool_calls, zero final content) →
+      raises :class:`StreamingRecoverableAfterReasoningError` so the fallback
+      chain re-routes to the next provider (buffer discarded);
+    - a terminal ``finish_reason: error`` event arrives with zero content of
+      any kind → raises :class:`StreamingPreContentError` (existing behavior,
+      LP-0MSETOTWY000SU0Z);
+    - a terminal ``finish_reason: error`` event arrives with tool_calls
+      delivered → returns the wrapped response as-is (replay buffer +
+      continue): the enriched error event reaches the client and the chain
+      does NOT re-route (operator decision Q1, tool-call-only stalls
+      terminate);
+    - the stream ends with zero content (empty response) → raises
+      :class:`StreamingPreContentError`;
+    - a stream exception occurs with zero content → raises
+      :class:`StreamingPreContentError`.
+
+    ``[DONE]`` / ``finish_reason: stop`` markers are consumed but do NOT
+    terminate the pre-flight: the upstream generator retries empty responses
+    internally (LP-0MRF77A0E0026B9T) and only yields a terminal error event
+    once those retries are exhausted, so the pre-flight keeps consuming until
+    content or that terminal error.
+
+    Args:
+        response: The candidate response from the remote provider.
+        request: The client request (for disconnect checks).
+        provider_name: Config entry name, used for the error signal.
+
+    Returns:
+        The (possibly wrapped) response to stream to the client.
+    """
+    if not _is_streaming_response(response) or int(getattr(response, "status_code", 0) or 0) >= 400:
+        return response
+
+    original = response.body_iterator
+    buffered: list[bytes] = []
+    saw_final_content = False
+    saw_tool_calls = False
+    saw_reasoning = False
+    disconnected = False
+    try:
+        while True:
+            try:
+                if await request.is_disconnected():
+                    disconnected = True
+                    break
+            except Exception:
+                pass
+            try:
+                chunk = await original.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as exc:
+                if not (saw_final_content or saw_tool_calls or saw_reasoning):
+                    raise StreamingPreContentError(
+                        provider_name,
+                        f"stream_exception:{type(exc).__name__}",
+                    ) from exc
+                break
+            buffered.append(chunk)
+            (
+                has_final_content,
+                has_tool_calls,
+                has_reasoning,
+                is_terminal_error,
+                _is_done,
+            ) = _classify_stream_chunk(chunk)
+            # Accumulate what has been delivered so far (buffered intermediate
+            # chunks count toward the stall classification decision).
+            saw_final_content = saw_final_content or has_final_content
+            saw_tool_calls = saw_tool_calls or has_tool_calls
+            saw_reasoning = saw_reasoning or has_reasoning
+            if has_final_content:
+                saw_final_content = True
+                break
+            if is_terminal_error:
+                if saw_tool_calls:
+                    # Tool-call-only stall: terminate via the enriched error
+                    # (replay buffer + continue; the error event is in the
+                    # stream). No re-route (operator decision Q1).
+                    break
+                if saw_reasoning:
+                    raise StreamingRecoverableAfterReasoningError(
+                        provider_name,
+                        "stall_after_reasoning",
+                    )
+                raise StreamingPreContentError(provider_name, "finish_reason:error")
+            # [DONE] / finish_reason: stop with zero content is NOT terminal
+            # here — the generator retries empty responses internally and only
+            # yields a terminal error event once those retries are exhausted
+            # (LP-0MRF77A0E0026B9T). Keep consuming.
+    except GeneratorExit:
+        raise
+
+    if disconnected:
+        # Client is gone — hand the (partially consumed) response back as-is;
+        # re-routing to another provider would be wasteful.
+        return response
+
+    if not (saw_final_content or saw_tool_calls or saw_reasoning):
+        raise StreamingPreContentError(provider_name, "empty_response")
+
+    async def _replay_and_continue():
+        for c in buffered:
+            yield c
+        async for c in original:
+            yield c
+
+    return StreamingResponse(
+        _replay_and_continue(),
+        media_type=response.media_type,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+    )
+
+
 def _handle_streaming_success(
     response: Response,
     provider_name: str,
@@ -1137,6 +2106,32 @@ def _handle_streaming_success(
             )
         return result
     return None
+
+
+def _prepend_sse_comment(response: Response, comment: str) -> Response:
+    """Return a StreamingResponse whose body emits *comment* (an SSE comment
+    line, e.g. ``: re-route provider=a->b reason=stall_after_reasoning``)
+    before the original body bytes.
+
+    If *response* is not a streaming response, the comment is dropped (the
+    client gets the JSON/other body as-is) — the marker is best-effort.
+    """
+    if not _is_streaming_response(response):
+        return response
+    original = response.body_iterator
+    comment_bytes = (comment if comment.endswith("\n\n") else comment + "\n\n").encode()
+
+    async def _with_comment():
+        yield comment_bytes
+        async for c in original:
+            yield c
+
+    return StreamingResponse(
+        _with_comment(),
+        media_type=response.media_type,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+    )
 
 
 def _build_fallback_success_response(
@@ -1265,6 +2260,42 @@ def _handle_http_error_with_cooldown(
     return cooldown
 
 
+def _observe_http_error_400(
+    response: Response,
+    provider_name: str,
+    provider_type: str,
+    path: str,
+    body_text: str,
+    fallback_reason: str,
+) -> None:
+    """Observability for remote HTTP 400 rejections (LP-0MSC1BNP90017L9K).
+
+    Emits a per-fallback INFO log line containing the response body snippet
+    (first 512 chars) and increments ``proxy_http_errors_total{status=400}``
+    with the fallback reason, so rejection causes are discoverable without
+    code changes. Best-effort: never raises.
+    """
+    try:
+        if int(response.status_code) != 400 or provider_type != "remote":
+            return
+        snippet = (body_text or "")[:512]
+        logger.info(
+            "Remote HTTP 400 from provider=%s model=%s reason=%s body_snippet=%s",
+            provider_name,
+            path,
+            fallback_reason,
+            snippet,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", fallback_reason)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _handle_empty_response_with_cooldown(
     response: Response,
     provider_name: str,
@@ -1358,15 +2389,24 @@ def _resolve_reasoning_content_promotion(
 
 def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
     """Log diagnostic details about which providers are in cooldown and return
-    the mapping of provider name to remaining cooldown seconds.
+    the mapping of provider key to remaining cooldown seconds.
+
+    Includes BOTH entry-name and provider-brand cooldown keys so a Tier-3
+    stall circuit breaker trip (which marks the brand unavailable) is visible
+    when all providers are exhausted (LP-0MSG45LOO007K236).
     """
     unavailable: dict[str, int] = {}
     try:
-        provider_names = [p.get("name") for p in model_config.get("providers", []) if isinstance(p, dict)]
-        for n in provider_names:
-            exp = _provider_unavailable_until.get(n)
-            if exp:
-                unavailable[n] = int(max(0, exp - time.time()))
+        providers = model_config.get("providers", []) or []
+        for p in providers:
+            if not isinstance(p, dict):
+                continue
+            for key in (p.get("name"), p.get("provider")):
+                if not key:
+                    continue
+                remaining = _provider_cooldown_remaining(key)
+                if remaining > 0:
+                    unavailable[key] = remaining
         logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
     except Exception:
         pass
@@ -1401,19 +2441,35 @@ async def proxy_with_remote_fallback(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # SSE comment emitted on the next successful streaming response after a
+    # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
+    # the next provider is resolved.
+    _pending_reroute: str | None = None
+    # AC3 (LP-0MSGU3JNU0092AFQ): remember the first reasoning_content
+    # round-trip 400 so the exhausted path returns a synthetic error with
+    # remediation guidance instead of the raw upstream body (or a 503 whose
+    # diagnostics leak it).
+    _reasoning_roundtrip_response: Response | None = None
 
     ptr = _get_proxy_to_remote()
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
+    # Failure-domain keys already failed/stalled THIS request — same-gateway
+    # API-key siblings are skipped so re-route hops to a different gateway
+    # (LP-0MSG45I8Q0020N1F). Per-request only; cross-request quarantine stays
+    # with the Tier-3 stall circuit breaker (LP-0MSG45LOO007K236).
+    attempted_domains: set[str] = set()
 
     # Preserve first model-loading response so single-provider models
     # do not collapse into generic "All providers exhausted".
     first_model_loading_response: Response | None = None
 
     while True:
-        provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
+        provider_cfg = _resolve_provider_with_exclusions(
+            model_config, attempted_provider_names, attempted_domains,
+        )
         if provider_cfg is None:
             break
 
@@ -1447,12 +2503,73 @@ async def proxy_with_remote_fallback(
 
             response = await ptr(request, path, provider_cfg)
 
+            # Pre-flight remote streaming responses: detect a pre-content
+            # finish_reason: error / empty / stream-exception so the fallback
+            # chain re-routes to the next provider instead of surfacing a
+            # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
+            if provider_type == "remote" and _has_next_provider(
+                model_config, attempted_provider_names, attempted_domains,
+            ):
+                try:
+                    response = await _preflight_streaming_response(
+                        response, request, provider_name
+                    )
+                except StreamingPreContentError as exc:
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_error",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+                except StreamingRecoverableAfterReasoningError as exc:
+                    # Mid-stream re-route (LP-0MSF1PUM90099ZSW): reasoning was
+                    # delivered but no final content / no tool_calls, so the
+                    # client has not committed to an answer. Re-route the SAME
+                    # request to the next provider; the buffered intermediate
+                    # output is discarded (never reaches the client).
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
+                    # entry's failure domain is skipped for the rest of this
+                    # request so the re-route hops straight to a different
+                    # gateway instead of retrying via another API-key sibling.
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_reroute",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _pending_reroute = f": re-route provider={provider_name}->{{to}} reason={exc.reason}"
+                    logger.warning(
+                        "Mid-stream re-route: provider=%s model=%s reason=%s "
+                        "(no final content committed; routing to next provider)",
+                        provider_name, path, exc.reason,
+                    )
+                    continue
+
             # Shared primitive: handle streaming success
             stream_result = _handle_streaming_success(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                if _pending_reroute:
+                    stream_result = _prepend_sse_comment(
+                        stream_result,
+                        _pending_reroute.format(to=provider_name),
+                    )
+                    _pending_reroute = None
                 return stream_result
 
             # Safely extract a small body snippet for diagnostics
@@ -1483,6 +2600,7 @@ async def proxy_with_remote_fallback(
                     fallback_reason = "free_usage_limit"
                     prev_provider = provider_name
                     mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -1500,10 +2618,19 @@ async def proxy_with_remote_fallback(
                     response, provider_name, provider_type,
                     cooldown_seconds, attempts, body_text,
                 )
+                # AC3 (LP-0MSGU3JNU0092AFQ): remember this specific 400 so the
+                # exhausted path can return a synthetic error instead of the
+                # raw upstream body / exhausted-503-with-diagnostics.
+                if _reasoning_roundtrip_response is None and _is_reasoning_content_roundtrip_error(response):
+                    _reasoning_roundtrip_response = response
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
                 if response.status_code != 429:
                     all_slot_exhaustion = False
+                _observe_http_error_400(
+                    response, provider_name, provider_type, path, body_text, fallback_reason,
+                )
                 continue
 
             # Treat empty successful responses as failures to allow fallback
@@ -1529,6 +2656,7 @@ async def proxy_with_remote_fallback(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text,
                     )
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -1551,6 +2679,7 @@ async def proxy_with_remote_fallback(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -1561,6 +2690,26 @@ async def proxy_with_remote_fallback(
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
 
+    # Record time-window skips as distinct diagnostics so operators can tell
+    # whether providers were excluded by their available_times windows rather
+    # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
+    for skipped in _providers_outside_window(model_config):
+        _record_attempt(
+            attempts,
+            provider=skipped["name"],
+            type=skipped["type"],
+            status="outside_time_window",
+        )
+
+    # Distinguishable exhaustion: when time windows are the *only* reason no
+    # provider could be used, surface a specific message instead of the generic
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    time_window_exhausted = _build_time_window_exhausted_response(
+        attempts, unavailable, any_provider_tried,
+    )
+    if time_window_exhausted is not None:
+        return time_window_exhausted
+
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
 
@@ -1570,6 +2719,17 @@ async def proxy_with_remote_fallback(
             path,
         )
         return first_model_loading_response
+
+    # AC3 (LP-0MSGU3JNU0092AFQ): never surface the raw upstream
+    # reasoning_content round-trip 400 (or a 503 whose diagnostics leak it);
+    # return a synthetic error with remediation guidance instead.
+    if _reasoning_roundtrip_response is not None:
+        logger.warning(
+            "Intercepting reasoning_content round-trip 400 for model=%s; "
+            "returning synthetic error instead of raw upstream body",
+            path,
+        )
+        return _build_reasoning_content_roundtrip_error()
 
     return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
 
@@ -1606,6 +2766,10 @@ async def proxy_with_fallback(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # SSE comment emitted on the next successful streaming response after a
+    # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
+    # the next provider is resolved.
+    _pending_reroute: str | None = None
 
     # Accumulate slot counts when local providers report slot exhaustion
     total_slots_sum = 0
@@ -1640,9 +2804,16 @@ async def proxy_with_fallback(
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
+    # Failure-domain keys already failed/stalled THIS request — same-gateway
+    # API-key siblings are skipped so re-route hops to a different gateway
+    # (LP-0MSG45I8Q0020N1F). Per-request only; cross-request quarantine stays
+    # with the Tier-3 stall circuit breaker (LP-0MSG45LOO007K236).
+    attempted_domains: set[str] = set()
 
     while True:
-        provider_cfg = _resolve_provider_with_exclusions(model_config, attempted_provider_names)
+        provider_cfg = _resolve_provider_with_exclusions(
+            model_config, attempted_provider_names, attempted_domains,
+        )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Local lease-active is expected contention, not provider failure.
             # For transparent fallback, allow trying the next remote provider
@@ -1654,7 +2825,11 @@ async def proxy_with_fallback(
                 candidate_name = candidate.get("name", "")
                 if candidate_name in attempted_provider_names:
                     continue
+                if _failure_domain_key(candidate) in attempted_domains:
+                    continue
                 if candidate.get("type") != "remote":
+                    continue
+                if not _is_within_allowed_window(candidate):
                     continue
                 provider_cfg = candidate
                 break
@@ -1695,17 +2870,23 @@ async def proxy_with_fallback(
                 # (LP-0MRP44W7I0085I6N). Uses cached_tokens ratio from the last
                 # local response instead of inferred cache-cold state.
                 _llama_model = provider_cfg.get("llama_model", "")
-                _cold_threshold = _get_large_context_threshold(config)
-                _warm_threshold = _get_warm_cache_threshold(config)
+                # Clamp configured thresholds to the actual per-slot context so
+                # prompts that cannot fit the KV slot fall through to remote
+                # BEFORE context exhaustion (LP-0MSAZXXDY005AWA1).
+                _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
+                    config
+                )
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,
                 )
-                # Apply model-level token estimate multiplier to account for
-                # tokenizer mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
-                # can differ by ~13-15%).  Configurable via token_estimate_multiplier
-                # on the model entry in config.yaml.
-                _multiplier = float(model_config.get("token_estimate_multiplier", 1.0))
+                # Apply token estimate multiplier to account for tokenizer
+                # mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
+                # undercounts ~1.69x — LP-0MSAOQTJS000FFVM F2/F3). Server-level
+                # token_estimate_multiplier is applied, with a per-model
+                # token_estimate_multiplier override winning (F2
+                # LP-0MSEGPO77005CYCQ).
+                _multiplier = _get_token_estimate_multiplier(config, model_config)
                 if _multiplier != 1.0:
                     _estimated_tokens = int(_estimated_tokens * _multiplier)
                 # Compute once for reuse in logs and reason detection
@@ -1716,7 +2897,7 @@ async def proxy_with_fallback(
                 logger.info(
                     "routing_check provider=%s model=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                    "new_tokens=%d cached_ratio=%.2f messages=%d",
+                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
@@ -1725,7 +2906,33 @@ async def proxy_with_fallback(
                     _routing_new_tokens,
                     _routing_cached_ratio,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
+                    _session_id or "unknown",
                 )
+                # Context-pressure compaction signal (LP-0MSDCLQ2W001LGWC):
+                # KV reads scale linearly with context (20 KB/token at f16),
+                # so sessions approaching the per-slot limit decode at a
+                # fraction of their earlier speed. Warn so agents/operators
+                # compact before decode degrades.
+                if should_warn_context_pressure(_estimated_tokens, config):
+                    _per_slot = effective_per_slot_threshold(
+                        _get_local_model_ctx_size(config),
+                        _get_active_local_slots(config),
+                    )
+                    logger.warning(
+                        "context_pressure session=%s estimated_tokens=%d "
+                        "per_slot_ctx=%d ratio=%.2f >= %.2f; consider "
+                        "compacting the session history to reduce local decode "
+                        "cost (KV read scales with context)",
+                        _session_id or "unknown",
+                        _estimated_tokens,
+                        _per_slot,
+                        context_pressure_ratio(
+                            _estimated_tokens,
+                            _get_local_model_ctx_size(config),
+                            _get_active_local_slots(config),
+                        ),
+                        _get_context_pressure_warn_ratio(config),
+                    )
                 _skip_local = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -1747,7 +2954,8 @@ async def proxy_with_fallback(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                         "new_tokens=%d cached_ratio=%.2f "
-                        "reason=%s → skipping local, routing to next remote provider",
+                        "reason=%s → skipping local, routing to next remote provider "
+                        "session=%s",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -1756,6 +2964,7 @@ async def proxy_with_fallback(
                         _routing_new_tokens,
                         _routing_cached_ratio,
                         _skip_reason,
+                        _session_id or "unknown",
                     )
                     _record_attempt(
                         attempts,
@@ -1803,6 +3012,61 @@ async def proxy_with_fallback(
 
                 response = await ptr_remote(request, path, provider_cfg)
 
+            # Pre-flight remote streaming responses: detect a pre-content
+            # finish_reason: error / empty / stream-exception so the fallback
+            # chain re-routes to the next provider instead of surfacing a
+            # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
+            if provider_type == "remote" and _has_next_provider(
+                model_config, attempted_provider_names, attempted_domains,
+            ):
+                try:
+                    response = await _preflight_streaming_response(
+                        response, request, provider_name
+                    )
+                except StreamingPreContentError as exc:
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_error",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+                except StreamingRecoverableAfterReasoningError as exc:
+                    # Mid-stream re-route (LP-0MSF1PUM90099ZSW): reasoning was
+                    # delivered but no final content / no tool_calls, so the
+                    # client has not committed to an answer. Re-route the SAME
+                    # request to the next provider; the buffered intermediate
+                    # output is discarded (never reaches the client).
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
+                    # entry's failure domain is skipped for the rest of this
+                    # request so the re-route hops straight to a different
+                    # gateway instead of retrying via another API-key sibling.
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="stream_reroute",
+                        error=exc.reason,
+                    )
+                    fallback_reason = exc.reason
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _pending_reroute = f": re-route provider={provider_name}->{{to}} reason={exc.reason}"
+                    logger.warning(
+                        "Mid-stream re-route: provider=%s model=%s reason=%s "
+                        "(no final content committed; routing to next provider)",
+                        provider_name, path, exc.reason,
+                    )
+                    continue
+
             # Shared primitive: handle streaming success
             stream_result = _handle_streaming_success(
                 response, provider_name, provider_type, attempts,
@@ -1811,6 +3075,12 @@ async def proxy_with_fallback(
             if stream_result is not None:
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
+                if _pending_reroute:
+                    stream_result = _prepend_sse_comment(
+                        stream_result,
+                        _pending_reroute.format(to=provider_name),
+                    )
+                    _pending_reroute = None
                 return stream_result
 
             # Capture the first non-success response so we can return it when
@@ -1909,6 +3179,7 @@ async def proxy_with_fallback(
                             continue
 
                         mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "slot_exhaustion"
                         prev_provider = provider_name
                         total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
@@ -1923,6 +3194,7 @@ async def proxy_with_fallback(
                         continue
                 else:
                     mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "slot_exhaustion"
                     prev_provider = provider_name
                     total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
@@ -2017,6 +3289,7 @@ async def proxy_with_fallback(
                         fallback_reason = "free_usage_limit"
                         prev_provider = provider_name
                         mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                         _record_attempt(
                             attempts,
                             provider=provider_name,
@@ -2034,10 +3307,14 @@ async def proxy_with_fallback(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text,
                     )
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
                     if response.status_code != 429:
                         all_slot_exhaustion = False
+                    _observe_http_error_400(
+                        response, provider_name, provider_type, path, body_text, fallback_reason,
+                    )
                     continue
 
             # Treat empty successful responses as failures to allow fallback
@@ -2105,6 +3382,7 @@ async def proxy_with_fallback(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text,
                             )
+                            attempted_domains.add(_failure_domain_key(provider_cfg))
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
                             all_slot_exhaustion = False
@@ -2115,6 +3393,7 @@ async def proxy_with_fallback(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text,
                         )
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "empty_response"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
@@ -2137,6 +3416,7 @@ async def proxy_with_fallback(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -2219,6 +3499,7 @@ async def proxy_with_fallback(
                         media_type="application/json",
                     )
                 mark_provider_unavailable(provider_name, cooldown_seconds)
+                attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTPException {exc.status_code}"
                 prev_provider = provider_name
                 _record_attempt(
@@ -2236,6 +3517,26 @@ async def proxy_with_fallback(
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
+
+    # Record time-window skips as distinct diagnostics so operators can tell
+    # whether providers were excluded by their available_times windows rather
+    # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
+    for skipped in _providers_outside_window(model_config):
+        _record_attempt(
+            attempts,
+            provider=skipped["name"],
+            type=skipped["type"],
+            status="outside_time_window",
+        )
+
+    # Distinguishable exhaustion: when time windows are the *only* reason no
+    # provider could be used, surface a specific message instead of the generic
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    time_window_exhausted = _build_time_window_exhausted_response(
+        attempts, unavailable, any_provider_tried,
+    )
+    if time_window_exhausted is not None:
+        return time_window_exhausted
 
     if not any_provider_tried:
         return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
@@ -2264,6 +3565,16 @@ async def proxy_with_fallback(
                 "remote fallback chain present",
                 path,
             )
+        elif _is_reasoning_content_roundtrip_error(_first_error_response):
+            # AC3 (LP-0MSGU3JNU0092AFQ): never surface the raw upstream
+            # reasoning_content round-trip 400 to the client; return a
+            # synthetic error with remediation guidance instead.
+            logger.warning(
+                "Intercepting reasoning_content round-trip 400 for model=%s; "
+                "returning synthetic error instead of raw upstream body",
+                path,
+            )
+            return _build_reasoning_content_roundtrip_error()
         else:
             logger.info(
                 "Returning first provider error response instead of generic exhausted "

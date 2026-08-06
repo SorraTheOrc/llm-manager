@@ -467,6 +467,15 @@ def setup_logging(config: dict) -> logging.Logger:
     retention_days = log_config.get("retention_days", 90)
     log_level = log_config.get("level", "INFO")
 
+    # Verbose per-chunk SSE logging: enabled by config logging.verbose_chunks
+    # or LLAMA_PROXY_VERBOSE=1 (LP-0MS9GAN2P002NR4M). When enabled, STREAM
+    # CHUNK lines are logged at INFO level; otherwise at DEBUG (suppressed at
+    # the default INFO level).
+    verbose_chunks = bool(log_config.get("verbose_chunks", False)) or (
+        os.environ.get("LLAMA_PROXY_VERBOSE") == "1"
+    )
+    srv.verbose_chunks = verbose_chunks
+
     if is_dev:
         # Dev mode: use XDG-based dev log directory with DEBUG level
         xdg_state = os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))

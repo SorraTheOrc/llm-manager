@@ -43,6 +43,7 @@ from proxy.session import (  # noqa: E402
     _detect_restore_signal_from_llama_log,
     _detect_restore_signal_from_log_slice,
     _has_explicit_restore_signal,
+    _invalidate_session_and_slot,
     _record_guardrail_cutoff,
     _record_restore_success,
     _restore_slot_snapshot,
@@ -76,7 +77,6 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_active_queries,
     _decrement_local_active_queries,
     _decrement_per_model_query,
-    _get_per_model_queries,
     _estimate_tokens_sent,
     _get_lease_timeout_seconds,
     _get_request_preview,
@@ -315,6 +315,58 @@ async def _update_session_and_slot(
                 exc_info=True,
             )
 
+    # Update per-session cached-tokens ratio from REAL usage data
+    # (LP-0MS9GAN2P009KK6G). The final usage chunk in the local response
+    # reports prompt_tokens + prompt_tokens_details.cached_tokens; use the
+    # true cache-hit fraction when available. The save-success 1.0 below
+    # remains the fallback when no usage data is present.
+    _real_usage_applied = False
+    if session_id and srv.current_model:
+        try:
+            from proxy.provider import (
+                _extract_cached_tokens_from_usage,
+                _extract_usage_from_sse_text,
+                update_cached_ratio,
+            )
+            _full_text = None
+            if collected_content is not None and collected_content:
+                _full_text = "".join(collected_content)
+            elif hasattr(response, "content") and isinstance(
+                getattr(response, "content", None), (bytes, str)
+            ):
+                _full_text = response.content.decode(
+                    "utf-8", errors="replace"
+                )
+            _usage = None
+            if _full_text:
+                # Streaming SSE path: the final chunk carries a usage event.
+                _usage = _extract_usage_from_sse_text(_full_text)
+                if _usage is None:
+                    # Buffered path: JSON body with a top-level usage field.
+                    try:
+                        _body = json.loads(_full_text)
+                        if isinstance(_body, dict) and isinstance(
+                            _body.get("usage"), dict
+                        ):
+                            _usage = _body["usage"]
+                    except Exception:
+                        _usage = None
+            if isinstance(_usage, dict):
+                _cached = _extract_cached_tokens_from_usage(_usage)
+                _prompt = int(_usage.get("prompt_tokens", 0) or 0)
+                if _prompt > 0:
+                    update_cached_ratio(
+                        srv.current_model,
+                        session_id,
+                        cached_tokens=_cached,
+                        prompt_tokens=_prompt,
+                    )
+                    _real_usage_applied = True
+        except Exception:
+            srv.logger.debug(
+                "update_cached_ratio from usage failed", exc_info=True
+            )
+
     # Save slot snapshot if enabled
     if slot_save_allowed and slot_enabled and upstream_status < 400:
         try:
@@ -332,7 +384,8 @@ async def _update_session_and_slot(
                     slot_id,
                 )
                 # Update per-session cached-tokens ratio (LP-0MRMMBZ7T007ER59)
-                if session_id and srv.current_model:
+                # as a FALLBACK when no real usage data was reported.
+                if session_id and srv.current_model and not _real_usage_applied:
                     try:
                         from proxy.provider import update_cached_ratio
                         update_cached_ratio(
@@ -1257,14 +1310,22 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 pass
                             # Synthesize a final SSE event so the client receives a
                             # proper finish_reason marker even on stream error.
-                            final_obj = {
-                                "choices": [
-                                    {"delta": {}, "finish_reason": "error", "index": 0}
-                                ]
-                            }
-                            final_bytes = (
-                                f"data: {json.dumps(final_obj)}\n\n"
-                            ).encode()
+                            final_obj = _build_stream_error_event(
+                                provider="local",
+                                model=model_name,
+                                error_type="stream_exception",
+                                message=f"Local stream error ({_error_type}); llama-server may be unhealthy",
+                                suggested_action="Check llama-server logs; the request may be retried",
+                                session_id=session_id,
+                            )
+                            final_bytes = _stream_error_event_bytes(
+                                provider="local",
+                                model=model_name,
+                                error_type="stream_exception",
+                                message=f"Local stream error ({_error_type}); llama-server may be unhealthy",
+                                suggested_action="Check llama-server logs; the request may be retried",
+                                session_id=session_id,
+                            )
                             yield final_bytes
                             log_response_chunk(final_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                             # Emit [DONE] marker after synthetic error finish event
@@ -1568,6 +1629,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
 # Backward-compatibility re-exports for tests
 from .proxy_remote import (  # noqa: E402, F401
+    _build_stream_error_event,
+    _stream_error_event_bytes,
     proxy_to_remote,
 )
 from .router_helpers import (  # noqa: E402, F811

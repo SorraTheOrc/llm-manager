@@ -87,13 +87,10 @@ async def test_retry_exhaustion_calls_circuit_breaker(mock_request):
     AC1: When max retries are exhausted, _check_stall_circuit_breaker()
     is called with the correct provider name.
     """
-    # All 4 attempts stall after first chunk (initial + 3 retries)
-    chunks_per_attempt = [
-        [b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n'],
-        [b'data: {"choices":[{"delta":{"content":"B"},"index":0}]}\n\n'],
-        [b'data: {"choices":[{"delta":{"content":"C"},"index":0}]}\n\n'],
-        [b'data: {"choices":[{"delta":{"content":"D"},"index":0}]}\n\n'],
-    ]
+    # All 4 attempts stall before delivering content (initial + 3 retries),
+    # so retries exhaust and the circuit breaker records the stall
+    # (LP-0MS9FR9LG002AJ4C).
+    chunks_per_attempt = [[], [], [], []]
 
     responses = []
     for attempt_chunks in chunks_per_attempt:
@@ -180,12 +177,12 @@ async def test_circuit_breaker_called_with_provider_name(mock_request):
     AC2: When _handle_remote_streaming is invoked with a named provider,
     that name is passed to the circuit breaker.
     """
-    # All attempts stall (to trigger retry exhaustion)
-    chunk = [b'data: {"choices":[{"delta":{"content":"A"},"index":0}]}\n\n']
+    # All attempts stall before delivering content (to trigger retry
+    # exhaustion — LP-0MS9FR9LG002AJ4C)
     responses = []
     for i in range(4):
         resp = _make_mock_response(
-            status_code=200, aiter_chunks=chunk, hang_after=True
+            status_code=200, aiter_chunks=[], hang_after=True
         )
         responses.append(resp)
 

@@ -66,7 +66,12 @@ _llama_status_discovered_pid: int | None = None
 
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
-from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: F401
+from .handlers import (  # noqa: E402, F401
+    extract_progress_data,
+    format_progress,
+    poll_slots_for_model,
+    start_slot_polling,
+)
 
 # Polling state for /slots API (model -> latest data)
 slot_polling_state: dict = {}
@@ -325,6 +330,30 @@ async def _capture_rocm_version() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _startup_validate_local_routing_config(config: dict) -> None:
+    """Validate the ctx-size / slot-count routing clamp configuration.
+
+    Mirrors the effective-threshold math in provider.py (LP-0MSAZXXDY005AWA1)
+    so a misconfigured ctx/slot combination cannot silently move ALL local
+    traffic to remote providers (LP-0MSAOQTJS000FFVM / LP-0MSCABA5K0010LW2).
+
+    Logs a WARNING per problem by default; raises ValueError at startup when
+    ``min_local_routing_threshold_fatal`` is enabled (hard floor).
+    """
+    from proxy.provider import validate_local_routing_config
+
+    problems = validate_local_routing_config(config)
+    for problem in problems:
+        if problem.startswith("FATAL: "):
+            logger.error("Local routing config validation FAILED: %s", problem)
+        else:
+            logger.warning("Local routing config validation: %s", problem)
+    if any(p.startswith("FATAL: ") for p in problems):
+        raise ValueError(
+            "Local routing config validation failed: " + "; ".join(problems)
+        )
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -334,6 +363,7 @@ def _startup_config_logging():
     global config, logger
     config = load_config()
     logger = setup_logging(config)
+    _startup_validate_local_routing_config(config)
     logger.info("Starting LLama Proxy Server")
     return config, logger
 
@@ -742,7 +772,6 @@ def _shutdown_llama_server():
 
 def _shutdown_tts_server():
     """Stop the qwentts TTS server process."""
-    from .lifecycle import stop_tts_server
     stop_tts_server()
 
 
@@ -968,7 +997,24 @@ async def debug_prompt(request: Request, alias: str = "", full: bool = False):
 
 def main():
     """Main entry point."""
+    import argparse
+    import os
+
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="LLM proxy server")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO "
+            "level). Equivalent to LLAMA_PROXY_VERBOSE=1 or config "
+            "logging.verbose_chunks: true."
+        ),
+    )
+    args, _ = parser.parse_known_args()
+    if args.verbose:
+        os.environ["LLAMA_PROXY_VERBOSE"] = "1"
 
     # Load config for server settings
     cfg = load_config()
@@ -1033,13 +1079,13 @@ from .lifecycle import (  # noqa: E402, F401
     ensure_model_loaded,
     get_local_model_name,
     get_model_config,
+    restart_services,
     rotate_llama_logs,
     router_is_model_loaded,
     router_list_models,
     router_load_model,
     router_preload_models,
     router_wait_for_model,
-    restart_services,
     schedule_background_load,
     start_llama_server,
     stop_llama_server,
@@ -1129,25 +1175,25 @@ from .session import (  # noqa: E402, F401
     session_single_flight_observability,
     slot_lock_coordinator,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     create_embeddings as _ui_create_embeddings,
 )
 from .ui import (  # noqa: E402
     index as _ui_index,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     proxy_openai_api as _ui_proxy_openai_api,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     status_events as _ui_status_events,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     switch_model as _ui_switch_model,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     tail_logs as _ui_tail_logs,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     view_logs as _ui_view_logs,
 )
 from .utils import (  # noqa: E402, F401

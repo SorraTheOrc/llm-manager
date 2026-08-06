@@ -15,8 +15,8 @@ from proxy.session import (
     _build_slot_context,
     _restore_slot_snapshot,
     _save_slot_snapshot,
-    _slot_filename_for_session,
     _slot_failure_state,
+    _slot_filename_for_session,
     _slot_id_for_session,
     _slot_persistence_enabled,
 )
@@ -547,8 +547,9 @@ class TestSlotDistributionConsistency:
         """With pool_size=2, first two sessions get slots 0 and 1."""
         from proxy.session import _free_slot_assignment
 
-        sid0 = _slot_id_for_session("sess-0", 2)
-        sid1 = _slot_id_for_session("sess-1", 2)
+        # Occupy both slots, then verify a third session is rejected
+        _slot_id_for_session("sess-0", 2)
+        _slot_id_for_session("sess-1", 2)
         # All slots occupied now
         assert _slot_id_for_session("sess-2", 2) is None
 
@@ -566,3 +567,177 @@ class TestSlotDistributionConsistency:
                 assert 0 <= sid < pool_size, f"i={i} pool={pool_size} sid={sid}"
             # Pool exhausted — next session gets None
             assert _slot_id_for_session(f"test-{pool_size}", pool_size) is None
+
+
+# ===================================================================
+# Real cached-tokens ratio wiring (LP-0MS9GAN2P009KK6G)
+# ===================================================================
+
+
+class TestRealCachedTokensRatioWiring:
+    """Router-level tests: the local SSE response path must update the
+    per-session cached_ratio from the REAL prompt_tokens_details.cached_tokens
+    reported in the final usage chunk, not the hardcoded 1.0.
+
+    Test-first (LP-0MSATT20A0055YSO): the real-usage tests fail against the
+    current code, which only sets ratio 1.0 after a successful slot save.
+    """
+
+    def setup_method(self):
+        from proxy.provider import _last_cached_ratio
+        _last_cached_ratio.clear()
+
+    def _make_srv(self) -> MagicMock:
+        """Build a minimal server mock with an async session manager."""
+        srv = MagicMock()
+        srv.current_model = "Qwen3"
+        srv.logger = MagicMock()
+        srv.session_manager = AsyncMock()
+        return srv
+
+    def _usage_sse(self, cached_tokens: int = 33792, prompt_tokens: int = 41721) -> str:
+        """Build an SSE stream whose final chunk carries a usage event."""
+        return (
+            'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n'
+            'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],'
+            f'"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":100,'
+            f'"prompt_tokens_details":{{"cached_tokens":{cached_tokens}}}}}}}\n\n'
+            'data: [DONE]\n\n'
+        )
+
+    async def _run_response_path(
+        self,
+        srv,
+        session_id: str,
+        collected_content: list[str],
+        slot_enabled: bool = False,
+    ) -> None:
+        """Run the shared router response-path helper with a mocked SSE stream."""
+        from proxy.router import _update_session_and_slot
+
+        with (
+            patch(
+                "proxy.router._detect_restore_signal_from_llama_log",
+                return_value=False,
+            ),
+        ):
+            await _update_session_and_slot(
+                srv=srv,
+                session_id=session_id,
+                body_json={"messages": [{"role": "user", "content": "hi"}]},
+                is_delta_request=False,
+                delta_messages=[],
+                original_message_count=1,
+                response=MagicMock(),
+                llama_port=8080,
+                slot_id=0 if slot_enabled else None,
+                slot_filename="/tmp/slots/test.bin" if slot_enabled else None,
+                slot_timeout=3.0,
+                slot_model_payload=None,
+                slot_enabled=slot_enabled,
+                upstream_status=200,
+                collected_content=collected_content,
+            )
+
+    @pytest.mark.asyncio
+    async def test_real_usage_chunk_updates_ratio(self):
+        """A local SSE response whose final usage chunk reports
+        cached_tokens=33792 / prompt_tokens=41721 updates the (Qwen3, session)
+        ratio to 33792/41721 after the router's response path runs."""
+        from proxy.provider import _last_cached_ratio
+
+        srv = self._make_srv()
+        await self._run_response_path(
+            srv, "sess_real", [self._usage_sse()], slot_enabled=False
+        )
+        assert _last_cached_ratio[("Qwen3", "sess_real")] == pytest.approx(
+            33792 / 41721
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_usage_save_success_sets_ratio_one(self):
+        """When usage data is absent, a successful slot save still sets ratio
+        to 1.0 (fallback, unchanged)."""
+        from proxy.provider import _last_cached_ratio
+        from proxy.router import _update_session_and_slot
+
+        srv = self._make_srv()
+        no_usage_sse = (
+            'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n'
+            'data: [DONE]\n\n'
+        )
+        with (
+            patch(
+                "proxy.router._detect_restore_signal_from_llama_log",
+                return_value=False,
+            ),
+            patch(
+                "proxy.router._save_slot_snapshot",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await _update_session_and_slot(
+                srv=srv,
+                session_id="sess_fallback",
+                body_json={"messages": [{"role": "user", "content": "hi"}]},
+                is_delta_request=False,
+                delta_messages=[],
+                original_message_count=1,
+                response=MagicMock(),
+                llama_port=8080,
+                slot_id=0,
+                slot_filename="/tmp/slots/test.bin",
+                slot_timeout=3.0,
+                slot_model_payload=None,
+                slot_enabled=True,
+                upstream_status=200,
+                collected_content=[no_usage_sse],
+            )
+        assert _last_cached_ratio[("Qwen3", "sess_fallback")] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_zero_prompt_tokens_no_raise(self):
+        """prompt_tokens=0 in usage must not raise; ratio remains 0.0 (or
+        previous value preserved)."""
+        from proxy.provider import _last_cached_ratio
+
+        srv = self._make_srv()
+        zero_usage_sse = self._usage_sse(cached_tokens=0, prompt_tokens=0)
+        await self._run_response_path(
+            srv, "sess_zero", [zero_usage_sse], slot_enabled=False
+        )
+        assert _last_cached_ratio.get(("Qwen3", "sess_zero"), 0.0) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_missing_usage_no_raise(self):
+        """SSE without a usage event must not raise; ratio stays 0.0."""
+        from proxy.provider import _last_cached_ratio
+
+        srv = self._make_srv()
+        no_usage_sse = (
+            'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n'
+            'data: [DONE]\n\n'
+        )
+        await self._run_response_path(
+            srv, "sess_no_usage", [no_usage_sse], slot_enabled=False
+        )
+        assert _last_cached_ratio.get(("Qwen3", "sess_no_usage"), 0.0) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_ratio_key_matches_routing_reads(self):
+        """Keys use (model_name, session_id) exactly as routing reads them
+        via _get_cached_ratio."""
+        from proxy.provider import _get_cached_ratio, _last_cached_ratio
+
+        srv = self._make_srv()
+        await self._run_response_path(
+            srv, "sess_key", [self._usage_sse()], slot_enabled=False
+        )
+        # Same (model, session) key → real ratio
+        assert _get_cached_ratio("Qwen3", "sess_key") == pytest.approx(
+            33792 / 41721
+        )
+        # Different session under same model → cold (0.0)
+        assert _get_cached_ratio("Qwen3", "other_session") == 0.0
+        # Different model under same session → cold (0.0)
+        assert _get_cached_ratio("gemma4", "sess_key") == 0.0

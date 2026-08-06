@@ -56,7 +56,9 @@ def resolve_var(vars_map, val):
     # rgba(...) -> ignore alpha and return rgb tuple
     m2 = re.match(r"rgba?\(\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)(?:\s*,\s*([0-9\.]+))?\s*\)", val)
     if m2:
-        r = int(m2.group(1)); g = int(m2.group(2)); b = int(m2.group(3))
+        r = int(m2.group(1))
+        g = int(m2.group(2))
+        b = int(m2.group(3))
         return (r, g, b)
 
     # hex color
