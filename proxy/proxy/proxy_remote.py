@@ -205,6 +205,18 @@ def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
         role = msg.get("role")
         if role == "assistant":
             cleaned = dict(msg)
+            # reasoning_content round-trip repair (LP-0MSGU3JNU0092AFQ):
+            # remote thinking-mode providers (Console / Console Go / deepseek)
+            # reject the whole request with HTTP 400 when ANY assistant message
+            # lacks the ``reasoning_content`` field. Clients (e.g. opencode)
+            # drop the empty ``reasoning_content: ""`` that the upstream emitted
+            # on tool-call-only turns, so the field is absent on those messages
+            # when the history is re-sent. Inject ``""`` (matching upstream
+            # emission) where the field is missing or null — additive only;
+            # existing values are never touched.
+            if cleaned.get("reasoning_content") is None:
+                _log("repair", index, "missing/null reasoning_content -> ''")
+                cleaned["reasoning_content"] = ""
             tool_calls = cleaned.get("tool_calls")
             if isinstance(tool_calls, list):
                 if not tool_calls:

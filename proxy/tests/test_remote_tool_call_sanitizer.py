@@ -56,10 +56,22 @@ def _valid_history():
 
 
 def test_valid_tool_call_sequence_unchanged():
-    """Valid tool-call sequences must pass through unchanged (regression guard)."""
+    """Valid tool-call sequences keep structure and values (regression guard).
+
+    The only mutation applied to a valid sequence is the reasoning_content
+    round-trip repair (LP-0MSGU3JNU0092AFQ): assistant messages missing the
+    field gain ``reasoning_content: ""``. Content, tool_calls, tool messages
+    and all other fields must be byte-identical.
+    """
     history = _valid_history()
     result = _sanitize(copy.deepcopy(history))
-    assert result == history, "valid sequence must not be altered"
+    assert result[1]["content"] == history[1]["content"]
+    assert result[1]["tool_calls"] == history[1]["tool_calls"]
+    assert result[2] == history[2], "tool message must be unchanged"
+    assert result[0] == history[0] and result[3] == history[3], "user messages must be unchanged"
+    assert result[1]["reasoning_content"] == "", (
+        "assistant reasoning_content must be normalized to '' (round-trip repair)"
+    )
 
 
 def test_content_null_repaired_when_tool_calls_present():
@@ -117,6 +129,114 @@ def test_reasoning_content_preserved_while_tool_call_repairs_apply():
     assert result[1]["tool_calls"][0]["type"] == "function", (
         "missing type must still be repaired to 'function'"
     )
+
+
+# ---------------------------------------------------------------------------
+# reasoning_content round-trip repair (LP-0MSGU3JNU0092AFQ)
+# ---------------------------------------------------------------------------
+#
+# Remote thinking-mode providers (Console opencode.ai/zen, Console Go
+# opencode.ai/zen/go, api.deepseek.com) require the `reasoning_content` field
+# to be present on EVERY assistant message in a multi-turn request. The client
+# (opencode) drops the empty `reasoning_content: ""` that the upstream emitted
+# on tool-call-only turns, so the field is entirely absent on those messages
+# when the history is re-sent. The sanitizer must inject `reasoning_content:
+# ""` (matching upstream emission) on assistant messages where the field is
+# missing or null — additive-only; existing values are never touched.
+
+
+def test_reasoning_content_injected_when_missing_on_tool_call_turn():
+    """Assistant tool-call message missing reasoning_content -> injected as ''.
+
+    This is the exact rejection shape from the recorded 400 traffic (session
+    019fd49c-...): 3 tool-call-only assistant messages lacked the field while
+    30 others carried it, and the upstream rejected the whole request.
+    """
+    history = _valid_history()
+    assert "reasoning_content" not in history[1], "precondition: field absent"
+    result = _sanitize(copy.deepcopy(history))
+    assert result[1]["reasoning_content"] == "", (
+        "missing reasoning_content must be injected as '' on assistant tool-call turns"
+    )
+    assert result[1]["tool_calls"][0]["id"] == "call_01", (
+        "tool_calls must be unchanged by the reasoning injection"
+    )
+
+
+def test_reasoning_content_injected_when_null():
+    """reasoning_content: null -> normalized to '' (additive repair)."""
+    messages = [
+        {"role": "user", "content": "think about it"},
+        {"role": "assistant", "content": "", "reasoning_content": None},
+    ]
+    result = _sanitize(copy.deepcopy(messages))
+    assert result[1]["reasoning_content"] == "", (
+        "null reasoning_content must be normalized to ''"
+    )
+
+
+def test_reasoning_content_non_empty_preserved_not_overwritten():
+    """Existing non-empty reasoning_content must never be modified."""
+    history = _valid_history()
+    history[1]["reasoning_content"] = "deep thinking here"
+    result = _sanitize(copy.deepcopy(history))
+    assert result[1]["reasoning_content"] == "deep thinking here", (
+        "existing reasoning_content must be preserved verbatim"
+    )
+
+
+def test_reasoning_content_not_injected_on_non_assistant_roles():
+    """Injection applies only to assistant messages; other roles untouched."""
+    history = _valid_history()
+    result = _sanitize(copy.deepcopy(history))
+    assert "reasoning_content" not in result[0], "user message must stay unchanged"
+    assert "reasoning_content" not in result[2], "tool message must stay unchanged"
+    assert "reasoning_content" not in result[3], "user message must stay unchanged"
+
+
+def test_mixed_history_all_assistant_messages_get_reasoning_content():
+    """Recorded failure shape: mixed history -> every assistant msg has the field.
+
+    Mirrors the recorded 400 request (session 019fd49c-..., 2026-08-06): 33
+    assistant messages, 30 with non-empty reasoning_content and 3 tool-call-only
+    messages missing the field entirely. After sanitize, all 33 must carry the
+    field and existing values must be untouched.
+    """
+    messages = [
+        {"role": "user", "content": "do work"},
+        {"role": "assistant", "content": "ok", "reasoning_content": "thought 1"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": "file1"},
+        {"role": "assistant", "content": "ok", "reasoning_content": "thought 2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_b", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_b", "content": "ok"},
+        {"role": "assistant", "content": "done", "reasoning_content": "thought 3"},
+    ]
+    result = _sanitize(copy.deepcopy(messages))
+    assistant_indices = [i for i, m in enumerate(result) if m.get("role") == "assistant"]
+    assert len(assistant_indices) == 5, "all assistant messages must survive"
+    for i in assistant_indices:
+        assert "reasoning_content" in result[i], (
+            f"assistant message {i} must carry reasoning_content after sanitize"
+        )
+    # Existing values preserved verbatim; injected values are empty strings.
+    assert result[1]["reasoning_content"] == "thought 1"
+    assert result[4]["reasoning_content"] == "thought 2"
+    assert result[7]["reasoning_content"] == "thought 3"
+    assert result[2]["reasoning_content"] == ""
+    assert result[5]["reasoning_content"] == ""
 
 
 def test_missing_tool_call_id_pruned():

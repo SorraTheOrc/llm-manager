@@ -1300,6 +1300,64 @@ def _add_resolved_model_header(response: Response, provider_cfg: dict) -> Respon
     return response
 
 
+def _is_reasoning_content_roundtrip_error(response: Response) -> bool:
+    """True when a response is the upstream thinking-mode reasoning_content 400.
+
+    Remote thinking-mode providers (Console opencode.ai/zen, Console Go
+    opencode.ai/zen/go, api.deepseek.com) reject multi-turn requests with this
+    HTTP 400 when any assistant message lacks the ``reasoning_content`` field
+    (LP-0MSGU3JNU0092AFQ). The message appears both wrapped by the Console
+    gateway ("Error from provider (Console Go): Upstream request failed:
+    [invalid_request_error] The `reasoning_content` ...") and verbatim from
+    api.deepseek.com. Match on the invariant substring rather than the exact
+    body so both variants are caught.
+    """
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return False
+    except Exception:
+        return False
+    body_l = _response_body_text(response).lower()
+    return (
+        "reasoning_content" in body_l
+        and "must be passed back" in body_l
+        and "thinking mode" in body_l
+    )
+
+
+def _build_reasoning_content_roundtrip_error() -> Response:
+    """Build the synthetic error returned instead of the raw upstream 400.
+
+    AC3 (LP-0MSGU3JNU0092AFQ): when the reasoning_content round-trip 400 still
+    occurs after the sanitizer repaired the payload (edge case) and all
+    fallback providers are exhausted, the proxy must not surface the raw
+    upstream body to the client. This synthetic 400 carries the cause and
+    remediation guidance instead.
+    """
+    payload = {
+        "error": {
+            "type": "proxy_error",
+            "code": "reasoning_content_roundtrip",
+            "message": (
+                "Upstream thinking-mode provider rejected the request: an "
+                "assistant message in the conversation history is missing "
+                "`reasoning_content`. The proxy has repaired the payload; if "
+                "this error persists, the conversation history cannot be "
+                "replayed to the thinking-mode provider."
+            ),
+            "suggested_action": (
+                "Retry the request. If it persists, compact the conversation "
+                "history or start a new session."
+            ),
+        }
+    }
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=400,
+        media_type="application/json",
+    )
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -2387,6 +2445,11 @@ async def proxy_with_remote_fallback(
     # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
     # the next provider is resolved.
     _pending_reroute: str | None = None
+    # AC3 (LP-0MSGU3JNU0092AFQ): remember the first reasoning_content
+    # round-trip 400 so the exhausted path returns a synthetic error with
+    # remediation guidance instead of the raw upstream body (or a 503 whose
+    # diagnostics leak it).
+    _reasoning_roundtrip_response: Response | None = None
 
     ptr = _get_proxy_to_remote()
 
@@ -2555,6 +2618,11 @@ async def proxy_with_remote_fallback(
                     response, provider_name, provider_type,
                     cooldown_seconds, attempts, body_text,
                 )
+                # AC3 (LP-0MSGU3JNU0092AFQ): remember this specific 400 so the
+                # exhausted path can return a synthetic error instead of the
+                # raw upstream body / exhausted-503-with-diagnostics.
+                if _reasoning_roundtrip_response is None and _is_reasoning_content_roundtrip_error(response):
+                    _reasoning_roundtrip_response = response
                 attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
@@ -2651,6 +2719,17 @@ async def proxy_with_remote_fallback(
             path,
         )
         return first_model_loading_response
+
+    # AC3 (LP-0MSGU3JNU0092AFQ): never surface the raw upstream
+    # reasoning_content round-trip 400 (or a 503 whose diagnostics leak it);
+    # return a synthetic error with remediation guidance instead.
+    if _reasoning_roundtrip_response is not None:
+        logger.warning(
+            "Intercepting reasoning_content round-trip 400 for model=%s; "
+            "returning synthetic error instead of raw upstream body",
+            path,
+        )
+        return _build_reasoning_content_roundtrip_error()
 
     return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
 
@@ -3486,6 +3565,16 @@ async def proxy_with_fallback(
                 "remote fallback chain present",
                 path,
             )
+        elif _is_reasoning_content_roundtrip_error(_first_error_response):
+            # AC3 (LP-0MSGU3JNU0092AFQ): never surface the raw upstream
+            # reasoning_content round-trip 400 to the client; return a
+            # synthetic error with remediation guidance instead.
+            logger.warning(
+                "Intercepting reasoning_content round-trip 400 for model=%s; "
+                "returning synthetic error instead of raw upstream body",
+                path,
+            )
+            return _build_reasoning_content_roundtrip_error()
         else:
             logger.info(
                 "Returning first provider error response instead of generic exhausted "

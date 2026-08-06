@@ -897,6 +897,24 @@ impact (recovery-first avoids the pre-content window; informative-error
 covers 100% of client-visible errors), and the emission-site audit
 (`proxy/docs/sse-error-emission-audit.md`).
 
+##### `reasoning_content` round-trip repair (LP-0MSGU3JNU0092AFQ)
+
+Remote thinking-mode providers (Console `opencode.ai/zen`, Console Go
+`opencode.ai/zen/go`, `api.deepseek.com`) reject multi-turn requests with
+HTTP 400 (*"The `reasoning_content` in the thinking mode must be passed back
+to the API"*) when any assistant message lacks the `reasoning_content` field.
+The client (opencode) drops the **empty** `reasoning_content: ""` that the
+upstream emitted on tool-call-only turns. The proxy repairs the payload
+before remote send:
+
+- `proxy_remote.py::_sanitize_remote_messages` injects `reasoning_content:
+  ""` (matching upstream emission) on assistant messages where the field is
+  missing or `null` — additive-only, existing values never touched.
+- Both fallback functions (`proxy_with_fallback`, `proxy_with_remote_fallback`)
+  intercept the specific 400: when all providers are exhausted, a synthetic
+  JSON error with `suggested_action` remediation is returned instead of the
+  raw upstream body, so the opaque 400 never reaches the client.
+
 ### Local Stream Timeout Configuration
 
 The proxy uses a separate idle timeout for **local model** (llama-server) streaming, distinct from the remote upstream timeout above. This timeout governs pauses between tokens from the local inference engine, which can be significantly longer during complex reasoning chains (LP-0MS14PM7J003XPS8).

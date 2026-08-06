@@ -116,6 +116,38 @@ availability; follow-up tuning work item LP-0MSDRRPV0001TCLX tracks the
   (LP-0MRGU0I91006ODFD) suppresses repeat fallbacks to the exhausted free
   tier (4 occurrences vs 112 upstream errors; cooldown working).
 
+#### 4a. `reasoning_content` round-trip repair (LP-0MSGU3JNU0092AFQ)
+
+Remote thinking-mode providers (Console `opencode.ai/zen`, Console Go
+`opencode.ai/zen/go`, `api.deepseek.com`) require the `reasoning_content`
+field to be present on assistant messages in multi-turn requests. The client
+(opencode) drops the **empty** `reasoning_content: ""` that the upstream
+emitted on tool-call-only turns, so the field is entirely absent on those
+messages when the history is re-sent. The upstream rejects the whole request
+with HTTP 400: *"The `reasoning_content` in the thinking mode must be passed
+back to the API."*
+
+**Fix (deployed 2026-08-06):**
+
+1. `proxy_remote.py::_sanitize_remote_messages` now injects
+   `reasoning_content: ""` (matching upstream emission) on every assistant
+   message where the field is missing or `null` — additive-only; existing
+   values are never touched. This makes the forwarded payload exactly match
+   what the upstream itself produced, eliminating the validation trigger.
+2. `provider.py` intercepts the specific 400 in both `proxy_with_fallback`
+   and `proxy_with_remote_fallback`: when all providers are exhausted and
+   the first error is this reasoning_content round-trip 400, the proxy
+   returns a synthetic JSON error (`code: reasoning_content_roundtrip`,
+   `suggested_action` remediation) instead of the raw upstream body — the
+   error never reaches the client as an opaque upstream failure.
+
+**Probe verification (2026-08-06):** `reasoning_content: ""` is accepted by
+all three endpoints (opencode.ai/zen, opencode.ai/zen/go,
+api.deepseek.com), including the exact recorded 69-message production payload
+on api.deepseek.com. The missing-field shape was also accepted at probe time,
+indicating the upstream rejection was a strict/transient validation state;
+the injection removes the risk entirely by matching upstream emission.
+
 ### 5. `backend_retry` timeouts — 93 (transient, absorbed)
 
 | Error | Count | Signal |
