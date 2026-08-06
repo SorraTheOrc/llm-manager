@@ -313,7 +313,11 @@ async def get_llama_local_status():
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
-    not running or the query fails both default to 0.
+    not running or the query fails both default to 0. When the server is
+    running but no model is loaded yet, the configured
+    ``session_slot_pool_size`` is reported instead (fail-open, so
+    orchestrators see available capacity during idle windows —
+    LP-0MSI06HPB0043MV1).
 
     Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
     (seconds, default 1.0).
@@ -374,13 +378,29 @@ async def get_llama_local_status():
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
-            llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-            client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-            from proxy.observability import _query_slots
-            available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
         except Exception:
-            # slots query is best-effort; default to 0 on failure
-            pass
+            server_cfg = {}
+        if cm:
+            try:
+                llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                from proxy.observability import _query_slots
+                available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
+            except Exception:
+                # slots query is best-effort; default to 0 on failure
+                pass
+        else:
+            # Fail-open (LP-0MSI06HPB0043MV1): server is up but no model is
+            # loaded yet (e.g. right after restart while preload runs).
+            # Querying /slots without ?model= yields HTTP 400 -> 0/0, which
+            # wedges orchestrators (Herdr downtime worker) into "no capacity".
+            # Report the configured pool size instead; all slots are idle.
+            # The first dispatched job triggers ensure_model_loaded().
+            try:
+                total_slots = int(server_cfg.get("session_slot_pool_size", 3) or 3)
+            except (TypeError, ValueError):
+                total_slots = 3
+            available_slots = total_slots
 
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
     local_owner_session_id = None
