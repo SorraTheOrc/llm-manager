@@ -38,7 +38,7 @@ from proxy.observability import (  # noqa: E402
     _record_backend_signal,
 )
 from proxy.session import (  # noqa: E402
-    SessionSingleFlightRejected,
+    SessionSingleFlightRejectedError,
     _build_slot_context,
     _detect_restore_signal_from_llama_log,
     _detect_restore_signal_from_log_slice,
@@ -1428,7 +1428,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         headers=outgoing_headers,
                         status_code=upstream_status,
                     )
-        except SessionSingleFlightRejected as exc:
+        except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=False,
@@ -1599,7 +1599,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             decrement_local=True,
                             session_explicit=session_explicit,
                         )
-        except SessionSingleFlightRejected as exc:
+        except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=True,

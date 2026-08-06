@@ -523,12 +523,12 @@ class TestSessionSingleFlightCoordinator:
 
     @pytest.mark.asyncio
     async def test_reject_mode_rejects_second_inflight_request(self):
-        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejectedError
 
         coordinator = SessionSingleFlightCoordinator()
 
         async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
-            with pytest.raises(SessionSingleFlightRejected) as excinfo:
+            with pytest.raises(SessionSingleFlightRejectedError) as excinfo:
                 async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
                     pass
 
@@ -538,7 +538,7 @@ class TestSessionSingleFlightCoordinator:
 
     @pytest.mark.asyncio
     async def test_queue_mode_enforces_queue_depth(self):
-        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejectedError
 
         coordinator = SessionSingleFlightCoordinator()
         first_entered = asyncio.Event()
@@ -559,7 +559,7 @@ class TestSessionSingleFlightCoordinator:
         queued_task = asyncio.create_task(second_request())
         await asyncio.sleep(0.01)
 
-        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+        with pytest.raises(SessionSingleFlightRejectedError) as excinfo:
             async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
                 pass
 
@@ -571,12 +571,12 @@ class TestSessionSingleFlightCoordinator:
 
     @pytest.mark.asyncio
     async def test_queue_timeout_raises_rejected_when_expired(self):
-        """AC1+AC3: Queue timeout fires and raises SessionSingleFlightRejected.
+        """AC1+AC3: Queue timeout fires and raises SessionSingleFlightRejectedError.
 
         When a queued request waits longer than queue_timeout_seconds, it
-        should receive a SessionSingleFlightRejected instead of hanging.
+        should receive a SessionSingleFlightRejectedError instead of hanging.
         """
-        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejectedError
 
         coordinator = SessionSingleFlightCoordinator()
         first_entered = asyncio.Event()
@@ -593,7 +593,7 @@ class TestSessionSingleFlightCoordinator:
         await first_entered.wait()
 
         # Second request should time out quickly
-        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+        with pytest.raises(SessionSingleFlightRejectedError) as excinfo:
             async with coordinator.acquire(
                 "timeout-session", mode="queue", max_queue_depth=8, queue_timeout_seconds=0.05
             ):

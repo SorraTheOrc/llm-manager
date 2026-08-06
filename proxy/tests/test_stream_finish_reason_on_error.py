@@ -355,7 +355,7 @@ def _make_error_streaming_response(
             yield c
         raise exc
 
-    MockStreamResponse = type("MockStreamResponse", (), {
+    mock_stream_response = type("MockStreamResponse", (), {
         "status_code": 200,
         "headers": {"content-type": content_type},
         "aiter_bytes": staticmethod(_aiter),
@@ -364,12 +364,12 @@ def _make_error_streaming_response(
 
     class MockCM:
         async def __aenter__(self):
-            return MockStreamResponse()
+            return mock_stream_response()
 
         async def __aexit__(self, *args):
             pass
 
-    return MockCM(), MockStreamResponse()
+    return MockCM(), mock_stream_response()
 
 
 @pytest.fixture(autouse=True)

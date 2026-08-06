@@ -370,7 +370,7 @@ def normalize_upstream_request_headers(headers: Mapping[str, str]) -> dict[str, 
 
 def _call_with_backend_retries(*args, **kwargs):
     """Wrapper around _call_with_backend_retries to support monkey-patching.
-    
+
     Accesses via _srv() so that tests can monkeypatch server-level
     references (back-compat with test patterns).
     """
@@ -379,7 +379,7 @@ def _call_with_backend_retries(*args, **kwargs):
 
 def _call_with_empty_retry(*args, **kwargs):
     """Wrapper around _call_with_empty_retry to support monkey-patching.
-    
+
     Accesses via _srv() so that tests can monkeypatch server-level
     references (back-compat with test patterns).
     """
@@ -400,7 +400,7 @@ def _build_backend_error_response(
     retry_after: int | None = None,
 ) -> JSONResponse:
     """Build a 503 error response with session information headers.
-    
+
     Used by both streaming and non-streaming paths in proxy_to_local
     when the backend is unavailable or returns an error.
     """
@@ -436,7 +436,7 @@ def _build_backend_unavailable_response(
     srv, path: str
 ) -> JSONResponse:
     """Build a 503 response for backend_unavailable state.
-    
+
     Called before any session processing has happened, so no session
     headers are included.
     """
@@ -1085,7 +1085,7 @@ async def _handle_session(
     request_headers,
 ) -> dict:
     """Handle session resolution and delta calculation.
-    
+
     Returns a dict with session_id, session_created, is_delta_request,
     session_fallback_reason, delta_messages, and updated body_json/body.
     """
@@ -1404,7 +1404,7 @@ async def _check_slot_availability(
     path: str,
 ) -> JSONResponse | None:
     """Check llama-server slot availability.
-    
+
     Returns a 503 JSONResponse if no slots are available, None otherwise.
     """
     if not (path == "v1/chat/completions" or path.endswith("chat/completions")):

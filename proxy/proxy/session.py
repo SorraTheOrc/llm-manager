@@ -927,7 +927,7 @@ slot_lock_coordinator = SlotLockCoordinator()
 # ===================================================================
 
 
-class SessionSingleFlightRejected(Exception):
+class SessionSingleFlightRejectedError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
@@ -963,10 +963,10 @@ class SessionSingleFlightCoordinator:
                 if state["lock"].locked():
                     if mode_norm == "reject":
                         _record_single_flight_reject()
-                        raise SessionSingleFlightRejected("active_inflight")
+                        raise SessionSingleFlightRejectedError("active_inflight")
                     if max_queue_depth is not None and state["waiters"] >= max_queue_depth:
                         _record_single_flight_reject()
-                        raise SessionSingleFlightRejected("queue_full")
+                        raise SessionSingleFlightRejectedError("queue_full")
                     state["waiters"] += 1
                     is_waiting = True
                     _record_single_flight_queue()
@@ -983,7 +983,7 @@ class SessionSingleFlightCoordinator:
                     if is_waiting:
                         state["waiters"] = max(0, state["waiters"] - 1)
                 _record_single_flight_reject()
-                raise SessionSingleFlightRejected("queue_timeout")
+                raise SessionSingleFlightRejectedError("queue_timeout")
             async with self._state_lock:
                 if is_waiting:
                     state["waiters"] = max(0, state["waiters"] - 1)

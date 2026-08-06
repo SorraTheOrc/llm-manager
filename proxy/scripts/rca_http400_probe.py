@@ -184,7 +184,7 @@ def _redact(text: str) -> str:
 def main() -> int:
     auth_keys = _load_auth_keys()
     if not auth_keys:
-        print("ERROR: no API keys found in %s" % AUTH_PATH, file=sys.stderr)
+        print(f"ERROR: no API keys found in {AUTH_PATH}", file=sys.stderr)
         return 2
 
     out = {"endpoints": [], "results": [], "rejected_matrix": {}}

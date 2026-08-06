@@ -71,7 +71,7 @@ def _mock_streaming_upstream_response(
         for c in chunks:
             yield c
 
-    MockStreamResponse = type("MockStreamResponse", (), {
+    mock_stream_response = type("MockStreamResponse", (), {
         "status_code": status_code,
         "headers": {"content-type": content_type},
         "aiter_bytes": staticmethod(_aiter),
@@ -80,12 +80,12 @@ def _mock_streaming_upstream_response(
 
     class MockCM:
         async def __aenter__(self):
-            return MockStreamResponse()
+            return mock_stream_response()
 
         async def __aexit__(self, *args):
             pass
 
-    return MockCM(), MockStreamResponse()
+    return MockCM(), mock_stream_response()
 
 
 def _make_mock_client(mock_response):

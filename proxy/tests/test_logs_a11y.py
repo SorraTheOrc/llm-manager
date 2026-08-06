@@ -25,18 +25,18 @@ def srgb_channel_to_linear(c: float) -> float:
 
 def luminance(rgb):
     r, g, b = rgb
-    R = srgb_channel_to_linear(r)
-    G = srgb_channel_to_linear(g)
-    B = srgb_channel_to_linear(b)
-    return 0.2126 * R + 0.7152 * G + 0.0722 * B
+    r_lin = srgb_channel_to_linear(r)
+    g_lin = srgb_channel_to_linear(g)
+    b_lin = srgb_channel_to_linear(b)
+    return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
 
 
 def contrast_ratio(rgb1, rgb2):
-    L1 = luminance(rgb1)
-    L2 = luminance(rgb2)
-    L_high = max(L1, L2)
-    L_low = min(L1, L2)
-    return (L_high + 0.05) / (L_low + 0.05)
+    lum1 = luminance(rgb1)
+    lum2 = luminance(rgb2)
+    lum_high = max(lum1, lum2)
+    lum_low = min(lum1, lum2)
+    return (lum_high + 0.05) / (lum_low + 0.05)
 
 
 def resolve_var(vars_map, val):

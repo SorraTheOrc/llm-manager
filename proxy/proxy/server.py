@@ -847,10 +847,10 @@ async def status_events():
 
 def _resolve_log_path(source: str = "proxy") -> Path:
     """Resolve the log file path for a given source.
-    
+
     Args:
         source: Either 'proxy' for proxy.log or 'llama' for llama-server.log
-        
+
     Returns:
         Path to the requested log file
     """
@@ -1138,7 +1138,7 @@ from .router import (  # noqa: E402, F401
 from .session import (  # noqa: E402, F401
     ContentOnlyConsoleHandler,
     SessionSingleFlightCoordinator,
-    SessionSingleFlightRejected,
+    SessionSingleFlightRejectedError,
     SlotLockCoordinator,
     _build_slot_context,
     _call_slot_endpoint,

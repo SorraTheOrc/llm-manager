@@ -86,7 +86,7 @@ async def start_test_server(handler, host='localhost', port=0):
 @pytest.mark.asyncio
 async def test_connection_pooling_allows_concurrent_status_requests():
     """Verify that multiple concurrent HTTP requests use connection pooling.
-    
+
     This test creates a real HTTP server and uses httpx with connection pooling
     to verify that multiple concurrent status requests complete without blocking.
     """
@@ -123,7 +123,7 @@ async def test_connection_pooling_allows_concurrent_status_requests():
 @pytest.mark.asyncio
 async def test_status_request_not_blocked_by_streaming_request():
     """Verify status request completes even when streaming request is active.
-    
+
     This test simulates the bug scenario where a status request would block
     when a streaming request is in progress, and verifies that connection
     pooling prevents this blocking.
@@ -214,12 +214,12 @@ async def test_status_request_not_blocked_by_streaming_request():
 @pytest.mark.asyncio
 async def test_status_request_with_limited_connections_and_blocking_stream():
     """Verify status completes even when streaming requests hold all but one connection.
-    
+
     This test simulates the real bug scenario where:
     1. Multiple streaming requests are in progress (holding connections)
     2. A status request needs to complete
     3. With a shared connection pool, the status should still complete
-    
+
     With a limit of 2 max connections, where 1 is held by a slow streaming request,
     the status request should still be able to complete using the second connection.
     """
@@ -310,7 +310,7 @@ async def test_status_request_with_limited_connections_and_blocking_stream():
 @pytest.mark.asyncio
 async def test_without_connection_pooling_blocks():
     """Verify that WITHOUT connection pooling, requests would block.
-    
+
     This test creates a NEW client per request (no pooling) and shows
     that concurrent requests complete slower than with pooling.
     """

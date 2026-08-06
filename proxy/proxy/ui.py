@@ -689,7 +689,7 @@ async def create_embeddings(request: Request):
     """
     Dedicated endpoint for embeddings requests.
     Validates the request and routes to the appropriate backend.
-    
+
     The OpenAI embeddings API expects:
     - model: string (required)
     - input: string or array of strings (required)

@@ -12,7 +12,6 @@ Acceptance criteria (from LP-0MQJGVH9Q003MTAQ):
 4. Disabled mode (threshold=0) never triggers, even at extreme token rates (>500 t/s)
 """
 
-from typing import List, Tuple
 from unittest.mock import patch
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
