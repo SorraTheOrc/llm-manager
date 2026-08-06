@@ -637,6 +637,39 @@ When all providers are exhausted:
 - **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
 - **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable — `error` is `"All providers unavailable: no provider is available during the current scheduled time window"` and the `diagnostics` entries carry `status: "outside_time_window"` instead of the generic `"All providers exhausted"`. Mixed cases (a provider in cooldown or an error plus a time-window skip) keep the generic message, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible.
 
+#### Chain-Hold Retry (deferred exhaustion)
+
+Most chain exhaustion is transient — 60s provider cooldowns, 180s stall
+circuit-breaker cooldowns, 5–10 min `available_times` window edges. Rather
+than erroring immediately when the final provider in a fallback chain is
+unavailable, the proxy can **hold** the request and restart the chain cycle
+from the **first** provider once short cooldowns have had time to expire
+(LP-0MSH94Z7K007VKC9).
+
+- **`server.chain_hold_seconds`** (default `300`) — how long to hold an
+exhausted chain's request before starting a new cycle from the first
+provider. `0` retries immediately (no wait).
+- **`server.chain_hold_max_cycles`** (default `3`; `0` = infinite) — how many
+hold-retry cycles are allowed before the existing exhaustion/error response
+is returned unchanged. With the defaults, the chain runs at most 4 times
+(initial run + 3 holds) and the total wait is bounded by ~15 minutes.
+
+Behavior:
+- **Streaming requests** (`stream: true`) receive periodic SSE comment lines
+  (`: chain exhausted (<diagnostics>); retrying from <first> in <Ns>`) during
+the hold, so clients can surface live progress; the real result (or the
+terminal error) streams after the hold. Client-side surfacing of these
+comments is tracked in SA-0MSHAKSEA001LQ6T.
+- **Non-streaming requests** are held silently (deferred response) with no
+mid-hold feedback channel.
+- **Client disconnect** aborts the hold promptly — no wasted waiting.
+- The hold only defers the exhaustion verdict: successful responses, provider
+ordering, and existing cooldown/circuit-breaker behavior are unchanged.
+- The feature is enabled when either knob is configured; production
+`config.yaml` ships both. Both values are validated as non-negative at
+startup (a `0`/`0` combination — zero hold interval with infinite cycles —
+is rejected as an unbounded busy-retry loop).
+
 #### Observability
 
 When a fallback occurs:

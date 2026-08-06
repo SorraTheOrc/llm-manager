@@ -350,6 +350,45 @@ on signal, bounded by remaining providers + per-provider cooldown),
 
 ---
 
+# Follow-up — Chain-hold retry for exhausted chains (LP-0MSH94Z7K007VKC9)
+
+## Problem (2026-08-06 09:05–09:08 cluster)
+
+When every provider in a model's fallback chain is unavailable (final model
+unreachable), the proxy returned an error to the client immediately. In the
+09:05 cluster, Console Go's stall circuit breaker (180s), the free tier's
+3-hour cooldown, and the deepseek direct time-window gap left the `plan`
+chain with zero redundancy for ~3 minutes, producing 31 "All providers
+exhausted" errors. Most chain exhaustion is transient (60s cooldowns, 180s
+stall-circuit-breaker cooldowns, 5–10 min time-window edges), so erroring
+immediately discarded requests that would have succeeded moments later.
+
+## Mechanism
+
+Both fallback entry points (`proxy_with_fallback` /
+`proxy_with_remote_fallback`) now run their provider chain as a CYCLE under a
+cycle-hold wrapper. When a cycle exhausts every provider (a distinguishable
+`ChainExhaustedError` raised from the exhaustion tail), the wrapper holds the
+request for `server.chain_hold_seconds` (default 300) then starts a NEW cycle
+from the FIRST provider with fresh per-request state — giving short cooldowns
+time to expire. The number of hold-retry cycles is bounded by
+`server.chain_hold_max_cycles` (default 3; 0 = infinite); after the bound the
+existing exhaustion/error response is returned unchanged.
+
+- Streaming requests receive periodic SSE comment lines
+  (`: chain exhausted (<diagnostics>); retrying from <first> in <Ns>`) during
+the hold (client surfacing tracked in SA-0MSHAKSEA001LQ6T); non-streaming
+requests are held silently.
+- A client disconnect aborts the hold promptly (no wasted waiting).
+- The hold only defers the exhaustion verdict — successful responses,
+provider ordering, and existing cooldown/circuit-breaker behavior are
+unchanged. This complements Recommendation 1's recovery-first strategy: it
+covers the case where the ENTIRE chain is exhausted (not just one provider)
+and Recommendation 2's escalation remains the terminal response after the
+bound.
+
+---
+
 # Recommendation 2 — Informative-error SSE fallback (LP-0MSDP2PH20079WQ7)
 
 ## Goal

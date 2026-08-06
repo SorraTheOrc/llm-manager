@@ -341,6 +341,22 @@ server:
   llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
+  # Chain-hold retry (LP-0MSH94Z7K007VKC9): when EVERY provider in a model's
+  # fallback chain is exhausted, hold the request for chain_hold_seconds
+  # (default 300) instead of erroring immediately, then start a NEW cycle from
+  # the FIRST provider — giving short cooldowns (60s provider cooldown, 180s
+  # stall circuit breaker, available_times window edges) time to expire.
+  #   - Streaming requests receive periodic SSE feedback comments
+  #     (`: chain exhausted (...); retrying from <first> in <Ns>`) so clients
+  #     can surface live progress (companion item SA-0MSHAKSEA001LQ6T).
+  #   - Non-streaming requests are held silently (deferred response).
+  #   - A client disconnect aborts the hold promptly.
+  #   - 0 disables the wait (retries immediately).
+  chain_hold_seconds: 300
+  # Maximum number of hold-retry cycles before returning the exhaustion error
+  # response unchanged. 0 = infinite (keep holding/retrying until the client
+  # disconnects).
+  chain_hold_max_cycles: 3
   # Local slot-exhaustion grace retries before remote fallback.
   # Helps right-after-restart races where slot probes briefly report 0 available.
   local_slot_exhaustion_retry_attempts: 1

@@ -424,8 +424,24 @@ def load_config(config_path: str | None = None) -> dict:
 
     # Validate system_prompt configurations
     _validate_prompt_configs(cfg)
+    # Validate chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5)
+    _validate_chain_hold_config(cfg)
 
     return cfg
+
+
+def _validate_chain_hold_config(cfg: dict) -> None:
+    """Validate the chain-hold configuration (``chain_hold_seconds`` /
+    ``chain_hold_max_cycles``).
+
+    Raises ValueError on first invalid config (mirrors
+    ``_validate_prompt_configs``).
+    """
+    from proxy.provider import validate_chain_hold_config as _vchc
+
+    problems = _vchc(cfg)
+    if problems:
+        raise ValueError("Chain-hold config validation failed: " + "; ".join(problems))
 
 
 def _validate_prompt_configs(cfg: dict) -> None:
