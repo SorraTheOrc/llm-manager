@@ -377,7 +377,7 @@ async def get_llama_local_status():
             llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
             client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
             from proxy.observability import _query_slots
-            available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0)
+            available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
         except Exception:
             # slots query is best-effort; default to 0 on failure
             pass

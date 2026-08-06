@@ -8,6 +8,7 @@ Tests for:
 
 import json
 import time
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -3789,3 +3790,429 @@ async def test_get_local_concurrency_info_reads_session_slot_pool_size():
         "session_slot_pool_size": 1,
     })
     assert result == (0, 1), f"Expected (0, 1), got {result}"
+
+
+# ===================================================================
+# Timed access to models (LP-0MS4ETBNO0022QAC)
+# ===================================================================
+#
+# available_times: optional list of "HH:MM-HH:MM" UTC windows on a provider
+# entry. Providers without it remain unrestricted (backward compatible).
+
+# Fixed "now" used by the async loop tests: 13:00 UTC on a Monday.
+_FIXED_NOW_13_UTC = datetime(2026, 1, 5, 13, 0, 0, tzinfo=UTC)
+
+
+class _FakeDatetime:
+    """Stand-in for proxy.provider.datetime so _is_within_allowed_window()
+    observes a deterministic current time."""
+
+    _now = _FIXED_NOW_13_UTC
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._now
+
+
+def _patch_utc_now(dt):
+    _FakeDatetime._now = dt
+    return patch("proxy.provider.datetime", _FakeDatetime)
+
+
+# ---------------------------------------------------------------------------
+# _is_within_allowed_window helper tests
+# ---------------------------------------------------------------------------
+
+def test_is_within_allowed_window_within_window():
+    """A provider is eligible at a time inside one of its windows."""
+    cfg = {"name": "p", "available_times": ["10:00-12:00"]}
+    now = datetime(2026, 1, 5, 10, 30, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=now) is True
+
+
+def test_is_within_allowed_window_outside_window():
+    """A provider is not eligible outside all of its windows."""
+    cfg = {"name": "p", "available_times": ["10:00-12:00"]}
+    now = datetime(2026, 1, 5, 13, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=now) is False
+
+
+def test_is_within_allowed_window_boundaries():
+    """Window start is inclusive, end is exclusive."""
+    cfg = {"name": "p", "available_times": ["10:00-12:00"]}
+    at_start = datetime(2026, 1, 5, 10, 0, tzinfo=UTC)
+    at_end = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=at_start) is True
+    assert provider._is_within_allowed_window(cfg, now_utc=at_end) is False
+
+
+def test_is_within_allowed_window_overnight_wrap():
+    """Overnight ranges (end < start) wrap past midnight."""
+    cfg = {"name": "p", "available_times": ["22:00-02:00"]}
+    before_midnight = datetime(2026, 1, 5, 23, 30, tzinfo=UTC)
+    after_midnight = datetime(2026, 1, 6, 1, 0, tzinfo=UTC)
+    outside = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=before_midnight) is True
+    assert provider._is_within_allowed_window(cfg, now_utc=after_midnight) is True
+    assert provider._is_within_allowed_window(cfg, now_utc=outside) is False
+
+
+def test_is_within_allowed_window_multiple_windows():
+    """Any one matching window makes the provider eligible."""
+    cfg = {"name": "p", "available_times": ["09:00-11:00", "14:00-16:00"]}
+    first = datetime(2026, 1, 5, 10, 0, tzinfo=UTC)
+    second = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
+    gap = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=first) is True
+    assert provider._is_within_allowed_window(cfg, now_utc=second) is True
+    assert provider._is_within_allowed_window(cfg, now_utc=gap) is False
+
+
+def test_is_within_allowed_window_missing_times_unrestricted():
+    """A provider without available_times is always eligible (backward compat)."""
+    cfg = {"name": "p"}
+    now = datetime(2026, 1, 5, 13, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=now) is True
+
+
+def test_is_within_allowed_window_empty_times_unrestricted():
+    """An empty available_times list is unrestricted."""
+    cfg = {"name": "p", "available_times": []}
+    now = datetime(2026, 1, 5, 13, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=now) is True
+
+
+def test_is_within_allowed_window_malformed_fail_open():
+    """Malformed window strings are logged and treated as unrestricted (fail-open)."""
+    cfg = {"name": "p", "available_times": ["garbage"]}
+    now = datetime(2026, 1, 5, 13, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=now) is True
+
+
+def test_is_within_allowed_window_mixed_valid_and_malformed():
+    """Valid windows apply even when an unrelated entry is malformed."""
+    cfg = {"name": "p", "available_times": ["garbage", "10:00-12:00"]}
+    inside = datetime(2026, 1, 5, 11, 0, tzinfo=UTC)
+    outside = datetime(2026, 1, 5, 13, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=inside) is True
+    assert provider._is_within_allowed_window(cfg, now_utc=outside) is False
+
+
+def test_is_within_allowed_window_out_of_range_hour_fail_open():
+    """Windows with invalid hour values are ignored (fail-open)."""
+    cfg = {"name": "p", "available_times": ["25:00-26:00"]}
+    now = datetime(2026, 1, 5, 13, 0, tzinfo=UTC)
+    assert provider._is_within_allowed_window(cfg, now_utc=now) is True
+
+
+# ---------------------------------------------------------------------------
+# resolve_provider time-window tests
+# ---------------------------------------------------------------------------
+
+def test_resolve_provider_skips_provider_outside_window():
+    """resolve_provider skips a provider whose window excludes now and returns
+    the next eligible provider."""
+    config = {
+        "providers": [
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+            {"name": "always", "type": "remote"},
+        ]
+    }
+    with _patch_utc_now(_FIXED_NOW_13_UTC):
+        result = provider.resolve_provider(config)
+    assert result is not None
+    assert result["name"] == "always"
+
+
+def test_resolve_provider_returns_none_when_all_outside_window():
+    """resolve_provider returns None when every provider is outside its window."""
+    config = {
+        "providers": [
+            {"name": "a", "type": "remote", "available_times": ["00:00-01:00"]},
+            {"name": "b", "type": "remote", "available_times": ["00:00-01:00"]},
+        ]
+    }
+    with _patch_utc_now(_FIXED_NOW_13_UTC):
+        result = provider.resolve_provider(config)
+    assert result is None
+
+
+def test_resolve_provider_uses_provider_inside_window():
+    """A provider inside its window is returned even when a later provider
+    would otherwise be picked."""
+    config = {
+        "providers": [
+            {"name": "windowed", "type": "remote", "available_times": ["12:00-14:00"]},
+            {"name": "always", "type": "remote"},
+        ]
+    }
+    with _patch_utc_now(_FIXED_NOW_13_UTC):
+        result = provider.resolve_provider(config)
+    assert result is not None
+    assert result["name"] == "windowed"
+
+
+def test_resolve_provider_skips_outside_window_and_cooldown():
+    """Window-skipped and cooldown-skipped providers are both skipped."""
+    config = {
+        "providers": [
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+            {"name": "cooled", "type": "remote"},
+            {"name": "always", "type": "remote"},
+        ]
+    }
+    provider.mark_provider_unavailable("cooled", 60.0)
+    with _patch_utc_now(_FIXED_NOW_13_UTC):
+        result = provider.resolve_provider(config)
+    assert result is not None
+    assert result["name"] == "always"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_provider_with_exclusions time-window tests
+# ---------------------------------------------------------------------------
+
+def test_resolve_provider_with_exclusions_honors_windows():
+    """The exclusions-based resolver also skips providers outside their window."""
+    config = {
+        "providers": [
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+            {"name": "always", "type": "remote"},
+        ]
+    }
+    with _patch_utc_now(_FIXED_NOW_13_UTC):
+        result = provider._resolve_provider_with_exclusions(config, set())
+    assert result is not None
+    assert result["name"] == "always"
+
+
+# ---------------------------------------------------------------------------
+# Fallback loop time-window tests (proxy_with_remote_fallback)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_remote_fallback_time_window_skips_to_next_eligible():
+    """A provider outside its window is skipped without being called; the
+    next eligible provider serves the request."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+            {"name": "remote-fallback", "type": "remote"},
+        ]
+    }
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["remote-fallback"], (
+        f"Timed provider should be skipped without being called, got {call_log}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_all_time_window_skipped_distinguishable_503():
+    """When every provider is skipped due to its time window (no cooldown, no
+    errors), the response is a 503 with the time-window-specific message and
+    diagnostics — not the generic 'All providers exhausted'."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "a", "type": "remote", "available_times": ["00:00-01:00"]},
+            {"name": "b", "type": "remote", "available_times": ["00:00-01:00"]},
+        ]
+    }
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(status_code=200, content=b"unexpected")
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert call_log == [], "No provider should have been called"
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == (
+        "All providers unavailable: no provider is available during the current scheduled time window"
+    ), f"Expected time-window message, got: {body}"
+    assert "All providers exhausted" not in result.body.decode("utf-8")
+    diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
+    assert diag_statuses == ["outside_time_window", "outside_time_window"], (
+        f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_mixed_cooldown_and_window_returns_generic():
+    """Mixed cooldown + time-window skips fall back to the generic exhausted
+    response, but the diagnostics still expose the time-window skip."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "cooled", "type": "remote"},
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+        ]
+    }
+    provider.mark_provider_unavailable("cooled", 60.0)
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        raise AssertionError("No provider should be called")
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == "All providers exhausted", (
+        f"Mixed cooldown+window should stay generic, got: {body}"
+    )
+    diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
+    assert "outside_time_window" in diag_statuses, (
+        f"Expected outside_time_window diagnostic, got: {body.get('diagnostics')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_error_and_window_mixed_returns_generic():
+    """When a provider was tried and failed (cooldown) while another is
+    time-skipped, the generic exhausted response is used (not the
+    time-window message), because a real error/cooldown occurred."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "failing", "type": "remote"},
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+        ]
+    }
+    call_log = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(status_code=502, content=b"Bad gateway")
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert call_log == ["failing"]
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == "All providers exhausted", (
+        f"Error+window mix should stay generic, got: {body}"
+    )
+    diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
+    assert "outside_time_window" in diag_statuses
+    assert "timed" in [a.get("provider") for a in body.get("diagnostics", [])]
+
+
+# ---------------------------------------------------------------------------
+# Fallback loop time-window tests (proxy_with_fallback — local + remote)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_proxy_with_fallback_time_window_skips_local_uses_next():
+    """proxy_with_fallback skips a local provider outside its window and
+    routes to the next eligible remote provider."""
+    request = _DummyRequest(body=b'{"model":"timed","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "local-timed", "type": "local", "llama_model": "Qwen3",
+             "available_times": ["00:00-01:00"]},
+            {"name": "remote-ok", "type": "remote"},
+        ]
+    }
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-timed")
+        raise AssertionError("Timed local provider must not be dispatched")
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote), \
+         patch("proxy.router.proxy_to_local", _mock_proxy_to_local):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["remote-ok"], f"Expected only remote-ok, got {call_log}"
+
+
+@pytest.mark.asyncio
+async def test_proxy_with_fallback_all_time_window_skipped_distinguishable_503():
+    """proxy_with_fallback returns the distinguishable time-window 503 when
+    every provider (local and remote) is outside its window."""
+    request = _DummyRequest(body=b'{"model":"timed","messages":[{"role":"user","content":"hi"}],"stream":false}')
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "local-timed", "type": "local", "llama_model": "Qwen3",
+             "available_times": ["00:00-01:00"]},
+            {"name": "remote-timed", "type": "remote",
+             "available_times": ["00:00-01:00"]},
+        ]
+    }
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local-timed")
+        raise AssertionError("Timed local provider must not be dispatched")
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_log.append(provider_cfg.get("name"))
+        raise AssertionError("Timed remote provider must not be dispatched")
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote), \
+         patch("proxy.router.proxy_to_local", _mock_proxy_to_local):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert call_log == [], "No provider should have been called"
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == (
+        "All providers unavailable: no provider is available during the current scheduled time window"
+    ), f"Expected time-window message, got: {body}"
+    assert "All providers exhausted" not in result.body.decode("utf-8")
+    diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
+    assert diag_statuses == ["outside_time_window", "outside_time_window"], (
+        f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
+    )

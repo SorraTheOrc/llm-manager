@@ -592,6 +592,119 @@ async def test_orphan_cleanup_abandoned_stream_integration():
 
 
 # ---------------------------------------------------------------------------
+# Slot registry cleanup on periodic release (LP-0MSB0RP7F000U0WJ)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_frees_slot_registry_entries():
+    """
+    _cleanup_stale_local_dispatch must free slot registry entries for
+    sessions it releases, both via idle_timeout (expired inactive) and
+    orphan_cleanup (expired active) branches (LP-0MSB0RP7F000U0WJ).
+
+    Without the fix, ghost entries accumulate in the module-level
+    ``_slot_owners`` dict, exhausting the slot pool so every new session
+    receives ``slot=none`` and proxy-level slot save/restore silently stops.
+    """
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+    from proxy.session import _slot_id_for_session, _slot_owners
+
+    _slot_owners.clear()
+    try:
+        logger = MagicMock()
+        srv = SimpleNamespace(
+            config={"server": {"local_dispatch_lease_timeout_seconds": 60}},
+            local_active_queries=1,
+            local_active_queries_lock=asyncio.Lock(),
+            local_dispatch_records={
+                # Expired inactive lease -> idle_timeout release
+                "sess-idle-expired": {
+                    "backend": "local",
+                    "started_at": 1.0,
+                    "active": False,
+                    "expires_at": 0.0,
+                },
+                # Expired active lease -> orphan_cleanup release
+                "sess-orphan-expired": {
+                    "backend": "local",
+                    "started_at": 1.0,
+                    "active": True,
+                    "expires_at": 0.0,
+                },
+                # Still-valid lease -> must be preserved
+                "sess-active-valid": {
+                    "backend": "local",
+                    "started_at": 1.0,
+                    "active": True,
+                    "expires_at": 10**12,
+                },
+            },
+            local_dispatch_records_lock=asyncio.Lock(),
+            logger=logger,
+        )
+
+        # Assign slots to the two sessions that will be released by cleanup
+        pool_size = 4
+        idle_slot = _slot_id_for_session("sess-idle-expired", pool_size)
+        orphan_slot = _slot_id_for_session("sess-orphan-expired", pool_size)
+        valid_slot = _slot_id_for_session("sess-active-valid", pool_size)
+        assert idle_slot is not None
+        assert orphan_slot is not None
+        assert valid_slot is not None
+        assert len({idle_slot, orphan_slot, valid_slot}) == 3, (
+            "Fixture sessions must occupy distinct slots"
+        )
+
+        removed = await _cleanup_stale_local_dispatch(srv)
+
+        # Both expired records must be removed; valid record preserved
+        assert removed == 2, f"Expected 2 leases removed, got {removed}"
+        assert "sess-idle-expired" not in srv.local_dispatch_records
+        assert "sess-orphan-expired" not in srv.local_dispatch_records
+        assert "sess-active-valid" in srv.local_dispatch_records
+
+        # The released sessions must no longer own slots
+        from proxy.session import _slot_owners as owners
+        assert idle_slot not in owners, (
+            "idle_timeout release must free the session's slot"
+        )
+        assert orphan_slot not in owners, (
+            "orphan_cleanup release must free the session's slot"
+        )
+
+        # A fresh session must be able to reuse one of the freed slots
+        new_slot = _slot_id_for_session("sess-fresh", pool_size)
+        assert new_slot is not None, (
+            "New session must receive a slot after periodic cleanup releases"
+        )
+        assert new_slot in (idle_slot, orphan_slot), (
+            "Freed slots should be reused by the next session"
+        )
+        assert new_slot != valid_slot, (
+            "Still-valid session's slot must not be reused"
+        )
+
+        # Verify through the production entry point (_build_slot_context):
+        # a fresh session must receive slot=N (not slot=none) after churn.
+        from proxy.session import _build_slot_context
+        slot_id, filename, _timeout = _build_slot_context(
+            {
+                "session_slot_save_path": "/tmp/slot-cache-test",
+                "session_slot_pool_size": pool_size,
+                "session_slot_timeout_seconds": 3.0,
+            },
+            "sess-fresh-2",
+        )
+        assert slot_id is not None, (
+            "Fresh session must receive slot=N (not slot=none) after churn"
+        )
+        assert filename is not None
+    finally:
+        _slot_owners.clear()
+
+
+# ---------------------------------------------------------------------------
 # Cross-session handoff tests (LP-0MRHV4UYE0013F6P)
 # ---------------------------------------------------------------------------
 

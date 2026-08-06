@@ -51,6 +51,36 @@ The proxy logs every incoming request at **INFO** level via the `llama-proxy` lo
 
 The body preview automatically filters out messages with `role: "system"` to prevent sensitive system-prompt content from leaking into proxy logs. Only `role: "user"` and `role: "assistant"` messages are included in the preview.
 
+### Usage analysis (proxy-usage-analysis skill)
+
+The `proxy-usage-analysis` skill turns the last 24h of proxy logs into
+per-session daytime/nighttime CSVs and a Markdown report with data-backed
+configuration recommendations (fallback reasons, slot contention, context
+pressure, day/night comparison). It parses the structured INFO lines the
+proxy emits — `Stream started`/`Stream finished` (with authoritative
+`tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
+and `local_dispatch_denied` — streaming large logs line by line.
+
+To run it, invoke the skill (`/skill:proxy-usage-analysis`); it writes
+`~/proxy-usage-reports/{daytime_sessions,nighttime_sessions}.csv` and
+`~/proxy-usage-reports/report.md` by default (override with `--output-dir`).
+Operators can instead call the underlying script directly:
+
+```bash
+python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+    --log-dir /var/log/llama-proxy \
+    --hours 24 \
+    --output-dir ~/proxy-usage-reports
+```
+
+Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
+`daytime_sessions.csv`, `nighttime_sessions.csv`
+(one row per session; day/night split derived from the `slot_schedule` in
+`config.yaml`), and `report.md` (aggregates + recommendations).
+
+See `~/.pi/agent/skills/proxy-usage-analysis/SKILL.md` for usage details and
+interpretation guidance.
+
 ## Host-first deployment
 
 The repository supports two deployment models for running llama-server:
@@ -367,6 +397,25 @@ programmatically by inspecting the `aliases` field of each model entry.
 - `api_key_env`: Environment variable containing the API key
 - `headers`: Additional headers to include (optional)
 
+#### Remote request sanitization
+
+Before a chat-completions request is forwarded to a remote provider, the proxy
+sanitizes the request shape and the accumulated message history
+(LP-0MSC1BNP90017L9K):
+
+- **Top-level fields**: a conservative OpenAI-compatible allowlist is kept;
+  local/experimental fields are stripped (logged at INFO).
+- **Message history** (`_sanitize_remote_messages`, always-on): malformed
+  tool-call/tool-result sequences that remote providers reject with HTTP 400
+  are repaired or pruned — never sent as-is:
+  - repair: assistant `content: null` → `""` when `tool_calls` present; missing
+    `type` → `"function"`; missing `function.arguments` → `""`
+  - prune: tool messages with missing or dangling `tool_call_id`; assistant
+    `tool_calls` entries missing `id`; empty `tool_calls` arrays
+  - preserve: truncated `function.arguments` JSON and valid tool-call
+    sequences (RCA showed these are accepted by the remote chain)
+  - every mutation is logged at DEBUG
+
 ### Audit Model Configuration
 
 The audit skill (`skill/audit/`) uses the `audit_model` and `audit_model_fallbacks`
@@ -455,6 +504,7 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
+| `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
 
 #### Example: Remote Fallback
 
@@ -494,6 +544,48 @@ models:
 ```
 
 In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to the remote provider.
+
+#### Timed Access (`available_times`)
+
+Each provider entry may optionally restrict *when* it may be used with an
+`available_times` list of `"HH:MM-HH:MM"` windows. This is useful for
+providers with peak-hour pricing (e.g. DeepSeek charges peak rates between
+01:00–04:00 and 06:00–10:00 UTC) — operators can keep the provider in the
+fallback chain but only allow the proxy to route to it when it is cheap.
+
+- **UTC only** — windows are interpreted in **UTC**, never server local time.
+- **End-exclusive** — a `"10:00-12:00"` window includes 10:00 but excludes 12:00.
+- **Overnight ranges** — `"22:00-02:00"` wraps past midnight (covers 22:00–23:59 and 00:00–01:59).
+- **Multiple windows** — a provider is eligible if the current UTC time falls inside *any* of its windows.
+- **Backward compatible** — a provider without `available_times` (or with an empty list) is unrestricted and behaves exactly as before.
+- **Fail-open parsing** — malformed window strings are logged and ignored. If *every* window is malformed the provider is treated as unrestricted, so a config typo never breaks proxy startup.
+
+Example — use DeepSeek only outside its peak-pricing windows:
+
+```yaml
+models:
+  plan:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: deepseek-v4-flash
+        type: remote
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["10:00-12:00", "14:00-16:00"]
+    aliases:
+      - plan*
+```
+
+During fallback resolution, a provider whose current UTC time is **outside**
+all its windows is skipped exactly like a provider in cooldown — it is *not*
+marked with a failure count or cooldown, and becomes eligible again as soon
+as a window reopens. Both selection entry points (`resolve_provider()` and the
+fallback loops used by `proxy_with_fallback` / `proxy_with_remote_fallback`)
+honor the windows, so local-first chains, remote fallback, and concurrency-
+limit remote fallback all behave consistently.
 
 #### Unavailability Detection
 
@@ -543,6 +635,7 @@ repeatedly across requests is quarantined after the threshold is exceeded.
 When all providers are exhausted:
 - **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 (Too Many Requests) with `Content-Type: text/plain` and body `"Model server busy: 0/<total_slots> slots available. Retry later."` (no `Retry-After` header).
 - **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
+- **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable — `error` is `"All providers unavailable: no provider is available during the current scheduled time window"` and the `diagnostics` entries carry `status: "outside_time_window"` instead of the generic `"All providers exhausted"`. Mixed cases (a provider in cooldown or an error plus a time-window skip) keep the generic message, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible.
 
 #### Observability
 
@@ -551,6 +644,10 @@ When a fallback occurs:
 - **Logging**: An INFO-level log is emitted:
   ```
   Fallback triggered for model=v1/chat/completions, from=remote-primary, to=remote-fallback, reason=HTTP 502
+  ```
+- **HTTP 400 (remote)**: A per-fallback INFO log line includes the response body snippet (first 512 chars) so the rejection reason (e.g. missing `tool_call_id`) is discoverable, and `proxy_http_errors_total{endpoint,status="400",reason=...}` is incremented (LP-0MSC1BNP90017L9K):
+  ```
+  Remote HTTP 400 from provider=remote-primary model=v1/chat/completions reason=HTTP 400 body_snippet={"error": ...}
   ```
 
 #### Migration Guide
@@ -752,7 +849,7 @@ The proxy uses two separate timeout values for upstream remote connections:
 
 | Config Key | Default | Description |
 |-----------|---------|-------------|
-| `server.upstream_idle_timeout_seconds` | `30` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. Reduced from 60s to 30s for faster stall detection (LP-0MRFEXXVC001RYKB). Operators with long-thinking models may increase this value. |
+| `server.upstream_idle_timeout_seconds` | `120` | Per-chunk idle timeout for SSE streaming. When the upstream stops sending data mid-stream without closing the connection, the proxy waits this long for the next chunk before detecting a stall. Raised from 30s to 120s to tolerate long reasoning pauses from remote reasoning models (e.g. opencode-go/deepseek-v4-flash on large contexts) which can pause >30s between chunks while still being alive (LP-0MS9FR9LG002AJ4C). Matches the local `stream_idle_timeout_seconds` (120s). Tier-1 retries only occur while zero content has been delivered; once content flows, a stall terminates the stream immediately with `finish_reason: error` instead of re-sending the whole request. |
 | `server.upstream_retry_connect_timeout_seconds` | `30` | Timeout for establishing a retry connection after a stall. Decoupled from the idle timeout so operators can tune retry connection timeouts independently (typically shorter). |
 | `server.upstream_retry_max_attempts` | `3` | Maximum number of retry attempts (initial attempt + retries) for a stalled upstream stream. Aligned with Pi's default maxRetries=3. |
 | `server.upstream_retry_base_delay_seconds` | `2.0` | Base delay for exponential backoff between retries. The actual delay is `min(base_delay * 2^attempt, max_delay)`. Aligned with Pi's default maxRetryDelayMs=60000. |
@@ -766,7 +863,57 @@ The proxy uses two separate timeout values for upstream remote connections:
 
 The retry connection timeout (`upstream_retry_connect_timeout_seconds`) controls how long the proxy waits for a retry connection to be established before counting the retry as failed and either retrying again (with exponential backoff) or exhausting retries. The per-chunk idle timeout (`upstream_idle_timeout_seconds`) controls how long the proxy waits between SSE chunks before detecting a stall.
 
+Tier-1 per-stream retries are **content-aware** (LP-0MS9FR9LG002AJ4C): a stall (idle timeout or `httpx.ReadTimeout`) only triggers a whole-request retry while **zero** content-bearing chunks have been delivered. Once any content (`content`, `tool_calls`, or `reasoning_content`) has been sent to the client, a stall terminates the stream immediately with a synthetic `finish_reason: error` — the multi-hundred-KB request is never re-sent, so failure time stays bounded and the client can retry with full context.
+
 Streaming empty-response detection (`_delta_has_content` in `proxy/proxy_remote.py`) classifies a stream delta as meaningful output when it contains non-empty `content`, a non-empty `tool_calls` list, or non-empty `reasoning_content`. Tool-call-only streams (e.g. deepseek-v4-flash emitting `delta.tool_calls` with `content` always `null`/`""`) and reasoning-only streams therefore pass through unchanged instead of triggering the empty-response retry or the synthetic `finish_reason: error` fallback. A stream is retried as empty only when it produces none of those fields. When an empty-response retry does fire, the log records `saw_tool_calls` / `saw_reasoning` diagnostics to aid future diagnosis.
+
+#### Error handling strategy (recovery-first + informative-error fallback)
+
+The proxy's stream error handling follows a **recovery-first** strategy with an
+**informative-error fallback** (recommendations from the Aug 3 error analysis,
+LP-0MSDFKCK4007CPMY):
+
+1. **Recover first** — on a pre-content mid-stream failure (empty response,
+   connect failure, pre-content stall), the proxy attempts to **silently
+   continue** by re-routing to the next healthy provider in the configured
+   chain, bounded by the number of remaining providers and respecting the
+   content-delivered boundary (never re-route once any `content`,
+   `tool_calls`, or `reasoning_content` chunk has been forwarded). Providers
+   that fail mid-stream enter the existing per-provider cooldown / stall
+   circuit breaker so recovery cannot loop forever. See
+   **LP-0MSDRRDWK009QT4E**.
+2. **Informative error only when recovery is impossible** — when every
+   provider has failed/is in cooldown, or content was already delivered
+   (re-routing is unsafe), the synthetic `finish_reason: error` SSE event
+   carries a structured `error` payload:
+   `{type, message, provider, model, entry, suggested_action}`. This is
+   backward compatible — existing clients still see `finish_reason: error`
+   (unchanged) — while a future client can render the detail. See
+   **LP-0MSDRRJPF0052STT**.
+
+Both changes are tracked as follow-up work items from the analysis; see
+`proxy/docs/error-analysis-2026-08-03.md` for the full taxonomy, quantified
+impact (recovery-first avoids the pre-content window; informative-error
+covers 100% of client-visible errors), and the emission-site audit
+(`proxy/docs/sse-error-emission-audit.md`).
+
+##### `reasoning_content` round-trip repair (LP-0MSGU3JNU0092AFQ)
+
+Remote thinking-mode providers (Console `opencode.ai/zen`, Console Go
+`opencode.ai/zen/go`, `api.deepseek.com`) reject multi-turn requests with
+HTTP 400 (*"The `reasoning_content` in the thinking mode must be passed back
+to the API"*) when any assistant message lacks the `reasoning_content` field.
+The client (opencode) drops the **empty** `reasoning_content: ""` that the
+upstream emitted on tool-call-only turns. The proxy repairs the payload
+before remote send:
+
+- `proxy_remote.py::_sanitize_remote_messages` injects `reasoning_content:
+  ""` (matching upstream emission) on assistant messages where the field is
+  missing or `null` — additive-only, existing values never touched.
+- Both fallback functions (`proxy_with_fallback`, `proxy_with_remote_fallback`)
+  intercept the specific 400: when all providers are exhausted, a synthetic
+  JSON error with `suggested_action` remediation is returned instead of the
+  raw upstream body, so the opaque 400 never reaches the client.
 
 ### Local Stream Timeout Configuration
 
@@ -842,6 +989,30 @@ python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
 # Development (with auto-reload and DEBUG logging)
 LLAMA_PROXY_DEV=1 python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
 ```
+
+### Verbose per-chunk SSE logging (`--verbose`)
+
+By default the proxy logs per-chunk SSE data (`STREAM CHUNK | data: ...` lines) at
+DEBUG level, so they are **not** written to `proxy.log` at the default INFO level.
+This cuts log volume by >99% over a 24h window (previously ~920MB/6h) and reduces
+proxy CPU spent on log I/O (LP-0MS9GAN2P002NR4M).
+
+Enable verbose chunk logging for debugging stream issues with any of:
+
+```bash
+# start-proxy.sh flag (recommended)
+./scripts/start-proxy.sh --verbose
+
+# Environment variable (works with any launcher, including direct uvicorn)
+LLAMA_PROXY_VERBOSE=1 ./scripts/start-proxy.sh
+
+# Config key in config.yaml
+#   logging:
+#     verbose_chunks: true
+```
+
+Lifecycle lines (`Stream started:`, `Stream finished:`, truncation warnings) remain
+at INFO level in all modes, and chunk content is always suppressed from the console.
 
 Note on start-proxy.sh hardening
 

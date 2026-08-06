@@ -45,22 +45,25 @@ test.describe('Model Stats Panel', () => {
   test('SSE payload includes stats fields', async ({ page }) => {
     const sseMessages = [];
     
-    await page.goto('/');
-    
+    // Register before navigation so the EventSource override applies to the
+    // page's SSE connection (LP-0MSGA6SKI0085UO6). addEventListener is used
+    // because assigning onmessage after construction can miss the first event.
     await page.addInitScript(() => {
       const originalEventSource = window.EventSource;
       window.EventSource = function(url) {
         const es = new originalEventSource(url);
-        const originalOnMessage = es.onmessage;
-        es.onmessage = function(event) {
+        es.addEventListener('message', function(event) {
           window.lastSSEMessage = event.data;
-          if (originalOnMessage) originalOnMessage.call(es, event);
-        };
+        });
         return es;
       };
     });
     
-    await page.waitForTimeout(2000);
+    await page.goto('/');
+    
+    // SSE broadcasts fire on status events (no heartbeat), so wait for the
+    // first message instead of a blind sleep (LP-0MSGA6SKI0085UO6).
+    await page.waitForFunction(() => window.lastSSEMessage !== undefined, null, { timeout: 30000 });
     
     const lastMessage = await page.evaluate(() => window.lastSSEMessage);
     expect(lastMessage).toBeDefined();

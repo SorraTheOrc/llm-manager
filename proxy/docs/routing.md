@@ -75,3 +75,34 @@ models:
 - `{"model": "Qwen3"}` → matches `qwen3` config directly → routes to local llama-server
 - `{"model": "claude-3-opus"}` → matches `anthropic` config via exact alias → routes to Anthropic API
 - No model specified + `current_model` is set → uses the currently loaded local model
+
+## Stream Error Handling (recovery-first + informative-error fallback)
+
+When a routed stream fails, the proxy follows a **recovery-first** strategy
+with an **informative-error fallback** (from the Aug 3 error analysis,
+LP-0MSDFKCK4007CPMY; see `proxy/docs/error-analysis-2026-08-03.md`):
+
+1. **Recover first** — pre-content mid-stream failures (empty response,
+   connect failure, pre-content stall) re-route to the next healthy provider
+   in the configured chain, bounded by the remaining providers and the
+   content-delivered boundary (no re-route once any content chunk has been
+   forwarded). Failed providers enter the existing cooldown / stall circuit
+   breaker. The pre-flight re-route is implemented in
+   `proxy/proxy/provider.py` (`_preflight_streaming_response`,
+   `StreamingPreContentError`); it is gated on a remaining provider being
+   available so the last provider in a chain still surfaces its terminal
+   error to the client. Tracked in **LP-0MSETOTWY000SU0Z** (implements
+   LP-0MSDRRDWK009QT4E).
+2. **Informative error fallback** — when recovery is impossible (all
+   providers failed/in cooldown, or content already delivered), the
+   synthetic `finish_reason: error` SSE event carries a structured
+   `error` payload (`type`, `message`, `provider`, `model`, `entry`,
+   `suggested_action`) so the client/operator can act. Backward compatible:
+   `finish_reason: error` semantics unchanged, no client-side change.
+   All eight emission sites use the shared helper
+   `_build_stream_error_event` / `_stream_error_event_bytes` in
+   `proxy/proxy/proxy_remote.py`. Tracked in **LP-0MSETOTWY000SU0Z** (implements
+   LP-0MSDRRJPF0052STT).
+
+Emission sites and the single-helper enrichment point are documented in
+`proxy/docs/sse-error-emission-audit.md`.

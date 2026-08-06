@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -268,11 +267,10 @@ class TestTtsWatchdogLifecycle:
         """TTS watchdog task should be created during server startup."""
         from unittest.mock import patch
 
+        import proxy.server as server_mod
         from proxy.server import _startup_launch_watchdog_tasks
 
-        import proxy.server as server_mod
-
-        loop = asyncio.get_running_loop()
+        _ = asyncio.get_running_loop()
 
         # Reset globals
         server_mod.backend_watchdog_task = None
@@ -315,9 +313,8 @@ class TestTtsWatchdogLifecycle:
     @pytest.mark.asyncio
     async def test_watchdog_cancelled_on_shutdown(self):
         """TTS watchdog task should be cancelled during shutdown."""
-        from proxy.server import _shutdown_cleanup_tasks
-
         import proxy.server as server_mod
+        from proxy.server import _shutdown_cleanup_tasks
 
         loop = asyncio.get_running_loop()
 

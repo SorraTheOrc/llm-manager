@@ -27,7 +27,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -548,10 +547,10 @@ class TestStartupLaunchTtsServer:
     @pytest.mark.asyncio
     async def test_does_not_start_when_tts_disabled(self, monkeypatch):
         """Should not start TTS when tts_enabled=false."""
-        from proxy.server import _startup_launch_tts_server
         import proxy.server as server_mod
+        from proxy.server import _startup_launch_tts_server
 
-        loop = asyncio.get_running_loop()
+        _ = asyncio.get_running_loop()
 
         # monkeypatch auto-restores module globals after the test. Leaving
         # server.logger as a MagicMock breaks later caplog-based tests
@@ -581,10 +580,10 @@ class TestStartupLaunchTtsServer:
     @pytest.mark.asyncio
     async def test_startup_handles_start_tts_failure(self, monkeypatch):
         """Startup should log warning when start_tts_server returns None."""
-        from proxy.server import _startup_launch_tts_server
         import proxy.server as server_mod
+        from proxy.server import _startup_launch_tts_server
 
-        loop = asyncio.get_running_loop()
+        _ = asyncio.get_running_loop()
 
         # monkeypatch auto-restores module globals after the test (see
         # test_does_not_start_when_tts_disabled).
@@ -620,8 +619,6 @@ class TestTtsSelfHealPortCleanup:
         from proxy.backends.tts import _attempt_tts_self_heal
 
         srv = _make_mock_server(tts_server_port=_find_free_port())
-
-        port_cleaned = [False]
 
         def fake_start_tts():
             return None

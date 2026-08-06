@@ -6,7 +6,6 @@ Uses lazy server import (_srv()) to avoid circular imports.
 """
 
 import asyncio
-import httpx
 import json
 from pathlib import Path
 
@@ -15,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from proxy.lifecycle import _extract_router_model_ids
-from proxy.observability import _build_llama_url, _query_slots_detail
+from proxy.observability import _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
 from proxy.router_helpers import _get_per_model_queries
@@ -84,7 +83,6 @@ def _build_home_model_rows(srv) -> str:
             if not isinstance(p, dict):
                 continue
 
-            ptype = p.get("type", "")
             endpoint = p.get("endpoint") or p.get("llama_model", "") or "-"
             provider_model_name = p.get("model") or p.get("llama_model") or p.get("name", "") or "-"
             is_first = idx == 0
@@ -273,9 +271,11 @@ async def status_events():
             # initial SSE payload shows real token counts even when /slots
             # endpoint is unresponsive during busy generation.
             from proxy.observability import (
-                _last_slot_details_cache as _slot_cache,
-                _update_slot_progress_from_log,
                 _enrich_slot_details_with_progress,
+                _update_slot_progress_from_log,
+            )
+            from proxy.observability import (
+                _last_slot_details_cache as _slot_cache,
             )
             _update_slot_progress_from_log()
             if slot_details:

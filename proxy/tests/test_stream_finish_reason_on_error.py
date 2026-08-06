@@ -571,19 +571,20 @@ async def test_router_normal_completion_preserved(monkeypatch):
     [
         (
             "proxy/router.py",
-            'finish_reason": "error',
+            "_build_stream_error_event(",
         ),
         (
             "proxy/proxy_remote.py",
-            'finish_reason": "error',
+            "_build_stream_error_event(",
         ),
     ],
 )
 def test_except_exception_contains_finish_reason_error(filepath, expected_substring):
-    """Structural test: verify except Exception handler yields finish_reason: 'error'.
+    """Structural test: verify except Exception handler emits an enriched error event.
 
-    This ensures the synthetic finish_reason yield exists in the exception
-    handler of stream_generator in both files.
+    This ensures the synthetic finish_reason:error event (built via the shared
+    :func:`_build_stream_error_event` helper, LP-0MSETOTWY000SU0Z) is emitted
+    in the exception handler of stream_generator in both files.
     """
     import os
 
@@ -594,7 +595,7 @@ def test_except_exception_contains_finish_reason_error(filepath, expected_substr
         content = f.read()
 
     # Find the "except Exception" section and verify it contains the expected pattern
-    # We look for 'except Exception' followed by the synthetic finish_reason code
+    # We look for 'except Exception' followed by the synthetic error-event call
     lines = content.splitlines()
 
     found_except_exception = False
@@ -604,8 +605,8 @@ def test_except_exception_contains_finish_reason_error(filepath, expected_substr
         stripped = line.strip()
         if stripped.startswith("except Exception") or stripped.startswith("except Exception "):
             found_except_exception = True
-            # Look at the next lines for the finish_reason error pattern
-            for j in range(i, min(i + 30, len(lines))):
+            # Look at the next lines for the error-event helper call
+            for j in range(i, min(i + 40, len(lines))):
                 if expected_substring in lines[j]:
                     found_finish_reason_error = True
                     break
@@ -1160,16 +1161,17 @@ async def test_remote_both_paths_concurrent(mock_remote_request):
     [
         (
             "proxy/proxy_remote.py",
-            'finish_reason": "error',
+            "_build_stream_error_event(",
         ),
     ],
 )
 def test_proxy_remote_except_exception_readtimeout(filepath, expected_substring):
-    """Structural verification: proxy_remote.py has finish_reason: 'error' in
-    its stream_generator's exception handler.
+    """Structural verification: proxy_remote.py emits an enriched error event
+    in its stream_generator's exception handler.
 
-    This ensures the synthetic finish_reason: 'error' yield exists even for
-    httpx.ReadTimeout in the remote streaming path.
+    This ensures the synthetic finish_reason: 'error' event (built via the
+    shared helper) exists even for httpx.ReadTimeout in the remote streaming
+    path (LP-0MSETOTWY000SU0Z).
     """
     import os
 
@@ -1188,7 +1190,7 @@ def test_proxy_remote_except_exception_readtimeout(filepath, expected_substring)
         stripped = line.strip()
         if stripped.startswith("except Exception") or stripped.startswith("except Exception "):
             found_except_exception = True
-            for j in range(i, min(i + 30, len(lines))):
+            for j in range(i, min(i + 40, len(lines))):
                 if expected_substring in lines[j]:
                     found_finish_reason_error = True
                     break

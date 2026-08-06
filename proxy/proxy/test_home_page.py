@@ -6,10 +6,9 @@ Tests cover:
 3. Index handler injects model endpoint data into template
 """
 
-import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -96,9 +95,9 @@ async def test_increment_per_model_query():
 @pytest.mark.asyncio
 async def test_decrement_per_model_query():
     """Test that _decrement_per_model_query decrements the counter."""
-    from proxy.router_helpers import _increment_per_model_query, _decrement_per_model_query
-
     import asyncio
+
+    from proxy.router_helpers import _decrement_per_model_query, _increment_per_model_query
     srv = MagicMock()
     srv.per_model_queries = {}
     srv.per_model_queries_lock = asyncio.Lock()
@@ -121,9 +120,9 @@ async def test_decrement_per_model_query():
 @pytest.mark.asyncio
 async def test_per_model_query_unknown_model():
     """Test that increment/decrement with None or empty model name is safe."""
-    from proxy.router_helpers import _increment_per_model_query, _decrement_per_model_query
-
     import asyncio
+
+    from proxy.router_helpers import _decrement_per_model_query, _increment_per_model_query
     srv = MagicMock()
     srv.per_model_queries = {}
     srv.per_model_queries_lock = asyncio.Lock()
@@ -140,9 +139,9 @@ async def test_per_model_query_unknown_model():
 @pytest.mark.asyncio
 async def test_get_per_model_queries():
     """Test snapshot function returns current state."""
-    from proxy.router_helpers import _increment_per_model_query, _get_per_model_queries
-
     import asyncio
+
+    from proxy.router_helpers import _get_per_model_queries, _increment_per_model_query
     srv = MagicMock()
     srv.per_model_queries = {}
     srv.per_model_queries_lock = asyncio.Lock()
@@ -160,9 +159,9 @@ async def test_get_per_model_queries():
 @pytest.mark.asyncio
 async def test_sse_payload_includes_per_model_queries():
     """Test that status_events payload includes per_model_queries."""
-    from proxy.ui import status_events
-
     import asyncio
+
+    from proxy.ui import status_events
     srv = MagicMock()
     srv.per_model_queries = {"model-a": 2}
     srv.per_model_queries_lock = asyncio.Lock()

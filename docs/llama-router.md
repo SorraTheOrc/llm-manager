@@ -58,3 +58,105 @@ The router exposes:
 - During active self-healing, requests return `503` with `Retry-After: 30` and a `backend_recovery_in_progress` error payload.
 - Backend crash-path signals are exposed via `/health` and `/admin/metrics` in `backend_signals`, and current recovery progress is reported in `backend_recovery`.
 - Repro fault injection script: `proxy/scripts/fault-injection-backend-crash.sh` captures health/metrics snapshots and log signatures during a forced backend crash.
+
+## KV-cache quantization (LP-0MSDCLQ2W001LGWC)
+
+KV-cache data type is a first-class llama-server preset option, so it is configured
+per-model in `models.ini` (in the model's own section, like `ctx-size`):
+
+```ini
+[Qwen3]
+cache-type-k = q8_0
+cache-type-v = q8_0
+```
+
+Allowed values (lowercase): `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`.
+`f16` is the llama-server default; `q8_0` roughly halves KV read cost per decoded
+token and is the recommended default for large-context sessions; `q4_0` saves more
+VRAM at a small quality cost.
+
+Rationale (LP-0MSDCLQ2W001LGWC): decode is memory-bandwidth-bound on the Strix Halo
+iGPU (~256 GB/s shared). Each decoded token reads the model weights plus the session
+KV, and the KV term grows linearly with context (at f16, ~20 KB/token → ~1.1 GB at a
+57K-token session). Quantizing KV to q8_0 cuts that term roughly in half, improving
+large-context decode throughput ~1.2–1.4x without changing ctx-size or slot count.
+
+For single-model (non-router) startup, `start-llama.sh` reads `cache-type-k` /
+`cache-type-v` from `models.ini` and passes `--cache-type-k` / `--cache-type-v` to
+llama-server (defaulting to f16 when unset).
+
+## Session context-pressure warning (LP-0MSDCLQ2W001LGWC)
+
+Sessions with contexts near the per-slot limit decode far slower (KV reads scale
+with context), and compaction is performed by the agents, not the proxy. The proxy
+emits a `context_pressure` WARNING at routing time when a session's estimated
+context reaches the configured fraction of the effective per-slot context
+(`ctx_size / slots - 4096` output headroom).
+
+```yaml
+server:
+  context_pressure_warn_ratio: 0.8  # 0 disables; default 0.8
+```
+
+The warning names the session and the ratio so operators/agents can compact before
+decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
+
+## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
+
+The smart-routing clamp (`_effective_large_context_thresholds` in
+`proxy/proxy/provider.py`) estimates prompt tokens with tiktoken (cl100k) via
+`count_text_tokens`. Benchmark measurements (2026-08-04) found tiktoken
+**undercounts Qwen3-native tokens by ~1.69x for dense prose**: a 90930-char
+fixture estimates 22732 tokens but Qwen3's tokenizer produces 38529.
+
+Consequences:
+- A prompt can pass the clamp check (est < per_slot − 4096) yet exceed the KV
+  slot at decode time → llama-server HTTP 400 → remote fallback. Measured on
+  4x65.5K (60K fixture: est 45357 < clamp 61440, actual 77060 > 65536 slot) and
+  8x32.8K (30K fixture: est 22732 < clamp 28672, actual 38529 > 32768 slot).
+- Effective local capacity for dense prose is ~39K tokens regardless of slot
+  size until the estimator is corrected.
+
+Mitigations (implemented in follow-up LP-0MSEGPO77005CYCQ F2/F3):
+- Server-level `token_estimate_multiplier: 1.69` is set in `proxy/config.yaml`
+  and applied consistently to BOTH the routing estimate (provider.py) and the
+  slot-persistence estimate (session.py) via `_get_token_estimate_multiplier`
+  in `proxy/proxy/provider.py`, so the routing clamp and the persistence cap
+  compare Qwen3-native token counts. Per-model `token_estimate_multiplier`
+  overrides the server-level value for routing.
+- The slot-persistence cap `session_slot_max_prompt_tokens` is derived
+  dynamically from the effective per-slot clamp
+  (`local_model_ctx_size // active_slots - 4096` output headroom, the same
+  source as the routing clamp) when the config key is absent/0, so it
+  auto-adapts to slot-count/ctx-size changes.
+
+## Warm-cache context-threshold routing (LP-0MSB2RASV009WFGI)
+
+When routing requests to the local llama-server, the proxy applies a two-tier
+context-size check before committing to local, in
+`_should_bypass_local_for_large_context` (proxy/proxy/provider.py):
+
+1. **Warm-cache threshold (hard cap):** If the estimated total prompt context
+   exceeds `local_large_context_warm_cache_threshold` (default `100000` in
+   `proxy/config.yaml`), local is bypassed regardless of cache state. This
+   prevents routing excessively large total contexts to the local model slot
+   even when the KV cache is warm.
+
+2. **Cold-cache new-token check:** The number of uncached tokens is computed
+   as `new_tokens = estimated_tokens × (1 − cached_ratio)`. If
+   `new_tokens > cold_cache_threshold`, the prefill is considered too
+   expensive and local is bypassed; otherwise the request routes local.
+
+The `cached_ratio` is tracked per-session (see `proxy/session.py` delta
+routing classification). A ratio of `0.0` (unknown sessions) is conservative:
+local is bypassed whenever new tokens exceed the threshold. A ratio of `1.0`
+(full warm cache) yields `new_tokens = 0`, so local is always used unless the
+warm-cache hard cap applies. A threshold of `0` disables the bypass entirely.
+
+Config keys (both nested under `server:` and flat forms are supported):
+
+```yaml
+server:
+  local_large_context_fallback_threshold: 60000        # cold-cache new-token cap
+  local_large_context_warm_cache_threshold: 100000     # total-context hard cap
+```

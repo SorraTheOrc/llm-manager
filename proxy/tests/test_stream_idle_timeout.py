@@ -437,7 +437,7 @@ async def test_grace_margin_extra_heartbeat_cycle(monkeypatch):
 
     # Count heartbeat events - with grace margin we should have at least one
     # heartbeat after the last content chunk before the finish_reason
-    heartbeat_count = sum(
+    _ = sum(
         1 for c in collected
         if '"type":"heartbeat"' in c or '"type": "heartbeat"' in c
     )

@@ -156,6 +156,131 @@ def _sanitize_remote_chat_payload(path: str, payload: dict[str, Any]) -> dict[st
     return sanitized
 
 
+def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
+    """Sanitize accumulated chat message history for remote sends.
+
+    Remote providers (opencode zen/go, api.deepseek.com) reject malformed
+    tool-call/tool-result sequences with HTTP 400 (LP-0MSC1BNP90017L9K).
+    RCA (F1) confirmed the rejected shapes:
+
+      - tool message missing ``tool_call_id``
+      - tool message with dangling ``tool_call_id`` (no matching assistant tool_calls)
+      - assistant ``tool_calls`` entry missing ``id``
+      - empty ``tool_calls`` array
+
+    Hybrid policy (always-on, no config flag):
+
+      - **Repair** where unambiguous: assistant ``content: null`` -> ``""``
+        when ``tool_calls`` present; missing ``function.arguments`` -> ``""``;
+        missing ``type`` -> ``"function"``.
+      - **Prune** where not: tool messages with missing/dangling
+        ``tool_call_id``; assistant ``tool_calls`` entries missing ``id``;
+        empty ``tool_calls`` arrays (key removed).
+      - **Preserve** truncated ``function.arguments`` JSON — RCA showed it is
+        accepted by both zen/go and deepseek; do not alter valid semantics.
+
+    Valid tool-call sequences pass through unchanged (regression guards:
+    LP-0MS8XAPXT009W3CL, LP-0MQP3Q8DN0047J1H).
+
+    Each mutation is logged at DEBUG for diagnosability.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    def _log(action: str, index: int, detail: str) -> None:
+        try:
+            _srv().logger.debug(
+                "[remote] sanitizer: %s messages[%d] %s", action, index, detail,
+            )
+        except Exception:
+            pass
+
+    # First pass: sanitize assistant messages and collect valid tool_call ids.
+    valid_tool_call_ids: set[str] = set()
+    sanitized: list[Any] = []
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            sanitized.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            cleaned = dict(msg)
+            # reasoning_content round-trip repair (LP-0MSGU3JNU0092AFQ):
+            # remote thinking-mode providers (Console / Console Go / deepseek)
+            # reject the whole request with HTTP 400 when ANY assistant message
+            # lacks the ``reasoning_content`` field. Clients (e.g. opencode)
+            # drop the empty ``reasoning_content: ""`` that the upstream emitted
+            # on tool-call-only turns, so the field is absent on those messages
+            # when the history is re-sent. Inject ``""`` (matching upstream
+            # emission) where the field is missing or null — additive only;
+            # existing values are never touched.
+            if cleaned.get("reasoning_content") is None:
+                _log("repair", index, "missing/null reasoning_content -> ''")
+                cleaned["reasoning_content"] = ""
+            tool_calls = cleaned.get("tool_calls")
+            if isinstance(tool_calls, list):
+                if not tool_calls:
+                    # Empty tool_calls array -> 400; remove the key entirely.
+                    _log("prune", index, "empty tool_calls array")
+                    del cleaned["tool_calls"]
+                else:
+                    # Repair content:null -> "" when tool_calls present.
+                    if cleaned.get("content") is None:
+                        _log("repair", index, "content null -> ''")
+                        cleaned["content"] = ""
+
+                    valid_entries: list[Any] = []
+                    for entry in tool_calls:
+                        if not isinstance(entry, dict):
+                            _log("prune", index, "non-dict tool_calls entry")
+                            continue
+                        if not entry.get("id"):
+                            # RCA: missing id -> 400 on both zen/go and deepseek.
+                            _log("prune", index, "tool_calls entry missing id")
+                            continue
+                        entry = dict(entry)
+                        if not entry.get("type"):
+                            _log("repair", index, f"tool_calls[{entry.get('id')}] missing type -> 'function'")
+                            entry["type"] = "function"
+                        fn = entry.get("function")
+                        if not isinstance(fn, dict):
+                            _log("prune", index, f"tool_calls[{entry.get('id')}] missing function")
+                            continue
+                        fn = dict(fn)
+                        if not fn.get("name"):
+                            _log("prune", index, f"tool_calls[{entry.get('id')}] missing function.name")
+                            continue
+                        if "arguments" not in fn:
+                            _log("repair", index, f"tool_calls[{entry.get('id')}] missing arguments -> ''")
+                            fn["arguments"] = ""
+                        entry["function"] = fn
+                        valid_entries.append(entry)
+                        valid_tool_call_ids.add(str(entry["id"]))
+
+                    if valid_entries:
+                        cleaned["tool_calls"] = valid_entries
+                    else:
+                        _log("prune", index, "all tool_calls entries invalid")
+                        del cleaned["tool_calls"]
+            sanitized.append(cleaned)
+        else:
+            sanitized.append(msg)
+
+    # Second pass: prune tool messages with missing or dangling tool_call_id.
+    result: list[Any] = []
+    for index, msg in enumerate(sanitized):
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if not tool_call_id:
+                _log("prune", index, "tool message missing tool_call_id")
+                continue
+            if str(tool_call_id) not in valid_tool_call_ids:
+                _log("prune", index, f"tool message dangling tool_call_id {tool_call_id}")
+                continue
+        result.append(msg)
+    return result
+
+
 async def proxy_to_remote(
     request: Request,
     path: str,
@@ -229,6 +354,13 @@ async def proxy_to_remote(
     # Sanitize request-shape for remote compatibility before model override.
     body_json = _sanitize_remote_chat_payload(path, body_json)
 
+    # Sanitize accumulated tool-call/tool-result message history before remote
+    # sends (LP-0MSC1BNP90017L9K): remote providers reject malformed tool-call
+    # sequences with HTTP 400 (missing/dangling tool_call_id, missing id/type,
+    # empty tool_calls). Always-on; repairs where unambiguous, prunes otherwise.
+    if isinstance(body_json.get("messages"), list):
+        body_json["messages"] = _sanitize_remote_messages(body_json["messages"])
+
     # Override model name in body if provider config specifies an upstream model ID.
     # This allows the proxy to present a different model name to the remote API
     # than what the client originally sent (e.g. "deepseek-v4-flash-free" for a
@@ -247,6 +379,12 @@ async def proxy_to_remote(
         model_name = None
     if not model_name:
         model_name = _srv().current_model or model_config.get("name") or model_config.get("id") or "unknown"
+
+    # Config entry name for stream-level log attribution (LP-0MSC7F7BG0043TE1).
+    # Distinct from model_name (the body model ID): multiple config entries can
+    # share the same provider+model, so entry=<name> lets per-account traffic
+    # be distinguished in logs. None when the config entry has no name.
+    entry_name = model_config.get("name")
 
     # Resolve session ID from headers for recording (LP-0MR8FEKK6005V9ML)
     _remote_session_id = (
@@ -307,8 +445,12 @@ async def proxy_to_remote(
         )
 
     # Read upstream idle timeout from config (LP-0MRE52D3C001KP1H)
+    # Default raised 60 -> 120 -> 240 to tolerate long reasoning pauses on
+    # remote upstreams (LP-0MS9FR9LG002AJ4C; LP-0MSF5I7XN009ENWQ raises the
+    # default to 240s for LP-0MSF1PUM90099ZSW F4). Keep in sync with the
+    # fallback in _handle_remote_streaming and proxy/config.yaml.
     _upstream_idle_timeout = float(
-        server_config.get("upstream_idle_timeout_seconds", 60) or 60
+        server_config.get("upstream_idle_timeout_seconds", 240) or 240
     )
     # Read upstream retry connect timeout from config (LP-0MRE8FYKV008WOTB)
     _upstream_retry_connect_timeout = float(
@@ -326,6 +468,7 @@ async def proxy_to_remote(
                 resolved_model=_resolved_model_header,
                 session_id=_remote_session_id,
                 provider=_provider_name,
+                entry=entry_name,
                 upstream_idle_timeout_seconds=_upstream_idle_timeout,
                 upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
                 pool_client=_pool_client,
@@ -335,6 +478,7 @@ async def proxy_to_remote(
             model_name, remote_timeout,
             resolved_model=_resolved_model_header,
             provider=_provider_name,
+            entry=entry_name,
             upstream_idle_timeout_seconds=_upstream_idle_timeout,
             upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
             pool_client=_pool_client,
@@ -352,6 +496,76 @@ async def proxy_to_remote(
             resolved_model=_resolved_model_header,
             pool_client=_pool_client,
         )
+
+
+def _build_stream_error_event(
+    provider: str | None = None,
+    model: str | None = None,
+    entry: str | None = None,
+    error_type: str = "stream_error",
+    message: str = "Upstream stream error",
+    suggested_action: str | None = None,
+    session_id: str | None = None,
+) -> dict:
+    """Build an enriched synthetic ``finish_reason: error`` SSE event.
+
+    Replaces the previously bare ``{"delta": {}, "finish_reason": "error"}``
+    payload (LP-0MSETOTWY000SU0Z / proxy/docs/error-analysis-2026-08-03.md
+    Recommendation 2). The event keeps ``finish_reason: error`` and an empty
+    ``delta`` (backward compatible with existing clients) and adds a
+    structured ``error`` object (type/message/provider/model/entry/
+    suggested_action/session_id) so the operator/agent can act instead of
+    seeing an unspecified error.
+
+    Args:
+        provider: The provider brand (e.g. ``opencode-go``) that failed.
+        model: The model id (e.g. ``deepseek-v4-flash``).
+        entry: The config entry name (e.g. ``opencode-go-2-deepseek``).
+        error_type: Failure class (stall_exhausted, empty_response,
+            stream_exception, stall_after_content, ...).
+        message: Human-readable one-liner with the underlying cause.
+        suggested_action: Static remediation guidance for this failure type.
+        session_id: The proxy session id, when available.
+
+    Returns:
+        The SSE event dict (one ``choices`` entry with finish_reason: error
+        and an ``error`` payload).
+    """
+    error_payload: dict[str, Any] = {
+        "type": error_type,
+        "message": message,
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+    }
+    if entry:
+        error_payload["entry"] = entry
+    if suggested_action:
+        error_payload["suggested_action"] = suggested_action
+    if session_id:
+        error_payload["session_id"] = session_id
+    return {
+        "choices": [
+            {
+                "delta": {},
+                "finish_reason": "error",
+                "index": 0,
+                "error": error_payload,
+            }
+        ]
+    }
+
+
+def _stream_error_event_bytes(
+    provider: str | None = None,
+    model: str | None = None,
+    entry: str | None = None,
+    error_type: str = "stream_error",
+    message: str = "Upstream stream error",
+    suggested_action: str | None = None,
+    session_id: str | None = None,
+) -> bytes:
+    """Serialize :func:`_build_stream_error_event` to an SSE ``data:`` chunk."""
+    return f"data: {json.dumps(_build_stream_error_event(provider=provider, model=model, entry=entry, error_type=error_type, message=message, suggested_action=suggested_action, session_id=session_id))}\n\n".encode()
 
 
 def _delta_has_content(delta: dict) -> bool:
@@ -387,6 +601,7 @@ async def _handle_remote_streaming(
     resolved_model: str | None = None,
     session_id: str | None = None,
     provider: str | None = None,
+    entry: str | None = None,
     upstream_idle_timeout_seconds: float | None = None,
     upstream_retry_connect_timeout_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
@@ -399,6 +614,11 @@ async def _handle_remote_streaming(
     - Automatic retry: on stall detection (asyncio.TimeoutError) or httpx
       ReadTimeout, retries the same provider with bounded exponential backoff
       (1s, 2s, 4s; max 3 retries).
+    - Content-aware retry (LP-0MS9FR9LG002AJ4C): Tier-1 retries only occur
+      while zero content-bearing chunks have been delivered. Once any content
+      has been sent to the client, a stall terminates the stream immediately
+      with a synthetic ``finish_reason: error`` (no whole-request retry) so
+      the client can retry with full context.
     - Fallthrough: after max retries exhausted, yields a synthetic
       ``finish_reason: error`` event so the caller (provider.py fallback chain)
       can route to the next provider.
@@ -408,11 +628,11 @@ async def _handle_remote_streaming(
         try:
             upstream_idle_timeout_seconds = float(
                 _srv().config.get("server", {}).get(
-                    "upstream_idle_timeout_seconds", 60
-                ) or 60
+                    "upstream_idle_timeout_seconds", 240
+                ) or 240
             )
         except Exception:
-            upstream_idle_timeout_seconds = 60.0
+            upstream_idle_timeout_seconds = 240.0
 
     # Resolve upstream_retry_connect_timeout_seconds from parameter or config
     if upstream_retry_connect_timeout_seconds is None:
@@ -560,11 +780,12 @@ async def _handle_remote_streaming(
         try:
             _request_preview = _get_request_preview(body_json)
             _srv().logger.info(
-                "Stream started: provider=%s model=%s session=%s request=%s",
+                "Stream started: provider=%s model=%s session=%s request=%s%s",
                 provider or "remote",
                 model_name,
                 session_id or "unknown",
                 _request_preview or "",
+                f" entry={entry}" if entry else "",
             )
         except Exception:
             pass
@@ -578,6 +799,11 @@ async def _handle_remote_streaming(
         _current_cm = cm
         _current_response = response
         _should_retry = False
+        # After-content termination flag (LP-0MS9FR9LG002AJ4C): set when a
+        # stall/ReadTimeout occurs after content-bearing chunks were already
+        # delivered; the stream then terminates immediately with a synthetic
+        # finish_reason: error instead of restarting the whole request.
+        _terminate_after_content = False
 
         # Outer loop: retry on stall/ReadTimeout (initial attempt counts as
         # iteration 0; retries are iterations 1..max_retries) or
@@ -626,18 +852,22 @@ async def _handle_remote_streaming(
                         except Exception:
                             pass
                         # Yield error and exit
-                        _final_error_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "error", "index": 0}
-                            ]
-                        }
+                        _final_error_obj = _build_stream_error_event(
+                            provider=provider,
+                            model=model_name,
+                            entry=entry,
+                            error_type="empty_response",
+                            message="Retry returned a non-streaming/HTTP error after an empty upstream response",
+                            suggested_action="Upstream returned no content; check upstream status or route manually",
+                            session_id=session_id,
+                        )
                         _final_error_bytes = (
                             f"data: {json.dumps(_final_error_obj)}\n\n"
                         ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_error_bytes)
                         yield _final_error_bytes
-                        log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                         break
 
                     # Reset stream state for the new connection
@@ -673,18 +903,22 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                _final_error_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="empty_response",
+                    message=f"Empty upstream response after {_empty_retry_count} retries",
+                    suggested_action="Upstream returned no content; check upstream status or route manually",
+                    session_id=session_id,
+                )
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
                 ).encode()
                 if collected_chunks is not None:
                     collected_chunks.append(_final_error_bytes)
                 yield _final_error_bytes
-                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
 
             if _retry_count >= max_retries:
@@ -715,18 +949,22 @@ async def _handle_remote_streaming(
                 except Exception:
                     pass
 
-                _final_error_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="stall_exhausted",
+                    message=f"Upstream stalled repeatedly ({_retry_count} retries exhausted; idle timeout {upstream_idle_timeout_seconds:.0f}s)",
+                    suggested_action="Provider placed in cooldown; the next provider in the chain will be used",
+                    session_id=session_id,
+                )
                 _final_error_bytes = (
                     f"data: {json.dumps(_final_error_obj)}\n\n"
                 ).encode()
                 if collected_chunks is not None:
                     collected_chunks.append(_final_error_bytes)
                 yield _final_error_bytes
-                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
 
             if _should_retry:
@@ -881,7 +1119,7 @@ async def _handle_remote_streaming(
                     if collected_chunks is not None:
                         collected_chunks.append(chunk)
                     yield chunk
-                    log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                    log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
 
                     if saw_done or saw_finish:
                         break
@@ -902,25 +1140,38 @@ async def _handle_remote_streaming(
                     # so the caller (provider.py fallback chain) can route to
                     # the next provider.
                     if not _has_content:
-                        _final_empty_error_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "error", "index": 0}
-                            ]
-                        }
+                        _final_empty_error_obj = _build_stream_error_event(
+                            provider=provider,
+                            model=model_name,
+                            entry=entry,
+                            error_type="empty_response",
+                            message="Upstream stream completed with no content",
+                            suggested_action="Upstream returned no content; check upstream status or route manually",
+                            session_id=session_id,
+                        )
                         _final_empty_error_bytes = (
                             f"data: {json.dumps(_final_empty_error_obj)}\n\n"
                         ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_empty_error_bytes)
                         yield _final_empty_error_bytes
-                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                     # Has content (with or without retries) or retries exhausted — stop outer loop
                     break
 
                 # If we break out of the inner loop without saw_done/saw_finish
                 # and without disconnect, it's a stall (asyncio.TimeoutError).
-                # Set retry flag to reconnect with backoff.
-                _should_retry = True
+                # Content-aware retry (LP-0MS9FR9LG002AJ4C): only retry while
+                # zero content-bearing chunks were delivered. Once any content
+                # has been sent to the client, restarting the whole request
+                # would re-send a huge prompt and duplicate output, so the
+                # stream terminates immediately instead.
+                if _has_content:
+                    _terminate_after_content = True
+                else:
+                    # Zero content delivered — safe to retry the whole request
+                    # with bounded exponential backoff.
+                    _should_retry = True
 
             except StopAsyncIteration:
                 # Normal exhaustion of the upstream iterator (no [DONE] received).
@@ -935,18 +1186,22 @@ async def _handle_remote_streaming(
                     # If no content (and retries exhausted/exhausted above), yield
                     # synthetic error so the fallback chain can activate.
                     if not _has_content:
-                        _final_empty_error_obj = {
-                            "choices": [
-                                {"delta": {}, "finish_reason": "error", "index": 0}
-                            ]
-                        }
+                        _final_empty_error_obj = _build_stream_error_event(
+                            provider=provider,
+                            model=model_name,
+                            entry=entry,
+                            error_type="empty_response",
+                            message="Upstream closed without delivering content",
+                            suggested_action="Upstream returned no content; check upstream status or route manually",
+                            session_id=session_id,
+                        )
                         _final_empty_error_bytes = (
                             f"data: {json.dumps(_final_empty_error_obj)}\n\n"
                         ).encode()
                         if collected_chunks is not None:
                             collected_chunks.append(_final_empty_error_bytes)
                         yield _final_empty_error_bytes
-                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_empty_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                     else:
                         # Stream had content but ended without [DONE] — yield stop
                         _final_stop_obj = {
@@ -960,10 +1215,12 @@ async def _handle_remote_streaming(
                         if collected_chunks is not None:
                             collected_chunks.append(_final_stop_bytes)
                         yield _final_stop_bytes
-                        log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                        log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
             except httpx.ReadTimeout:
-                # httpx ReadTimeout before idle timeout (edge case) — retry
+                # httpx ReadTimeout before idle timeout (edge case). Content-
+                # aware retry: only retry while zero content was delivered
+                # (LP-0MS9FR9LG002AJ4C); after content, terminate immediately.
                 try:
                     _srv().logger.warning(
                         "Upstream ReadTimeout session=%s provider=%s model=%s",
@@ -973,7 +1230,10 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                _should_retry = True
+                if _has_content:
+                    _terminate_after_content = True
+                else:
+                    _should_retry = True
             except GeneratorExit:
                 # Client disconnected or generator is being closed.
                 # Skip the final event yield and proceed directly to cleanup.
@@ -986,26 +1246,31 @@ async def _handle_remote_streaming(
                 try:
                     _error_type = type(exc).__name__
                     _srv().logger.warning(
-                        "Stream error: session=%s provider=%s model=%s error=%s",
+                        "Stream error: session=%s provider=%s model=%s error=%s%s",
                         session_id or "unknown",
                         provider or "remote",
                         model_name,
                         _error_type,
+                        f" entry={entry}" if entry else "",
                     )
                 except Exception:
                     pass
-                _final_obj = {
-                    "choices": [
-                        {"delta": {}, "finish_reason": "error", "index": 0}
-                    ]
-                }
+                _final_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="stream_exception",
+                    message=f"Proxy stream error ({_error_type}); upstream may be unhealthy",
+                    suggested_action="Check proxy/upstream logs; the next provider in the chain may be used",
+                    session_id=session_id,
+                )
                 _final_bytes = (
                     f"data: {json.dumps(_final_obj)}\n\n"
                 ).encode()
                 if collected_chunks is not None:
                     collected_chunks.append(_final_bytes)
                 yield _final_bytes
-                log_response_chunk(_final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json)
+                log_response_chunk(_final_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
             finally:
                 # Clean up the current connection (client+cm) after each
@@ -1024,6 +1289,52 @@ async def _handle_remote_streaming(
                                 await asyncio.wait_for(_current_client.aclose(), timeout=disconnect_cleanup_timeout)
                             except (TimeoutError, Exception):
                                 pass
+
+            # After-content stall/ReadTimeout: terminate the stream immediately
+            # with a synthetic finish_reason: error instead of restarting the
+            # whole request (LP-0MS9FR9LG002AJ4C). The client sees a clear
+            # terminal state quickly and can retry with full context.
+            if _terminate_after_content:
+                try:
+                    _srv().logger.warning(
+                        "Upstream stall after content delivered: terminating "
+                        "stream without retry session=%s provider=%s model=%s "
+                        "timeout=%.1fs",
+                        session_id or "unknown",
+                        provider or "remote",
+                        model_name,
+                        upstream_idle_timeout_seconds,
+                    )
+                except Exception:
+                    pass
+                # Record the stall in the Tier 3 circuit breaker so repeated
+                # stalls (before or after content) accumulate toward provider
+                # cooldown (LP-0MRFEXXVC001RYKB).
+                try:
+                    _config = _srv().config if hasattr(_srv(), 'config') else {}
+                    _check_stall_circuit_breaker(
+                        provider or "remote",
+                        _config,
+                    )
+                except Exception:
+                    pass
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="stall_after_content",
+                    message=f"Upstream idle timeout after content delivered ({upstream_idle_timeout_seconds:.0f}s no data)",
+                    suggested_action="Retry the request with full context, or route to a healthier provider",
+                    session_id=session_id,
+                )
+                _final_error_bytes = (
+                    f"data: {json.dumps(_final_error_obj)}\n\n"
+                ).encode()
+                if collected_chunks is not None:
+                    collected_chunks.append(_final_error_bytes)
+                yield _final_error_bytes
+                log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
+                break
 
             if saw_done or saw_finish or disconnected:
                 # Don't break if we're about to handle an empty-response retry;

@@ -43,3 +43,7 @@ __pycache__/
 *.pyc
 proxy/session-recordings/
 qwentts.cpp/models/
+
+# Generated benchmark/test artifacts (not source)
+benchmark-results/
+test-results/

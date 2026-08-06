@@ -12,7 +12,6 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from proxy.backends.llama import (
     _gpu_busy_percent_rocm_smi,
     _gpu_power_draw_rocm_smi,
@@ -23,7 +22,6 @@ from proxy.backends.llama import (
     _read_gpu_power_draw,
     _slots_all_idle,
 )
-
 
 # ===================================================================
 # _slots_all_idle

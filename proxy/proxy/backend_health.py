@@ -14,7 +14,6 @@ Backward-compatible re-exports:
 """
 
 import subprocess
-import time
 
 from fastapi.responses import JSONResponse
 
@@ -191,7 +190,6 @@ from .backends.llama import (  # noqa: E402, F401
     _probe_model_instance_with_retries,
     _router_model_health_loop,
 )
-
 from .backends.tts import (  # noqa: E402, F401
     _attempt_tts_self_heal,
     _get_tts_self_heal_max_attempts,
