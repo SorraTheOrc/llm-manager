@@ -27,7 +27,7 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
-import proxy.metrics as metrics  # noqa: E402 — lifecycle records model load/unload metrics
+import proxy.metrics as metrics
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,12 @@ def schedule_background_load(model_name: str) -> bool:
 # Functions extracted to handlers.py:
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
-from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: E402, F401
+from .handlers import (  # noqa: E402, F401
+    extract_progress_data,
+    format_progress,
+    poll_slots_for_model,
+    start_slot_polling,
+)
 
 # Polling state for /slots API (model -> latest data)
 slot_polling_state: dict = {}
