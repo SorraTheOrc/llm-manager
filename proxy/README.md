@@ -1044,6 +1044,11 @@ http://localhost:8000/
 - Real-time display of current model, server health, and llama-server status
 - Automatic refresh on page load
 
+**Slot Status**
+- Real-time per-slot status cards for the local llama-server (idle/processing/waiting indicators, decoded-token progress)
+- Updates live via SSE broadcasts from `/events` (per-slot data queried from the llama-server `/slots` endpoint)
+- Covered by Playwright E2E tests in `tests/slot-status.spec.js`
+
 **Quick Links**
 - Direct links to API documentation, health endpoint, and model list
 - "Load Model" buttons to quickly switch between local models
@@ -2217,6 +2222,7 @@ The test suite covers:
 - **Model switch via API** - Tests that external API calls trigger UI updates via SSE
 - **Load Model button** - Tests UI button triggers status updates
 - **API passthrough tests** - Tests model switching when using test buttons
+- **Slot Status** - Verifies slot cards render with correct status colors and identifiers, and update when SSE delivers new slot data
 
 ## Architecture
 
