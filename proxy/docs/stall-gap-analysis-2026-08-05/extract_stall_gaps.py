@@ -24,7 +24,7 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 
@@ -145,7 +145,7 @@ def analyze_recording(session_id: str, before_ts=None):
 
 
 def main():
-    print(f"# Stall-gap distribution analysis (LP-0MSF5IAXE005BG33)")
+    print("# Stall-gap distribution analysis (LP-0MSF5IAXE005BG33)")
     print(f"\nLog: {LOG_PATH}")
     print(f"Recordings dir: {RECORDINGS_DIR}\n")
 
@@ -288,13 +288,13 @@ def main():
     print("=" * 72)
     total_client_errors = len(finished_errors)
     print(f"\nClient-visible stall_after_content errors: {total_client_errors}")
-    print(f"(a) 240s raise alone: avoids stalls where the upstream resumed between")
-    print(f"    120s and 240s. Direct evidence is unavailable (the proxy terminates")
+    print("(a) 240s raise alone: avoids stalls where the upstream resumed between")
+    print("    120s and 240s. Direct evidence is unavailable (the proxy terminates")
     print(f"    at the timeout); proxy evidence: {sum(1 for s in stalls if s['session_continued'])} of")
     print(f"    {len(stalls)} stalls were in sessions that continued afterward (slow-but-alive")
-    print(f"    upstream), supporting a longer timeout.")
-    print(f"(b) re-route behavior (F2/F3): avoids reasoning-only stalls — the client")
-    print(f"    receives the next provider's completion instead of an error.")
+    print("    upstream), supporting a longer timeout.")
+    print("(b) re-route behavior (F2/F3): avoids reasoning-only stalls — the client")
+    print("    receives the next provider's completion instead of an error.")
     print(f"    Estimated re-route-eligible after-content errors: {reroute_eligible_after_content}")
 
     # Recommendation

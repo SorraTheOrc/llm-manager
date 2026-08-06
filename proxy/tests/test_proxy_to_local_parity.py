@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import proxy.server as server
 import pytest
 from proxy.router import proxy_to_local
+
 pytestmark = pytest.mark.refactor_parity
 
 

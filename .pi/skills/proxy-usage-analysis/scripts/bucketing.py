@@ -9,9 +9,9 @@ slots), so the analysis does not hardcode the 6/8 split.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Sequence
 
 MINUTES_PER_DAY = 24 * 60
 

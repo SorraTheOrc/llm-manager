@@ -13,17 +13,18 @@ from __future__ import annotations
 import csv
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import bucketing  # noqa: E402
-import llama_log_parser  # noqa: E402
-import reporting  # noqa: E402
-from tests import fixtures  # noqa: E402
+import bucketing
+import llama_log_parser
+import reporting
+
+from tests import fixtures
 
 WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
 WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
@@ -388,7 +389,7 @@ class TestEndToEnd:
         log_dir = self._write_logs(tmp_path)
         out_dir = tmp_path / "out"
 
-        result = reporting.run_analysis(
+        _ = reporting.run_analysis(
             log_dir=log_dir,
             window_start=WINDOW_START,
             window_end=WINDOW_END,
@@ -419,7 +420,7 @@ class TestEndToEnd:
         (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
         out_dir = tmp_path / "out_none"
 
-        result = reporting.run_analysis(
+        _ = reporting.run_analysis(
             log_dir=log_dir,
             window_start=WINDOW_START,
             window_end=WINDOW_END,

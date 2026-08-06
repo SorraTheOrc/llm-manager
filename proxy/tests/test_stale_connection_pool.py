@@ -38,7 +38,7 @@ class MockHTTPHandler:
             await writer.wait_closed()
             return
 
-        data = await reader.read(1024)
+        _ = await reader.read(1024)
         body = b'{"status": "ok", "n_ctx": 4096}'
         response = (
             f"HTTP/1.1 200 OK\r\n"

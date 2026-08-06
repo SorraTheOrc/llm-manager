@@ -149,7 +149,7 @@ def test_main_json_output(mod, tmp_path, capsys):
     out = capsys.readouterr().out
     # JSON block: find the line containing '"configs":' and back up to the '{'
     lines = out.split("\n")
-    cfg_idx = next(i for i, l in enumerate(lines) if '"configs":' in l)
+    cfg_idx = next(i for i, line in enumerate(lines) if '"configs":' in line)
     start = cfg_idx
     while start > 0 and lines[start - 1].strip() != "{":
         start -= 1

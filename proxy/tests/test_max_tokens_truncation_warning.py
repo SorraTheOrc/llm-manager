@@ -14,10 +14,9 @@ import logging
 import re
 from pathlib import Path
 
-import pytest
 import proxy.server as server
+import pytest
 from proxy.router import _get_guardrail_config
-
 
 # ── Tests for finish_reason: "length" warning ─────────────────────────────
 

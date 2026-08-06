@@ -24,7 +24,10 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 import httpx
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
+
+import proxy.metrics as metrics  # noqa: E402 — lifecycle records model load/unload metrics
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +44,7 @@ def _srv():
 #   re-exports keep existing import chains (server.py, router.py) and
 #   test monkey-patches on server.* working without modification.
 # ===================================================================
-from .backend_health import (  # noqa: F401
+from .backend_health import (  # noqa: E402, F401
     _attempt_router_self_heal,
     _attempt_tts_self_heal,
     _backend_recovery_snapshot,
@@ -139,7 +142,7 @@ def schedule_background_load(model_name: str) -> bool:
 # Functions extracted to handlers.py:
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
-from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: F401
+from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: E402, F401
 
 # Polling state for /slots API (model -> latest data)
 slot_polling_state: dict = {}
@@ -821,7 +824,6 @@ def _wait_for_port_release(port: int, timeout: float = 10.0, interval: float = 0
     Returns:
         ``True`` if the port became free within the timeout, ``False`` otherwise.
     """
-    import errno
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1771,7 +1773,6 @@ from .backend_health import (  # noqa: E402, F401
     _probe_model_instance,
     _router_model_health_loop,
 )
-
 
 # ---------------------------------------------------------------------------
 # Slot-scheduled restart (time-based slot count transitions)

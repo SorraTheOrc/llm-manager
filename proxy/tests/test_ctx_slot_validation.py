@@ -11,11 +11,10 @@ This test module verifies the startup config validation that catches this
 misconfiguration before it reaches production.
 """
 import pytest
-
 from proxy.provider import (
-    validate_local_routing_config,
-    effective_per_slot_threshold,
     _LOCAL_ROUTING_OUTPUT_HEADROOM,
+    effective_per_slot_threshold,
+    validate_local_routing_config,
 )
 
 

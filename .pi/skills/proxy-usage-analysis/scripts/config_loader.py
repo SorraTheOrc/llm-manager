@@ -15,7 +15,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 # Scalar keys the skill reads (recommendations + slot schedule fallback).
 SCALAR_KEYS = (
     "session_slot_pool_size",

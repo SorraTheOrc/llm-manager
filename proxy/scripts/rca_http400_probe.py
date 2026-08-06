@@ -224,7 +224,7 @@ def main() -> int:
                     print(f"  [{marker}] {shape_name:38s} -> {resp.status_code}")
                     if resp.status_code != 200:
                         print(f"         body: {body_text[:300]}")
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     record = {
                         "endpoint": ep["name"],
                         "shape": shape_name,

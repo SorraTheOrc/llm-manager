@@ -335,9 +335,10 @@ class TestLastSlotDetailsCache:
     async def test_status_events_payload_has_slots_field(self):
         """status_events() includes a slots field in the initial SSE payload.
         When llama-server is not running, slots should be an empty list."""
-        from proxy.ui import status_events
+        from unittest.mock import AsyncMock, MagicMock, patch
+
         from proxy.observability import _last_slot_details_cache
-        from unittest.mock import patch, AsyncMock, MagicMock
+        from proxy.ui import status_events
 
         # Clear the shared cache
         _last_slot_details_cache.clear()
@@ -381,8 +382,9 @@ class TestLastSlotDetailsCache:
         the cache; on failure fall back to it.  We verify the logic by
         exercising _query_slots_detail() with mock clients that simulate
         success then failure."""
-        from proxy.observability import _query_slots_detail, _last_slot_details_cache
         from unittest.mock import AsyncMock, MagicMock
+
+        from proxy.observability import _last_slot_details_cache, _query_slots_detail
 
         # Start with empty cache
         _last_slot_details_cache.clear()
@@ -518,7 +520,8 @@ class TestSlotProgressCache:
     def test_enrich_overrides_n_decoded_from_progress(self):
         """When progress has higher n_tokens than API n_decoded, override."""
         from proxy.observability import (
-            _enrich_slot_details_with_progress, _slot_progress_cache,
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
         )
         self._clear_stable_tracker()
         _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.17, "timestamp": 1000.0}
@@ -537,7 +540,8 @@ class TestSlotProgressCache:
     def test_enrich_does_not_override_when_api_is_higher(self):
         """When API n_decoded is already higher than progress, keep it."""
         from proxy.observability import (
-            _enrich_slot_details_with_progress, _slot_progress_cache,
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
         )
         self._clear_stable_tracker()
         _slot_progress_cache[3] = {"n_tokens": 100, "progress": 0.5, "timestamp": 1000.0}
@@ -553,7 +557,8 @@ class TestSlotProgressCache:
     def test_enrich_sets_is_processing_from_progress(self):
         """Sets is_processing=True when progress > 0 but API says idle."""
         from proxy.observability import (
-            _enrich_slot_details_with_progress, _slot_progress_cache,
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
         )
         self._clear_stable_tracker()
         _slot_progress_cache[5] = {"n_tokens": 2048, "progress": 0.50, "timestamp": 1000.0}
@@ -571,7 +576,8 @@ class TestSlotProgressCache:
     def test_enrich_detects_generation_complete(self):
         """When n_tokens is stable for > 3s, sets generation_done=True."""
         from proxy.observability import (
-            _enrich_slot_details_with_progress, _slot_progress_cache,
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
             _slot_stable_tracker,
         )
         self._clear_stable_tracker()
@@ -593,7 +599,8 @@ class TestSlotProgressCache:
     def test_enrich_ignores_stale_progress(self):
         """Ignores progress data older than 60 seconds."""
         from proxy.observability import (
-            _enrich_slot_details_with_progress, _slot_progress_cache,
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
         )
         self._clear_stable_tracker()
         _slot_progress_cache[3] = {"n_tokens": 999, "progress": 0.5, "timestamp": 900.0}

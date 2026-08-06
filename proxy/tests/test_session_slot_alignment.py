@@ -547,8 +547,9 @@ class TestSlotDistributionConsistency:
         """With pool_size=2, first two sessions get slots 0 and 1."""
         from proxy.session import _free_slot_assignment
 
-        sid0 = _slot_id_for_session("sess-0", 2)
-        sid1 = _slot_id_for_session("sess-1", 2)
+        # Occupy both slots, then verify a third session is rejected
+        _slot_id_for_session("sess-0", 2)
+        _slot_id_for_session("sess-1", 2)
         # All slots occupied now
         assert _slot_id_for_session("sess-2", 2) is None
 

@@ -338,7 +338,7 @@ def write_artifacts(
     md.append("")
     md.append("## Headline assertions")
     md.append("")
-    md.append(f"- **PASSED**" if assertion_result["passed"] else "- **FAILED**")
+    md.append("- **PASSED**" if assertion_result["passed"] else "- **FAILED**")
     for f in assertion_result["failures"]:
         md.append(f"  - {f}")
     md.append("")

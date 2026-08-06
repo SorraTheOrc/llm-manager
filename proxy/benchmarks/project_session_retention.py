@@ -25,9 +25,7 @@ Usage:
 import argparse
 import csv
 import json
-import statistics
 import sys
-from pathlib import Path
 
 OUTPUT_HEADROOM = 4096
 PERSISTENCE_CAP_CURRENT = 12288

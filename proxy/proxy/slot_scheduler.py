@@ -17,7 +17,8 @@ Features:
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 from typing import Any
 
 logger = logging.getLogger("llama-proxy")
@@ -492,7 +493,6 @@ class SlotScheduler:
         # ── Phase 1: Check if a pending restart should execute now ──────────
         if self._pending_restart_slot is not None:
             now_dt = self._now_dt()
-            tolerance = timedelta(seconds=1)
 
             # Find the entry that matches our pending slot.
             matched_entry = None
@@ -645,7 +645,6 @@ class SlotScheduler:
 
         # ── Determine current slot count for comparison ───────────────
         static_slots = self._get_static_slot_count()
-        schedule_current = self._config.get_active_slot(now_time)
         current_slots = static_slots  # before first transition
 
         # ── Find the next entry where the slot count actually changes ──
@@ -660,8 +659,6 @@ class SlotScheduler:
                     # entry.time on the same day → shift back one day.
                     if drain_start > entry.time:
                         drain_dt -= timedelta(days=1)
-
-                    transition_dt = datetime.combine(now_dt.date(), entry.time)
 
                     if now_dt < drain_dt:
                         # Wake when the drain window opens.

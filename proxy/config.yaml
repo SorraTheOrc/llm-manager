@@ -171,6 +171,13 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -245,6 +252,13 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -264,7 +278,6 @@ models:
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
         model: deepseek-v4-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:

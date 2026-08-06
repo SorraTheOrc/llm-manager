@@ -40,7 +40,6 @@ from typing import Any
 import httpx
 
 
-
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
 # ---------------------------------------------------------------------------

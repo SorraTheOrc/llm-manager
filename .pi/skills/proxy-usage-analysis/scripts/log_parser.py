@@ -15,10 +15,10 @@ and log-format drift do not break the analysis.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator
 
 # Log line prefix: "2026-08-02 13:58:32,260 - INFO - <message>"
 LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - (\w+) - (.*)$")

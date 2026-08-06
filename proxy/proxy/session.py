@@ -9,7 +9,6 @@ circular import issues.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
@@ -979,7 +978,7 @@ class SessionSingleFlightCoordinator:
                     )
                 else:
                     await state["lock"].acquire()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 async with self._state_lock:
                     if is_waiting:
                         state["waiters"] = max(0, state["waiters"] - 1)

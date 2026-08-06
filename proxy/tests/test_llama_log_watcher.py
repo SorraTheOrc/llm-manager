@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import importlib
 
 lifecycle = importlib.import_module("proxy.lifecycle")
-from proxy.lifecycle import (
+from proxy.lifecycle import (  # noqa: E402
     _check_unload_lru_threshold,
     _parse_unload_lru,
     _UnloadLruTracker,

@@ -10,12 +10,12 @@ import json
 import logging
 import subprocess
 import time
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-
 
 # ===================================================================
 # Fixtures
@@ -461,7 +461,7 @@ class TestSlotScheduler:
     @pytest.mark.asyncio
     async def test_calculate_sleep_disabled(self, disabled_schedule):
         """Verify disabled schedule returns max sleep."""
-        from proxy.slot_scheduler import SlotScheduler, SlotScheduler
+        from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
         mock_srv.config = {"server": {"slot_schedule": disabled_schedule}}
@@ -682,7 +682,7 @@ class TestSlotSchedulerEdgeCases:
     @pytest.mark.asyncio
     async def test_midnight_transition(self):
         """Verify a transition at midnight works correctly with drain."""
-        from proxy.slot_scheduler import SlotScheduler, SlotScheduleConfig
+        from proxy.slot_scheduler import SlotScheduleConfig, SlotScheduler
 
         mock_srv = MagicMock()
         schedule = {

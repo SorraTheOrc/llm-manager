@@ -14,8 +14,8 @@ after the production changes land (LP-0MSEQR4IU008IE0D + LP-0MSEQR964003C30S).
 
 import pytest
 from proxy.provider import (
-    effective_per_slot_threshold,
     _estimate_prompt_tokens_for_routing,
+    effective_per_slot_threshold,
 )
 
 # cl100k (tiktoken) ≈ 1 token per 8 chars of dense prose
@@ -206,7 +206,7 @@ class TestDynamicCapOverridesStaticConfig:
 
         assert slot_id is not None, (
             "Context of ~20K tokens should be persisted when clamp-derived cap "
-            f"(39594) > estimate, but got None (persistence skipped)"
+            "(39594) > estimate, but got None (persistence skipped)"
         )
 
     def test_context_above_dynamic_cap_is_rejected(self):

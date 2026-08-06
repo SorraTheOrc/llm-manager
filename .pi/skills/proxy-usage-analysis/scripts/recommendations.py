@@ -24,7 +24,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 
-
 import bucketing
 from aggregation import AnalysisResult
 

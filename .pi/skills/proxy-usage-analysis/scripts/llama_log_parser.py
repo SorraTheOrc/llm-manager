@@ -22,10 +22,10 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
 
 # Optional "[<port>] " prefix + eval timing body. llama.cpp aligns columns with
 # variable whitespace, so all separators are whitespace-tolerant:

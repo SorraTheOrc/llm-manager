@@ -20,8 +20,8 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import config_loader  # noqa: E402
-import reporting  # noqa: E402
+import config_loader
+import reporting
 
 DEFAULT_LOG_DIR = "/var/log/llama-proxy"
 DEFAULT_HOURS = 24

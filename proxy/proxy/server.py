@@ -66,7 +66,7 @@ _llama_status_discovered_pid: int | None = None
 
 #   extract_progress_data, poll_slots_for_model, start_slot_polling, format_progress
 # The module-level state they reference remains here.
-from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: F401
+from .handlers import extract_progress_data, format_progress, poll_slots_for_model, start_slot_polling  # noqa: E402, F401
 
 # Polling state for /slots API (model -> latest data)
 slot_polling_state: dict = {}
@@ -767,7 +767,6 @@ def _shutdown_llama_server():
 
 def _shutdown_tts_server():
     """Stop the qwentts TTS server process."""
-    from .lifecycle import stop_tts_server
     stop_tts_server()
 
 
@@ -1075,13 +1074,13 @@ from .lifecycle import (  # noqa: E402, F401
     ensure_model_loaded,
     get_local_model_name,
     get_model_config,
+    restart_services,
     rotate_llama_logs,
     router_is_model_loaded,
     router_list_models,
     router_load_model,
     router_preload_models,
     router_wait_for_model,
-    restart_services,
     schedule_background_load,
     start_llama_server,
     stop_llama_server,
@@ -1171,25 +1170,25 @@ from .session import (  # noqa: E402, F401
     session_single_flight_observability,
     slot_lock_coordinator,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     create_embeddings as _ui_create_embeddings,
 )
 from .ui import (  # noqa: E402
     index as _ui_index,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     proxy_openai_api as _ui_proxy_openai_api,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     status_events as _ui_status_events,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     switch_model as _ui_switch_model,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     tail_logs as _ui_tail_logs,
 )
-from .ui import (
+from .ui import (  # noqa: E402
     view_logs as _ui_view_logs,
 )
 from .utils import (  # noqa: E402, F401

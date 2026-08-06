@@ -20,13 +20,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import aggregation  # noqa: E402
-import bucketing  # noqa: E402
-import config_loader  # noqa: E402
-import log_parser  # noqa: E402
-import recommendations  # noqa: E402
-import reporting  # noqa: E402
-from tests import fixtures  # noqa: E402
+import aggregation
+import bucketing
+import config_loader
+import log_parser
+import recommendations
+import reporting
+
+from tests import fixtures
 
 WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
 WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
@@ -471,7 +472,7 @@ class TestErrorAggregation:
         assert breakdown[("upstream_http_error", None, None)] == 1
 
     def test_error_events_outside_window_excluded(self):
-        res = aggregation.aggregate(
+        _ = aggregation.aggregate(
             _events(ERROR_LINES), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
         )
         # All fixtures are inside the Aug 3 10:00-15:00 window; also verify a
@@ -1270,7 +1271,7 @@ class TestReportRestructure:
         # Rotated file (rotation 14:00, inside window) + live log.
         (log_dir / "proxy.log.2026-08-02_14").write_text("\n".join(fixtures.E2E_LINES[:3]) + "\n")
         (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES[3:]) + "\n")
-        result = reporting.run_analysis(
+        _ = reporting.run_analysis(
             log_dir=log_dir,
             window_start=WINDOW_START,
             window_end=WINDOW_END,

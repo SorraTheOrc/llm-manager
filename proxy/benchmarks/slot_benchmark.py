@@ -32,10 +32,9 @@ import re
 import subprocess
 import sys
 import time
-import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
@@ -157,10 +156,10 @@ def build_user_prompt(index: int = 0) -> str:
     ensuring real processing work rather than a trivial answer.
     """
     return (
-        f"How many numbers appear in Part 2? Count them carefully and provide "
-        f"the exact total. Explain your reasoning step by step, then state "
-        f"the final answer as 'Total: <number>'. "
-        f"If you do not see Part 2 data, say 'NO DATA'."
+        "How many numbers appear in Part 2? Count them carefully and provide "
+        "the exact total. Explain your reasoning step by step, then state "
+        "the final answer as 'Total: <number>'. "
+        "If you do not see Part 2 data, say 'NO DATA'."
     )
 
 
@@ -357,8 +356,8 @@ def _kill_llama_server() -> None:
 
 def _wait_for_llama_server(timeout: int = 300) -> None:
     """Wait until llama-server responds on its health endpoint."""
-    from urllib.request import urlopen
     from urllib.error import URLError
+    from urllib.request import urlopen
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -375,7 +374,7 @@ def _wait_for_llama_server(timeout: int = 300) -> None:
 
 def _wait_for_proxy(timeout: int = 120) -> None:
     """Wait until the proxy responds to a health check."""
-    from urllib.request import urlopen, URLError
+    from urllib.request import URLError, urlopen
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -804,7 +803,7 @@ async def run_slot_benchmark(
 ) -> SlotRunResult:
     """Execute a benchmark run for a given slot count."""
     result = SlotRunResult(slot_count=slot_count)
-    result.start_time = datetime.now(timezone.utc).isoformat()
+    result.start_time = datetime.now(UTC).isoformat()
 
     print(f"\n{'='*60}")
     print(f"  Slot count: {slot_count}")
@@ -817,8 +816,6 @@ async def run_slot_benchmark(
 
     # Clear slot cache for clean measurements
     clear_slot_cache()
-
-    total = num_requests + warmup
 
     async with httpx.AsyncClient(timeout=TARGET_RESPONSE_TIME_S * 2) as client:
         # Create all tasks with staggered start delays.
@@ -910,7 +907,7 @@ async def run_slot_benchmark(
         # Sort results back to request_index order
         result.results.sort(key=lambda r: r.request_index)
 
-    result.end_time = datetime.now(timezone.utc).isoformat()
+    result.end_time = datetime.now(UTC).isoformat()
 
     # Capture GPU memory snapshot
     result.gpu_memory_bytes = _capture_gpu_memory()
@@ -958,7 +955,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "prompt_tokens_target": TARGET_PROMPT_TOKENS,
         "output_tokens_target": TARGET_OUTPUT_TOKENS,
         "target_response_time_seconds": TARGET_RESPONSE_TIME_S,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "runs": [
             dict(
                 slot_count=r.slot_count,
@@ -982,7 +979,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "=" * 72,
         f"  Target: {TARGET_PROMPT_TOKENS:,} prompt tokens, ~{TARGET_RESPONSE_TIME_S}s response",
         f"  Requests per run: {TOTAL_REQUESTS_PER_RUN}  |  Warmup: 0 (use --warmup to enable)",
-        f"  Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"  Date: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
         f"{'Slots':>6}  {'Completed':>10}  {'Errors':>7}  {'Avg Dur':>8}  {'Min Dur':>8}  {'Max Dur':>8}  {'Avg TPS':>8}  {'Avg TTFT':>9}  {'GPU Mem':>10}",
         "-" * 80,
@@ -1079,7 +1076,7 @@ async def run_test_mode(
     ]
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        print(f"  Sending: 'Say Hi'")
+        print("  Sending: 'Say Hi'")
         req = await send_request(
             client, messages, index=0, base_url=base_url,
             max_tokens=20, timeout=120.0,
@@ -1087,7 +1084,7 @@ async def run_test_mode(
         )
 
     if req.status == "completed":
-        print(f"  ✓ Test passed!")
+        print("  ✓ Test passed!")
         print(f"      Duration: {req.total_duration_seconds:.1f}s")
         print(f"      Prompt tokens: {req.prompt_tokens}")
         print(f"      Completion tokens: {req.completion_tokens}")
@@ -1098,7 +1095,7 @@ async def run_test_mode(
         print(f"  ✗ Test FAILED: {req.error}")
 
     print(f"\n{'='*60}")
-    print(f"  TEST MODE COMPLETE")
+    print("  TEST MODE COMPLETE")
     print(f"{'='*60}")
 
 
@@ -1230,14 +1227,14 @@ def main(argv: list[str] | None = None) -> None:
                 print("  Slot cache preserved (--clean-cache not set)")
 
             # Record restart timestamps for reproducible measurements
-            from datetime import datetime, timezone
-            proxy_restart_time = datetime.now(timezone.utc).isoformat()
+            from datetime import datetime
+            proxy_restart_time = datetime.now(UTC).isoformat()
             print(f"  Proxy restart recorded at: {proxy_restart_time}")
 
             restart_services(slot_count)
 
             # Record llama-server ready timestamp
-            llama_ready_time = datetime.now(timezone.utc).isoformat()
+            llama_ready_time = datetime.now(UTC).isoformat()
             print(f"  Llama-server ready at: {llama_ready_time}")
         else:
             print("  Skipping restart (--skip-restart)")
@@ -1289,7 +1286,7 @@ def main(argv: list[str] | None = None) -> None:
     report_path = generate_report(all_results, output_dir)
 
     # Restore original slot count (6 = current production value)
-    print(f"\nRestoring slot count to 6...")
+    print("\nRestoring slot count to 6...")
     set_slot_count(6)
     if not args.skip_restart:
         restart_services(6)

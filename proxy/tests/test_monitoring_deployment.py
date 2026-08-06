@@ -277,7 +277,7 @@ class TestGrafanaDashboardConfig:
                         "${grafana_home}"
                     ) or dash_path_str.startswith("/"), (
                         f"Dashboard path {dash_path_str} should be absolute or "
-                        f"reference ${grafana_home}"
+                        f"reference ${{{{grafana_home}}}}"
                     )
 
 

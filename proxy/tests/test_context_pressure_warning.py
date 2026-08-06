@@ -11,11 +11,10 @@ agents a data-backed prompt to compact before decode degrades.
 This module verifies the warning computation used at routing time.
 """
 import pytest
-
 from proxy.provider import (
+    _LOCAL_ROUTING_OUTPUT_HEADROOM,
     context_pressure_ratio,
     should_warn_context_pressure,
-    _LOCAL_ROUTING_OUTPUT_HEADROOM,
 )
 
 
