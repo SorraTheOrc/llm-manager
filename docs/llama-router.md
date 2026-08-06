@@ -129,3 +129,34 @@ Mitigations (implemented in follow-up LP-0MSEGPO77005CYCQ F2/F3):
   (`local_model_ctx_size // active_slots - 4096` output headroom, the same
   source as the routing clamp) when the config key is absent/0, so it
   auto-adapts to slot-count/ctx-size changes.
+
+## Warm-cache context-threshold routing (LP-0MSB2RASV009WFGI)
+
+When routing requests to the local llama-server, the proxy applies a two-tier
+context-size check before committing to local, in
+`_should_bypass_local_for_large_context` (proxy/proxy/provider.py):
+
+1. **Warm-cache threshold (hard cap):** If the estimated total prompt context
+   exceeds `local_large_context_warm_cache_threshold` (default `100000` in
+   `proxy/config.yaml`), local is bypassed regardless of cache state. This
+   prevents routing excessively large total contexts to the local model slot
+   even when the KV cache is warm.
+
+2. **Cold-cache new-token check:** The number of uncached tokens is computed
+   as `new_tokens = estimated_tokens × (1 − cached_ratio)`. If
+   `new_tokens > cold_cache_threshold`, the prefill is considered too
+   expensive and local is bypassed; otherwise the request routes local.
+
+The `cached_ratio` is tracked per-session (see `proxy/session.py` delta
+routing classification). A ratio of `0.0` (unknown sessions) is conservative:
+local is bypassed whenever new tokens exceed the threshold. A ratio of `1.0`
+(full warm cache) yields `new_tokens = 0`, so local is always used unless the
+warm-cache hard cap applies. A threshold of `0` disables the bypass entirely.
+
+Config keys (both nested under `server:` and flat forms are supported):
+
+```yaml
+server:
+  local_large_context_fallback_threshold: 60000        # cold-cache new-token cap
+  local_large_context_warm_cache_threshold: 100000     # total-context hard cap
+```
