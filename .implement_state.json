@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MS8ZM98R000M8AN",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MS8ZM98R000M8AN-toctou-race-in-try-acquire-local-dispatc",
+  "work_item_id": "LP-0MSI8W67N007RJIL",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSI8W67N007RJIL-archive-proxy-usage-reports-auto-archive",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-01T18:08:39Z"
+  "started_at": "2026-08-07T01:07:37Z"
 }

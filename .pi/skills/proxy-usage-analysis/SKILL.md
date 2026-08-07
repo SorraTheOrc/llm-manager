@@ -60,6 +60,21 @@ Options:
 | `--json` | off | Print a machine-readable JSON summary instead of the text summary |
 | `--quiet` | off | Suppress the stdout summary |
 
+## Automated daily run
+
+A cron job runs the report automatically every day at 05:00 (output logged
+to `~/proxy-usage-reports/cron.log` so each run's summary and any failures
+are visible):
+
+```cron
+0 5 * * * cd /home/rgardler/projects/llm && python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py >> ~/proxy-usage-reports/cron.log 2>&1
+```
+
+Each run archives the previous day's outputs into a dated subdirectory (see
+[Archival](#archival)), so a historical daily report accumulates under
+`~/proxy-usage-reports/YYYY-MM-DD/`. `cron.log` is not an analysis artifact
+and stays at the root, untouched by archival.
+
 ## Outputs
 
 Written to `--output-dir` (default `~/proxy-usage-reports`):
@@ -95,6 +110,18 @@ start/avg/max context size, avg/max response size, initial model assignment
 back), fallback reason (empty if never fell back), bucket, slots,
 local/remote request counts, dispatch denials, decode tok/s (derived from
 local completion tokens ÷ local active span; empty when not derivable).
+
+### Archival
+
+Before writing fresh outputs, the script moves any existing artifacts
+(`report.md`, `daytime_sessions.csv`, `nighttime_sessions.csv`, `errors.csv`,
+`errors.json`) into a dated subdirectory named by the **run date**
+(`YYYY-MM-DD/`); when that directory already exists (a same-day repeat, or a
+manual archive), a `_2`, `_3` … suffix is appended so archives are never
+overwritten. Only the skill's own artifacts are moved — anything else in the
+output dir (e.g. `cron.log`) stays put, and a pristine output dir is left
+touched-free (no empty archive dirs). The CLI prints the archive path on each
+run (`Previous outputs archived to …`).
 
 ## How it works
 

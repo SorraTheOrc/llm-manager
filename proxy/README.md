@@ -76,7 +76,10 @@ python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
 `daytime_sessions.csv`, `nighttime_sessions.csv`
 (one row per session; day/night split derived from the `slot_schedule` in
-`config.yaml`), and `report.md` (aggregates + recommendations).
+`config.yaml`), and `report.md` (aggregates + recommendations). Existing
+outputs are archived into a dated subdirectory before each run overwrites
+them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
+runs the report daily at 05:00 (see SKILL.md).
 
 See `~/.pi/agent/skills/proxy-usage-analysis/SKILL.md` for usage details and
 interpretation guidance.

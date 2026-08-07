@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Outputs written to {args.output_dir}: "
               f"daytime_sessions.csv, nighttime_sessions.csv, errors.csv, report.md")
+        if run.archived_to:
+            print(f"Previous outputs archived to {run.archived_to}")
     return 0
 
 

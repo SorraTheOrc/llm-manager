@@ -1322,3 +1322,144 @@ class TestReportRestructure:
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Day | Night | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
+
+
+class TestArchiveOutputs:
+    """Existing output artifacts are moved into dated archive subdirectories
+    before a fresh run overwrites them, so historical reports are kept.
+
+    Covers AC1 (pre-existing artifacts archived), AC2 (same-day runs get
+    suffixed dirs, never overwriting), AC3 (pristine dir untouched).
+    """
+
+    # Frozen clock so the dated archive dirs are deterministic in tests.
+    NOW = datetime(2026, 8, 7, 5, 0, 0)
+
+    class _FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return TestArchiveOutputs.NOW
+
+    def _write_logs(self, tmp_path: Path) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        return log_dir
+
+    def _run(self, tmp_path: Path, out_name: str = "out", monkeypatch=None):
+        if monkeypatch is not None:
+            monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        return reporting.run_analysis(
+            log_dir=self._write_logs(tmp_path),
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / out_name,
+            config=None,
+        )
+
+    def test_archives_existing_artifacts_before_overwrite(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        out = tmp_path / "out"
+        out.mkdir()
+        # Pre-existing artifacts, as if a previous run had written them.
+        (out / "report.md").write_text("OLD REPORT")
+        (out / "daytime_sessions.csv").write_text("old day")
+        (out / "nighttime_sessions.csv").write_text("old night")
+        (out / "errors.csv").write_text("old errors")
+        (out / "errors.json").write_text("{\"old\": true}")
+
+        run = self._run(tmp_path, monkeypatch=monkeypatch)
+
+        # All five artifacts moved into the dated archive dir, verbatim.
+        archive = out / "2026-08-07"
+        assert archive.is_dir()
+        assert run.archived_to == archive
+        assert (archive / "report.md").read_text() == "OLD REPORT"
+        assert (archive / "daytime_sessions.csv").read_text() == "old day"
+        assert (archive / "nighttime_sessions.csv").read_text() == "old night"
+        assert (archive / "errors.csv").read_text() == "old errors"
+        assert (archive / "errors.json").read_text() == "{\"old\": true}"
+        # Fresh outputs written at the root.
+        assert (out / "report.md").read_text().startswith("# Proxy Usage Analysis")
+        assert (out / "daytime_sessions.csv").exists()
+        assert (out / "nighttime_sessions.csv").exists()
+        assert (out / "errors.csv").exists()
+        assert (out / "errors.json").exists()
+
+    def test_same_day_runs_get_suffixed_archive_dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        out = tmp_path / "out"
+        log_dir = self._write_logs(tmp_path)
+        # Run 1: pristine dir -> nothing archived, first archives appear later.
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out,
+            config=None,
+        )
+        assert list(out.iterdir())  # fresh outputs present
+        first_md = (out / "report.md").read_text()
+
+        # Run 2 (same day): previous outputs move into the plain dated dir.
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out,
+            config=None,
+        )
+        archive1 = out / "2026-08-07"
+        assert (archive1 / "report.md").read_text() == first_md
+
+        # Run 3 (same day): run-2 outputs move into the _2 suffix dir, and the
+        # run-1 archive is never overwritten.
+        second_md = (out / "report.md").read_text()
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out,
+            config=None,
+        )
+        archive2 = out / "2026-08-07_2"
+        assert (archive2 / "report.md").read_text() == second_md
+        assert (archive1 / "report.md").read_text() == first_md
+        # A fresh report still sits at the root after every run.
+        assert (out / "report.md").exists()
+        assert (out / "daytime_sessions.csv").exists()
+
+    def test_same_day_archive_dir_collides_with_existing_dir(self, tmp_path):
+        # A dated dir already exists (e.g. a manual archive) -> suffix, not overwrite.
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "2026-08-07").mkdir()
+        (out / "2026-08-07" / "report.md").write_text("MANUAL")
+        (out / "report.md").write_text("CURRENT")
+
+        archived = reporting._archive_existing_outputs(out, now=self.NOW)
+
+        assert archived.name == "2026-08-07_2"
+        assert (archived / "report.md").read_text() == "CURRENT"
+        assert (out / "2026-08-07" / "report.md").read_text() == "MANUAL"
+
+    def test_pristine_output_dir_left_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        self._run(tmp_path, out_name="fresh", monkeypatch=monkeypatch)
+        out = tmp_path / "fresh"
+        # No archive dirs are created when there was nothing to archive.
+        dirs = [p for p in out.iterdir() if p.is_dir()]
+        assert dirs == []
+
+    def test_unrelated_files_in_output_dir_are_not_moved(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "report.md").write_text("CURRENT")
+        (out / "cron.log").write_text("2026-08-07 05:00 ok\n")
+
+        archived = reporting._archive_existing_outputs(out, now=self.NOW)
+
+        assert (archived / "report.md").read_text() == "CURRENT"
+        # Non-artifact files stay put (cron log lives at the root).
+        assert (out / "cron.log").read_text() == "2026-08-07 05:00 ok\n"
+        assert not (archived / "cron.log").exists()
