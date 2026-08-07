@@ -227,6 +227,86 @@ class TestErrorLineParsing:
         assert events[0].src_file == "proxy.log.2026-08-03_13"
 
 
+class TestDiscoverLogFiles:
+    """Discovery of proxy log files for an analysis window.
+
+    Rotated files (``proxy.log.YYYY-MM-DD_HH``) are included regardless of
+    their name-encoded timestamp: in this deployment a rotated file routinely
+    holds data well past its encoded rotation time (e.g. ``proxy.log.2026-08-07_03``
+    contains data until 09:03), so discovery must never exclude a file based on
+    its name. ``iter_events`` per-line timestamp filtering is the only boundary.
+    """
+
+    def test_live_log_always_included(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert files == [log_dir / "proxy.log"]
+
+    def test_rotated_file_with_pre_window_encoded_time_is_included(self, tmp_path):
+        # Regression: name-encoded rotation time (03:00 on 08-07) precedes
+        # window start (04:00 on 08-07), but the file may still hold in-window
+        # data — it must be discovered and filtered per line, never excluded by
+        # name. Mirrors the real deployment case (proxy.log.2026-08-07_03).
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.2026-08-07_03").write_text("garbage\n")
+        (log_dir / "proxy.log").write_text("garbage\n")
+        window_start = datetime(2026, 8, 7, 4, 0)
+        files = log_parser.discover_log_files(log_dir, window_start)
+        assert log_dir / "proxy.log.2026-08-07_03" in files
+        assert log_dir / "proxy.log" in files
+
+    def test_all_rotated_files_included_regardless_of_encoded_time(self, tmp_path):
+        # Encoded times before, inside, and after the window are all included;
+        # discovery never excludes a rotated file based on its name timestamp.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        names = [
+            "proxy.log.2026-07-31_10",  # long before the window
+            "proxy.log.2026-08-02_14",  # inside the window
+            "proxy.log.2026-08-03_20",  # after the window
+        ]
+        for name in names:
+            (log_dir / name).write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert {p.name for p in files} == set(names)
+
+    def test_unrecognized_rotated_names_included(self, tmp_path):
+        # Names that do not match the YYYY-MM-DD_HH convention are also kept.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.1").write_text("garbage\n")
+        (log_dir / "proxy.log.gz").write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert {p.name for p in files} == {"proxy.log.1", "proxy.log.gz"}
+
+    def test_non_log_files_excluded(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "llama-server.log").write_text("garbage\n")
+        (log_dir / "notes.txt").write_text("garbage\n")
+        (log_dir / "proxy.log").write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert files == [log_dir / "proxy.log"]
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert log_parser.discover_log_files(tmp_path / "nope", WINDOW_START) == []
+
+    def test_sorted_by_name(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        for name in ["proxy.log.2026-08-02_14", "proxy.log.2026-08-01_10", "proxy.log"]:
+            (log_dir / name).write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert [p.name for p in files] == [
+            "proxy.log",
+            "proxy.log.2026-08-01_10",
+            "proxy.log.2026-08-02_14",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Session aggregation
 # ---------------------------------------------------------------------------
@@ -1204,10 +1284,12 @@ class TestEndToEnd:
         assert result.summary.sessions == {}
         assert (tmp_path / "out3" / "report.md").exists()
 
-    def test_rotated_file_outside_window_is_not_parsed(self, tmp_path):
+    def test_rotated_file_outside_window_is_filtered_per_line(self, tmp_path):
         log_dir = tmp_path / "logs2"
         log_dir.mkdir()
-        # Rotation time 13:00 < window_start 14:00 → excluded by discovery.
+        # Rotation time 13:00 < window_start 14:00: the file is still discovered
+        # (name timestamps are not authoritative), but its 12:00 content lies
+        # outside the margin-widened window and is dropped per line by iter_events.
         (log_dir / "proxy.log.2026-08-02_13").write_text(
             "2026-08-02 12:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=old request=[]\n"
         )
@@ -1221,7 +1303,35 @@ class TestEndToEnd:
             output_dir=tmp_path / "out4",
             config=None,
         )
+        # The rotated file is discovered, but its pre-window event is filtered
+        # by the authoritative per-line timestamp check in iter_events.
+        assert log_dir / "proxy.log.2026-08-02_13" in result.files
         assert list(result.summary.sessions) == ["new"]
+
+    def test_rotated_file_with_earlier_rotation_reports_overlapping_session(self, tmp_path):
+        # Regression: a rotated file whose name-encoded rotation time precedes
+        # window start may still hold in-window data (deployment files span far
+        # past their encoded time). Discovery must include it so its in-window
+        # session is reported — never silently dropped.
+        log_dir = tmp_path / "logs3"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.2026-08-02_13").write_text(
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=carried request=[]\n"
+            "2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=carried provider=local model=Qwen3 request=[]\n"
+        )
+        (log_dir / "proxy.log").write_text(
+            "2026-08-02 14:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=live request=[]\n"
+            "2026-08-02 14:30:02,000 - INFO - Stream finished: reason=stop tokens=200/20/220 session=live provider=local model=Qwen3 request=[]\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out5",
+            config=None,
+        )
+        assert log_dir / "proxy.log.2026-08-02_13" in result.files
+        assert set(result.summary.sessions) == {"carried", "live"}
 
 
 class TestDefaultOutputDir:

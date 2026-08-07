@@ -44,8 +44,10 @@ RE_UPSTREAM_STATUS = re.compile(r"status=(\d+)")
 # upstream error type appears in the JSON body as {"type":"error","error":{"type":"<Type>",...}}.
 RE_UPSTREAM_BODY_TYPE = re.compile(r'"type":"(FreeUsageLimitError|[A-Za-z]+Error)"')
 
-# Rotated log naming: proxy.log.YYYY-MM-DD_HH (the timestamp is the rotation time).
-ROTATED_NAME_RE = re.compile(r"^proxy\.log\.(\d{4})-(\d{2})-(\d{2})_(\d{2})$")
+# Rotated log naming: proxy.log.YYYY-MM-DD_HH (the timestamp is the rotation
+# time). Note: the name-encoded time does NOT reliably bound a file's content
+# span in this deployment — rotated files routinely hold data past it — so
+# discovery includes every rotated file and iter_events is the only boundary.
 
 STREAM_STARTED = "Stream started"
 STREAM_FINISHED = "Stream finished"
@@ -279,35 +281,23 @@ def discover_log_files(log_dir: Path, window_start: datetime) -> list[Path]:
     """Return the log files in ``log_dir`` that can overlap the analysis
     window, sorted by name.
 
-    The live ``proxy.log`` is always included. Rotated files
-    (``proxy.log.YYYY-MM-DD_HH``) end at their name-encoded rotation time, so
-    a rotated file overlaps the window iff rotation_time >= window_start.
-    Files with unrecognised names fall back to an mtime check (conservative;
-    per-line timestamp filtering remains authoritative).
+    The live ``proxy.log`` is always included, and so is every rotated file
+    (``proxy.log.YYYY-MM-DD_HH``). The name-encoded timestamp does not
+    reliably bound a rotated file's content in this deployment — files
+    routinely hold data well past their encoded rotation time (e.g.
+    ``proxy.log.2026-08-07_03`` contains data until 09:03) — so any name- or
+    mtime-based inclusion test risks silently dropping in-window data.
+    ``iter_events`` per-line timestamp filtering remains the authoritative
+    boundary check.
+
+    ``window_start`` is retained for API compatibility; discovery no longer
+    depends on it.
     """
     log_dir = Path(log_dir)
     if not log_dir.is_dir():
         return []
     candidates: list[Path] = []
     for p in sorted(log_dir.iterdir()):
-        if not p.is_file():
-            continue
-        if p.name == "proxy.log":
+        if p.is_file() and (p.name == "proxy.log" or p.name.startswith("proxy.log.")):
             candidates.append(p)
-            continue
-        if not p.name.startswith("proxy.log."):
-            continue
-        m = ROTATED_NAME_RE.match(p.name)
-        if m is not None:
-            y, mo, d, h = (int(x) for x in m.groups())
-            rotation = datetime(y, mo, d, h)
-            if rotation >= window_start:
-                candidates.append(p)
-        else:
-            try:
-                mtime = datetime.fromtimestamp(p.stat().st_mtime)
-            except OSError:
-                continue
-            if mtime >= window_start:
-                candidates.append(p)
     return sorted(candidates, key=lambda p: p.name)

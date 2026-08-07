@@ -125,8 +125,12 @@ run (`Previous outputs archived to …`).
 
 ## How it works
 
-1. **File discovery** — the live `proxy.log` plus every rotated file whose
-   name-encoded rotation time is at/after the window start.
+1. **File discovery** — the live `proxy.log` plus every rotated sibling
+   (`proxy.log.YYYY-MM-DD_HH`). All rotated files are included regardless of
+   their name-encoded timestamp: in this deployment a rotated file routinely
+   holds data well past its encoded rotation time, so a name-based inclusion
+   test would silently drop in-window data. Per-line timestamp filtering in
+   step 2 is the authoritative window boundary.
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
