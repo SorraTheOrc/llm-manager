@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSDRRPV0001TCLX",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSDRRPV0001TCLX-root-cause-local-stream-nameerror-3-even",
+  "work_item_id": "LP-0MSEHMMBK0062ZPI",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSEHMMBK0062ZPI-apply-adaptive-dispatch-lease-to-anonymo",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-07T17:00:54Z"
+  "started_at": "2026-08-07T17:39:33Z"
 }

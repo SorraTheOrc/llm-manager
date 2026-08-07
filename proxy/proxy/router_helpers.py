@@ -684,12 +684,20 @@ async def _increment_local_active_queries(
     srv,
     session_key: str | None = None,
     backend: str | None = None,
+    body_json: dict | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
     When *session_key* and *backend* are provided, a corresponding
     dispatch record is created in *local_dispatch_records* to track
     lease ownership.
+
+    When *body_json* is provided, the lease timeout is extended
+    adaptively based on the estimated prompt token count, so that
+    large-prompt prefills (which produce no stream chunks to refresh
+    the lease) hold their lease for the full prefill duration. This
+    applies the adaptive lease to anonymous/non-explicit sessions, not
+    just explicit ones (LP-0MSEHMMBK0062ZPI).
     """
     try:
         async with srv.local_active_queries_lock:
@@ -701,7 +709,7 @@ async def _increment_local_active_queries(
         try:
             lock = getattr(srv, "local_dispatch_records_lock", None)
             if lock is not None:
-                lease_timeout = _get_lease_timeout_seconds(srv)
+                lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
                 async with lock:
                     srv.local_dispatch_records[session_key] = {
                         "backend": backend,

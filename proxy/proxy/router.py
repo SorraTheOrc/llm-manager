@@ -767,10 +767,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # check above ran (session_id and session_explicit), _try_acquire_local_dispatch
     # already incremented local_active_queries and created the dispatch record.
     if not (session_id and session_explicit):
+        # Anonymous/non-explicit sessions: apply the adaptive lease timeout
+        # for large prompts so the lease covers the prefill phase (which
+        # produces no stream chunks to refresh it) instead of expiring after
+        # the base 60s and being orphan-cleaned mid-prefill
+        # (LP-0MSEHMMBK0062ZPI).
         await _increment_local_active_queries(
             srv,
             session_key=session_id,
             backend="local",
+            body_json=body_json if isinstance(body_json, dict) else None,
         )
 
     # Token accounting

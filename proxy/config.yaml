@@ -469,6 +469,9 @@ server:
   #   added per estimated prompt token for large-context requests, reused from
   #   llama_adaptive_timeout_per_token_seconds (0.015) if not explicitly set.
   #   This prevents mid-stream lease expiry during cache prefill.
+  #   Applied to BOTH explicit and anonymous/non-explicit sessions
+  #   (LP-0MSEHMMBK0062ZPI) so large anonymous prefills hold their lease for
+  #   the full prefill duration instead of the base 60s.
   # local_dispatch_lease_max_seconds: Hard upper bound for the adaptive lease
   #   timeout, defaults to 1500 (same as default llama_request_timeout).
   # Reduced from 180s to 60s to prevent long cross-session blocking.
