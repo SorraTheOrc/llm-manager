@@ -575,6 +575,71 @@ def _truncate_body(body: str, maxlen: int = 500) -> str:
     return body[:maxlen] + "..."
 
 
+def _slot_busy_state_snapshot(slot_id: int | None = None) -> dict:
+    """Snapshot proxy-side load state used to judge slot busyness.
+
+    Returns a JSON-serializable dict with:
+
+    - ``active_queries``: total in-flight queries (local + remote backends).
+    - ``local_active_queries``: in-flight queries on the local backend.
+    - ``active_sessions``: sessions holding an *active* dispatch lease
+      (a request currently in flight on the local backend).
+    - ``slot_busy``: whether *slot_id*'s owning session has an active
+      dispatch lease (a request in flight on that slot).
+
+    Correlation evidence (LP-0MSI1RWLM007N367 F1): slot save/restore
+    ReadTimeouts cluster when other local streams are active — llama-server
+    serializes each KV-cache copy behind its slot work, so a save issued
+    while another slot is generating can exceed the adaptive timeout. This
+    snapshot gives the correlation script (and the F3 load gate) a concrete
+    busy definition from proxy-side state, with no extra llama-server calls.
+    """
+    state = {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": False,
+    }
+    try:
+        srv = _srv()
+    except Exception:
+        return state
+    try:
+        state["active_queries"] = int(
+            getattr(srv, "active_queries", 0) or 0
+        )
+    except Exception:
+        pass
+    try:
+        state["local_active_queries"] = int(
+            getattr(srv, "local_active_queries", 0) or 0
+        )
+    except Exception:
+        pass
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if isinstance(records, dict):
+            state["active_sessions"] = sum(
+                1
+                for rec in records.values()
+                if isinstance(rec, dict) and rec.get("active")
+            )
+            if slot_id is not None:
+                owner = None
+                for sid, owner_id in _slot_owners.items():
+                    if sid == slot_id:
+                        owner = owner_id
+                        break
+                if owner is not None and owner in records:
+                    rec = records.get(owner)
+                    state["slot_busy"] = bool(
+                        isinstance(rec, dict) and rec.get("active")
+                    )
+    except Exception:
+        pass
+    return state
+
+
 async def _call_slot_endpoint(
     llama_port: int,
     slot_id: int,
@@ -593,6 +658,12 @@ async def _call_slot_endpoint(
     - A DEBUG-level log with exc_info=True is emitted for every exception,
       capturing the full stack trace for post-hoc diagnosis.
 
+    Failure-path instrumentation (LP-0MSI1RWLM007N367 F1): every failed
+    save/restore logs the elapsed time at timeout, the applied timeout, and a
+    proxy-side busy-state snapshot (``_slot_busy_state_snapshot``) so the
+    correlation script can prove whether the failure was load-starved. The
+    success path logs elapsed time at DEBUG for latency measurement.
+
     Failures feed the circuit breaker (``_slot_failure_state``) so repeated
     timeouts disable persistence for the slot instead of piling doomed
     KV-cache copies onto the GPU (LP-0MS91DHPZ001VWQO).
@@ -605,32 +676,53 @@ async def _call_slot_endpoint(
         payload["model"] = model
     srv = _srv()
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=timeout)
+    start = time.monotonic()
     try:
         response = await client.post(url, json=payload, timeout=timeout)
+        elapsed = time.monotonic() - start
         if getattr(response, "status_code", None) != 200:
             body = getattr(response, "text", "")
+            busy = _slot_busy_state_snapshot(slot_id)
             srv.logger.warning(
-                "slot_%s failed slot=%s status=%s body=%s",
+                "slot_%s failed slot=%s status=%s body=%s elapsed=%.1fs timeout=%.1fs busy=%s",
                 action,
                 slot_id,
                 response.status_code,
                 _truncate_body(body),
+                elapsed,
+                timeout,
+                json.dumps(busy),
             )
             _record_slot_failure(slot_id)
             return False
         _record_slot_success(slot_id)
+        # Elapsed-time on success lets the correlation script measure real
+        # save/restore latency vs the adaptive timeout (llama-server logs
+        # lack timestamps; LP-0MSI1RWLM007N367 F1).
+        srv.logger.debug(
+            "slot_%s ok slot=%s elapsed=%.1fs timeout=%.1fs",
+            action,
+            slot_id,
+            elapsed,
+            timeout,
+        )
         return True
     except Exception as exc:
+        elapsed = time.monotonic() - start
         # Log exception type name in the warning so empty __str__ values
         # never produce an empty error field (LP-0MQWXX17C005BX1E).
         exc_type = type(exc).__name__
         detail = str(exc) if str(exc) else exc_type
+        busy = _slot_busy_state_snapshot(slot_id)
         srv.logger.warning(
-            "slot_%s failed slot=%s error=%s/%s",
+            "slot_%s failed slot=%s error=%s/%s elapsed=%.1fs timeout=%.1fs busy=%s",
             action,
             slot_id,
             exc_type,
             detail,
+            elapsed,
+            timeout,
+            json.dumps(busy),
         )
         # Feed the circuit breaker so repeated timeouts disable persistence.
         _record_slot_failure(slot_id)
