@@ -545,8 +545,15 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     ``finish_reason=length`` (context exhaustion) — surfaced by pi as the
     misleading "maximum output token limit" error (LP-0MSAZXXDY005AWA1).
 
-    Clamping the effective thresholds to the actual per-slot context makes
-    oversized prompts fall through to remote BEFORE context exhaustion.
+    The warm threshold is clamped to the actual per-slot context because it
+    represents a **hard capacity limit**: total context exceeding the slot
+    must be routed remote to prevent context exhaustion.
+
+    The cold threshold is an **economic new-token threshold** and must NOT be
+    clamped — it defines the band (cold, warm] where the cached_ratio routing
+    check (Check 2 in ``_should_skip_local``) operates. Clamping cold to the
+    same cap as warm collapses the band to zero width, making the ratio check
+    unreachable dead code (LP-0MSI2M5BT004BCDP).
 
     Returns the configured thresholds unchanged when ``local_model_ctx_size``
     is 0 (clamp disabled) or per-slot context cannot be computed.
@@ -560,8 +567,9 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     if cap <= 0:
         return cold, warm
 
-    if cold > 0:
-        cold = min(cold, cap)
+    # Only clamp the WARM threshold to the per-slot cap (hard capacity limit).
+    # COLD stays as the economic new-token threshold so the (cold, warm] band
+    # remains non-empty for Check 2 (cached_ratio routing) to operate in.
     if warm > 0:
         warm = min(warm, cap)
     return cold, warm
@@ -3375,9 +3383,11 @@ async def _proxy_with_fallback_cycle(
                 # (LP-0MRP44W7I0085I6N). Uses cached_tokens ratio from the last
                 # local response instead of inferred cache-cold state.
                 _llama_model = provider_cfg.get("llama_model", "")
-                # Clamp configured thresholds to the actual per-slot context so
+                # Clamp the WARM threshold to the actual per-slot context so
                 # prompts that cannot fit the KV slot fall through to remote
-                # BEFORE context exhaustion (LP-0MSAZXXDY005AWA1).
+                # BEFORE context exhaustion (LP-0MSAZXXDY005AWA1). COLD stays
+                # as the economic new-token threshold so the (cold, warm] band
+                # keeps the cached_ratio check reachable (LP-0MSI2M5BT004BCDP).
                 _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
                     config
                 )

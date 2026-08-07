@@ -64,7 +64,7 @@ class TestEffectiveLargeContextThresholds:
         threshold must be clamped below that (with output headroom) so a
         43K-token prompt is skipped instead of routed local."""
         config = {"server": {
-            "local_large_context_cold_cache_threshold": 60000,
+            "local_large_context_cold_cache_threshold": 20000,
             "local_large_context_warm_cache_threshold": 100000,
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 8,
@@ -76,11 +76,12 @@ class TestEffectiveLargeContextThresholds:
     def test_ctx_size_6_slots_clamps_higher(self):
         """6 slots -> per-slot = 43690, so warm clamps higher than 8-slot."""
         config = {"server": {
+            "local_large_context_cold_cache_threshold": 20000,
             "local_large_context_warm_cache_threshold": 100000,
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 6,
         }}
-        _, warm = _effective_large_context_thresholds(config)
+        cold, warm = _effective_large_context_thresholds(config)
         assert 32768 < warm <= 43690
 
     def test_skips_oversized_prompt_that_previously_truncated(self):
@@ -101,4 +102,91 @@ class TestEffectiveLargeContextThresholds:
         body = {"messages": [{"role": "user", "content": phrase * 7300}]}  # ~43.7K tokens
         assert _should_skip_local(
             "Qwen3", "sess_a", body, cold, warm_cache_threshold=warm
+        ) is True
+
+
+class TestColdWarmBandReachable:
+    """The cached_ratio routing check (Check 2 in _should_skip_local) must be
+    reachable: cold must stay BELOW the clamped warm threshold so the
+    (cold, warm] band has non-zero width (LP-0MSI2M5BT004BCDP).
+
+    LP-0MSAZXXDY005AWA1 clamped BOTH thresholds to the per-slot cap, so
+    cold == warm collapsed the band and Check 2 became unreachable dead
+    code. Only WARM (the hard capacity limit) is clamped now; COLD is the
+    economic new-token threshold."""
+
+    def _production_config(self):
+        """Mirror the live proxy/config.yaml routing settings."""
+        return {"server": {
+            "local_large_context_cold_cache_threshold": 30000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,
+        }}
+
+    def test_production_config_returns_cold_below_warm(self):
+        """AC1: under the production config, cold < warm so the band exists.
+
+        131072 ctx / 3 slots = 43690 per-slot, minus 4096 headroom =
+        39594 cap. Cold (30000) must stay below the clamped warm (39594).
+        """
+        cold, warm = _effective_large_context_thresholds(self._production_config())
+        assert cold == 30000
+        assert warm == 39594
+        assert cold < warm
+
+    def test_only_warm_is_clamped_cold_passes_through(self):
+        """COLD is an economic threshold and must NOT be clamped to the
+        per-slot cap; only WARM (the hard capacity limit) is clamped."""
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 15000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        assert cold == 15000  # untouched
+        assert warm == 39594  # clamped to per-slot cap
+        assert cold < warm
+
+    def test_check2_warm_ratio_routes_local_in_band(self):
+        """AC2: a request in the (cold, warm] band with a warm cache (high
+        ratio) stays local — Check 2 computes new_tokens = estimated *
+        (1 - ratio) <= cold."""
+        config = self._production_config()
+        cold, warm = _effective_large_context_thresholds(config)
+        from proxy.provider import update_cached_ratio
+
+        # Warm cache: 60% of the 35K-token prompt is cached -> 14K new tokens.
+        update_cached_ratio("Qwen3", "band_sess", cached_tokens=60, prompt_tokens=100)
+        body = {"messages": [{"role": "user", "content": "x " * 35000}]}  # ~35K est
+        assert _should_skip_local(
+            "Qwen3", "band_sess", body, cold, warm_cache_threshold=warm
+        ) is False
+
+    def test_check2_cold_ratio_bypasses_in_band(self):
+        """AC2: the same band request with a cold cache (ratio 0 -> all 35K
+        tokens are new) bypasses local: new_tokens > cold."""
+        config = self._production_config()
+        cold, warm = _effective_large_context_thresholds(config)
+        from proxy.provider import update_cached_ratio
+
+        # Cold cache (ratio 0.0): unknown session defaults to conservative.
+        body = {"messages": [{"role": "user", "content": "x " * 35000}]}  # ~35K est
+        assert _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
+        ) is True
+
+    def test_check2_warm_ratio_high_new_tokens_bypasses(self):
+        """AC2: even with a warm cache, if the uncached (new) token count
+        still exceeds cold, local is bypassed inside the band."""
+        config = self._production_config()
+        cold, warm = _effective_large_context_thresholds(config)
+        from proxy.provider import update_cached_ratio
+
+        # 39K estimate (in band), ratio 0.2 -> 31.2K new tokens > cold 30000.
+        update_cached_ratio("Qwen3", "band_sess2", cached_tokens=20, prompt_tokens=100)
+        body = {"messages": [{"role": "user", "content": "x " * 39000}]}  # ~39K est
+        assert _should_skip_local(
+            "Qwen3", "band_sess2", body, cold, warm_cache_threshold=warm
         ) is True
