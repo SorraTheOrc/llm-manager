@@ -1,5 +1,8 @@
 {
   "name": "llm-manager",
   "version": "0.1.10",
-  "private": true
+  "private": true,
+  "scripts": {
+    "build": "python3 -m compileall -q proxy/proxy"
+  }
 }
