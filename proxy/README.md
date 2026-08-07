@@ -843,7 +843,6 @@ Add a `slot_schedule` section under `server:` in `config.yaml`:
 server:
   slot_schedule:
     enabled: true
-    drain_minutes: 3
     entries:
       - time: "10:00"
         slots: 4
@@ -854,18 +853,15 @@ server:
 | Field | Description |
 |-------|-------------|
 | `enabled` | Set to `true` to activate the schedule. When `false` or absent, the feature is disabled and the static `session_slot_pool_size` value is used (backward compatible). |
-| `drain_minutes` | Duration (in minutes) before a transition during which the proxy drains in-flight workloads and refuses new requests. Default: 3 (reduced from 15 per LP-0MS6OD1G90023F0A). |
+| `drain_minutes` | **Deprecated — ignored.** Parsed for backward compatibility only; transitions no longer have a drain window (LP-0MSF9RUSQ007M346). |
 | `entries` | List of time-to-slot mappings. Each entry has a `time` (HH:MM format) and a `slots` value. Entries are sorted chronologically. |
 
 #### How It Works
 
 1. At startup, the proxy reads the `slot_schedule` section from `config.yaml`.
-2. A background scheduler periodically checks the current time against the schedule.
-3. When a transition approaches (within `drain_minutes`), the proxy enters **drain mode**:
-   - New requests receive `503 Service Unavailable` with a `Retry-After` header and the message `"Draining workloads for scheduled slot-count change — please retry shortly"`.
-   - In-flight streams are allowed to finish naturally.
-4. At the transition time, llama-server is gracefully restarted with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
-5. New requests are accepted again once the restart completes.
+2. A background scheduler checks the current time against the schedule and sleeps until the next transition where the slot count changes.
+3. At the transition time, llama-server is restarted immediately with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
+4. There is **no drain window and no 503 rejection period** (LP-0MSF9RUSQ007M346): requests continue to be served until the restart. In-flight requests are terminated by the restart and clients retry.
 
 #### Disabling
 

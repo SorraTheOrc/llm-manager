@@ -7,9 +7,10 @@ based on the time of day.
 
 Features:
 - User-configurable schedule in ``config.yaml`` with time ranges and slot counts.
-- Automatic drain phase before transitions (configurable drain window).
-- Background scheduler that periodically checks the schedule and triggers
-  graceful restart of llama-server with the new slot count.
+- Background scheduler that sleeps until the next transition time and triggers
+  an immediate restart of llama-server with the new slot count.  There is no
+  drain window and no request-rejection period (LP-0MSF9RUSQ007M346) — in-flight
+  requests are terminated by the restart and clients retry.
 - Enabled by default with a sensible schedule (10:00→4, 12:00→8). Disable
   by setting ``enabled: false`` or removing the ``slot_schedule`` section.
 """
@@ -37,12 +38,15 @@ class SlotScheduleConfig:
     """Parsed slot schedule configuration.
 
     Reads the ``slot_schedule`` section from the server config and provides
-    helper methods for determining the active slot count and drain window
-    at any given time of day.
+    helper methods for determining the active slot count at any given time
+    of day.
+
+    ``drain_minutes`` is parsed for backward compatibility but **ignored**:
+    transitions apply immediately with no drain window (LP-0MSF9RUSQ007M346).
     """
 
     enabled: bool = False
-    drain_minutes: int = 3  # LP-0MS6OD1G90023F0A: reduced from 15 to 3 (180 seconds)
+    drain_minutes: int = 3  # Parsed but IGNORED (LP-0MSF9RUSQ007M346): no drain window
     entries: list[SlotScheduleEntry] = field(default_factory=list)
 
     def __init__(self, raw: dict[str, Any] | None):
@@ -64,12 +68,14 @@ class SlotScheduleConfig:
         """
         if not raw or not isinstance(raw, dict):
             self.enabled = False
-            self.drain_minutes = 3  # LP-0MS6OD1G90023F0A: reduced from 15 to 3
+            self.drain_minutes = 3  # Parsed but IGNORED (LP-0MSF9RUSQ007M346)
             self.entries = []
             return
 
         self.enabled = bool(raw.get("enabled", False))
-        self.drain_minutes = int(raw.get("drain_minutes", 3) or 3)  # LP-0MS6OD1G90023F0A: reduced from 15 to 3
+        # drain_minutes is parsed but IGNORED (LP-0MSF9RUSQ007M346): transitions
+        # have no drain window; kept only for backward compatibility.
+        self.drain_minutes = int(raw.get("drain_minutes", 3) or 3)
         self.entries = []
 
         raw_entries = raw.get("entries", [])
@@ -164,82 +170,14 @@ class SlotScheduleConfig:
         first = self.entries[0]
         return (first.time, first.slots)
 
-    def get_slot_at_entry(self, target_time: dt_time) -> int | None:
-        """Return the slot count for the entry closest to *target_time*."""
-        if not self.enabled or not self.entries:
-            return None
-        for entry in self.entries:
-            if entry.time == target_time:
-                return entry.slots
-        return None
-
-    def is_in_drain_window(
-        self,
-        now: dt_time | None = None,
-        current_slots: int | None = None,
-    ) -> bool | tuple[bool, int | None]:
-        """Check if the current time is within a drain window before any transition.
-
-        A drain window is the ``drain_minutes`` period immediately before a schedule
-        entry where the slot count will change. During this window, the proxy should
-        refuse new requests and drain in-flight workloads.
-
-        The method checks whether the slot count actually changes at the next
-        transition — if the count is the same as the current active slot, no drain
-        is needed.
-
-        Args:
-            now: The current time-of-day. Defaults to ``datetime.now().time()``.
-            current_slots: The currently active slot count (from server config or
-                the last matched entry). When ``None``, uses ``get_active_slot(now)``
-                which returns ``None`` before the first transition (static config
-                should be compared separately if needed).
-
-        Returns:
-            ``True`` when draining should be active.  Returns ``(True, next_slot_count)``
-            when migrating to new dispatch handlers.  Returns ``False`` when no drain
-            is needed.
-        """
-        if not self.enabled or not self.entries:
-            return False
-
-        now = now or datetime.now().time()
-        if current_slots is None:
-            current_slots = self.get_active_slot(now)
-
-        # Find the next transition where the slot count actually changes.
-        for entry in self.entries:
-            if entry.time > now:
-                # Only trigger drain if slot count actually changes.
-                if entry.slots != current_slots:
-                    drain_start = self._drain_start_time(entry.time)
-                    if drain_start <= now < entry.time:
-                        return (True, entry.slots)
-                break
-
-        # No upcoming transition found today (all entries passed).
-        return False
-
-    def _drain_start_time(self, transition_time: dt_time) -> dt_time:
-        """Compute the start time of the drain window for a transition.
-
-        Subtracts ``drain_minutes`` from *transition_time*, handling
-        wrapping past midnight (returns a time that may be > transition_time
-        if the drain window started before midnight).
-        """
-        delta = timedelta(minutes=self.drain_minutes)
-        transition_dt = datetime.combine(datetime.today(), transition_time)
-        drain_dt = transition_dt - delta
-        return drain_dt.time()
-
 
 class SlotScheduler:
     """Background scheduler for time-based slot count transitions.
 
     Instead of polling on a fixed interval, the scheduler calculates the
-    exact time until the next relevant event (drain window opening or
-    transition deadline) and sleeps only until then.  This avoids hundreds
-    of unnecessary wake-ups per day.
+    exact time until the next relevant event (a transition deadline) and
+    sleeps only until then.  This avoids hundreds of unnecessary wake-ups
+    per day.
 
     The scheduler:
     1. Computes seconds until the next interesting event.
@@ -248,7 +186,6 @@ class SlotScheduler:
     4. Repeats — each cycle recomputes the next target.
 
     Events the scheduler cares about:
-    - A drain window opening (transition_time - drain_minutes).
     - A transition deadline (the time a new slot count takes effect).
     - The next event after a pending restart was executed.
 
@@ -277,8 +214,6 @@ class SlotScheduler:
         self._config: SlotScheduleConfig = SlotScheduleConfig.from_server_config(
             srv.config.get("server", {}) if isinstance(srv.config, dict) else None
         )
-        self._draining: bool = False
-        self._drain_started_at: datetime | None = None
         self._pending_restart_slot: int | None = None
         self._task: asyncio.Task | None = None
 
@@ -286,29 +221,6 @@ class SlotScheduler:
     def enabled(self) -> bool:
         """Whether the scheduler is active (has a configured, enabled schedule)."""
         return self._config.enabled and len(self._config.entries) > 0
-
-    @property
-    def draining(self) -> bool:
-        """Whether the proxy is currently in drain mode.
-
-        When ``True``, new requests should receive a 503 ``Service Unavailable``
-        response with a ``retry-after`` header.
-        """
-        return self._draining
-
-    def set_draining(self, value: bool) -> None:
-        """Set the draining flag, propagating to the server module for router checks."""
-        self._draining = value
-        if value:
-            self._drain_started_at = self._now_dt()
-        else:
-            self._drain_started_at = None
-        # Propagate to the server module-level flag so the router can check it
-        # without importing the scheduler (LP-0MRXZU90M007WNWT regression fix).
-        try:
-            self._srv.draining = value
-        except Exception:
-            pass
 
     @property
     def pending_restart_slot(self) -> int | None:
@@ -331,8 +243,8 @@ class SlotScheduler:
         """Start the background scheduler loop.
 
         Creates an asyncio task that runs ``_check_loop``.  The loop uses
-        adaptive sleep: it calculates the exact time until the next drain
-        window opening or transition deadline and sleeps only that long.
+        adaptive sleep: it calculates the exact time until the next
+        transition deadline and sleeps only that long.
         """
         if not self.enabled:
             logger.info("Slot scheduler: disabled, not starting background loop")
@@ -343,10 +255,9 @@ class SlotScheduler:
             for e in self._config.entries
         )
         logger.info(
-            "Slot scheduler: starting (entries=%d: %s, drain=%d min)",
+            "Slot scheduler: starting (entries=%d: %s)",
             len(self._config.entries),
             entries_desc,
-            self._config.drain_minutes,
         )
         loop = asyncio.get_running_loop()
         self._task = loop.create_task(self._check_loop())
@@ -366,7 +277,7 @@ class SlotScheduler:
         """Adaptive check loop that sleeps until the next interesting event.
 
         On each iteration:
-        1. Run the evaluation cycle (drain / transition / clear).
+        1. Run the evaluation cycle (transition / clear).
         2. Calculate the exact seconds until the next relevant event.
         3. Sleep for that duration.
 
@@ -390,10 +301,10 @@ class SlotScheduler:
 
         Called periodically by the check loop.  Examines the current time
         against the schedule and decides whether to:
-        - Start draining (drain window opened for an upcoming transition).
-        - Trigger a restart (transition time arrived, drain window ended).
-        - Clear pending state (drain window ended without restart in simple
-          cases where the static config already matches).
+        - Arm the next slot-count transition (no drain window).
+        - Trigger a restart (transition time arrived).
+        - Clear pending state (no restart needed because the static config
+          already matches).
 
         The "current slot count" is determined by:
         1. The schedule's ``get_active_slot()`` (last matched entry).
@@ -429,28 +340,13 @@ class SlotScheduler:
         if not self.enabled:
             return
 
-        # Don't start a new drain/restart if a model switch is already in
+        # Don't start a new restart if a model switch is already in
         # progress (prevents overlapping restarts).
         try:
             if getattr(self._srv, 'model_switch_refcount', 0) > 0:
                 return
         except Exception:
             pass
-
-        # ── Drain stuck circuit breaker ─────────────────────────────────
-        if self._draining and self._drain_started_at is not None:
-            elapsed = (self._now_dt() - self._drain_started_at).total_seconds()
-            margin = self._config.drain_minutes * 60 + 60
-            if elapsed > margin:
-                logger.warning(
-                    "Slot scheduler: drain circuit breaker — draining for %.0fs "
-                    "(margin=%ds), forcing clear",
-                    elapsed,
-                    margin,
-                )
-                self.set_draining(False)
-                self.clear_pending_restart()
-                return
 
         # ── Catch-up: if we started after a transition time, apply it now ──
         if self._pending_restart_slot is None:
@@ -470,7 +366,8 @@ class SlotScheduler:
 
         now = self._now()
 
-        # Determine the "current running" slot count for drain comparison:
+        # Determine the "current running" slot count for transition
+        # comparison:
         #   - Before any transition has been performed (pending_restart is
         #     None), the system is running the static config value.
         #   - After a transition has been detected (pending_restart is set),
@@ -517,7 +414,6 @@ class SlotScheduler:
                         matched_entry.time.strftime("%H:%M"),
                         diff_seconds,
                     )
-                    self.set_draining(False)
                     await self.perform_restart()
                     return
 
@@ -525,15 +421,14 @@ class SlotScheduler:
                 # The entry time is more than 1s in the future today.
                 # This means the pending restart slot's conceptual
                 # transition was missed (would sleep 24h for this entry).
-                # Clear drain and pending so the scheduler falls through
-                # to normal evaluation.
+                # Clear pending so the scheduler falls through to normal
+                # evaluation.
                 logger.warning(
                     "Slot scheduler: missed transition window for %d slots "
-                    "at %s — time has passed, clearing drain",
+                    "at %s — time has passed, clearing pending restart",
                     matched_entry.slots,
                     matched_entry.time.strftime("%H:%M"),
                 )
-                self.set_draining(False)
                 self.clear_pending_restart()
                 return
 
@@ -541,41 +436,27 @@ class SlotScheduler:
             # needing a restart (e.g., static config already matches) and
             # the transition time has not yet passed, just clear silently.
             if self._pending_restart_slot == current_slots:
-                self.set_draining(False)
                 self.clear_pending_restart()
                 return
 
-        # ── Phase 2: Check drain window for upcoming transitions ───────────
-        drain_result = self._config.is_in_drain_window(
-            now, current_slots=current_slots
-        )
-        if drain_result:
-            _, next_slot_count = drain_result if isinstance(drain_result, tuple) else (True, None)
-            if next_slot_count is not None:
+        # ── Phase 2: Arm the next slot-count transition (no drain window) ──
+        # Find the next schedule entry whose slot count differs from the
+        # current value and arm the restart.  Phase 1 executes the restart
+        # as soon as the entry's transition time arrives.  Requests are
+        # never rejected in the meantime — there is no drain window
+        # (LP-0MSF9RUSQ007M346).
+        next_entry = self._config._get_next_entry_time(now)
+        if next_entry is not None:
+            next_time, next_slot_count = next_entry
+            if next_slot_count != current_slots:
                 logger.info(
-                    "Slot scheduler: drain window active for transition to %d slots "
-                    "at %s (current=%s)",
+                    "Slot scheduler: arming transition to %d slots at %s (current=%s)",
                     next_slot_count,
-                    self._next_entry_time_str(now),
+                    next_time.strftime("%H:%M"),
                     current_slots,
                 )
-                self.set_draining(True)
                 self.set_pending_restart(next_slot_count)
-            return
-
-        # ── Phase 3: If we were draining but the window passed, clear ──────
-        if self._draining:
-            self.set_draining(False)
-            logger.info(
-                "Slot scheduler: drain window ended, clearing drain flag"
-            )
-
-    def _next_entry_time_str(self, now: dt_time) -> str:
-        """Return a human-readable string for the next entry time after *now*."""
-        for entry in self._config.entries:
-            if entry.time > now:
-                return entry.time.strftime("%H:%M")
-        return self._config.entries[0].time.strftime("%H:%M") + " (next day)" if self._config.entries else "(none)"
+                return
 
     # ────────────────────────────────────────────────────────────────────
     # Adaptive sleep calculation
@@ -605,14 +486,13 @@ class SlotScheduler:
         ``_run_check_cycle`` should run.  The calculation depends on
         the scheduler's current state:
 
-        **Draining or pending restart**
+        **Pending restart**
             Sleep until the transition time of the matching schedule entry.
 
         **Normal (no pending work)**
             Find the next schedule entry where the slot count differs from
-            the current value.  If a drain window exists before that
-            transition, sleep until the drain window opens.  Otherwise
-            sleep until the transition time itself.
+            the current value and sleep until its transition time.  There
+            is no drain window (LP-0MSF9RUSQ007M346).
 
         If no future event differs (all entries match the current slot),
         sleep the full maximum duration (24 h).
@@ -641,7 +521,6 @@ class SlotScheduler:
                     return self._seconds_until(entry.time)
             # Pending time passed — clear and fall through
             self.clear_pending_restart()
-            self.set_draining(False)
 
         # ── Determine current slot count for comparison ───────────────
         static_slots = self._get_static_slot_count()
@@ -651,21 +530,8 @@ class SlotScheduler:
         for entry in self._config.entries:
             if entry.time > now_time:
                 if entry.slots != current_slots:
-                    drain_start = self._config._drain_start_time(entry.time)
-                    now_dt = self._now_dt()
-                    drain_dt = datetime.combine(now_dt.date(), drain_start)
-
-                    # If drain_start wraps past midnight, it's later than
-                    # entry.time on the same day → shift back one day.
-                    if drain_start > entry.time:
-                        drain_dt -= timedelta(days=1)
-
-                    if now_dt < drain_dt:
-                        # Wake when the drain window opens.
-                        seconds = (drain_dt - now_dt).total_seconds()
-                        return max(self._MIN_SLEEP_SECONDS,
-                                   min(seconds, self._MAX_SLEEP_SECONDS))
-                    # Already inside the drain window — wake at transition.
+                    # No drain window — sleep straight through to the
+                    # transition time (LP-0MSF9RUSQ007M346).
                     return self._seconds_until(entry.time)
                 break  # no change → skip this transition
 
@@ -681,7 +547,7 @@ class SlotScheduler:
         """Execute the pending restart of llama-server with the new slot count.
 
         Calls ``restart_services(slot_count=..., reason="scheduled_slot_change")``
-        on the server module to perform the graceful drain and restart.
+        on the server module to perform the restart.
 
         Returns ``True`` if the restart was initiated, ``False`` if no pending
         restart slot was set or if an error occurred.

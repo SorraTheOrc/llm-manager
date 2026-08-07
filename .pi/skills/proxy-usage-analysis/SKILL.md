@@ -243,8 +243,9 @@ lines (`proxy.log` and `llama-server.log`).
 - `Fallback triggered` lines carry no session UUID; per-session attribution
   prefers the session's own `routing_skip_local` line and otherwise the
   nearest fallback event within 60s of the first remote stream.
-- Sessions spanning a slot-schedule transition may observe 503s during the
-  drain window; those are expected, not errors.
+- Sessions spanning a slot-schedule transition may observe a brief restart
+  interruption (llama-server is restarted immediately at the transition time);
+  since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
   window; the day/night bucket is keyed by its first in-window stream.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events

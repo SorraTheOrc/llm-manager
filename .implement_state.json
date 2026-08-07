@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSE05J53004C6EL",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSE05J53004C6EL-lease-released-during-pre-fill",
+  "work_item_id": "LP-0MSF9RUSQ007M346",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSF9RUSQ007M346-eliminate-request-rejections-during-day",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-07T19:28:07Z"
+  "started_at": "2026-08-07T20:48:49Z"
 }
