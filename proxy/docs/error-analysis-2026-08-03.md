@@ -84,12 +84,28 @@ recommendation LP-0MSDP2PDB004GV86 quantifies the avoidance (see below).
 2026-08-03 17:01:35,368 - WARNING - Stream error: session=019fc312-… provider=local model=Qwen3 error=RemoteProtocolError
 ```
 
-**Root cause (confidence: MEDIUM):** local llama-server stream exceptions
-(`proxy_remote.py` L1157 generic-exception site / `router.py` L1315 local
-path). `RemoteProtocolError` at 17:01:35 ×3 in three sessions suggests a
-llama-server connection drop (possibly restart or slot churn); `NameError` at
-00:00/12:47/12:54 is a proxy-side code bug worth investigating
-(see follow-up recommendation R4 / LP-0MSDRRPV0001TCLX).
+**Root cause (confidence: HIGH, resolved):** local llama-server stream
+exceptions (`proxy_remote.py` L1157 generic-exception site / `router.py`
+L1315 local path). `RemoteProtocolError` at 17:01:35 ×3 in three sessions
+suggests a llama-server connection drop (possibly restart or slot churn);
+`NameError` at 00:00/12:47/12:54 was a proxy-side code bug — resolved by
+LP-0MSDRRPV0001TCLX:
+
+- **Undefined name:** `_invalidate_session_and_slot`.
+- **Code path:** `router.py` local `stream_generator` guardrail-cutoff
+  branch (`if session_id and should_invalidate:`), hit when a stream
+  guardrail (runtime cutoff by default; repetition when enabled) fires for
+  a session.
+- **Cause:** the name was called but **not imported** from `proxy.session`
+  in the Aug-3 deployed commit `02efd152` — a `NameError` was raised, and
+  the generic `except Exception` handler masked it as
+  `Stream error: ... error=NameError` (no traceback).
+- **Fix:** the import landed in commit `c807d94` (LP-0MSETOTWY000SU0Z),
+  inadvertently resolving the undefined name. The generic handler is now
+  hardened to classify `NameError`/`AttributeError` as proxy-code bugs with
+  full-traceback logging (self-diagnosing), and a hermetic regression test
+  (`test_router_guardrail_cutoff_invalidation_no_nameerror`) forces the
+  exact path.
 
 **Related work items:** the local ctx-size increase
 (LP-0MSAOQTJS000FFVM) addresses the slot pressure that degrades local

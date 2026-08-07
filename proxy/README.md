@@ -926,6 +926,18 @@ LP-0MSDFKCK4007CPMY):
    backward compatible — existing clients still see `finish_reason: error`
    (unchanged) — while a future client can render the detail. See
    **LP-0MSDRRJPF0052STT**.
+3. **Proxy-code bugs are self-diagnosing (LP-0MSDRRPV0001TCLX)** — a
+   `NameError`/`AttributeError` raised inside the local stream loop
+   (`router.py` `proxy_to_local` → `stream_generator`) is a proxy-side
+   coding bug (undefined name / bad attribute access), never an upstream
+   fault. The generic handler classifies these distinctly and logs a full
+   traceback (`PROXY-CODE BUG in local stream loop: <Type> ...`), while
+   genuine upstream stream errors (httpx exceptions) continue to log the
+   classic `Stream error: ... error=<Type>` warning. Both paths still emit
+   the synthetic `finish_reason: error` + `[DONE]` terminal events so
+   clients see a clean stream end. (Root cause of the Aug 3 NameError ×3:
+   `_invalidate_session_and_slot` was called on the guardrail-cutoff
+   invalidation path but not imported; the import landed in LP-0MSETOTWY000SU0Z.)
 
 Both changes are tracked as follow-up work items from the analysis; see
 `proxy/docs/error-analysis-2026-08-03.md` for the full taxonomy, quantified

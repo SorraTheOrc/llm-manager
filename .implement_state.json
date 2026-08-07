@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSISZS1O004KJRR",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSISZS1O004KJRR-bug-proxy-usage-analysis-file-discovery",
+  "work_item_id": "LP-0MSDRRPV0001TCLX",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSDRRPV0001TCLX-root-cause-local-stream-nameerror-3-even",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-07T14:43:03Z"
+  "started_at": "2026-08-07T17:00:54Z"
 }

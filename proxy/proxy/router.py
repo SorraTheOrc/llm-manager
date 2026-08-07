@@ -1298,14 +1298,33 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Log and let the finally block handle cleanup so backend_ready
                             # is not spuriously set to False (which would cooldown the
                             # local provider and trigger fallback to remotes).
+                            #
+                            # Proxy-code bug classification (LP-0MSDRRPV0001TCLX):
+                            # NameError/AttributeError raised in the loop are proxy-side
+                            # coding bugs (undefined name / bad attribute access), never an
+                            # upstream fault. On Aug 3 a missing import raised NameError 3x
+                            # and was masked as a generic stream error with no traceback.
+                            # Log a full traceback for these so they are self-diagnosing,
+                            # while still emitting the synthetic finish_reason:error / [DONE]
+                            # terminal events clients depend on.
                             try:
                                 _error_type = type(exc).__name__
-                                srv.logger.warning(
-                                    "Stream error: session=%s provider=local model=%s error=%s",
-                                    session_id or "unknown",
-                                    model_name,
-                                    _error_type,
-                                )
+                                if isinstance(exc, (NameError, AttributeError)):
+                                    srv.logger.exception(
+                                        "PROXY-CODE BUG in local stream loop: %s - this "
+                                        "is NOT an upstream stream error (session=%s "
+                                        "provider=local model=%s); fix router.py",
+                                        _error_type,
+                                        session_id or "unknown",
+                                        model_name,
+                                    )
+                                else:
+                                    srv.logger.warning(
+                                        "Stream error: session=%s provider=local model=%s error=%s",
+                                        session_id or "unknown",
+                                        model_name,
+                                        _error_type,
+                                    )
                             except Exception:
                                 pass
                             # Synthesize a final SSE event so the client receives a
