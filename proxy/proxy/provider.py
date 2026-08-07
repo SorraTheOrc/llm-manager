@@ -2506,6 +2506,16 @@ def _resolve_reasoning_content_promotion(
 
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
+
+    Consistency note (LP-0MSEHOE7B005DE08): since the placeholder change,
+    thinking-only responses (``reasoning_content`` present, no tool call)
+    are extracted as the non-empty placeholder ``"Thinking..."`` by
+    ``_extract_assistant_content``, so ``_is_empty_response`` returns False
+    and the fallback chain treats them as plain successes without reaching
+    this function. This function remains the safety net for bodies whose raw
+    text contains the ``reasoning_content`` key but where extraction found
+    nothing usable (e.g. an empty ``reasoning_content`` value) - those still
+    count as promoted successes rather than triggering cooldown/fallback.
     """
     body_l = (body_text or "").lower()
     if "reasoning_content" in body_l:

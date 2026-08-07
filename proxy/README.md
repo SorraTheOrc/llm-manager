@@ -951,6 +951,37 @@ before remote send:
   JSON error with `suggested_action` remediation is returned instead of the
   raw upstream body, so the opaque 400 never reaches the client.
 
+##### `"Thinking..."` placeholder for thinking-only responses (LP-0MSEHOE7B005DE08)
+
+When a model emits **only** `reasoning_content` (thinking) with empty/null
+`content` and no tool call, the proxy does **not** promote the thinking text
+into `assistant.content`. Instead:
+
+- `_extract_assistant_content` (non-streaming) and
+  `_extract_assistant_content_from_sse` (streaming) return the literal
+  placeholder `"Thinking..."`.
+- The full thinking text stays **untouched** in `reasoning_content` and is
+  persisted unchanged in session history — no thinking text is dropped or
+  replayed as content on later turns.
+- Tool-call extraction from `reasoning_content` (`<function=...>...</function>`)
+  is unaffected: tool-call-only responses still return the tool call, never
+  the placeholder.
+- When real `content` is present, it is returned as-is — the placeholder is
+  only the no-content fallback.
+
+**Rationale (context saving):** replaying the full thinking text as
+`assistant.content` in multi-turn session history wastes context on every
+subsequent turn. The short placeholder keeps clients' assistant messages
+non-empty (their UI shows `Thinking...` instead of blank content) while the
+thinking text remains available in `reasoning_content` without being
+re-sent as content.
+
+**Empty-response semantics preserved:** a thinking-only response still counts
+as a non-empty success (content = `"Thinking..."`) for `_is_empty_response`
+and the provider fallback chain, so it never triggers cooldown/fallback
+retries. The placeholder behavior is hard-coded; there is no configuration
+option.
+
 ### Local Stream Timeout Configuration
 
 The proxy uses a separate idle timeout for **local model** (llama-server) streaming, distinct from the remote upstream timeout above. This timeout governs pauses between tokens from the local inference engine, which can be significantly longer during complex reasoning chains (LP-0MS14PM7J003XPS8).

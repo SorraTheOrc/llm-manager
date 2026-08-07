@@ -118,11 +118,18 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
 
     Prefer explicit message.content when it is non-empty. If message.content
     is present but empty/whitespace-only, treat it as absent and fall back to
-    reasoning_content extraction (tool call extraction or promoting plain
-    reasoning text). This handles models that write replies into
-    reasoning_content during their 'thinking' phase.
+    reasoning_content extraction (tool call extraction, or a short hard-coded
+    placeholder for plain thinking text). This handles models that write
+    replies into reasoning_content during their 'thinking' phase.
 
-    Returns extracted content string, or None when no usable content is found.
+    Plain (non-tool) reasoning text is **not** promoted into content
+    (LP-0MSEHOE7B005DE08): replaying the full thinking text in history wastes
+    context on later turns. Instead the literal placeholder ``"Thinking..."``
+    is returned so clients still receive a non-empty assistant message; the
+    full thinking text remains untouched in ``reasoning_content``.
+
+    Returns extracted content string, the placeholder, or None when no usable
+    content is found.
     """
     srv = _srv()
     try:
@@ -154,18 +161,18 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
                 )
                 return tool_call
 
-            # Promote plain reasoning text (non-tool) as a fallback so clients
-            # receive a usable assistant message when the model emitted its
-            # reply into the thinking channel instead of content.
+            # Plain (non-tool) reasoning text is NOT promoted into content
+            # (LP-0MSEHOE7B005DE08): the full thinking text stays in
+            # reasoning_content (session history persists it unchanged) and a
+            # short hard-coded placeholder is returned instead, so clients
+            # receive a non-empty assistant message without context bloat.
             try:
                 if reasoning_content and isinstance(reasoning_content, str):
-                    rc_trim = reasoning_content.strip()
-                    if rc_trim:
+                    if reasoning_content.strip():
                         srv.logger.info(
-                            "Promoting reasoning_content to assistant.content (non-tool fallback): %.120s",
-                            rc_trim[:120],
+                            "No content; reasoning_content present without tool call - emitting 'Thinking...' placeholder",
                         )
-                        return rc_trim
+                        return "Thinking..."
             except Exception:
                 pass
     except Exception:
@@ -213,8 +220,17 @@ def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
 
     Parses 'data: {json}' lines, extracting delta.content from each chunk.
     If no content is found, falls back to checking delta.reasoning_content
-    for embedded tool call XML patterns (<function=...>...</function>).
-    Returns concatenated content string, tool call string, or None.
+    for embedded tool call XML patterns (<function=...>...</function>), or
+    returns the literal placeholder ``"Thinking..."`` when the stream only
+    carried plain thinking text (LP-0MSEHOE7B005DE08).
+
+    Plain (non-tool) reasoning text is **not** promoted into content: the
+    full thinking text stays in ``reasoning_content`` (session history
+    persists it unchanged) and the placeholder keeps clients' assistant
+    messages non-empty without inflating context.
+
+    Returns concatenated content string, tool call string, the placeholder,
+    or None.
     """
     srv = _srv()
     parts: list[str] = []
@@ -253,15 +269,17 @@ def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
                 tool_call,
             )
             return tool_call
-        # Promote non-tool reasoning text as a fallback (streaming case)
+        # Plain (non-tool) reasoning text is NOT promoted into content
+        # (LP-0MSEHOE7B005DE08): the full thinking text stays in
+        # reasoning_content (session history persists it unchanged) and a
+        # short hard-coded placeholder is returned instead, so clients
+        # receive a non-empty assistant message without context bloat.
         try:
-            rc_trim = full_reasoning.strip()
-            if rc_trim:
+            if full_reasoning.strip():
                 srv.logger.info(
-                    "Promoting streaming reasoning_content to assistant content (non-tool fallback): %.120s",
-                    rc_trim[:120],
+                    "No content; streaming reasoning_content present without tool call - emitting 'Thinking...' placeholder",
                 )
-                return rc_trim
+                return "Thinking..."
         except Exception:
             pass
 
