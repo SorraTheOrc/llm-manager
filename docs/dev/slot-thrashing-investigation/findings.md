@@ -267,7 +267,35 @@ findings and adds the load-correlation numbers above.
    window before failing; raising the coefficient/cap would only extend the same doomed
    waits and re-introduce the GPU-wedge exposure LP-0MS91DHPZ001VWQO fixed. The load gate is
    the primary fix; the timeout rebalance is belt-and-braces only.
-3. **Config shape (F3):** `session_slot_skip_when_busy: true` (default-on, configurable) in
-   `proxy/config.yaml`; busy threshold derived from the proxy-side snapshot (F1
-   instrumentation), applied in `_build_slot_context` so both save and restore paths are
-   gated identically. Context-size gate and circuit breaker stay unchanged.
+3. **Config shape (F3):** `session_slot_skip_when_busy: true` in `proxy/config.yaml`
+   (enabled by the deployed config; the code gates only when the key is set true,
+   so `_build_slot_context` is not coupled to ambient global state). Busy threshold
+   derives from the proxy-side snapshot (F1 instrumentation, `active_sessions > 0`),
+   applied in `_build_slot_context` so both save and restore paths are gated
+   identically. Context-size gate and circuit breaker stay unchanged.
+
+## Mitigation implemented (F3, 2026-08-07)
+
+The approved recommendation (d) was landed in commit `9acfebc`:
+
+- **Load-aware gate (primary):** `_build_slot_context` now returns `(None, None, timeout)`
+  (skips save/restore, logs `reason=slot_busy`) when another local session is actively
+  streaming — busy signal = `active_sessions > 0` from dispatch-lease state, with the
+  requesting session's own lease excluded. Applied uniformly to save and restore.
+- **Conservative timeout rebalance (belt-and-braces):** per-token coefficient 0.001 →
+  0.0015; cap unchanged at 60s so the circuit breaker still trips within a bounded
+  window (no GPU-wedge regression).
+- **Unchanged:** context-size gate, adaptive timeout scaling, circuit breaker
+  (3 failures → session-slot 300s cooldown), per-slot `SlotLockCoordinator` serialization.
+
+Post-deploy confirmation: track the F4 7-day observation window via
+`scripts/slot-persistence-failures.sh` / `slot-persistence-correlate.py`.
+
+## F1 verification-deliverables
+
+- **Instrumentation** in `_call_slot_endpoint`: failed save/restore logs `elapsed=`, `timeout=`,
+  and `busy={active_queries, local_active_queries, active_sessions, slot_busy}`; success
+  logs `elapsed=` at DEBUG.
+- **Correlation script** `scripts/slot-persistence-correlate.py` (or use the
+  `--json` output) reproduces the cadence/load analysis above from `/var/log/llama-proxy`
+  for any future window.

@@ -1621,7 +1621,10 @@ run with `--slot-save-path` pointing at the same path.
 Config keys:
 - `server.session_slot_save_path` — directory for slot snapshot files
 - `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
-- `server.session_slot_timeout_seconds` — timeout for save/restore calls
+- `server.session_slot_timeout_seconds` — base timeout for save/restore calls
+- `server.session_slot_timeout_per_token_seconds` — adaptive add-on per estimated token
+- `server.session_slot_max_timeout_seconds` — cap on the scaled timeout
+- `server.session_slot_skip_when_busy` — load-aware gate (default-on in config)
 
 The proxy restores the slot before each request and saves it after the response.
 To avoid slot mismatches, keep `session_slot_pool_size` aligned with
@@ -1630,6 +1633,20 @@ If a session is invalidated (history mismatch or guardrail), the slot file is
 removed to avoid stale restores. Ensure llama-server is launched with
 `--slot-save-path` (see `start-llama.sh` / `models.ini`) and, for SWA/hybrid
 models, `--swa-full` to prevent checkpoint invalidation.
+
+**Load-aware gating (LP-0MSI1RWLM007N367):** llama-server serializes each KV
+copy behind its slot work, so saves issued while another local session is
+actively streaming can exceed the adaptive timeout (ReadTimeout, ~1.8% of saves
+under load). When `session_slot_skip_when_busy: true`, save/restore is skipped
+for a request whenever another local session is actively streaming. The gated
+session resumes cold via full prefill on its next turn; the adaptive timeout
+(coeff 0.0015/token, cap 60s) + circuit breaker (`session_slot_max_consecutive_failures`)
+still bound genuinely stalled saves. The busy signal is proxy-side dispatch-lease
+state, so no extra llama-server call is made.
+
+A correlation script (`scripts/slot-persistence-correlate.py`) maps save/restore
+ReadTimeout windows to concurrent local load and the adaptive-timeout cadence;
+run it with `--json` for machine-readable output.
 
 ### Operator verification checklist
 
