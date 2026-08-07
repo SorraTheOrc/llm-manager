@@ -566,8 +566,23 @@ server:
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
   # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
   # 0 disables the add-on (fixed timeout only).
-  session_slot_timeout_per_token_seconds: 0.001
+  #
+  # F3 rebalance (LP-0MSI1RWLM007N367): coefficient 0.001 -> 0.0015 so
+  # mid-size contexts get a bit more headroom; the cap stays 60s to preserve
+  # the no-wedge invariant (the circuit breaker still trips within a bounded
+  # window for genuinely stalled saves). The load-aware gate below is the
+  # primary fix; this rebalance is belt-and-braces.
+  session_slot_timeout_per_token_seconds: 0.0015
   session_slot_max_timeout_seconds: 60
+  # Load-aware save/restore gating (LP-0MSI1RWLM007N367 F3): skip slot
+  # save/restore when ANOTHER local session is actively streaming. llama-server
+  # serializes each KV-cache copy behind its slot work, so saves issued under
+  # concurrent load exceed the adaptive timeout (ReadTimeout at ~1.8% of saves
+  # under load). The busy signal is proxy-side dispatch-lease state (no
+  # llama-server calls); the requesting session's own lease is excluded.
+  # Enabled explicitly here (the deployed config turns the gate on). Set to
+  # false to disable it.
+  session_slot_skip_when_busy: true
   # Circuit breaker: after this many consecutive save/restore failures for
   # a slot, stop issuing persistence calls for that slot until the cooldown
   # expires. Prevents piling doomed KV-cache copies onto a wedged GPU.
