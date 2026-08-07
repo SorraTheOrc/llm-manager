@@ -78,6 +78,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_local_active_queries,
     _decrement_per_model_query,
     _estimate_tokens_sent,
+    _extend_lease_during_prefill,
     _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
@@ -1041,6 +1042,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                             _heartbeat_interval = stream_heartbeat_interval
                             remaining_budget = runtime_budget
+                            # ── Prefill-phase dispatch-lease tracking ──
+                            # The prefill phase emits no stream data chunks, so
+                            # the chunk-based lease refresh below never fires;
+                            # instead we poll llama-server for observed prefill
+                            # progress on the heartbeat branch and extend the
+                            # lease while progress advances (LP-0MSE05J53004C6EL).
+                            _saw_actual_data = False
+                            _last_prefill_poll = 0.0
+                            _prefill_progress = 0
+                            _prefill_poll_seconds = float(
+                                server_config.get(
+                                    "local_dispatch_lease_prefill_poll_seconds", 10
+                                ) or 10
+                            )
                             while True:
                                 _hb_task = asyncio.ensure_future(
                                     asyncio.sleep(_heartbeat_interval)
@@ -1066,6 +1081,39 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         )
                                         break
                                     remaining_budget -= _heartbeat_interval
+                                    # ── Prefill-phase lease extension ──
+                                    # While the request is still in the prefill
+                                    # phase (no actual data chunk yet) and the
+                                    # session is explicit, poll llama-server for
+                                    # observed prefill progress at the configured
+                                    # cadence and extend the dispatch lease by
+                                    # the safety buffer while progress advances.
+                                    # This covers very large prefills beyond the
+                                    # adaptive token-estimate cap (1500s); the
+                                    # existing chunk-refresh path takes over once
+                                    # the first data chunk arrives.
+                                    if (
+                                        not _saw_actual_data
+                                        and session_id
+                                        and session_explicit
+                                        and _prefill_poll_seconds > 0
+                                    ):
+                                        _now_ts = time.monotonic()
+                                        if (
+                                            _now_ts - _last_prefill_poll
+                                            >= _prefill_poll_seconds
+                                        ):
+                                            _last_prefill_poll = _now_ts
+                                            _prefill_progress, _extended = (
+                                                await _extend_lease_during_prefill(
+                                                    srv,
+                                                    session_id,
+                                                    llama_port=llama_port,
+                                                    model_name=model_name,
+                                                    slot_id=slot_id,
+                                                    last_progress=_prefill_progress,
+                                                )
+                                            )
                                     # Build heartbeat JSON with token progress (LP-0MRDFUHMP005SFU2)
                                     _pct = (
                                         round(completion_tokens_total / max_completion_tokens * 100, 1)
@@ -1181,6 +1229,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                                 if _has_actual_data:
                                     remaining_budget = float(stream_idle_timeout)
+                                    # Prefill phase is over: the first actual data
+                                    # chunk has arrived, so stop progress-based
+                                    # lease extension — the chunk-refresh path
+                                    # below takes over (LP-0MSE05J53004C6EL).
+                                    _saw_actual_data = True
 
                                 # Refresh dispatch lease expiry for long-running
                                 # streams (LP-0MRDKV44T003FRBP).  Extend the lease

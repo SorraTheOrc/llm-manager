@@ -25,6 +25,10 @@ HTTP JSON parsing and URL building patterns found in both
 - ``_query_slots_detail(llama_port, timeout, model)`` — Query the ``/slots``
   endpoint with an optional ``model`` query parameter, returning a list of
   per-slot dicts with keys ``slot_id``, ``is_processing``, and ``n_decoded``.
+- ``_query_slots_progress(llama_port, timeout, model)`` — Query the ``/slots``
+  endpoint and return a dict mapping slot id -> prefill progress tokens
+  (max of ``n_past`` / ``n_prompt_tokens_processed``), used by the
+  prefill-progress dispatch-lease extension (LP-0MSE05J53004C6EL).
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
@@ -231,6 +235,57 @@ async def _query_slots_detail(
             model or "(none)", exc,
         )
     return []
+
+
+async def _query_slots_progress(
+    llama_port: int,
+    timeout: float = 2.0,
+    model: str | None = None,
+    _client: httpx.AsyncClient | None = None,
+) -> dict[int, int]:
+    """Query the llama-server ``/slots`` endpoint for per-slot prefill progress.
+
+    Returns a dict mapping slot id -> progress tokens, where progress is the
+    maximum of the slot's ``n_past`` and ``n_prompt_tokens_processed`` fields.
+    Both advance as llama-server ingests prompt tokens during the cache
+    prefill phase, so an increasing value signals active prefill on that
+    slot (LP-0MSE05J53004C6EL).
+
+    Returns an empty dict on any failure (HTTP error, connection error,
+    timeout, or unexpected response shape), mirroring ``_query_slots_detail``.
+
+    Pass ``_client`` only in tests to avoid real HTTP.
+    """
+    try:
+        url = _build_llama_url(llama_port, "/slots")
+        if model:
+            url = f"{url}?model={model}"
+        if _client is not None:
+            slots_resp = await _client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+                slots_resp = await client.get(url)
+        if slots_resp.status_code == 200:
+            slots_data = await _safe_parse_json_response(slots_resp)
+            if isinstance(slots_data, list):
+                result: dict[int, int] = {}
+                for i, slot in enumerate(slots_data):
+                    if not isinstance(slot, dict):
+                        continue
+                    sid = slot.get("id", i)
+                    candidates = [
+                        c for c in (slot.get("n_past"), slot.get("n_prompt_tokens_processed"))
+                        if isinstance(c, (int, float)) and c >= 0
+                    ]
+                    if candidates:
+                        result[sid] = int(max(candidates))
+                return result
+    except Exception as exc:
+        _srv().logger.debug(
+            "Slot progress query failed [%s] for %s: %s",
+            type(exc).__name__, _build_llama_url(llama_port, "/slots"), exc,
+        )
+    return {}
 
 
 # ===================================================================

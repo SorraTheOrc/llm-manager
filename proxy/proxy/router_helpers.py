@@ -15,6 +15,7 @@ Includes:
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -614,6 +615,149 @@ def _get_adaptive_lease_timeout_seconds(
         return min(adaptive, max_lease)
     except Exception:
         return base_timeout
+
+
+def _get_prefill_lease_config(srv) -> tuple[float, float]:
+    """Return the prefill-progress lease config ``(poll_seconds, buffer_seconds)``.
+
+    - *poll_seconds* — cadence (seconds) at which the proxy polls llama-server
+      for observed prefill progress during the prefill phase of an explicit-
+      session request. ``0`` disables progress-based extension entirely.
+    - *buffer_seconds* — safety buffer added to ``expires_at`` after each
+      observed progress advance. Must comfortably exceed the dispatch
+      cleanup-loop cadence (~10s) so a refresh cannot lose to cleanup.
+
+    Defaults: (10, 30). (LP-0MSE05J53004C6EL)
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw_poll = server_cfg.get("local_dispatch_lease_prefill_poll_seconds", 10)
+        poll_seconds = float(raw_poll) if raw_poll is not None else 10.0
+        raw_buffer = server_cfg.get("local_dispatch_lease_prefill_buffer_seconds", 30)
+        buffer_seconds = float(raw_buffer) if raw_buffer is not None else 30.0
+        return poll_seconds, buffer_seconds
+    except Exception:
+        return 10.0, 30.0
+
+
+async def _query_prefill_progress(
+    srv,
+    llama_port: int,
+    model_name: str | None = None,
+    slot_id: int | None = None,
+) -> int | None:
+    """Poll llama-server for observed prefill progress (KV tokens processed).
+
+    Non-blocking: every query is wrapped in ``asyncio.wait_for`` using the
+    same ``STATUS_QUERY_TIMEOUT`` (default 1.0s) pattern as the
+    ``/llama/local/status`` endpoint, so the stream loop is never blocked
+    waiting on llama-server.
+
+    Progress sources, in preference order:
+
+    1. Per-slot: ``/slots`` -> ``n_past`` / ``n_prompt_tokens_processed``
+       for the specific slot (accurate when other slots are busy).
+    2. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
+       ``n_past`` if present).
+
+    Returns ``None`` when progress cannot be observed (query failure,
+    timeout, or no token count reported).
+    """
+    timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+
+    if slot_id is not None:
+        try:
+            from proxy.observability import _query_slots_progress
+
+            progress = await asyncio.wait_for(
+                _query_slots_progress(
+                    llama_port, timeout=timeout, model=model_name
+                ),
+                timeout=timeout + 0.5,
+            )
+            value = progress.get(slot_id)
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+        except Exception:
+            pass
+
+    try:
+        from proxy.observability import query_llama_status
+
+        status = await asyncio.wait_for(query_llama_status(), timeout=timeout)
+        for key in ("kv_cache_tokens", "n_past"):
+            value = status.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+    except Exception:
+        pass
+
+    return None
+
+
+async def _extend_lease_during_prefill(
+    srv,
+    session_key: str,
+    *,
+    llama_port: int,
+    model_name: str | None = None,
+    slot_id: int | None = None,
+    last_progress: int = 0,
+) -> tuple[int, bool]:
+    """Observe prefill progress and extend the dispatch lease while advancing.
+
+    During the prefill phase of an explicit-session request (dispatched, no
+    stream data chunks yet), llama-server reports advancing KV-cache usage
+    (per-slot ``n_past``/``n_prompt_tokens_processed``, or aggregate
+    ``kv_cache_tokens``). While that progress advances, the session's
+    dispatch lease ``expires_at`` is pushed out to ``now + safety buffer``
+    so a very large prefill — beyond the adaptive token-estimate cap of
+    1500s — cannot lose its lease mid-prefill (LP-0MSE05J53004C6EL).
+
+    Returns ``(last_progress, extended)``:
+
+    - *last_progress* is the latest observed progress the caller should
+      pass back on the next poll so extension stops when progress stalls.
+    - *extended* is True when ``expires_at`` was pushed out.
+
+    When progress is unobservable (query failure/timeout/None), the lease is
+    left untouched — it keeps the adaptive token-estimate value applied at
+    acquisition rather than being dropped (fallback). When disabled
+    (``local_dispatch_lease_prefill_poll_seconds: 0``) this is a no-op.
+    """
+    poll_seconds, buffer_seconds = _get_prefill_lease_config(srv)
+    if poll_seconds <= 0 or buffer_seconds <= 0:
+        return last_progress, False
+
+    progress = await _query_prefill_progress(
+        srv, llama_port, model_name=model_name, slot_id=slot_id
+    )
+    if progress is None or progress <= last_progress:
+        # Unobservable or stalled: no extension. Unobservable keeps the
+        # adaptive estimate applied at acquisition (fallback).
+        return last_progress, False
+
+    extended = False
+    try:
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        if lock is not None:
+            async with lock:
+                record = srv.local_dispatch_records.get(session_key)
+                if record is not None and record.get("active"):
+                    record["expires_at"] = time.monotonic() + buffer_seconds
+                    extended = True
+                    try:
+                        srv.logger.info(
+                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                            session_key[:8] if session_key else "unknown",
+                            progress,
+                            buffer_seconds,
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return progress, extended
 
 
 async def _decrement_local_active_queries(

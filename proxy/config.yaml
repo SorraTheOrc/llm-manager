@@ -474,6 +474,17 @@ server:
   #   the full prefill duration instead of the base 60s.
   # local_dispatch_lease_max_seconds: Hard upper bound for the adaptive lease
   #   timeout, defaults to 1500 (same as default llama_request_timeout).
+  # local_dispatch_lease_prefill_poll_seconds: During the prefill phase of an
+  #   explicit-session request (dispatched, no stream data chunks yet), the proxy
+  #   polls llama-server for observed prefill progress (per-slot n_past /
+  #   n_prompt_tokens_processed from /slots, falling back to kv_cache_tokens) and
+  #   extends the dispatch lease while progress is advancing, so very large
+  #   prefills beyond the adaptive cap (1500s) keep their lease. Cadence in
+  #   seconds; 0 disables progress-based extension entirely (LP-0MSE05J53004C6EL).
+  # local_dispatch_lease_prefill_buffer_seconds: Safety buffer added to the lease
+  #   expiry after each observed prefill progress advance. Must comfortably exceed
+  #   the dispatch cleanup-loop cadence (~10s) so a refresh cannot lose to cleanup.
+  #   Default 30.
   # Reduced from 180s to 60s to prevent long cross-session blocking.
   # The previous 180s timeout was conservative for inter-tool-call gaps
   # (observed max ~60s). 60s safely covers those gaps while reducing
