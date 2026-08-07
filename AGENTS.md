@@ -1,1 +1,5 @@
-Follow the global AGENTS.md in addition to the rules below. The local rules below take priority in the event of a conflict.
+## Global agent guidance
+
+Read the global agent instructions at `~/.pi/agent/AGENTS.md` — they define the core principles, the Worklog >
+
+## Project-specific guidance
