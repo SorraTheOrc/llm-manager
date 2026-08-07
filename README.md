@@ -120,6 +120,16 @@ Existing session slot settings (used when `slot_management` is absent):
 | `session_slot_save_path` | `./slot-cache` | Directory for KV cache snapshots. |
 | `session_slot_timeout_seconds` | `3.0` | Slot save/restore timeout in seconds. |
 
+Dispatch-lease settings (per-session reservation of the local backend):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `local_dispatch_lease_timeout_seconds` | `60` | Base dispatch-lease timeout. An idle session holds an inactive lease for this duration after its last request; active leases are refreshed by stream data chunks. |
+| `local_dispatch_lease_per_token_seconds` | `0.015` | Additional lease seconds per estimated prompt token (adaptive lease covering the cache-prefill phase). |
+| `local_dispatch_lease_max_seconds` | `1500` | Upper bound for the adaptive token-estimate lease. |
+| `local_dispatch_lease_prefill_poll_seconds` | `10` | Cadence (s) at which the proxy polls llama-server for observed prefill progress and extends the lease while progress advances (explicit sessions; `0` disables). |
+| `local_dispatch_lease_prefill_buffer_seconds` | `30` | Safety buffer added to the lease expiry after each observed prefill-progress advance. |
+
 Contributing
 - Open issues and PRs in the `SorraTheOrc/llm-manager` repo. If you want changes merged upstream to `rgardler/llm`, open a PR from this repo to the upstream repository.
 

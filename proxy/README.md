@@ -1274,6 +1274,49 @@ whether the lease is still active.
 `local_dispatch_records`. It does **not** release the scheduler slot (job
 ownership), which is managed separately via disconnect detection or timeout.
 
+#### Dispatch Lease
+
+When a session dispatches a request to the local llama-server, the proxy
+creates a **dispatch lease** in `local_dispatch_records`. The lease reserves
+the local backend for the owning session and expires after
+`local_dispatch_lease_timeout_seconds` (default `60`; reduced from 180s in
+LP-0MRHV4UYE0013F6P to limit cross-session blocking). While a lease is
+active, competing sessions receive `503 local_lease_active` responses.
+
+The lease is refreshed/extended by three mechanisms:
+
+1. **Data-chunk refresh (LP-0MRDKV44T003FRBP):** every real SSE data chunk
+   during streaming pushes `expires_at` out by the base timeout, so long
+   streams never lose their lease.
+2. **Adaptive token-estimate lease (LP-0MRDUQ9QC003LDDP, LP-0MSEHMMBK0062ZPI):**
+   at acquisition, the lease duration is
+   `base + est_prompt_tokens × local_dispatch_lease_per_token_seconds`
+   (default `0.015`/token), capped at `local_dispatch_lease_max_seconds`
+   (default `1500`). This covers the cache-prefill phase of large-context
+   requests, which emits no stream data to trigger mechanism 1.
+3. **Prefill-progress extension (LP-0MSE05J53004C6EL):** for **explicit**
+   sessions (X-Session-Id header / session-affinity), while a request is in
+   the prefill phase (dispatched, no actual data chunk yet), the proxy polls
+   llama-server for observed prefill progress — per-slot `n_past` /
+   `n_prompt_tokens_processed` from `/slots`, falling back to aggregate
+   `kv_cache_tokens` from `query_llama_status()` — at
+   `local_dispatch_lease_prefill_poll_seconds` cadence (default `10`). Each
+   time the observed progress advances, `expires_at` is pushed out by
+   `local_dispatch_lease_prefill_buffer_seconds` (default `30`), so very
+   large prefills beyond the 1500s adaptive cap keep their lease. Extension
+   stops when the first data chunk arrives (mechanism 1 takes over) or the
+   stream ends; when progress is unobservable the lease keeps the adaptive
+   estimate from acquisition rather than being dropped. Polling is
+   non-blocking (bounded by `STATUS_QUERY_TIMEOUT`, default 1s) and set
+   `local_dispatch_lease_prefill_poll_seconds: 0` to disable it.
+
+Each progress-based extension is logged as `lease_extended_during_prefill
+session=... progress=... buffer=...s`.
+
+Anonymous/non-explicit sessions do **not** receive the prefill-progress
+extension; they rely on the adaptive token-estimate lease
+(LP-0MSEHMMBK0062ZPI).
+
 #### Automatic Counter Recovery
 
 The proxy includes an automatic recovery mechanism for the `local_active_queries`
