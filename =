@@ -1,0 +1,24 @@
+{
+  "success": true,
+  "workItem": {
+    "id": "LP-0MSISZS1O004KJRR",
+    "title": "Bug: proxy-usage-analysis file discovery silently excludes rotated logs whose name-encoded rotation time precedes window start",
+    "description": "## Summary\n\nThe proxy-usage-analysis skill's log-file discovery (`discover_log_files` in `.pi/skills/proxy-usage-analysis/scripts/log_parser.py`) assumes a rotated log file ends at its name-encoded rotation time. Files are included only when `rotation_time >= window_start`. This assumption is wrong for the actual rotation behaviour: `proxy.log.2026-08-07_03` (name-encoded rotation 03:00) actually contains data until **09:03** on 2026-08-07. Any analysis window starting after 03:00 silently drops this file's contents, producing materially wrong reports with no warning.\n\n## Impact\n\n- A manual `--start 2026-08-07 04:00:00` run reported **57 sessions / 1,089 requests / 30m18s local busy**; the true figures for the same window are **148 sessions / 3,327 requests / 1h40m busy (23.8%)** — the 04:00–09:03 data was entirely missing.\n- The daily cron report (05:00, `--hours 24`) likely misses the previous day's early-morning data whenever a rotated file's name-encoded time precedes the 24h window start but the file still holds in-window data.\n- Findings are wrong silently: no error, no warning, and reports look plausible.\n\n## Steps to reproduce\n\n1. Run: `python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py --log-dir /var/log/llama-proxy --start \"2026-08-07 04:00:00\" --end \"2026-08-07 11:02:00\"`\n2. Observe the report covers only 09:03+ (the live `proxy.log`): `proxy.log.2026-08-07_03` is excluded because 03:00 < 04:00, even though it contains data until 09:03.\n3. Compare with a run that includes the file explicitly (e.g. via `iter_events` on both files): 148 sessions vs 57 sessions.\n\n## Root cause\n\n`discover_log_files` uses `rotation >= window_start` as the inclusion test, documented as \\a",
+    "status": "open",
+    "priority": "critical",
+    "sortIndex": 14300,
+    "parentId": null,
+    "createdAt": "2026-08-07T10:30:05.244Z",
+    "updatedAt": "2026-08-07T10:30:05.244Z",
+    "tags": [],
+    "assignee": "",
+    "stage": "idea",
+    "issueType": "bug",
+    "createdBy": "",
+    "deletedBy": "",
+    "deleteReason": "",
+    "risk": "",
+    "effort": "",
+    "needsProducerReview": false
+  }
+}

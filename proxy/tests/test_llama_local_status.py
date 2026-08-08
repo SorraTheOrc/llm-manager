@@ -223,3 +223,129 @@ class TestQuerySlotsModelParam:
 
         available, total = await _query_slots(mock_client, 8080, timeout=2.0)
         assert (available, total) == (0, 0)
+
+
+# ======================================================================
+# Fail-open slot capacity when no model is loaded (LP-0MSI06HPB0043MV1)
+# ======================================================================
+
+
+class TestFailOpenSlotCapacity:
+    """When llama-server is up but no model is loaded, report configured capacity.
+
+    LP-0MSI06HPB0043MV1: right after a restart, router-mode has no model
+    loaded. Querying /slots without ?model= returns HTTP 400 -> 0/0, which
+    wedges orchestrators (Herdr downtime worker) into "no capacity" mode.
+    The status endpoint now reports the configured session_slot_pool_size
+    instead of querying /slots when no model is loaded.
+    """
+
+    class _FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_running_no_model_reports_configured_capacity(self):
+        """(a) running + no model -> total/available = configured pool size."""
+        from unittest.mock import AsyncMock
+
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return {"llama_server_running": True}
+
+        transport = httpx.ASGITransport(app=app)
+        slots_mock = AsyncMock(return_value=(0, 0))
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "current_model", None):
+                with patch.object(server, "model_switch_refcount", 0):
+                    with patch.object(server, "model_switch_lock", self._FakeLock()):
+                        with patch.object(server, "background_loads", {}):
+                            with patch.object(
+                                server,
+                                "config",
+                                {"server": {"session_slot_pool_size": 5, "llama_server_port": 8080}},
+                            ):
+                                with patch("proxy.observability._query_slots", slots_mock):
+                                    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                                        resp = await ac.get("/llama/local/status")
+
+        assert resp.status_code == 200
+        j = resp.json()
+        assert j["llama_server_running"] is True
+        assert j["current_model"] is None
+        assert j["total_slots"] == 5
+        assert j["available_slots"] == 5
+        # AC4: /slots must never be queried without a loaded model name
+        slots_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_running_no_model_defaults_to_three_when_unconfigured(self):
+        """Without session_slot_pool_size in config the default (3) is used."""
+        from unittest.mock import AsyncMock
+
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return {"llama_server_running": True}
+
+        transport = httpx.ASGITransport(app=app)
+        slots_mock = AsyncMock(return_value=(0, 0))
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "current_model", None):
+                with patch.object(server, "model_switch_refcount", 0):
+                    with patch.object(server, "model_switch_lock", self._FakeLock()):
+                        with patch.object(server, "background_loads", {}):
+                            with patch.object(server, "config", {"server": {}}):
+                                with patch("proxy.observability._query_slots", slots_mock):
+                                    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                                        resp = await ac.get("/llama/local/status")
+
+        assert resp.status_code == 200
+        j = resp.json()
+        assert j["total_slots"] == 3
+        assert j["available_slots"] == 3
+        slots_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_running_with_model_queries_slots_with_model(self):
+        """(b) running + model loaded -> real counts from /slots (unchanged path)."""
+        from unittest.mock import AsyncMock
+
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return {"llama_server_running": True}
+
+        transport = httpx.ASGITransport(app=app)
+        slots_mock = AsyncMock(return_value=(2, 3))
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "current_model", "test-model"):
+                with patch.object(server, "model_switch_refcount", 0):
+                    with patch.object(server, "model_switch_lock", self._FakeLock()):
+                        with patch.object(server, "background_loads", {}):
+                            with patch("proxy.observability._query_slots", slots_mock):
+                                async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                                    resp = await ac.get("/llama/local/status")
+
+        assert resp.status_code == 200
+        j = resp.json()
+        assert j["current_model"] == "test-model"
+        assert j["total_slots"] == 3
+        assert j["available_slots"] == 2
+        slots_mock.assert_awaited_once()
+        # the loaded model name must be passed through (AC2 / LP-0MSHFGO0M003Q5BL)
+        _, kwargs = slots_mock.await_args
+        assert kwargs["model"] == "test-model"

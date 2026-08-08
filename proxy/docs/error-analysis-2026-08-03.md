@@ -84,12 +84,28 @@ recommendation LP-0MSDP2PDB004GV86 quantifies the avoidance (see below).
 2026-08-03 17:01:35,368 - WARNING - Stream error: session=019fc312-… provider=local model=Qwen3 error=RemoteProtocolError
 ```
 
-**Root cause (confidence: MEDIUM):** local llama-server stream exceptions
-(`proxy_remote.py` L1157 generic-exception site / `router.py` L1315 local
-path). `RemoteProtocolError` at 17:01:35 ×3 in three sessions suggests a
-llama-server connection drop (possibly restart or slot churn); `NameError` at
-00:00/12:47/12:54 is a proxy-side code bug worth investigating
-(see follow-up recommendation R4 / LP-0MSDRRPV0001TCLX).
+**Root cause (confidence: HIGH, resolved):** local llama-server stream
+exceptions (`proxy_remote.py` L1157 generic-exception site / `router.py`
+L1315 local path). `RemoteProtocolError` at 17:01:35 ×3 in three sessions
+suggests a llama-server connection drop (possibly restart or slot churn);
+`NameError` at 00:00/12:47/12:54 was a proxy-side code bug — resolved by
+LP-0MSDRRPV0001TCLX:
+
+- **Undefined name:** `_invalidate_session_and_slot`.
+- **Code path:** `router.py` local `stream_generator` guardrail-cutoff
+  branch (`if session_id and should_invalidate:`), hit when a stream
+  guardrail (runtime cutoff by default; repetition when enabled) fires for
+  a session.
+- **Cause:** the name was called but **not imported** from `proxy.session`
+  in the Aug-3 deployed commit `02efd152` — a `NameError` was raised, and
+  the generic `except Exception` handler masked it as
+  `Stream error: ... error=NameError` (no traceback).
+- **Fix:** the import landed in commit `c807d94` (LP-0MSETOTWY000SU0Z),
+  inadvertently resolving the undefined name. The generic handler is now
+  hardened to classify `NameError`/`AttributeError` as proxy-code bugs with
+  full-traceback logging (self-diagnosing), and a hermetic regression test
+  (`test_router_guardrail_cutoff_invalidation_no_nameerror`) forces the
+  exact path.
 
 **Related work items:** the local ctx-size increase
 (LP-0MSAOQTJS000FFVM) addresses the slot pressure that degrades local
@@ -347,6 +363,45 @@ on signal, bounded by remaining providers + per-provider cooldown),
    informative-error event (Recommendation 2) instead of aborting silently.
 5. Full test suite passes; new hermetic tests for the re-route decision
    (pre-content vs after-content, bounded attempts, cooldown).
+
+---
+
+# Follow-up — Chain-hold retry for exhausted chains (LP-0MSH94Z7K007VKC9)
+
+## Problem (2026-08-06 09:05–09:08 cluster)
+
+When every provider in a model's fallback chain is unavailable (final model
+unreachable), the proxy returned an error to the client immediately. In the
+09:05 cluster, Console Go's stall circuit breaker (180s), the free tier's
+3-hour cooldown, and the deepseek direct time-window gap left the `plan`
+chain with zero redundancy for ~3 minutes, producing 31 "All providers
+exhausted" errors. Most chain exhaustion is transient (60s cooldowns, 180s
+stall-circuit-breaker cooldowns, 5–10 min time-window edges), so erroring
+immediately discarded requests that would have succeeded moments later.
+
+## Mechanism
+
+Both fallback entry points (`proxy_with_fallback` /
+`proxy_with_remote_fallback`) now run their provider chain as a CYCLE under a
+cycle-hold wrapper. When a cycle exhausts every provider (a distinguishable
+`ChainExhaustedError` raised from the exhaustion tail), the wrapper holds the
+request for `server.chain_hold_seconds` (default 300) then starts a NEW cycle
+from the FIRST provider with fresh per-request state — giving short cooldowns
+time to expire. The number of hold-retry cycles is bounded by
+`server.chain_hold_max_cycles` (default 3; 0 = infinite); after the bound the
+existing exhaustion/error response is returned unchanged.
+
+- Streaming requests receive periodic SSE comment lines
+  (`: chain exhausted (<diagnostics>); retrying from <first> in <Ns>`) during
+the hold (client surfacing tracked in SA-0MSHAKSEA001LQ6T); non-streaming
+requests are held silently.
+- A client disconnect aborts the hold promptly (no wasted waiting).
+- The hold only defers the exhaustion verdict — successful responses,
+provider ordering, and existing cooldown/circuit-breaker behavior are
+unchanged. This complements Recommendation 1's recovery-first strategy: it
+covers the case where the ENTIRE chain is exhausted (not just one provider)
+and Recommendation 2's escalation remains the terminal response after the
+bound.
 
 ---
 

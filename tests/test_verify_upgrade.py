@@ -7,7 +7,7 @@ SCRIPT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'scripts
 
 def test_verify_upgrade_dry_run_json():
     assert os.path.exists(SCRIPT), f"verify-upgrade script not found at {SCRIPT}"
-    proc = subprocess.run([SCRIPT, '--dry-run', '--json'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run([SCRIPT, '--dry-run', '--json'], capture_output=True, text=True)
     stdout = proc.stdout.strip()
     if not stdout:
         raise AssertionError(f"No output from script. stderr: {proc.stderr}")

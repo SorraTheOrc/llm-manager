@@ -76,7 +76,10 @@ python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
 `daytime_sessions.csv`, `nighttime_sessions.csv`
 (one row per session; day/night split derived from the `slot_schedule` in
-`config.yaml`), and `report.md` (aggregates + recommendations).
+`config.yaml`), and `report.md` (aggregates + recommendations). Existing
+outputs are archived into a dated subdirectory before each run overwrites
+them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
+runs the report daily at 05:00 (see SKILL.md).
 
 See `~/.pi/agent/skills/proxy-usage-analysis/SKILL.md` for usage details and
 interpretation guidance.
@@ -637,6 +640,39 @@ When all providers are exhausted:
 - **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
 - **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable — `error` is `"All providers unavailable: no provider is available during the current scheduled time window"` and the `diagnostics` entries carry `status: "outside_time_window"` instead of the generic `"All providers exhausted"`. Mixed cases (a provider in cooldown or an error plus a time-window skip) keep the generic message, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible.
 
+#### Chain-Hold Retry (deferred exhaustion)
+
+Most chain exhaustion is transient — 60s provider cooldowns, 180s stall
+circuit-breaker cooldowns, 5–10 min `available_times` window edges. Rather
+than erroring immediately when the final provider in a fallback chain is
+unavailable, the proxy can **hold** the request and restart the chain cycle
+from the **first** provider once short cooldowns have had time to expire
+(LP-0MSH94Z7K007VKC9).
+
+- **`server.chain_hold_seconds`** (default `300`) — how long to hold an
+exhausted chain's request before starting a new cycle from the first
+provider. `0` retries immediately (no wait).
+- **`server.chain_hold_max_cycles`** (default `3`; `0` = infinite) — how many
+hold-retry cycles are allowed before the existing exhaustion/error response
+is returned unchanged. With the defaults, the chain runs at most 4 times
+(initial run + 3 holds) and the total wait is bounded by ~15 minutes.
+
+Behavior:
+- **Streaming requests** (`stream: true`) receive periodic SSE comment lines
+  (`: chain exhausted (<diagnostics>); retrying from <first> in <Ns>`) during
+the hold, so clients can surface live progress; the real result (or the
+terminal error) streams after the hold. Client-side surfacing of these
+comments is tracked in SA-0MSHAKSEA001LQ6T.
+- **Non-streaming requests** are held silently (deferred response) with no
+mid-hold feedback channel.
+- **Client disconnect** aborts the hold promptly — no wasted waiting.
+- The hold only defers the exhaustion verdict: successful responses, provider
+ordering, and existing cooldown/circuit-breaker behavior are unchanged.
+- The feature is enabled when either knob is configured; production
+`config.yaml` ships both. Both values are validated as non-negative at
+startup (a `0`/`0` combination — zero hold interval with infinite cycles —
+is rejected as an unbounded busy-retry loop).
+
 #### Observability
 
 When a fallback occurs:
@@ -807,7 +843,6 @@ Add a `slot_schedule` section under `server:` in `config.yaml`:
 server:
   slot_schedule:
     enabled: true
-    drain_minutes: 3
     entries:
       - time: "10:00"
         slots: 4
@@ -818,18 +853,15 @@ server:
 | Field | Description |
 |-------|-------------|
 | `enabled` | Set to `true` to activate the schedule. When `false` or absent, the feature is disabled and the static `session_slot_pool_size` value is used (backward compatible). |
-| `drain_minutes` | Duration (in minutes) before a transition during which the proxy drains in-flight workloads and refuses new requests. Default: 3 (reduced from 15 per LP-0MS6OD1G90023F0A). |
+| `drain_minutes` | **Deprecated — ignored.** Parsed for backward compatibility only; transitions no longer have a drain window (LP-0MSF9RUSQ007M346). |
 | `entries` | List of time-to-slot mappings. Each entry has a `time` (HH:MM format) and a `slots` value. Entries are sorted chronologically. |
 
 #### How It Works
 
 1. At startup, the proxy reads the `slot_schedule` section from `config.yaml`.
-2. A background scheduler periodically checks the current time against the schedule.
-3. When a transition approaches (within `drain_minutes`), the proxy enters **drain mode**:
-   - New requests receive `503 Service Unavailable` with a `Retry-After` header and the message `"Draining workloads for scheduled slot-count change — please retry shortly"`.
-   - In-flight streams are allowed to finish naturally.
-4. At the transition time, llama-server is gracefully restarted with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
-5. New requests are accepted again once the restart completes.
+2. A background scheduler checks the current time against the schedule and sleeps until the next transition where the slot count changes.
+3. At the transition time, llama-server is restarted immediately with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
+4. There is **no drain window and no 503 rejection period** (LP-0MSF9RUSQ007M346): requests continue to be served until the restart. In-flight requests are terminated by the restart and clients retry.
 
 #### Disabling
 
@@ -890,6 +922,18 @@ LP-0MSDFKCK4007CPMY):
    backward compatible — existing clients still see `finish_reason: error`
    (unchanged) — while a future client can render the detail. See
    **LP-0MSDRRJPF0052STT**.
+3. **Proxy-code bugs are self-diagnosing (LP-0MSDRRPV0001TCLX)** — a
+   `NameError`/`AttributeError` raised inside the local stream loop
+   (`router.py` `proxy_to_local` → `stream_generator`) is a proxy-side
+   coding bug (undefined name / bad attribute access), never an upstream
+   fault. The generic handler classifies these distinctly and logs a full
+   traceback (`PROXY-CODE BUG in local stream loop: <Type> ...`), while
+   genuine upstream stream errors (httpx exceptions) continue to log the
+   classic `Stream error: ... error=<Type>` warning. Both paths still emit
+   the synthetic `finish_reason: error` + `[DONE]` terminal events so
+   clients see a clean stream end. (Root cause of the Aug 3 NameError ×3:
+   `_invalidate_session_and_slot` was called on the guardrail-cutoff
+   invalidation path but not imported; the import landed in LP-0MSETOTWY000SU0Z.)
 
 Both changes are tracked as follow-up work items from the analysis; see
 `proxy/docs/error-analysis-2026-08-03.md` for the full taxonomy, quantified
@@ -914,6 +958,37 @@ before remote send:
   intercept the specific 400: when all providers are exhausted, a synthetic
   JSON error with `suggested_action` remediation is returned instead of the
   raw upstream body, so the opaque 400 never reaches the client.
+
+##### `"Thinking..."` placeholder for thinking-only responses (LP-0MSEHOE7B005DE08)
+
+When a model emits **only** `reasoning_content` (thinking) with empty/null
+`content` and no tool call, the proxy does **not** promote the thinking text
+into `assistant.content`. Instead:
+
+- `_extract_assistant_content` (non-streaming) and
+  `_extract_assistant_content_from_sse` (streaming) return the literal
+  placeholder `"Thinking..."`.
+- The full thinking text stays **untouched** in `reasoning_content` and is
+  persisted unchanged in session history — no thinking text is dropped or
+  replayed as content on later turns.
+- Tool-call extraction from `reasoning_content` (`<function=...>...</function>`)
+  is unaffected: tool-call-only responses still return the tool call, never
+  the placeholder.
+- When real `content` is present, it is returned as-is — the placeholder is
+  only the no-content fallback.
+
+**Rationale (context saving):** replaying the full thinking text as
+`assistant.content` in multi-turn session history wastes context on every
+subsequent turn. The short placeholder keeps clients' assistant messages
+non-empty (their UI shows `Thinking...` instead of blank content) while the
+thinking text remains available in `reasoning_content` without being
+re-sent as content.
+
+**Empty-response semantics preserved:** a thinking-only response still counts
+as a non-empty success (content = `"Thinking..."`) for `_is_empty_response`
+and the provider fallback chain, so it never triggers cooldown/fallback
+retries. The placeholder behavior is hard-coded; there is no configuration
+option.
 
 ### Local Stream Timeout Configuration
 
@@ -1043,6 +1118,11 @@ http://localhost:8000/
 **Status Bar**
 - Real-time display of current model, server health, and llama-server status
 - Automatic refresh on page load
+
+**Slot Status**
+- Real-time per-slot status cards for the local llama-server (idle/processing/waiting indicators, decoded-token progress)
+- Updates live via SSE broadcasts from `/events` (per-slot data queried from the llama-server `/slots` endpoint)
+- Covered by Playwright E2E tests in `tests/slot-status.spec.js`
 
 **Quick Links**
 - Direct links to API documentation, health endpoint, and model list
@@ -1189,6 +1269,49 @@ whether the lease is still active.
 **Important:** This endpoint only releases the dispatch lease record from
 `local_dispatch_records`. It does **not** release the scheduler slot (job
 ownership), which is managed separately via disconnect detection or timeout.
+
+#### Dispatch Lease
+
+When a session dispatches a request to the local llama-server, the proxy
+creates a **dispatch lease** in `local_dispatch_records`. The lease reserves
+the local backend for the owning session and expires after
+`local_dispatch_lease_timeout_seconds` (default `60`; reduced from 180s in
+LP-0MRHV4UYE0013F6P to limit cross-session blocking). While a lease is
+active, competing sessions receive `503 local_lease_active` responses.
+
+The lease is refreshed/extended by three mechanisms:
+
+1. **Data-chunk refresh (LP-0MRDKV44T003FRBP):** every real SSE data chunk
+   during streaming pushes `expires_at` out by the base timeout, so long
+   streams never lose their lease.
+2. **Adaptive token-estimate lease (LP-0MRDUQ9QC003LDDP, LP-0MSEHMMBK0062ZPI):**
+   at acquisition, the lease duration is
+   `base + est_prompt_tokens × local_dispatch_lease_per_token_seconds`
+   (default `0.015`/token), capped at `local_dispatch_lease_max_seconds`
+   (default `1500`). This covers the cache-prefill phase of large-context
+   requests, which emits no stream data to trigger mechanism 1.
+3. **Prefill-progress extension (LP-0MSE05J53004C6EL):** for **explicit**
+   sessions (X-Session-Id header / session-affinity), while a request is in
+   the prefill phase (dispatched, no actual data chunk yet), the proxy polls
+   llama-server for observed prefill progress — per-slot `n_past` /
+   `n_prompt_tokens_processed` from `/slots`, falling back to aggregate
+   `kv_cache_tokens` from `query_llama_status()` — at
+   `local_dispatch_lease_prefill_poll_seconds` cadence (default `10`). Each
+   time the observed progress advances, `expires_at` is pushed out by
+   `local_dispatch_lease_prefill_buffer_seconds` (default `30`), so very
+   large prefills beyond the 1500s adaptive cap keep their lease. Extension
+   stops when the first data chunk arrives (mechanism 1 takes over) or the
+   stream ends; when progress is unobservable the lease keeps the adaptive
+   estimate from acquisition rather than being dropped. Polling is
+   non-blocking (bounded by `STATUS_QUERY_TIMEOUT`, default 1s) and set
+   `local_dispatch_lease_prefill_poll_seconds: 0` to disable it.
+
+Each progress-based extension is logged as `lease_extended_during_prefill
+session=... progress=... buffer=...s`.
+
+Anonymous/non-explicit sessions do **not** receive the prefill-progress
+extension; they rely on the adaptive token-estimate lease
+(LP-0MSEHMMBK0062ZPI).
 
 #### Automatic Counter Recovery
 
@@ -1549,7 +1672,10 @@ run with `--slot-save-path` pointing at the same path.
 Config keys:
 - `server.session_slot_save_path` — directory for slot snapshot files
 - `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
-- `server.session_slot_timeout_seconds` — timeout for save/restore calls
+- `server.session_slot_timeout_seconds` — base timeout for save/restore calls
+- `server.session_slot_timeout_per_token_seconds` — adaptive add-on per estimated token
+- `server.session_slot_max_timeout_seconds` — cap on the scaled timeout
+- `server.session_slot_skip_when_busy` — load-aware gate (default-on in config)
 
 The proxy restores the slot before each request and saves it after the response.
 To avoid slot mismatches, keep `session_slot_pool_size` aligned with
@@ -1558,6 +1684,20 @@ If a session is invalidated (history mismatch or guardrail), the slot file is
 removed to avoid stale restores. Ensure llama-server is launched with
 `--slot-save-path` (see `start-llama.sh` / `models.ini`) and, for SWA/hybrid
 models, `--swa-full` to prevent checkpoint invalidation.
+
+**Load-aware gating (LP-0MSI1RWLM007N367):** llama-server serializes each KV
+copy behind its slot work, so saves issued while another local session is
+actively streaming can exceed the adaptive timeout (ReadTimeout, ~1.8% of saves
+under load). When `session_slot_skip_when_busy: true`, save/restore is skipped
+for a request whenever another local session is actively streaming. The gated
+session resumes cold via full prefill on its next turn; the adaptive timeout
+(coeff 0.0015/token, cap 60s) + circuit breaker (`session_slot_max_consecutive_failures`)
+still bound genuinely stalled saves. The busy signal is proxy-side dispatch-lease
+state, so no extra llama-server call is made.
+
+A correlation script (`scripts/slot-persistence-correlate.py`) maps save/restore
+ReadTimeout windows to concurrent local load and the adaptive-timeout cadence;
+run it with `--json` for machine-readable output.
 
 ### Operator verification checklist
 
@@ -2217,6 +2357,7 @@ The test suite covers:
 - **Model switch via API** - Tests that external API calls trigger UI updates via SSE
 - **Load Model button** - Tests UI button triggers status updates
 - **API passthrough tests** - Tests model switching when using test buttons
+- **Slot Status** - Verifies slot cards render with correct status colors and identifiers, and update when SSE delivers new slot data
 
 ## Architecture
 

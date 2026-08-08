@@ -243,7 +243,7 @@ async def test_query_llama_status_custom_port(mock_config):
 @pytest.mark.asyncio
 async def test_query_llama_status_concurrent_requests_do_not_block(mock_config):
     """Verify multiple concurrent status requests complete without blocking.
-    
+
     This test verifies that when using a shared httpx client with connection pooling,
     multiple concurrent calls to query_llama_status complete in a reasonable time
     rather than blocking each other.
@@ -288,7 +288,7 @@ async def test_query_llama_status_concurrent_requests_do_not_block(mock_config):
 @pytest.mark.asyncio
 async def test_status_request_during_streaming_request(mock_config):
     """Verify status requests complete even when a streaming request is active.
-    
+
     This test simulates the scenario described in LP-0MNWEZMUX009XL9B where
     the /llama/local/status endpoint hangs while llama-server is busy processing
     a streaming OpenAI request. With connection pooling, the status request

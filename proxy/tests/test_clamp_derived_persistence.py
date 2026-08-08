@@ -329,3 +329,95 @@ class TestBuildSlotContextAppliesMultiplier:
         config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
         config["token_estimate_multiplier"] = multiplier
         return config
+
+
+# ===================================================================
+# Busy-slot load gate (LP-0MSI1RWLM007N367 F2/F3)
+# ===================================================================
+
+
+class TestBusySlotGate:
+    """The load-aware gate skips persistence when another local session is
+    actively streaming, independent of the context-size cap."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_slot_registry(self):
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
+        yield
+        _slot_owners.clear()
+
+    def _make_config(self, skip_when_busy=True):
+        return {
+            "session_slot_save_path": "/tmp/slot-cache",
+            "session_slot_pool_size": 3,
+            "local_model_ctx_size": 131072,
+            "session_slot_max_prompt_tokens": 0,
+            "session_slot_timeout_seconds": 3.0,
+            "session_slot_skip_when_busy": skip_when_busy,
+        }
+
+    def _mock_srv(self, records):
+        from unittest.mock import MagicMock
+        srv = MagicMock()
+        srv.active_queries = 1
+        srv.local_active_queries = 1
+        srv.local_dispatch_records = records
+        return srv
+
+    def test_context_within_cap_skipped_when_slot_busy(self):
+        """A within-cap context is still skipped when another session streams
+        (gate is independent of the context-size cap)."""
+        from unittest.mock import patch
+
+        from proxy.session import _build_slot_context
+
+        config = self._make_config()
+        with patch(
+            "proxy.session._srv",
+            return_value=self._mock_srv({"other-session": {"active": True}}),
+        ):
+            slot_id, filename, _ = _build_slot_context(
+                config, "busy-session", _body_for_tokens(5000)
+            )
+        assert slot_id is None, (
+            "Persistence should be skipped when another local session is "
+            "actively streaming, even for a small within-cap context"
+        )
+        assert filename is None
+
+    def test_idle_slot_persists_within_cap(self):
+        """With no active sessions, a within-cap context persists."""
+        from unittest.mock import patch
+
+        from proxy.session import _build_slot_context
+
+        config = self._make_config()
+        with patch(
+            "proxy.session._srv",
+            return_value=self._mock_srv({}),
+        ):
+            slot_id, filename, _ = _build_slot_context(
+                config, "idle-session", _body_for_tokens(5000)
+            )
+        assert slot_id is not None
+        assert filename is not None
+
+    def test_gate_disabled_allows_persistence_under_load(self):
+        """session_slot_skip_when_busy=false restores persistence under load."""
+        from unittest.mock import patch
+
+        from proxy.session import _build_slot_context
+
+        config = self._make_config(skip_when_busy=False)
+        with patch(
+            "proxy.session._srv",
+            return_value=self._mock_srv({"other-session": {"active": True}}),
+        ):
+            slot_id, filename, _ = _build_slot_context(
+                config, "gate-off-session", _body_for_tokens(5000)
+            )
+        assert slot_id is not None, (
+            "With the gate disabled, persistence should proceed even under load"
+        )
+        assert filename is not None

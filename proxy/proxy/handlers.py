@@ -25,6 +25,31 @@ from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
 
+
+def _resolve_client_ip(request: Request) -> tuple[str, str]:
+    """Resolve the client IP from the request.
+
+    Prefers reverse-proxy headers (X-Forwarded-For, X-Real-IP) when present
+    (reverse-proxy safe), falling back to the direct connection address.
+    Returns a ``(ip, source)`` tuple where source is ``"header"`` or
+    ``"direct"``.
+    """
+    # X-Forwarded-For: may contain "client, proxy1, proxy2" — take the first
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip(), "header"
+
+    # X-Real-IP: single address set by reverse proxy
+    xri = request.headers.get("x-real-ip")
+    if xri:
+        return xri.strip(), "header"
+
+    # Direct connection
+    if request.client:
+        return request.client.host, "direct"
+
+    return "unknown", "direct"
+
 # APIRouter for use by the main server app
 router = APIRouter()
 
@@ -292,7 +317,7 @@ def format_progress(
 # ---------------------------------------------------------------------------
 
 @router.get("/llama/local/status")
-async def get_llama_local_status():
+async def get_llama_local_status(request: Request):
     """Return a small JSON object describing local llama-server status.
 
     The endpoint is designed to be non-blocking even when the underlying
@@ -313,13 +338,20 @@ async def get_llama_local_status():
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
-    not running or the query fails both default to 0.
+    not running or the query fails both default to 0. When the server is
+    running but no model is loaded yet, the configured
+    ``session_slot_pool_size`` is reported instead (fail-open, so
+    orchestrators see available capacity during idle windows —
+    LP-0MSI06HPB0043MV1).
 
     Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
     (seconds, default 1.0).
 
     Each call is logged with a ``status_request`` structured message that
-    includes the response fields and request latency (ms).
+    includes the client IP (with source: header vs direct), the response
+    fields and request latency (ms). The client IP resolves via
+    X-Forwarded-For / X-Real-IP headers when present (reverse-proxy safe),
+    falling back to the direct connection address.
     """
     import os  # noqa: local import for config access
 
@@ -374,13 +406,29 @@ async def get_llama_local_status():
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
-            llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-            client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-            from proxy.observability import _query_slots
-            available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
         except Exception:
-            # slots query is best-effort; default to 0 on failure
-            pass
+            server_cfg = {}
+        if cm:
+            try:
+                llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                from proxy.observability import _query_slots
+                available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
+            except Exception:
+                # slots query is best-effort; default to 0 on failure
+                pass
+        else:
+            # Fail-open (LP-0MSI06HPB0043MV1): server is up but no model is
+            # loaded yet (e.g. right after restart while preload runs).
+            # Querying /slots without ?model= yields HTTP 400 -> 0/0, which
+            # wedges orchestrators (Herdr downtime worker) into "no capacity".
+            # Report the configured pool size instead; all slots are idle.
+            # The first dispatched job triggers ensure_model_loaded().
+            try:
+                total_slots = int(server_cfg.get("session_slot_pool_size", 3) or 3)
+            except (TypeError, ValueError):
+                total_slots = 3
+            available_slots = total_slots
 
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
     local_owner_session_id = None
@@ -401,9 +449,12 @@ async def get_llama_local_status():
 
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
+    client_ip, client_ip_source = _resolve_client_ip(request)
     logger.info(
         "status_request",
         extra={
+            "client_ip": client_ip,
+            "client_ip_source": client_ip_source,
             "latency_ms": _latency_ms,
             "llama_server_running": llama_running,
             "active_query": active,

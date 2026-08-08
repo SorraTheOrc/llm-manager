@@ -118,11 +118,18 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
 
     Prefer explicit message.content when it is non-empty. If message.content
     is present but empty/whitespace-only, treat it as absent and fall back to
-    reasoning_content extraction (tool call extraction or promoting plain
-    reasoning text). This handles models that write replies into
-    reasoning_content during their 'thinking' phase.
+    reasoning_content extraction (tool call extraction, or a short hard-coded
+    placeholder for plain thinking text). This handles models that write
+    replies into reasoning_content during their 'thinking' phase.
 
-    Returns extracted content string, or None when no usable content is found.
+    Plain (non-tool) reasoning text is **not** promoted into content
+    (LP-0MSEHOE7B005DE08): replaying the full thinking text in history wastes
+    context on later turns. Instead the literal placeholder ``"Thinking..."``
+    is returned so clients still receive a non-empty assistant message; the
+    full thinking text remains untouched in ``reasoning_content``.
+
+    Returns extracted content string, the placeholder, or None when no usable
+    content is found.
     """
     srv = _srv()
     try:
@@ -154,18 +161,18 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
                 )
                 return tool_call
 
-            # Promote plain reasoning text (non-tool) as a fallback so clients
-            # receive a usable assistant message when the model emitted its
-            # reply into the thinking channel instead of content.
+            # Plain (non-tool) reasoning text is NOT promoted into content
+            # (LP-0MSEHOE7B005DE08): the full thinking text stays in
+            # reasoning_content (session history persists it unchanged) and a
+            # short hard-coded placeholder is returned instead, so clients
+            # receive a non-empty assistant message without context bloat.
             try:
                 if reasoning_content and isinstance(reasoning_content, str):
-                    rc_trim = reasoning_content.strip()
-                    if rc_trim:
+                    if reasoning_content.strip():
                         srv.logger.info(
-                            "Promoting reasoning_content to assistant.content (non-tool fallback): %.120s",
-                            rc_trim[:120],
+                            "No content; reasoning_content present without tool call - emitting 'Thinking...' placeholder",
                         )
-                        return rc_trim
+                        return "Thinking..."
             except Exception:
                 pass
     except Exception:
@@ -213,8 +220,17 @@ def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
 
     Parses 'data: {json}' lines, extracting delta.content from each chunk.
     If no content is found, falls back to checking delta.reasoning_content
-    for embedded tool call XML patterns (<function=...>...</function>).
-    Returns concatenated content string, tool call string, or None.
+    for embedded tool call XML patterns (<function=...>...</function>), or
+    returns the literal placeholder ``"Thinking..."`` when the stream only
+    carried plain thinking text (LP-0MSEHOE7B005DE08).
+
+    Plain (non-tool) reasoning text is **not** promoted into content: the
+    full thinking text stays in ``reasoning_content`` (session history
+    persists it unchanged) and the placeholder keeps clients' assistant
+    messages non-empty without inflating context.
+
+    Returns concatenated content string, tool call string, the placeholder,
+    or None.
     """
     srv = _srv()
     parts: list[str] = []
@@ -253,15 +269,17 @@ def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
                 tool_call,
             )
             return tool_call
-        # Promote non-tool reasoning text as a fallback (streaming case)
+        # Plain (non-tool) reasoning text is NOT promoted into content
+        # (LP-0MSEHOE7B005DE08): the full thinking text stays in
+        # reasoning_content (session history persists it unchanged) and a
+        # short hard-coded placeholder is returned instead, so clients
+        # receive a non-empty assistant message without context bloat.
         try:
-            rc_trim = full_reasoning.strip()
-            if rc_trim:
+            if full_reasoning.strip():
                 srv.logger.info(
-                    "Promoting streaming reasoning_content to assistant content (non-tool fallback): %.120s",
-                    rc_trim[:120],
+                    "No content; streaming reasoning_content present without tool call - emitting 'Thinking...' placeholder",
                 )
-                return rc_trim
+                return "Thinking..."
         except Exception:
             pass
 
@@ -424,8 +442,24 @@ def load_config(config_path: str | None = None) -> dict:
 
     # Validate system_prompt configurations
     _validate_prompt_configs(cfg)
+    # Validate chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5)
+    _validate_chain_hold_config(cfg)
 
     return cfg
+
+
+def _validate_chain_hold_config(cfg: dict) -> None:
+    """Validate the chain-hold configuration (``chain_hold_seconds`` /
+    ``chain_hold_max_cycles``).
+
+    Raises ValueError on first invalid config (mirrors
+    ``_validate_prompt_configs``).
+    """
+    from proxy.provider import validate_chain_hold_config as _vchc
+
+    problems = _vchc(cfg)
+    if problems:
+        raise ValueError("Chain-hold config validation failed: " + "; ".join(problems))
 
 
 def _validate_prompt_configs(cfg: dict) -> None:
@@ -448,6 +482,47 @@ def _validate_prompt_configs(cfg: dict) -> None:
             raise ValueError(
                 f"Model '{model_name}': {e}"
             ) from e
+
+
+def _format_log_value(value: object) -> str:
+    """Render an extra field value as its plain-text ``key=value`` form."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "None"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    return json.dumps(value, default=str)
+
+
+class KeyValueFormatter(logging.Formatter):
+    """Formatter that renders structured ``extra`` fields as ``key=value`` pairs.
+
+    The stock logging formatter only renders the message string and silently
+    drops the ``extra`` dict passed to ``logger.info(msg, extra={...})``.
+    This formatter appends each extra field (skipping reserved LogRecord
+    attributes) as ``key=value`` so structured payloads are visible in the
+    plain-text proxy.log, e.g.::
+
+        status_request client_ip=192.168.0.191 llama_server_running=true
+    """
+
+    # LogRecord attributes owned by the logging machinery (not our extras)
+    _RESERVED_ATTRS = frozenset(
+        logging.LogRecord("m", logging.INFO, "p", 0, None, None, None, None).__dict__.keys()
+        | {"message", "asctime", "taskName"}
+    )
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        pairs = []
+        for key, value in sorted(record.__dict__.items()):
+            if key in self._RESERVED_ATTRS:
+                continue
+            pairs.append(f"{key}={_format_log_value(value)}")
+        if not pairs:
+            return base
+        return f"{base} {' '.join(pairs)}"
 
 
 def setup_logging(config: dict) -> logging.Logger:
@@ -512,14 +587,14 @@ def setup_logging(config: dict) -> logging.Logger:
         backupCount=backup_count,
         encoding="utf-8"
     )
-    file_handler.setFormatter(logging.Formatter(
+    file_handler.setFormatter(KeyValueFormatter(
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
     logger.addHandler(file_handler)
 
     # Console handler for debugging
     console_handler = ContentOnlyConsoleHandler()
-    console_handler.setFormatter(logging.Formatter(
+    console_handler.setFormatter(KeyValueFormatter(
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
     logger.addHandler(console_handler)

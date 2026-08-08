@@ -1,8 +1,9 @@
 """
 Tests for the slot scheduler module.
 
-Covers schedule parsing, drain-window detection, transition logic,
-and the restart-trigger sequence.
+Covers schedule parsing, transition arming, and the restart-trigger
+sequence.  Transitions apply immediately with no drain window
+(LP-0MSF9RUSQ007M346) — requests are never rejected before a restart.
 """
 
 import asyncio
@@ -293,108 +294,6 @@ class TestSlotScheduleConfigActiveSlot:
         assert cfg.get_active_slot(dt_time(12, 0)) is None
 
 
-class TestSlotScheduleDrainWindow:
-    """Tests for is_in_drain_window() — whether we're in the pre-transition drain phase."""
-
-    def _make_cfg(self, entries, drain_minutes=15):
-        from proxy.slot_scheduler import SlotScheduleConfig
-
-        return SlotScheduleConfig({
-            "enabled": True,
-            "drain_minutes": drain_minutes,
-            "entries": [{"time": t, "slots": s} for t, s in entries],
-        })
-
-    def test_drain_window_detected(self):
-        """Drain window opens drain_minutes before a transition."""
-        cfg = self._make_cfg([("12:00", 8)], drain_minutes=15)
-        # 11:46 is inside the 15-min drain window before 12:00.
-        # With current_slots=4 (static config), 4 != 8 → drain needed.
-        assert cfg.is_in_drain_window(dt_time(11, 46), current_slots=4) == (True, 8)
-        # 11:44 is outside (16 min before)
-        assert cfg.is_in_drain_window(dt_time(11, 44), current_slots=4) is False
-
-    def test_drain_window_exact_boundary(self):
-        """At the exact start of the drain window, drain is active."""
-        cfg = self._make_cfg([("12:00", 8)], drain_minutes=15)
-        # 11:45 is exactly drain_minutes before transition
-        assert cfg.is_in_drain_window(dt_time(11, 45), current_slots=4) == (True, 8)
-        # 12:00 is transition time — drain ends
-        assert cfg.is_in_drain_window(dt_time(12, 0), current_slots=4) is False
-
-    def test_no_drain_on_disabled(self):
-        """Disabled schedule never reports drain."""
-        from proxy.slot_scheduler import SlotScheduleConfig
-
-        cfg = SlotScheduleConfig({
-            "enabled": False,
-            "drain_minutes": 15,
-            "entries": [{"time": "10:00", "slots": 4}],
-        })
-        assert cfg.is_in_drain_window(dt_time(9, 50)) is False
-
-    def test_no_drain_with_no_entries(self, empty_schedule):
-        """Empty entries never produce a drain window."""
-        from proxy.slot_scheduler import SlotScheduleConfig
-
-        cfg = SlotScheduleConfig(empty_schedule)
-        assert cfg.is_in_drain_window(dt_time(12, 0)) is False
-
-    def test_no_drain_when_transition_is_not_slot_change(self):
-        """Same slot count should not trigger drain."""
-        cfg = self._make_cfg([("10:00", 4), ("12:00", 4)], drain_minutes=15)
-        # Both entries have the same slot count — no actual transition needed
-        assert cfg.is_in_drain_window(dt_time(11, 46)) is False
-
-    def test_drain_window_midnight_wrap(self):
-        """Drain window wraps across midnight correctly."""
-        cfg = self._make_cfg([("23:50", 2), ("06:00", 8)], drain_minutes=15)
-        # Entries sorted: [06:00→8, 23:50→2]
-        # 23:35 is inside the 15-min drain window before 23:50
-        assert cfg.is_in_drain_window(dt_time(23, 35)) is True or cfg.is_in_drain_window(dt_time(23, 35)) == (True, 2)
-        # 23:34 is outside
-        assert cfg.is_in_drain_window(dt_time(23, 34)) is False
-        # 05:45 is inside the 15-min drain window before 06:00
-        assert cfg.is_in_drain_window(dt_time(5, 45)) is True or cfg.is_in_drain_window(dt_time(5, 45)) == (True, 8)
-        assert cfg.is_in_drain_window(dt_time(5, 44)) is False
-
-    def test_drain_window_with_no_current_slot_change(self):
-        """Drain is only active when the current slot count differs from the next."""
-        cfg = self._make_cfg([("10:00", 4), ("12:00", 8)], drain_minutes=15)
-        # At 09:50, the current slot wraps to last entry: 12:00→8 = 8.
-        # The next transition is 10:00 (4 slots). Since 4 != 8, drain is needed.
-        # Drain window starts at 09:45 (10:00 - 15min). 09:50 > 09:45, so drain is active.
-        current = cfg.get_active_slot(dt_time(9, 50))
-        next_slot = cfg.get_slot_at_entry(dt_time(10, 0))
-        assert current == 8  # last entry wraps
-        assert next_slot == 4
-        # Drain IS active because slot changes
-        assert cfg.is_in_drain_window(dt_time(9, 50)) is True or cfg.is_in_drain_window(dt_time(9, 50)) == (True, 4)
-
-    def test_drain_window_returns_transition_details(self):
-        """is_in_drain_window should return (True, slot_count) when draining.
-
-        With a single entry [12:00→8] at 11:46, current_slots=8 (wrapped) = next=8,
-        so no drain is needed.  To force drain detection, pass a different
-        current_slots value (e.g. static config value 4).
-        """
-        cfg = self._make_cfg([("12:00", 8)], drain_minutes=15)
-        # With current_slots=4 (static config), 4 != 8 → drain needed
-        result = cfg.is_in_drain_window(dt_time(11, 46), current_slots=4)
-        assert result == (True, 8) or result is True
-        # With current_slots=8 (same as next), no drain needed
-        result_same = cfg.is_in_drain_window(dt_time(11, 46), current_slots=8)
-        assert result_same is False
-        result_outside = cfg.is_in_drain_window(dt_time(11, 44), current_slots=4)
-        # 11:44 is outside the 15-min drain window before 12:00
-        assert result_outside is False
-
-
-# ===================================================================
-# SlotScheduler class (background task)
-# ===================================================================
-
-
 class TestSlotScheduler:
     """Tests for the SlotScheduler background task."""
 
@@ -431,7 +330,7 @@ class TestSlotScheduler:
         }
         mock_srv.config = {"server": {"slot_schedule": schedule}}
         scheduler = SlotScheduler(mock_srv)
-        # No pending restart, no draining
+        # No pending restart
         assert scheduler.pending_restart_slot is None
         sleep_s = scheduler._calculate_sleep_seconds()
         assert sleep_s >= 1.0
@@ -469,20 +368,6 @@ class TestSlotScheduler:
         assert scheduler.enabled is False
         sleep_s = scheduler._calculate_sleep_seconds()
         assert sleep_s == scheduler._MAX_SLEEP_SECONDS
-
-    @pytest.mark.asyncio
-    async def test_drain_flag_start_and_stop(self, sample_schedule):
-        """Verify draining flag can be set and cleared."""
-        from proxy.slot_scheduler import SlotScheduler
-
-        mock_srv = MagicMock()
-        mock_srv.config = {"server": {"slot_schedule": sample_schedule}}
-        scheduler = SlotScheduler(mock_srv)
-        assert scheduler.draining is False
-        scheduler.set_draining(True)
-        assert scheduler.draining is True
-        scheduler.set_draining(False)
-        assert scheduler.draining is False
 
     @pytest.mark.asyncio
     async def test_pending_restart_slot(self, sample_schedule):
@@ -539,20 +424,25 @@ class TestSlotScheduler:
         # but current_slots=static (default 1).  So check with that context.
         with patch.object(scheduler, '_now', return_value=dt_time(3, 0)):
             await scheduler._run_check_cycle()
-            # At 03:00, no drain window, no transition time
-            assert scheduler.draining is False
+            # At 03:00, no transition is armed and no restart is pending
             assert scheduler.pending_restart_slot is None
 
     @pytest.mark.asyncio
-    async def test_run_cycle_transition_detected(self):
-        """Verify a check cycle detects a pending transition and sets drain."""
+    async def test_run_cycle_arms_transition_without_rejection_state(self):
+        """Verify a check cycle arms the next transition WITHOUT any drain state.
+
+        LP-0MSF9RUSQ007M346: at a time that would previously have been inside
+        the drain window (11:55 for a 12:00 transition), the scheduler arms
+        the restart but never marks the proxy as draining — new requests are
+        not rejected.
+        """
         from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
         # Two entries: 10:00→4 and 12:00→8. At 11:55, the active slot from
         # the schedule is 4 (second entry hasn't arrived yet). We set static
-        # slots to 4 so catch-up doesn't fire, and the drain window for the
-        # 12:00→8 transition is properly detected (slot count changes).
+        # slots to 4 so catch-up doesn't fire; the 12:00→8 transition (slot
+        # count changes) is armed.
         schedule = {
             "enabled": True,
             "drain_minutes": 15,
@@ -569,16 +459,17 @@ class TestSlotScheduler:
         }
         mock_srv.restart_services = AsyncMock(return_value=True)
         scheduler = SlotScheduler(mock_srv)
-        # At 11:55, we're 5 min before the 12:00 transition AND 10 min inside
-        # the 15-min drain window. The slot count changes from 4→8.
+        # At 11:55 — inside the old 15-min drain window (11:45–12:00).
         with patch.object(scheduler, '_now', return_value=dt_time(11, 55)):
             await scheduler._run_check_cycle()
-            # Should be draining
-            assert scheduler.draining is True
+            # The 12:00 restart is armed…
+            assert scheduler.pending_restart_slot == 8
+            # …but the proxy is never placed in a rejecting drain state.
+            assert getattr(mock_srv, 'draining', None) is not True
 
     @pytest.mark.asyncio
-    async def test_run_cycle_completes_drain_and_restarts(self):
-        """Verify when transition time is now, drain becomes False and restart happens."""
+    async def test_run_cycle_restarts_at_transition_time(self):
+        """Verify the restart happens when the transition time is reached."""
         from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
@@ -613,7 +504,6 @@ class TestSlotScheduler:
         assert scheduler.enabled is False
         with patch.object(scheduler, '_now', return_value=dt_time(9, 45)):
             await scheduler._run_check_cycle()
-            assert scheduler.draining is False
             assert scheduler.pending_restart_slot is None
 
     @pytest.mark.asyncio
@@ -633,12 +523,12 @@ class TestSlotScheduler:
         scheduler = SlotScheduler(mock_srv)
         with patch.object(scheduler, '_now', return_value=dt_time(11, 55)):
             await scheduler._run_check_cycle()
-            # Should NOT start draining because switch is in progress
-            assert scheduler.draining is False
+            # Should NOT arm a restart because a switch is in progress
+            assert scheduler.pending_restart_slot is None
 
     @pytest.mark.asyncio
     async def test_run_cycle_same_slot_skips_transition(self):
-        """Verify no drain/restart when slot count doesn't change."""
+        """Verify no restart is armed when the slot count doesn't change."""
         from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
@@ -656,20 +546,8 @@ class TestSlotScheduler:
         scheduler = SlotScheduler(mock_srv)
         with patch.object(scheduler, '_now', return_value=dt_time(11, 55)):
             await scheduler._run_check_cycle()
-            # No drain needed when slot count is same (wrapping matches)
-            assert scheduler.draining is False
-
-    @pytest.mark.asyncio
-    async def test_is_draining_flag_on_server(self, sample_schedule):
-        """Verify scheduler.draining is reflected on the server module."""
-        from proxy.slot_scheduler import SlotScheduler
-
-        mock_srv = MagicMock()
-        mock_srv.config = {"server": {"slot_schedule": sample_schedule}}
-        scheduler = SlotScheduler(mock_srv)
-        scheduler.set_draining(True)
-        # The draining state should be accessible
-        assert scheduler.draining is True
+            # No restart armed when slot count is same (wrapping matches)
+            assert scheduler.pending_restart_slot is None
 
 
 # ===================================================================
@@ -681,7 +559,7 @@ class TestSlotSchedulerEdgeCases:
 
     @pytest.mark.asyncio
     async def test_midnight_transition(self):
-        """Verify a transition at midnight works correctly with drain."""
+        """Verify a midnight transition is armed without draining and restarts."""
         from proxy.slot_scheduler import SlotScheduleConfig, SlotScheduler
 
         mock_srv = MagicMock()
@@ -704,20 +582,19 @@ class TestSlotSchedulerEdgeCases:
         mock_srv.restart_services = AsyncMock(return_value=True)
         scheduler = SlotScheduler(mock_srv)
 
-        # At 23:45, draining for the 23:50 transition
+        # At 23:45 — inside the old drain window for the 23:50 transition.
         now_dt_2345 = datetime(2026, 7, 23, 23, 45, 0)
         with patch.object(scheduler, '_now_dt', return_value=now_dt_2345):
             with patch.object(scheduler, '_now', return_value=now_dt_2345.time()):
                 await scheduler._run_check_cycle()
-                assert scheduler.draining is True
+                # Transition is armed but the proxy is never rejecting.
+                assert scheduler.pending_restart_slot == 2
+                assert getattr(mock_srv, 'draining', None) is not True
 
-        # At 23:50, restart — catch-up fires because active slot (2) differs
-        # from static (8), triggering immediate restart.
-        scheduler.set_draining(False)  # simulate state
+        # At 23:50, the restart fires at the transition time.
         now_dt_2350 = datetime(2026, 7, 23, 23, 50, 0)
         with patch.object(scheduler, '_now_dt', return_value=now_dt_2350):
             with patch.object(scheduler, '_now', return_value=now_dt_2350.time()):
-                scheduler.set_draining(True)  # was draining before
                 await scheduler._run_check_cycle()
                 mock_srv.restart_services.assert_called_with(
                     slot_count=2, reason="scheduled_slot_change"
@@ -754,112 +631,16 @@ class TestSlotSchedulerEdgeCases:
 
 
 # ===================================================================
-# Drain stuck circuit breaker & microsecond tolerance
+# Transition safety: microsecond tolerance & missed-transition fallback
 # ===================================================================
 
 
-class TestSlotSchedulerDrainSafety:
-    """Tests for the drain-stuck circuit breaker, microsecond tolerance,
-    and missed-transition fallback logic."""
+class TestSlotSchedulerTransitionSafety:
+    """Tests for transition safety: restart microsecond tolerance,
+    missed-transition fallback, and the absence of a rejection window
+    (LP-0MSF9RUSQ007M346)."""
 
-    # ── AC1: Drain-stuck circuit breaker ──────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_drain_started_at_tracked_on_set_true(self):
-        """Verify _drain_started_at is set when set_draining(True) is called."""
-        from proxy.slot_scheduler import SlotScheduler
-
-        mock_srv = MagicMock()
-        mock_srv.config = {"server": {"slot_schedule": {"enabled": True, "drain_minutes": 15, "entries": []}}}
-        scheduler = SlotScheduler(mock_srv)
-        assert scheduler._drain_started_at is None
-        scheduler.set_draining(True)
-        assert scheduler._drain_started_at is not None
-
-    @pytest.mark.asyncio
-    async def test_drain_started_at_cleared_on_set_false(self):
-        """Verify _drain_started_at is reset when set_draining(False) is called."""
-        from proxy.slot_scheduler import SlotScheduler
-
-        mock_srv = MagicMock()
-        mock_srv.config = {"server": {"slot_schedule": {"enabled": True, "drain_minutes": 15, "entries": []}}}
-        scheduler = SlotScheduler(mock_srv)
-        scheduler.set_draining(True)
-        assert scheduler._drain_started_at is not None
-        scheduler.set_draining(False)
-        assert scheduler._drain_started_at is None
-
-    @pytest.mark.asyncio
-    async def test_circuit_breaker_clears_stuck_drain(self):
-        """Circuit breaker clears draining if active beyond drain_minutes + 60s."""
-        from proxy.slot_scheduler import SlotScheduler
-
-        mock_srv = MagicMock()
-        schedule = {
-            "enabled": True,
-            "drain_minutes": 15,
-            "entries": [{"time": "12:00", "slots": 8}],
-        }
-        mock_srv.config = {"server": {"slot_schedule": schedule}}
-        mock_srv.restart_services = AsyncMock(return_value=True)
-        scheduler = SlotScheduler(mock_srv)
-
-        # Manually set draining with a start time far in the past
-        scheduler.set_draining(True)
-        # Use _now_dt() patching to simulate the check running well past
-        # the drain_minutes + 60s threshold
-        past = datetime(2026, 7, 23, 10, 0, 0)  # baseline
-        scheduler._drain_started_at = past
-
-        # Run check cycle at a time > drain_minutes + 60s after past
-        # drain_minutes=15 → 15*60+60 = 960s threshold
-        # past=10:00, cycle runs at 10:17 (1020s later) → exceeds 960
-        with patch.object(scheduler, '_now_dt', return_value=datetime(2026, 7, 23, 10, 17, 0)):
-            with patch.object(scheduler, '_now', return_value=dt_time(10, 17)):
-                await scheduler._run_check_cycle()
-
-        # Circuit breaker should have cleared draining
-        assert scheduler.draining is False
-        assert scheduler._drain_started_at is None
-
-    @pytest.mark.asyncio
-    async def test_circuit_breaker_does_not_clear_normal_drain(self):
-        """Circuit breaker does NOT clear draining if within normal window."""
-        from proxy.slot_scheduler import SlotScheduler
-
-        mock_srv = MagicMock()
-        schedule = {
-            "enabled": True,
-            "drain_minutes": 15,
-            "entries": [{"time": "12:00", "slots": 8}],
-        }
-        mock_srv.config = {
-            "server": {
-                "session_slot_pool_size": 4,
-                "slot_schedule": schedule,
-            }
-        }
-        scheduler = SlotScheduler(mock_srv)
-
-        # Set draining recently — still within the allowed window
-        now = datetime(2026, 7, 23, 11, 50, 0)  # 10 min into drain window
-        scheduler._drain_started_at = now
-        # Set draining flag directly without going through set_draining (which would
-        # override _drain_started_at with real time)
-        scheduler._draining = True
-        try:
-            scheduler._srv.draining = True
-        except Exception:
-            pass
-
-        with patch.object(scheduler, '_now_dt', return_value=now):
-            with patch.object(scheduler, '_now', return_value=dt_time(11, 50)):
-                await scheduler._run_check_cycle()
-
-        # Should still be draining (circuit breaker did NOT fire)
-        assert scheduler.draining is True
-
-    # ── AC2: Microsecond tolerance ────────────────────────────────────
+    # ── Microsecond tolerance ─────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_phase1_fires_with_microsecond_tolerance_before(self):
@@ -890,7 +671,6 @@ class TestSlotSchedulerDrainSafety:
         mock_srv.restart_services.assert_called_once_with(
             slot_count=8, reason="scheduled_slot_change"
         )
-        assert scheduler.draining is False
 
     @pytest.mark.asyncio
     async def test_phase1_fires_with_microsecond_tolerance_after(self):
@@ -920,14 +700,13 @@ class TestSlotSchedulerDrainSafety:
         mock_srv.restart_services.assert_called_once_with(
             slot_count=8, reason="scheduled_slot_change"
         )
-        assert scheduler.draining is False
 
-    # ── AC3: Missed transition fallback ───────────────────────────────
+    # ── Missed transition fallback ────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_missed_transition_clears_drain_and_pending(self):
+    async def test_missed_transition_clears_pending(self):
         """When pending_restart_slot is set but its time has passed by >1s,
-        the scheduler clears drain and pending, falling through."""
+        the scheduler clears pending, falling through."""
         from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
@@ -945,13 +724,11 @@ class TestSlotSchedulerDrainSafety:
 
         # We had a pending restart for 23:59→8 but it's now 07:00 next day
         scheduler.set_pending_restart(8)
-        scheduler.set_draining(True)
 
         with patch.object(scheduler, '_now', return_value=dt_time(7, 0)):
             await scheduler._run_check_cycle_inner()
 
-        # Drain should be cleared, pending should be cleared
-        assert scheduler.draining is False
+        # Pending should be cleared
         assert scheduler.pending_restart_slot is None
 
     @pytest.mark.asyncio
@@ -980,7 +757,6 @@ class TestSlotSchedulerDrainSafety:
         # Simulate missed transition: pending_restart=8 for 23:59→8
         # which has now passed (it's 07:00 next day).
         scheduler.set_pending_restart(8)
-        scheduler.set_draining(True)
 
         # At 07:00, pending slot 8's entry at 23:59 has passed.
         # _calculate_sleep_seconds should detect this and fall through.
@@ -995,7 +771,7 @@ class TestSlotSchedulerDrainSafety:
 
     @pytest.mark.asyncio
     async def test_missed_transition_logs_warning(self, caplog):
-        """Verify a WARNING is logged when a missed transition is detected (AC4).
+        """Verify a WARNING is logged when a missed transition is detected.
 
         Uses a cross-midnight scenario: pending_restart was set for 23:59→8
         from the previous day, now is 07:00 the next day. The entry at 23:59
@@ -1018,15 +794,7 @@ class TestSlotSchedulerDrainSafety:
         scheduler = SlotScheduler(mock_srv)
 
         scheduler.set_pending_restart(8)
-        # Set drain state directly to avoid circuit breaker issues:
-        # circuit breaker uses _drain_started_at vs _now_dt, so align them.
         now_dt = datetime(2026, 7, 24, 7, 0, 0)
-        scheduler._draining = True
-        scheduler._drain_started_at = now_dt - timedelta(minutes=1)  # started 1 min ago, well under 960s margin
-        try:
-            scheduler._srv.draining = True
-        except Exception:
-            pass
 
         with caplog.at_level(logging.WARNING):
             with patch.object(scheduler, '_now_dt', return_value=now_dt):
@@ -1039,9 +807,16 @@ class TestSlotSchedulerDrainSafety:
             for msg in caplog.messages
         ), f"Expected warning about missed transition, got: {caplog.messages}"
 
+    # ── LP-0MSF9RUSQ007M346: no rejection window before transitions ──
+
     @pytest.mark.asyncio
-    async def test_circuit_breaker_logs_warning(self, caplog):
-        """Verify a WARNING is logged when the circuit breaker fires (AC4)."""
+    async def test_calculate_sleep_targets_transition_time_not_drain_start(self):
+        """Sleep goes straight to the transition time — never to a drain start.
+
+        With a 12:00 transition and drain_minutes=15, at 11:30 the old code
+        woke at 11:45 (drain start, 900s away).  The new code sleeps until
+        12:00 (1800s away): there is no drain window (LP-0MSF9RUSQ007M346).
+        """
         from proxy.slot_scheduler import SlotScheduler
 
         mock_srv = MagicMock()
@@ -1050,21 +825,48 @@ class TestSlotSchedulerDrainSafety:
             "drain_minutes": 15,
             "entries": [{"time": "12:00", "slots": 8}],
         }
-        mock_srv.config = {"server": {"slot_schedule": schedule}}
-        mock_srv.restart_services = AsyncMock(return_value=True)
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 4,
+                "slot_schedule": schedule,
+            }
+        }
         scheduler = SlotScheduler(mock_srv)
+        now_dt = datetime(2026, 7, 23, 11, 30, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                sleep_s = scheduler._calculate_sleep_seconds()
+        # 30 min until the 12:00 transition (1800s), not 15 min to drain start.
+        assert 1799 <= sleep_s <= 1801, f"Expected ~1800s to transition, got {sleep_s}"
 
-        scheduler.set_draining(True)
-        past = datetime(2026, 7, 23, 10, 0, 0)
-        scheduler._drain_started_at = past
+    @pytest.mark.asyncio
+    async def test_calculate_sleep_ignores_drain_minutes_value(self):
+        """drain_minutes no longer affects when the scheduler wakes.
 
-        with caplog.at_level(logging.WARNING):
-            with patch.object(scheduler, '_now_dt', return_value=datetime(2026, 7, 23, 10, 17, 0)):
-                with patch.object(scheduler, '_now', return_value=dt_time(10, 17)):
-                    await scheduler._run_check_cycle()
+        Whether drain_minutes is 15 or 3, the scheduler sleeps until the
+        transition time (12:00) — the drain value is parsed but ignored.
+        """
+        from proxy.slot_scheduler import SlotScheduler
 
-        # Should contain a warning about drain circuit breaker
-        assert any(
-            "drain circuit breaker" in msg.lower() or "forcing clear" in msg
-            for msg in caplog.messages
-        ), f"Expected warning about circuit breaker, got: {caplog.messages}"
+        for drain_minutes in (3, 15):
+            mock_srv = MagicMock()
+            schedule = {
+                "enabled": True,
+                "drain_minutes": drain_minutes,
+                "entries": [{"time": "12:00", "slots": 8}],
+            }
+            mock_srv.config = {
+                "server": {
+                    "session_slot_pool_size": 4,
+                    "slot_schedule": schedule,
+                }
+            }
+            scheduler = SlotScheduler(mock_srv)
+            now_dt = datetime(2026, 7, 23, 11, 30, 0)
+            with patch.object(scheduler, '_now_dt', return_value=now_dt):
+                with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                    sleep_s = scheduler._calculate_sleep_seconds()
+            assert 1799 <= sleep_s <= 1801, (
+                f"drain_minutes={drain_minutes}: expected ~1800s to transition, "
+                f"got {sleep_s}"
+            )

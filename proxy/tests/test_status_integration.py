@@ -235,16 +235,16 @@ async def test_concurrent_status_requests(transport):
         ) as mock_qls:
             mock_qls.return_value = {"llama_server_running": True}
 
-            # Launch N concurrent requests
-            N = 8
+            # Launch num_requests concurrent requests
+            num_requests = 8
             start = asyncio.get_event_loop().time()
             results = await asyncio.wait_for(
-                asyncio.gather(*[ac.get("/llama/local/status") for _ in range(N)]),
+                asyncio.gather(*[ac.get("/llama/local/status") for _ in range(num_requests)]),
                 timeout=5.0,
             )
             elapsed = asyncio.get_event_loop().time() - start
 
-            assert len(results) == N
+            assert len(results) == num_requests
             for resp in results:
                 assert resp.status_code == 200
                 j = resp.json()

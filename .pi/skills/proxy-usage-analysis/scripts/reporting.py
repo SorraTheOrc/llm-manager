@@ -58,6 +58,7 @@ TS_FMT = "%Y-%m-%d %H:%M:%S"
 class AnalysisRun:
     summary: AnalysisResult
     files: list[Path] = field(default_factory=list)
+    archived_to: Path | None = None
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -107,6 +108,45 @@ def write_csvs(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
     _write_csv(day_path, day_rows)
     _write_csv(night_path, night_rows)
     return day_path, night_path
+
+
+# Output artifacts that get archived (moved into a dated subdirectory)
+# before a fresh run overwrites them. Anything else in the output dir
+# (e.g. cron.log) is left untouched.
+ARCHIVE_ARTIFACTS = [
+    "report.md",
+    "daytime_sessions.csv",
+    "nighttime_sessions.csv",
+    "errors.csv",
+    "errors.json",
+]
+
+
+def _archive_existing_outputs(output_dir: Path, now: datetime | None = None) -> Path | None:
+    """Move existing report artifacts into a dated archive subdirectory.
+
+    Artifacts are named by the run date (``YYYY-MM-DD``); when that directory
+    already exists (a same-day repeat, or a manual archive), a ``_2``, ``_3``
+    ... suffix is appended so archives are never overwritten. Returns the
+    archive directory path, or ``None`` when the output directory contained no
+    artifacts to archive (a pristine dir is left untouched). Only the skill's
+    own artifacts (``ARCHIVE_ARTIFACTS``) are moved.
+    """
+    existing = [output_dir / name for name in ARCHIVE_ARTIFACTS if (output_dir / name).exists()]
+    if not existing:
+        return None
+    if now is None:
+        now = datetime.now()
+    stamp = now.strftime("%Y-%m-%d")
+    archive_dir = output_dir / stamp
+    n = 2
+    while archive_dir.exists():
+        archive_dir = output_dir / f"{stamp}_{n}"
+        n += 1
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for path in existing:
+        path.replace(archive_dir / path.name)
+    return archive_dir
 
 
 ERROR_CSV_COLUMNS = [
@@ -620,11 +660,12 @@ def run_analysis(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    archived_to = _archive_existing_outputs(output_dir)
     write_csvs(summary, output_dir)
     write_error_artifacts(summary, output_dir)
     report_path = output_dir / "report.md"
     report_path.write_text(build_report(summary, config, summary.speed), encoding="utf-8")
-    return AnalysisRun(summary=summary, files=files)
+    return AnalysisRun(summary=summary, files=files, archived_to=archived_to)
 
 
 def summary_to_json(summary: AnalysisResult) -> dict:
