@@ -227,6 +227,86 @@ class TestErrorLineParsing:
         assert events[0].src_file == "proxy.log.2026-08-03_13"
 
 
+class TestDiscoverLogFiles:
+    """Discovery of proxy log files for an analysis window.
+
+    Rotated files (``proxy.log.YYYY-MM-DD_HH``) are included regardless of
+    their name-encoded timestamp: in this deployment a rotated file routinely
+    holds data well past its encoded rotation time (e.g. ``proxy.log.2026-08-07_03``
+    contains data until 09:03), so discovery must never exclude a file based on
+    its name. ``iter_events`` per-line timestamp filtering is the only boundary.
+    """
+
+    def test_live_log_always_included(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert files == [log_dir / "proxy.log"]
+
+    def test_rotated_file_with_pre_window_encoded_time_is_included(self, tmp_path):
+        # Regression: name-encoded rotation time (03:00 on 08-07) precedes
+        # window start (04:00 on 08-07), but the file may still hold in-window
+        # data — it must be discovered and filtered per line, never excluded by
+        # name. Mirrors the real deployment case (proxy.log.2026-08-07_03).
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.2026-08-07_03").write_text("garbage\n")
+        (log_dir / "proxy.log").write_text("garbage\n")
+        window_start = datetime(2026, 8, 7, 4, 0)
+        files = log_parser.discover_log_files(log_dir, window_start)
+        assert log_dir / "proxy.log.2026-08-07_03" in files
+        assert log_dir / "proxy.log" in files
+
+    def test_all_rotated_files_included_regardless_of_encoded_time(self, tmp_path):
+        # Encoded times before, inside, and after the window are all included;
+        # discovery never excludes a rotated file based on its name timestamp.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        names = [
+            "proxy.log.2026-07-31_10",  # long before the window
+            "proxy.log.2026-08-02_14",  # inside the window
+            "proxy.log.2026-08-03_20",  # after the window
+        ]
+        for name in names:
+            (log_dir / name).write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert {p.name for p in files} == set(names)
+
+    def test_unrecognized_rotated_names_included(self, tmp_path):
+        # Names that do not match the YYYY-MM-DD_HH convention are also kept.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.1").write_text("garbage\n")
+        (log_dir / "proxy.log.gz").write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert {p.name for p in files} == {"proxy.log.1", "proxy.log.gz"}
+
+    def test_non_log_files_excluded(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "llama-server.log").write_text("garbage\n")
+        (log_dir / "notes.txt").write_text("garbage\n")
+        (log_dir / "proxy.log").write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert files == [log_dir / "proxy.log"]
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert log_parser.discover_log_files(tmp_path / "nope", WINDOW_START) == []
+
+    def test_sorted_by_name(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        for name in ["proxy.log.2026-08-02_14", "proxy.log.2026-08-01_10", "proxy.log"]:
+            (log_dir / name).write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert [p.name for p in files] == [
+            "proxy.log",
+            "proxy.log.2026-08-01_10",
+            "proxy.log.2026-08-02_14",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Session aggregation
 # ---------------------------------------------------------------------------
@@ -1204,10 +1284,12 @@ class TestEndToEnd:
         assert result.summary.sessions == {}
         assert (tmp_path / "out3" / "report.md").exists()
 
-    def test_rotated_file_outside_window_is_not_parsed(self, tmp_path):
+    def test_rotated_file_outside_window_is_filtered_per_line(self, tmp_path):
         log_dir = tmp_path / "logs2"
         log_dir.mkdir()
-        # Rotation time 13:00 < window_start 14:00 → excluded by discovery.
+        # Rotation time 13:00 < window_start 14:00: the file is still discovered
+        # (name timestamps are not authoritative), but its 12:00 content lies
+        # outside the margin-widened window and is dropped per line by iter_events.
         (log_dir / "proxy.log.2026-08-02_13").write_text(
             "2026-08-02 12:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=old request=[]\n"
         )
@@ -1221,7 +1303,35 @@ class TestEndToEnd:
             output_dir=tmp_path / "out4",
             config=None,
         )
+        # The rotated file is discovered, but its pre-window event is filtered
+        # by the authoritative per-line timestamp check in iter_events.
+        assert log_dir / "proxy.log.2026-08-02_13" in result.files
         assert list(result.summary.sessions) == ["new"]
+
+    def test_rotated_file_with_earlier_rotation_reports_overlapping_session(self, tmp_path):
+        # Regression: a rotated file whose name-encoded rotation time precedes
+        # window start may still hold in-window data (deployment files span far
+        # past their encoded time). Discovery must include it so its in-window
+        # session is reported — never silently dropped.
+        log_dir = tmp_path / "logs3"
+        log_dir.mkdir()
+        (log_dir / "proxy.log.2026-08-02_13").write_text(
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=carried request=[]\n"
+            "2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=carried provider=local model=Qwen3 request=[]\n"
+        )
+        (log_dir / "proxy.log").write_text(
+            "2026-08-02 14:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=live request=[]\n"
+            "2026-08-02 14:30:02,000 - INFO - Stream finished: reason=stop tokens=200/20/220 session=live provider=local model=Qwen3 request=[]\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out5",
+            config=None,
+        )
+        assert log_dir / "proxy.log.2026-08-02_13" in result.files
+        assert set(result.summary.sessions) == {"carried", "live"}
 
 
 class TestDefaultOutputDir:
@@ -1322,3 +1432,144 @@ class TestReportRestructure:
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Day | Night | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
+
+
+class TestArchiveOutputs:
+    """Existing output artifacts are moved into dated archive subdirectories
+    before a fresh run overwrites them, so historical reports are kept.
+
+    Covers AC1 (pre-existing artifacts archived), AC2 (same-day runs get
+    suffixed dirs, never overwriting), AC3 (pristine dir untouched).
+    """
+
+    # Frozen clock so the dated archive dirs are deterministic in tests.
+    NOW = datetime(2026, 8, 7, 5, 0, 0)
+
+    class _FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return TestArchiveOutputs.NOW
+
+    def _write_logs(self, tmp_path: Path) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        return log_dir
+
+    def _run(self, tmp_path: Path, out_name: str = "out", monkeypatch=None):
+        if monkeypatch is not None:
+            monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        return reporting.run_analysis(
+            log_dir=self._write_logs(tmp_path),
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / out_name,
+            config=None,
+        )
+
+    def test_archives_existing_artifacts_before_overwrite(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        out = tmp_path / "out"
+        out.mkdir()
+        # Pre-existing artifacts, as if a previous run had written them.
+        (out / "report.md").write_text("OLD REPORT")
+        (out / "daytime_sessions.csv").write_text("old day")
+        (out / "nighttime_sessions.csv").write_text("old night")
+        (out / "errors.csv").write_text("old errors")
+        (out / "errors.json").write_text("{\"old\": true}")
+
+        run = self._run(tmp_path, monkeypatch=monkeypatch)
+
+        # All five artifacts moved into the dated archive dir, verbatim.
+        archive = out / "2026-08-07"
+        assert archive.is_dir()
+        assert run.archived_to == archive
+        assert (archive / "report.md").read_text() == "OLD REPORT"
+        assert (archive / "daytime_sessions.csv").read_text() == "old day"
+        assert (archive / "nighttime_sessions.csv").read_text() == "old night"
+        assert (archive / "errors.csv").read_text() == "old errors"
+        assert (archive / "errors.json").read_text() == "{\"old\": true}"
+        # Fresh outputs written at the root.
+        assert (out / "report.md").read_text().startswith("# Proxy Usage Analysis")
+        assert (out / "daytime_sessions.csv").exists()
+        assert (out / "nighttime_sessions.csv").exists()
+        assert (out / "errors.csv").exists()
+        assert (out / "errors.json").exists()
+
+    def test_same_day_runs_get_suffixed_archive_dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        out = tmp_path / "out"
+        log_dir = self._write_logs(tmp_path)
+        # Run 1: pristine dir -> nothing archived, first archives appear later.
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out,
+            config=None,
+        )
+        assert list(out.iterdir())  # fresh outputs present
+        first_md = (out / "report.md").read_text()
+
+        # Run 2 (same day): previous outputs move into the plain dated dir.
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out,
+            config=None,
+        )
+        archive1 = out / "2026-08-07"
+        assert (archive1 / "report.md").read_text() == first_md
+
+        # Run 3 (same day): run-2 outputs move into the _2 suffix dir, and the
+        # run-1 archive is never overwritten.
+        second_md = (out / "report.md").read_text()
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out,
+            config=None,
+        )
+        archive2 = out / "2026-08-07_2"
+        assert (archive2 / "report.md").read_text() == second_md
+        assert (archive1 / "report.md").read_text() == first_md
+        # A fresh report still sits at the root after every run.
+        assert (out / "report.md").exists()
+        assert (out / "daytime_sessions.csv").exists()
+
+    def test_same_day_archive_dir_collides_with_existing_dir(self, tmp_path):
+        # A dated dir already exists (e.g. a manual archive) -> suffix, not overwrite.
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "2026-08-07").mkdir()
+        (out / "2026-08-07" / "report.md").write_text("MANUAL")
+        (out / "report.md").write_text("CURRENT")
+
+        archived = reporting._archive_existing_outputs(out, now=self.NOW)
+
+        assert archived.name == "2026-08-07_2"
+        assert (archived / "report.md").read_text() == "CURRENT"
+        assert (out / "2026-08-07" / "report.md").read_text() == "MANUAL"
+
+    def test_pristine_output_dir_left_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reporting, "datetime", self._FrozenClock)
+        self._run(tmp_path, out_name="fresh", monkeypatch=monkeypatch)
+        out = tmp_path / "fresh"
+        # No archive dirs are created when there was nothing to archive.
+        dirs = [p for p in out.iterdir() if p.is_dir()]
+        assert dirs == []
+
+    def test_unrelated_files_in_output_dir_are_not_moved(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "report.md").write_text("CURRENT")
+        (out / "cron.log").write_text("2026-08-07 05:00 ok\n")
+
+        archived = reporting._archive_existing_outputs(out, now=self.NOW)
+
+        assert (archived / "report.md").read_text() == "CURRENT"
+        # Non-artifact files stay put (cron log lives at the root).
+        assert (out / "cron.log").read_text() == "2026-08-07 05:00 ok\n"
+        assert not (archived / "cron.log").exists()

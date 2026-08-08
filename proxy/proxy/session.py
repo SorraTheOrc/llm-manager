@@ -575,6 +575,109 @@ def _truncate_body(body: str, maxlen: int = 500) -> str:
     return body[:maxlen] + "..."
 
 
+def _slot_busy_state_snapshot(
+    slot_id: int | None = None,
+    exclude_session: str | None = None,
+) -> dict:
+    """Snapshot proxy-side load state used to judge slot busyness.
+
+    Returns a JSON-serializable dict with:
+
+    - ``active_queries``: total in-flight queries (local + remote backends).
+    - ``local_active_queries``: in-flight queries on the local backend.
+    - ``active_sessions``: sessions holding an *active* dispatch lease
+      (a request currently in flight on the local backend), excluding
+      *exclude_session* when provided.
+    - ``slot_busy``: whether *slot_id*'s owning session has an active
+      dispatch lease (a request in flight on that slot).
+
+    Correlation evidence (LP-0MSI1RWLM007N367 F1): slot save/restore
+    ReadTimeouts cluster when other local streams are active — llama-server
+    serializes each KV-cache copy behind its slot work, so a save issued
+    while another slot is generating can exceed the adaptive timeout. This
+    snapshot gives the correlation script (and the F3 load gate) a concrete
+    busy definition from proxy-side state, with no extra llama-server calls.
+
+    *exclude_session* is used by the F3 load gate so the requesting
+    session's own active lease does not make the slot look busy (the gate
+    must reflect *other* sessions' load).
+    """
+    state = {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": False,
+    }
+    try:
+        srv = _srv()
+    except Exception:
+        return state
+    try:
+        state["active_queries"] = int(
+            getattr(srv, "active_queries", 0) or 0
+        )
+    except Exception:
+        pass
+    try:
+        state["local_active_queries"] = int(
+            getattr(srv, "local_active_queries", 0) or 0
+        )
+    except Exception:
+        pass
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if isinstance(records, dict):
+            state["active_sessions"] = sum(
+                1
+                for owner, rec in records.items()
+                if isinstance(rec, dict)
+                and rec.get("active")
+                and owner != exclude_session
+            )
+            if slot_id is not None:
+                owner = None
+                for sid, owner_id in _slot_owners.items():
+                    if sid == slot_id:
+                        owner = owner_id
+                        break
+                if owner is not None and owner in records:
+                    rec = records.get(owner)
+                    state["slot_busy"] = bool(
+                        isinstance(rec, dict) and rec.get("active")
+                    )
+    except Exception:
+        pass
+    return state
+
+
+def _slot_persistence_skip_when_busy(
+    server_config: dict,
+    slot_id: int | None,
+    session_id: str | None = None,
+) -> bool:
+    """Return True when the load-aware gate says persistence should be skipped.
+
+    Implements the F3 busy-signal decision (LP-0MSI1RWLM007N367 F3, per the
+    F1 decision record): skip slot save/restore when another local session is
+    actively streaming — llama-server serializes each KV-cache copy behind
+    its slot work, so saves issued under concurrent load exceed the adaptive
+    timeout. The signal is proxy-side dispatch-lease state (no llama-server
+    calls); the requesting session's own lease is excluded.
+
+    Disabled when ``session_slot_skip_when_busy`` is false. The gate is
+    enabled explicitly by the deployed config (``proxy/config.yaml`` sets
+    ``session_slot_skip_when_busy: true``); a non-dict *server_config* or an
+    absent key is treated as gate-off so `_build_slot_context` does not
+    depend on ambient global server state unless the feature is opted in.
+    """
+    if not isinstance(server_config, dict):
+        return False
+    if not server_config.get("session_slot_skip_when_busy", False):
+        return False
+    busy = _slot_busy_state_snapshot(slot_id, exclude_session=session_id)
+    return busy["active_sessions"] > 0
+
+
 async def _call_slot_endpoint(
     llama_port: int,
     slot_id: int,
@@ -593,6 +696,12 @@ async def _call_slot_endpoint(
     - A DEBUG-level log with exc_info=True is emitted for every exception,
       capturing the full stack trace for post-hoc diagnosis.
 
+    Failure-path instrumentation (LP-0MSI1RWLM007N367 F1): every failed
+    save/restore logs the elapsed time at timeout, the applied timeout, and a
+    proxy-side busy-state snapshot (``_slot_busy_state_snapshot``) so the
+    correlation script can prove whether the failure was load-starved. The
+    success path logs elapsed time at DEBUG for latency measurement.
+
     Failures feed the circuit breaker (``_slot_failure_state``) so repeated
     timeouts disable persistence for the slot instead of piling doomed
     KV-cache copies onto the GPU (LP-0MS91DHPZ001VWQO).
@@ -605,32 +714,53 @@ async def _call_slot_endpoint(
         payload["model"] = model
     srv = _srv()
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=timeout)
+    start = time.monotonic()
     try:
         response = await client.post(url, json=payload, timeout=timeout)
+        elapsed = time.monotonic() - start
         if getattr(response, "status_code", None) != 200:
             body = getattr(response, "text", "")
+            busy = _slot_busy_state_snapshot(slot_id)
             srv.logger.warning(
-                "slot_%s failed slot=%s status=%s body=%s",
+                "slot_%s failed slot=%s status=%s body=%s elapsed=%.1fs timeout=%.1fs busy=%s",
                 action,
                 slot_id,
                 response.status_code,
                 _truncate_body(body),
+                elapsed,
+                timeout,
+                json.dumps(busy),
             )
             _record_slot_failure(slot_id)
             return False
         _record_slot_success(slot_id)
+        # Elapsed-time on success lets the correlation script measure real
+        # save/restore latency vs the adaptive timeout (llama-server logs
+        # lack timestamps; LP-0MSI1RWLM007N367 F1).
+        srv.logger.debug(
+            "slot_%s ok slot=%s elapsed=%.1fs timeout=%.1fs",
+            action,
+            slot_id,
+            elapsed,
+            timeout,
+        )
         return True
     except Exception as exc:
+        elapsed = time.monotonic() - start
         # Log exception type name in the warning so empty __str__ values
         # never produce an empty error field (LP-0MQWXX17C005BX1E).
         exc_type = type(exc).__name__
         detail = str(exc) if str(exc) else exc_type
+        busy = _slot_busy_state_snapshot(slot_id)
         srv.logger.warning(
-            "slot_%s failed slot=%s error=%s/%s",
+            "slot_%s failed slot=%s error=%s/%s elapsed=%.1fs timeout=%.1fs busy=%s",
             action,
             slot_id,
             exc_type,
             detail,
+            elapsed,
+            timeout,
+            json.dumps(busy),
         )
         # Feed the circuit breaker so repeated timeouts disable persistence.
         _record_slot_failure(slot_id)
@@ -767,6 +897,8 @@ def _build_slot_context(
     - the request context exceeds ``session_slot_max_prompt_tokens``
       (saves serialize the whole KV cache, so large contexts ReadTimeout
       and can wedge the GPU), or
+    - another local session is actively streaming (load-aware gate,
+      ``session_slot_skip_when_busy``; LP-0MSI1RWLM007N367 F3), or
     - the slot is in circuit-breaker cooldown after repeated save/restore
       failures.
 
@@ -813,13 +945,31 @@ def _build_slot_context(
         )
         return None, None, slot_timeout
 
-    # 2) Adaptive timeout: scale with context size so legitimate saves of
+    # 2) Load-aware gating (LP-0MSI1RWLM007N367 F3): skip persistence when
+    #    another local session is actively streaming. llama-server serializes
+    #    each KV-cache copy behind its slot work, so saves issued under
+    #    concurrent load exceed the adaptive timeout (ReadTimeout). The busy
+    #    signal is proxy-side dispatch-lease state (no llama-server calls);
+    #    the requesting session's own lease is excluded (at request start the
+    #    session is not yet in the records anyway). Configurable via
+    #    ``session_slot_skip_when_busy`` (enabled by the deployed config.yaml).
+    if _slot_persistence_skip_when_busy(server_config, slot_id, session_id):
+        busy = _slot_busy_state_snapshot(slot_id, exclude_session=session_id)
+        logger.info(
+            "slot persistence skipped session=%s slot=%s reason=slot_busy active_sessions=%s",
+            session_id[:8] if session_id else "unknown",
+            slot_id,
+            busy["active_sessions"],
+        )
+        return None, None, slot_timeout
+
+    # 3) Adaptive timeout: scale with context size so legitimate saves of
     #    medium contexts don't spuriously time out.
     if per_token > 0:
         max_timeout = float(server_config.get("session_slot_max_timeout_seconds", 60.0) or 60.0)
         slot_timeout = min(slot_timeout + per_token * estimated, max_timeout)
 
-    # 3) Circuit breaker: stop issuing saves/restores for a failing slot.
+    # 4) Circuit breaker: stop issuing saves/restores for a failing slot.
     if _slot_in_failure_cooldown(slot_id, server_config):
         return None, None, slot_timeout
 
@@ -927,7 +1077,7 @@ slot_lock_coordinator = SlotLockCoordinator()
 # ===================================================================
 
 
-class SessionSingleFlightRejected(Exception):
+class SessionSingleFlightRejectedError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
@@ -963,10 +1113,10 @@ class SessionSingleFlightCoordinator:
                 if state["lock"].locked():
                     if mode_norm == "reject":
                         _record_single_flight_reject()
-                        raise SessionSingleFlightRejected("active_inflight")
+                        raise SessionSingleFlightRejectedError("active_inflight")
                     if max_queue_depth is not None and state["waiters"] >= max_queue_depth:
                         _record_single_flight_reject()
-                        raise SessionSingleFlightRejected("queue_full")
+                        raise SessionSingleFlightRejectedError("queue_full")
                     state["waiters"] += 1
                     is_waiting = True
                     _record_single_flight_queue()
@@ -983,7 +1133,7 @@ class SessionSingleFlightCoordinator:
                     if is_waiting:
                         state["waiters"] = max(0, state["waiters"] - 1)
                 _record_single_flight_reject()
-                raise SessionSingleFlightRejected("queue_timeout")
+                raise SessionSingleFlightRejectedError("queue_timeout")
             async with self._state_lock:
                 if is_waiting:
                     state["waiters"] = max(0, state["waiters"] - 1)

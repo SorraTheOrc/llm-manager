@@ -338,6 +338,57 @@ class TestSessionHistoryMetadataPreservation:
         assert assistant_message["tool_calls"][0]["function"]["name"] == "bash"
         assert assistant_message["tool_calls"][0]["function"]["arguments"] == '{"command": "echo hi"}'
 
+    def test_thinking_only_stream_preserves_reasoning_in_history(self):
+        """AC3 (LP-0MSEHOE7B005DE08): a thinking-only stream persists the
+        full reasoning_content unchanged in session history - no promotion
+        of the thinking text into content, no thinking text dropped."""
+        chunk = {
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "Let me think very carefully about this multi-turn problem...",
+                    }
+                }
+            ]
+        }
+        sse = (
+            f"data: {json.dumps(chunk)}\n\n"
+            "data: [DONE]\n\n"
+        )
+
+        assistant_message = extract_streamed_assistant_message_from_sse(sse)
+
+        assert assistant_message is not None
+        assert assistant_message["role"] == "assistant"
+        # Full thinking text preserved unchanged in reasoning_content
+        assert assistant_message["reasoning_content"] == (
+            "Let me think very carefully about this multi-turn problem..."
+        )
+        # No content field: the thinking text is NOT promoted into content
+        assert "content" not in assistant_message
+
+    def test_merge_thinking_only_message_keeps_thinking_out_of_content(self):
+        """AC3 (LP-0MSEHOE7B005DE08): merging a thinking-only assistant
+        message into session history preserves the full reasoning_content and
+        never injects the thinking text into content."""
+        existing_messages = [{"role": "user", "content": "hi"}]
+        merged = merge_session_history_for_update(
+            existing_messages=existing_messages,
+            request_messages=list(existing_messages),
+            delta_messages=None,
+            is_delta_request=False,
+            assistant_content="Thinking...",
+            assistant_message={
+                "role": "assistant",
+                "reasoning_content": "full thinking text here",
+            },
+        )
+        assert merged[-1]["role"] == "assistant"
+        assert merged[-1]["reasoning_content"] == "full thinking text here"
+        assert merged[-1].get("content") not in ("full thinking text here",)
+
 
 class TestDeltaComputation:
     def test_delta_empty_existing(self):

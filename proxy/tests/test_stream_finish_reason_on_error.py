@@ -355,7 +355,7 @@ def _make_error_streaming_response(
             yield c
         raise exc
 
-    MockStreamResponse = type("MockStreamResponse", (), {
+    mock_stream_response = type("MockStreamResponse", (), {
         "status_code": 200,
         "headers": {"content-type": content_type},
         "aiter_bytes": staticmethod(_aiter),
@@ -364,12 +364,35 @@ def _make_error_streaming_response(
 
     class MockCM:
         async def __aenter__(self):
-            return MockStreamResponse()
+            return mock_stream_response()
 
         async def __aexit__(self, *args):
             pass
 
-    return MockCM(), MockStreamResponse()
+    return MockCM(), mock_stream_response()
+
+
+def _make_mock_cm(aiter_func):
+    """Create (cm, response) for router tests with a plain streaming iterator.
+
+    Returns (context_manager, response_object) matching the contract
+    of _call_with_backend_retries in the streaming path.
+    """
+    mock_resp = type("MockStreamResponse", (), {
+        "status_code": 200,
+        "headers": {"content-type": "text/event-stream"},
+        "aiter_bytes": staticmethod(aiter_func),
+        "aread": AsyncMock(return_value=b""),
+    })
+
+    class _MockCM:
+        async def __aenter__(self):
+            return mock_resp()
+
+        async def __aexit__(self, *args):
+            pass
+
+    return _MockCM(), mock_resp()
 
 
 @pytest.fixture(autouse=True)
@@ -558,6 +581,202 @@ async def test_router_normal_completion_preserved(monkeypatch):
     done_count = collected.count(b"[DONE]")
     assert done_count == 1, (
         f"[DONE] should appear exactly once (from upstream), got {done_count}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LP-0MSDRRPV0001TCLX: local-stream NameError root cause & hardening tests
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# On Aug 3, 2026 the local (Qwen3) stream loop raised NameError 3x. Root
+# cause: router.py called `_invalidate_session_and_slot()` on the guardrail-
+# cutoff-with-invalidation path but the name was not imported (deployed commit
+# 02efd152). The generic `except Exception` handler masked it as a generic
+# stream error. The import landed later (c807d94); these tests lock in the
+# fix (test 1) and the hardening (tests 2-3): proxy-code exceptions
+# (NameError/AttributeError) never escape the stream loop and are classified
+# distinctly from genuine upstream stream errors.
+
+
+async def _collect_streamed_chunks(resp):
+    """Collect all chunks from a StreamingResponse."""
+    collected = b""
+    async for chunk in resp.body_iterator:
+        collected += chunk
+    return collected
+
+
+@pytest.mark.asyncio
+async def test_router_guardrail_cutoff_invalidation_no_nameerror(monkeypatch):
+    """Regression: guardrail-cutoff + session invalidation must not NameError.
+
+    Forces the exact Aug 3 path: guardrail reason 'runtime' fires inside the
+    local stream loop for a session with invalidation enabled (the default).
+    The loop then resolves `_invalidate_session_and_slot` — undefined on the
+    Aug-3 deploy (02efd152), imported since c807d94. A NameError would be
+    masked as a generic stream error and corrupt the terminal event into
+    finish_reason 'error'; with the fix the guardrail cutoff is a normal
+    stop and the session is invalidated.
+    """
+    from proxy.router import proxy_to_local
+
+    async def _aiter():
+        yield b'data: {"choices": [{"delta": {"content": "Hello"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {"content": " world"}, "index": 0}]}\n\n'
+
+    cm, resp = _make_mock_cm(_aiter)
+    monkeypatch.setattr(
+        "proxy.router._call_with_backend_retries",
+        AsyncMock(return_value=(cm, resp)),
+    )
+    # Force a deterministic guardrail cutoff on the second chunk (mid-stream);
+    # the default config keeps session_guardrail_invalidate_on_cutoff=True so
+    # the invalidation branch is exercised.
+    _guardrail_calls = {"n": 0}
+
+    def _guardrail(**kwargs):
+        _guardrail_calls["n"] += 1
+        return "runtime" if _guardrail_calls["n"] >= 2 else None
+
+    monkeypatch.setattr(
+        "proxy.router.evaluate_stream_guardrail",
+        _guardrail,
+    )
+
+    response = await proxy_to_local(
+        _dummy_request(
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            stream=True,
+        ),
+        "v1/chat/completions",
+    )
+
+    # Consuming the stream must NOT raise NameError and must terminate with
+    # normal terminal events (guardrail cutoff is a deliberate stop, not an
+    # upstream error). On the Aug-3 code this path raised NameError which the
+    # generic handler converted into finish_reason 'error'.
+    collected = await _collect_streamed_chunks(response)
+
+    assert b"Hello" in collected, "Content chunk should be delivered"
+    assert b'"stop"' in collected, (
+        "Guardrail cutoff must terminate with finish_reason 'stop', not 'error'"
+    )
+    assert b'"error"' not in collected, (
+        "A guardrail cutoff is a deliberate stop — no error event expected; "
+        "an 'error' here means a proxy-code exception was masked (Aug 3 bug)"
+    )
+    assert b"[DONE]" in collected, "[DONE] terminal marker must be emitted"
+    assert server.session_manager.invalidate.called, (
+        "_invalidate_session_and_slot must have run and invalidated the "
+        "session (on Aug-3 code the undefined name aborted before this call)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_nameerror_contained_and_classified_as_proxy_bug(monkeypatch):
+    """AC3+AC6: a NameError raised mid-loop never escapes and is self-diagnosing.
+
+    Simulates the Aug 3 defect (an undefined name raised on a content chunk)
+    by making log_response_chunk raise NameError for the first content chunk.
+    The generic handler must contain it: the stream still emits the synthetic
+    finish_reason 'error' + [DONE] terminal events, and the exception is
+    classified as a proxy-code bug with a full traceback log.
+    """
+    from proxy.router import proxy_to_local
+
+    async def _aiter():
+        yield b'data: {"choices": [{"delta": {"content": "Hello"}, "index": 0}]}\n\n'
+
+    cm, resp = _make_mock_cm(_aiter)
+    monkeypatch.setattr(
+        "proxy.router._call_with_backend_retries",
+        AsyncMock(return_value=(cm, resp)),
+    )
+
+    def _buggy_log_response_chunk(chunk, **kwargs):
+        if b"Hello" in chunk:
+            raise NameError("name '_invalidate_session_and_slot' is not defined")
+
+    monkeypatch.setattr(
+        "proxy.router.log_response_chunk", _buggy_log_response_chunk
+    )
+
+    response = await proxy_to_local(
+        _dummy_request(
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            stream=True,
+        ),
+        "v1/chat/completions",
+    )
+
+    # Consuming the stream must NOT raise: the NameError is contained by the
+    # generic handler and converted into terminal SSE events.
+    collected = await _collect_streamed_chunks(response)
+
+    assert b"Hello" in collected, "Content chunk delivered before the bug fired"
+    assert b'"error"' in collected, (
+        "Synthetic finish_reason 'error' terminal event must be preserved"
+    )
+    assert b"[DONE]" in collected, "[DONE] terminal marker must be preserved"
+
+    # AC6: proxy-code exceptions are classified distinctly with a full
+    # traceback log so future occurrences are self-diagnosing.
+    proxy_bug_logs = [
+        c for c in server.logger.exception.call_args_list
+        if "PROXY-CODE BUG" in str(c)
+    ]
+    assert proxy_bug_logs, (
+        "NameError must be logged as a PROXY-CODE BUG with full traceback"
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_upstream_error_not_classified_as_proxy_bug(monkeypatch):
+    """AC6: genuine upstream stream errors stay warnings, not proxy-code bugs.
+
+    An httpx.RemoteProtocolError (upstream fault) must still log the classic
+    'Stream error: ...' warning and must NOT be classified as a proxy-code
+    bug (no traceback/exception log), preserving the distinction introduced
+    for NameError/AttributeError.
+    """
+    from proxy.router import proxy_to_local
+
+    chunks = [
+        b'data: {"choices": [{"delta": {"content": "Hello"}, "index": 0}]}\n\n',
+    ]
+
+    cm, sresp = _make_error_streaming_response(chunks, httpx.RemoteProtocolError)
+    monkeypatch.setattr(
+        "proxy.router._call_with_backend_retries",
+        AsyncMock(return_value=(cm, sresp)),
+    )
+
+    response = await proxy_to_local(
+        _dummy_request(
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            stream=True,
+        ),
+        "v1/chat/completions",
+    )
+
+    collected = await _collect_streamed_chunks(response)
+
+    assert b'"error"' in collected, "Synthetic finish_reason 'error' preserved"
+    assert b"[DONE]" in collected, "[DONE] terminal marker preserved"
+
+    stream_error_warnings = [
+        c for c in server.logger.warning.call_args_list
+        if "Stream error:" in str(c)
+    ]
+    assert stream_error_warnings, (
+        "Upstream stream error must still log the classic warning"
+    )
+    proxy_bug_logs = [
+        c for c in server.logger.exception.call_args_list
+        if "PROXY-CODE BUG" in str(c)
+    ]
+    assert not proxy_bug_logs, (
+        "Upstream stream errors must not be classified as proxy-code bugs"
     )
 
 

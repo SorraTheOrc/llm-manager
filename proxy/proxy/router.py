@@ -38,7 +38,7 @@ from proxy.observability import (  # noqa: E402
     _record_backend_signal,
 )
 from proxy.session import (  # noqa: E402
-    SessionSingleFlightRejected,
+    SessionSingleFlightRejectedError,
     _build_slot_context,
     _detect_restore_signal_from_llama_log,
     _detect_restore_signal_from_log_slice,
@@ -78,6 +78,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_local_active_queries,
     _decrement_per_model_query,
     _estimate_tokens_sent,
+    _extend_lease_during_prefill,
     _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
@@ -503,54 +504,6 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     if not srv.backend_ready or srv.llama_process is None:
         return _build_backend_unavailable_response(srv, path)
 
-    # LP-0MRXZU90M007WNWT: Check if the proxy is in drain mode for a
-    # scheduled slot-count transition.  When draining, new requests receive
-    # a 503 with a retry-after header so clients can retry after the
-    # transition completes.
-    # LP-0MRXZU90M007WNWT: Check if the proxy is in drain mode for a
-    # scheduled slot-count transition.  Only checks the module-level
-    # ``draining`` flag when it is explicitly set to True in the real
-    # server module (not auto-created by Mock).  We use a string check
-    # on the class name to avoid false positives from MagicMock.
-    _draining = None
-    try:
-        _draining = getattr(srv, 'draining', None)
-    except Exception:
-        pass
-    if _draining is True:  # explicitly True, not a mock attribute
-        drain_retry_after = 15  # default retry-after in seconds
-        try:
-            scheduler = getattr(srv, 'slot_scheduler', None)
-            if scheduler is not None and hasattr(scheduler, '_config'):
-                drain_retry_after = max(15, scheduler._config.drain_minutes * 60)
-        except Exception:
-            pass
-
-        srv.logger.info(
-            "drain_active: refusing new request, retry_after=%ds",
-            drain_retry_after,
-        )
-        record_http_error("v1/chat/completions", "5xx", "draining")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": {
-                    "type": "service_unavailable",
-                    "code": "draining",
-                    "message": (
-                        "Draining workloads for scheduled slot-count change "
-                        "— please retry shortly"
-                    ),
-                },
-                "status": 503,
-                "retry_after": drain_retry_after,
-            },
-            headers={
-                "Retry-After": str(drain_retry_after),
-                "Cache-Control": "no-store",
-            },
-        )
-
     # Get request body (keep original for logging before any modifications)
     body = await request.body()
     body_for_logging = body
@@ -767,10 +720,16 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # check above ran (session_id and session_explicit), _try_acquire_local_dispatch
     # already incremented local_active_queries and created the dispatch record.
     if not (session_id and session_explicit):
+        # Anonymous/non-explicit sessions: apply the adaptive lease timeout
+        # for large prompts so the lease covers the prefill phase (which
+        # produces no stream chunks to refresh it) instead of expiring after
+        # the base 60s and being orphan-cleaned mid-prefill
+        # (LP-0MSEHMMBK0062ZPI).
         await _increment_local_active_queries(
             srv,
             session_key=session_id,
             backend="local",
+            body_json=body_json if isinstance(body_json, dict) else None,
         )
 
     # Token accounting
@@ -1035,6 +994,20 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             )
                             _heartbeat_interval = stream_heartbeat_interval
                             remaining_budget = runtime_budget
+                            # ── Prefill-phase dispatch-lease tracking ──
+                            # The prefill phase emits no stream data chunks, so
+                            # the chunk-based lease refresh below never fires;
+                            # instead we poll llama-server for observed prefill
+                            # progress on the heartbeat branch and extend the
+                            # lease while progress advances (LP-0MSE05J53004C6EL).
+                            _saw_actual_data = False
+                            _last_prefill_poll = 0.0
+                            _prefill_progress = 0
+                            _prefill_poll_seconds = float(
+                                server_config.get(
+                                    "local_dispatch_lease_prefill_poll_seconds", 10
+                                ) or 10
+                            )
                             while True:
                                 _hb_task = asyncio.ensure_future(
                                     asyncio.sleep(_heartbeat_interval)
@@ -1060,6 +1033,39 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         )
                                         break
                                     remaining_budget -= _heartbeat_interval
+                                    # ── Prefill-phase lease extension ──
+                                    # While the request is still in the prefill
+                                    # phase (no actual data chunk yet) and the
+                                    # session is explicit, poll llama-server for
+                                    # observed prefill progress at the configured
+                                    # cadence and extend the dispatch lease by
+                                    # the safety buffer while progress advances.
+                                    # This covers very large prefills beyond the
+                                    # adaptive token-estimate cap (1500s); the
+                                    # existing chunk-refresh path takes over once
+                                    # the first data chunk arrives.
+                                    if (
+                                        not _saw_actual_data
+                                        and session_id
+                                        and session_explicit
+                                        and _prefill_poll_seconds > 0
+                                    ):
+                                        _now_ts = time.monotonic()
+                                        if (
+                                            _now_ts - _last_prefill_poll
+                                            >= _prefill_poll_seconds
+                                        ):
+                                            _last_prefill_poll = _now_ts
+                                            _prefill_progress, _extended = (
+                                                await _extend_lease_during_prefill(
+                                                    srv,
+                                                    session_id,
+                                                    llama_port=llama_port,
+                                                    model_name=model_name,
+                                                    slot_id=slot_id,
+                                                    last_progress=_prefill_progress,
+                                                )
+                                            )
                                     # Build heartbeat JSON with token progress (LP-0MRDFUHMP005SFU2)
                                     _pct = (
                                         round(completion_tokens_total / max_completion_tokens * 100, 1)
@@ -1175,6 +1181,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                                 if _has_actual_data:
                                     remaining_budget = float(stream_idle_timeout)
+                                    # Prefill phase is over: the first actual data
+                                    # chunk has arrived, so stop progress-based
+                                    # lease extension — the chunk-refresh path
+                                    # below takes over (LP-0MSE05J53004C6EL).
+                                    _saw_actual_data = True
 
                                 # Refresh dispatch lease expiry for long-running
                                 # streams (LP-0MRDKV44T003FRBP).  Extend the lease
@@ -1298,14 +1309,33 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             # Log and let the finally block handle cleanup so backend_ready
                             # is not spuriously set to False (which would cooldown the
                             # local provider and trigger fallback to remotes).
+                            #
+                            # Proxy-code bug classification (LP-0MSDRRPV0001TCLX):
+                            # NameError/AttributeError raised in the loop are proxy-side
+                            # coding bugs (undefined name / bad attribute access), never an
+                            # upstream fault. On Aug 3 a missing import raised NameError 3x
+                            # and was masked as a generic stream error with no traceback.
+                            # Log a full traceback for these so they are self-diagnosing,
+                            # while still emitting the synthetic finish_reason:error / [DONE]
+                            # terminal events clients depend on.
                             try:
                                 _error_type = type(exc).__name__
-                                srv.logger.warning(
-                                    "Stream error: session=%s provider=local model=%s error=%s",
-                                    session_id or "unknown",
-                                    model_name,
-                                    _error_type,
-                                )
+                                if isinstance(exc, (NameError, AttributeError)):
+                                    srv.logger.exception(
+                                        "PROXY-CODE BUG in local stream loop: %s - this "
+                                        "is NOT an upstream stream error (session=%s "
+                                        "provider=local model=%s); fix router.py",
+                                        _error_type,
+                                        session_id or "unknown",
+                                        model_name,
+                                    )
+                                else:
+                                    srv.logger.warning(
+                                        "Stream error: session=%s provider=local model=%s error=%s",
+                                        session_id or "unknown",
+                                        model_name,
+                                        _error_type,
+                                    )
                             except Exception:
                                 pass
                             # Synthesize a final SSE event so the client receives a
@@ -1428,7 +1458,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                         headers=outgoing_headers,
                         status_code=upstream_status,
                     )
-        except SessionSingleFlightRejected as exc:
+        except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=False,
@@ -1599,7 +1629,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             decrement_local=True,
                             session_explicit=session_explicit,
                         )
-        except SessionSingleFlightRejected as exc:
+        except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=True,

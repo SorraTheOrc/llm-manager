@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MSI4ZIF60064EOR
+# smell: modernization
+# severity: medium
+# description: Use format specifiers instead of percent format
+# -->
 """
 Provider Module
 
@@ -539,8 +545,15 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     ``finish_reason=length`` (context exhaustion) — surfaced by pi as the
     misleading "maximum output token limit" error (LP-0MSAZXXDY005AWA1).
 
-    Clamping the effective thresholds to the actual per-slot context makes
-    oversized prompts fall through to remote BEFORE context exhaustion.
+    The warm threshold is clamped to the actual per-slot context because it
+    represents a **hard capacity limit**: total context exceeding the slot
+    must be routed remote to prevent context exhaustion.
+
+    The cold threshold is an **economic new-token threshold** and must NOT be
+    clamped — it defines the band (cold, warm] where the cached_ratio routing
+    check (Check 2 in ``_should_skip_local``) operates. Clamping cold to the
+    same cap as warm collapses the band to zero width, making the ratio check
+    unreachable dead code (LP-0MSI2M5BT004BCDP).
 
     Returns the configured thresholds unchanged when ``local_model_ctx_size``
     is 0 (clamp disabled) or per-slot context cannot be computed.
@@ -554,8 +567,9 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     if cap <= 0:
         return cold, warm
 
-    if cold > 0:
-        cold = min(cold, cap)
+    # Only clamp the WARM threshold to the per-slot cap (hard capacity limit).
+    # COLD stays as the economic new-token threshold so the (cold, warm] band
+    # remains non-empty for Check 2 (cached_ratio routing) to operate in.
     if warm > 0:
         warm = min(warm, cap)
     return cold, warm
@@ -1178,6 +1192,115 @@ def _get_cooldown_seconds(config: dict) -> float:
     if val is None:
         val = config.get("server", {}).get("provider_cooldown_seconds", 60)
     return float(val)
+
+
+def _chain_hold_enabled(config: dict) -> bool:
+    """Return True when the chain-hold feature is explicitly configured.
+
+    The feature is enabled when either ``chain_hold_seconds`` or
+    ``chain_hold_max_cycles`` is present (flat or ``server.*``). Production
+    config.yaml ships both (300s / 3 cycles). When neither is present the
+    fallback chain runs single-pass with no hold — exactly the legacy
+    behavior — so existing unit tests that pass minimal config dicts are
+    unaffected.
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    return (
+        "chain_hold_seconds" in config
+        or "chain_hold_seconds" in server_cfg
+        or "chain_hold_max_cycles" in config
+        or "chain_hold_max_cycles" in server_cfg
+    )
+
+
+def _get_chain_hold_seconds(config: dict) -> float:
+    """Read ``chain_hold_seconds`` from config (flat or ``server.*``).
+
+    Supports the same flat-first / nested-fallback pattern as
+    ``_get_cooldown_seconds`` for production configs loaded from
+    ``config.yaml``. Defaults to 300 (LP-0MSH94Z7K007VKC9 AC1/AC5).
+    """
+    val = config.get("chain_hold_seconds")
+    if val is None:
+        val = config.get("server", {}).get("chain_hold_seconds", 300)
+    try:
+        return max(0.0, float(val or 0))
+    except (ValueError, TypeError):
+        return 300.0
+
+
+def _get_chain_hold_max_cycles(config: dict) -> int:
+    """Read ``chain_hold_max_cycles`` from config (flat or ``server.*``).
+
+    0 = infinite (keep holding/retrying until the client disconnects).
+    Defaults to 3 (LP-0MSH94Z7K007VKC9 AC2/AC5).
+    """
+    val = config.get("chain_hold_max_cycles")
+    if val is None:
+        val = config.get("server", {}).get("chain_hold_max_cycles", 3)
+    try:
+        return max(0, int(val or 0))
+    except (ValueError, TypeError):
+        return 3
+
+
+def validate_chain_hold_config(config: dict) -> list[str]:
+    """Validate the chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5).
+
+    Checks that ``chain_hold_seconds`` and ``chain_hold_max_cycles`` (flat or
+    ``server.*``) are non-negative numbers when present, and flags the
+    pathological combination of a zero hold interval with an unlimited cycle
+    count (an unbounded busy-retry loop).
+
+    Returns a list of human-readable problem descriptions (empty when the
+    config is consistent).
+    """
+    problems: list[str] = []
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+
+    seconds = config.get("chain_hold_seconds")
+    if seconds is None:
+        seconds = server_cfg.get("chain_hold_seconds")
+    if seconds is not None:
+        try:
+            if float(seconds) < 0:
+                problems.append(
+                    "server.chain_hold_seconds must be >= 0 (got %r)" % (seconds,)
+                )
+        except (ValueError, TypeError):
+            problems.append(
+                "server.chain_hold_seconds must be a number (got %r)" % (seconds,)
+            )
+
+    max_cycles = config.get("chain_hold_max_cycles")
+    if max_cycles is None:
+        max_cycles = server_cfg.get("chain_hold_max_cycles")
+    if max_cycles is not None:
+        try:
+            if int(max_cycles) < 0:
+                problems.append(
+                    "server.chain_hold_max_cycles must be >= 0 (got %r)" % (max_cycles,)
+                )
+        except (ValueError, TypeError):
+            problems.append(
+                "server.chain_hold_max_cycles must be an integer (got %r)"
+                % (max_cycles,)
+            )
+
+    # Unbounded busy-retry: zero hold interval with unlimited cycles.
+    try:
+        seconds_f = float(seconds) if seconds is not None else None
+        cycles_i = int(max_cycles) if max_cycles is not None else None
+        if seconds_f is not None and cycles_i is not None and seconds_f == 0 and cycles_i == 0:
+            problems.append(
+                "server.chain_hold_seconds=0 with server.chain_hold_max_cycles=0 "
+                "(infinite) creates an unbounded retry loop; set a positive hold "
+                "interval or a finite cycle bound"
+            )
+    except (ValueError, TypeError):
+        pass
+
+    return problems
 
 
 def _get_local_slot_retry_attempts(config: dict) -> int:
@@ -1879,6 +2002,28 @@ class StreamingRecoverableAfterReasoningError(Exception):
         super().__init__(f"mid-stream stall after reasoning for {provider_name}: {reason}")
 
 
+class ChainExhaustedError(Exception):
+    """Raised when a fallback chain CYCLE exhausts every provider.
+
+    This is the distinguishable exhaustion signal at the chain-hold wrapper
+    boundary (LP-0MSH94Z7K007VKC9): the fallback cycle functions raise it from
+    their exhaustion tail instead of returning an error response, so the
+    cycle-hold wrapper can decide whether to hold + restart a new cycle from
+    the first provider, or return the carried response verbatim once the hold
+    bound is reached. Genuine mid-stream failures NEVER raise this — they
+    re-route inside the cycle or return a normal (non-exhaustion) response.
+
+    Attributes:
+        response: The response the exhausted chain would have returned
+            (503 "All providers exhausted", first-provider error, time-window
+            exhaustion, etc.).
+    """
+
+    def __init__(self, response: Response):
+        self.response = response
+        super().__init__(f"provider chain exhausted: status={getattr(response, 'status_code', '?')}")
+
+
 def _classify_stream_chunk(chunk: bytes) -> tuple[bool, bool, bool, bool, bool]:
     """Classify one raw SSE chunk for pre-content recovery pre-flight.
 
@@ -2361,6 +2506,16 @@ def _resolve_reasoning_content_promotion(
 
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
+
+    Consistency note (LP-0MSEHOE7B005DE08): since the placeholder change,
+    thinking-only responses (``reasoning_content`` present, no tool call)
+    are extracted as the non-empty placeholder ``"Thinking..."`` by
+    ``_extract_assistant_content``, so ``_is_empty_response`` returns False
+    and the fallback chain treats them as plain successes without reaching
+    this function. This function remains the safety net for bodies whose raw
+    text contains the ``reasoning_content`` key but where extraction found
+    nothing usable (e.g. an empty ``reasoning_content`` value) - those still
+    count as promoted successes rather than triggering cooldown/fallback.
     """
     body_l = (body_text or "").lower()
     if "reasoning_content" in body_l:
@@ -2413,18 +2568,336 @@ def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
     return unavailable
 
 
-async def proxy_with_remote_fallback(
+# ---------------------------------------------------------------------------
+# Chain-hold retry (LP-0MSH94Z7K007VKC9)
+#
+# When a fallback chain CYCLE exhausts every provider, the request is held for
+# ``server.chain_hold_seconds`` (default 300) — giving short cooldowns
+# (provider cooldown, stall circuit breaker, time-window edges) time to
+# expire — then a NEW cycle starts from the FIRST provider with fresh
+# per-request state. The number of hold-retry cycles is bounded by
+# ``server.chain_hold_max_cycles`` (default 3; 0 = infinite).
+#
+# The hold only defers the exhaustion verdict: successful responses, provider
+# ordering, and existing cooldown/circuit-breaker behavior are unchanged.
+# Streaming requests receive periodic SSE comment lines
+# (``: chain exhausted (...); retrying from <first> in <Ns>``) so the client
+# can surface live progress; non-streaming requests are held silently
+# (deferred). A client disconnect aborts the hold promptly.
+#
+# The feature is enabled when either config key is present (flat or
+# ``server.*``); production config.yaml ships both (300s / 3 cycles).
+# ---------------------------------------------------------------------------
+
+
+def _first_provider_name(model_config: dict) -> str:
+    """Return the name of the first provider in the chain.
+
+    Used for the ``retrying from <first-model>`` hold-feedback comment: a new
+    cycle always restarts from the first provider.
+    """
+    providers = model_config.get("providers") or []
+    for p in providers:
+        if isinstance(p, dict):
+            return str(p.get("name") or p.get("provider") or "unknown")
+    return "unknown"
+
+
+def _exhaustion_diagnostics(response: Response) -> str:
+    """Extract a compact provider-diagnostics string from an exhaustion response.
+
+    Reads the ``error``, ``unavailable_providers`` and ``diagnostics`` fields
+    of the exhausted 503 payload (built by ``_build_exhausted_response``) so
+    the hold-feedback comment can tell the client which providers were
+    unavailable and why. Returns "" when the body is not a JSON payload.
+    """
+    try:
+        body_text = _response_body_text(response)
+        payload = json.loads(body_text) if body_text else None
+        if isinstance(payload, dict):
+            bits: list[str] = []
+            err = payload.get("error")
+            if isinstance(err, str) and err:
+                bits.append(f"error={err}")
+            unavail = payload.get("unavailable_providers")
+            if isinstance(unavail, dict) and unavail:
+                bits.append(f"unavailable={unavail}")
+            diag = payload.get("diagnostics")
+            if isinstance(diag, list) and diag:
+                bits.append(f"attempts={len(diag)}")
+            if bits:
+                return ", ".join(bits)[:512]
+    except Exception:
+        pass
+    return ""
+
+
+def _build_chain_hold_comment(first_provider: str, hold_seconds: float, diagnostics: str) -> str:
+    """Build the SSE hold-feedback comment line.
+
+    Mirrors the existing ``: re-route provider=a->b reason=...`` comment
+    format (LP-0MSF1PUM90099ZSW)::
+
+        : chain exhausted (<provider diagnostics>); retrying from <first> in <Ns>
+
+    Clients may surface these comment lines as live progress while the
+    request is held (companion item SA-0MSHAKSEA001LQ6T).
+    """
+    return (
+        f": chain exhausted ({diagnostics}); retrying from {first_provider} "
+        f"in {int(hold_seconds)}s"
+    )
+
+
+async def _request_is_streaming(request) -> bool:
+    """Return True when the request asks for an SSE stream (``stream: true``).
+
+    Best-effort: reads the (Starlette-cached) request body; defaults to False
+    when the body cannot be read or parsed.
+    """
+    try:
+        raw = await request.body()
+        payload = json.loads(raw) if raw else {}
+        return bool(payload.get("stream", False))
+    except Exception:
+        return False
+
+
+async def _hold_sleep(request, seconds: float) -> bool:
+    """Silent (non-streaming) hold: sleep *seconds* with periodic disconnect
+    checks.
+
+    Returns True when the client disconnected during the hold (caller should
+    abort the hold, AC4), False when the full hold elapsed.
+    """
+    if seconds <= 0:
+        return False
+    interval = min(1.0, max(0.05, seconds / 20))
+    remaining = seconds
+    while remaining > 0:
+        try:
+            if await request.is_disconnected():
+                return True
+        except Exception:
+            pass
+        slice_ = min(interval, remaining)
+        await asyncio.sleep(slice_)
+        remaining -= slice_
+    return False
+
+
+async def _hold_feedback(request, hold_seconds: float, comment: str):
+    """Async generator: emit *comment* as an SSE line, periodically, while
+    sleeping *hold_seconds*.
+
+    Aborts (stops yielding) as soon as the client disconnects (AC4). A
+    zero-length hold still emits one comment so the client sees the hold
+    start.
+    """
+    comment_bytes = (comment + "\n\n").encode("utf-8")
+    if hold_seconds <= 0:
+        yield comment_bytes
+        return
+    interval = min(30.0, max(0.1, hold_seconds / 10))
+    remaining = hold_seconds
+    while remaining > 0:
+        try:
+            if await request.is_disconnected():
+                return
+        except Exception:
+            pass
+        yield comment_bytes
+        slice_ = min(interval, remaining)
+        await asyncio.sleep(slice_)
+        remaining -= slice_
+
+
+def _response_body_bytes(response: Response) -> bytes:
+    """Best-effort extraction of the raw body bytes of a plain Response."""
+    try:
+        if hasattr(response, "body"):
+            b = response.body
+            return b if isinstance(b, bytes) else str(b).encode("utf-8")
+        if hasattr(response, "content"):
+            b = response.content
+            return b if isinstance(b, bytes) else str(b).encode("utf-8")
+    except Exception:
+        pass
+    return b""
+
+
+def _response_to_sse_bytes(response: Response) -> bytes:
+    """Serialize a plain Response body as one SSE ``data:`` chunk.
+
+    Used to deliver the terminal exhaustion/error response inside a streaming
+    hold, where the stream already started with 200 + hold comments.
+    """
+    body = _response_body_bytes(response)
+    if not body:
+        return b"data: {}\n\n"
+    if body.lstrip().startswith(b"data:"):
+        return body
+    return b"data: " + body + b"\n\n"
+
+
+def _log_chain_hold_start(path: str, hold_seconds: float, cycle: int, max_cycles: int) -> None:
+    """Log the start of a chain hold (operator-visible, mirrors the existing
+    re-route / exhausted log lines)."""
+    logger.warning(
+        "Chain exhausted for model=%s; holding %.0fs before restarting cycle "
+        "from the first provider (cycle=%d, max_cycles=%s)",
+        path,
+        hold_seconds,
+        cycle,
+        max_cycles if max_cycles else "infinite",
+    )
+
+
+def _build_streaming_hold_response(
+    request,
+    path: str,
+    model_config: dict,
+    config: dict,
+    cycle_fn,
+    next_cycle: int,
+    max_cycles: int,
+    hold_seconds: float,
+    exhaustion_response: Response,
+) -> StreamingResponse:
+    """Build the streaming response that delivers the chain hold (AC3/AC4).
+
+    The generator:
+    1. emits ``: chain exhausted (...)`` SSE comment lines periodically while
+       sleeping *hold_seconds* (disconnect-aware — AC4);
+    2. runs the next chain cycle from the FIRST provider;
+    3. on success, replays the cycle's response body after the comments;
+    4. on exhaustion, repeats from step 1 until the cycle bound is reached,
+       then emits the terminal exhaustion body as an SSE ``data:`` chunk.
+    """
+    first_provider = _first_provider_name(model_config)
+
+    async def _gen():
+        cycle = next_cycle
+        current_exhaustion = exhaustion_response
+        while True:
+            _log_chain_hold_start(path, hold_seconds, cycle, max_cycles)
+            comment = _build_chain_hold_comment(
+                first_provider,
+                hold_seconds,
+                _exhaustion_diagnostics(current_exhaustion),
+            )
+            async for c in _hold_feedback(request, hold_seconds, comment):
+                yield c
+            try:
+                if await request.is_disconnected():
+                    return
+            except Exception:
+                pass
+            try:
+                result = await cycle_fn(request, path, model_config, config)
+            except ChainExhaustedError as exc:
+                if max_cycles != 0 and cycle >= max_cycles:
+                    yield _response_to_sse_bytes(exc.response)
+                    return
+                current_exhaustion = exc.response
+                cycle += 1
+                continue
+            # Success — replay the cycle's response body (streaming or plain).
+            if _is_streaming_response(result):
+                async for chunk in result.body_iterator:
+                    yield chunk
+            else:
+                yield _response_to_sse_bytes(result)
+            return
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _run_chain_cycles(
+    request,
+    path: str,
+    model_config: dict,
+    config: dict,
+    cycle_fn,
+) -> Response:
+    """Run the provider chain with cycle-hold semantics.
+
+    Each call to *cycle_fn* runs one full fallback cycle from the FIRST
+    provider with fresh per-request state; on exhaustion it raises
+    :class:`ChainExhaustedError` carrying the exhaustion response.
+
+    When the chain-hold feature is enabled (``chain_hold_seconds`` and/or
+    ``chain_hold_max_cycles`` configured), an exhausted cycle holds the
+    request for ``chain_hold_seconds`` (default 300) before starting a NEW
+    cycle, so short cooldowns (provider cooldown, stall circuit breaker,
+    time-window edges) can expire. The number of hold-retry cycles is bounded
+    by ``chain_hold_max_cycles`` (default 3; 0 = infinite). After the bound
+    the exhaustion response is returned unchanged.
+
+    Streaming requests receive periodic SSE hold-feedback comments (AC3);
+    non-streaming requests are held silently (deferred). A client disconnect
+    aborts the hold promptly (AC4).
+
+    When the feature is not configured, *cycle_fn* is run exactly once —
+    legacy single-pass behavior with no hold.
+    """
+    if not _chain_hold_enabled(config):
+        try:
+            return await cycle_fn(request, path, model_config, config)
+        except ChainExhaustedError as exc:
+            return exc.response
+
+    hold_seconds = _get_chain_hold_seconds(config)
+    max_cycles = _get_chain_hold_max_cycles(config)
+
+    cycle = 0
+    while True:
+        try:
+            return await cycle_fn(request, path, model_config, config)
+        except ChainExhaustedError as exc:
+            if max_cycles != 0 and cycle >= max_cycles:
+                return exc.response
+            _log_chain_hold_start(path, hold_seconds, cycle, max_cycles)
+            if await _request_is_streaming(request):
+                # Streaming: return a streaming response that emits SSE hold
+                # comments, sleeps, then runs the remaining cycles inside the
+                # generator (AC3). Cycle 0 already ran; resume at cycle + 1.
+                return _build_streaming_hold_response(
+                    request,
+                    path,
+                    model_config,
+                    config,
+                    cycle_fn,
+                    next_cycle=cycle + 1,
+                    max_cycles=max_cycles,
+                    hold_seconds=hold_seconds,
+                    exhaustion_response=exc.response,
+                )
+            # Non-streaming: silent (deferred) hold, then a new cycle from
+            # the first provider.
+            if await _hold_sleep(request, hold_seconds):
+                # Client disconnected during the hold — abort (AC4).
+                return exc.response
+            cycle += 1
+
+
+async def _proxy_with_remote_fallback_cycle(
     request,
     path: str,
     model_config: dict,
     config: dict,
 ) -> Response:
-    """Proxy a request to a remote model with provider fallback.
+    """Proxy a request to a remote model with provider fallback (one cycle).
 
     Iterates through the model's configured providers (in order) and
     returns the first successful response.  On failure (connection error
     or HTTP status >= 400), the provider is marked with a cooldown and
     the next provider is tried.
+
+    Runs ONE cycle: when every provider is exhausted, raises
+    :class:`ChainExhaustedError` carrying the exhaustion response so the
+    cycle-hold wrapper (``proxy_with_remote_fallback``) can hold + restart
+    from the first provider (LP-0MSH94Z7K007VKC9).
 
     Args:
         request: The incoming FastAPI Request.
@@ -2433,8 +2906,11 @@ async def proxy_with_remote_fallback(
         config: Server configuration dict (for ``provider_cooldown_seconds``).
 
     Returns:
-        A ``Response`` from a successful provider, or a 503/429 error
-        response if all providers are exhausted.
+        A ``Response`` from a successful provider.
+
+    Raises:
+        ChainExhaustedError: when all providers are exhausted (the carried
+            response is the 503/429/error response the cycle would return).
     """
     cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
@@ -2708,17 +3184,19 @@ async def proxy_with_remote_fallback(
         attempts, unavailable, any_provider_tried,
     )
     if time_window_exhausted is not None:
-        return time_window_exhausted
+        raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
-        return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+        raise ChainExhaustedError(
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+        )
 
     if first_model_loading_response is not None:
         logger.info(
             "Returning model_loading response instead of generic exhausted message for model=%s",
             path,
         )
-        return first_model_loading_response
+        raise ChainExhaustedError(first_model_loading_response)
 
     # AC3 (LP-0MSGU3JNU0092AFQ): never surface the raw upstream
     # reasoning_content round-trip 400 (or a 503 whose diagnostics leak it);
@@ -2729,24 +3207,66 @@ async def proxy_with_remote_fallback(
             "returning synthetic error instead of raw upstream body",
             path,
         )
-        return _build_reasoning_content_roundtrip_error()
+        raise ChainExhaustedError(_build_reasoning_content_roundtrip_error())
 
-    return _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
+    raise ChainExhaustedError(
+        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
+    )
 
 
-async def proxy_with_fallback(
+async def proxy_with_remote_fallback(
     request,
     path: str,
     model_config: dict,
     config: dict,
 ) -> Response:
-    """Proxy a request with fallback across both local and remote providers.
+    """Proxy a request to a remote model with provider fallback and chain-hold
+    retry semantics (LP-0MSH94Z7K007VKC9).
+
+    Runs the provider chain; when every provider in the fallback chain is
+    exhausted (final model unavailable), the request is HELD for
+    ``server.chain_hold_seconds`` (default 300) and a NEW cycle starts from
+    the FIRST provider — giving short cooldowns time to expire instead of
+    erroring immediately. Streaming requests receive periodic SSE feedback
+    comments (``: chain exhausted (...); retrying from <first> in <Ns>``);
+    non-streaming requests are held silently. The number of hold-retry cycles
+    is bounded by ``server.chain_hold_max_cycles`` (default 3; 0 = infinite);
+    after the bound the exhaustion response is returned unchanged. A client
+    disconnect aborts the hold promptly.
+
+    Args:
+        request: The incoming FastAPI Request.
+        path: The API path to proxy (e.g., ``v1/chat/completions``).
+        model_config: Model configuration dict with a ``providers`` list.
+        config: Server configuration dict (for ``provider_cooldown_seconds``).
+
+    Returns:
+        A ``Response`` from a successful provider, or the 503/429 exhaustion
+        response once the hold-retry bound is reached.
+    """
+    return await _run_chain_cycles(
+        request, path, model_config, config, _proxy_with_remote_fallback_cycle,
+    )
+
+
+async def _proxy_with_fallback_cycle(
+    request,
+    path: str,
+    model_config: dict,
+    config: dict,
+) -> Response:
+    """Proxy a request with fallback across both local and remote providers (one cycle).
 
     Iterates through the model's configured providers (in order) and
     tries each one.  Local providers are dispatched via ``proxy_to_local``,
     remote providers via ``proxy_to_remote``.  On failure (connection error,
     HTTP status >= 400 for remote, slot exhaustion for local), the provider
     enters cooldown and the next provider is tried.
+
+    Runs ONE cycle: when every provider is exhausted, raises
+    :class:`ChainExhaustedError` carrying the exhaustion response so the
+    cycle-hold wrapper (``proxy_with_fallback``) can hold + restart from the
+    first provider (LP-0MSH94Z7K007VKC9).
 
     Args:
         request: The incoming FastAPI Request.
@@ -2755,8 +3275,11 @@ async def proxy_with_fallback(
         config: Server configuration dict.
 
     Returns:
-        A ``Response`` from a successful provider, or a 503/429 error
-        response if all providers are exhausted.
+        A ``Response`` from a successful provider.
+
+    Raises:
+        ChainExhaustedError: when all providers are exhausted (the carried
+            response is the 503/429/error response the cycle would return).
     """
     cooldown_seconds = _get_cooldown_seconds(config)
     local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
@@ -2870,9 +3393,11 @@ async def proxy_with_fallback(
                 # (LP-0MRP44W7I0085I6N). Uses cached_tokens ratio from the last
                 # local response instead of inferred cache-cold state.
                 _llama_model = provider_cfg.get("llama_model", "")
-                # Clamp configured thresholds to the actual per-slot context so
+                # Clamp the WARM threshold to the actual per-slot context so
                 # prompts that cannot fit the KV slot fall through to remote
-                # BEFORE context exhaustion (LP-0MSAZXXDY005AWA1).
+                # BEFORE context exhaustion (LP-0MSAZXXDY005AWA1). COLD stays
+                # as the economic new-token threshold so the (cold, warm] band
+                # keeps the cached_ratio check reachable (LP-0MSI2M5BT004BCDP).
                 _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
                     config
                 )
@@ -3536,14 +4061,18 @@ async def proxy_with_fallback(
         attempts, unavailable, any_provider_tried,
     )
     if time_window_exhausted is not None:
-        return time_window_exhausted
+        raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
-        return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+        raise ChainExhaustedError(
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+        )
 
     # If all failures were slot exhaustion, include total slots in message
     if all_slot_exhaustion:
-        return _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts)
+        raise ChainExhaustedError(
+            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts)
+        )
 
     # When all providers are exhausted, return the first provider's actual
     # error response instead of the generic "All providers exhausted"
@@ -3574,13 +4103,50 @@ async def proxy_with_fallback(
                 "returning synthetic error instead of raw upstream body",
                 path,
             )
-            return _build_reasoning_content_roundtrip_error()
+            raise ChainExhaustedError(_build_reasoning_content_roundtrip_error())
         else:
             logger.info(
                 "Returning first provider error response instead of generic exhausted "
                 "message for model=%s (status=%s)",
                 path, _first_error_response.status_code,
             )
-            return _first_error_response
+            raise ChainExhaustedError(_first_error_response)
 
-    return _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+    raise ChainExhaustedError(
+        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+    )
+
+
+async def proxy_with_fallback(
+    request,
+    path: str,
+    model_config: dict,
+    config: dict,
+) -> Response:
+    """Proxy a request with fallback across both local and remote providers,
+    with chain-hold retry semantics (LP-0MSH94Z7K007VKC9).
+
+    Runs the provider chain; when every provider in the fallback chain is
+    exhausted (final model unavailable), the request is HELD for
+    ``server.chain_hold_seconds`` (default 300) and a NEW cycle starts from
+    the FIRST provider — giving short cooldowns time to expire instead of
+    erroring immediately. Streaming requests receive periodic SSE feedback
+    comments (``: chain exhausted (...); retrying from <first> in <Ns>``);
+    non-streaming requests are held silently. The number of hold-retry cycles
+    is bounded by ``server.chain_hold_max_cycles`` (default 3; 0 = infinite);
+    after the bound the exhaustion response is returned unchanged. A client
+    disconnect aborts the hold promptly.
+
+    Args:
+        request: The incoming FastAPI Request.
+        path: The API path to proxy.
+        model_config: Model configuration dict with a ``providers`` list.
+        config: Server configuration dict.
+
+    Returns:
+        A ``Response`` from a successful provider, or the 503/429 exhaustion
+        response once the hold-retry bound is reached.
+    """
+    return await _run_chain_cycles(
+        request, path, model_config, config, _proxy_with_fallback_cycle,
+    )

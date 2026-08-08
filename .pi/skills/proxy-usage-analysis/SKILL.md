@@ -60,6 +60,21 @@ Options:
 | `--json` | off | Print a machine-readable JSON summary instead of the text summary |
 | `--quiet` | off | Suppress the stdout summary |
 
+## Automated daily run
+
+A cron job runs the report automatically every day at 05:00 (output logged
+to `~/proxy-usage-reports/cron.log` so each run's summary and any failures
+are visible):
+
+```cron
+0 5 * * * cd /home/rgardler/projects/llm && python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py >> ~/proxy-usage-reports/cron.log 2>&1
+```
+
+Each run archives the previous day's outputs into a dated subdirectory (see
+[Archival](#archival)), so a historical daily report accumulates under
+`~/proxy-usage-reports/YYYY-MM-DD/`. `cron.log` is not an analysis artifact
+and stays at the root, untouched by archival.
+
 ## Outputs
 
 Written to `--output-dir` (default `~/proxy-usage-reports`):
@@ -96,10 +111,26 @@ back), fallback reason (empty if never fell back), bucket, slots,
 local/remote request counts, dispatch denials, decode tok/s (derived from
 local completion tokens ÷ local active span; empty when not derivable).
 
+### Archival
+
+Before writing fresh outputs, the script moves any existing artifacts
+(`report.md`, `daytime_sessions.csv`, `nighttime_sessions.csv`, `errors.csv`,
+`errors.json`) into a dated subdirectory named by the **run date**
+(`YYYY-MM-DD/`); when that directory already exists (a same-day repeat, or a
+manual archive), a `_2`, `_3` … suffix is appended so archives are never
+overwritten. Only the skill's own artifacts are moved — anything else in the
+output dir (e.g. `cron.log`) stays put, and a pristine output dir is left
+touched-free (no empty archive dirs). The CLI prints the archive path on each
+run (`Previous outputs archived to …`).
+
 ## How it works
 
-1. **File discovery** — the live `proxy.log` plus every rotated file whose
-   name-encoded rotation time is at/after the window start.
+1. **File discovery** — the live `proxy.log` plus every rotated sibling
+   (`proxy.log.YYYY-MM-DD_HH`). All rotated files are included regardless of
+   their name-encoded timestamp: in this deployment a rotated file routinely
+   holds data well past its encoded rotation time, so a name-based inclusion
+   test would silently drop in-window data. Per-line timestamp filtering in
+   step 2 is the authoritative window boundary.
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
@@ -212,8 +243,9 @@ lines (`proxy.log` and `llama-server.log`).
 - `Fallback triggered` lines carry no session UUID; per-session attribution
   prefers the session's own `routing_skip_local` line and otherwise the
   nearest fallback event within 60s of the first remote stream.
-- Sessions spanning a slot-schedule transition may observe 503s during the
-  drain window; those are expected, not errors.
+- Sessions spanning a slot-schedule transition may observe a brief restart
+  interruption (llama-server is restarted immediately at the transition time);
+  since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
   window; the day/night bucket is keyed by its first in-window stream.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events

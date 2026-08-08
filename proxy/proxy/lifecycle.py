@@ -223,7 +223,7 @@ def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitt
 
 def _estimate_prompt_tokens(body_json: dict) -> int:
     """Estimate prompt token count from request body.
-    
+
     Returns estimated token count based on message content length.
     Uses a heuristic of ~4 bytes per token for UTF-8 text.
     """
@@ -256,9 +256,9 @@ def _compute_adaptive_timeout(
     max_timeout: float,
 ) -> float:
     """Compute adaptive timeout based on prompt size.
-    
+
     Timeout = min(base_timeout + per_token_timeout * estimated_tokens, max_timeout)
-    
+
     This allows larger prompts to have longer timeouts while keeping
     a reasonable upper bound.
     """
@@ -355,13 +355,13 @@ def get_model_config(model_name: str | None) -> dict | None:
     srv = _srv()
     """
     Get model configuration by name or alias.
-    
+
     Supports wildcard patterns in aliases using fnmatch syntax:
     - '*' matches any sequence of characters
     - '?' matches any single character
     - '[seq]' matches any character in seq
     - '[!seq]' matches any character not in seq
-    
+
     Examples:
     - 'gpt*' matches 'gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'
     - 'claude-3-*' matches 'claude-3-opus', 'claude-3-sonnet'

@@ -523,12 +523,12 @@ class TestSessionSingleFlightCoordinator:
 
     @pytest.mark.asyncio
     async def test_reject_mode_rejects_second_inflight_request(self):
-        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejectedError
 
         coordinator = SessionSingleFlightCoordinator()
 
         async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
-            with pytest.raises(SessionSingleFlightRejected) as excinfo:
+            with pytest.raises(SessionSingleFlightRejectedError) as excinfo:
                 async with coordinator.acquire("same-session", mode="reject", max_queue_depth=0):
                     pass
 
@@ -538,7 +538,7 @@ class TestSessionSingleFlightCoordinator:
 
     @pytest.mark.asyncio
     async def test_queue_mode_enforces_queue_depth(self):
-        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejectedError
 
         coordinator = SessionSingleFlightCoordinator()
         first_entered = asyncio.Event()
@@ -559,7 +559,7 @@ class TestSessionSingleFlightCoordinator:
         queued_task = asyncio.create_task(second_request())
         await asyncio.sleep(0.01)
 
-        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+        with pytest.raises(SessionSingleFlightRejectedError) as excinfo:
             async with coordinator.acquire("same-session", mode="queue", max_queue_depth=1):
                 pass
 
@@ -571,12 +571,12 @@ class TestSessionSingleFlightCoordinator:
 
     @pytest.mark.asyncio
     async def test_queue_timeout_raises_rejected_when_expired(self):
-        """AC1+AC3: Queue timeout fires and raises SessionSingleFlightRejected.
+        """AC1+AC3: Queue timeout fires and raises SessionSingleFlightRejectedError.
 
         When a queued request waits longer than queue_timeout_seconds, it
-        should receive a SessionSingleFlightRejected instead of hanging.
+        should receive a SessionSingleFlightRejectedError instead of hanging.
         """
-        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejected
+        from proxy.server import SessionSingleFlightCoordinator, SessionSingleFlightRejectedError
 
         coordinator = SessionSingleFlightCoordinator()
         first_entered = asyncio.Event()
@@ -593,7 +593,7 @@ class TestSessionSingleFlightCoordinator:
         await first_entered.wait()
 
         # Second request should time out quickly
-        with pytest.raises(SessionSingleFlightRejected) as excinfo:
+        with pytest.raises(SessionSingleFlightRejectedError) as excinfo:
             async with coordinator.acquire(
                 "timeout-session", mode="queue", max_queue_depth=8, queue_timeout_seconds=0.05
             ):
@@ -1077,8 +1077,8 @@ class TestToolCallFromReasoning:
         assert 'ls -la' in result
 
     def test_extract_assistant_content_from_sse_reasoning_no_tool_call(self):
-        """When reasoning_content has no tool call, promote reasoning text
-        as fallback so clients receive a usable assistant message."""
+        """When reasoning_content has no tool call, emit the 'Thinking...'
+        placeholder instead of promoting the thinking text into content."""
         from proxy.server import _extract_assistant_content_from_sse
 
         sse_text = (
@@ -1087,8 +1087,10 @@ class TestToolCallFromReasoning:
             'data: [DONE]\n'
         )
         result = _extract_assistant_content_from_sse(sse_text)
-        # Reasoning content is promoted as a fallback so clients see the response
-        assert result == "Just thinking about it..."
+        # The thinking text is NOT promoted into content (LP-0MSEHOE7B005DE08):
+        # a short hard-coded placeholder is returned instead to avoid
+        # bloating session history with replayed thinking text.
+        assert result == "Thinking..."
 
     def test_extract_assistant_content_from_sse_prefers_content_over_reasoning(self):
         """When both content and reasoning_content are present, prefer content."""
@@ -1124,8 +1126,8 @@ class TestToolCallFromReasoning:
         assert 'echo hi' in result
 
     def test_extract_assistant_content_non_streaming_reasoning_no_tool_call(self):
-        """Non-streaming: when reasoning_content has no tool call,
-        promote reasoning text as fallback so clients see it."""
+        """Non-streaming: when reasoning_content has no tool call, emit the
+        'Thinking...' placeholder instead of promoting the thinking text."""
         from proxy.server import _extract_assistant_content
 
         resp = {
@@ -1140,8 +1142,49 @@ class TestToolCallFromReasoning:
             ]
         }
         result = _extract_assistant_content(resp)
-        # Reasoning content is promoted as a fallback so clients see the response
-        assert result == "Just thinking quietly..."
+        # The thinking text is NOT promoted into content (LP-0MSEHOE7B005DE08):
+        # a short hard-coded placeholder is returned instead to avoid
+        # bloating session history with replayed thinking text.
+        assert result == "Thinking..."
+
+    def test_extract_assistant_content_non_streaming_empty_string_content_with_reasoning(self):
+        """Non-streaming: empty-string content plus reasoning text yields the
+        placeholder, not the thinking text (LP-0MSEHOE7B005DE08)."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Long thinking text that must stay in reasoning_content"
+                    }
+                }
+            ]
+        }
+        result = _extract_assistant_content(resp)
+        assert result == "Thinking..."
+
+    def test_extract_assistant_content_non_streaming_whitespace_content_with_reasoning(self):
+        """Non-streaming: whitespace-only content plus reasoning text yields
+        the placeholder, not the thinking text (LP-0MSEHOE7B005DE08)."""
+        from proxy.server import _extract_assistant_content
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "   ",
+                        "reasoning_content": "   "
+                    }
+                }
+            ]
+        }
+        # Whitespace-only reasoning does not count as thinking text either
+        result = _extract_assistant_content(resp)
+        assert result is None
 
     def test_extract_assistant_content_non_streaming_prefers_content(self):
         """Non-streaming: when content is present, ignore reasoning_content."""
@@ -1188,6 +1231,25 @@ class TestToolCallFromReasoning:
                         "role": "assistant",
                         "content": None,
                         "reasoning_content": "<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>"
+                    }
+                }
+            ]
+        }
+        assert _is_empty_response(None, resp) is False
+
+    def test_is_empty_response_with_plain_reasoning_not_empty(self):
+        """Thinking-only response (no tool call) is NOT empty: the placeholder
+        counts as content, preserving the promoted-success semantics so the
+        fallback chain does not trigger cooldown/retry (LP-0MSEHOE7B005DE08)."""
+        from proxy.server import _is_empty_response
+
+        resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "Let me think about this problem carefully..."
                     }
                 }
             ]

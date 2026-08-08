@@ -10,7 +10,6 @@ Tests cover:
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

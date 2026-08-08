@@ -10,7 +10,6 @@ and mock the backend llama-server with controlled SSE streaming.
 
 import json
 from collections.abc import AsyncGenerator
-from typing import List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
