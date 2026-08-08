@@ -502,6 +502,9 @@ server:
   # Prevents stuck requests from starving subsequent requests indefinitely.
   # Default: 120 seconds.
   session_single_flight_queue_timeout_seconds: 120
+  # Directory for KV-cache slot snapshots written by slot save/restore
+  # (llama-server prompt_save/prompt_load). Must be writable by the proxy
+  # user; retention is handled by scripts/cleanup-slot-cache.sh.
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   # Number of parallel sessions (GPU contexts) for local dispatch.
   # Controls how many concurrent Pi agent sessions can hold dispatch leases
@@ -567,6 +570,11 @@ server:
       - time: "10:00"
         slots: 3
 
+  # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
+  # The effective timeout is base + session_slot_timeout_per_token_seconds x
+  # estimated tokens, capped at session_slot_max_timeout_seconds (adaptive
+  # scaling defined below). 3.0s covers small-context saves; larger contexts
+  # get headroom from the per-token coefficient.
   session_slot_timeout_seconds: 3.0
   # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
   # Skip slot save/restore when the request context exceeds this many
