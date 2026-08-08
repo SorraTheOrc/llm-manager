@@ -485,11 +485,15 @@ server:
   #   expiry after each observed prefill progress advance. Must comfortably exceed
   #   the dispatch cleanup-loop cadence (~10s) so a refresh cannot lose to cleanup.
   #   Default 30.
-  # Reduced from 180s to 60s to prevent long cross-session blocking.
-  # The previous 180s timeout was conservative for inter-tool-call gaps
-  # (observed max ~60s). 60s safely covers those gaps while reducing
-  # cross-session blocking from 3 minutes to 1 minute (LP-0MRHV4UYE0013F6P).
-  local_dispatch_lease_timeout_seconds: 60
+  # Reduced from 180s to 60s to prevent long cross-session blocking, then
+  # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
+  # events) showed 100% of denies caused by idle lease holders, never GPU
+  # saturation (active>=3: 0). Inter-turn reclaim gaps: median 0.2s, p90 0.7s,
+  # p95 1.6s — well under 15s. Deny-avoidance simulation: T=15 avoids ~1/3 of
+  # denies (~9% model error). Prefill protection is preserved: the adaptive
+  # lease (60 + tokens x 0.015, cap 1500s) and prefill-progress extension apply
+  # to the in-flight request; only the post-stream cooldown (fixed base) shrinks.
+  local_dispatch_lease_timeout_seconds: 15
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   # Session single-flight queue timeout (LP-0MS14PM88007NNUJ).

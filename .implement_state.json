@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSF9RUSQ007M346",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSF9RUSQ007M346-eliminate-request-rejections-during-day",
+  "work_item_id": "LP-0MSKLI4FH0082TEB",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSKLI4FH0082TEB-reduce-local-dispatch-lease-timeout-from",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-07T20:48:49Z"
+  "started_at": "2026-08-08T16:51:10Z"
 }
