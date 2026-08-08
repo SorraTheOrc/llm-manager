@@ -25,6 +25,31 @@ from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
 
+
+def _resolve_client_ip(request: Request) -> tuple[str, str]:
+    """Resolve the client IP from the request.
+
+    Prefers reverse-proxy headers (X-Forwarded-For, X-Real-IP) when present
+    (reverse-proxy safe), falling back to the direct connection address.
+    Returns a ``(ip, source)`` tuple where source is ``"header"`` or
+    ``"direct"``.
+    """
+    # X-Forwarded-For: may contain "client, proxy1, proxy2" — take the first
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip(), "header"
+
+    # X-Real-IP: single address set by reverse proxy
+    xri = request.headers.get("x-real-ip")
+    if xri:
+        return xri.strip(), "header"
+
+    # Direct connection
+    if request.client:
+        return request.client.host, "direct"
+
+    return "unknown", "direct"
+
 # APIRouter for use by the main server app
 router = APIRouter()
 
@@ -292,7 +317,7 @@ def format_progress(
 # ---------------------------------------------------------------------------
 
 @router.get("/llama/local/status")
-async def get_llama_local_status():
+async def get_llama_local_status(request: Request):
     """Return a small JSON object describing local llama-server status.
 
     The endpoint is designed to be non-blocking even when the underlying
@@ -323,7 +348,10 @@ async def get_llama_local_status():
     (seconds, default 1.0).
 
     Each call is logged with a ``status_request`` structured message that
-    includes the response fields and request latency (ms).
+    includes the client IP (with source: header vs direct), the response
+    fields and request latency (ms). The client IP resolves via
+    X-Forwarded-For / X-Real-IP headers when present (reverse-proxy safe),
+    falling back to the direct connection address.
     """
     import os  # noqa: local import for config access
 
@@ -421,9 +449,12 @@ async def get_llama_local_status():
 
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
+    client_ip, client_ip_source = _resolve_client_ip(request)
     logger.info(
         "status_request",
         extra={
+            "client_ip": client_ip,
+            "client_ip_source": client_ip_source,
             "latency_ms": _latency_ms,
             "llama_server_running": llama_running,
             "active_query": active,

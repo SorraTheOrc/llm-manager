@@ -484,6 +484,47 @@ def _validate_prompt_configs(cfg: dict) -> None:
             ) from e
 
 
+def _format_log_value(value: object) -> str:
+    """Render an extra field value as its plain-text ``key=value`` form."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "None"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    return json.dumps(value, default=str)
+
+
+class KeyValueFormatter(logging.Formatter):
+    """Formatter that renders structured ``extra`` fields as ``key=value`` pairs.
+
+    The stock logging formatter only renders the message string and silently
+    drops the ``extra`` dict passed to ``logger.info(msg, extra={...})``.
+    This formatter appends each extra field (skipping reserved LogRecord
+    attributes) as ``key=value`` so structured payloads are visible in the
+    plain-text proxy.log, e.g.::
+
+        status_request client_ip=192.168.0.191 llama_server_running=true
+    """
+
+    # LogRecord attributes owned by the logging machinery (not our extras)
+    _RESERVED_ATTRS = frozenset(
+        logging.LogRecord("m", logging.INFO, "p", 0, None, None, None, None).__dict__.keys()
+        | {"message", "asctime", "taskName"}
+    )
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        pairs = []
+        for key, value in sorted(record.__dict__.items()):
+            if key in self._RESERVED_ATTRS:
+                continue
+            pairs.append(f"{key}={_format_log_value(value)}")
+        if not pairs:
+            return base
+        return f"{base} {' '.join(pairs)}"
+
+
 def setup_logging(config: dict) -> logging.Logger:
     """Setup logging with time-based rotation.
 
@@ -546,14 +587,14 @@ def setup_logging(config: dict) -> logging.Logger:
         backupCount=backup_count,
         encoding="utf-8"
     )
-    file_handler.setFormatter(logging.Formatter(
+    file_handler.setFormatter(KeyValueFormatter(
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
     logger.addHandler(file_handler)
 
     # Console handler for debugging
     console_handler = ContentOnlyConsoleHandler()
-    console_handler.setFormatter(logging.Formatter(
+    console_handler.setFormatter(KeyValueFormatter(
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
     logger.addHandler(console_handler)
