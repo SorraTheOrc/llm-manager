@@ -13,7 +13,7 @@
 # Configuration (environment variables):
 #   PROJECT_ROOT          Override project directory (default: auto-detect)
 #   CLEANUP_HOUR          Hour for cleanup cron (default: 3 = 3 AM)
-#   CLEANUP_LOG           Log file path (default: /var/log/pi-cleanup.log)
+#   CLEANUP_LOG           Log file path (default: $HOME/logs/pi-cleanup.log)
 #   CLEANUP_ENABLE_MODELS     0 to skip (default: 1)
 #   CLEANUP_ENABLE_CONTAINERS 0 to skip (default: 1)
 #   CLEANUP_ENABLE_PI         0 to skip (default: 1)
@@ -34,7 +34,11 @@ if [ -z "${PROJECT_ROOT:-}" ]; then
 fi
 
 CLEANUP_HOUR="${CLEANUP_HOUR:-3}"
-CLEANUP_LOG="${CLEANUP_LOG:-/var/log/pi-cleanup.log}"
+CLEANUP_LOG="${CLEANUP_LOG:-$HOME/logs/pi-cleanup.log}"
+
+# Ensure the log directory exists (user-writable path)
+LOG_DIR="$(dirname "$CLEANUP_LOG")"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 CRON_TAG="# pi-cleanup-orchestrator"
 CRON_TAG_END="# end-pi-cleanup-orchestrator"
 
