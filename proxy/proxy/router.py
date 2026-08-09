@@ -73,6 +73,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _call_with_backend_retries,
     _call_with_empty_retry,
     _check_slot_availability,
+    _client_identity_extra,
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
@@ -411,6 +412,7 @@ async def _cleanup_after_request(
     decrement_local: bool = True,
     session_explicit: bool = False,
     model_name: str | None = None,
+    request: Request | None = None,
 ) -> None:
     """Decrement active query counters and clean up dispatch records.
 
@@ -429,6 +431,10 @@ async def _cleanup_after_request(
 
     When *model_name* is provided, the per-model active query counter
     is also decremented.
+
+    When *request* is provided, ``lease_released`` log events carry the
+    caller's client identity (``client_ip`` / ``client_port``) for poller
+    attribution (LP-0MSKV3IEQ004ZV88).
     """
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
@@ -453,6 +459,7 @@ async def _cleanup_after_request(
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
                                     session_id[:8] if session_id else "unknown",
+                                    extra=_client_identity_extra(request),
                                 )
                             except Exception:
                                 pass
@@ -472,6 +479,7 @@ async def _cleanup_after_request(
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
                                 session_id[:8] if session_id else "unknown",
+                                extra=_client_identity_extra(request),
                             )
                         except Exception:
                             pass
@@ -817,6 +825,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
+                            request=request,
                         )
                         try:
                             await client.aclose()
@@ -875,6 +884,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
+                            request=request,
                         )
                         return Response(
                             content=body_bytes,
@@ -1450,6 +1460,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 decrement_local=True,
                                 session_explicit=session_explicit,
                                 model_name=model_name,
+                                request=request,
                             )
 
                     return StreamingResponse(
@@ -1463,6 +1474,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 srv, session_id,
                 decrement_local=False,
                 model_name=model_name,
+                request=request,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:
@@ -1628,11 +1640,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
+                            request=request,
                         )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=True,
+                request=request,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:

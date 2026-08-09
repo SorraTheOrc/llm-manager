@@ -854,7 +854,7 @@ async def release_lease(request: Request):
 
     try:
         from proxy.router_helpers import _release_local_dispatch
-        await _release_local_dispatch(srv, session_id)
+        await _release_local_dispatch(srv, session_id, request=request)
     except Exception as e:
         logger.exception(
             "Failed to release dispatch lease for session %s",

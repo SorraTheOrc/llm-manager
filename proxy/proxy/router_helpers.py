@@ -992,7 +992,29 @@ async def _try_acquire_local_dispatch(
         return (True, None, 0, 1.0)
 
 
-async def _release_local_dispatch(srv, session_id: str) -> bool:
+def _client_identity_extra(request: Request | None) -> dict:
+    """Build the client-identity ``extra`` dict for structured log events.
+
+    Returns the resolved ``client_ip`` / ``client_ip_source`` / ``client_port``
+    when a Request is in scope, or an empty dict when it is not (background
+    cleanup paths degrade gracefully — identity omitted, event still logged)
+    (LP-0MSKV3IEQ004ZV88).
+    """
+    if request is None:
+        return {}
+    try:
+        from proxy.handlers import _resolve_client_ip, _resolve_client_port
+        client_ip, client_ip_source = _resolve_client_ip(request)
+        return {
+            "client_ip": client_ip,
+            "client_ip_source": client_ip_source,
+            "client_port": _resolve_client_port(request),
+        }
+    except Exception:
+        return {}
+
+
+async def _release_local_dispatch(srv, session_id: str, request: Request | None = None) -> bool:
     """Explicitly release the dispatch lease for *session_id*.
 
     Removes the dispatch record from ``local_dispatch_records`` under
@@ -1014,6 +1036,7 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
                     srv.logger.info(
                         "lease_released session=%s reason=explicit_release",
                         session_id[:8] if session_id else "unknown",
+                        extra=_client_identity_extra(request),
                     )
                 except Exception:
                     pass
