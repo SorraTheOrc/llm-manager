@@ -857,17 +857,23 @@ a restart is pending is a noop if the mode matches, otherwise rejected with
 ### Automatic mode schedule
 
 By default the proxy **enforces a time-of-day schedule** (local server
-time), regardless of manual switches:
+time):
 
 - **cheap** from `01:00` until `10:00`
 - **fast** from `10:00` until `01:00` (i.e. 10:00 through midnight, plus
   00:00–00:59)
 
-A background scheduler checks every 30s (and immediately at startup, so a
-restart mid-period applies the scheduled mode right away). When the
-persisted mode diverges from the schedule — e.g. a manual API/UI switch
-away from the scheduled mode — the timer reverts it through the normal
-`set-mode` path (persist + background restart). A switch in progress
+A background scheduler checks every 30s (and immediately at startup). A
+**manual API switch** (or UI switch through `set-mode`) is respected until
+the **next scheduled transition** instead of being reverted on the next
+tick: e.g. switching to `fast` at 02:00 (scheduled cheap) keeps the proxy
+in fast until 10:00, even across restarts/reboots. The override expiry is
+persisted in `proxy/.mode.override-until` (gitignored runtime state) and is
+computed from the `mode_schedule` at switch time. Once the next scheduled
+transition passes, the schedule reasserts control (the timer applies the
+scheduled mode through the normal `set-mode` path — persist + background
+restart). With `enabled: false` or a schedule that never changes mode, a
+manual switch persists until the next API call. A switch in progress
 (pending restart) is left alone and retried on the next check.
 
 The schedule is configured in the `mode_schedule` section of the active

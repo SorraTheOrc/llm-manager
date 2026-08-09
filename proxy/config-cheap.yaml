@@ -496,7 +496,9 @@ server:
         slots: 1
   # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
   # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
-  # times, regardless of any manual mode change. The active entry is the most
+  # times. A manual API switch (POST /admin/set-mode) overrides the schedule
+  # until the next scheduled transition (LP-0MSMF25V9002AY1J). The active
+  # entry is the most
   # recent one at or before the current time (circular wrap, so the last
   # entry covers 00:00-00:59). Set enabled: false to disable; an absent
   # section uses this same built-in schedule.

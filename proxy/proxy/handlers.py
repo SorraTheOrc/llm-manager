@@ -795,7 +795,16 @@ async def set_operating_mode(request: Request):
         raise HTTPException(status_code=400, detail="mode must be 'fast' or 'cheap'")
 
     try:
-        persisted, restart = mode_module.set_mode(mode)
+        # A manual switch is respected until the next scheduled mode change
+        # (LP-0MSMF25V9002AY1J): derive the schedule from the server config
+        # so set_mode can persist the override expiry alongside the mode.
+        server_config = (
+            _srv().config.get("server", {})
+            if isinstance(_srv().config, dict)
+            else None
+        )
+        schedule = mode_module.ModeScheduleConfig.from_server_config(server_config)
+        persisted, restart = mode_module.set_mode(mode, manual=True, schedule=schedule)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

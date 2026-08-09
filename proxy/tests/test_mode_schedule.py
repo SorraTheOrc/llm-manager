@@ -7,6 +7,7 @@ scheduled mode when the persisted mode diverges, defers while a restart is
 pending).
 """
 
+from datetime import datetime
 from datetime import time as dt_time
 
 import pytest
@@ -199,3 +200,130 @@ class TestModeSchedulerStep:
         while time.monotonic() < deadline and not calls:
             time.sleep(0.01)
         assert calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# Next scheduled change computation (LP-0MSMF25V9002AY1J)
+# ---------------------------------------------------------------------------
+
+
+class TestNextChange:
+    def test_next_change_mid_cheap_period(self):
+        """02:00 (cheap period) -> today 10:00 (fast boundary)."""
+        schedule = builtin()
+        assert schedule.next_change(datetime(2026, 8, 10, 2, 0)) == datetime(
+            2026, 8, 10, 10, 0
+        )
+
+    def test_next_change_evening_wraps_to_tomorrow(self):
+        """20:00 (fast period) -> tomorrow 01:00 (cheap boundary)."""
+        schedule = builtin()
+        assert schedule.next_change(datetime(2026, 8, 10, 20, 0)) == datetime(
+            2026, 8, 11, 1, 0
+        )
+
+    def test_next_change_before_first_entry(self):
+        """00:00:00 (midnight-wrap period, fast) -> today 01:00 (cheap)."""
+        schedule = builtin()
+        assert schedule.next_change(datetime(2026, 8, 10, 0, 0, 0)) == datetime(
+            2026, 8, 10, 1, 0
+        )
+
+    def test_next_change_at_exact_boundary_is_next_day(self):
+        """At exactly 10:00 (fast just started) the next change is 01:00 tomorrow."""
+        schedule = builtin()
+        assert schedule.next_change(datetime(2026, 8, 10, 10, 0)) == datetime(
+            2026, 8, 11, 1, 0
+        )
+
+    def test_next_change_disabled_is_none(self):
+        schedule = ModeScheduleConfig(
+            {"enabled": False, "entries": [{"time": "00:01", "mode": "cheap"}]}
+        )
+        assert schedule.next_change(datetime(2026, 8, 10, 2, 0)) is None
+
+    def test_next_change_constant_schedule_is_none(self):
+        """A schedule whose boundaries never change the mode has no next change."""
+        schedule = ModeScheduleConfig(
+            {"enabled": True, "entries": [
+                {"time": "00:01", "mode": "fast"},
+                {"time": "12:00", "mode": "fast"},
+            ]}
+        )
+        assert schedule.next_change(datetime(2026, 8, 10, 2, 0)) is None
+
+    def test_next_change_skips_same_mode_boundaries(self):
+        """06:00 cheap->cheap is not a change; the next change is 10:00."""
+        schedule = ModeScheduleConfig(
+            {"enabled": True, "entries": [
+                {"time": "00:01", "mode": "cheap"},
+                {"time": "06:00", "mode": "cheap"},
+                {"time": "10:00", "mode": "fast"},
+            ]}
+        )
+        assert schedule.next_change(datetime(2026, 8, 10, 3, 0)) == datetime(
+            2026, 8, 10, 10, 0
+        )
+
+
+# ---------------------------------------------------------------------------
+# Manual override respected until the next scheduled change (LP-0MSMF25V9002AY1J)
+# ---------------------------------------------------------------------------
+
+
+class TestManualOverrideActive:
+    @pytest.fixture
+    def override_file(self, tmp_path, monkeypatch):
+        path = tmp_path / ".mode.override-until"
+        monkeypatch.setattr(mode_module, "override_until_file", lambda: path)
+        return path
+
+    def test_no_file_inactive(self, override_file):
+        assert mode_module.manual_override_active() is False
+
+    def test_future_expiry_active(self, override_file):
+        override_file.write_text(datetime(2099, 1, 1).isoformat() + "\n")
+        assert mode_module.manual_override_active() is True
+
+    def test_past_expiry_inactive(self, override_file):
+        override_file.write_text(datetime(2000, 1, 1).isoformat() + "\n")
+        assert mode_module.manual_override_active() is False
+
+    def test_garbage_file_inactive(self, override_file):
+        override_file.write_text("not-a-date\n")
+        assert mode_module.manual_override_active() is False
+
+
+class TestModeSchedulerStepOverride:
+    @pytest.fixture
+    def schedule(self):
+        return builtin()
+
+    @pytest.fixture
+    def override_file(self, tmp_path, monkeypatch):
+        path = tmp_path / ".mode.override-until"
+        monkeypatch.setattr(mode_module, "override_until_file", lambda: path)
+        return path
+
+    def test_respects_active_manual_override(self, schedule, override_file, monkeypatch):
+        """An unexpired manual override (fast at 02:00 while cheap is scheduled)
+        is NOT reverted by the scheduler."""
+        override_file.write_text(datetime(2099, 1, 1, 10, 0).isoformat() + "\n")
+        monkeypatch.setattr(mode_module, "read_mode", lambda: "fast")
+        applied = []
+        monkeypatch.setattr(
+            mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+        )
+        assert _mode_scheduler_step(schedule, now=T(2, 0)) is False
+        assert applied == []
+
+    def test_reverts_after_override_expires(self, schedule, override_file, monkeypatch):
+        """Once the override expiry passes, a diverging scheduled mode is applied."""
+        override_file.write_text(datetime(2000, 1, 1, 10, 0).isoformat() + "\n")
+        monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
+        applied = []
+        monkeypatch.setattr(
+            mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+        )
+        assert _mode_scheduler_step(schedule, now=T(14, 0)) is True
+        assert applied == ["fast"]

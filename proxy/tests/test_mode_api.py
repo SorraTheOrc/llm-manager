@@ -11,6 +11,7 @@ Covers (LP-0MSLMYEEU002IBH6):
 """
 
 import json
+from datetime import datetime
 
 import httpx
 import pytest
@@ -22,6 +23,15 @@ from proxy import mode as mode_module
 def mode_file(tmp_path):
     """Return a temp path to use as the mode state file."""
     return tmp_path / ".mode"
+
+
+@pytest.fixture(autouse=True)
+def _override_file(tmp_path, monkeypatch):
+    """Point the manual-override expiry state file at a temp path so no test
+    writes into the real proxy directory (LP-0MSMF25V9002AY1J)."""
+    path = tmp_path / ".mode.override-until"
+    monkeypatch.setattr(mode_module, "override_until_file", lambda: path)
+    return path
 
 
 @pytest.fixture(autouse=True)
@@ -240,3 +250,105 @@ class TestModeStateFile:
         proxy = mode_module.proxy_dir()
         for name in mode_module.MODE_CONFIG_FILES.values():
             assert (proxy / name).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Manual override persistence (LP-0MSMF25V9002AY1J)
+# ---------------------------------------------------------------------------
+
+
+class TestSetModeOverridePersistence:
+    @pytest.mark.asyncio
+    async def test_manual_switch_records_override_expiry(
+        self, mode_file, client, monkeypatch
+    ):
+        """A manual switch records an override-until expiry (next schedule change)."""
+        mode_file.write_text("cheap\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "fast"})
+            )
+        assert resp.status_code == 200
+        assert resp.json()["restart"] is True
+        expiry = mode_module.read_override_until()
+        assert expiry is not None
+        assert expiry > datetime.now()  # a future expiry, not immediate
+
+    @pytest.mark.asyncio
+    async def test_noop_manual_call_refreshes_override(
+        self, mode_file, client, monkeypatch
+    ):
+        """Requesting the already-active mode still establishes the override window."""
+        mode_file.write_text("fast\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "fast"})
+            )
+        assert resp.status_code == 200
+        assert resp.json()["restart"] is False
+        assert mode_module.read_override_until() is not None
+
+
+class TestOverrideStateFile:
+    def test_scheduler_set_mode_clears_override(self, mode_file, monkeypatch):
+        """A non-manual set_mode (scheduler path) clears the override window."""
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_override_until(datetime(2099, 1, 1))
+        mode_module.set_mode("cheap")  # manual=False
+        assert mode_module.read_override_until() is None
+        assert mode_file.read_text().strip() == "cheap"
+
+    def test_manual_set_mode_persists_override(self, mode_file, monkeypatch):
+        """A manual set_mode persists an override-until expiry."""
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.set_mode(
+            "cheap", manual=True, schedule=mode_module.ModeScheduleConfig(None)
+        )
+        assert mode_module.read_override_until() is not None
+        assert mode_file.read_text().strip() == "cheap"
+
+    def test_override_survives_fresh_read(self, mode_file, monkeypatch):
+        """Simulated reboot: state persisted by one 'process' is honored by a
+        fresh read from disk (mode + unexpired override)."""
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.set_mode(
+            "cheap", manual=True, schedule=mode_module.ModeScheduleConfig(None)
+        )
+        # fresh process: re-read persisted state from disk
+        assert mode_module.read_mode() == "cheap"
+        assert mode_module.manual_override_active() is True
+
+    def test_write_override_until_none_removes_file(self, mode_file, monkeypatch):
+        """write_override_until(None) clears the state file."""
+        path = mode_module.override_until_file()
+        mode_module.write_override_until(datetime(2099, 1, 1))
+        assert path.exists()
+        mode_module.write_override_until(None)
+        assert not path.exists()
+
+    def test_manual_override_constant_schedule_persists_indefinitely(
+        self, mode_file, monkeypatch
+    ):
+        """A constant schedule (no future transitions) keeps the manual override
+        active until the next API call (LP-0MSMF25V9002AY1J)."""
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        schedule = mode_module.ModeScheduleConfig(
+            {
+                "enabled": True,
+                "entries": [
+                    {"time": "00:01", "mode": "fast"},
+                    {"time": "12:00", "mode": "fast"},
+                ],
+            }
+        )
+        mode_module.set_mode("cheap", manual=True, schedule=schedule)
+        assert mode_module.read_override_until() == mode_module.OVERRIDE_UNTIL_NEVER
+        assert mode_module.manual_override_active() is True

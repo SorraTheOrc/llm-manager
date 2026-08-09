@@ -691,9 +691,11 @@ def _startup_launch_mode_scheduler():
     """Start the automatic fast/cheap mode-scheduler background thread.
 
     Enforces the ``mode_schedule`` (default cheap 01:00-10:00, fast
-    10:00-01:00) regardless of manual mode changes. The first check runs
-    immediately, so a proxy restart mid-period applies the scheduled mode
-    right away instead of waiting a full interval.
+    10:00-01:00). A manual API override (persisted override-until expiry)
+    is respected until the next scheduled transition, so a restart
+    mid-override does NOT revert it (LP-0MSMF25V9002AY1J). The first check
+    runs immediately so schedule transitions apply right away instead of
+    waiting a full interval.
     """
     try:
         srv_config = _srv().config

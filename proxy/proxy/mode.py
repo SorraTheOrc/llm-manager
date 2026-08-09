@@ -20,9 +20,15 @@ requests — clients retry (same semantics as slot-schedule transitions,
 LP-0MSF9RUSQ007M346). This is accepted behavior, not a bug.
 
 An automatic ``mode_schedule`` (default: cheap 01:00-10:00, fast
-10:00-01:00, local server time) is enforced by a background scheduler that
-overrides any manual setting — see ``ModeScheduleConfig`` and
-``start_mode_scheduler`` (LP-0MSM5K4TX004MICX).
+10:00-01:00, local server time) is enforced by a background scheduler — see
+``ModeScheduleConfig`` and ``start_mode_scheduler`` (LP-0MSM5K4TX004MICX).
+
+A mode switched via ``POST /admin/set-mode`` is a **manual override**: it is
+respected until the next scheduled mode transition (``ModeScheduleConfig.next_change``)
+instead of being reverted on the next scheduler tick. The override expiry is
+persisted in a companion state file (``proxy/.mode.override-until``) so it
+survives proxy restarts and reboots; once the next scheduled change passes,
+the schedule reasserts control (LP-0MSMF25V9002AY1J).
 """
 
 import logging
@@ -31,7 +37,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
@@ -63,6 +69,11 @@ MODE_SCHEDULE_DEFAULT_ENTRIES = [("01:00", MODE_CHEAP), ("10:00", MODE_FAST)]
 # short poll bounds both the transition latency at schedule boundaries and
 # how long a manual override survives before the timer reverts it.
 MODE_SCHEDULE_CHECK_INTERVAL_SECONDS = 30
+
+# Sentinel override expiry used when a schedule has no future transitions
+# (disabled or constant): the manual mode then persists until the next API
+# call rather than being reverted by the scheduler (LP-0MSMF25V9002AY1J).
+OVERRIDE_UNTIL_NEVER = datetime.max
 
 
 @dataclass
@@ -155,6 +166,39 @@ class ModeScheduleConfig:
         # entry (the previous period persists until the first transition).
         return self.entries[-1].mode
 
+    def next_change(self, now: datetime | None = None) -> datetime | None:
+        """Return the next datetime at which the scheduled mode changes, or None.
+
+        The next change is the earliest schedule boundary strictly after
+        *now* whose mode differs from the mode in effect just before the
+        boundary (consecutive same-mode entries are not changes). When no
+        change remains today the search wraps to tomorrow's first change.
+
+        Returns None when the schedule is disabled, has no entries, or is
+        constant (no boundary ever changes the mode) — in those cases a
+        manual override never expires on its own (LP-0MSMF25V9002AY1J).
+        """
+        if not self.enabled or not self.entries:
+            return None
+        now = now or datetime.now()
+        entries = self.entries
+        # Boundaries where the mandated mode actually changes. The segment
+        # before entries[0] is the last entry of the previous day (wrap),
+        # so entries[-1] is the correct predecessor for index 0.
+        change_indices = [
+            i for i, entry in enumerate(entries) if entry.mode != entries[i - 1].mode
+        ]
+        if not change_indices:
+            return None  # constant schedule — no changes ever
+        for i in change_indices:
+            if entries[i].time > now.time():
+                return datetime.combine(now.date(), entries[i].time)
+        # No change remains today: the next one is tomorrow at the first
+        # change boundary.
+        return datetime.combine(
+            now.date() + timedelta(days=1), entries[change_indices[0]].time
+        )
+
 
 def _parse_hhmm(time_str: str) -> dt_time | None:
     """Parse an ``HH:MM`` string into a time, or None when invalid."""
@@ -194,16 +238,21 @@ def _mode_scheduler_step(
 ) -> bool:
     """One scheduler check: apply the scheduled mode when it diverges.
 
-    Enforces the schedule regardless of the currently active setting: a
-    manual API/UI switch away from the scheduled mode is reverted here.
-    Returns True when a mode change was applied. A pending mode-switch
-    restart (e.g. a manual switch in flight) is left alone and retried on
-    the next cycle.
+    A manual API override (persisted override-until expiry that has not yet
+    passed) is respected: the scheduled mode is NOT applied before the next
+    scheduled transition. Once the override expires the scheduled mode is
+    applied regardless of the current setting. Returns True when a mode
+    change was applied. A pending mode-switch restart (e.g. a manual switch
+    in flight) is left alone and retried on the next cycle.
     """
     expected = schedule.active_mode(now)
     if expected is None:
         return False
     if read_mode() == expected:
+        return False
+    if manual_override_active():
+        # A manual API override is in effect until the next scheduled
+        # change; stand down instead of reverting it.
         return False
     try:
         set_mode(expected)
@@ -259,6 +308,68 @@ def proxy_dir() -> Path:
 def mode_state_file() -> Path:
     """Path to the persisted mode state file (``proxy/.mode``)."""
     return proxy_dir() / ".mode"
+
+
+def override_until_file() -> Path:
+    """Path to the manual-override expiry state file (``proxy/.mode.override-until``).
+
+    Holds an ISO-format naive local datetime marking when the manual override
+    expires (the next scheduled mode transition). Absent file = no override.
+    """
+    return proxy_dir() / ".mode.override-until"
+
+
+def read_override_until() -> datetime | None:
+    """Return the persisted manual-override expiry, or None when absent/invalid.
+
+    The expiry is a naive local datetime matching the schedule's local-time
+    semantics. A missing, empty, or unparsable state file yields None (no
+    override). An expired value is returned as-is — callers decide whether
+    the override is still active via ``manual_override_active``.
+    """
+    try:
+        text = override_until_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        logger.warning(
+            "Ignoring unparsable override-until state %r, treating as no override",
+            text,
+        )
+        return None
+
+
+def write_override_until(expiry: datetime | None) -> None:
+    """Persist (or clear) the manual-override expiry state file.
+
+    ``None`` removes the file (no override in effect).
+    """
+    path = override_until_file()
+    if expiry is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove override-until state file")
+        return
+    path.write_text(expiry.isoformat() + "\n", encoding="utf-8")
+
+
+def manual_override_active(now: datetime | None = None) -> bool:
+    """Whether a manual mode override is currently in effect.
+
+    True when an override expiry is persisted and has not yet passed. An
+    absent/expired/invalid expiry yields False (the schedule applies).
+    """
+    expiry = read_override_until()
+    if expiry is None:
+        return False
+    return (now or datetime.now()) < expiry
 
 
 def read_mode() -> str:
@@ -322,13 +433,25 @@ def restart_pending() -> bool:
         return _restart_pending
 
 
-def set_mode(mode: str) -> tuple[str, bool]:
+def set_mode(
+    mode: str,
+    manual: bool = False,
+    schedule: ModeScheduleConfig | None = None,
+) -> tuple[str, bool]:
     """Persist *mode* and arm a background restart when it changes.
+
+    *manual* marks the call as an explicit API/operator override: the
+    override expiry is (re)computed from *schedule* and persisted, so the
+    background scheduler respects the chosen mode until the next scheduled
+    time change instead of reverting it on the next tick
+    (LP-0MSMF25V9002AY1J). A non-manual call (the scheduler enforcing the
+    schedule) persists the mode and clears any pending override.
 
     Returns ``(persisted_mode, restart_triggered)``:
 
     - Requesting the mode that is already active is a **noop**: nothing is
-      persisted and no restart is armed.
+      persisted and no restart is armed (a manual call still refreshes the
+      override expiry).
     - Requesting a different mode persists the new mode and spawns the
       restart (``scripts/start-proxy.sh --restart``) in the background.
 
@@ -339,14 +462,39 @@ def set_mode(mode: str) -> tuple[str, bool]:
     with _mode_lock:
         if _restart_pending:
             if read_mode() == mode:
+                if manual:
+                    _write_override_expiry(schedule)
                 return mode, False
             raise RuntimeError("A mode-switch restart is already in progress")
         if read_mode() == mode:
+            if manual:
+                _write_override_expiry(schedule)
             return mode, False
         write_mode(mode)
+        if manual:
+            _write_override_expiry(schedule)
+        else:
+            write_override_until(None)
         _restart_pending = True
     _spawn_restart()
     return mode, True
+
+
+def _write_override_expiry(schedule: ModeScheduleConfig | None) -> None:
+    """Persist the manual-override expiry derived from *schedule*.
+
+    A disabled or constant schedule (``next_change`` returns None) yields
+    the ``OVERRIDE_UNTIL_NEVER`` sentinel so the manual mode persists until
+    the next API call. With no schedule available, no override is recorded
+    (fail-safe: the schedule applies).
+    """
+    if schedule is None:
+        write_override_until(None)
+        return
+    next_change = schedule.next_change()
+    write_override_until(
+        next_change if next_change is not None else OVERRIDE_UNTIL_NEVER
+    )
 
 
 def _spawn_restart() -> None:

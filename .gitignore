@@ -36,6 +36,7 @@ proxy/session-recordings/
 
 # Operating-mode state file (fast/cheap) — runtime state, not committed
 proxy/.mode
+proxy/.mode.override-until
 
 
 bundles/
