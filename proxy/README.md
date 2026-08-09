@@ -854,6 +854,40 @@ retry (same semantics as slot-schedule transitions). A second switch while
 a restart is pending is a noop if the mode matches, otherwise rejected with
 `409` (avoids restart loops).
 
+### Automatic mode schedule
+
+By default the proxy **enforces a time-of-day schedule** (local server
+time), regardless of manual switches:
+
+- **cheap** from `00:01` until `10:00`
+- **fast** from `10:00` until `00:01` (i.e. 10:00 through midnight, plus
+  00:00–00:00:59)
+
+A background scheduler checks every 30s (and immediately at startup, so a
+restart mid-period applies the scheduled mode right away). When the
+persisted mode diverges from the schedule — e.g. a manual API/UI switch
+away from the scheduled mode — the timer reverts it through the normal
+`set-mode` path (persist + background restart). A switch in progress
+(pending restart) is left alone and retried on the next check.
+
+The schedule is configured in the `mode_schedule` section of the active
+config profile (same section in `config.yaml` / `config-fast.yaml` /
+`config-cheap.yaml`):
+
+```yaml
+mode_schedule:
+  enabled: true
+  entries:
+    - time: "00:01"
+      mode: cheap
+    - time: "10:00"
+      mode: fast
+```
+
+Set `enabled: false` to disable the timer; an absent section uses the
+built-in schedule above. Entries follow the same "most recent time at or
+before now, wrapping circularly" rule as `slot_schedule`.
+
 ### Environment Variables
 
 | Variable | Description |

@@ -18,6 +18,11 @@ triggers a full proxy restart (``scripts/start-proxy.sh --restart``) so the
 new config profile takes effect. A mode-switch restart terminates in-flight
 requests — clients retry (same semantics as slot-schedule transitions,
 LP-0MSF9RUSQ007M346). This is accepted behavior, not a bug.
+
+An automatic ``mode_schedule`` (default: cheap 00:01-10:00, fast
+10:00-00:01, local server time) is enforced by a background scheduler that
+overrides any manual setting — see ``ModeScheduleConfig`` and
+``start_mode_scheduler`` (LP-0MSM5K4TX004MICX).
 """
 
 import logging
@@ -25,7 +30,11 @@ import os
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
+from datetime import time as dt_time
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("llama-proxy")
 
@@ -44,6 +53,196 @@ MODE_CONFIG_FILES = {
 # Delay (seconds) before the background restart spawns, so the API response
 # flushes before the process is killed (LP-0MSLMYEEU002IBH6).
 RESTART_DELAY_SECONDS = 1.5
+
+# Built-in automatic mode schedule: cheap from 00:01 until 10:00, fast from
+# 10:00 until 00:01 (LP-0MSM5K4TX004MICX). Used when the config has no
+# ``mode_schedule`` section; entries are ``(HH:MM, mode)``.
+MODE_SCHEDULE_DEFAULT_ENTRIES = [("00:01", MODE_CHEAP), ("10:00", MODE_FAST)]
+
+# How often (seconds) the background mode-scheduler re-checks the clock. A
+# short poll bounds both the transition latency at schedule boundaries and
+# how long a manual override survives before the timer reverts it.
+MODE_SCHEDULE_CHECK_INTERVAL_SECONDS = 30
+
+
+@dataclass
+class ModeScheduleEntry:
+    """A single schedule entry mapping a time-of-day to an operating mode."""
+
+    time: dt_time
+    mode: str
+
+
+class ModeScheduleConfig:
+    """Parsed automatic mode-schedule configuration.
+
+    Reads the ``mode_schedule`` section from the server config. An absent
+    section (or absent ``entries``) falls back to the built-in schedule
+    (cheap 00:01-10:00, fast 10:00-00:01) so the timer stays on unless
+    explicitly disabled with ``enabled: false``. Invalid entries (bad time
+    format or unknown mode) are skipped with a warning; if no valid entry
+    remains, the built-in schedule is used.
+
+    The active mode at any instant is the most recent entry whose time is
+    at or before *now*; before the first entry of the day the schedule
+    wraps circularly to the last entry (so ``10:00 -> fast`` also covers
+    00:00-00:00:59, matching the slot_schedule semantics).
+    """
+
+    def __init__(self, raw: dict[str, Any] | None):
+        if not raw or not isinstance(raw, dict):
+            # Absent/empty section: enabled with the built-in schedule.
+            self.enabled = True
+            self.entries = self._parse_entries(None)
+            return
+
+        self.enabled = bool(raw.get("enabled", True))
+        self.entries = self._parse_entries(raw.get("entries"))
+
+    @classmethod
+    def from_server_config(
+        cls, server_config: dict[str, Any] | None
+    ) -> "ModeScheduleConfig":
+        """Extract the mode schedule from the server config dict."""
+        if not server_config or not isinstance(server_config, dict):
+            return cls(None)
+        return cls(server_config.get("mode_schedule"))
+
+    @staticmethod
+    def _parse_entries(raw_entries: Any) -> list[ModeScheduleEntry]:
+        """Parse ``[{time, mode}, ...]`` into sorted entries, skipping invalid."""
+        entries: list[ModeScheduleEntry] = []
+        if isinstance(raw_entries, list):
+            for entry in raw_entries:
+                if not isinstance(entry, dict):
+                    continue
+                parsed = _parse_schedule_entry(entry)
+                if parsed is not None:
+                    entries.append(parsed)
+        if entries:
+            entries.sort(key=lambda e: e.time)
+            return entries
+        # No valid entries (absent section or all invalid): use the built-in
+        # schedule so the timer never silently turns off.
+        logger.warning(
+            "mode_schedule: no valid entries, using built-in default schedule"
+        )
+        return [
+            ModeScheduleEntry(
+                time=_parse_hhmm(time_str), mode=mode
+            )
+            for time_str, mode in MODE_SCHEDULE_DEFAULT_ENTRIES
+        ]
+
+    def active_mode(self, now: dt_time | None = None) -> str | None:
+        """Return the mode mandated by the schedule at *now* (or None if disabled).
+
+        None is returned only when the schedule is disabled
+        (``enabled: false``).
+        """
+        if not self.enabled or not self.entries:
+            return None
+        now = now or datetime.now().time()
+        last_matching: ModeScheduleEntry | None = None
+        for entry in self.entries:
+            if entry.time <= now:
+                last_matching = entry
+            else:
+                break
+        if last_matching is not None:
+            return last_matching.mode
+        # Before the first entry of the day — wrap circularly to the last
+        # entry (the previous period persists until the first transition).
+        return self.entries[-1].mode
+
+
+def _parse_hhmm(time_str: str) -> dt_time | None:
+    """Parse an ``HH:MM`` string into a time, or None when invalid."""
+    parts = str(time_str).strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return dt_time(hour, minute)
+
+
+def _parse_schedule_entry(entry: dict[str, Any]) -> ModeScheduleEntry | None:
+    """Parse a single ``{time, mode}`` entry, or None when invalid."""
+    parsed_time = _parse_hhmm(entry.get("time") or "")
+    mode = str(entry.get("mode") or "").strip().lower()
+    if parsed_time is None or mode not in VALID_MODES:
+        logger.warning("mode_schedule: ignoring invalid entry %r", entry)
+        return None
+    return ModeScheduleEntry(time=parsed_time, mode=mode)
+
+
+def expected_mode_for_time(
+    now: dt_time | None = None,
+    schedule: ModeScheduleConfig | None = None,
+) -> str | None:
+    """Return the mode the schedule mandates at *now* (None when disabled)."""
+    schedule = schedule or ModeScheduleConfig(None)
+    return schedule.active_mode(now)
+
+
+def _mode_scheduler_step(
+    schedule: ModeScheduleConfig, now: dt_time | None = None
+) -> bool:
+    """One scheduler check: apply the scheduled mode when it diverges.
+
+    Enforces the schedule regardless of the currently active setting: a
+    manual API/UI switch away from the scheduled mode is reverted here.
+    Returns True when a mode change was applied. A pending mode-switch
+    restart (e.g. a manual switch in flight) is left alone and retried on
+    the next cycle.
+    """
+    expected = schedule.active_mode(now)
+    if expected is None:
+        return False
+    if read_mode() == expected:
+        return False
+    try:
+        set_mode(expected)
+    except RuntimeError:
+        logger.debug("Mode scheduler: restart pending, retrying next cycle")
+        return False
+    logger.info("Mode scheduler: applied scheduled mode %s", expected)
+    return True
+
+
+def _mode_scheduler_loop(
+    schedule: ModeScheduleConfig, interval: float
+) -> None:
+    """Background loop: enforce the schedule, checking immediately and then
+    every *interval* seconds. Runs as a daemon thread so it dies with the
+    proxy process (a mode-switch restart replaces the whole process anyway).
+    """
+    while True:
+        try:
+            _mode_scheduler_step(schedule)
+        except Exception:
+            logger.exception("Mode scheduler: unexpected error in check cycle")
+        time.sleep(interval)
+
+
+def start_mode_scheduler(
+    schedule: ModeScheduleConfig,
+    interval: float = MODE_SCHEDULE_CHECK_INTERVAL_SECONDS,
+) -> threading.Thread:
+    """Start the background mode-scheduler thread and return it."""
+    thread = threading.Thread(
+        target=_mode_scheduler_loop,
+        args=(schedule, interval),
+        daemon=True,
+        name="mode-scheduler",
+    )
+    thread.start()
+    return thread
+
 
 # Serializes set-mode calls and guards the pending-restart flag so a second
 # switch cannot arm a second restart while one is already in flight

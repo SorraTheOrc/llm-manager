@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
+from proxy import mode as mode_module
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
 from proxy.slot_scheduler import SlotScheduler
 
@@ -686,6 +687,33 @@ def _startup_launch_slot_scheduler():
         slot_scheduler = None
 
 
+def _startup_launch_mode_scheduler():
+    """Start the automatic fast/cheap mode-scheduler background thread.
+
+    Enforces the ``mode_schedule`` (default cheap 00:01-10:00, fast
+    10:00-00:01) regardless of manual mode changes. The first check runs
+    immediately, so a proxy restart mid-period applies the scheduled mode
+    right away instead of waiting a full interval.
+    """
+    try:
+        srv_config = _srv().config
+        server_config = (
+            srv_config.get("server", {}) if isinstance(srv_config, dict) else None
+        )
+        schedule = mode_module.ModeScheduleConfig.from_server_config(server_config)
+        if schedule.enabled:
+            mode_module.start_mode_scheduler(schedule)
+            logger.info(
+                "Mode scheduler: enabled with %d entries: %s",
+                len(schedule.entries),
+                [(e.time.strftime("%H:%M"), e.mode) for e in schedule.entries],
+            )
+        else:
+            logger.debug("Mode scheduler: disabled via config (enabled: false)")
+    except Exception as e:
+        logger.warning("Failed to start mode scheduler: %s", e)
+
+
 def _startup_register_session_routes(app):
     """Register session recording admin routes on the FastAPI app.
 
@@ -806,6 +834,7 @@ async def lifespan(app: FastAPI):
     _startup_start_dispatch_cleanup()
     _startup_register_session_routes(app)
     _startup_launch_slot_scheduler()
+    _startup_launch_mode_scheduler()
 
     yield
 

@@ -50,3 +50,6 @@ qwentts.cpp/models/
 # Generated benchmark/test artifacts (not source)
 benchmark-results/
 test-results/
+
+# implement.py runtime state (was accidentally tracked; never commit)
+.implement_state.json
