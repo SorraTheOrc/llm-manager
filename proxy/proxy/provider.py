@@ -1291,11 +1291,11 @@ def validate_chain_hold_config(config: dict) -> list[str]:
         try:
             if float(seconds) < 0:
                 problems.append(
-                    "server.chain_hold_seconds must be >= 0 (got %r)" % (seconds,)
+                    f"server.chain_hold_seconds must be >= 0 (got {seconds!r})"
                 )
         except (ValueError, TypeError):
             problems.append(
-                "server.chain_hold_seconds must be a number (got %r)" % (seconds,)
+                f"server.chain_hold_seconds must be a number (got {seconds!r})"
             )
 
     max_cycles = config.get("chain_hold_max_cycles")
@@ -1305,12 +1305,11 @@ def validate_chain_hold_config(config: dict) -> list[str]:
         try:
             if int(max_cycles) < 0:
                 problems.append(
-                    "server.chain_hold_max_cycles must be >= 0 (got %r)" % (max_cycles,)
+                    f"server.chain_hold_max_cycles must be >= 0 (got {max_cycles!r})"
                 )
         except (ValueError, TypeError):
             problems.append(
-                "server.chain_hold_max_cycles must be an integer (got %r)"
-                % (max_cycles,)
+                f"server.chain_hold_max_cycles must be an integer (got {max_cycles!r})"
             )
 
     # Unbounded busy-retry: zero hold interval with unlimited cycles.
