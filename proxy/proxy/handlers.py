@@ -328,6 +328,7 @@ async def get_llama_local_status(request: Request):
     Fields returned::
 
         {"active_query": bool,
+         "local_active_query": bool,
          "model_switch_in_progress": bool,
          "current_model": str | None,
          "llama_server_running": bool,
@@ -343,6 +344,13 @@ async def get_llama_local_status(request: Request):
     ``session_slot_pool_size`` is reported instead (fail-open, so
     orchestrators see available capacity during idle windows —
     LP-0MSI06HPB0043MV1).
+
+    ``local_active_query`` mirrors ``active_query`` but is derived from the
+    local-only counter (``local_active_queries``), so remote provider
+    streams (e.g. opencode-go → deepseek-v4-flash) do not make it true.
+    Local activity is a subset of all activity, so
+    ``local_active_query=true`` implies ``active_query=true``
+    (LP-0MSL2ZLLS009RVKR).
 
     Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
     (seconds, default 1.0).
@@ -399,6 +407,17 @@ async def get_llama_local_status(request: Request):
             active = srv.active_queries > 0
     except Exception:
         active = False
+
+    # -- local active queries (non-blocking snapshot, LP-0MSL2ZLLS009RVKR) --
+    # The global counter above also counts remote provider streams, so herdr
+    # dispatch needs a local-only signal. local_active_query=true implies
+    # active_query=true (local activity is a subset of all activity).
+    local_active_query = False
+    try:
+        async with srv.local_active_queries_lock:
+            local_active_query = srv.local_active_queries > 0
+    except Exception:
+        local_active_query = False
 
     # -- slots query (lightweight, short timeout) -------------------------
     available_slots = 0
@@ -458,6 +477,7 @@ async def get_llama_local_status(request: Request):
             "latency_ms": _latency_ms,
             "llama_server_running": llama_running,
             "active_query": active,
+            "local_active_query": local_active_query,
             "model_switch_in_progress": switch_in_progress,
             "current_model": cm,
             "available_slots": available_slots,
@@ -469,6 +489,7 @@ async def get_llama_local_status(request: Request):
 
     return {
         "active_query": bool(active),
+        "local_active_query": bool(local_active_query),
         "model_switch_in_progress": bool(switch_in_progress),
         "current_model": cm,
         "llama_server_running": bool(llama_running),

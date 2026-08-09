@@ -1184,6 +1184,7 @@ Response:
 ```json
 {
   "active_query": false,
+  "local_active_query": false,
   "model_switch_in_progress": false,
   "current_model": "qwen3",
   "llama_server_running": true,
@@ -1197,6 +1198,7 @@ Response:
 | Field                     | Type          | Description                                                                 |
 |---------------------------|---------------|-----------------------------------------------------------------------------|
 | `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
+| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight (remote provider streams are excluded — LP-0MSL2ZLLS009RVKR). |
 | `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
 | `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |

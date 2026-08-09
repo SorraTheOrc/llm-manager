@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSL1OX51003DOP4",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSL1OX51003DOP4-add-recovery-for-global-active-queries-c",
+  "work_item_id": "LP-0MSL2ZLLS009RVKR",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSL2ZLLS009RVKR-expose-local-active-query-in-llama-local",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-09T00:25:16Z"
+  "started_at": "2026-08-09T00:53:49Z"
 }

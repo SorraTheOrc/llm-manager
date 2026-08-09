@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import patch
 
 import httpx
@@ -349,6 +350,82 @@ class TestFailOpenSlotCapacity:
         # the loaded model name must be passed through (AC2 / LP-0MSHFGO0M003Q5BL)
         _, kwargs = slots_mock.await_args
         assert kwargs["model"] == "test-model"
+
+
+# ======================================================================
+# local_active_query (LP-0MSL2ZLLS009RVKR)
+# ======================================================================
+
+
+class _LocalStatusHarness:
+    """Build a /llama/local/status call with controllable counters."""
+
+    class _FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    async def get(self, active_queries, local_active_queries):
+        """Issue a status request with the given global/local counter values."""
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return {"llama_server_running": True}
+
+        transport = httpx.ASGITransport(app=app)
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "active_queries", active_queries):
+                with patch.object(server, "active_queries_lock", asyncio.Lock()):
+                    with patch.object(server, "local_active_queries", local_active_queries):
+                        with patch.object(server, "local_active_queries_lock", asyncio.Lock()):
+                            with patch.object(server, "local_dispatch_records", {}):
+                                with patch.object(server, "local_dispatch_records_lock", self._FakeLock()):
+                                    with patch.object(server, "model_switch_refcount", 0):
+                                        with patch.object(server, "model_switch_lock", self._FakeLock()):
+                                            with patch.object(server, "background_loads", {}):
+                                                with patch.object(server, "current_model", "test-model"):
+                                                    async with httpx.AsyncClient(
+                                                        transport=transport, base_url="http://test"
+                                                    ) as ac:
+                                                        resp = await ac.get("/llama/local/status")
+        assert resp.status_code == 200
+        return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_local_active_query_remote_only_streams():
+    """Remote provider streams drive global active but NOT local_active_query.
+
+    LP-0MSL2ZLLS009RVKR: opencode-go → deepseek-v4-flash streams consume zero
+    local Qwen3 slots yet keep active_query=true. With no local activity the
+    status must report local_active_query=false so herdr sees idle.
+    """
+    j = await _LocalStatusHarness().get(active_queries=2, local_active_queries=0)
+    assert j["active_query"] is True
+    assert j["local_active_query"] is False
+
+
+@pytest.mark.asyncio
+async def test_local_active_local_stream_sets_both():
+    """A local stream in flight sets both active_query and local_active_query."""
+    j = await _LocalStatusHarness().get(active_queries=3, local_active_queries=1)
+    assert j["active_query"] is True
+    assert j["local_active_query"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_active_no_activity_both_false():
+    """No activity at all: both counters zero → both fields false."""
+    j = await _LocalStatusHarness().get(active_queries=0, local_active_queries=0)
+    assert j["active_query"] is False
+    assert j["local_active_query"] is False
 
 
 # ======================================================================

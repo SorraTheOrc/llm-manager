@@ -90,6 +90,31 @@ def _status_records(caplog):
 
 
 @pytest.mark.asyncio
+async def test_status_request_logs_local_active_query(caplog):
+    """The status_request log line carries local_active_query (LP-0MSL2ZLLS009RVKR)."""
+    from proxy.server import app
+
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get("/llama/local/status")
+
+    assert resp.status_code == 200
+    records = _status_records(caplog)
+    assert records, "Expected status_request log record"
+    assert hasattr(records[-1], "local_active_query")
+    assert records[-1].local_active_query is False
+
+
+@pytest.mark.asyncio
 async def test_status_request_logs_client_ip_direct(caplog):
     """Direct pollers are attributable: client_ip comes from request.client."""
     from proxy.server import app
@@ -170,6 +195,7 @@ async def test_status_request_logs_all_response_fields(caplog):
         "latency_ms",
         "llama_server_running",
         "active_query",
+        "local_active_query",
         "model_switch_in_progress",
         "current_model",
         "available_slots",
@@ -206,6 +232,7 @@ def _make_status_record():
     record.latency_ms = 12
     record.llama_server_running = True
     record.active_query = False
+    record.local_active_query = False
     record.model_switch_in_progress = False
     record.current_model = "Qwen3"
     record.available_slots = 3
@@ -228,6 +255,7 @@ def test_key_value_formatter_renders_status_request_payload():
     assert "latency_ms=12" in text
     assert "llama_server_running=true" in text
     assert "active_query=false" in text
+    assert "local_active_query=false" in text
     assert "model_switch_in_progress=false" in text
     assert "current_model=Qwen3" in text
     assert "available_slots=3" in text
