@@ -69,6 +69,22 @@ def _resolve_client_port(request: Request) -> int | str:
         return request.client.port
     return "unknown"
 
+
+def _resolve_client_id(request: Request) -> str | None:
+    """Resolve a stable client identifier from the session headers.
+
+    Returns the first present of ``x-session-id`` / ``session_id`` /
+    ``x-client-request-id`` (matching the session-header convention in
+    ``proxy/proxy/session.py``), or ``None`` when none are present so the
+    field can be omitted — not rendered as ``unknown`` — from the structured
+    log (LP-0MSKV3IEQ004ZV88).
+    """
+    for header_name in ("x-session-id", "session_id", "x-client-request-id"):
+        value = request.headers.get(header_name)
+        if value:
+            return value
+    return None
+
 # APIRouter for use by the main server app
 router = APIRouter()
 
@@ -377,8 +393,10 @@ async def get_llama_local_status(request: Request):
     Each call is logged with a ``status_request`` structured message that
     includes the client IP (with source: header vs direct), the client source
     port (direct connections only; ``unknown`` for reverse-proxy header
-    paths), the response fields and request latency (ms). The client IP
-    resolves via X-Forwarded-For / X-Real-IP headers when present
+    paths), a stable ``client_id`` from the session headers when present
+    (``x-session-id`` → ``session_id`` → ``x-client-request-id``; omitted
+    when none are sent), the response fields and request latency (ms). The
+    client IP resolves via X-Forwarded-For / X-Real-IP headers when present
     (reverse-proxy safe), falling back to the direct connection address.
     """
     import os  # noqa: local import for config access
@@ -489,24 +507,27 @@ async def get_llama_local_status(request: Request):
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
     client_ip, client_ip_source = _resolve_client_ip(request)
-    logger.info(
-        "status_request",
-        extra={
-            "client_ip": client_ip,
-            "client_ip_source": client_ip_source,
-            "client_port": _resolve_client_port(request),
-            "latency_ms": _latency_ms,
-            "llama_server_running": llama_running,
-            "active_query": active,
-            "local_active_query": local_active_query,
-            "model_switch_in_progress": switch_in_progress,
-            "current_model": cm,
-            "available_slots": available_slots,
-            "total_slots": total_slots,
-            "local_owner_session_id": local_owner_session_id,
-            "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
-        },
-    )
+    status_extra = {
+        "client_ip": client_ip,
+        "client_ip_source": client_ip_source,
+        "client_port": _resolve_client_port(request),
+        "latency_ms": _latency_ms,
+        "llama_server_running": llama_running,
+        "active_query": active,
+        "local_active_query": local_active_query,
+        "model_switch_in_progress": switch_in_progress,
+        "current_model": cm,
+        "available_slots": available_slots,
+        "total_slots": total_slots,
+        "local_owner_session_id": local_owner_session_id,
+        "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+    }
+    # Stable client identifier from session headers — omitted (not "unknown")
+    # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
+    client_id = _resolve_client_id(request)
+    if client_id:
+        status_extra["client_id"] = client_id
+    logger.info("status_request", extra=status_extra)
 
     return {
         "active_query": bool(active),
