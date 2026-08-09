@@ -19,9 +19,10 @@ data-backed recommendations — including an **error taxonomy** and quantified
   remote providers, why, and what to change. The **Local model utilization**
   section answers "how much of the time was the local model busy?" (busy %,
   idle %, streams, concurrency, hourly/day-night profile).
-- Investigating slot counts (6 daytime / 8 nighttime), context limits, or
-  routing thresholds: the report's fallback-reason breakdown and context
-  pressure stats show whether configuration changes are warranted.
+- Investigating slot counts (daytime / nighttime, as configured in the
+  `slot_schedule` of `proxy/config.yaml`), context limits, or routing
+  thresholds: the report's fallback-reason breakdown and context pressure
+  stats show whether configuration changes are warranted.
 - An error spike occurred (e.g. `Stream finished: reason=error`, `slot_save`
   ReadTimeouts, `backend_retry` timeouts, upstream 429s): the report's
   **Error analysis** section categorizes every error event and recommends
@@ -79,11 +80,12 @@ and stays at the root, untouched by archival.
 
 Written to `--output-dir` (default `~/proxy-usage-reports`):
 
-- `daytime_sessions.csv` — one row per **daytime** session (10:00–23:59,
-  6 slots per the configured schedule). One row per session, covering ALL
-  sessions in the window (local-only and fallback).
-- `nighttime_sessions.csv` — one row per **nighttime** session (00:00–09:59,
-  8 slots).
+- `daytime_sessions.csv` — one row per **daytime** session (the period(s)
+  with the fewest slots per the configured `slot_schedule`). One row per
+  session, covering ALL sessions in the window (local-only and fallback).
+- `nighttime_sessions.csv` — one row per **nighttime** session (the
+  period(s) with the most slots; when all periods have the same slot count
+  there is no night bucket and this file is not produced).
 - `errors.csv` — one row per **error event** in the window (stream finish
   errors, stream errors, `slot_save` failures, `backend_retry` timeouts,
   upstream HTTP errors), with error type, timestamp, provider/model, session,
@@ -151,8 +153,10 @@ run (`Previous outputs archived to …`).
    attributed to hours and to day/night periods (slot schedule) by
    splitting at hour and period boundaries.
 5. **Day/night bucketing** — derived from the `slot_schedule` in
-   `proxy/config.yaml` (10:00 → 6 slots day, 23:59 → 8 slots night), keyed by
-   session start time; nothing is hardcoded.
+   `proxy/config.yaml` (transition times and slot counts are read from
+   config; the period(s) with the fewest slots are labelled "day", the
+   period(s) with the most "night"; equal counts collapse to a single day
+   bucket), keyed by session start time; nothing is hardcoded.
 6. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,

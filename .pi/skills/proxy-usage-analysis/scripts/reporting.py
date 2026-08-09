@@ -2,9 +2,12 @@
 
 Outputs (per acceptance criteria):
 
-- ``daytime_sessions.csv`` — one row per daytime session (10:00-23:59, 6 slots
-  per the configured schedule) covering ALL sessions in the window.
-- ``nighttime_sessions.csv`` — one row per nighttime session (00:00-09:59).
+- ``daytime_sessions.csv`` — one row per daytime session (the period(s)
+  with the fewest slots per the configured ``slot_schedule`` in
+  ``proxy/config.yaml``) covering ALL sessions in the window.
+- ``nighttime_sessions.csv`` — one row per nighttime session (the period(s)
+  with the most slots; produced only when the schedule has differing slot
+  counts).
 - ``report.md`` — the aggregate Markdown report with highlighted,
   data-backed recommendations.
 """
