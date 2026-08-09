@@ -194,6 +194,25 @@ def _error_row(e: log_parser.LogEvent) -> dict:
     }
 
 
+# JSON key used when a provider or model is not derivable from the log line.
+UNKNOWN_LABEL = "(unknown)"
+
+
+def error_provider_model_json(summary: AnalysisResult) -> dict:
+    """Nested error breakdown ``{error_type: {provider: {model: count}}}``.
+
+    Rows are ordered by count (descending) so the JSON is deterministic for
+    consumers. A provider/model that is not derivable from the log line is
+    keyed as ``(unknown)`` so the breakdown is self-describing.
+    """
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    for (kind, provider, model), count in summary.error_provider_model_counts.most_common():
+        p = provider or UNKNOWN_LABEL
+        m = model or UNKNOWN_LABEL
+        out.setdefault(kind, {}).setdefault(p, {})[m] = count
+    return out
+
+
 def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
     """Write ``errors.csv`` (one row per error event) and ``errors.json``
     (aggregated counts by error type); returns their paths."""
@@ -211,6 +230,7 @@ def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path,
     payload = {
         "total": len(events),
         "by_type": by_type,
+        "by_provider_model": error_provider_model_json(summary),
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
     }
@@ -401,8 +421,9 @@ def build_report(
 def _append_error_section(ap, summary: AnalysisResult) -> None:
     """Append the ``## Error analysis`` section to the report.
 
-    Taxonomy table (error type, count, affected providers/models, evidence
-    excerpt) plus a pointer to the remediation recommendations and the
+    Taxonomy table (error type, count, evidence excerpt) plus a
+    ``### Provider/model breakdown`` table (error type × provider × model ×
+    count) and a pointer to the remediation recommendations and the
     ``errors.csv`` / ``errors.json`` artifacts. The section is omitted when
     the window has no error events.
     """
@@ -411,25 +432,29 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
     ap("")
     ap("## Error analysis")
     ap("")
-    ap("| Error type | Count | Affected providers/models | Evidence excerpt |")
-    ap("|---|---|---|---|")
+    ap("| Error type | Count | Evidence excerpt |")
+    ap("|---|---|---|")
     counts = summary.error_counts
-    pm = summary.error_provider_model_counts
     for kind, count in counts.most_common():
-        affected = ", ".join(
-            f"{p}/{m}" if p and m else (p or m or "-")
-            for (k, p, m), _ in pm.most_common(6)
-            if k == kind and (p or m)
-        )
-        if not affected:
-            affected = "-"
         first = next((e for e in summary.error_events if e.kind == kind), None)
         excerpt = ""
         if first and first.raw:
             excerpt = first.raw.strip()
             if len(excerpt) > 100:
                 excerpt = excerpt[:100] + "…"
-        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {count} | {affected} | `{excerpt}` |")
+        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {count} | `{excerpt}` |")
+    ap("")
+    ap("### Provider/model breakdown")
+    ap("")
+    ap("| Error type | Provider | Model | Count |")
+    ap("|---|---|---|---|")
+    pm = summary.error_provider_model_counts
+    for (kind, provider, model), count in sorted(
+        pm.items(),
+        key=lambda kv: (-kv[1], kv[0][0], kv[0][1] or "", kv[0][2] or ""),
+    ):
+        label = ERROR_TYPE_LABELS.get(kind, kind)
+        ap(f"| {label} | {provider or '-'} | {model or '-'} | {count} |")
     ap("")
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
@@ -696,6 +721,7 @@ def summary_to_json(summary: AnalysisResult) -> dict:
         "night_sessions": sum(1 for s in sessions if s.bucket == "night"),
         "errors": len(summary.error_events),
         "errors_by_type": dict(summary.error_counts.most_common()),
+        "errors_by_provider_model": error_provider_model_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None)),
         "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,

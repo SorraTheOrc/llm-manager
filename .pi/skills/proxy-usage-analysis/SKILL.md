@@ -91,12 +91,17 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
   upstream HTTP errors), with error type, timestamp, provider/model, session,
   config entry, error detail, HTTP status, retry attempt/signal, source log
   file, and the raw evidence line.
-- `errors.json` — aggregated error counts by type plus the window bounds.
+- `errors.json` — aggregated error counts by type plus a **provider/model
+  breakdown** (nested `{error_type: {provider: {model: count}}}`; providers or
+  models not derivable from the log line are keyed `(unknown)`) plus the window
+  bounds.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Day / Night**
   columns), fallback-reason and routing-skip breakdowns, per-model
-  breakdown, **Error analysis** (when the window has error events),
+  breakdown, **Error analysis** (when the window has error events) with a
+  taxonomy table plus a **Provider/model breakdown** table (error type ×
+  provider × model × count),
   **Local model utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency, hourly busy profile,
   day/night split — when the window has local traffic), **Decode speed** and
@@ -162,8 +167,18 @@ run (`Previous outputs archived to …`).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
-   rendered into the report's **Error analysis** section plus
-   `errors.csv`/`errors.json`. Remediation recommendations (recovery-first,
+   rendered into the report's **Error analysis** section (taxonomy table plus
+   a **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
+   Provider/model attribution is best effort: `Stream finished: reason=error`
+   and `Stream error:` lines carry `provider=`/`model=` directly; `slot_save
+   failed` is always the local llama-server (provider `local`, model not in
+   the line); `[remote] upstream error` carries only a target URL so the
+   provider is inferred from the endpoint (e.g. `opencode.ai/zen/go` →
+   `opencode-go`, `opencode.ai/zen` → `opencode`, `api.deepseek.com` →
+   `deepseek`, `models.inference.ai.azure.com` → `github`; unknown endpoints
+   fall back to the bare hostname) and the model is unknown; `backend_retry`
+   carries neither. Undetermined values render as `-` in the report and
+   `(unknown)` in JSON. Remediation recommendations (recovery-first,
    informative-error, ctx-size pressure, 429 cooldown) are generated from
    these events and link to the relevant work items.
 8. **Decode/prompt-eval speed** — llama-server eval-timing lines
@@ -215,6 +230,13 @@ run (`Previous outputs archived to …`).
 - **Day vs night**: a large fallback-rate gap between buckets suggests the
   slot schedule under-serves one period.
 - **Error analysis** (see the **Error analysis** section and `errors.csv`):
+  the taxonomy table counts each error type; the **Provider/model breakdown**
+  table splits each type by provider and model (e.g. a spike of
+  `Stream finished: reason=error` on `opencode-go/deepseek-v4-flash` vs
+  `local/Qwen3` pinpoints which provider/model to fix). Provider/model
+  attribution is best effort (see [How it works](#how-it-works)); values not
+  derivable from the log line show as `-` in the report and `(unknown)` in
+  `errors.json`.
   - `Stream finished: reason=error` — the client-visible synthetic error
     event (no payload). Remediation: recovery-first silent continue
     (LP-0MSDP2PDB004GV86) + informative-error fallback

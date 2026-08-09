@@ -41,6 +41,7 @@ RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-
 RE_BACKEND_ATTEMPT = re.compile(r"attempt=(\d+/\d+)")
 RE_BACKEND_SIGNAL = re.compile(r"signal=([\w_]+)")
 RE_UPSTREAM_STATUS = re.compile(r"status=(\d+)")
+RE_UPSTREAM_URL = re.compile(r"url=(\S+)")
 # upstream error type appears in the JSON body as {"type":"error","error":{"type":"<Type>",...}}.
 RE_UPSTREAM_BODY_TYPE = re.compile(r'"type":"(FreeUsageLimitError|[A-Za-z]+Error)"')
 
@@ -60,6 +61,35 @@ STREAM_ERROR = "Stream error:"
 SLOT_SAVE_FAILED = "slot_save failed"
 BACKEND_RETRY = "backend_retry"
 UPSTREAM_ERROR = "[remote] upstream error"
+
+# Best-effort provider attribution for ``[remote] upstream error`` lines: the
+# line carries only the target URL, so the provider is inferred from the
+# endpoint path/host. These patterns mirror the remote provider endpoints in
+# proxy/config.yaml (opencode.ai/zen/go → opencode-go, opencode.ai/zen →
+# opencode, api.deepseek.com → deepseek, models.inference.ai.azure.com →
+# github). The model is not present in the line and stays ``None``.
+UPSTREAM_URL_PROVIDER_PATTERNS = (
+    ("opencode.ai/zen/go", "opencode-go"),
+    ("opencode.ai/zen", "opencode"),
+    ("api.deepseek.com", "deepseek"),
+    ("models.inference.ai.azure.com", "github"),
+)
+
+
+def _provider_from_upstream_url(url: str | None) -> str | None:
+    """Infer a provider name from an upstream error target URL (best effort).
+
+    Known endpoint patterns are matched first; anything else falls back to the
+    bare hostname so unknown endpoints are still attributed. Returns ``None``
+    when the line carried no URL.
+    """
+    if not url:
+        return None
+    for needle, provider in UPSTREAM_URL_PROVIDER_PATTERNS:
+        if needle in url:
+            return provider
+    host = url.split("/", 3)[2] if "//" in url else None
+    return host or None
 
 # Events within this many seconds *before* a session's first remote stream are
 # candidates for attributing a session-less "Fallback triggered" line to that
@@ -215,9 +245,12 @@ def parse_log_line(line: str) -> LogEvent | None:
         )
     if msg.startswith(SLOT_SAVE_FAILED):
         # "slot_save failed slot=2 error=ReadTimeout/ReadTimeout"
+        # Slot persistence always targets the local llama-server, so the event
+        # is attributed to the local provider; the model is not in the line.
         return LogEvent(
             "slot_save_error",
             ts,
+            provider=LOCAL_PROVIDER,
             error=_first(RE_ERROR_DETAIL, msg),
             raw=line,
         )
@@ -238,6 +271,7 @@ def parse_log_line(line: str) -> LogEvent | None:
         return LogEvent(
             "upstream_http_error",
             ts,
+            provider=_provider_from_upstream_url(_first(RE_UPSTREAM_URL, msg)),
             error=body_type.group(1) if body_type else None,
             status=int(status_m.group(1)) if status_m else None,
             raw=line,

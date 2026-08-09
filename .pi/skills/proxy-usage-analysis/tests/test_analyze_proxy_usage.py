@@ -187,6 +187,9 @@ class TestErrorLineParsing:
         assert ev is not None
         assert ev.kind == "slot_save_error"
         assert ev.error == "ReadTimeout/ReadTimeout"
+        # Slot persistence always targets the local llama-server.
+        assert ev.provider == "local"
+        assert ev.model is None
 
     def test_backend_retry(self):
         ev = log_parser.parse_log_line(fixtures.BACKEND_RETRY_TIMEOUT)
@@ -202,6 +205,34 @@ class TestErrorLineParsing:
         assert ev.kind == "upstream_http_error"
         assert ev.status == 429
         assert ev.error == "FreeUsageLimitError"
+        # Provider is inferred from the target URL; model is not in the line.
+        assert ev.provider == "opencode"
+        assert ev.model is None
+
+    def test_upstream_url_provider_mapping(self):
+        cases = [
+            ("url=https://opencode.ai/zen/go/v1/chat/completions", "opencode-go"),
+            ("url=https://opencode.ai/zen/v1/chat/completions", "opencode"),
+            ("url=https://api.deepseek.com/v1/chat/completions", "deepseek"),
+            ("url=https://models.inference.ai.azure.com/v1/chat/completions", "github"),
+            # Unknown endpoints fall back to the bare hostname.
+            ("url=https://other.example.com/v1/chat/completions", "other.example.com"),
+        ]
+        for url, expected in cases:
+            line = (
+                f"2026-08-03 13:58:04,053 - WARNING - [remote] upstream error status=429 "
+                f"{url} body={{\"type\":\"error\"}}"
+            )
+            ev = log_parser.parse_log_line(line)
+            assert ev is not None and ev.kind == "upstream_http_error"
+            assert ev.provider == expected, f"{url} → {ev.provider}, expected {expected}"
+
+    def test_upstream_error_without_url(self):
+        line = "2026-08-03 13:58:04,053 - WARNING - [remote] upstream error status=503 body={}"
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None and ev.kind == "upstream_http_error"
+        assert ev.provider is None
+        assert ev.status == 503
 
     def test_slot_save_success_is_ignored(self):
         assert log_parser.parse_log_line(fixtures.SLOT_SAVE_SUCCESS) is None
@@ -546,10 +577,12 @@ class TestErrorAggregation:
         # stream_finish_error: opencode / deepseek-v4-flash-free; stream_error: local / Qwen3.
         assert breakdown[("stream_finish_error", "opencode", "deepseek-v4-flash-free")] == 1
         assert breakdown[("stream_error", "local", "Qwen3")] == 1
-        # slot_save / backend_retry / upstream carry no provider/model.
-        assert breakdown[("slot_save_error", None, None)] == 1
+        # slot_save is attributed to the local provider (model not in the line);
+        # backend_retry carries no provider/model; upstream HTTP errors get their
+        # provider from the target URL (opencode.ai/zen → opencode).
+        assert breakdown[("slot_save_error", "local", None)] == 1
         assert breakdown[("backend_retry", None, None)] == 1
-        assert breakdown[("upstream_http_error", None, None)] == 1
+        assert breakdown[("upstream_http_error", "opencode", None)] == 1
 
     def test_error_events_outside_window_excluded(self):
         _ = aggregation.aggregate(
@@ -1232,7 +1265,10 @@ class TestEndToEnd:
         report_md = (out_dir / "report.md").read_text()
         assert "## Error analysis" in report_md
         assert "stream_finish_error" in report_md
-        assert "opencode/deepseek-v4-flash-free" in report_md
+        assert "Provider/model breakdown" in report_md
+        # The breakdown table carries provider and model cells per error type.
+        assert "| opencode | deepseek-v4-flash-free |" in report_md
+        assert "| local | Qwen3 |" in report_md
         assert "slot_save_error" in report_md
         assert "upstream_http_error" in report_md
         assert "FreeUsageLimitError" in report_md
@@ -1248,6 +1284,8 @@ class TestEndToEnd:
         by_type = {r["error_type"]: r for r in rows}
         assert by_type["stream_finish_error"]["provider"] == "opencode"
         assert by_type["upstream_http_error"]["status"] == "429"
+        assert by_type["upstream_http_error"]["provider"] == "opencode"
+        assert by_type["slot_save_error"]["provider"] == "local"
 
         errors_json = out_dir / "errors.json"
         assert errors_json.exists()
@@ -1255,6 +1293,13 @@ class TestEndToEnd:
         assert data["total"] == 5
         assert data["by_type"]["stream_finish_error"] == 1
         assert data["by_type"]["upstream_http_error"] == 1
+        # Provider/model breakdown mirrors the report table.
+        bpm = data["by_provider_model"]
+        assert bpm["stream_finish_error"]["opencode"]["deepseek-v4-flash-free"] == 1
+        assert bpm["stream_error"]["local"]["Qwen3"] == 1
+        assert bpm["slot_save_error"]["local"]["(unknown)"] == 1
+        assert bpm["upstream_http_error"]["opencode"]["(unknown)"] == 1
+        assert bpm["backend_retry"]["(unknown)"]["(unknown)"] == 1
 
     def test_error_json_summary_counts(self, tmp_path):
         log_dir = tmp_path / "logs_err2"
@@ -1270,6 +1315,11 @@ class TestEndToEnd:
         data = reporting.summary_to_json(result.summary)
         assert data["errors"] == 5
         assert data["errors_by_type"]["stream_finish_error"] == 1
+        # Provider/model breakdown is exposed in the JSON summary.
+        bpm = data["errors_by_provider_model"]
+        assert bpm["stream_error"]["local"]["Qwen3"] == 1
+        assert bpm["upstream_http_error"]["opencode"]["(unknown)"] == 1
+        json.dumps(data)
 
     def test_empty_log_dir(self, tmp_path):
         log_dir = tmp_path / "empty"
