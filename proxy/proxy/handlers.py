@@ -50,6 +50,25 @@ def _resolve_client_ip(request: Request) -> tuple[str, str]:
 
     return "unknown", "direct"
 
+
+def _resolve_client_port(request: Request) -> int | str:
+    """Resolve the client source port for structured logging.
+
+    Returns ``request.client.port`` for direct connections, or the string
+    ``"unknown"`` when the client identity came from a reverse-proxy header
+    (X-Forwarded-For / X-Real-IP — these carry no source port) or when no
+    client address/port is present (LP-0MSKV3IEQ004ZV88).
+
+    The header check mirrors ``_resolve_client_ip`` precedence: when a header
+    is present the effective client identity is the header value, so the
+    direct connection's port must not be attributed to it.
+    """
+    if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
+        return "unknown"
+    if request.client and request.client.port is not None:
+        return request.client.port
+    return "unknown"
+
 # APIRouter for use by the main server app
 router = APIRouter()
 
@@ -356,10 +375,11 @@ async def get_llama_local_status(request: Request):
     (seconds, default 1.0).
 
     Each call is logged with a ``status_request`` structured message that
-    includes the client IP (with source: header vs direct), the response
-    fields and request latency (ms). The client IP resolves via
-    X-Forwarded-For / X-Real-IP headers when present (reverse-proxy safe),
-    falling back to the direct connection address.
+    includes the client IP (with source: header vs direct), the client source
+    port (direct connections only; ``unknown`` for reverse-proxy header
+    paths), the response fields and request latency (ms). The client IP
+    resolves via X-Forwarded-For / X-Real-IP headers when present
+    (reverse-proxy safe), falling back to the direct connection address.
     """
     import os  # noqa: local import for config access
 
@@ -474,6 +494,7 @@ async def get_llama_local_status(request: Request):
         extra={
             "client_ip": client_ip,
             "client_ip_source": client_ip_source,
+            "client_port": _resolve_client_port(request),
             "latency_ms": _latency_ms,
             "llama_server_running": llama_running,
             "active_query": active,
