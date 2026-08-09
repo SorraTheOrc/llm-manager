@@ -1786,6 +1786,7 @@ from .backend_health import (  # noqa: E402, F401
 
 async def restart_services(
     slot_count: int | None = None,
+    ctx_size: int | None = None,
     reason: str = "scheduled_slot_change",
 ) -> bool:
     """Gracefully restart llama-server with a new slot count.
@@ -1809,6 +1810,14 @@ async def restart_services(
     Args:
         slot_count: The new ``--parallel N`` value.  When ``None``, the
             current ``session_slot_pool_size`` from config is used.
+        ctx_size: Optional per-period context-size override
+            (LP-0MSLNK96T0018W4D): the total context across all slots
+            (llama-server's ``--ctx-size``) for the new period. When set,
+            ``local_model_ctx_size`` in the in-memory config is updated (so
+            the routing clamp derives thresholds from the ACTIVE period) and
+            ``LLAMA_CTX_SIZE``/``LLAMA_CTX_MODEL`` are exported for
+            ``start-llama.sh`` to override the models.ini value. When
+            ``None``, no context override is applied.
         reason: A descriptive label for log messages (default
             ``"scheduled_slot_change"``).
 
@@ -1828,6 +1837,13 @@ async def restart_services(
     else:
         server_cfg = srv.config.get("server", {})
         slot_count = int(server_cfg.get("session_slot_pool_size", 1) or 1)
+
+    if ctx_size is not None:
+        # Per-period context-size override (LP-0MSLNK96T0018W4D): update the
+        # in-memory config so the routing clamp derives per-slot thresholds
+        # from the ACTIVE period's ctx-size.
+        if isinstance(server_cfg, dict):
+            server_cfg["local_model_ctx_size"] = int(ctx_size)
 
     srv.logger.info(
         "restart_services: restarting llama-server with %d slots (reason=%s)",
@@ -1868,6 +1884,17 @@ async def restart_services(
 
     # Set the LLAMA_PARALLEL env var so the start script reads it.
     os.environ["LLAMA_PARALLEL"] = str(slot_count)
+    if ctx_size is not None:
+        # Per-period ctx-size override (LP-0MSLNK96T0018W4D): export the
+        # new context size so start-llama.sh overrides the models.ini value
+        # for the local model, plus the local model's preset name so the
+        # override targets the right section.
+        os.environ["LLAMA_CTX_SIZE"] = str(int(ctx_size))
+        model_name = getattr(srv, "current_model", None) or server_config.get(
+            "local_model_name"
+        )
+        if model_name:
+            os.environ["LLAMA_CTX_MODEL"] = str(model_name)
 
     # Determine which model to reload.
     router_mode = bool(server_config.get("llama_router_mode", False))

@@ -421,3 +421,104 @@ class TestBusySlotGate:
             "With the gate disabled, persistence should proceed even under load"
         )
         assert filename is not None
+
+
+# ===================================================================
+# Per-period ctx_size: dynamic cap uses the ACTIVE period's (ctx_size, slots)
+# ===================================================================
+
+
+class TestDynamicCapPerPeriodCtx:
+    """LP-0MSLNK96T0018W4D: session_slot_max_prompt_tokens dynamic
+    derivation must use the ACTIVE period's ctx_size (e.g. 2 slots @
+    262144 overnight → cap 126,976), not just the static config value."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_slot_registry(self):
+        from proxy.session import _slot_owners
+        _slot_owners.clear()
+        yield
+        _slot_owners.clear()
+
+    def _make_config(self, ctx_size=131072, pool_size=3, max_prompt_tokens=0):
+        return {
+            "session_slot_save_path": "/tmp/slot-cache",
+            "session_slot_pool_size": pool_size,
+            "local_model_ctx_size": ctx_size,
+            "session_slot_max_prompt_tokens": max_prompt_tokens,
+            "session_slot_timeout_seconds": 3.0,
+        }
+
+    def test_night_2slot_262k_admits_100k(self, monkeypatch):
+        """Night period (262144, 2) → cap 126,976. A 100K-token context is
+        admitted even though it exceeds the day-period cap (39,594)."""
+        from proxy.session import _build_slot_context
+
+        config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
+        sched = type(
+            "S",
+            (),
+            {
+                "get_active_ctx_size": lambda self, now=None: 262144,
+                "get_active_slot": lambda self, now=None: 2,
+            },
+        )()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        slot_id, _, _ = _build_slot_context(
+            config, "night-100k", _body_for_tokens(100000)
+        )
+        assert slot_id is not None, (
+            "100K tokens should be admitted under night 2-slot @ 262144 "
+            "cap (126976)"
+        )
+
+    def test_night_2slot_262k_rejects_150k(self, monkeypatch):
+        """A 150K-token context exceeds the 126,976 night cap → rejected."""
+        from proxy.session import _build_slot_context
+
+        config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
+        sched = type(
+            "S",
+            (),
+            {
+                "get_active_ctx_size": lambda self, now=None: 262144,
+                "get_active_slot": lambda self, now=None: 2,
+            },
+        )()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        slot_id, _, _ = _build_slot_context(
+            config, "night-150k", _body_for_tokens(150000)
+        )
+        assert slot_id is None, (
+            "150K tokens should be rejected under night 2-slot @ 262144 "
+            "cap (126976)"
+        )
+
+    def test_day_3slot_131k_rejects_100k(self, monkeypatch):
+        """Day period (131072, 3) → cap 39,594. The same 100K-token context
+        that night admits is rejected during the day."""
+        from proxy.session import _build_slot_context
+
+        config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
+        sched = type(
+            "S",
+            (),
+            {
+                "get_active_ctx_size": lambda self, now=None: None,
+                "get_active_slot": lambda self, now=None: 3,
+            },
+        )()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        slot_id, _, _ = _build_slot_context(
+            config, "day-100k", _body_for_tokens(100000)
+        )
+        assert slot_id is None, (
+            "100K tokens should be rejected under day 3-slot @ 131072 "
+            "cap (39594)"
+        )

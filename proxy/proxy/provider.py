@@ -436,6 +436,28 @@ def _get_active_local_slots(config: dict) -> int:
 _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
 
 
+def _get_active_local_ctx_size(config: dict) -> int:
+    """Return the currently active local context size (schedule-aware).
+
+    Prefers the live slot scheduler's per-period ``ctx_size`` (the ACTIVE
+    schedule entry's override, LP-0MSLNK96T0018W4D); falls back to the
+    static ``local_model_ctx_size`` from config, which ``restart_services``
+    keeps in sync with the last applied transition. Mirrors
+    ``_get_active_local_slots``.
+    """
+    try:
+        import proxy.server as _srv
+
+        scheduler = getattr(_srv, "slot_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "get_active_ctx_size"):
+            ctx = scheduler.get_active_ctx_size()
+            if ctx and int(ctx) > 0:
+                return int(ctx)
+    except Exception:
+        pass
+    return _get_local_model_ctx_size(config)
+
+
 def _get_context_pressure_warn_ratio(config: dict) -> float:
     """Read the context-pressure warning ratio from config.
 
@@ -560,7 +582,7 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     """
     cold = _get_large_context_threshold(config)
     warm = _get_warm_cache_threshold(config)
-    ctx_size = _get_local_model_ctx_size(config)
+    ctx_size = _get_active_local_ctx_size(config)
     slots = _get_active_local_slots(config)
 
     cap = effective_per_slot_threshold(ctx_size, slots)
@@ -575,21 +597,23 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     return cold, warm
 
 
-def _collect_local_slot_counts(config: dict) -> list[int]:
-    """All slot counts the proxy may run with: static pool + schedule entries.
+def _collect_local_ctx_pairs(config: dict) -> list[tuple[int, int]]:
+    """All (ctx_size, slots) pairs the proxy may run with.
 
-    Returns the static ``session_slot_pool_size`` (when > 0) followed by the
-    ``slots`` value of every entry in an enabled ``slot_schedule``. Slot counts
-    are de-duplicated while preserving order.
+    The static ``local_model_ctx_size``/``session_slot_pool_size`` pair plus
+    every ``slot_schedule`` entry, where an entry's per-period ``ctx_size``
+    overrides the global value (falling back to it when unset)
+    (LP-0MSLNK96T0018W4D). Pairs are de-duplicated while preserving order.
     """
     server_cfg = config.get("server", config)
-    counts: list[int] = []
+    ctx_size = _get_local_model_ctx_size(config)
+    pairs: list[tuple[int, int]] = []
     try:
         pool = int(server_cfg.get("session_slot_pool_size", 0) or 0)
     except (ValueError, TypeError):
         pool = 0
     if pool > 0:
-        counts.append(pool)
+        pairs.append((ctx_size, pool))
 
     try:
         from proxy.slot_scheduler import SlotScheduleConfig
@@ -599,9 +623,10 @@ def _collect_local_slot_counts(config: dict) -> list[int]:
         schedule = None
     if schedule is not None and schedule.enabled:
         for entry in schedule.entries:
-            if entry.slots > 0 and entry.slots not in counts:
-                counts.append(entry.slots)
-    return counts
+            entry_ctx = entry.ctx_size if entry.ctx_size is not None else ctx_size
+            if entry.slots > 0 and (entry_ctx, entry.slots) not in pairs:
+                pairs.append((entry_ctx, entry.slots))
+    return pairs
 
 
 def _get_min_local_routing_threshold(config: dict) -> int:
@@ -627,11 +652,14 @@ def validate_local_routing_config(config: dict) -> list[str]:
     """Validate the ctx-size / slot-count routing clamp configuration.
 
     Computes the effective per-slot large-context routing threshold
-    (``local_model_ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``,
-    mirroring ``_effective_large_context_thresholds``) for EVERY slot count
-    the proxy may run with — the static ``session_slot_pool_size`` AND all
-    ``slot_schedule`` entries — and reports a problem when the threshold
-    falls below the configured minimum (default 10000 tokens).
+    (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``, mirroring
+    ``_effective_large_context_thresholds``) for EVERY (ctx_size, slots)
+    pair the proxy may run with — the static
+    ``local_model_ctx_size``/``session_slot_pool_size`` AND all
+    ``slot_schedule`` entries (each entry's per-period ``ctx_size``
+    overriding the global when set, LP-0MSLNK96T0018W4D) — and reports a
+    problem when the threshold falls below the configured minimum (default
+    10000 tokens).
 
     A threshold this small means every realistic agent session exceeds the
     clamp, silently bypassing ALL local traffic to remote providers (the
@@ -642,10 +670,6 @@ def validate_local_routing_config(config: dict) -> list[str]:
     set, each problem is prefixed with ``FATAL: `` so callers can fail
     startup; otherwise callers log a WARNING.
     """
-    ctx_size = _get_local_model_ctx_size(config)
-    if ctx_size <= 0:
-        return []  # clamp disabled; nothing to validate
-
     min_threshold = _get_min_local_routing_threshold(config)
     if min_threshold <= 0:
         return []  # minimum check disabled (min_local_routing_threshold: 0)
@@ -656,8 +680,10 @@ def validate_local_routing_config(config: dict) -> list[str]:
     )
 
     problems: list[str] = []
-    for slots in _collect_local_slot_counts(config):
-        threshold = effective_per_slot_threshold(ctx_size, slots)
+    for ctx, slots in _collect_local_ctx_pairs(config):
+        if ctx <= 0:
+            continue  # clamp disabled for this pair
+        threshold = effective_per_slot_threshold(ctx, slots)
         if threshold <= 0:
             # Per-slot context leaves no room for output tokens; the clamp
             # leaves thresholds unchanged rather than clamping, so nothing
@@ -665,9 +691,9 @@ def validate_local_routing_config(config: dict) -> list[str]:
             continue
         if threshold < min_threshold:
             msg = (
-                f"local_model_ctx_size={ctx_size} with {slots} slots yields "
+                f"local_model_ctx_size={ctx} with {slots} slots yields "
                 f"effective per-slot large-context routing threshold "
-                f"{threshold} ({ctx_size}//{slots} - "
+                f"{threshold} ({ctx}//{slots} - "
                 f"{_LOCAL_ROUTING_OUTPUT_HEADROOM} headroom), below the "
                 f"minimum of {min_threshold}. Every prompt above {threshold} "
                 f"tokens bypasses local to remote, silently disabling local "
@@ -3439,8 +3465,9 @@ async def _proxy_with_fallback_cycle(
                 # fraction of their earlier speed. Warn so agents/operators
                 # compact before decode degrades.
                 if should_warn_context_pressure(_estimated_tokens, config):
+                    _active_ctx = _get_active_local_ctx_size(config)
                     _per_slot = effective_per_slot_threshold(
-                        _get_local_model_ctx_size(config),
+                        _active_ctx,
                         _get_active_local_slots(config),
                     )
                     logger.warning(
@@ -3453,7 +3480,7 @@ async def _proxy_with_fallback_cycle(
                         _per_slot,
                         context_pressure_ratio(
                             _estimated_tokens,
-                            _get_local_model_ctx_size(config),
+                            _active_ctx,
                             _get_active_local_slots(config),
                         ),
                         _get_context_pressure_warn_ratio(config),

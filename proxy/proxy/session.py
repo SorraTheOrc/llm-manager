@@ -925,12 +925,12 @@ def _build_slot_context(
     # instead of freezing at a static value.
     if max_prompt_tokens <= 0:
         from proxy.provider import (
+            _get_active_local_ctx_size,
             _get_active_local_slots,
-            _get_local_model_ctx_size,
             effective_per_slot_threshold,
         )
         max_prompt_tokens = effective_per_slot_threshold(
-            _get_local_model_ctx_size(server_config),
+            _get_active_local_ctx_size(server_config),
             _get_active_local_slots(server_config),
         )
     per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)

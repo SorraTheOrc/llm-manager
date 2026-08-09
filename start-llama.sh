@@ -151,6 +151,54 @@ if [[ "$router_mode" -eq 1 ]]; then
   MODELS_INI="${LLAMA_MODELS_PRESET:-${2:-"$SCRIPT_DIR/models.ini"}}"
   MODELS_MAX="${LLAMA_MODELS_MAX:-1}"
 
+  # Per-period ctx-size override (LP-0MSLNK96T0018W4D). A global --ctx-size
+  # on the router command line would override per-model INI ctx-size for
+  # EVERY model (CLI args take highest precedence in llama.cpp's preset
+  # merge — server-models.cpp) — ballooning the embed model's KV cache.
+  # Instead, patch only the local model's ctx-size in a temp copy of the
+  # preset and point --models-preset at it. The proxy lifecycle exports
+  # LLAMA_CTX_SIZE (+ LLAMA_CTX_MODEL, default Qwen3) at slot transitions.
+  if [[ -n "${LLAMA_CTX_SIZE:-}" ]]; then
+    CTX_MODEL="${LLAMA_CTX_MODEL:-Qwen3}"
+    # Remove stale preset variants from previous runs (single-instance
+    # deployment; the running llama-server holds the file open while active).
+    rm -f "${TMPDIR:-/tmp}"/llama-models-ctx.*.ini 2>/dev/null || true
+    TMP_INI="$(mktemp "${TMPDIR:-/tmp}/llama-models-ctx.XXXXXX.ini")"
+    if awk -v model="$CTX_MODEL" -v new_ctx="$LLAMA_CTX_SIZE" '
+        BEGIN { in_section = 0; patched = 0 }
+        /^[ \t]*\[/ {
+          name = $0
+          gsub(/^[ \t]*\[/, "", name)
+          gsub(/\].*$/, "", name)
+          gsub(/^[ \t]+|[ \t]+$/, "", name)
+          if (in_section && !patched) {
+            print "ctx-size = " new_ctx
+            patched = 1
+          }
+          in_section = (tolower(name) == tolower(model))
+          print
+          next
+        }
+        in_section && /^[ \t]*ctx-size[ \t]*=/ {
+          print "ctx-size = " new_ctx
+          patched = 1
+          next
+        }
+        { print }
+        END {
+          if (patched) exit 0
+          if (in_section) { print "ctx-size = " new_ctx; exit 0 }
+          exit 1
+        }
+      ' "$MODELS_INI" > "$TMP_INI"; then
+      MODELS_INI="$TMP_INI"
+      echo "LLAMA_CTX_SIZE=$LLAMA_CTX_SIZE (patched [$CTX_MODEL] ctx-size into $TMP_INI)"
+    else
+      echo "WARNING: [$CTX_MODEL] section not found in $MODELS_INI; LLAMA_CTX_SIZE ignored" >&2
+      rm -f "$TMP_INI"
+    fi
+  fi
+
   echo "Server Environment"
   echo
   echo "IP_ADDRESS=$IP_ADDRESS"
@@ -313,6 +361,16 @@ if [[ -n "$INI_CTX" ]]; then
   CONTEXT="$INI_CTX"
 else
   echo "No ctx-size found in $MODELS_INI_FILE for model '$model'; using CONTEXT=$CONTEXT"
+fi
+
+##
+# Per-period ctx-size override (LP-0MSLNK96T0018W4D): LLAMA_CTX_SIZE is
+# exported by the proxy lifecycle at slot-schedule transitions and wins
+# over the models.ini value.
+##
+if [[ -n "${LLAMA_CTX_SIZE:-}" ]]; then
+  echo "LLAMA_CTX_SIZE=$LLAMA_CTX_SIZE (overriding CONTEXT=$CONTEXT)"
+  CONTEXT="$LLAMA_CTX_SIZE"
 fi
 
 ##

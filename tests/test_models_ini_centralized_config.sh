@@ -449,6 +449,90 @@ INI
 }
 
 # ---------------------------------------------------------------
+# Test: LLAMA_CTX_SIZE overrides models.ini ctx-size (single-model mode)
+# ---------------------------------------------------------------
+test_llama_ctx_size_overrides_single_model() {
+    echo "Test: LLAMA_CTX_SIZE overrides models.ini ctx-size in single-model mode"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[qwen3]
+hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M
+ctx-size = 131072
+INI
+
+    # Intercept the llama-server invocation: use a fake binary that records args
+    cat > "$TESTS_TMPDIR/llama-server" << 'FAKE'
+#!/usr/bin/env bash
+echo "ARGS: $*"
+exit 0
+FAKE
+    chmod +x "$TESTS_TMPDIR/llama-server"
+
+    local output rc=0
+    output=$(LLAMA_SERVER_BIN="$TESTS_TMPDIR/llama-server" LLAMA_MODELS_PRESET="$TESTS_TMPDIR/models.ini" LLAMA_CTX_SIZE=262144 bash "$SCRIPT" qwen3 2>&1 || rc=$?) || true
+
+    echo "$output" | grep -q "LLAMA_CTX_SIZE=262144 (overriding CONTEXT=131072)" && pass "log shows LLAMA_CTX_SIZE override of models.ini ctx-size" || fail "override log missing (output: $(echo "$output" | grep -i 'LLAMA_CTX_SIZE\|CONTEXT' | head -5))"
+    echo "$output" | grep -q "ARGS:.*--ctx-size 262144" && pass "--ctx-size 262144 passed to llama-server" || fail "--ctx-size not overridden (output: $(echo "$output" | grep 'ARGS:') )"
+
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: LLAMA_CTX_SIZE patches ONLY the local model in a temp router preset
+# ---------------------------------------------------------------
+test_llama_ctx_size_patches_router_preset() {
+    echo "Test: LLAMA_CTX_SIZE patches local model ctx-size in a temp router preset"
+
+    TESTS_TMPDIR="$(mktemp -d)"
+
+    cat > "$TESTS_TMPDIR/models.ini" << 'INI'
+[global]
+ngl = 80
+
+[mxbai-embed]
+hf-repo = magicunicorn/mxbai-embed-large-v1-Q8_0-GGUF:Q8_0
+embeddings = true
+
+[Qwen3]
+hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M
+ctx-size = 131072
+INI
+
+    cat > "$TESTS_TMPDIR/llama-server" << 'FAKE'
+#!/usr/bin/env bash
+echo "ARGS: $*"
+exit 0
+FAKE
+    chmod +x "$TESTS_TMPDIR/llama-server"
+
+    local output rc=0
+    output=$(LLAMA_SERVER_BIN="$TESTS_TMPDIR/llama-server" LLAMA_MODELS_PRESET="$TESTS_TMPDIR/models.ini" LLAMA_CTX_SIZE=262144 LLAMA_CTX_MODEL=Qwen3 bash "$SCRIPT" router 2>&1 || rc=$?) || true
+
+    echo "$output" | grep -q "patched \[Qwen3\] ctx-size into" && pass "log shows patched [Qwen3] ctx-size into temp preset" || fail "patch log missing (output: $(echo "$output" | grep -i 'LLAMA_CTX_SIZE' | head -3))"
+
+    # Extract the temp preset path from the log and verify its contents
+    local tmp_ini
+    tmp_ini=$(echo "$output" | sed -n 's/.*patched \[Qwen3\] ctx-size into \([^)]*\))/\1/p' | head -1)
+    if [[ -n "$tmp_ini" && -f "$tmp_ini" ]]; then
+        grep -q "ctx-size = 262144" "$tmp_ini" && pass "temp preset has [Qwen3] ctx-size = 262144" || fail "temp preset missing patched ctx-size (file: $tmp_ini)"
+        # The embed section must NOT receive a ctx-size (global --ctx-size
+        # would leak to all router models; LP-0MSLNK96T0018W4D)
+        local embed_ctx
+        embed_ctx=$(sed -n '/^\[mxbai-embed\]/,/^\[/p' "$tmp_ini" | grep -c "ctx-size")
+        [ "$embed_ctx" -eq 0 ] && pass "embed section untouched (no ctx-size added)" || fail "embed section got a ctx-size (global override leak!)"
+        # Original models.ini must be untouched
+        grep -q "ctx-size = 131072" "$TESTS_TMPDIR/models.ini" && pass "original models.ini untouched" || fail "original models.ini modified"
+        rm -f "$tmp_ini"
+    else
+        fail "could not extract temp preset path from log (output: $output)"
+    fi
+
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
 # Test: Script exists and is executable
 # ---------------------------------------------------------------
 test_script_exists() {
@@ -481,6 +565,8 @@ test_logging_shows_source
 test_logging_shows_quant_source
 test_logging_shows_quant_fallback
 test_hardcoded_fallback
+test_llama_ctx_size_overrides_single_model
+test_llama_ctx_size_patches_router_preset
 
 echo "=========================================="
 echo "Results: $PASS passed, $FAIL failed"

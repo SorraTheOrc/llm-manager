@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSL2ZLLS009RVKR",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSL2ZLLS009RVKR-expose-local-active-query-in-llama-local",
+  "work_item_id": "LP-0MSLNK96T0018W4D",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSLNK96T0018W4D-support-per-period-ctx-size-in-slot-sche",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-09T00:53:49Z"
+  "started_at": "2026-08-09T10:26:49Z"
 }

@@ -160,3 +160,41 @@ server:
   local_large_context_fallback_threshold: 60000        # cold-cache new-token cap
   local_large_context_warm_cache_threshold: 100000     # total-context hard cap
 ```
+
+## Per-period ctx_size in slot_schedule (LP-0MSLNK96T0018W4D)
+
+`slot_schedule` entries may carry an optional `ctx_size`: the total context
+across all slots (llama-server `--ctx-size`) while that entry is active.
+When absent, the global `local_model_ctx_size` applies.
+
+```yaml
+server:
+  slot_schedule:
+    enabled: true
+    entries:
+      - time: "10:00"
+        slots: 3
+      - time: "23:59"
+        slots: 2
+        ctx_size: 262144   # overnight: 2 slots @ 256K
+```
+
+At a transition the proxy restarts llama-server with the new `--parallel`
+AND context size, and the routing clamp (`_effective_large_context_thresholds`)
+plus the `session_slot_max_prompt_tokens` dynamic derivation use the ACTIVE
+period's `(ctx_size, slots)` — so overnight the per-slot cap becomes
+`262144 // 2 - 4096 = 126976` while daytime stays `131072 // 3 - 4096 = 39594`.
+
+**Router-mode mechanism:** a global `--ctx-size` on the router command line
+would override per-model INI `ctx-size` for EVERY model (CLI args take highest
+precedence in llama.cpp's preset merge), ballooning the embed model's KV cache.
+Instead `start-llama.sh` patches ONLY the local model's `ctx-size` into a temp
+copy of the preset (`LLAMA_CTX_SIZE`/`LLAMA_CTX_MODEL` exported by the proxy
+lifecycle) and points `--models-preset` at it.
+
+**Consistency invariant (F3 lesson):** the routing clamp must never admit
+prompts larger than the real per-slot context after llama.cpp rounds
+`n_ctx_seq` UP to a multiple of 256 (`262144/2 → 131072/slot`,
+`131072/3 → 43776/slot`). The clamp `(ctx_size // slots - 4096)` is always ≤
+the rounded per-slot context — enforced by
+`proxy/tests/test_ctx_slot_validation.py::TestCtxSlotConsistency`.

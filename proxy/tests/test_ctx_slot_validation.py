@@ -201,3 +201,135 @@ class TestValidateLocalRoutingConfig:
         assert "slot" in msg.lower() or "6" in msg
         assert "threshold" in msg.lower() or "effective" in msg
         assert "remote" in msg.lower() or "bypass" in msg or "bypassed" in msg
+
+
+class TestValidateLocalRoutingConfigPerPeriodCtx:
+    """Per-entry ctx_size validation (LP-0MSLNK96T0018W4D)."""
+
+    def test_entry_ctx_size_checked_independently(self):
+        """Each entry's (ctx_size, slots) is validated with ITS ctx_size."""
+        config = {"server": {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,  # ok: 131072//3 - 4096 = 39594
+            "slot_schedule": {
+                "enabled": True,
+                "entries": [
+                    {"time": "10:00", "slots": 3},
+                    # Bad: 65536//6 - 4096 = 6826 < 10000
+                    {"time": "23:59", "slots": 6, "ctx_size": 65536},
+                ],
+            },
+        }}
+        problems = validate_local_routing_config(config)
+        assert len(problems) == 1
+        assert "65536" in problems[0]
+        assert "6" in problems[0]
+
+    def test_entry_ctx_size_high_ok(self):
+        """Night entry 2 slots @ 262144 → 126,976 ≥ minimum → no problem."""
+        config = {"server": {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,  # ok
+            "slot_schedule": {
+                "enabled": True,
+                "entries": [
+                    {"time": "10:00", "slots": 3},
+                    {"time": "23:59", "slots": 2, "ctx_size": 262144},
+                ],
+            },
+        }}
+        assert validate_local_routing_config(config) == []
+
+    def test_entries_without_ctx_use_global(self):
+        """Entries without ctx_size fall back to the global value."""
+        config = {"server": {
+            "local_model_ctx_size": 65536,
+            "session_slot_pool_size": 3,  # ok: 65536//3 - 4096 = 21832
+            "slot_schedule": {
+                "enabled": True,
+                "entries": [
+                    {"time": "10:00", "slots": 6},  # bad: 6826 (global ctx)
+                ],
+            },
+        }}
+        problems = validate_local_routing_config(config)
+        assert len(problems) == 1
+        assert "65536" in problems[0]
+
+    def test_global_zero_but_entry_ctx_enables_clamp(self):
+        """A global ctx of 0 (clamp disabled) still validates entries that
+        carry their own ctx_size."""
+        config = {"server": {
+            "local_model_ctx_size": 0,
+            "session_slot_pool_size": 3,
+            "slot_schedule": {
+                "enabled": True,
+                "entries": [
+                    {"time": "10:00", "slots": 3},
+                    # Bad despite global 0: 65536//6 - 4096 = 6826 < 10000
+                    {"time": "23:59", "slots": 6, "ctx_size": 65536},
+                ],
+            },
+        }}
+        problems = validate_local_routing_config(config)
+        assert len(problems) == 1
+        assert "65536" in problems[0]
+
+
+class TestCtxSlotConsistency:
+    """AC7: the routing clamp must never admit prompts larger than the real
+    per-slot context after llama.cpp's n_ctx rounding (LP-0MSLNK96T0018W4D).
+
+    llama.cpp rounds n_ctx_seq (per-slot context) UP to a multiple of 256:
+        n_ctx = GGML_PAD(n_ctx, 256)
+        n_ctx_seq = GGML_PAD(n_ctx // n_seq_max, 256)
+        n_ctx = n_ctx_seq * n_seq_max
+    The proxy's clamp (ctx_size // slots - headroom) must be ≤ the rounded
+    per-slot context so a prompt admitted local fits the slot.
+    """
+
+    @staticmethod
+    def _llama_rounded_per_slot(ctx_size: int, slots: int) -> int:
+        """Mimic llama.cpp n_ctx rounding for a given total ctx and slot count."""
+        def pad(x, n):
+            return ((x + n - 1) // n) * n
+
+        n_ctx = pad(ctx_size, 256)
+        n_ctx_seq = pad(n_ctx // slots, 256)
+        return n_ctx_seq
+
+    def test_clamp_never_exceeds_rounded_per_slot(self):
+
+        cases = [
+            (131072, 3),   # day: real per-slot 43776, clamp 39594
+            (262144, 2),   # night: real per-slot 131072, clamp 126976
+            (131072, 2),   # 2 slots @ 128K
+            (262144, 1),   # 1 slot @ 256K
+            (262144, 4),   # 4 slots @ 256K
+            (65536, 6),    # degenerate case
+        ]
+        for ctx_size, slots in cases:
+            real_per_slot = self._llama_rounded_per_slot(ctx_size, slots)
+            clamp = ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM
+            assert clamp <= real_per_slot, (
+                f"ctx={ctx_size} slots={slots}: clamp {clamp} > real per-slot "
+                f"{real_per_slot} — prompts at the clamp would truncate"
+            )
+
+    def test_night_config_clamp_leaves_headroom(self):
+        """2 slots @ 262144: clamp 126,976 × 2 = 253,952 ≤ 262,144."""
+        from proxy.provider import effective_per_slot_threshold
+
+        clamp = effective_per_slot_threshold(262144, 2)
+        assert clamp == 126976
+        assert clamp * 2 <= 262144
+        # A prompt admitted at the clamp + headroom fits the real per-slot ctx.
+        assert clamp + 4096 <= self._llama_rounded_per_slot(262144, 2)
+
+    def test_day_config_clamp_leaves_headroom(self):
+        """3 slots @ 131072: clamp 39,594 ≤ real per-slot 43,776."""
+        from proxy.provider import effective_per_slot_threshold
+
+        clamp = effective_per_slot_threshold(131072, 3)
+        assert clamp == 39594
+        assert clamp + 4096 <= self._llama_rounded_per_slot(131072, 3)

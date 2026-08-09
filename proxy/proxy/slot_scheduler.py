@@ -27,10 +27,17 @@ logger = logging.getLogger("llama-proxy")
 
 @dataclass
 class SlotScheduleEntry:
-    """A single schedule entry mapping a time-of-day to a slot count."""
+    """A single schedule entry mapping a time-of-day to a slot count.
+
+    ``ctx_size`` is an optional per-period context-size override: the total
+    context across all slots (llama-server's ``--ctx-size``) that applies
+    while this entry is active (LP-0MSLNK96T0018W4D). When ``None`` the
+    global ``local_model_ctx_size`` from config applies.
+    """
 
     time: dt_time
     slots: int
+    ctx_size: int | None = None
 
 
 @dataclass
@@ -98,8 +105,25 @@ class SlotScheduleConfig:
                 minute = int(parts[1])
                 if not (0 <= hour <= 23 and 0 <= minute <= 59):
                     continue
+                # Optional per-period ctx_size (LP-0MSLNK96T0018W4D): total
+                # context across all slots while this entry is active.
+                # Invalid/absent values fall back to the global
+                # ``local_model_ctx_size`` (represented as None).
+                ctx_size: int | None = None
+                raw_ctx = entry.get("ctx_size")
+                if raw_ctx is not None:
+                    try:
+                        parsed_ctx = int(raw_ctx)
+                        if parsed_ctx > 0:
+                            ctx_size = parsed_ctx
+                    except (ValueError, TypeError):
+                        ctx_size = None
                 self.entries.append(
-                    SlotScheduleEntry(time=dt_time(hour, minute), slots=int(slots))
+                    SlotScheduleEntry(
+                        time=dt_time(hour, minute),
+                        slots=int(slots),
+                        ctx_size=ctx_size,
+                    )
                 )
             except (ValueError, TypeError):
                 continue
@@ -121,6 +145,38 @@ class SlotScheduleConfig:
         raw = server_config.get("slot_schedule")
         return cls(raw)
 
+    def get_active_entry(self, now: dt_time | None = None) -> SlotScheduleEntry | None:
+        """Return the schedule entry active at *now*, or None if no entry matches.
+
+        Returns the most recent schedule entry whose time is at or before
+        *now*.  If no entry has been reached yet today, the schedule wraps
+        circularly to the last entry (persisting from the previous
+        day/night).
+
+        Returns ``None`` only when:
+        - The schedule is disabled.
+        - No entries are configured (caller should use the static slot count).
+        """
+        if not self.enabled or not self.entries:
+            return None
+
+        now = now or datetime.now().time()
+
+        # Walk entries in order; find the last one whose time <= now.
+        last_matching: SlotScheduleEntry | None = None
+        for entry in self.entries:
+            if entry.time <= now:
+                last_matching = entry
+            else:
+                break
+
+        if last_matching is not None:
+            return last_matching
+
+        # Before the first entry of the day — the schedule wraps circularly,
+        # so the last entry from the previous day applies.
+        return self.entries[-1]
+
     def get_active_slot(self, now: dt_time | None = None) -> int | None:
         """Return the slot count active at *now*, or None if no entry matches.
 
@@ -133,28 +189,20 @@ class SlotScheduleConfig:
         - The schedule is disabled.
         - No entries are configured (caller should use the static slot count).
         """
-        if not self.enabled or not self.entries:
-            return None
+        entry = self.get_active_entry(now)
+        return entry.slots if entry is not None else None
 
-        now = now or datetime.now().time()
+    def get_active_ctx_size(self, now: dt_time | None = None) -> int | None:
+        """Return the ctx_size of the entry active at *now*.
 
-        # Walk entries in order; find the last one whose time <= now.
-        last_matching: int | None = None
-        for entry in self.entries:
-            if entry.time <= now:
-                last_matching = entry.slots
-            else:
-                break
+        ``None`` means the active entry has no per-period override (callers
+        fall back to the global ``local_model_ctx_size`` from config).
+        """
+        entry = self.get_active_entry(now)
+        return entry.ctx_size if entry is not None else None
 
-        if last_matching is not None:
-            return last_matching
-
-        # Before the first entry of the day — the schedule wraps circularly,
-        # so the last entry from the previous day applies.
-        return self.entries[-1].slots
-
-    def _get_next_entry_time(self, now: dt_time) -> tuple[dt_time, int] | None:
-        """Return the (time, slots) of the next schedule entry after *now*.
+    def _get_next_entry(self, now: dt_time) -> SlotScheduleEntry | None:
+        """Return the next schedule entry after *now*.
 
         Handles wrapping: if no entry remains today, returns the first entry
         (interpreted as the next day). Returns None for disabled or empty schedules.
@@ -164,11 +212,21 @@ class SlotScheduleConfig:
 
         for entry in self.entries:
             if entry.time > now:
-                return (entry.time, entry.slots)
+                return entry
 
         # All entries have passed — wrap to the first entry (next day).
-        first = self.entries[0]
-        return (first.time, first.slots)
+        return self.entries[0]
+
+    def _get_next_entry_time(self, now: dt_time) -> tuple[dt_time, int] | None:
+        """Return the (time, slots) of the next schedule entry after *now*.
+
+        Handles wrapping: if no entry remains today, returns the first entry
+        (interpreted as the next day). Returns None for disabled or empty schedules.
+        """
+        entry = self._get_next_entry(now)
+        if entry is None:
+            return None
+        return (entry.time, entry.slots)
 
 
 class SlotScheduler:
@@ -215,7 +273,13 @@ class SlotScheduler:
             srv.config.get("server", {}) if isinstance(srv.config, dict) else None
         )
         self._pending_restart_slot: int | None = None
+        self._pending_restart_ctx: int | None = None
         self._task: asyncio.Task | None = None
+        # Base context size captured at construction (before any transition
+        # mutates config ``local_model_ctx_size``). Schedule entries without
+        # an explicit ``ctx_size`` fall back to this value
+        # (LP-0MSLNK96T0018W4D).
+        self._base_ctx_size = self._get_static_ctx_size()
 
     @property
     def enabled(self) -> bool:
@@ -227,13 +291,34 @@ class SlotScheduler:
         """The slot count for the pending restart, or None if no restart is pending."""
         return self._pending_restart_slot
 
-    def set_pending_restart(self, slot_count: int) -> None:
-        """Mark a restart as pending with the given slot count."""
+    @property
+    def pending_restart_ctx(self) -> int | None:
+        """The ctx_size for the pending restart (None = fall back to global)."""
+        return self._pending_restart_ctx
+
+    def get_active_slot(self, now: dt_time | None = None) -> int | None:
+        """Schedule-aware active slot count (delegates to the schedule config).
+
+        Exposed on the scheduler so routing can prefer the live schedule
+        (LP-0MSLNK96T0018W4D).
+        """
+        return self._config.get_active_slot(now)
+
+    def get_active_ctx_size(self, now: dt_time | None = None) -> int | None:
+        """Schedule-aware active ctx_size (None = no per-period override)."""
+        return self._config.get_active_ctx_size(now)
+
+    def set_pending_restart(
+        self, slot_count: int, ctx_size: int | None = None
+    ) -> None:
+        """Mark a restart as pending with the given slot count and ctx_size."""
         self._pending_restart_slot = slot_count
+        self._pending_restart_ctx = ctx_size
 
     def clear_pending_restart(self) -> None:
-        """Clear the pending restart flag."""
+        """Clear the pending restart flag (and its ctx_size)."""
         self._pending_restart_slot = None
+        self._pending_restart_ctx = None
 
     def _now(self) -> dt_time:
         """Return the current time-of-day.  PATCHABLE in tests."""
@@ -331,6 +416,28 @@ class SlotScheduler:
         except Exception:
             return 1
 
+    def _get_static_ctx_size(self) -> int:
+        """Return the static ``local_model_ctx_size`` from config.
+
+        This is the initial context size before any schedule transition has
+        been performed. Returns 0 when unset (clamp disabled).
+        """
+        try:
+            server_cfg = getattr(self._srv, 'config', {}).get("server", {})
+            return int(server_cfg.get("local_model_ctx_size", 0) or 0)
+        except Exception:
+            return 0
+
+    def _effective_ctx_size(self, entry: SlotScheduleEntry | None) -> int:
+        """Resolve the effective context size for a schedule entry.
+
+        Per-period ``ctx_size`` when set, else the base global value captured
+        at construction (LP-0MSLNK96T0018W4D).
+        """
+        if entry is None or entry.ctx_size is None:
+            return self._base_ctx_size
+        return entry.ctx_size
+
     async def _run_check_cycle_inner(self) -> None:
         """Inner implementation of _run_check_cycle (no exception wrapping).
 
@@ -351,16 +458,19 @@ class SlotScheduler:
         # ── Catch-up: if we started after a transition time, apply it now ──
         if self._pending_restart_slot is None:
             now = self._now()
-            schedule_current = self._config.get_active_slot(now)
+            active_entry = self._config.get_active_entry(now)
             static_slots = self._get_static_slot_count()
-            if schedule_current is not None and schedule_current != static_slots:
+            if active_entry is not None and (
+                active_entry.slots != static_slots
+                or self._effective_ctx_size(active_entry) != self._get_static_ctx_size()
+            ):
                 logger.info(
                     "Slot scheduler: catch-up detected — should be at %d slots "
                     "(currently at %d) per schedule; applying transition now",
-                    schedule_current,
+                    active_entry.slots,
                     static_slots,
                 )
-                self.set_pending_restart(schedule_current)
+                self.set_pending_restart(active_entry.slots, active_entry.ctx_size)
                 await self.perform_restart()
                 return
 
@@ -374,27 +484,37 @@ class SlotScheduler:
         #     the "current" value comes from the schedule's wrapping.
         #   - If pending_restart just executed and cleared, we start fresh.
         schedule_current = self._config.get_active_slot(now)
+        schedule_current_ctx = self._config.get_active_ctx_size(now)
         static_slots = self._get_static_slot_count()
+        static_ctx = self._get_static_ctx_size()
 
         if self._pending_restart_slot is not None:
             # We're in a transition cycle — use schedule's wrapped value
             # for comparison, since at least one transition has been
             # performed or is in progress.
             current_slots = schedule_current
+            current_ctx = schedule_current_ctx
         else:
             # Before any transition — use static config as the baseline.
             # This ensures a single-entry schedule like [12:00→8] correctly
             # detects that a transition IS needed (static 4 != 8).
             current_slots = static_slots
+            current_ctx = static_ctx
 
         # ── Phase 1: Check if a pending restart should execute now ──────────
         if self._pending_restart_slot is not None:
             now_dt = self._now_dt()
 
-            # Find the entry that matches our pending slot.
+            # Find the entry that matches our pending (slots, ctx) pair.
+            # Matching on BOTH values disambiguates entries that share a
+            # slot count but differ in per-period ctx_size
+            # (LP-0MSLNK96T0018W4D).
             matched_entry = None
             for entry in self._config.entries:
-                if entry.slots == self._pending_restart_slot:
+                if (
+                    entry.slots == self._pending_restart_slot
+                    and entry.ctx_size == self._pending_restart_ctx
+                ):
                     matched_entry = entry
                     break
 
@@ -432,10 +552,14 @@ class SlotScheduler:
                 self.clear_pending_restart()
                 return
 
-            # If the pending slot matches the current active slot without
-            # needing a restart (e.g., static config already matches) and
-            # the transition time has not yet passed, just clear silently.
-            if self._pending_restart_slot == current_slots:
+            # If the pending (slots, ctx) matches the current active entry
+            # without needing a restart (e.g., static config already
+            # matches) and the transition time has not yet passed, just
+            # clear silently.
+            if (
+                self._pending_restart_slot == current_slots
+                and self._pending_restart_ctx == current_ctx
+            ):
                 self.clear_pending_restart()
                 return
 
@@ -445,17 +569,20 @@ class SlotScheduler:
         # as soon as the entry's transition time arrives.  Requests are
         # never rejected in the meantime — there is no drain window
         # (LP-0MSF9RUSQ007M346).
-        next_entry = self._config._get_next_entry_time(now)
+        next_entry = self._config._get_next_entry(now)
         if next_entry is not None:
-            next_time, next_slot_count = next_entry
-            if next_slot_count != current_slots:
+            next_time = next_entry.time
+            if (next_entry.slots, self._effective_ctx_size(next_entry)) != (
+                current_slots,
+                current_ctx,
+            ):
                 logger.info(
                     "Slot scheduler: arming transition to %d slots at %s (current=%s)",
-                    next_slot_count,
+                    next_entry.slots,
                     next_time.strftime("%H:%M"),
                     current_slots,
                 )
-                self.set_pending_restart(next_slot_count)
+                self.set_pending_restart(next_entry.slots, next_entry.ctx_size)
                 return
 
     # ────────────────────────────────────────────────────────────────────
@@ -506,7 +633,10 @@ class SlotScheduler:
         if self._pending_restart_slot is not None:
             now_dt = self._now_dt()
             for entry in self._config.entries:
-                if entry.slots == self._pending_restart_slot:
+                if (
+                    entry.slots == self._pending_restart_slot
+                    and entry.ctx_size == self._pending_restart_ctx
+                ):
                     entry_dt = datetime.combine(now_dt.date(), entry.time)
                     if entry_dt <= now_dt:
                         # Entry time has already passed today — fall through
@@ -524,12 +654,17 @@ class SlotScheduler:
 
         # ── Determine current slot count for comparison ───────────────
         static_slots = self._get_static_slot_count()
+        static_ctx = self._get_static_ctx_size()
         current_slots = static_slots  # before first transition
+        current_ctx = static_ctx
 
-        # ── Find the next entry where the slot count actually changes ──
+        # ── Find the next entry where (slots, ctx) actually changes ──
         for entry in self._config.entries:
             if entry.time > now_time:
-                if entry.slots != current_slots:
+                if (
+                    entry.slots != current_slots
+                    or self._effective_ctx_size(entry) != current_ctx
+                ):
                     # No drain window — sleep straight through to the
                     # transition time (LP-0MSF9RUSQ007M346).
                     return self._seconds_until(entry.time)
@@ -547,7 +682,11 @@ class SlotScheduler:
         """Execute the pending restart of llama-server with the new slot count.
 
         Calls ``restart_services(slot_count=..., reason="scheduled_slot_change")``
-        on the server module to perform the restart.
+        on the server module to perform the restart. When the pending entry
+        carries a per-period ctx_size (or falls back to the base global
+        value), ``ctx_size`` is passed so llama-server restarts with the new
+        context size AND the routing clamp derives thresholds from the active
+        period (LP-0MSLNK96T0018W4D).
 
         Returns ``True`` if the restart was initiated, ``False`` if no pending
         restart slot was set or if an error occurred.
@@ -556,15 +695,25 @@ class SlotScheduler:
         if slot_count is None:
             return False
 
+        # Resolve the ctx_size for this transition: the pending entry's
+        # per-period override, else the base global value (None when the
+        # clamp is disabled — local_model_ctx_size 0/absent).
+        ctx_size = self._pending_restart_ctx
+        if ctx_size is None:
+            ctx_size = self._base_ctx_size
+
         try:
             logger.info(
                 "Slot scheduler: performing restart with %d slots",
                 slot_count,
             )
-            result = await self._srv.restart_services(
-                slot_count=slot_count,
-                reason="scheduled_slot_change",
-            )
+            kwargs: dict[str, Any] = {
+                "slot_count": slot_count,
+                "reason": "scheduled_slot_change",
+            }
+            if ctx_size is not None and ctx_size > 0:
+                kwargs["ctx_size"] = ctx_size
+            result = await self._srv.restart_services(**kwargs)
             self.clear_pending_restart()
             return bool(result)
         except Exception:
