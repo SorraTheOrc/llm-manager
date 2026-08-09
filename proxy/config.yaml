@@ -585,9 +585,10 @@ server:
   # is absent or 0, the cap is derived from the effective per-slot clamp
   # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
   # source as the routing clamp (effective_per_slot_threshold in provider.py)
-  # — so it auto-adapts to slot-count/ctx-size changes (e.g. Option C day
-  # 3-slot → 39594; night 8-slot → 12288) instead of freezing at a static
-  # value. Set to a non-zero value to use an explicit static override.
+  # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
+  # 3-slot schedule (day 23:59→3, night 10:00→3) → 39594) instead of
+  # freezing at a static value. Set to a non-zero value to use an explicit
+  # static override.
   # 0 = dynamic derivation (current live config).
   session_slot_max_prompt_tokens: 0
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
