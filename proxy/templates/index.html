@@ -730,6 +730,13 @@
                 <p style="color: var(--text-secondary); margin-bottom: 1rem;">
                     Real-time per-slot status for the local llama-server.
                 </p>
+                <div class="mode-control" style="display: flex; align-items: center; gap: 12px; margin-bottom: 1rem; flex-wrap: wrap;">
+                    <span style="color: var(--text-secondary);">Operating Mode:</span>
+                    <strong id="mainModeStatus">__CURRENT_MODE__</strong>
+                    <button class="btn-switch" onclick="setMode('fast')">Fast</button>
+                    <button class="btn-switch" onclick="setMode('cheap')">Cheap</button>
+                    <span style="color: var(--text-secondary); font-size: 0.85rem;">Fast = cloud-backed &middot; Cheap = local-only, 1 slot. Switching restarts the proxy.</span>
+                </div>
                 <div id="slotStatusGrid" class="endpoint-grid">
                     <!-- Slot cards are rendered here by JavaScript -->
                 </div>
@@ -1360,6 +1367,8 @@ API Endpoints
                 if (resp.ok) {
                     const modeEl = document.getElementById('currentMode');
                     if (modeEl) modeEl.textContent = data.mode;
+                    const mainModeEl = document.getElementById('mainModeStatus');
+                    if (mainModeEl) mainModeEl.textContent = data.mode;
                     statusEl.className = data.restart ? 'status-message loading' : 'status-message success';
                     statusEl.textContent = data.message || `Mode set to ${data.mode}`;
                     statusEl.style.display = 'block';
