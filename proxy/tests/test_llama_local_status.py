@@ -349,3 +349,75 @@ class TestFailOpenSlotCapacity:
         # the loaded model name must be passed through (AC2 / LP-0MSHFGO0M003Q5BL)
         _, kwargs = slots_mock.await_args
         assert kwargs["model"] == "test-model"
+
+
+# ======================================================================
+# Global active_queries recovery → status reports active_query=false
+# (LP-0MSL1OX51003DOP4)
+# ======================================================================
+
+
+@pytest.mark.asyncio
+async def test_llama_local_status_active_query_false_after_recovery():
+    """A stuck global active_queries counter is recovered so status reports active_query=false.
+
+    LP-0MSL1OX51003DOP4: the global counter had no recovery mechanism, so an
+    abandoned stream left active_query=true forever, blocking herdr downtime
+    dispatch. After the periodic in-process recovery
+    (_recover_stuck_global_active_queries, run every 10s from
+    _dispatch_cleanup_loop), the status endpoint must report
+    active_query=false again — without a proxy restart.
+    """
+    import asyncio
+
+    from proxy.router_helpers import _recover_stuck_global_active_queries
+    from proxy.server import app
+
+    from proxy import server
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    class FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    transport = httpx.ASGITransport(app=app)
+
+    # Stuck global counter: >0 but no active local work (the RCA scenario:
+    # active_query=true with slots free, no lease, no requests in flight).
+    with patch("proxy.server.query_llama_status", side_effect=fake_query):
+        with patch.object(server, "active_queries", 3):
+            with patch.object(server, "active_queries_lock", asyncio.Lock()):
+                with patch.object(server, "local_active_queries", 0):
+                    with patch.object(server, "local_active_queries_lock", asyncio.Lock()):
+                        with patch.object(server, "local_dispatch_records", {}):
+                            with patch.object(server, "local_dispatch_records_lock", FakeLock()):
+                                with patch.object(server, "model_switch_refcount", 0):
+                                    with patch.object(server, "model_switch_lock", FakeLock()):
+                                        with patch.object(server, "background_loads", {}):
+                                            with patch.object(server, "current_model", "test-model"):
+                                                # Before recovery: stuck counter reports active_query=true
+                                                async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                                                    resp = await ac.get("/llama/local/status")
+                                                    assert resp.status_code == 200
+                                                    assert resp.json()["active_query"] is True, (
+                                                        "Stuck counter should report active_query=true"
+                                                    )
+
+                                                # In-process periodic recovery (no restart)
+                                                await _recover_stuck_global_active_queries(server)
+
+                                                # After recovery: active_query=false
+                                                async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                                                    resp = await ac.get("/llama/local/status")
+                                                    assert resp.status_code == 200
+                                                    assert resp.json()["active_query"] is False, (
+                                                        "Recovered counter should report active_query=false"
+                                                    )

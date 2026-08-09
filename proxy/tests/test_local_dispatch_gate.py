@@ -1572,3 +1572,202 @@ async def test_decrement_logs_warning_on_session_key_exception():
     assert "RuntimeError" in warning_msg, "Warning should contain exception type"
     assert "dispatch lock failure" in warning_msg, "Warning should contain exception message"
     assert "sess-tes" in warning_msg, "Warning should contain session context (truncated to 8 chars)"
+
+
+# ===================================================================
+# Global active_queries counter recovery
+# (LP-0MSL1OX51003DOP4)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_recover_global_resets_stuck_counter_when_no_active_work():
+    """_recover_stuck_global_active_queries resets the global counter when stuck.
+
+    If active_queries > 0 but no dispatch records are active and the
+    local counter is 0, the global counter leaked (e.g., an abandoned
+    stream) and must be reset to 0 so the status endpoint reports
+    active_query=false again.
+    """
+    from proxy.router_helpers import _recover_stuck_global_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        active_queries=3,
+        active_queries_lock=asyncio.Lock(),
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            # Only inactive (finished) records exist - no active ones
+            "sess-finished": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 10**12,
+            },
+        },
+        logger=logger,
+    )
+
+    await _recover_stuck_global_active_queries(srv)
+
+    assert srv.active_queries == 0, (
+        "Stuck global counter should be reset to 0 when no active work exists"
+    )
+
+    # Verify a WARNING was logged about the recovery
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 1, (
+        "Expected a WARNING log about global counter recovery"
+    )
+    warning_msg = str(warning_calls[0])
+    assert "3" in warning_msg, "Warning should include the previous counter value"
+
+
+@pytest.mark.asyncio
+async def test_recover_global_does_not_reset_when_active_streams_exist():
+    """_recover_stuck_global_active_queries must NOT reset when active streams exist.
+
+    Active dispatch records indicate legitimate in-flight requests; the
+    global counter must not be reset to avoid corrupting occupancy
+    accounting for active streams.
+    """
+    from proxy.router_helpers import _recover_stuck_global_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        active_queries=2,
+        active_queries_lock=asyncio.Lock(),
+        local_active_queries=2,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-active": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+            "sess-finished": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+            },
+        },
+        logger=logger,
+    )
+
+    await _recover_stuck_global_active_queries(srv)
+
+    assert srv.active_queries == 2, (
+        "Global counter should NOT be reset while active streams exist"
+    )
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 0, (
+        "No recovery WARNING should be logged while streams are active"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_global_does_not_reset_when_local_queries_in_flight():
+    """_recover_stuck_global_active_queries must NOT reset when local queries are in flight.
+
+    Even without active dispatch records, a positive local counter means
+    local requests are in flight (the global counter is incremented
+    alongside the local one on the main routing path), so the global
+    counter must be left alone.
+    """
+    from proxy.router_helpers import _recover_stuck_global_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        active_queries=1,
+        active_queries_lock=asyncio.Lock(),
+        local_active_queries=1,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        logger=logger,
+    )
+
+    await _recover_stuck_global_active_queries(srv)
+
+    assert srv.active_queries == 1, (
+        "Global counter should NOT be reset while local queries are in flight"
+    )
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 0, (
+        "No recovery WARNING should be logged while local queries are in flight"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_global_does_not_reset_counter_at_zero():
+    """_recover_stuck_global_active_queries does nothing when counter is already 0."""
+    from proxy.router_helpers import _recover_stuck_global_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        active_queries=0,
+        active_queries_lock=asyncio.Lock(),
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        logger=logger,
+    )
+
+    await _recover_stuck_global_active_queries(srv)
+
+    assert srv.active_queries == 0, "Counter should remain 0"
+
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 0, (
+        "No recovery WARNING should be logged when counter is 0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_global_resets_in_legacy_mode():
+    """_recover_stuck_global_active_queries resets in legacy mode (no dispatch records).
+
+    Without a dispatch-record system the only signal is the local
+    counter: if it is 0 and the global counter is positive, the global
+    counter leaked and must be reset.
+    """
+    from proxy.router_helpers import _recover_stuck_global_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        active_queries=5,
+        active_queries_lock=asyncio.Lock(),
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        logger=logger,
+    )
+    # Legacy state: no local_dispatch_records attribute at all
+    assert not hasattr(srv, "local_dispatch_records")
+
+    await _recover_stuck_global_active_queries(srv)
+
+    assert srv.active_queries == 0, (
+        "Stuck global counter should be reset to 0 in legacy mode"
+    )
+    warning_calls = [
+        call for call in logger.warning.call_args_list
+        if "active_queries counter recovered" in str(call)
+    ]
+    assert len(warning_calls) == 1, (
+        "Expected a WARNING log about global counter recovery"
+    )
+    warning_msg = str(warning_calls[0])
+    assert "5" in warning_msg, "Warning should include the previous counter value"

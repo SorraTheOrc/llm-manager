@@ -1173,6 +1173,67 @@ async def _recover_stuck_local_active_queries(srv) -> None:
         pass
 
 
+async def _recover_stuck_global_active_queries(srv) -> None:
+    """Detect and reset a stuck ``active_queries`` counter.
+
+    If ``active_queries > 0`` but there is no evidence of in-flight
+    work — ``local_active_queries == 0`` and no active dispatch
+    records — the global counter is likely stuck (e.g., an abandoned
+    stream whose decrement path never ran). Resets to 0 and logs a
+    WARNING-level message.
+
+    Mirrors ``_recover_stuck_local_active_queries`` and is designed to
+    be called from ``_dispatch_cleanup_loop`` (server.py) right after
+    the local recovery, providing a periodic in-process self-recovery
+    mechanism (no proxy restart required).
+
+    Rationale for the no-active-work check: the global counter is only
+    incremented on the main routing path (router.py), which always
+    increments ``local_active_queries`` as well — either via
+    ``_try_acquire_local_dispatch`` for explicit sessions or via
+    ``_increment_local_active_queries`` for anonymous ones. Remote
+    concurrency-limit fallback never touches the global counter.
+    Therefore a positive ``active_queries`` with no local activity
+    means the counter leaked and can be safely reset.
+
+    In legacy mode (no ``local_dispatch_records`` attribute) the only
+    remaining signal is the local counter: if it is 0 and the global
+    counter is positive, the global counter leaked.
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is not None:
+            async with srv.local_active_queries_lock:
+                has_active = any(
+                    r.get("active", False) for r in records.values()
+                )
+            if has_active:
+                # Legitimate in-flight local work — keep the counter.
+                return
+
+        async with srv.local_active_queries_lock:
+            local_active = int(getattr(srv, "local_active_queries", 0) or 0)
+        if local_active > 0:
+            # Local requests in flight — keep the global counter.
+            return
+
+        async with srv.active_queries_lock:
+            if srv.active_queries > 0:
+                prev = srv.active_queries
+                srv.active_queries = 0
+                try:
+                    srv.logger.warning(
+                        "active_queries counter recovered: "
+                        "reset from %d to 0 (no active dispatch "
+                        "records or local queries in flight)",
+                        prev,
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 # ===================================================================
 # Header normalization helpers
 # ===================================================================

@@ -159,7 +159,11 @@ async def _dispatch_cleanup_loop() -> None:
             await asyncio.sleep(10.0)
             # Import via _srv() to get the current module state
             import proxy.server as _srv
-            from proxy.router_helpers import _cleanup_stale_local_dispatch, _recover_stuck_local_active_queries
+            from proxy.router_helpers import (
+                _cleanup_stale_local_dispatch,
+                _recover_stuck_global_active_queries,
+                _recover_stuck_local_active_queries,
+            )
             removed = await _cleanup_stale_local_dispatch(_srv)
             if removed:
                 try:
@@ -170,6 +174,7 @@ async def _dispatch_cleanup_loop() -> None:
                 except Exception:
                     pass
             await _recover_stuck_local_active_queries(_srv)
+            await _recover_stuck_global_active_queries(_srv)
         except asyncio.CancelledError:
             logger.info("Dispatch lease cleanup task cancelled")
             return
