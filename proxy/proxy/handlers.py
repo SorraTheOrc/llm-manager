@@ -21,6 +21,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from proxy import mode as mode_module
 from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
@@ -745,6 +746,68 @@ async def admin_metrics():
         "backend_ready": bool(srv.backend_ready),
         "backend_recovery": srv._backend_recovery_snapshot(),
         "backend_signals": dict(srv.backend_signal_counts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# /admin/mode  and  /admin/set-mode  —  operating-mode switching (fast/cheap)
+# ---------------------------------------------------------------------------
+# The proxy runs in one of two operator-selected modes:
+#   fast  — cloud-backed (remote providers eligible; config-fast.yaml)
+#   cheap — local-only  (1-slot pool, no paid cloud calls; config-cheap.yaml)
+# The active mode is persisted in proxy/.mode and survives restarts. See
+# proxy/proxy/mode.py (LP-0MSLMYEEU002IBH6).
+
+
+@router.get("/admin/mode")
+async def get_operating_mode():
+    """Return the currently persisted operating mode.
+
+    Returns ``{"mode": "fast"}`` or ``{"mode": "cheap"}``. When no mode
+    has ever been persisted, defaults to ``fast`` (current behavior).
+    """
+    return {"mode": mode_module.read_mode()}
+
+
+@router.post("/admin/set-mode")
+async def set_operating_mode(request: Request):
+    """Switch the proxy between fast and cheap operating modes.
+
+    Accepts a JSON body with a ``mode`` parameter (``"fast"`` or
+    ``"cheap"``). Requesting the mode that is already active returns
+    success with **no restart** (noop). Requesting a different mode
+    persists the new mode and triggers a **full proxy restart**
+    (``scripts/start-proxy.sh --restart``) in the background — the
+    endpoint responds *before* the restart is triggered so clients get a
+    clean response.
+
+    Returns ``400`` for an invalid/missing mode, ``409`` when a
+    mode-switch restart is already in progress and the requested mode
+    differs (avoids restart loops).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    mode = (body.get("mode") or "").strip().lower()
+    if mode not in mode_module.VALID_MODES:
+        raise HTTPException(status_code=400, detail="mode must be 'fast' or 'cheap'")
+
+    try:
+        persisted, restart = mode_module.set_mode(mode)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return {
+        "status": "success",
+        "mode": persisted,
+        "restart": restart,
+        "message": (
+            f"Mode is already {persisted}"
+            if not restart
+            else f"Switched to {persisted} mode; proxy restarting"
+        ),
     }
 
 

@@ -54,15 +54,15 @@ The body preview automatically filters out messages with `role: "system"` to pre
 ### Usage analysis (proxy-usage-analysis skill)
 
 The `proxy-usage-analysis` skill turns the last 24h of proxy logs into
-per-session daytime/nighttime CSVs and a Markdown report with data-backed
+per-session fast/cheap CSVs and a Markdown report with data-backed
 configuration recommendations (fallback reasons, slot contention, context
-pressure, day/night comparison). It parses the structured INFO lines the
+pressure, fast/cheap comparison). It parses the structured INFO lines the
 proxy emits — `Stream started`/`Stream finished` (with authoritative
 `tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
 
 To run it, invoke the skill (`/skill:proxy-usage-analysis`); it writes
-`~/proxy-usage-reports/{daytime_sessions,nighttime_sessions}.csv` and
+`~/proxy-usage-reports/{fast_sessions,cheap_sessions}.csv` and
 `~/proxy-usage-reports/report.md` by default (override with `--output-dir`).
 Operators can instead call the underlying script directly:
 
@@ -74,9 +74,9 @@ python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 ```
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
-`daytime_sessions.csv`, `nighttime_sessions.csv`
-(one row per session; day/night split derived from the `slot_schedule` in
-`config.yaml`), and `report.md` (aggregates + recommendations). Existing
+`fast_sessions.csv`, `cheap_sessions.csv`
+(one row per session; fast/cheap split derived from the `slot_schedule` in
+the active config profile), and `report.md` (aggregates + recommendations). Existing
 outputs are archived into a dated subdirectory before each run overwrites
 them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
 runs the report daily at 05:00 (see SKILL.md).
@@ -817,11 +817,48 @@ By default, the endpoint returns only the first 200 characters of content
 mode is enabled. Without debug mode, the endpoint is accessible only from
 localhost (127.0.0.1).
 
+### Operating modes (fast / cheap)
+
+The proxy runs in one of two operator-selected operating modes:
+
+- **fast** — cloud-backed: remote providers are eligible and requests can
+  fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
+  3-slot pool).
+- **cheap** — local-only: requests use only the local llama-server at no
+  cost (`proxy/config-cheap.yaml`, 1-slot pool, no remote/cloud providers).
+
+The active mode is persisted in `proxy/.mode` (gitignored runtime state);
+when absent the mode defaults to **fast** (current behavior). The mode
+survives restarts: `scripts/start-proxy.sh` reads the persisted mode at
+startup, selects the matching config profile, and exports
+`LLAMA_PROXY_CONFIG` so the server and API-key resolution use the same
+profile.
+
+Switch modes from the web UI (Admin Endpoints card) or via the admin API:
+
+```bash
+# Query the current mode
+curl http://localhost:8000/admin/mode
+# -> {"mode": "fast"}
+
+# Switch to cheap mode (persists the mode, then restarts the proxy)
+curl -X POST http://localhost:8000/admin/set-mode \
+  -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
+```
+
+Requesting the mode that is already active is a noop (no restart).
+Switching to a different mode persists the new mode and triggers a **full
+proxy restart** in the background — the endpoint responds before the
+restart kills the process. In-flight requests are terminated and clients
+retry (same semantics as slot-schedule transitions). A second switch while
+a restart is pending is a noop if the mode matches, otherwise rejected with
+`409` (avoids restart loops).
+
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `LLAMA_PROXY_CONFIG` | Path to config file (default: `./config.yaml`) |
+| `LLAMA_PROXY_CONFIG` | Path to config file. When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml` (default fallback: `./config.yaml`) |
 | `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
 | `LLAMA_START_SCRIPT` | Override the start script path |
 | `OPENAI_API_KEY` | API key for OpenAI |
@@ -1349,6 +1386,26 @@ curl -X POST http://localhost:8000/admin/reload-config
 ```bash
 curl -X POST http://localhost:8000/admin/switch-model/qwen2.5
 ```
+
+#### Current Mode
+```bash
+curl http://localhost:8000/admin/mode
+```
+Returns the currently persisted operating mode:
+```json
+{"mode": "fast"}
+```
+
+#### Set Mode (fast / cheap)
+```bash
+curl -X POST http://localhost:8000/admin/set-mode \
+  -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
+```
+Switches the proxy between **fast** (cloud-backed) and **cheap**
+(local-only) operating modes. Requesting the active mode is a noop; a
+different mode is persisted (survives restarts) and triggers a full proxy
+restart in the background. Invalid modes return `400`; a switch while a
+restart is pending returns `409` when the mode differs.
 
 #### Stop LLama Server
 ```bash

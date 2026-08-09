@@ -1,4 +1,18 @@
 # ---------------------------------------------------------------------------
+# CHEAP MODE PROFILE (config-cheap.yaml)
+# ---------------------------------------------------------------------------
+# Selected automatically when the persisted operating mode is "cheap"
+# (proxy/.mode); see proxy/proxy/mode.py and POST /admin/set-mode.
+#
+# Cheap mode is LOCAL-ONLY and 1-slot:
+#   - session_slot_pool_size: 1 (single GPU slot)
+#   - slot_schedule entries all use slots: 1
+#   - NO remote/cloud providers (no opencode/deepseek/github tiers), so no
+#     paid calls can occur. Models with no local provider (e.g. github)
+#     are unavailable in cheap mode; switch to fast mode when needed.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Model Configuration
 # ---------------------------------------------------------------------------
 # Each model can define an ordered list of `providers` for automatic
@@ -148,57 +162,14 @@ models:
     aliases:
     - embeddings
     - embed
-  github:
-    providers:
-      - name: github-primary
-        type: remote
-        provider: github
-        endpoint: https://models.inference.ai.azure.com
-    aliases:
-    - github-*
-  # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, OpenCode Go #2, then DeepSeek direct.
-  # Slot exhaustion on the local model falls through to remote tiers.
-  # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
+  # Cheap mode is LOCAL-ONLY: no remote/cloud providers are configured, so
+  # no paid calls can occur. The github model (remote-only) is unavailable
+  # in cheap mode; switch to fast mode when it is needed.
   plan:
     providers:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
-        forward_session_headers: false
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
-      - name: opencode-go-2-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-      - name: opencode-go-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-      - name: deepseek-v4-flash
-        type: remote
-        provider: deepseek
-        endpoint: https://api.deepseek.com
-        api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - plan*
     force_full_prompt: true
@@ -208,34 +179,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-mimo-v2.5-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: mimo-v2.5-free
-        forward_session_headers: false
-      - name: opencode-go-2-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-      - name: opencode-go-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-      - name: deepseek-v4-flash
-        type: remote
-        provider: deepseek
-        endpoint: https://api.deepseek.com
-        api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - author
     force_full_prompt: true
@@ -245,41 +188,6 @@ models:
       - name: local-qwen3-next
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
-        forward_session_headers: false
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
-      - name: opencode-go-2-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-      - name: opencode-go-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-      - name: deepseek-v4-flash
-        type: remote
-        provider: deepseek
-        endpoint: https://api.deepseek.com
-        api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
     force_full_prompt: true
@@ -525,7 +433,7 @@ server:
   #
   # Server restart required to change this value (no hot reload).
   # Option C (3 slots) restored per LP-0MSEGPO77005CYCQ F4.
-  session_slot_pool_size: 3
+  session_slot_pool_size: 1
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
@@ -584,9 +492,9 @@ server:
     drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
     entries:
       - time: "23:59"
-        slots: 3
+        slots: 1
       - time: "10:00"
-        slots: 3
+        slots: 1
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
   # The effective timeout is base + session_slot_timeout_per_token_seconds x
@@ -604,7 +512,7 @@ server:
   # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
   # source as the routing clamp (effective_per_slot_threshold in provider.py)
   # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
-  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
+  # 3-slot schedule (day 23:59→3, night 10:00→3) → 39594) instead of
   # freezing at a static value. Set to a non-zero value to use an explicit
   # static override.
   # 0 = dynamic derivation (current live config).

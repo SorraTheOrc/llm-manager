@@ -1,7 +1,7 @@
 """Unit tests for the llama-server eval-timing parser (decode/generation speed).
 
 Covers: eval-timing line parsing (decode + prompt eval), Qwen3 child-port
-discovery, log-file discovery, streaming iteration, day/night speed
+discovery, log-file discovery, streaming iteration, fast/cheap speed
 aggregation, and the end-to-end report/CSV additions.
 
 Fixtures are derived from real lines in /var/log/llama-proxy/llama-server.log
@@ -278,7 +278,7 @@ class TestSpeedStats:
 
     def test_percentiles_and_buckets(self, tmp_path):
         lines = [
-            # 14:30 (mtime) is day under the test schedule.
+            # 14:30 (mtime) is fast under the test schedule.
             "[32999]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    40.00 tokens per second)",
             "[32999]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    50.00 tokens per second)",
             "[32999]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    60.00 tokens per second)",
@@ -296,9 +296,9 @@ class TestSpeedStats:
         assert dec["total"].median == 55.0
         assert dec["total"].p90 == 67.0
         assert dec["total"].p10 == 43.0
-        assert dec["day"].count == 4
-        assert dec["night"].count == 0
-        assert dec["night"].median is None
+        assert dec["fast"].count == 4
+        assert dec["cheap"].count == 0
+        assert dec["cheap"].median is None
 
         pe = stats.prompt_eval
         assert pe["total"].count == 2
@@ -346,7 +346,7 @@ class TestSpeedStats:
             fixtures.QWEN3_SPAWN_LINE
             + "\n[32999]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    42.00 tokens per second)\n"
         )
-        # mtime at 23:59+ → night bucket.
+        # mtime at 23:59+ → cheap bucket.
         _set_mtime(log_dir / "llama-server.log", datetime(2026, 8, 2, 23, 59, 30))
         files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
         stats = llama_log_parser.build_speed_stats(
@@ -355,9 +355,9 @@ class TestSpeedStats:
             datetime(2026, 8, 3, 0, 0),
             _schedule(),
         )
-        assert stats.decode["day"].count == 0
-        assert stats.decode["night"].count == 1
-        assert stats.decode["night"].median == 42.0
+        assert stats.decode["fast"].count == 0
+        assert stats.decode["cheap"].count == 1
+        assert stats.decode["cheap"].median == 42.0
 
 
 # ---------------------------------------------------------------------------
@@ -403,14 +403,14 @@ class TestEndToEnd:
         decode_section = md.split("## Decode speed", 1)[1].split("## ", 1)[0]
         assert "| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |" in decode_section
         assert "| Qwen3 | Total | 2 | 40.9 | 41.1 | 40.6 |" in decode_section
-        assert "| Qwen3 | Day | 2 |" in decode_section
+        assert "| Qwen3 | Fast | 2 |" in decode_section
 
         # Prompt eval speed section with the real prompt-eval samples (99.53, 388.05).
         pe_section = md.split("## Prompt eval speed", 1)[1].split("## ", 1)[0]
         assert "| Qwen3 | Total | 2 | 243.8 | 359.2 | 128.4 |" in pe_section
 
         # CSV gains the decode tok/s column.
-        with (out_dir / "daytime_sessions.csv").open() as f:
+        with (out_dir / "fast_sessions.csv").open() as f:
             rows = list(csv.DictReader(f))
         assert "decode_tok_s" in rows[0].keys()
 

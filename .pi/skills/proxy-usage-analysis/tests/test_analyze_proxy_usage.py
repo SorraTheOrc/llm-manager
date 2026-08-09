@@ -1,6 +1,6 @@
 """Unit tests for the proxy-usage-analysis skill.
 
-Covers: log-line parsing, session aggregation, day/night bucketing from the
+Covers: log-line parsing, session aggregation, fast/cheap bucketing from the
 slot schedule, recommendation rules, config loading, and an end-to-end run
 over fixture log files.
 
@@ -523,19 +523,19 @@ class TestSessionAggregation:
         assert s.start_context_size == 200
         assert s.max_context_size == 200
 
-    def test_day_night_bucket_assigned_by_start_time(self):
-        day_line = "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=day1 request=[]"
-        night_line = "2026-08-02 23:59:30,000 - INFO - Stream started: provider=local model=Qwen3 session=night1 request=[]"
+    def test_fast_cheap_bucket_assigned_by_start_time(self):
+        day_line = "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=fast1 request=[]"
+        night_line = "2026-08-02 23:59:30,000 - INFO - Stream started: provider=local model=Qwen3 session=cheap1 request=[]"
         res = aggregation.aggregate(
             _events([day_line, night_line]),
             datetime(2026, 8, 2, 0, 0),
             datetime(2026, 8, 3, 0, 0),
             _schedule(),
         )
-        assert res.sessions["day1"].bucket == "day"
-        assert res.sessions["day1"].slots == 6
-        assert res.sessions["night1"].bucket == "night"
-        assert res.sessions["night1"].slots == 8
+        assert res.sessions["fast1"].bucket == "fast"
+        assert res.sessions["fast1"].slots == 6
+        assert res.sessions["cheap1"].bucket == "cheap"
+        assert res.sessions["cheap1"].slots == 8
 
 
 class TestErrorAggregation:
@@ -606,7 +606,7 @@ class TestErrorAggregation:
 
 
 # ---------------------------------------------------------------------------
-# Day/night bucketing from the slot schedule
+# Fast/cheap bucketing from the slot schedule
 # ---------------------------------------------------------------------------
 
 
@@ -616,24 +616,24 @@ class TestBucketing:
         periods = sch.periods
         assert len(periods) == 3
         by_start = {p.start_minutes: p for p in periods}
-        # [00:00, 10:00) = 8 slots (night)
-        assert by_start[0].slots == 8 and by_start[0].label == "night"
-        # [10:00, 23:59) = 6 slots (day)
-        assert by_start[600].slots == 6 and by_start[600].label == "day"
-        # [23:59, 24:00) = 8 slots (night)
-        assert by_start[1439].slots == 8 and by_start[1439].label == "night"
-        assert sch.day_slots == 6
-        assert sch.night_slots == 8
+        # [00:00, 10:00) = 8 slots (cheap)
+        assert by_start[0].slots == 8 and by_start[0].label == "cheap"
+        # [10:00, 23:59) = 6 slots (fast)
+        assert by_start[600].slots == 6 and by_start[600].label == "fast"
+        # [23:59, 24:00) = 8 slots (cheap)
+        assert by_start[1439].slots == 8 and by_start[1439].label == "cheap"
+        assert sch.fast_slots == 6
+        assert sch.cheap_slots == 8
 
     @pytest.mark.parametrize(
         "ts,expected_label",
         [
-            (datetime(2026, 8, 2, 0, 0, 0), "night"),
-            (datetime(2026, 8, 2, 9, 59, 59), "night"),
-            (datetime(2026, 8, 2, 10, 0, 0), "day"),
-            (datetime(2026, 8, 2, 23, 58, 59), "day"),
-            (datetime(2026, 8, 2, 23, 59, 0), "night"),
-            (datetime(2026, 8, 2, 23, 59, 59), "night"),
+            (datetime(2026, 8, 2, 0, 0, 0), "cheap"),
+            (datetime(2026, 8, 2, 9, 59, 59), "cheap"),
+            (datetime(2026, 8, 2, 10, 0, 0), "fast"),
+            (datetime(2026, 8, 2, 23, 58, 59), "fast"),
+            (datetime(2026, 8, 2, 23, 59, 0), "cheap"),
+            (datetime(2026, 8, 2, 23, 59, 59), "cheap"),
         ],
     )
     def test_bucket_boundaries(self, ts, expected_label):
@@ -645,9 +645,9 @@ class TestBucketing:
         config = {"slot_schedule": {"enabled": False, "entries": [("23:59", 8), ("10:00", 6)]}}
         sch = bucketing.schedule_from_config(config, default_slots=6)
         assert len(sch.periods) == 1
-        assert sch.periods[0].label == "day"
+        assert sch.periods[0].label == "fast"
         assert sch.periods[0].slots == 6
-        assert sch.night_slots is None
+        assert sch.cheap_slots is None
 
     def test_missing_schedule_falls_back(self):
         sch = bucketing.schedule_from_config(None, default_slots=6)
@@ -656,17 +656,17 @@ class TestBucketing:
 
     def test_three_entry_schedule(self):
         sch = bucketing.schedule_from_entries([("12:00", 8), ("10:00", 4), ("14:00", 12)])
-        assert sch.day_slots == 4
-        assert sch.night_slots == 12
-        # 10:00-12:00 is the only period with 4 slots -> day
-        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 11, 0)).label == "day"
-        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 13, 0)).label == "night"
-        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 1, 0)).label == "night"
+        assert sch.fast_slots == 4
+        assert sch.cheap_slots == 12
+        # 10:00-12:00 is the only period with 4 slots -> fast
+        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 11, 0)).label == "fast"
+        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 13, 0)).label == "cheap"
+        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 1, 0)).label == "cheap"
 
     def test_equal_slot_counts_all_day(self):
         sch = bucketing.schedule_from_entries([("10:00", 6), ("23:59", 6)])
-        assert all(p.label == "day" for p in sch.periods)
-        assert sch.night_slots is None
+        assert all(p.label == "fast" for p in sch.periods)
+        assert sch.cheap_slots is None
 
     def test_minute_of_day_uses_fractional_minutes(self):
         assert bucketing.minute_of_day(datetime(2026, 8, 2, 23, 58, 30)) == pytest.approx(1438.5)
@@ -703,7 +703,7 @@ def _session(
     remote_move: bool = False,
     local_req: int = 1,
     remote_req: int = 0,
-    bucket: str = "day",
+    bucket: str = "fast",
     slots: int = 6,
     reason: str | None = None,
 ) -> dict:
@@ -768,9 +768,9 @@ class TestRecommendations:
         recs = recommendations.generate_recommendations(res, config={"local_model_ctx_size": 262144})
         assert any("context" in r.title.lower() for r in recs)
 
-    def test_day_night_imbalance(self):
-        sessions = [_session(f"d{i}", bucket="day", remote_move=True, reason="local_concurrency_limit") for i in range(5)]
-        sessions += [_session(f"n{i}", bucket="night") for i in range(10)]
+    def test_fast_cheap_imbalance(self):
+        sessions = [_session(f"f{i}", bucket="fast", remote_move=True, reason="local_concurrency_limit") for i in range(5)]
+        sessions += [_session(f"c{i}", bucket="cheap") for i in range(10)]
         res = _result_with_sessions(sessions)
         recs = recommendations.generate_recommendations(res, config=None)
         assert any("slot schedule" in r.title.lower() for r in recs)
@@ -881,37 +881,37 @@ class TestErrorRecommendations:
             assert r.evidence, f"recommendation {r.title} must cite evidence"
             assert r.title and r.detail
 
-    def test_recommendation_evidence_has_day_night_breakdown(self):
+    def test_recommendation_evidence_has_fast_cheap_breakdown(self):
         sessions = [
-            _session(f"d{i}", bucket="day", remote_move=True, reason="local_concurrency_limit")
+            _session(f"f{i}", bucket="fast", remote_move=True, reason="local_concurrency_limit")
             for i in range(3)
         ] + [
-            _session(f"n{i}", bucket="night", remote_move=True, reason="local_concurrency_limit")
+            _session(f"c{i}", bucket="cheap", remote_move=True, reason="local_concurrency_limit")
             for i in range(2)
         ]
         res = _result_with_sessions(sessions)
         recs = recommendations.generate_recommendations(res, config=None)
         slot = [r for r in recs if "session_slot_pool_size" in r.title.lower()]
         assert slot, "expected slot-contention recommendation"
-        assert "Day 3 (60.0%) / Night 2 (40.0%)" in slot[0].evidence
+        assert "Fast 3 (60.0%) / Cheap 2 (40.0%)" in slot[0].evidence
 
-    def test_all_recommendation_evidence_includes_day_night(self):
+    def test_all_recommendation_evidence_includes_fast_cheap(self):
         sessions = (
             [
-                _session(f"d{i}", bucket="day", remote_move=True, reason="local_concurrency_limit", max_context=40000)
+                _session(f"f{i}", bucket="fast", remote_move=True, reason="local_concurrency_limit", max_context=40000)
                 for i in range(5)
             ]
             + [
-                _session(f"n{i}", bucket="night", remote_move=True, reason="warm_cache_bypass", max_context=40000)
+                _session(f"c{i}", bucket="cheap", remote_move=True, reason="warm_cache_bypass", max_context=40000)
                 for i in range(5)
             ]
-            + [_session(f"r{i}", bucket="day", remote_move=True, reason="HTTP 400") for i in range(2)]
+            + [_session(f"r{i}", bucket="fast", remote_move=True, reason="HTTP 400") for i in range(2)]
         )
         res = _result_with_sessions(sessions)
         recs = recommendations.generate_recommendations(res, config={"local_model_ctx_size": 262144})
         assert recs, "expected recommendations"
         for r in recs:
-            assert "Day" in r.evidence and "Night" in r.evidence, f"{r.title}: {r.evidence}"
+            assert "Fast" in r.evidence and "Cheap" in r.evidence, f"{r.title}: {r.evidence}"
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +960,49 @@ class TestConfigLoader:
         p = tmp_path / "custom.yaml"
         p.write_text("x: 1\n")
         assert config_loader.find_config_path(explicit=str(p)) == p
+
+    def test_find_config_path_prefers_mode_selected_profile(self, tmp_path):
+        """A persisted cheap mode selects config-cheap.yaml (LP-0MSLMYEEU002IBH6)."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / "config-cheap.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / "config-fast.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / ".mode").write_text("cheap\n")
+        found = config_loader.find_config_path(start=tmp_path)
+        assert found == tmp_path / "proxy" / "config-cheap.yaml"
+
+    def test_find_config_path_mode_fast_selects_fast_profile(self, tmp_path):
+        """A persisted fast mode selects config-fast.yaml."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / "config-fast.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / ".mode").write_text("fast\n")
+        found = config_loader.find_config_path(start=tmp_path)
+        assert found == tmp_path / "proxy" / "config-fast.yaml"
+
+    def test_find_config_path_missing_mode_defaults_to_config_yaml(self, tmp_path):
+        """No .mode file -> the default config.yaml is used."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / "config-cheap.yaml").write_text("default_model: code\n")
+        found = config_loader.find_config_path(start=tmp_path)
+        assert found == tmp_path / "proxy" / "config.yaml"
+
+    def test_find_config_path_invalid_mode_ignored(self, tmp_path):
+        """A garbage .mode value falls back to config.yaml (fail-open)."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / ".mode").write_text("garbage\n")
+        found = config_loader.find_config_path(start=tmp_path)
+        assert found == tmp_path / "proxy" / "config.yaml"
+
+    def test_find_config_path_mode_config_missing_falls_back(self, tmp_path):
+        """Mode selects a profile that does not exist -> config.yaml."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
+        (tmp_path / "proxy" / ".mode").write_text("cheap\n")
+        found = config_loader.find_config_path(start=tmp_path)
+        assert found == tmp_path / "proxy" / "config.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1107,7 @@ class TestBusyStats:
         assert busy.busy_seconds == 10.0
 
     def test_hourly_and_day_night_attribution(self):
-        # Window 09:00-11:00; schedule 10:00 -> 6 slots (day), else 8 (night).
+        # Window 09:00-11:00; schedule 10:00 -> 6 slots (fast), else 8 (cheap).
         start = datetime(2026, 8, 2, 9, 0, 0)
         end = datetime(2026, 8, 2, 11, 0, 0)
         events = [
@@ -1076,10 +1119,10 @@ class TestBusyStats:
         busy = aggregation.compute_busy_stats(events, start, end, _schedule())
         assert busy is not None
         assert busy.busy_seconds == 25.0
-        assert busy.night_busy_seconds == 10.0
-        assert busy.day_busy_seconds == 15.0
-        assert busy.night_window_seconds == 3600.0
-        assert busy.day_window_seconds == 3600.0
+        assert busy.cheap_busy_seconds == 10.0
+        assert busy.fast_busy_seconds == 15.0
+        assert busy.cheap_window_seconds == 3600.0
+        assert busy.fast_window_seconds == 3600.0
         hourly = dict(busy.hourly_busy)
         assert hourly[9] == 10.0
         assert hourly[10] == 15.0
@@ -1142,16 +1185,16 @@ class TestEndToEnd:
         # Two sessions in the window.
         assert len(result.summary.sessions) == 2
 
-        day_csv = out_dir / "daytime_sessions.csv"
-        night_csv = out_dir / "nighttime_sessions.csv"
+        fast_csv = out_dir / "fast_sessions.csv"
+        cheap_csv = out_dir / "cheap_sessions.csv"
         report_md = out_dir / "report.md"
-        assert day_csv.exists()
-        assert night_csv.exists()
+        assert fast_csv.exists()
+        assert cheap_csv.exists()
         assert report_md.exists()
 
-        with day_csv.open() as f:
+        with fast_csv.open() as f:
             rows = list(csv.DictReader(f))
-        assert len(rows) == 2  # both sessions start at 14:00+ (day bucket)
+        assert len(rows) == 2  # both sessions start at 14:00+ (fast bucket)
 
         header = set(rows[0].keys())
         for col in [
@@ -1199,8 +1242,8 @@ class TestEndToEnd:
         assert "## Prompt eval speed" in md
         assert "No llama-server eval timing samples" in md
 
-        # Night CSV has no rows (all sessions start during day hours).
-        with night_csv.open() as f:
+        # Cheap CSV has no rows (all sessions start during fast hours).
+        with cheap_csv.open() as f:
             assert len(list(csv.DictReader(f))) == 0
 
     def test_dispatch_denied_attributed_to_session(self, tmp_path):
@@ -1417,12 +1460,12 @@ class TestDefaultOutputDir:
         out = home / "proxy-usage-reports"
         assert out.is_dir()
         assert (out / "report.md").exists()
-        assert (out / "daytime_sessions.csv").exists()
-        assert (out / "nighttime_sessions.csv").exists()
+        assert (out / "fast_sessions.csv").exists()
+        assert (out / "cheap_sessions.csv").exists()
 
 
 class TestReportRestructure:
-    """Report layout: consolidated tables with total/day/night columns, and
+    """Report layout: consolidated tables with total/fast/cheap columns, and
     no per-session fallback list."""
 
     def _run(self, tmp_path):
@@ -1446,7 +1489,7 @@ class TestReportRestructure:
             "## Session classification",
             "## Local vs remote",
             "## Sessions that fell back",
-            "## Daytime vs nighttime",
+            "## Fast vs cheap",
             "## Context usage",
         ]:
             assert section not in md, f"section should be removed: {section}"
@@ -1454,9 +1497,9 @@ class TestReportRestructure:
     def test_session_summary_has_total_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
-        assert "| Metric | Total | Day | Night |" in section
+        assert "| Metric | Total | Fast | Cheap |" in section
         # Both fixture sessions start during day hours (14:00-15:00 window);
-        # day/night cells carry the share of the metric's total.
+        # fast/cheap cells carry the share of the metric's total.
         assert "| Sessions | 2 | 2 (100.0%) | 0 (0.0%) |" in section
         assert "| Requests |" in section
         assert "| Local requests |" in section
@@ -1468,19 +1511,19 @@ class TestReportRestructure:
     def test_fallback_reasons_have_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Fallback reasons", 1)[1].split("## ", 1)[0]
-        assert "| Reason | Total | % of fallbacks | Day | Night |" in section
+        assert "| Reason | Total | % of fallbacks | Fast | Cheap |" in section
         assert "| local_concurrency_limit | 1 | 100.0% | 1 (100.0%) | 0 (0.0%) |" in section
 
     def test_routing_skip_reasons_have_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
-        assert "| Reason | Total | % of skips | Day | Night |" in section
+        assert "| Reason | Total | % of skips | Fast | Cheap |" in section
         assert "| local_concurrency_limit | 1 | 100.0% | 1 (100.0%) | 0 (0.0%) |" in section
 
     def test_per_model_breakdown_has_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
-        assert "| Provider | Model | Sessions | Day | Night | Requests | Fell back |" in section
+        assert "| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
 
 
@@ -1523,8 +1566,8 @@ class TestArchiveOutputs:
         out.mkdir()
         # Pre-existing artifacts, as if a previous run had written them.
         (out / "report.md").write_text("OLD REPORT")
-        (out / "daytime_sessions.csv").write_text("old day")
-        (out / "nighttime_sessions.csv").write_text("old night")
+        (out / "fast_sessions.csv").write_text("old fast")
+        (out / "cheap_sessions.csv").write_text("old cheap")
         (out / "errors.csv").write_text("old errors")
         (out / "errors.json").write_text("{\"old\": true}")
 
@@ -1535,14 +1578,14 @@ class TestArchiveOutputs:
         assert archive.is_dir()
         assert run.archived_to == archive
         assert (archive / "report.md").read_text() == "OLD REPORT"
-        assert (archive / "daytime_sessions.csv").read_text() == "old day"
-        assert (archive / "nighttime_sessions.csv").read_text() == "old night"
+        assert (archive / "fast_sessions.csv").read_text() == "old fast"
+        assert (archive / "cheap_sessions.csv").read_text() == "old cheap"
         assert (archive / "errors.csv").read_text() == "old errors"
         assert (archive / "errors.json").read_text() == "{\"old\": true}"
         # Fresh outputs written at the root.
         assert (out / "report.md").read_text().startswith("# Proxy Usage Analysis")
-        assert (out / "daytime_sessions.csv").exists()
-        assert (out / "nighttime_sessions.csv").exists()
+        assert (out / "fast_sessions.csv").exists()
+        assert (out / "cheap_sessions.csv").exists()
         assert (out / "errors.csv").exists()
         assert (out / "errors.json").exists()
 
@@ -1587,7 +1630,7 @@ class TestArchiveOutputs:
         assert (archive1 / "report.md").read_text() == first_md
         # A fresh report still sits at the root after every run.
         assert (out / "report.md").exists()
-        assert (out / "daytime_sessions.csv").exists()
+        assert (out / "fast_sessions.csv").exists()
 
     def test_same_day_archive_dir_collides_with_existing_dir(self, tmp_path):
         # A dated dir already exists (e.g. a manual archive) -> suffix, not overwrite.

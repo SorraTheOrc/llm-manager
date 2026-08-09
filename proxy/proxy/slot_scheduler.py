@@ -151,7 +151,7 @@ class SlotScheduleConfig:
         Returns the most recent schedule entry whose time is at or before
         *now*.  If no entry has been reached yet today, the schedule wraps
         circularly to the last entry (persisting from the previous
-        day/night).
+        fast/cheap period).
 
         Returns ``None`` only when:
         - The schedule is disabled.
@@ -183,7 +183,7 @@ class SlotScheduleConfig:
         Returns the slot count of the most recent schedule entry whose time
         is at or before *now*.  If no entry has been reached yet today,
         the schedule wraps circularly to the last entry (persisting from
-        the previous day/night).
+        the previous fast/cheap period).
 
         Returns ``None`` only when:
         - The schedule is disabled.

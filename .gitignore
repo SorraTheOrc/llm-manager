@@ -34,6 +34,9 @@ ds4/
 # Session recordings — runtime artifacts
 proxy/session-recordings/
 
+# Operating-mode state file (fast/cheap) — runtime state, not committed
+proxy/.mode
+
 
 bundles/
 logs/

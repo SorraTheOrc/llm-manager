@@ -13,7 +13,7 @@ work item's decisions:
   ``routing_skip_local`` line (carries session + reason), falling back to the
   nearest ``Fallback triggered`` line within 60s before the first remote
   stream, and finally to the first remote stream time itself;
-- day/night bucket and slot count come from the slot schedule, keyed by
+- fast/cheap bucket and slot count come from the slot schedule, keyed by
   session start time.
 
 Window semantics: only events with ``window_start <= ts <= window_end`` are
@@ -146,12 +146,12 @@ class BusyStats:
     avg_concurrency: float
     avg_stream_duration: float
     unfinished_streams: int
-    # Busy seconds attributed to day/night periods (from the slot schedule)
+    # Busy seconds attributed to fast/cheap periods (from the slot schedule)
     # and to each hour of the window (hour-of-day -> seconds).
-    day_busy_seconds: float
-    night_busy_seconds: float
-    day_window_seconds: float
-    night_window_seconds: float
+    fast_busy_seconds: float
+    cheap_busy_seconds: float
+    fast_window_seconds: float
+    cheap_window_seconds: float
     hourly_busy: list[tuple[int, float]]
 
     @property
@@ -317,8 +317,8 @@ def _segment_boundaries(
     schedule: bucketing.SlotSchedule,
 ) -> list[datetime]:
     """All timestamps inside ``(start, end)`` where the hour-of-day or the
-    day/night period (slot schedule) changes. Used to attribute busy seconds
-    to hours and day/night buckets exactly."""
+    fast/cheap period (slot schedule) changes. Used to attribute busy seconds
+    to hours and fast/cheap buckets exactly."""
     boundaries = {start, end}
     t = start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     while t < end:
@@ -342,18 +342,18 @@ def _attribute_interval(
     interval_start: datetime,
     interval_end: datetime,
     schedule: bucketing.SlotSchedule,
-    day_busy: dict[str, float],
+    bucket_busy: dict[str, float],
     hourly: dict[int, float],
 ) -> None:
-    """Add one merged busy interval's seconds to the day/night and hourly
+    """Add one merged busy interval's seconds to the fast/cheap and hourly
     buckets it overlaps, splitting at hour and period boundaries."""
     b = _segment_boundaries(interval_start, interval_end, schedule)
     for lo, hi in zip(b, b[1:]):
         if hi <= lo:
             continue
         mid = lo + (hi - lo) / 2
-        label = schedule.period_for(mid).label if schedule.periods else "day"
-        day_busy[label] = day_busy.get(label, 0.0) + (hi - lo).total_seconds()
+        label = schedule.period_for(mid).label if schedule.periods else "fast"
+        bucket_busy[label] = bucket_busy.get(label, 0.0) + (hi - lo).total_seconds()
         hourly[mid.hour] = hourly.get(mid.hour, 0.0) + (hi - lo).total_seconds()
 
 
@@ -416,22 +416,22 @@ def compute_busy_stats(
         cur += delta
         peak = max(peak, cur)
 
-    day_busy: dict[str, float] = {}
+    bucket_busy: dict[str, float] = {}
     hourly: dict[int, float] = {}
     for s, e in merged:
-        _attribute_interval(s, e, schedule, day_busy, hourly)
+        _attribute_interval(s, e, schedule, bucket_busy, hourly)
 
-    day_window = night_window = 0.0
+    fast_window = cheap_window = 0.0
     bounds = _segment_boundaries(window_start, window_end, schedule)
     for lo, hi in zip(bounds, bounds[1:]):
         if hi <= lo:
             continue
         mid = lo + (hi - lo) / 2
-        label = schedule.period_for(mid).label if schedule.periods else "day"
-        if label == "night":
-            night_window += (hi - lo).total_seconds()
+        label = schedule.period_for(mid).label if schedule.periods else "fast"
+        if label == "cheap":
+            cheap_window += (hi - lo).total_seconds()
         else:
-            day_window += (hi - lo).total_seconds()
+            fast_window += (hi - lo).total_seconds()
 
     return BusyStats(
         window_seconds=window_seconds,
@@ -442,10 +442,10 @@ def compute_busy_stats(
         avg_concurrency=round(total_compute / busy_seconds, 2) if busy_seconds else 0.0,
         avg_stream_duration=round(total_compute / len(intervals), 1) if intervals else 0.0,
         unfinished_streams=unfinished,
-        day_busy_seconds=round(day_busy.get("day", 0.0), 1),
-        night_busy_seconds=round(day_busy.get("night", 0.0), 1),
-        day_window_seconds=round(day_window, 1),
-        night_window_seconds=round(night_window, 1),
+        fast_busy_seconds=round(bucket_busy.get("fast", 0.0), 1),
+        cheap_busy_seconds=round(bucket_busy.get("cheap", 0.0), 1),
+        fast_window_seconds=round(fast_window, 1),
+        cheap_window_seconds=round(cheap_window, 1),
         hourly_busy=sorted(hourly.items()),
     )
 

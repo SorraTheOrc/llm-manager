@@ -1,7 +1,7 @@
 """Rule-based, data-backed recommendations for the usage analysis report.
 
 Each recommendation cites the aggregates that support it (fallback counts and
-reasons, context sizes vs configured limits, day/night fallback rates), so an
+reasons, context sizes vs configured limits, fast/cheap fallback rates), so an
 operator can judge whether a change is warranted. The rules encode the proxy
 operator's domain knowledge:
 
@@ -14,7 +14,7 @@ operator's domain knowledge:
   decision time → improve cache warm-up or raise the warm threshold.
 - Context pressure: sessions whose max context approaches the per-slot
   context limit (``local_model_ctx_size / slots``) → raise ctx-size.
-- Day vs night fallback-rate imbalance → adjust ``slot_schedule`` entries.
+- Fast vs cheap fallback-rate imbalance → adjust ``slot_schedule`` entries.
 - Remote-side errors (HTTP 4xx/5xx, empty responses, timeouts) are
   informational: check the remote provider configuration.
 """
@@ -76,12 +76,12 @@ def _pct(part: int, total: int) -> float:
 
 
 def _bucket_key(bucket: str | None) -> str:
-    return "night" if bucket == "night" else "day"
+    return "cheap" if bucket == "cheap" else "fast"
 
 
-def _dn(total: int, day: int, night: int) -> str:
-    """Format a total as a day/night split with shares of the total."""
-    return f"Day {day} ({_pct(day, total):.1f}%) / Night {night} ({_pct(night, total):.1f}%)"
+def _dn(total: int, fast: int, cheap: int) -> str:
+    """Format a total as a fast/cheap split with shares of the total."""
+    return f"Fast {fast} ({_pct(fast, total):.1f}%) / Cheap {cheap} ({_pct(cheap, total):.1f}%)"
 
 
 def _reason_counts_by_bucket(result: AnalysisResult, schedule) -> dict[str, Counter]:
@@ -90,13 +90,13 @@ def _reason_counts_by_bucket(result: AnalysisResult, schedule) -> dict[str, Coun
     Mirrors ``_combined_reason_counts``: per-session reasons are bucketed by
     the session's bucket, global fallback events by their own timestamp.
     """
-    buckets: dict[str, Counter] = {"day": Counter(), "night": Counter()}
+    buckets: dict[str, Counter] = {"fast": Counter(), "cheap": Counter()}
     for s in result.sessions.values():
         if s.fallback_reason:
             buckets[_bucket_key(s.bucket)][s.fallback_reason] += 1
     for ev in result.fallback_events:
         if ev.reason:
-            label = schedule.period_for(ev.ts).label if schedule.periods else "day"
+            label = schedule.period_for(ev.ts).label if schedule.periods else "fast"
             buckets[_bucket_key(label)][ev.reason] += 1
     return buckets
 
@@ -121,19 +121,19 @@ def _combined_reason_counts(result: AnalysisResult) -> Counter:
 def _slot_counts(config: dict | None, result: AnalysisResult) -> tuple[int | None, int | None]:
     if config:
         schedule = bucketing.schedule_from_config(config, config.get("session_slot_pool_size"))
-        return schedule.day_slots, schedule.night_slots
+        return schedule.fast_slots, schedule.cheap_slots
     # Fall back to the slot counts observed per bucket in the data.
-    day_slots = {s.slots for s in result.sessions.values() if s.bucket == "day" and s.slots}
-    night_slots = {s.slots for s in result.sessions.values() if s.bucket == "night" and s.slots}
-    return (sorted(day_slots)[-1] if day_slots else None), (
-        sorted(night_slots)[-1] if night_slots else None
+    fast_slots = {s.slots for s in result.sessions.values() if s.bucket == "fast" and s.slots}
+    cheap_slots = {s.slots for s in result.sessions.values() if s.bucket == "cheap" and s.slots}
+    return (sorted(fast_slots)[-1] if fast_slots else None), (
+        sorted(cheap_slots)[-1] if cheap_slots else None
     )
 
 
 def _bucket_stats(result: AnalysisResult) -> dict[str, dict]:
     stats: dict[str, dict] = {}
     for s in result.sessions.values():
-        b = stats.setdefault(s.bucket or "day", {"sessions": 0, "fell_back": 0, "requests": 0})
+        b = stats.setdefault(s.bucket or "fast", {"sessions": 0, "fell_back": 0, "requests": 0})
         b["sessions"] += 1
         b["requests"] += s.messages
         if s.fell_back:
@@ -151,14 +151,14 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     reason_counts = _combined_reason_counts(result)
     total_fallbacks = sum(reason_counts.values())
     fallback_rate = (total_fallbacks / total_requests) if total_requests else 0.0
-    day_slots, night_slots = _slot_counts(config, result)
+    fast_slots, cheap_slots = _slot_counts(config, result)
     bucket_stats = _bucket_stats(result)
     schedule = bucketing.schedule_from_config(
         config, (config or {}).get("session_slot_pool_size")
     )
     bucket_reasons = _reason_counts_by_bucket(result, schedule)
 
-    slot_counts_str = _slot_counts_str(day_slots, night_slots)
+    slot_counts_str = _slot_counts_str(fast_slots, cheap_slots)
     cfg_ctx = (config or {}).get("local_model_ctx_size")
 
     recs.extend(_error_recommendations(result))
@@ -169,8 +169,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         breakdown = ", ".join(
             f"{r}: {reason_counts[r]}" for r in sorted(reason_counts) if r in SLOT_CONTENTION_REASONS and reason_counts[r]
         )
-        contention_day = sum(bucket_reasons["day"][r] for r in SLOT_CONTENTION_REASONS)
-        contention_night = sum(bucket_reasons["night"][r] for r in SLOT_CONTENTION_REASONS)
+        contention_fast = sum(bucket_reasons["fast"][r] for r in SLOT_CONTENTION_REASONS)
+        contention_cheap = sum(bucket_reasons["cheap"][r] for r in SLOT_CONTENTION_REASONS)
         recs.append(
             Recommendation(
                 severity="high",
@@ -184,7 +184,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 evidence=(
                     f"{contention} of {total_fallbacks} fallback events ({_pct(contention, total_fallbacks):.1f}%) "
                     f"were slot-contention related ({breakdown}). "
-                    f"{_dn(contention, contention_day, contention_night)}. "
+                    f"{_dn(contention, contention_fast, contention_cheap)}. "
                     f"Current slot counts: {slot_counts_str}."
                 ),
             )
@@ -195,14 +195,14 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         reason_counts[r] for r in reason_counts if r and "large_context" in r.lower()
     )
     if large_ctx >= MIN_EVENTS and _pct(large_ctx, total_fallbacks) >= REASON_SHARE * 100:
-        large_ctx_day = sum(
-            bucket_reasons["day"][r]
-            for r in bucket_reasons["day"]
+        large_ctx_fast = sum(
+            bucket_reasons["fast"][r]
+            for r in bucket_reasons["fast"]
             if r and "large_context" in r.lower()
         )
-        large_ctx_night = sum(
-            bucket_reasons["night"][r]
-            for r in bucket_reasons["night"]
+        large_ctx_cheap = sum(
+            bucket_reasons["cheap"][r]
+            for r in bucket_reasons["cheap"]
             if r and "large_context" in r.lower()
         )
         thresholds = (
@@ -225,7 +225,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"{large_ctx} of {total_fallbacks} fallback events ({_pct(large_ctx, total_fallbacks):.1f}%) "
-                    f"were `large_context_bypass`. {_dn(large_ctx, large_ctx_day, large_ctx_night)}. {thresholds}"
+                    f"were `large_context_bypass`. {_dn(large_ctx, large_ctx_fast, large_ctx_cheap)}. {thresholds}"
                 ),
             )
         )
@@ -233,8 +233,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     # --- 3. Warm-cache bypass ----------------------------------------------
     warm = reason_counts.get("warm_cache_bypass", 0)
     if warm >= MIN_EVENTS and _pct(warm, total_fallbacks) >= REASON_SHARE * 100:
-        warm_day = bucket_reasons["day"].get("warm_cache_bypass", 0)
-        warm_night = bucket_reasons["night"].get("warm_cache_bypass", 0)
+        warm_fast = bucket_reasons["fast"].get("warm_cache_bypass", 0)
+        warm_cheap = bucket_reasons["cheap"].get("warm_cache_bypass", 0)
         recs.append(
             Recommendation(
                 severity="medium",
@@ -247,7 +247,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"{warm} of {total_fallbacks} fallback events ({_pct(warm, total_fallbacks):.1f}%) "
-                    f"had reason `warm_cache_bypass`. {_dn(warm, warm_day, warm_night)}."
+                    f"had reason `warm_cache_bypass`. {_dn(warm, warm_fast, warm_cheap)}."
                 ),
             )
         )
@@ -265,8 +265,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         if pressured:
             worst = max(pressured, key=lambda t: t[3])
             critical = any(t[3] >= CONTEXT_CRITICAL_RATIO for t in pressured)
-            pressured_day = sum(1 for t in pressured if _bucket_key(t[4]) == "day")
-            pressured_night = len(pressured) - pressured_day
+            pressured_fast = sum(1 for t in pressured if _bucket_key(t[4]) == "fast")
+            pressured_cheap = len(pressured) - pressured_fast
             recs.append(
                 Recommendation(
                     severity="high" if critical else "medium",
@@ -281,13 +281,13 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                         f"{len(pressured)} session(s) peaked at >= {int(CONTEXT_PRESSURE_RATIO * 100)}% of "
                         "per-slot context; worst: session " + worst[0][:8] + f" at {worst[1]} tokens "
                         f"(per-slot {worst[2]:.0f}, {worst[3] * 100:.0f}%). "
-                        f"{_dn(len(pressured), pressured_day, pressured_night)}. "
+                        f"{_dn(len(pressured), pressured_fast, pressured_cheap)}. "
                         f"Configured local_model_ctx_size={cfg_ctx}."
                     ),
                 )
             )
 
-    # --- 5. Day/night imbalance ---------------------------------------------
+    # --- 5. Fast/cheap imbalance -------------------------------------------
     buckets = [b for b in bucket_stats.values() if b["sessions"] >= IMBALANCE_MIN_SESSIONS]
     if len(buckets) == 2:
         low, high = sorted(buckets, key=lambda b: b["fallback_rate"])
@@ -300,15 +300,15 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
             recs.append(
                 Recommendation(
                     severity="medium",
-                    title="Day/night fallback-rate imbalance in the slot schedule",
+                    title="Fast/cheap fallback-rate imbalance in the slot schedule",
                     detail=(
-                        f"{high_name.capitalize()}time sessions fall back at a much higher rate than "
-                        f"{low_name}time sessions. Consider raising the slot count for the "
-                        f"{high_name}time `slot_schedule` entry (and keep `--parallel` aligned)."
+                        f"{high_name} mode sessions fall back at a much higher rate than "
+                        f"{low_name} mode sessions. Consider raising the slot count for the "
+                        f"{high_name} mode `slot_schedule` entry (and keep `--parallel` aligned)."
                     ),
                     evidence=(
-                        f"{high_name.capitalize()}time fallback rate {high['fallback_rate'] * 100:.1f}% "
-                        f"({high['fell_back']}/{high['sessions']} sessions) vs {low_name}time "
+                        f"{high_name} mode fallback rate {high['fallback_rate'] * 100:.1f}% "
+                        f"({high['fell_back']}/{high['sessions']} sessions) vs {low_name} mode "
                         f"{low['fallback_rate'] * 100:.1f}% ({low['fell_back']}/{low['sessions']}); "
                         f"overall {_pct(total_fb, total_sess):.1f}% ({total_fb}/{total_sess}). "
                         f"Current slot counts: {slot_counts_str}."
@@ -322,8 +322,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     ]
     if remote_errors:
         counts = ", ".join(f"{r}: {reason_counts[r]}" for r in sorted(remote_errors, key=lambda r: -reason_counts[r]))
-        remote_day = sum(bucket_reasons["day"][r] for r in remote_errors)
-        remote_night = sum(bucket_reasons["night"][r] for r in remote_errors)
+        remote_fast = sum(bucket_reasons["fast"][r] for r in remote_errors)
+        remote_cheap = sum(bucket_reasons["cheap"][r] for r in remote_errors)
         remote_total = sum(reason_counts[r] for r in remote_errors)
         recs.append(
             Recommendation(
@@ -336,15 +336,15 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"Fallback events with remote-error reasons: {counts}. "
-                    f"{_dn(remote_total, remote_day, remote_night)}."
+                    f"{_dn(remote_total, remote_fast, remote_cheap)}."
                 ),
             )
         )
 
     # --- 7. No change needed --------------------------------------------------
     if not recs and fallback_rate < FALLBACK_RATE_LOW:
-        day_fb_total = sum(bucket_reasons["day"].values())
-        night_fb_total = sum(bucket_reasons["night"].values())
+        fast_fb_total = sum(bucket_reasons["fast"].values())
+        cheap_fb_total = sum(bucket_reasons["cheap"].values())
         recs.append(
             Recommendation(
                 severity="info",
@@ -356,7 +356,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"Fallback rate {fallback_rate * 100:.1f}% ({total_fallbacks}/{total_requests} "
-                    f"events per request); {_dn(total_fallbacks, day_fb_total, night_fb_total)}. "
+                    f"events per request); {_dn(total_fallbacks, fast_fb_total, cheap_fb_total)}. "
                     "No slot contention, large-context, or warm-cache issues detected."
                 ),
             )
@@ -466,9 +466,9 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
     return recs
 
 
-def _slot_counts_str(day_slots: int | None, night_slots: int | None) -> str:
-    if day_slots is not None and night_slots is not None:
-        return f"{day_slots} day / {night_slots} night"
-    if day_slots is not None:
-        return f"{day_slots} (single bucket)"
+def _slot_counts_str(fast_slots: int | None, cheap_slots: int | None) -> str:
+    if fast_slots is not None and cheap_slots is not None:
+        return f"{fast_slots} fast / {cheap_slots} cheap"
+    if fast_slots is not None:
+        return f"{fast_slots} (single bucket)"
     return "see proxy/config.yaml slot_schedule"

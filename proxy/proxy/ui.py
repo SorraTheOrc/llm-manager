@@ -48,6 +48,16 @@ def _has_fallback_providers(model_cfg):
     return isinstance(first, dict) and first.get("type") == "remote"
 
 
+def _current_mode() -> str:
+    """Return the currently persisted operating mode (fast/cheap)."""
+    try:
+        from proxy.mode import read_mode
+
+        return read_mode()
+    except Exception:
+        return "fast"
+
+
 def _build_home_model_rows(srv) -> str:
     """Build the Home tab model endpoint table rows.
 
@@ -200,6 +210,7 @@ async def index(request: Request):
     # Substitute placeholders
     html_content = html_content.replace('__PROVIDER_HOST_HTML__', provider_host_html)
     html_content = html_content.replace('__CURRENT_MODEL_DISPLAY__', srv.current_model or 'None')
+    html_content = html_content.replace('__CURRENT_MODE__', _current_mode())
     html_content = html_content.replace('__ROUTER_MODE_STR__', 'true' if router_mode else 'false')
     html_content = html_content.replace('__ROUTER_MODE_DISPLAY__', 'flex' if router_mode else 'none')
     html_content = html_content.replace('__ROUTER_MODE_LABEL__', 'Enabled' if router_mode else 'Disabled')
