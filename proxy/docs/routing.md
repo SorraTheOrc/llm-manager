@@ -105,3 +105,20 @@ LP-0MSDFKCK4007CPMY; see `proxy/docs/error-analysis-2026-08-03.md`):
 
 Emission sites and the single-helper enrichment point are documented in
 `proxy/docs/sse-error-emission-audit.md`.
+
+## Usage-limit reset quarantine (GoUsageLimitError)
+
+HTTP 429 responses whose error type is `GoUsageLimitError` (a usage-limit
+variant distinct from `FreeUsageLimitError`) are treated as usage-limit
+**reset** events rather than generic rate-limit events. The proxy parses the
+reset duration from the provider message (`Resets in 22hr 43min`) — falling
+back to `metadata.limitName` (daily/weekly/monthly) when the message carries
+no explicit duration — adds a 2-minute safety margin, and quarantines the
+**whole failure domain** (all entries sharing the endpoint, e.g. both
+`opencode-go` and `opencode-go-2` on `https://opencode.ai/zen/go`) until the
+computed reset time passes. Routing decisions during the block log
+`usage_limit_reset_pending` with the reset time and do not contact the
+upstream; once the reset time arrives the domain becomes eligible again
+without operator intervention. `FreeUsageLimitError` responses without a
+reset time keep the existing 3-hour cooldown. Tracked in
+**LP-0MSLJPOCC0001ROJ**.

@@ -20,6 +20,7 @@ Provides:
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -53,6 +54,25 @@ _BACKOFF_MAX_SECONDS = 45.0
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details.
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+
+# Usage-limit reset tracking (LP-0MSLJPOCC0001ROJ): failure-domain key ->
+# absolute epoch timestamp when the usage limit resets (including the
+# 2-minute safety margin). Providers in a domain with a pending usage reset
+# are skipped by every routing decision until the reset time passes.
+_usage_reset_at: dict[str, float] = {}
+
+# 2-minute safety margin added to the computed usage-limit reset time so a
+# clock-skewed upstream does not start re-serving 429s the moment the limit
+# nominally resets.
+_USAGE_LIMIT_RESET_MARGIN_SECONDS = 120
+
+# Fallback durations per metadata.limitName when the upstream message carries
+# no explicit "Resets in ..." duration (daily/weekly/monthly periods).
+_PERIOD_DEFAULT_SECONDS = {
+    "daily": 24 * 3600,
+    "weekly": 7 * 24 * 3600,
+    "monthly": 30 * 24 * 3600,
+}
 
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
@@ -841,6 +861,8 @@ def resolve_provider(
       brand — LP-0MSG45I8Q0020N1F)
     - Is not in cooldown (entry name OR provider brand —
       LP-0MSG45LOO007K236)
+    - Does not belong to a failure domain with a pending usage-limit reset
+      (LP-0MSLJPOCC0001ROJ)
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
@@ -871,12 +893,25 @@ def resolve_provider(
         name = provider_cfg.get("name", "")
         if failed_provider and name == failed_provider:
             continue
-        if failed_domain is not None and _failure_domain_key(provider_cfg) == failed_domain:
+        domain = _failure_domain_key(provider_cfg)
+        if failed_domain is not None and domain == failed_domain:
             logger.info(
                 "Skipping provider=%s: same failure domain as %s (%s)",
                 name,
                 failed_provider,
-                failed_domain,
+                domain,
+            )
+            continue
+        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ)
+        reset_remaining = _usage_reset_remaining(domain)
+        if reset_remaining > 0:
+            logger.info(
+                "Skipping provider=%s: usage_limit_reset_pending "
+                "(domain=%s, reset_at=%s, reset_in=%ds)",
+                name,
+                domain,
+                datetime.fromtimestamp(_usage_reset_at[domain], tz=UTC).isoformat(),
+                int(reset_remaining),
             )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
@@ -1875,12 +1910,27 @@ def _resolve_provider_with_exclusions(
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
             continue
-        if _failure_domain_key(provider_cfg) in excluded_domains:
+        domain = _failure_domain_key(provider_cfg)
+        if domain in excluded_domains:
             logger.info(
                 "Skipping provider=%s: same failure domain as an already-failed "
                 "entry (domain=%s)",
                 name,
-                _failure_domain_key(provider_cfg),
+                domain,
+            )
+            continue
+        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the domain hit an
+        # upstream usage-limit error (GoUsageLimitError etc.) and is
+        # quarantined until the computed reset time + margin passes.
+        reset_remaining = _usage_reset_remaining(domain)
+        if reset_remaining > 0:
+            logger.info(
+                "Skipping provider=%s: usage_limit_reset_pending "
+                "(domain=%s, reset_at=%s, reset_in=%ds)",
+                name,
+                domain,
+                datetime.fromtimestamp(_usage_reset_at[domain], tz=UTC).isoformat(),
+                int(reset_remaining),
             )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
@@ -1972,6 +2022,108 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
         return True
 
     return False
+
+
+def _parse_resets_in(message: str) -> float | None:
+    """Parse a ``Resets in ...`` duration from an upstream error message.
+
+    Handles the observed opencode format (``Resets in 22hr 43min.``) plus
+    plural/full-word variants: hours, minutes, seconds, and days (used by
+    monthly limits). Returns the duration in seconds, or ``None`` when the
+    message carries no parseable reset duration.
+    """
+    match = re.search(r"resets?\s+in\s+(.+?)(?:\.|$)", message or "", re.IGNORECASE)
+    if not match:
+        return None
+    total = 0.0
+    found = False
+    for num_str, unit in re.findall(
+        r"(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)",
+        match.group(1),
+        re.IGNORECASE,
+    ):
+        value = float(num_str)
+        u = unit.lower()
+        if u in ("d", "day", "days"):
+            total += value * 86400
+        elif u in ("h", "hr", "hrs", "hour", "hours"):
+            total += value * 3600
+        elif u in ("m", "min", "mins", "minute", "minutes"):
+            total += value * 60
+        elif u in ("s", "sec", "secs", "second", "seconds"):
+            total += value
+        found = True
+    return total if found else None
+
+
+def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | None:
+    """Return seconds until the usage limit resets for a 429 usage-limit error.
+
+    Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
+    error variant that carries a reset duration in its message (including
+    ``FreeUsageLimitError`` responses that include one). The reset duration is
+    parsed from the provider message (``Resets in 22hr 43min``); when the
+    message has no explicit duration, ``metadata.limitName``
+    (daily/weekly/monthly) supplies the period. The 2-minute safety margin is
+    added to the returned duration.
+
+    Returns ``None`` when the response is not a 429 usage-limit error or no
+    reset duration can be computed — callers then fall back to the existing
+    ``FreeUsageLimitError`` 3-hour cooldown / generic rate-limit handling.
+
+    Expected upstream format (observed from opencode.ai/zen):
+        HTTP 429
+        Body: {"type": "error", "error": {"type": "GoUsageLimitError",
+              "message": "Weekly usage limit reached. Resets in 22hr 43min."},
+              "metadata": {"limitName": "weekly"}}
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return None
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    err_type = None
+    message = None
+    limit_name = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            err_type = str(error.get("type", "")).strip().lower()
+            message = error.get("message")
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            limit_name = str(metadata.get("limitName", "")).strip().lower()
+
+    if err_type not in ("gousagelimiterror", "freeusagelimiterror"):
+        return None
+
+    seconds = _parse_resets_in(message) if message else None
+    if seconds is None and limit_name in _PERIOD_DEFAULT_SECONDS:
+        seconds = _PERIOD_DEFAULT_SECONDS[limit_name]
+    if seconds is None:
+        return None
+    return float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS
+
+
+def _usage_reset_remaining(failure_domain: str) -> float:
+    """Return the remaining seconds before a usage-limit reset for a domain.
+
+    Returns 0.0 when the domain has no pending usage reset or its reset time
+    has passed (expired entries are cleaned up lazily, mirroring the cooldown
+    dict behaviour).
+    """
+    expiry = _usage_reset_at.get(failure_domain)
+    if expiry is None:
+        return 0.0
+    remaining = expiry - time.time()
+    if remaining <= 0:
+        del _usage_reset_at[failure_domain]
+        return 0.0
+    return remaining
 
 
 # ---------------------------------------------------------------------------
@@ -3094,6 +3246,28 @@ async def _proxy_with_remote_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
+                # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
+                # FreeUsageLimitError-with-reset-time quarantines the whole
+                # failure domain until the computed reset time + 2m margin.
+                _reset_seconds = _usage_limit_reset_seconds(response, body_text)
+                if _reset_seconds is not None:
+                    _reset_domain = _failure_domain_key(provider_cfg)
+                    _usage_reset_at[_reset_domain] = time.time() + _reset_seconds
+                    fallback_reason = "usage_limit_reset"
+                    prev_provider = provider_name
+                    attempted_domains.add(_reset_domain)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="usage_limit_reset",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                        reset_in_seconds=int(_reset_seconds),
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
                 # FreeUsageLimitError: apply 3-hour cooldown on affected provider
                 # so the fallback chain routes to paid alternatives instead of
                 # repeatedly retrying the exhausted free tier.
@@ -3829,6 +4003,28 @@ async def _proxy_with_fallback_cycle(
                             status="http_error_no_cooldown",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
+                    # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
+                    # FreeUsageLimitError-with-reset-time quarantines the whole
+                    # failure domain until the computed reset time + 2m margin.
+                    _reset_seconds = _usage_limit_reset_seconds(response, body_text)
+                    if _reset_seconds is not None:
+                        _reset_domain = _failure_domain_key(provider_cfg)
+                        _usage_reset_at[_reset_domain] = time.time() + _reset_seconds
+                        fallback_reason = "usage_limit_reset"
+                        prev_provider = provider_name
+                        attempted_domains.add(_reset_domain)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="usage_limit_reset",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            reset_in_seconds=int(_reset_seconds),
                         )
                         all_slot_exhaustion = False
                         continue

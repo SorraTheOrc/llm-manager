@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSLSR7NQ006RNLW",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSLSR7NQ006RNLW-test-client-port-resolution-and-logging",
+  "work_item_id": "LP-0MSLJPOCC0001ROJ",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSLJPOCC0001ROJ-recognize-gousagelimiterror-and-block-ro",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-09T12:56:50Z"
+  "started_at": "2026-08-09T13:02:41Z"
 }
