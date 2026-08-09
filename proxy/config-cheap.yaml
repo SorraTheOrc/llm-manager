@@ -526,7 +526,7 @@ server:
   # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
   # source as the routing clamp (effective_per_slot_threshold in provider.py)
   # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
-  # 3-slot schedule (day 23:59→3, night 10:00→3) → 39594) instead of
+  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
   # freezing at a static value. Set to a non-zero value to use an explicit
   # static override.
   # 0 = dynamic derivation (current live config).
