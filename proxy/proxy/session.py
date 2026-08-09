@@ -524,22 +524,35 @@ def _record_slot_failure(slot_id: int) -> None:
 def _estimate_slot_prompt_tokens(
     body_json: dict | None,
     server_config: dict | None = None,
+    model_config: dict | None = None,
 ) -> int:
     """Estimate request context tokens for slot persistence decisions.
 
-    Applies the server-level ``token_estimate_multiplier`` (same source as
-    the routing estimate, see ``_get_token_estimate_multiplier``) so the
-    persistence cap compares Qwen3-native token counts consistently with the
-    routing clamp (LP-0MSEGPO77005CYCQ F2).
+    Uses the SAME shared tokenizer resolution chain as the routing estimate
+    (``_get_tokenizer_for_model`` in provider.py, LP-0MSEQ71IF0003FRT): a
+    named tokenizer on the model entry gives exact native counts (multiplier
+    forced to 1.0), otherwise tiktoken + the server-level
+    ``token_estimate_multiplier`` applies. This guarantees the persistence
+    cap compares Qwen3-native token counts consistently with the routing
+    clamp (LP-0MSEGPO77005CYCQ F2, AC3).
+
+    Args:
+        body_json: Parsed request body.
+        server_config: Server config section (may carry
+            ``token_estimate_multiplier`` for the fallback path).
+        model_config: Optional model entry config (may carry
+            ``tokenizer: <name>``). When None, resolves to the
+            server-level multiplier fallback (no native tokenizer).
     """
     if not isinstance(body_json, dict):
         return 0
     from proxy.provider import (
         _estimate_prompt_tokens_for_routing,
-        _get_token_estimate_multiplier,
+        _get_tokenizer_for_model,
     )
-    estimate = _estimate_prompt_tokens_for_routing(body_json) or 0
-    multiplier = _get_token_estimate_multiplier(server_config or {})
+
+    tokenizer, multiplier = _get_tokenizer_for_model(model_config, server_config or {})
+    estimate = _estimate_prompt_tokens_for_routing(body_json, tokenizer=tokenizer) or 0
     if multiplier != 1.0:
         estimate = int(estimate * multiplier)
     return estimate
@@ -935,7 +948,24 @@ def _build_slot_context(
         )
     per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)
     need_estimate = max_prompt_tokens > 0 or per_token > 0
-    estimated = _estimate_slot_prompt_tokens(body_json, server_config) if need_estimate else 0
+    # Resolve the request's model config so the persistence estimate uses the
+    # SAME tokenizer resolution chain as the routing clamp (AC3,
+    # LP-0MSEQ71IF0003FRT). Falls back to None (server-level multiplier only)
+    # when the model cannot be resolved (e.g. unit tests without a live
+    # server, or requests with no model field).
+    model_config = None
+    if isinstance(body_json, dict) and body_json.get("model"):
+        try:
+            from proxy.lifecycle import get_model_config
+
+            model_config = get_model_config(body_json.get("model"))
+        except Exception:
+            model_config = None
+    estimated = (
+        _estimate_slot_prompt_tokens(body_json, server_config, model_config)
+        if need_estimate
+        else 0
+    )
     if max_prompt_tokens > 0 and estimated > max_prompt_tokens:
         logger.info(
             "slot persistence skipped session=%s estimated_tokens=%d max_prompt_tokens=%d reason=context_too_large",

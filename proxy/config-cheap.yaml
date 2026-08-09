@@ -173,6 +173,10 @@ models:
     aliases:
     - plan*
     force_full_prompt: true
+    # Native tokenizer for exact routing/persistence token estimates
+    # (LP-0MSEQ71IF0003FRT); replaces the server-level
+    # token_estimate_multiplier heuristic for this model.
+    tokenizer: qwen3
 
   author:
     providers:
@@ -182,6 +186,8 @@ models:
     aliases:
     - author
     force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
 
   code:
     providers:
@@ -191,6 +197,8 @@ models:
     aliases:
     - code
     force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
@@ -323,15 +331,6 @@ server:
   # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
   # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
   local_model_ctx_size: 131072
-  # Token estimate multiplier (LP-0MSEGPO77005CYCQ F2, AC1).
-  # tiktoken (cl100k) undercounts Qwen3 native tokens ~1.69x for dense prose
-  # (60K fixture: tiktoken est 47680 vs actual ~77060, ratio 1.69). Applied
-  # consistently to BOTH the routing estimate (provider.py) and the slot
-  # persistence estimate (session.py) via _get_token_estimate_multiplier, so
-  # the routing clamp and the persistence cap compare Qwen3-native token
-  # counts. Per-model token_estimate_multiplier overrides this server-level
-  # value for routing. Set to 1.0 to disable.
-  token_estimate_multiplier: 1.69
   # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
   # When a session's estimated context reaches this fraction of the
   # effective per-slot context (ctx_size / slots - 4096 headroom), the

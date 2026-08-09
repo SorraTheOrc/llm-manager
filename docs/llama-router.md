@@ -117,13 +117,18 @@ Consequences:
 - Effective local capacity for dense prose is ~39K tokens regardless of slot
   size until the estimator is corrected.
 
-Mitigations (implemented in follow-up LP-0MSEGPO77005CYCQ F2/F3):
-- Server-level `token_estimate_multiplier: 1.69` is set in `proxy/config.yaml`
-  and applied consistently to BOTH the routing estimate (provider.py) and the
-  slot-persistence estimate (session.py) via `_get_token_estimate_multiplier`
-  in `proxy/proxy/provider.py`, so the routing clamp and the persistence cap
-  compare Qwen3-native token counts. Per-model `token_estimate_multiplier`
-  overrides the server-level value for routing.
+Mitigations (implemented in follow-up LP-0MSEGPO77005CYCQ F2/F3, replaced by
+LP-0MSEQ71IF0003FRT):
+- **Native tokenizer (current):** local Qwen3 models carry `tokenizer: qwen3`
+  in `proxy/config.yaml`, loading the vendored Qwen3 `tokenizer.json` via
+  `proxy/proxy/tokenizers.py`. `_get_tokenizer_for_model` in
+  `proxy/proxy/provider.py` resolves (tokenizer, multiplier) and is shared by
+  BOTH the routing estimate (provider.py) and the slot-persistence estimate
+  (session.py), so the routing clamp and the persistence cap compare exact
+  Qwen3-native token counts (multiplier forced to 1.0 when a native tokenizer
+  is active). The server-level `token_estimate_multiplier` heuristic was
+  removed — tiktoken+multiplier remains only as a fallback for models without
+  a named tokenizer.
 - The slot-persistence cap `session_slot_max_prompt_tokens` is derived
   dynamically from the effective per-slot clamp
   (`local_model_ctx_size // active_slots - 4096` output headroom, the same

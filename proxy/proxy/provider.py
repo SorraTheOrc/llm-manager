@@ -251,19 +251,28 @@ def _extract_usage_from_sse_text(sse_text: str) -> dict | None:
     return last_usage
 
 
-def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
+def _estimate_prompt_tokens_for_routing(body_json: dict, tokenizer=None) -> int:
     """Estimate prompt token count for smart-routing decisions.
 
     Concatenates all message content (including reasoning_content
-    and tool_calls) and uses tiktoken (via ``count_text_tokens``) for
-    accurate token counting.  Falls back to a conservative byte-based
-    heuristic (1 byte per token) when tiktoken is unavailable.
+    and tool_calls) and counts tokens using the native tokenizer when one
+    is supplied (LP-0MSEQ71IF0003FRT), otherwise tiktoken (via
+    ``count_text_tokens``) for accurate token counting.  Falls back to a
+    conservative byte-based heuristic (1 byte per token) when tiktoken is
+    unavailable.
 
     Using tiktoken guarantees correct routing decisions regardless of
     content density — the previous byte heuristic with ``// 2`` could
     underestimate by 2× for very dense content (hex, compact JSON with
     bpt ~1.2), causing the cache-cold bypass to miss requests with 70K+
     actual tokens.
+
+    Args:
+        body_json: Parsed request body.
+        tokenizer: Optional native tokenizer (e.g. from
+            ``_get_tokenizer_for_model``). When provided, counts with it
+            directly (exact Qwen3-native counts); falls back to tiktoken
+            on any encode error.
     """
     if not isinstance(body_json, dict):
         return 0
@@ -313,6 +322,15 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     if not parts:
         return 0
 
+    # Primary path: native tokenizer when provided (exact Qwen3 counts).
+    if tokenizer is not None:
+        try:
+            text = " ".join(parts)
+            return len(tokenizer.encode(text).ids)
+        except Exception:
+            # Fall through to tiktoken on any native-encode error.
+            pass
+
     # Primary path: use tiktoken for accurate token counting.
     # This correctly handles all content densities (code, JSON, text).
     try:
@@ -325,6 +343,54 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         # JSON ~4, text ~4) guaranteeing the bypass always fires for large
         # requests even when tiktoken is unavailable.
         return max(1, total_bytes // 1)
+
+
+def _get_tokenizer_for_model(
+    model_config: dict | None,
+    server_config: dict | None = None,
+) -> tuple[object | None, float]:
+    """Resolve the native tokenizer + effective multiplier for a model.
+
+    Single ordered resolution chain (LP-0MSEQ71IF0003FRT):
+
+    1. Model entry has ``tokenizer: <name>`` that loads -> use that
+       tokenizer, **multiplier forced to 1.0** (a native tokenizer is
+       exact; applying the ~1.69x cl100k multiplier on top would
+       over-count ~69% and wrongly push requests remote).
+    2. No tokenizer named -> ``cl100k_base`` **+ multiplier** (per-model
+       override wins, else server-level, else 1.0) — today's behavior,
+       unchanged.
+    3. Named tokenizer exists but fails to load (missing file / import
+       error) -> warn + fall back to step 2.
+
+    Shared by BOTH the routing estimate (provider.py
+    ``_estimate_prompt_tokens_for_routing``) and the persistence estimate
+    (session.py ``_estimate_slot_prompt_tokens``) so the routing clamp and
+    the persistence cap can never disagree (AC3).
+
+    Returns:
+        ``(tokenizer_or_None, multiplier)``.
+    """
+    multiplier = _get_token_estimate_multiplier(server_config or {}, model_config)
+    if not isinstance(model_config, dict):
+        return None, multiplier
+    tokenizer_name = model_config.get("tokenizer")
+    if not tokenizer_name:
+        return None, multiplier
+    try:
+        from proxy.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(tokenizer_name)
+    except Exception:
+        tokenizer = None
+    if tokenizer is None:
+        logger.warning(
+            "tokenizer %r unavailable; falling back to tiktoken + multiplier %.3f",
+            tokenizer_name,
+            multiplier,
+        )
+        return None, multiplier
+    return tokenizer, 1.0
 
 
 def _get_token_estimate_multiplier(config: dict, model_config: dict | None = None) -> float:
@@ -727,6 +793,7 @@ def validate_local_routing_config(config: dict) -> list[str]:
 async def _estimate_effective_prompt_tokens_for_routing(
     request,
     body_json: dict,
+    tokenizer=None,
 ) -> int:
     """Estimate prompt tokens for routing, including active session history.
 
@@ -739,8 +806,12 @@ async def _estimate_effective_prompt_tokens_for_routing(
 
     - incoming request token estimate
     - existing session history token estimate (if a session header resolves)
+
+    ``tokenizer`` (optional native tokenizer, LP-0MSEQ71IF0003FRT) is passed
+    through to both estimates so routing clamps compare Qwen3-native counts
+    consistently with the persistence cap.
     """
-    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json, tokenizer=tokenizer)
 
     try:
         from proxy.session import _resolve_session_id_header
@@ -764,7 +835,7 @@ async def _estimate_effective_prompt_tokens_for_routing(
             return estimated_tokens
 
         session_tokens = _estimate_prompt_tokens_for_routing(
-            {"messages": session_messages}
+            {"messages": session_messages}, tokenizer=tokenizer
         )
         if session_tokens > estimated_tokens:
             logger.info(
@@ -3640,17 +3711,22 @@ async def _proxy_with_fallback_cycle(
                 _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
                     config
                 )
+                # Resolve the native tokenizer + multiplier via the shared
+                # helper (LP-0MSEQ71IF0003FRT): a named tokenizer (e.g.
+                # ``tokenizer: qwen3`` on the model entry) replaces the
+                # tiktoken-vs-Qwen3 mismatch (~1.69x undercount,
+                # LP-0MSAOQTJS000FFVM F2/F3) with exact counts and forces
+                # the multiplier to 1.0; without a tokenizer, the server-
+                # level / per-model token_estimate_multiplier still applies
+                # (LP-0MSEGPO77005CYCQ F2).
+                _tokenizer, _multiplier = _get_tokenizer_for_model(
+                    model_config, config
+                )
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,
+                    tokenizer=_tokenizer,
                 )
-                # Apply token estimate multiplier to account for tokenizer
-                # mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
-                # undercounts ~1.69x — LP-0MSAOQTJS000FFVM F2/F3). Server-level
-                # token_estimate_multiplier is applied, with a per-model
-                # token_estimate_multiplier override winning (F2
-                # LP-0MSEGPO77005CYCQ).
-                _multiplier = _get_token_estimate_multiplier(config, model_config)
                 if _multiplier != 1.0:
                     _estimated_tokens = int(_estimated_tokens * _multiplier)
                 # Compute once for reuse in logs and reason detection
