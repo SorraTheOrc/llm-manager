@@ -392,10 +392,12 @@ server:
   # tokenizer).
   local_large_context_cold_cache_threshold: 30000
 
-  # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
-  # When the slot cache is warm (cached prefix) but estimated prompt tokens
-  # exceed this value, local routing is bypassed to avoid GPU prefill contention
-  # on very large contexts. Set to 0 to disable. Default: 60000.
+  # Context-too-large bypass threshold (skip reason `context_too_large`;
+  # LP-0MRE4NBQ5009V5BX, renamed from `warm_cache_bypass` in
+  # LP-0MSF8XDG7000PERM). When the estimated prompt context exceeds this
+  # value, local routing is bypassed regardless of cache state (the old name
+  # was a misnomer: this is a context-size cap, not a cache-warmth signal).
+  # Set to 0 to disable. Default: 60000.
   #
   # This is a HARD PHYSICAL CAPACITY LIMIT: it is clamped to the actual
   # per-slot context (local_model_ctx_size / active_slots, minus output

@@ -202,8 +202,8 @@ run (`Previous outputs archived to …`).
 
 - **Session classification**: local-only vs fell back (local → remote) vs
   remote-only (never used local). A high remote-only share with
-  `warm_cache_bypass` reasons usually means routing thresholds are too low or
-  caches are cold.
+  `context_too_large` reasons usually means routing thresholds are too low
+  for the context sizes being routed.
 - **Fallback reasons**:
   - `local_concurrency_limit` / `local_lease_active` / `slot_exhaustion` →
     slot pool contention → raise `session_slot_pool_size` or the
@@ -213,9 +213,10 @@ run (`Previous outputs archived to …`).
     (`models.ini`), `local_large_context_*_threshold`, or
     `session_slot_max_prompt_tokens`. Related work item:
     **LP-0MSAOQTJS000FFVM** (evaluate increasing the local ctx-size).
-  - `warm_cache_bypass` → cache not warm at routing time → consider raising
-    `local_large_context_warm_cache_threshold` or improving slot-cache
-    warm-up / session affinity.
+  - `context_too_large` (legacy `warm_cache_bypass` in rotated logs) →
+    estimated context exceeds the per-slot hard cap → consider raising
+    local ctx-size (`models.ini`) or
+    `local_large_context_warm_cache_threshold`.
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
 - **Context pressure**: sessions whose max context approaches
@@ -223,9 +224,10 @@ run (`Previous outputs archived to …`).
 - **Local model utilization**: busy time is the share of the window with at
   least one local slot generating. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
-  fallback reasons), not that local is underprovisioned. `warm_cache_bypass`
-  is the largest lever: despite the name it fires when the *estimated
-  context* exceeds the effective warm-cache threshold (the per-slot clamp,
+  fallback reasons), not that local is underprovisioned. `context_too_large`
+  is the largest lever: despite the legacy name (`warm_cache_bypass`) it
+  fires when the *estimated context* exceeds the effective warm-cache
+  threshold (the per-slot clamp,
   `local_model_ctx_size // slots - headroom`, inflated by
   `token_estimate_multiplier`), so large-context sessions never reach local.
   Concurrency bursts beyond `session_slot_pool_size` show as

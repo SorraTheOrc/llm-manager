@@ -56,6 +56,23 @@ FALLBACK = "Fallback triggered"
 ROUTING_SKIP = "routing_skip_local"
 DISPATCH_DENIED = "local_dispatch_denied"
 
+# Reason-value normalization (backward compatibility). ``warm_cache_bypass``
+# was the pre-LP-0MSF8XDG7000PERM name for the warm-cache hard-cap skip. The
+# name misleads (the skip fires when the estimated prompt context exceeds the
+# per-slot hard cap, regardless of cache state) and was renamed to
+# ``context_too_large``. Rotated logs (6-hourly rotation, 90-day retention)
+# still contain the legacy value, so it is normalized here so downstream
+# analysis treats both spellings as the same reason.
+CONTEXT_TOO_LARGE = "context_too_large"
+LEGACY_WARM_CACHE_BYPASS = "warm_cache_bypass"
+
+
+def _normalize_reason(reason: str | None) -> str | None:
+    """Map legacy reason values to their current names."""
+    if reason == LEGACY_WARM_CACHE_BYPASS:
+        return CONTEXT_TOO_LARGE
+    return reason
+
 # Error-line prefixes (WARNING level structured lines the parser recognizes).
 STREAM_ERROR = "Stream error:"
 SLOT_SAVE_FAILED = "slot_save failed"
@@ -216,13 +233,15 @@ def parse_log_line(line: str) -> LogEvent | None:
         if m2 is None:
             return None
         fmodel, src, dst, reason = m2.groups()
-        return LogEvent("fallback", ts, reason=reason, src=src, dst=dst)
+        return LogEvent(
+            "fallback", ts, reason=_normalize_reason(reason), src=src, dst=dst
+        )
     if msg.startswith(ROUTING_SKIP):
         return LogEvent(
             "routing_skip",
             ts,
             session=_session_from(msg),
-            reason=_first(RE_ROUTING_SKIP_REASON, msg),
+            reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
         )
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)

@@ -381,11 +381,11 @@ def _get_large_context_threshold(config: dict) -> int:
 
 
 def _get_warm_cache_threshold(config: dict) -> int:
-    """Read the warm-cache total-context threshold from config.
+    """Read the context-too-large (warm-cache) total-context threshold.
 
-    When ``estimated_tokens`` exceeds this value, local is bypassed even
-    if the cache is warm (because total context is too large for the local
-    model slot).
+    When ``estimated_tokens`` exceeds this value, local is bypassed with
+    skip reason ``context_too_large`` (LP-0MSF8XDG7000PERM) regardless of
+    cache state — total context is too large for the local model slot.
 
     Supports both nested and flat config keys for production and test
     compatibility.  Config default: 100000.
@@ -791,10 +791,11 @@ def _should_skip_local(
 
     Implements a two-tier check:
 
-    1. **Warm-cache threshold (hard cap):** If ``estimated_tokens`` exceeds
-       ``warm_cache_threshold``, bypass local regardless of cache state.
-       This prevents routing excessively large total contexts to local even
-       when the cache is warm.
+    1. **Context-too-large threshold (hard cap):** If ``estimated_tokens``
+       exceeds ``warm_cache_threshold``, bypass local regardless of cache
+       state (skip reason ``context_too_large``). This prevents routing
+       excessively large total contexts to local even when the cache is
+       warm.
 
     2. **Cold-cache new-token check:** Calculates the number of uncached
        tokens: ``new_tokens = int(estimated_tokens * (1 - cached_ratio))``.
@@ -3667,12 +3668,13 @@ async def _proxy_with_fallback_cycle(
                     warm_cache_threshold=_warm_threshold,
                 )
                 if _skip_local:
-                    # Determine reason: warm_cache_threshold triggers when
-                    # estimated_tokens > warm_cache_threshold (total context
-                    # too large regardless of cache state).  Otherwise the
-                    # cold-cache new-token check triggered.
+                    # Determine reason: the context-too-large hard cap fires
+                    # when estimated_tokens > warm_cache_threshold (total
+                    # context too large regardless of cache state), logged as
+                    # ``context_too_large`` (LP-0MSF8XDG7000PERM).  Otherwise
+                    # the cold-cache new-token check triggered.
                     if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
-                        _skip_reason = "warm_cache_bypass"
+                        _skip_reason = "context_too_large"
                     else:
                         _skip_reason = "large_context_bypass"
                     logger.info(

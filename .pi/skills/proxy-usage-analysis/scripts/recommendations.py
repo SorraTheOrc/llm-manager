@@ -10,8 +10,9 @@ operator's domain knowledge:
 - ``large_context_bypass`` (or any reason containing ``large_context``)
   indicates prompts that cannot fit or would contend the KV cache → raise
   local ctx-size / routing thresholds.
-- ``warm_cache_bypass`` indicates the session cache was not warm at routing
-  decision time → improve cache warm-up or raise the warm threshold.
+- ``context_too_large`` (legacy ``warm_cache_bypass`` in rotated logs)
+  indicates the prompt context exceeded the per-slot hard cap → raise
+  local ctx-size / routing thresholds.
 - Context pressure: sessions whose max context approaches the per-slot
   context limit (``local_model_ctx_size / slots``) → raise ctx-size.
 - Fast vs cheap fallback-rate imbalance → adjust ``slot_schedule`` entries.
@@ -26,6 +27,7 @@ from dataclasses import dataclass
 
 import bucketing
 from aggregation import AnalysisResult
+from log_parser import CONTEXT_TOO_LARGE
 
 # Reasons that point at local slot pool contention.
 SLOT_CONTENTION_REASONS = {
@@ -230,24 +232,28 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
             )
         )
 
-    # --- 3. Warm-cache bypass ----------------------------------------------
-    warm = reason_counts.get("warm_cache_bypass", 0)
+    # --- 3. Context-too-large bypass -----------------------------------------
+    # ``context_too_large`` is the current name for the warm-cache hard-cap
+    # skip (renamed from ``warm_cache_bypass``, LP-0MSF8XDG7000PERM); the log
+    # parser normalizes the legacy value, so only the current name is counted.
+    warm = reason_counts.get(CONTEXT_TOO_LARGE, 0)
     if warm >= MIN_EVENTS and _pct(warm, total_fallbacks) >= REASON_SHARE * 100:
-        warm_fast = bucket_reasons["fast"].get("warm_cache_bypass", 0)
-        warm_cheap = bucket_reasons["cheap"].get("warm_cache_bypass", 0)
+        warm_fast = bucket_reasons["fast"].get(CONTEXT_TOO_LARGE, 0)
+        warm_cheap = bucket_reasons["cheap"].get(CONTEXT_TOO_LARGE, 0)
         recs.append(
             Recommendation(
                 severity="medium",
-                title="Warm-cache bypass is the dominant fallback reason",
+                title="Context-too-large bypass is the dominant fallback reason",
                 detail=(
-                    "The router skipped local because the session's cache was not warm at decision time "
-                    "(high estimated tokens with a cold cache). If this is frequent, consider raising "
-                    "`local_large_context_warm_cache_threshold` or improving slot-cache warm-up / session "
-                    "affinity so warm sessions stay on the local model."
+                    "The router skipped local because the estimated prompt context exceeded the "
+                    "hard per-slot capacity (`local_large_context_warm_cache_threshold`, clamped to "
+                    "local_model_ctx_size / slots). This is a context-size signal, not a cache-warmth "
+                    "problem. If it is frequent, consider raising the local ctx-size (models.ini) or "
+                    "the large-context routing thresholds."
                 ),
                 evidence=(
                     f"{warm} of {total_fallbacks} fallback events ({_pct(warm, total_fallbacks):.1f}%) "
-                    f"had reason `warm_cache_bypass`. {_dn(warm, warm_fast, warm_cheap)}."
+                    f"had reason `{CONTEXT_TOO_LARGE}`. {_dn(warm, warm_fast, warm_cheap)}."
                 ),
             )
         )

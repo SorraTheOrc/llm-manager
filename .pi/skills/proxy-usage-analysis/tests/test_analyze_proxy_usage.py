@@ -110,10 +110,29 @@ class TestLogLineParsing:
         assert ev.session is None
 
     def test_routing_skip_local(self):
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
+        assert ev.kind == "routing_skip"
+        assert ev.reason == "context_too_large"
+        assert ev.session == "019fc27d-3a46-7e5c-871e-57ab32f875f3"
+
+    def test_routing_skip_legacy_warm_cache_bypass_normalized(self):
+        # Legacy rotated logs carry ``warm_cache_bypass``; the parser maps it
+        # to the current ``context_too_large`` reason (LP-0MSF8XDG7000PERM).
         ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_WARM)
         assert ev.kind == "routing_skip"
-        assert ev.reason == "warm_cache_bypass"
+        assert ev.reason == "context_too_large"
         assert ev.session == "019fc27d-3a46-7e5c-871e-57ab32f875f3"
+
+    def test_fallback_context_too_large(self):
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_CONTEXT_TOO_LARGE)
+        assert ev.kind == "fallback"
+        assert ev.reason == "context_too_large"
+
+    def test_fallback_legacy_warm_cache_bypass_normalized(self):
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_WARM_CACHE)
+        assert ev.kind == "fallback"
+        assert ev.reason == "context_too_large"
+        assert ev.session is None
 
     def test_routing_skip_large_context(self):
         ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_LARGE_CONTEXT)
@@ -426,6 +445,8 @@ class TestSessionAggregation:
 
     def test_remote_only_session(self):
         lines = [
+            # Legacy reason value in a rotated log: still classified correctly
+            # as ``context_too_large`` (LP-0MSF8XDG7000PERM backward compat).
             "2026-08-02 14:00:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
             "from=local-qwen3, to=opencode-go-deepseek, reason=warm_cache_bypass",
             "2026-08-02 14:00:02,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s4 request=[]",
@@ -436,7 +457,7 @@ class TestSessionAggregation:
         assert s.initial_provider == "opencode-go"
         assert s.initial_model == "deepseek-v4-flash"
         assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 0)
-        assert s.fallback_reason == "warm_cache_bypass"
+        assert s.fallback_reason == "context_too_large"
         assert s.local_requests == 0
         assert s.remote_requests == 1
 
@@ -754,13 +775,13 @@ class TestRecommendations:
         titles = " | ".join(r.title for r in recs)
         assert "ctx" in titles.lower() or "context" in titles.lower()
 
-    def test_warm_cache_bypass_suggests_warm_cache(self):
+    def test_context_too_large_suggests_context(self):
         res = _result_with_sessions(
-            [_session("a", remote_move=True, reason="warm_cache_bypass")],
+            [_session("a", remote_move=True, reason="context_too_large")],
         )
         recs = recommendations.generate_recommendations(res, config=None)
         titles = " | ".join(r.title for r in recs)
-        assert "warm" in titles.lower()
+        assert "context" in titles.lower()
 
     def test_context_pressure_near_per_slot_limit(self):
         # 80% of per-slot ctx (262144/6 = 43690) is 34952.
@@ -902,7 +923,7 @@ class TestErrorRecommendations:
                 for i in range(5)
             ]
             + [
-                _session(f"c{i}", bucket="cheap", remote_move=True, reason="warm_cache_bypass", max_context=40000)
+                _session(f"c{i}", bucket="cheap", remote_move=True, reason="context_too_large", max_context=40000)
                 for i in range(5)
             ]
             + [_session(f"r{i}", bucket="fast", remote_move=True, reason="HTTP 400") for i in range(2)]
