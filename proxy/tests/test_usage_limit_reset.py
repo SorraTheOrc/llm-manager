@@ -8,9 +8,12 @@ When the opencode upstream returns HTTP 429 with error type
 - Recognize it as a usage-limit event (not a generic rate-limit event).
 - Compute the exact reset time from the provider message (e.g.
   ``Resets in 22hr 43min`` → now + 22h43m) plus a 2-minute safety margin.
-- Quarantine ALL provider entries sharing the failure domain until the
-  computed reset time + margin passes, logging ``usage_limit_reset_pending``
-  for routing decisions during the block.
+- Quarantine the failing provider's API-key ACCOUNT until the computed
+  reset time + margin passes, logging ``usage_limit_reset_pending`` for
+  routing decisions during the block. Entries using a different
+  ``api_key_env`` on the same gateway (e.g. opencode-go vs opencode-go-2)
+  have independent limits and are NOT quarantined together
+  (LP-0MSMBWB23009XYPW).
 - Resume routing automatically once the reset time arrives.
 - Keep the existing ``FreeUsageLimitError`` 3-hour cooldown unchanged.
 
@@ -20,8 +23,9 @@ Covers parent AC1-AC6:
   now + 22h43m + 2min, provider skipped until then.
 - AC2: Daily / Weekly / Monthly variants (message and/or ``limitName``) each
   produce the correct reset computation.
-- AC3: all entries sharing the failure domain are blocked, not just the
-  failing entry.
+- AC3: entries sharing the failing entry's API-key account are blocked;
+  entries with a different ``api_key_env`` on the same gateway are NOT
+  (LP-0MSMBWB23009XYPW).
 - AC4: after the reset time passes, routing resumes automatically.
 - AC5: routing during the block logs ``usage_limit_reset_pending`` with the
   reset time and does not contact the upstream.
@@ -252,25 +256,29 @@ def test_usage_reset_remaining_cleanup():
 
 
 @pytest.mark.asyncio
-async def test_remote_fallback_usage_limit_reset_blocks_same_domain(
+async def test_remote_fallback_usage_limit_reset_quarantines_account_not_gateway(
     opencode_usage_chain, caplog
 ):
-    """AC1+AC3+AC5: 429 GoUsageLimitError quarantines the whole failure domain;
-    the same-domain sibling is never contacted and routing logs
-    usage_limit_reset_pending."""
+    """AC1+AC3+AC5: a 429 GoUsageLimitError quarantines only the failing
+    API-key ACCOUNT; the same-gateway sibling with a different api_key_env has
+    its own independent limit and is still tried (LP-0MSMBWB23009XYPW)."""
     request = _DummyRequest()
     cfg = {"provider_cooldown_seconds": 60}
     call_count = 0
+    contacted = []
 
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         nonlocal call_count
         call_count += 1
         name = provider_cfg.get("name")
+        contacted.append(name)
         if name == "opencode-go-2-deepseek":
             # First entry returns the observed GoUsageLimitError
             return _gousage_429("Weekly usage limit reached. Resets in 22hr 43min.", "weekly")
-        assert name == "deepseek-v4-flash", (
-            "opencode-go-deepseek (same failure domain) must never be contacted"
+        # opencode-go-deepseek (different account) must still be contacted.
+        assert name == "opencode-go-deepseek", (
+            "deepseek-v4-flash must not be reached while a sibling account "
+            "with its own limit is available"
         )
         return Response(
             content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
@@ -285,24 +293,28 @@ async def test_remote_fallback_usage_limit_reset_blocks_same_domain(
             )
 
     assert result.status_code == 200
-    # Entry 1 (GoUsageLimitError) + entry 3 (deepseek); the same-domain
-    # sibling opencode-go-deepseek was skipped without a network call.
+    # Entry 1 (GoUsageLimitError) + entry 2 (opencode-go-deepseek); the
+    # different-account sibling was contacted and deepseek was not needed.
     assert call_count == 2
+    assert contacted == ["opencode-go-2-deepseek", "opencode-go-deepseek"]
 
-    # The failure domain is quarantined until reset + 2m margin.
-    domain = "https://opencode.ai/zen/go"
-    expiry = provider._usage_reset_at.get(domain)
-    assert expiry is not None, "failure domain should have a usage reset expiry"
+    # Only the FAILING account is quarantined until reset + 2m margin.
+    go2_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][0])
+    go_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][1])
+    assert go2_key != go_key
+    expiry = provider._usage_reset_at.get(go2_key)
+    assert expiry is not None, "failing account should have a usage reset expiry"
     remaining = expiry - time.time()
     assert remaining == pytest.approx(22 * 3600 + 43 * 60 + 120, abs=5)
+    # The sibling account is NOT quarantined.
+    assert go_key not in provider._usage_reset_at
 
-    # Routing during the block logs usage_limit_reset_pending with the reset
-    # time on a FRESH routing decision (the same-request skip uses the
-    # per-request attempted-domain exclusion).
+    # A FRESH routing decision skips only the quarantined account and resolves
+    # to the sibling (its own limit is untouched).
     with caplog.at_level("INFO", logger="llama-proxy.provider"):
         fresh = provider._resolve_provider_with_exclusions(opencode_usage_chain, set())
     assert fresh is not None
-    assert fresh.get("name") == "deepseek-v4-flash"
+    assert fresh.get("name") == "opencode-go-deepseek"
     assert any(
         "usage_limit_reset_pending" in rec.message
         and "reset_at=" in rec.message
@@ -310,9 +322,84 @@ async def test_remote_fallback_usage_limit_reset_blocks_same_domain(
         for rec in caplog.records
     )
     assert any(
+        "usage_limit_reset_pending" in rec.message and "opencode-go-2-deepseek" in rec.message
+        for rec in caplog.records
+    )
+    assert not any(
         "usage_limit_reset_pending" in rec.message and "opencode-go-deepseek" in rec.message
         for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_usage_limit_reset_blocks_shared_account():
+    """AC3: entries sharing the SAME api_key_env as the failing entry ARE
+    quarantined together (one account, one limit)."""
+    chain = {
+        "providers": [
+            {
+                "name": "opencode-go-2-a",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_2_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+            {
+                "name": "opencode-go-2-b",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_2_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+            {
+                "name": "opencode-go-deepseek",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+            {
+                "name": "deepseek-v4-flash",
+                "type": "remote",
+                "provider": "deepseek",
+                "endpoint": "https://api.deepseek.com",
+                "api_key_env": "DEEPSEEK_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ],
+    }
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        name = provider_cfg.get("name")
+        if name == "opencode-go-2-a":
+            return _gousage_429("Weekly usage limit reached. Resets in 22hr 43min.", "weekly")
+        # Same-account sibling must never be contacted; hop to the other account.
+        assert name == "opencode-go-deepseek", (
+            "opencode-go-2-b (same account) must never be contacted"
+        )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", chain, cfg
+        )
+
+    assert result.status_code == 200
+    # go-2-a (429) + opencode-go-deepseek (ok); the same-account entry
+    # opencode-go-2-b was skipped without a network call.
+    assert call_count == 2
 
 
 @pytest.mark.asyncio
@@ -339,39 +426,48 @@ async def test_remote_fallback_usage_limit_reset_daily_variant(opencode_usage_ch
         )
 
     assert result.status_code == 200
-    domain = "https://opencode.ai/zen/go"
-    remaining = provider._usage_reset_at[domain] - time.time()
+    # The sibling account was tried and succeeded; only the failing account
+    # carries the reset window.
+    assert call_count == 2
+    go2_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][0])
+    remaining = provider._usage_reset_at[go2_key] - time.time()
     assert remaining == pytest.approx(3600 + 120, abs=5)
 
 
 @pytest.mark.asyncio
 async def test_usage_limit_reset_expires_and_routing_resumes(opencode_usage_chain):
     """AC4: after the reset time passes, routing to the provider resumes."""
-    # Quarantine the domain with a reset already in the past.
-    domain = "https://opencode.ai/zen/go"
-    provider._usage_reset_at[domain] = time.time() - 1
+    # Quarantine the failing account with a reset already in the past.
+    go2_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][0])
+    provider._usage_reset_at[go2_key] = time.time() - 1
 
     # The first provider of the chain is now eligible again.
     resolved = provider._resolve_provider_with_exclusions(opencode_usage_chain, set())
     assert resolved is not None
     assert resolved.get("name") == "opencode-go-2-deepseek"
-    assert provider._usage_reset_remaining(domain) == 0
+    assert provider._usage_reset_remaining(go2_key) == 0
 
 
 @pytest.mark.asyncio
 async def test_resolve_provider_respects_usage_limit_reset(opencode_usage_chain, caplog):
-    """AC5: resolve_provider also skips domains with a pending usage reset."""
-    domain = "https://opencode.ai/zen/go"
-    provider._usage_reset_at[domain] = time.time() + 3600
+    """AC5: resolve_provider skips accounts with a pending usage reset but
+    still offers a different-account sibling on the same gateway."""
+    go2_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][0])
+    provider._usage_reset_at[go2_key] = time.time() + 3600
 
     with caplog.at_level("INFO", logger="llama-proxy.provider"):
         resolved = provider.resolve_provider(opencode_usage_chain)
 
     assert resolved is not None
-    assert resolved.get("name") == "deepseek-v4-flash"
+    assert resolved.get("name") == "opencode-go-deepseek"
     assert any(
         "usage_limit_reset_pending" in rec.message
         and "opencode-go-2-deepseek" in rec.message
+        for rec in caplog.records
+    )
+    assert not any(
+        "usage_limit_reset_pending" in rec.message
+        and "opencode-go-deepseek" in rec.message
         for rec in caplog.records
     )
 
@@ -446,13 +542,15 @@ async def test_usage_limit_reset_in_proxy_with_fallback(opencode_usage_chain, ca
             )
 
     assert result.status_code == 200
+    # go-2 (429) + sibling account (ok); deepseek not needed.
     assert call_count == 2
-    domain = "https://opencode.ai/zen/go"
-    remaining = provider._usage_reset_at[domain] - time.time()
+    go2_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][0])
+    remaining = provider._usage_reset_at[go2_key] - time.time()
     assert remaining == pytest.approx(22 * 3600 + 43 * 60 + 120, abs=5)
-    # AC5: a fresh routing decision after the block logs usage_limit_reset_pending.
+    # AC5: a fresh routing decision after the block resolves to the sibling
+    # account, not deepseek.
     with caplog.at_level("INFO", logger="llama-proxy.provider"):
         fresh = provider._resolve_provider_with_exclusions(opencode_usage_chain, set())
     assert fresh is not None
-    assert fresh.get("name") == "deepseek-v4-flash"
+    assert fresh.get("name") == "opencode-go-deepseek"
     assert any("usage_limit_reset_pending" in rec.message for rec in caplog.records)

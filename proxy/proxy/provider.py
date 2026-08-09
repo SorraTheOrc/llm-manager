@@ -862,8 +862,8 @@ def resolve_provider(
       brand — LP-0MSG45I8Q0020N1F)
     - Is not in cooldown (entry name OR provider brand —
       LP-0MSG45LOO007K236)
-    - Does not belong to a failure domain with a pending usage-limit reset
-      (LP-0MSLJPOCC0001ROJ)
+    - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
+      reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
@@ -903,15 +903,19 @@ def resolve_provider(
                 domain,
             )
             continue
-        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ)
-        reset_remaining = _usage_reset_remaining(domain)
+        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ). Quarantine is keyed
+        # on the API-key ACCOUNT, not the endpoint: distinct api_key_env
+        # entries on the same gateway have independent limits
+        # (LP-0MSMBWB23009XYPW).
+        usage_key = _usage_limit_account_key(provider_cfg)
+        reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(domain=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, reset_at=%s, reset_in=%ds)",
                 name,
-                domain,
-                datetime.fromtimestamp(_usage_reset_at[domain], tz=UTC).isoformat(),
+                usage_key,
+                datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
             continue
@@ -1889,6 +1893,24 @@ def _normalize_endpoint_for_failure_domain(endpoint: str) -> str | None:
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
+def _usage_limit_account_key(provider_cfg: dict) -> str:
+    """Return a canonical key identifying the upstream ACCOUNT for usage-limit
+    quarantine (LP-0MSMBWB23009XYPW).
+
+    Usage limits are per-account (per API key), NOT per endpoint: entries that
+    share a gateway but use different ``api_key_env`` values (e.g.
+    ``opencode-go`` and ``opencode-go-2`` on https://opencode.ai/zen/go) have
+    independent limits and must be quarantined independently. The key combines
+    ``api_key_env`` with the normalized endpoint so distinct accounts on the
+    same gateway stay separate. Entries without an ``api_key_env`` cannot be
+    distinguished by account and fall back to the failure-domain key.
+    """
+    api_key_env = provider_cfg.get("api_key_env")
+    if api_key_env:
+        return f"{api_key_env}@{_failure_domain_key(provider_cfg)}"
+    return _failure_domain_key(provider_cfg)
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
@@ -1900,6 +1922,9 @@ def _resolve_provider_with_exclusions(
     ``excluded_domains`` holds failure-domain keys (see ``_failure_domain_key``)
     that already stalled / terminally failed during THIS request, so the chain
     skips straight past same-gateway API-key siblings (LP-0MSG45I8Q0020N1F).
+    Usage-limit account keys (see ``_usage_limit_account_key``) are checked
+    against the same set so an account exhausted by a usage-limit error is not
+    retried via another entry sharing that account (LP-0MSMBWB23009XYPW).
     """
     providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
@@ -1920,17 +1945,28 @@ def _resolve_provider_with_exclusions(
                 domain,
             )
             continue
-        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the domain hit an
+        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
         # upstream usage-limit error (GoUsageLimitError etc.) and is
-        # quarantined until the computed reset time + margin passes.
-        reset_remaining = _usage_reset_remaining(domain)
+        # quarantined until the computed reset time + margin passes. Keyed on
+        # the API-key account, not the endpoint: distinct api_key_env entries
+        # on the same gateway have independent limits (LP-0MSMBWB23009XYPW).
+        usage_key = _usage_limit_account_key(provider_cfg)
+        if usage_key in excluded_domains:
+            logger.info(
+                "Skipping provider=%s: same usage-limit account as an "
+                "already-exhausted entry (account=%s)",
+                name,
+                usage_key,
+            )
+            continue
+        reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(domain=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, reset_at=%s, reset_in=%ds)",
                 name,
-                domain,
-                datetime.fromtimestamp(_usage_reset_at[domain], tz=UTC).isoformat(),
+                usage_key,
+                datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
             continue
@@ -2111,7 +2147,8 @@ def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | No
 
 
 def _usage_reset_remaining(failure_domain: str) -> float:
-    """Return the remaining seconds before a usage-limit reset for a domain.
+    """Return the remaining seconds before a usage-limit reset for an account
+    / failure-domain key (see ``_usage_limit_account_key``).
 
     Returns 0.0 when the domain has no pending usage reset or its reset time
     has passed (expired entries are cleaned up lazily, mirroring the cooldown
@@ -3248,15 +3285,17 @@ async def _proxy_with_remote_fallback_cycle(
                     continue
 
                 # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
-                # FreeUsageLimitError-with-reset-time quarantines the whole
-                # failure domain until the computed reset time + 2m margin.
+                # FreeUsageLimitError-with-reset-time quarantines the failing
+                # API-key ACCOUNT until the computed reset time + 2m margin.
+                # Not the whole endpoint: distinct api_key_env entries on the
+                # same gateway have independent limits (LP-0MSMBWB23009XYPW).
                 _reset_seconds = _usage_limit_reset_seconds(response, body_text)
                 if _reset_seconds is not None:
-                    _reset_domain = _failure_domain_key(provider_cfg)
-                    _usage_reset_at[_reset_domain] = time.time() + _reset_seconds
+                    _reset_account = _usage_limit_account_key(provider_cfg)
+                    _usage_reset_at[_reset_account] = time.time() + _reset_seconds
                     fallback_reason = "usage_limit_reset"
                     prev_provider = provider_name
-                    attempted_domains.add(_reset_domain)
+                    attempted_domains.add(_reset_account)
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -4010,15 +4049,17 @@ async def _proxy_with_fallback_cycle(
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
-                    # FreeUsageLimitError-with-reset-time quarantines the whole
-                    # failure domain until the computed reset time + 2m margin.
+                    # FreeUsageLimitError-with-reset-time quarantines the failing
+                    # API-key ACCOUNT until the computed reset time + 2m margin.
+                    # Not the whole endpoint: distinct api_key_env entries on the
+                    # same gateway have independent limits (LP-0MSMBWB23009XYPW).
                     _reset_seconds = _usage_limit_reset_seconds(response, body_text)
                     if _reset_seconds is not None:
-                        _reset_domain = _failure_domain_key(provider_cfg)
-                        _usage_reset_at[_reset_domain] = time.time() + _reset_seconds
+                        _reset_account = _usage_limit_account_key(provider_cfg)
+                        _usage_reset_at[_reset_account] = time.time() + _reset_seconds
                         fallback_reason = "usage_limit_reset"
                         prev_provider = provider_name
-                        attempted_domains.add(_reset_domain)
+                        attempted_domains.add(_reset_account)
                         _record_attempt(
                             attempts,
                             provider=provider_name,

@@ -1,8 +1,8 @@
 {
-  "work_item_id": "LP-0MSLMYEEU002IBH6",
-  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSLMYEEU002IBH6-web-api-and-ui-button-to-toggle-server-b",
+  "work_item_id": "LP-0MSMBWB23009XYPW",
+  "worktree_path": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MSMBWB23009XYPW-usage-limit-quarantine-keyed-on-endpoint",
   "repo_root": "/home/rgardler/projects/llm",
   "parent_branch": "dev",
   "commit_msg": "",
-  "started_at": "2026-08-09T19:16:54Z"
+  "started_at": "2026-08-09T21:42:42Z"
 }
