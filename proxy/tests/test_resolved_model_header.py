@@ -145,6 +145,7 @@ def _make_mock_remote_response(status_code=200, body=None, content_type="text/ev
 def _reset_cooldown():
     """Reset cooldown state between tests to avoid cross-test leakage."""
     provider._provider_unavailable_until.clear()
+    provider._usage_reset_at.clear()
     yield
 
 
