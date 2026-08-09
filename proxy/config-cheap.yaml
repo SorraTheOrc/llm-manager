@@ -495,15 +495,15 @@ server:
       - time: "10:00"
         slots: 1
   # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
-  # proxy between cheap (00:01-10:00) and fast (10:00-00:01) at the listed
+  # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
   # times, regardless of any manual mode change. The active entry is the most
   # recent one at or before the current time (circular wrap, so the last
-  # entry covers 00:00-00:00:59). Set enabled: false to disable; an absent
+  # entry covers 00:00-00:59). Set enabled: false to disable; an absent
   # section uses this same built-in schedule.
   mode_schedule:
     enabled: true
     entries:
-      - time: "00:01"
+      - time: "01:00"
         mode: cheap
       - time: "10:00"
         mode: fast

@@ -859,9 +859,9 @@ a restart is pending is a noop if the mode matches, otherwise rejected with
 By default the proxy **enforces a time-of-day schedule** (local server
 time), regardless of manual switches:
 
-- **cheap** from `00:01` until `10:00`
-- **fast** from `10:00` until `00:01` (i.e. 10:00 through midnight, plus
-  00:00–00:00:59)
+- **cheap** from `01:00` until `10:00`
+- **fast** from `10:00` until `01:00` (i.e. 10:00 through midnight, plus
+  00:00–00:59)
 
 A background scheduler checks every 30s (and immediately at startup, so a
 restart mid-period applies the scheduled mode right away). When the
@@ -878,7 +878,7 @@ config profile (same section in `config.yaml` / `config-fast.yaml` /
 mode_schedule:
   enabled: true
   entries:
-    - time: "00:01"
+    - time: "01:00"
       mode: cheap
     - time: "10:00"
       mode: fast

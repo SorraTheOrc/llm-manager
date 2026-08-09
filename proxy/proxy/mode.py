@@ -19,8 +19,8 @@ new config profile takes effect. A mode-switch restart terminates in-flight
 requests — clients retry (same semantics as slot-schedule transitions,
 LP-0MSF9RUSQ007M346). This is accepted behavior, not a bug.
 
-An automatic ``mode_schedule`` (default: cheap 00:01-10:00, fast
-10:00-00:01, local server time) is enforced by a background scheduler that
+An automatic ``mode_schedule`` (default: cheap 01:00-10:00, fast
+10:00-01:00, local server time) is enforced by a background scheduler that
 overrides any manual setting — see ``ModeScheduleConfig`` and
 ``start_mode_scheduler`` (LP-0MSM5K4TX004MICX).
 """
@@ -54,10 +54,10 @@ MODE_CONFIG_FILES = {
 # flushes before the process is killed (LP-0MSLMYEEU002IBH6).
 RESTART_DELAY_SECONDS = 1.5
 
-# Built-in automatic mode schedule: cheap from 00:01 until 10:00, fast from
-# 10:00 until 00:01 (LP-0MSM5K4TX004MICX). Used when the config has no
+# Built-in automatic mode schedule: cheap from 01:00 until 10:00, fast from
+# 10:00 until 01:00 (LP-0MSM5K4TX004MICX). Used when the config has no
 # ``mode_schedule`` section; entries are ``(HH:MM, mode)``.
-MODE_SCHEDULE_DEFAULT_ENTRIES = [("00:01", MODE_CHEAP), ("10:00", MODE_FAST)]
+MODE_SCHEDULE_DEFAULT_ENTRIES = [("01:00", MODE_CHEAP), ("10:00", MODE_FAST)]
 
 # How often (seconds) the background mode-scheduler re-checks the clock. A
 # short poll bounds both the transition latency at schedule boundaries and
@@ -78,7 +78,7 @@ class ModeScheduleConfig:
 
     Reads the ``mode_schedule`` section from the server config. An absent
     section (or absent ``entries``) falls back to the built-in schedule
-    (cheap 00:01-10:00, fast 10:00-00:01) so the timer stays on unless
+    (cheap 01:00-10:00, fast 10:00-01:00) so the timer stays on unless
     explicitly disabled with ``enabled: false``. Invalid entries (bad time
     format or unknown mode) are skipped with a warning; if no valid entry
     remains, the built-in schedule is used.
@@ -86,7 +86,7 @@ class ModeScheduleConfig:
     The active mode at any instant is the most recent entry whose time is
     at or before *now*; before the first entry of the day the schedule
     wraps circularly to the last entry (so ``10:00 -> fast`` also covers
-    00:00-00:00:59, matching the slot_schedule semantics).
+    00:00-00:59, matching the slot_schedule semantics).
     """
 
     def __init__(self, raw: dict[str, Any] | None):

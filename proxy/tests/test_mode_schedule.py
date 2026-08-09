@@ -1,6 +1,6 @@
 """Tests for the automatic fast/cheap mode schedule (LP-0MSM5K4TX004MICX).
 
-Covers the schedule semantics (cheap 00:01-10:00, fast 10:00-00:01 with
+Covers the schedule semantics (cheap 01:00-10:00, fast 10:00-01:00 with
 midnight wrap), config parsing (disabled / custom / invalid entries /
 built-in fallback), and the background enforcement step (applies the
 scheduled mode when the persisted mode diverges, defers while a restart is
@@ -30,8 +30,8 @@ def builtin():
 class TestDefaultScheduleSemantics:
     def test_cheap_period(self):
         schedule = builtin()
-        assert schedule.active_mode(T(0, 1)) == "cheap"
-        assert schedule.active_mode(T(0, 2)) == "cheap"
+        assert schedule.active_mode(T(1, 0)) == "cheap"
+        assert schedule.active_mode(T(1, 1)) == "cheap"
         assert schedule.active_mode(T(9, 59)) == "cheap"
 
     def test_fast_period(self):
@@ -39,21 +39,25 @@ class TestDefaultScheduleSemantics:
         assert schedule.active_mode(T(10, 0)) == "fast"
         assert schedule.active_mode(T(12, 30)) == "fast"
         assert schedule.active_mode(T(23, 59)) == "fast"
+        assert schedule.active_mode(T(0, 30)) == "fast"  # fast until 01:00
 
-    def test_midnight_wrap_covers_0000_to_0001(self):
-        """10:00->fast wraps circularly over midnight (00:00:00-00:00:59)."""
+    def test_midnight_wrap_covers_0000_to_0100(self):
+        """10:00->fast wraps circularly over midnight (00:00-00:59)."""
         schedule = builtin()
         assert schedule.active_mode(T(0, 0, 0)) == "fast"
         assert schedule.active_mode(T(0, 0, 30)) == "fast"
+        assert schedule.active_mode(T(0, 59, 59)) == "fast"
 
     def test_boundaries_exact(self):
         schedule = builtin()
-        assert schedule.active_mode(T(0, 1)) == "cheap"
+        assert schedule.active_mode(T(0, 59)) == "fast"
+        assert schedule.active_mode(T(1, 0)) == "cheap"
         assert schedule.active_mode(T(10, 0)) == "fast"
 
     def test_expected_mode_for_time_helper(self):
         assert mode_module.expected_mode_for_time(T(3, 0)) == "cheap"
         assert mode_module.expected_mode_for_time(T(15, 0)) == "fast"
+        assert mode_module.expected_mode_for_time(T(0, 30)) == "fast"
         assert mode_module.expected_mode_for_time(T(0, 0, 59)) == "fast"
 
 
@@ -67,7 +71,7 @@ class TestModeScheduleConfig:
         schedule = ModeScheduleConfig(None)
         assert schedule.enabled is True
         assert [(e.time, e.mode) for e in schedule.entries] == [
-            (T(0, 1), "cheap"),
+            (T(1, 0), "cheap"),
             (T(10, 0), "fast"),
         ]
 
@@ -102,7 +106,7 @@ class TestModeScheduleConfig:
             {"time": "bogus", "mode": "fast"},
         ]})
         assert [(e.time, e.mode) for e in schedule.entries] == [
-            (T(0, 1), "cheap"),
+            (T(1, 0), "cheap"),
             (T(10, 0), "fast"),
         ]
 
@@ -120,10 +124,10 @@ class TestModeScheduleConfig:
     def test_entries_sorted_by_time(self):
         schedule = ModeScheduleConfig({"enabled": True, "entries": [
             {"time": "10:00", "mode": "fast"},
-            {"time": "00:01", "mode": "cheap"},
+            {"time": "01:00", "mode": "cheap"},
         ]})
         assert [(e.time, e.mode) for e in schedule.entries] == [
-            (T(0, 1), "cheap"),
+            (T(1, 0), "cheap"),
             (T(10, 0), "fast"),
         ]
 

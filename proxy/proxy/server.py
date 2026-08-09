@@ -690,8 +690,8 @@ def _startup_launch_slot_scheduler():
 def _startup_launch_mode_scheduler():
     """Start the automatic fast/cheap mode-scheduler background thread.
 
-    Enforces the ``mode_schedule`` (default cheap 00:01-10:00, fast
-    10:00-00:01) regardless of manual mode changes. The first check runs
+    Enforces the ``mode_schedule`` (default cheap 01:00-10:00, fast
+    10:00-01:00) regardless of manual mode changes. The first check runs
     immediately, so a proxy restart mid-period applies the scheduled mode
     right away instead of waiting a full interval.
     """
