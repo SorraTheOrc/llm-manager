@@ -4,7 +4,9 @@ Covers the schedule semantics (cheap 01:00-10:00, fast 10:00-01:00 with
 midnight wrap), config parsing (disabled / custom / invalid entries /
 built-in fallback), and the background enforcement step (applies the
 scheduled mode when the persisted mode diverges, defers while a restart is
-pending).
+pending). The enforcement-step tests isolate the manual-override state file
+so they are hermetic — a live proxy override in the checkout never leaks
+into them (LP-0MSMM59TU002X1HA).
 """
 
 from datetime import datetime
@@ -143,6 +145,20 @@ class TestModeSchedulerStep:
     def schedule(self):
         return builtin()
 
+    @pytest.fixture(autouse=True)
+    def _isolate_override_state(self, tmp_path, monkeypatch):
+        """Redirect the manual-override state file to a tmp path.
+
+        Regression (LP-0MSMM59TU002X1HA): these tests read the override state
+        via manual_override_active() -> override_until_file(). Without
+        isolation they hit the REAL proxy/.mode.override-until file, so a live
+        manual override in the checkout made them environment-dependent (they
+        failed whenever an unexpired override was present).
+        """
+        monkeypatch.setattr(
+            mode_module, "override_until_file", lambda: tmp_path / ".mode.override-until"
+        )
+
     def test_applies_scheduled_mode_when_diverged(self, schedule, monkeypatch):
         """A manual override (cheap at 14:00) is reverted to the scheduled fast."""
         monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
@@ -180,6 +196,37 @@ class TestModeSchedulerStep:
         monkeypatch.setattr(mode_module, "set_mode", lambda m: applied.append(m))
         assert _mode_scheduler_step(schedule, now=T(14, 0)) is False
         assert applied == []
+
+    def test_ignores_live_override_file_in_checkout(self, schedule, monkeypatch):
+        """Regression (LP-0MSMM59TU002X1HA): an unexpired manual override in
+        the real checkout (proxy/.mode.override-until) must not leak into the
+        scheduler-step tests.
+
+        Before the class isolated the override state to a tmp path, a live
+        proxy override made these tests environment-dependent: the scheduled
+        mode was silently NOT applied (step returned False) and the test
+        failed.
+        """
+        real_state = mode_module.proxy_dir() / ".mode.override-until"
+        previous = (
+            real_state.read_text(encoding="utf-8") if real_state.exists() else None
+        )
+        try:
+            real_state.write_text(
+                datetime(2099, 1, 1).isoformat() + "\n", encoding="utf-8"
+            )
+            monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
+            applied = []
+            monkeypatch.setattr(
+                mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+            )
+            assert _mode_scheduler_step(schedule, now=T(14, 0)) is True
+            assert applied == ["fast"]
+        finally:
+            if previous is None:
+                real_state.unlink(missing_ok=True)
+            else:
+                real_state.write_text(previous, encoding="utf-8")
 
     def test_loop_calls_step_immediately(self, schedule, monkeypatch):
         """The first check runs before the first sleep (startup applies the
