@@ -8,8 +8,9 @@ contiguous day periods and labels them "fast" (fewer slots) vs "cheap" (more
 slots), so the analysis does not hardcode the split.
 
 Terminology note (LP-0MSLMYEEU002IBH6): the operating modes are **fast**
-(cloud-backed; the old "day" period) and **cheap** (local-only; the old
-"night" period). The slot-count -> label mapping is unchanged: the period(s)
+(cloud-backed; the old "day" period) and **cheap** (1-slot local pool,
+same models as fast, LP-0MSMIPPJI007GU9N; the old "night" period). The
+slot-count -> label mapping is unchanged: the period(s)
 with the fewest slots are labelled "fast", the period(s) with the most
 "cheap"; equal counts collapse to a single "fast" bucket.
 """

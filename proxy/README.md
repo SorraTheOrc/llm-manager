@@ -824,8 +824,11 @@ The proxy runs in one of two operator-selected operating modes:
 - **fast** — cloud-backed: remote providers are eligible and requests can
   fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
   3-slot pool).
-- **cheap** — local-only: requests use only the local llama-server at no
-  cost (`proxy/config-cheap.yaml`, 1-slot pool, no remote/cloud providers).
+- **cheap** — 1-slot local pool with the same models/provider chains as
+  fast: remote providers (including paid tiers) stay enabled and are used
+  when local slots are exhausted (`proxy/config-cheap.yaml`,
+  LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
+  local slot pool (1 vs 3).
 
 The active mode is persisted in `proxy/.mode` (gitignored runtime state);
 when absent the mode defaults to **fast** (current behavior). The mode
@@ -1442,7 +1445,8 @@ curl -X POST http://localhost:8000/admin/set-mode \
   -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
 ```
 Switches the proxy between **fast** (cloud-backed) and **cheap**
-(local-only) operating modes. Requesting the active mode is a noop; a
+(1-slot local pool, same models as fast — remote providers enabled)
+operating modes. Requesting the active mode is a noop; a
 different mode is persisted (survives restarts) and triggers a full proxy
 restart in the background. Invalid modes return `400`; a switch while a
 restart is pending returns `409` when the mode differs.

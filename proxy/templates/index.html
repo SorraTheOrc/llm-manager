@@ -735,7 +735,7 @@
                     <strong id="mainModeStatus">__CURRENT_MODE__</strong>
                     <button class="btn-switch" onclick="setMode('fast')">Fast</button>
                     <button class="btn-switch" onclick="setMode('cheap')">Cheap</button>
-                    <span style="color: var(--text-secondary); font-size: 0.85rem;">Fast = cloud-backed &middot; Cheap = local-only, 1 slot. Switching restarts the proxy.</span>
+                    <span style="color: var(--text-secondary); font-size: 0.85rem;">Fast = cloud-backed &middot; Cheap = 1-slot local pool, same models as fast. Switching restarts the proxy.</span>
                 </div>
                 <div id="slotStatusGrid" class="endpoint-grid">
                     <!-- Slot cards are rendered here by JavaScript -->
@@ -926,7 +926,7 @@
                             <span class="endpoint-path">/admin/mode</span>
                             <span style="margin-left:auto;">Current: <strong id="currentMode">__CURRENT_MODE__</strong></span>
                         </div>
-                        <p class="endpoint-desc">Fast = cloud-backed (day); Cheap = local-only, 1 slot (night). Switching mode restarts the proxy.</p>
+                        <p class="endpoint-desc">Fast = cloud-backed (day); Cheap = 1-slot local pool, same models as fast (night). Switching mode restarts the proxy.</p>
                         <div style="display:flex; gap:8px; margin-top:8px;">
                             <button class="btn-switch" onclick="setMode('fast')">Fast</button>
                             <button class="btn-switch" onclick="setMode('cheap')">Cheap</button>

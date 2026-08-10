@@ -4,12 +4,15 @@
 # Selected automatically when the persisted operating mode is "cheap"
 # (proxy/.mode); see proxy/proxy/mode.py and POST /admin/set-mode.
 #
-# Cheap mode is LOCAL-ONLY and 1-slot:
+# Cheap mode is 1-SLOT with the SAME models/provider chains as fast mode
+# (LP-0MSMIPPJI007GU9N):
 #   - session_slot_pool_size: 1 (single GPU slot)
 #   - slot_schedule entries all use slots: 1
-#   - NO remote/cloud providers (no opencode/deepseek/github tiers), so no
-#     paid calls can occur. Models with no local provider (e.g. github)
-#     are unavailable in cheap mode; switch to fast mode when needed.
+#   - Remote/cloud providers (opencode/deepseek/github tiers) are ENABLED,
+#     so remote calls (including paid tiers) may occur when local slots are
+#     exhausted — the only intended difference from fast mode is the local
+#     slot pool. Keep this file's models section in sync with
+#     config-fast.yaml (test_cheap_config_matches_fast_models guards it).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -162,14 +165,57 @@ models:
     aliases:
     - embeddings
     - embed
-  # Cheap mode is LOCAL-ONLY: no remote/cloud providers are configured, so
-  # no paid calls can occur. The github model (remote-only) is unavailable
-  # in cheap mode; switch to fast mode when it is needed.
+  github:
+    providers:
+      - name: github-primary
+        type: remote
+        provider: github
+        endpoint: https://models.inference.ai.azure.com
+    aliases:
+    - github-*
+  # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, OpenCode Go #2, then DeepSeek direct.
+  # Slot exhaustion on the local model falls through to remote tiers.
+  # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
   plan:
     providers:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - plan*
     force_full_prompt: true
@@ -183,6 +229,34 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      - name: opencode-mimo-v2.5-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: mimo-v2.5-free
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - author
     force_full_prompt: true
@@ -194,6 +268,41 @@ models:
       - name: local-qwen3-next
         type: local
         llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
     force_full_prompt: true

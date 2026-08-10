@@ -3,9 +3,12 @@
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and the server
-  behaves as before (current day settings; ``config-fast.yaml``).
-- **cheap** — local-only: requests use only the local llama-server at no
-  cost (1-slot pool; ``config-cheap.yaml``).
+  behaves as before (current day settings; ``config-fast.yaml``, 3-slot
+  pool).
+- **cheap** — 1-slot local pool with the SAME models/provider chains as
+  fast: remote providers (including paid tiers) stay enabled and are used
+  when local slots are exhausted (``config-cheap.yaml``, LP-0MSMIPPJI007GU9N).
+  The only intended difference from fast mode is the local slot pool.
 
 The active mode is persisted in a small runtime state file
 (``proxy/.mode``); when absent the mode defaults to ``fast`` (current

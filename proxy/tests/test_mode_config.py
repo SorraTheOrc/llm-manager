@@ -5,8 +5,9 @@ Covers (LP-0MSLMYEEU002IBH6):
   proxy/config.yaml default
 - config-fast.yaml mirrors the current config.yaml day settings (3-slot,
   remote providers eligible)
-- config-cheap.yaml is a 1-slot local-only profile (no remote/cloud
-  providers, so no paid calls can occur)
+- config-cheap.yaml is a 1-slot profile with the SAME models/provider
+  chains as fast (remote providers enabled, LP-0MSMIPPJI007GU9N); only
+  the local slot pool differs (1 vs 3)
 - resolve_config_path() maps modes to the correct profile files
 """
 
@@ -160,8 +161,8 @@ class TestCheapConfigProfile:
         entries = srv["slot_schedule"]["entries"]
         assert [e["slots"] for e in entries] == [1, 1]
 
-    def test_cheap_config_has_no_remote_providers(self):
-        """config-cheap.yaml is local-only: no paid cloud calls can occur."""
+    def test_cheap_config_has_remote_providers(self):
+        """config-cheap.yaml keeps remote providers enabled (LP-0MSMIPPJI007GU9N)."""
         cfg = _load("config-cheap.yaml")
         remote = [
             (model, p["name"])
@@ -169,16 +170,47 @@ class TestCheapConfigProfile:
             for p in mc.get("providers", [])
             if p.get("type") == "remote"
         ]
-        assert remote == [], f"cheap config must have no remote providers, found {remote}"
+        assert remote, "cheap config must retain remote (cloud) providers"
+        # DeepSeek and OpenCode tiers are present, as in fast mode.
+        brands = {name.split("-")[0] for _, name in remote}
+        assert "deepseek" in brands or any("deepseek" in n for _, n in remote)
+        assert any("opencode" in n for _, n in remote)
 
     def test_cheap_config_keeps_local_models(self):
-        """The local models (embed/plan/author/code) remain available."""
+        """Local models (embed/plan/author/code) remain available and local-first."""
         cfg = _load("config-cheap.yaml")
-        assert set(cfg["models"]) == {"embed", "plan", "author", "code"}
+        assert {"embed", "plan", "author", "code"} <= set(cfg["models"])
+        assert "github" in cfg["models"]  # remote-only model restored (LP-0MSMIPPJI007GU9N)
         for model in ("plan", "author", "code"):
             providers = cfg["models"][model]["providers"]
             assert providers, f"{model} must have at least the local provider"
-            assert all(p["type"] == "local" for p in providers)
+            assert providers[0]["type"] == "local", f"{model} must route local-first"
+
+    def test_cheap_config_resolves_github_alias(self, monkeypatch):
+        """A github-* request resolves in cheap mode via get_model_config (LP-0MSMIPPJI007GU9N)."""
+        import proxy.server as server_module
+        from proxy.lifecycle import get_model_config
+
+        monkeypatch.setattr(server_module, "config", _load("config-cheap.yaml"))
+        cfg = get_model_config("github-session")
+        assert cfg is not None, "github-* must resolve in cheap mode"
+        assert cfg["providers"][0]["type"] == "remote"
+
+    def test_cheap_config_matches_fast_models(self):
+        """cheap and fast expose identical models/provider chains (LP-0MSMIPPJI007GU9N)."""
+        cheap = _load("config-cheap.yaml")
+        fast = _load("config-fast.yaml")
+        assert cheap["models"] == fast["models"]
+
+    def test_cheap_config_differs_from_fast_only_by_slot_pool(self):
+        """The only intended cheap-vs-fast server difference is the slot pool."""
+        cheap = _load("config-cheap.yaml")
+        fast = _load("config-fast.yaml")
+        cheap_srv = dict(cheap["server"])
+        fast_srv = dict(fast["server"])
+        cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
+        cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
+        assert cheap_srv == fast_srv
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
         """The local model context size is unchanged between profiles."""
