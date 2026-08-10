@@ -271,6 +271,78 @@ class TestListAllSessionsLimit:
     """Tests for list_all_sessions() respecting the 15-session limit."""
 
     @pytest.mark.asyncio
+    async def test_list_all_sessions_serves_index_updates(self, tmp_path, monkeypatch):
+        """Sessions recorded via record_request appear in list_all_sessions.
+
+        Covers the shared-index contract: router_helpers writes through a
+        fresh SessionRecorder while the UI reads through its cached instance;
+        both must see the same index (LP-0MSNM90VD0030GEL).
+        """
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        await recorder.record_request(
+            "sess-api-indexed", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hello"}]},
+            model="qwen3", provider="local",
+        )
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = None
+
+        response = await list_all_sessions(request=mock_request)
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+
+        ids = [s["session_id"] for s in body["sessions"]]
+        assert "sess-api-indexed" in ids
+        assert body["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_list_all_sessions_model_filter(self, tmp_path, monkeypatch):
+        """list_all_sessions with ?model= filters via the index (LP-0MSNM90VD0030GEL)."""
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        await recorder.record_request(
+            "sess-filter-alpha", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "a"}]},
+            model="alpha", provider="local",
+        )
+        await recorder.record_request(
+            "sess-filter-beta", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "b"}]},
+            model="beta", provider="local",
+        )
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = "alpha"
+
+        response = await list_all_sessions(request=mock_request)
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+
+        ids = [s["session_id"] for s in body["sessions"]]
+        assert "sess-filter-alpha" in ids
+        assert "sess-filter-beta" not in ids
+
+    @pytest.mark.asyncio
     async def test_list_all_sessions_limited_to_15(self, tmp_path, monkeypatch):
         """list_all_sessions returns at most 15 sessions when many exist."""
         from proxy.session_recorder import SessionRecorder

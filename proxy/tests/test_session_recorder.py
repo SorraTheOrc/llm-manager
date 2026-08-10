@@ -626,6 +626,178 @@ class TestListAndRetrieve:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Metadata index (LP-0MSNM90VD0030GEL)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMetadataIndex:
+    """Tests for the in-memory metadata index backing list_sessions*.
+
+    Pins the behaviour required by the /admin/sessions disk-thrash fix:
+    record_request/record_response update the shared index; list_sessions*
+    serve from the index (zero disk reads when warm) and fall back to a
+    bounded cold scan when the index is empty.
+    """
+
+    @pytest.mark.asyncio
+    async def test_record_request_updates_index(self, recorder, temp_recording_dir):
+        """record_request populates the shared index entry for the session."""
+        await recorder.record_request(
+            "sess-idx-req", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hello index"}]},
+            model="qwen3", provider="local",
+        )
+
+        # The index entry must exist and carry the recorded metadata.
+        entry = recorder.get_index_entry("sess-idx-req")
+        assert entry is not None
+        assert entry["session_id"] == "sess-idx-req"
+        assert entry["last_activity"]
+        assert entry["model"] == "qwen3"
+        assert entry["provider"] == "local"
+        assert entry["preview_text"] == "Hello index"
+
+    @pytest.mark.asyncio
+    async def test_record_response_sets_response_time(self, recorder, temp_recording_dir):
+        """The first provider_to_client response sets response_time in the index."""
+        await recorder.record_request(
+            "sess-idx-resp", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hi"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_response(
+            "sess-idx-resp", "provider_to_client",
+            {"choices": [{"text": "Hello"}]},
+            model="qwen3", provider="local",
+        )
+
+        entry = recorder.get_index_entry("sess-idx-resp")
+        assert entry is not None
+        assert entry["response_time"]
+        assert entry["last_activity"] >= entry["response_time"]
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_serves_from_index_after_file_removal(self, recorder, temp_recording_dir):
+        """Warm list_sessions returns sessions from the index, not disk.
+
+        Delete the recording file after writing; list_sessions must still
+        return the session (proves zero disk reads when the index is warm).
+        """
+        filepath = await recorder.record_request(
+            "sess-idx-warm", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Warm"}]},
+            model="qwen3", provider="local",
+        )
+        assert filepath is not None
+        os.remove(filepath)
+
+        sessions = recorder.list_sessions()
+        ids = [s["session_id"] for s in sessions]
+        assert "sess-idx-warm" in ids
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_ordered_by_last_activity_desc(self, recorder, temp_recording_dir):
+        """Index-backed list_sessions is ordered by last_activity descending."""
+        for i in range(5):
+            await recorder.record_request(
+                f"sess-order-{i}", "client_to_proxy",
+                {"messages": [{"role": "user", "content": f"msg {i}"}]},
+                model="qwen3", provider="local",
+            )
+
+        sessions = recorder.list_sessions()
+        ids = [s["session_id"] for s in sessions]
+        # Most recently recorded session first (timestamps are monotonic).
+        assert ids[0] == "sess-order-4"
+        times = [s["last_activity"] for s in sessions]
+        assert times == sorted(times, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_by_model_filters_index(self, recorder, temp_recording_dir):
+        """list_sessions_by_model returns only sessions matching the model."""
+        await recorder.record_request(
+            "sess-model-alpha", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "a"}]},
+            model="alpha", provider="local",
+        )
+        await recorder.record_request(
+            "sess-model-beta", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "b"}]},
+            model="beta", provider="local",
+        )
+
+        alpha = recorder.list_sessions_by_model("alpha")
+        ids = [s["session_id"] for s in alpha]
+        assert "sess-model-alpha" in ids
+        assert "sess-model-beta" not in ids
+
+    def test_empty_index_falls_back_to_bounded_scan(self, tmp_path, monkeypatch):
+        """A cold index triggers a bounded scan, not a full-tree read."""
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = tmp_path / "bounded-recordings"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create 100 session dirs directly on disk (bypassing record_*),
+        # so the recorder's index starts cold.
+        for i in range(100):
+            sess_dir = rec_dir / f"sess-cold-{i:03d}"
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            recording = {
+                "session_id": f"sess-cold-{i:03d}",
+                "direction": "client_to_proxy",
+                "timestamp": f"2026-07-07T10:{i % 60:02d}:00.000000+00:00",
+                "payload": {"messages": [{"role": "user", "content": f"m {i}"}]},
+                "model": "qwen3",
+                "provider": "local",
+            }
+            (sess_dir / f"2026-07-07T10:{i % 60:02d}:00.000000-request.json").write_text(
+                json.dumps(recording)
+            )
+
+        from proxy import session_recorder as sr_module
+        original = SessionRecorder._extract_session_preview
+        calls = {"n": 0}
+
+        def counting_preview(session_dir):
+            calls["n"] += 1
+            return original(session_dir)
+
+        monkeypatch.setattr(SessionRecorder, "_extract_session_preview", staticmethod(counting_preview))
+        monkeypatch.setattr(sr_module, "COLD_SCAN_DIR_LIMIT", 25)
+
+        recorder = SessionRecorder(recording_path=str(rec_dir))
+        sessions = recorder.list_sessions()
+
+        # Bounded scan: no full-tree read (100 dirs exist, limit is 25).
+        assert calls["n"] <= 25, f"Cold scan visited {calls['n']} dirs, expected <= 25"
+        assert len(sessions) <= 15
+
+    @pytest.mark.asyncio
+    async def test_index_survives_restart_via_lazy_rebuild(self, recorder, temp_recording_dir):
+        """A fresh recorder instance rebuilds the index via bounded scan (AC5)."""
+        await recorder.record_request(
+            "sess-restart-a", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "A"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_request(
+            "sess-restart-b", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "B"}]},
+            model="qwen3", provider="local",
+        )
+
+        # Simulate a proxy restart: new recorder instance, same path.
+        from proxy.session_recorder import SessionRecorder
+        fresh = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = fresh.list_sessions()
+
+        ids = {s["session_id"] for s in sessions}
+        assert "sess-restart-a" in ids
+        assert "sess-restart-b" in ids
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Configuration integration (AC5)
 # ═══════════════════════════════════════════════════════════════════════════
 
