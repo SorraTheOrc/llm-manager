@@ -171,7 +171,7 @@
         .tab:hover { color:var(--text-primary); }
         .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
 
-        /* Slots tab — one live log section per active slot */
+        /* Slots tab — one live log section per slot reported by llama-server */
         .slot-sections {
             display:flex;
             flex-direction:column;
@@ -274,7 +274,7 @@
       <button id="tabAllLogs" class="tab" type="button">All Logs</button>
     </div>
 
-    <!-- Slots tab: one live log section per active slot -->
+    <!-- Slots tab: one live log section per slot reported by llama-server -->
     <div id="tabSlotsContent" class="tab-content">
       <div id="slotSummary" class="muted" style="margin-bottom:0.5rem; font-size:0.85rem;"></div>
       <div id="slotSections" class="slot-sections"></div>
@@ -976,7 +976,7 @@
     tabAllLogsBtn.addEventListener('click', () => switchTab('all'));
 
     // ===================================================================
-    // Slots tab — one live log section per active slot
+    // Slots tab — one live log section per slot reported by llama-server
     //
     // The active-slot list comes from the existing /events SSE stream
     // (enriched slot details with session_id, is_processing, progress).
@@ -989,14 +989,26 @@
     let slotEventSource = null;
     let slotTailSources = {};  // slotId -> {proxy: EventSource, llama: EventSource}
     let expandedSlotId = null;
-    let currentSlots = [];     // last active slot list from /events
+    let currentSlots = [];     // last slot list from /events (all slots)
+
+    // Every slot reported by llama-server is rendered (matching the home-page
+    // slot-card convention) so the Slots tab is never empty when the server is
+    // up; the status badge reflects processing/session state live. This fixes
+    // the "slots screen is empty" rejection (audit 2026-08-10): a strict
+    // processing-or-mapped-session filter rendered nothing while slots were
+    // idle or their dispatch sessions were not yet assigned.
+    function allSlotsFrom(slots) {
+      if (!Array.isArray(slots)) return [];
+      return slots.filter(function (s) {
+        return !!s && s.slot_id !== undefined && s.slot_id !== null;
+      });
+    }
 
     // A slot is "active" when it is processing or still carries a mapped
     // dispatch session (recently-finished generations stay inspectable).
+    // Used only for the summary count, not for section visibility.
     function activeSlotsFrom(slots) {
-      if (!Array.isArray(slots)) return [];
-      return slots.filter(function (s) {
-        if (!s || s.slot_id === undefined) return false;
+      return allSlotsFrom(slots).filter(function (s) {
         const hasSession = s.session_id !== undefined && s.session_id !== null && s.session_id !== '';
         return s.is_processing === true || hasSession;
       });
@@ -1058,13 +1070,20 @@
       const container = document.getElementById('slotSections');
       if (!container) return;
       const summary = document.getElementById('slotSummary');
+      const slotsList = allSlotsFrom(slots);
       const active = activeSlotsFrom(slots);
-      currentSlots = active;
+      currentSlots = slotsList;
 
       if (summary) {
-        summary.textContent = active.length === 0
-          ? 'No active slots. Idle slots remain visible on the All Logs tab.'
-          : active.length + ' active slot' + (active.length !== 1 ? 's' : '');
+        if (slotsList.length === 0) {
+          summary.textContent = 'No slot data available — llama-server not responding or no slots configured.';
+        } else if (active.length === 0) {
+          summary.textContent = slotsList.length + ' slot' + (slotsList.length !== 1 ? 's' : '') +
+            ' (all idle) — new activity appears here live.';
+        } else {
+          summary.textContent = active.length + ' active of ' + slotsList.length + ' slot' +
+            (slotsList.length !== 1 ? 's' : '');
+        }
       }
 
       const existing = new Map();
@@ -1073,7 +1092,7 @@
       });
 
       const seen = new Set();
-      for (const slot of active) {
+      for (const slot of slotsList) {
         const sid = slot.slot_id;
         seen.add(sid);
         const sessionId = slot.session_id || '';
@@ -1100,8 +1119,8 @@
         }
       }
 
-      // Connect tails for every active slot (no-op for already-connected ones)
-      active.forEach(connectSlotTails);
+      // Connect tails for every slot section (no-op for already-connected ones)
+      slotsList.forEach(connectSlotTails);
 
       // Expansion bookkeeping: if the expanded slot vanished, reset
       if (expandedSlotId !== null && !seen.has(expandedSlotId)) expandedSlotId = null;

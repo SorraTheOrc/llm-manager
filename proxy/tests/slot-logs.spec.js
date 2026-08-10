@@ -257,4 +257,36 @@ test.describe('Slot Logs Tab', () => {
     await expect(page.locator('#slotSections .slot-section')).toHaveCount(1);
     await expect(page.locator('.slot-section[data-slot-id="2"]')).toHaveCount(1);
   });
+
+  test('idle slots are still rendered so the Slots tab is never empty', async ({ page }) => {
+    // Regression for the manual-review rejection (2026-08-10): when no slot
+    // is processing and no dispatch session is mapped yet, every slot must
+    // still appear with an Idle badge — mirroring the home-page slot cards.
+    const idlePayload = statusPayload([
+      { slot_id: 0, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 1, is_processing: false, n_decoded: 0, generation_done: false },
+    ]);
+    await page.addInitScript(installFakeEventSource, [eventsRoute([idlePayload])]);
+
+    await page.goto('/logs');
+    await expect(page.locator('#slotSections .slot-section')).toHaveCount(2);
+    await expect(page.locator('.slot-section[data-slot-id="0"] .slot-status-badge')).toContainText('Idle');
+    await expect(page.locator('.slot-section[data-slot-id="1"] .slot-status-badge')).toContainText('Idle');
+    await expect(page.locator('.slot-section[data-slot-id="0"] .slot-session')).toContainText('no session yet');
+    await expect(page.locator('#slotSummary')).toContainText('all idle');
+
+    // A later update marks slot 1 processing -> badge flips live, section stays
+    const processingPayload = statusPayload([
+      { slot_id: 0, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 1, is_processing: true, n_decoded: 42, n_tokens: 42, progress: 0.2, total_tokens: 210, session_id: SESSION_B, generation_done: false },
+    ]);
+    const routes = [
+      { urlContains: '/events', delayMs: 100, payloads: [idlePayload] },
+      { urlContains: '/events', delayMs: 700, payloads: [processingPayload] },
+    ];
+    await page.addInitScript(installFakeEventSource, routes);
+    await page.goto('/logs');
+    await expect(page.locator('#slotSections .slot-section')).toHaveCount(2);
+    await expect(page.locator('.slot-section[data-slot-id="1"] .slot-status-badge')).toContainText('Processed');
+  });
 });
