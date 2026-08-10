@@ -894,8 +894,14 @@ def _resolve_log_path(source: str = "proxy") -> Path:
 
 
 @app.get("/logs/tail")
-async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
-    return await _ui_tail_logs(request, lines, source)
+async def tail_logs(
+    request: Request,
+    lines: int = 100,
+    source: str = "proxy",
+    slot: int | None = None,
+    session: str | None = None,
+):
+    return await _ui_tail_logs(request, lines, source, slot, session)
 
 @app.get("/logs")
 async def view_logs(request: Request):

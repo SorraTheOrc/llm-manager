@@ -16,7 +16,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
-- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
+- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per active slot, and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view.
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
 
@@ -2101,6 +2101,39 @@ tail -f /var/log/llama-proxy/llama-server.log
 # Systemd journal
 journalctl -u llama-proxy -f
 ```
+
+### Web UI: per-slot log view (`/logs`)
+
+The logs page opens on the **Slots** tab, which renders one live log section per
+**active slot** (a slot is active while it is processing or still carries a
+mapped dispatch session — recently finished generations stay inspectable until
+the session ends). Each section has a header (slot id, session id, status) and a
+live log pane streaming that slot's relevant lines from both `proxy.log` and
+`llama-server.log` (lines carry a `proxy`/`llama` source badge). Sections share
+equal heights so every slot is visible at once; clicking a section expands it to
+fill the log area and clicking again restores the equal-height layout. The slot
+list comes from the existing `/events` SSE stream, so it refreshes as slots
+become active/inactive and survives a busy llama-server via the
+`_last_slot_details_cache` fallback.
+
+The unfiltered two-pane log view and the session-recording view are available
+unchanged on the **All Logs** tab.
+
+**Per-slot filtering rule** (`proxy/proxy/slot_log_filter.py`, pytest-covered in
+`proxy/tests/test_slot_log_filter.py`):
+
+- `llama-server.log` lines are attributed by their slot id marker (`id <N> |` or
+  `id=<N>`, e.g. `slot update_slots: id  2 | task ...`); non-slot lines
+  (`srv ...`) never match.
+- `proxy.log` lines are attributed primarily by `session=<uuid>` against the
+  slot's mapped dispatch session, falling back to `slot=<n>` markers. Lines
+  tagged `slot=none` (session not yet assigned) or without markers are
+  excluded from slot sections but remain visible on the All Logs tab.
+
+Streaming reuses the existing `/logs/tail` SSE fan-out: the optional `slot` and
+`session` query params filter a single file tail server-side
+(`/logs/tail?source=llama&slot=2&session=<uuid>`), and the unfiltered
+`source=proxy|llama` behaviour is unchanged when those params are omitted.
 
 ## TTS (Text-to-Speech) /v1/audio/speech
 

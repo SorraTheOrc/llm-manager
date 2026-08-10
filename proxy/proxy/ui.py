@@ -336,12 +336,25 @@ async def status_events():
 
 
 
-async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
+async def tail_logs(
+    request: Request,
+    lines: int = 100,
+    source: str = "proxy",
+    slot: int | None = None,
+    session: str | None = None,
+):
     """Stream a log file as Server-Sent Events (SSE).
 
     Query params:
     - lines: number of previous lines to include initially (default 100)
     - source: which log to tail: 'proxy' (default) or 'llama' for llama-server.log
+    - slot: optional llama-server slot id. When provided, only lines relevant
+      to that slot are streamed (llama lines matched by their `id <N> |`
+      marker, proxy lines matched by `session=<uuid>` with a `slot=<n>`
+      fallback) — see proxy.slot_log_filter.  The unfiltered behaviour is
+      unchanged when this param is omitted (LP-0MSHET5SI000LYSK).
+    - session: optional dispatch session id used to attribute proxy.log lines
+      for the given slot.
 
     Sends an initial SSE message with key `initial` containing the last
     `lines` lines, then streams new lines as they are appended with key
@@ -353,6 +366,17 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
         source = "proxy"
 
     log_path = srv._resolve_log_path(source)
+
+    # Optional per-slot relevance filter (slot-aware /logs/tail).
+    from proxy.slot_log_filter import filter_log_lines_for_slot, line_matches_slot
+
+    def filter_lines(text: str) -> str:
+        if slot is None:
+            return text
+        kept = filter_log_lines_for_slot(
+            text.splitlines() if text else [], slot, session_id=session, source=source
+        )
+        return "\n".join(kept)
 
     async def event_generator():
         # local reference to counts queue for cleanup in finally - ensure always defined
@@ -384,7 +408,11 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
 
             # Send initial block of lines
             initial = await asyncio.to_thread(read_last_n, lines)
-            yield f"data: {json.dumps({'initial': initial, 'source': source})}\n\n"
+            initial = filter_lines(initial)
+            msg = {"initial": initial, "source": source}
+            if slot is not None:
+                msg["slot"] = slot
+            yield f"data: {json.dumps(msg)}\n\n"
 
             # Register for counts updates
             counts_queue: asyncio.Queue | None = None
@@ -447,7 +475,14 @@ async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
 
                     # Send each new line as its own SSE message
                     for line in new.splitlines():
-                        yield f"data: {json.dumps({'line': line, 'source': source})}\n\n"
+                        if slot is not None and not line_matches_slot(
+                            line, slot, session_id=session, source=source
+                        ):
+                            continue
+                        msg = {"line": line, "source": source}
+                        if slot is not None:
+                            msg["slot"] = slot
+                        yield f"data: {json.dumps(msg)}\n\n"
                 else:
                     # No new file data; send keepalive
                     yield ": keepalive\n\n"
