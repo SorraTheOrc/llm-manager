@@ -1079,6 +1079,7 @@ async def list_all_sessions(request: Request = None) -> JSONResponse:
                     "last_activity": s.get("last_activity", s.get("response_time", "")),
                     "model": s.get("model", ""),
                     "provider": s.get("provider", ""),
+                    "preview_text": s.get("preview_text", ""),
                     "active": False,
                 })
         return merged

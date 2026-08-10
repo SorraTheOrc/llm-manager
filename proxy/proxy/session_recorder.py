@@ -413,6 +413,11 @@ class SessionRecorder:
         with _SHARED_INDEX_LOCK:
             if self.recording_path in _INDEX_WARM_PATHS:
                 return
+            # An index already populated by write-path updates is warm — do
+            # not re-scan the recordings tree (LP-0MSNM9BDV007DQXB AC1).
+            if self._index:
+                _INDEX_WARM_PATHS.add(self.recording_path)
+                return
             self._rebuild_index_from_scan()
             _INDEX_WARM_PATHS.add(self.recording_path)
 
