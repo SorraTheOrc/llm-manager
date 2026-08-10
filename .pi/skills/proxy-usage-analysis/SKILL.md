@@ -260,9 +260,10 @@ run (`Previous outputs archived to …`).
 
 ## Testing
 
+Run the full suite via the test skill (canonical, cached pipeline):
+
 ```bash
-cd .pi/skills/proxy-usage-analysis
-python3 -m pytest tests -q
+/skill:test
 ```
 
 The suite covers log-line parsing, session aggregation, fallback attribution,
