@@ -4,15 +4,25 @@
 # Selected automatically when the persisted operating mode is "cheap"
 # (proxy/.mode); see proxy/proxy/mode.py and POST /admin/set-mode.
 #
-# Cheap mode is 1-SLOT with the SAME models/provider chains as fast mode
-# (LP-0MSMIPPJI007GU9N):
-#   - session_slot_pool_size: 1 (single GPU slot)
-#   - slot_schedule entries all use slots: 1
+# Cheap mode is 2-SLOT with the SAME models/provider chains as fast mode
+# (LP-0MSMIPPJI007GU9N, amended LP-0MSMZOAJW002UR2A):
+#   - session_slot_pool_size: 2 (two GPU slots)
+#   - slot_schedule entries all use slots: 2 with a per-period
+#     ctx_size: 262144 override (the model's full 256K; GGUF metadata
+#     qwen35moe.context_length = 262144)
 #   - Remote/cloud providers (opencode/deepseek/github tiers) are ENABLED,
 #     so remote calls (including paid tiers) may occur when local slots are
-#     exhausted — the only intended difference from fast mode is the local
-#     slot pool. Keep this file's models section in sync with
+#     exhausted. Keep this file's models section in sync with
 #     config-fast.yaml (test_cheap_config_matches_fast_models guards it).
+#
+# BOOT CATCH-UP NOTE (LP-0MSMZOAJW002UR2A): local_model_ctx_size below stays
+# 131072 (the shared models.ini base) even though the schedule entries carry
+# ctx_size: 262144. The slot-scheduler applies the per-period ctx override
+# via a boot catch-up restart (it fires only when the static config differs
+# from the active schedule entry). DO NOT align local_model_ctx_size with the
+# entries' 262144: that would suppress the catch-up and cheap would boot at
+# 131072 total (2x65.5K) for the whole period. The catch-up transient runs at
+# 2x65.5K (clamp 61440 <= real per-slot 65536) — the safe direction.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -540,8 +550,10 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Option C (3 slots) restored per LP-0MSEGPO77005CYCQ F4.
-  session_slot_pool_size: 1
+  # 2 slots with per-period ctx_size 262144 (full model 256K) per
+  # LP-0MSMZOAJW002UR2A (previously 1 slot). Fast mode keeps 3 slots
+  # (Option C, LP-0MSEGPO77005CYCQ F4).
+  session_slot_pool_size: 2
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
@@ -600,9 +612,11 @@ server:
     drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
     entries:
       - time: "23:59"
-        slots: 1
+        slots: 2
+        ctx_size: 262144
       - time: "10:00"
-        slots: 1
+        slots: 2
+        ctx_size: 262144
   # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
   # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
   # times. A manual API switch (POST /admin/set-mode) overrides the schedule

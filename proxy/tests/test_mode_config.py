@@ -5,9 +5,10 @@ Covers (LP-0MSLMYEEU002IBH6):
   proxy/config.yaml default
 - config-fast.yaml mirrors the current config.yaml day settings (3-slot,
   remote providers eligible)
-- config-cheap.yaml is a 1-slot profile with the SAME models/provider
-  chains as fast (remote providers enabled, LP-0MSMIPPJI007GU9N); only
-  the local slot pool differs (1 vs 3)
+- config-cheap.yaml is a 2-slot profile with the SAME models/provider
+  chains as fast (remote providers enabled, LP-0MSMIPPJI007GU9N); it
+  differs only in the local slot pool (2 vs 3) and the per-period
+  ctx_size (262144 vs 131072, LP-0MSMZOAJW002UR2A)
 - resolve_config_path() maps modes to the correct profile files
 """
 
@@ -41,12 +42,12 @@ class TestConfigResolution:
         assert cfg["server"]["session_slot_pool_size"] == 3
 
     def test_cheap_mode_selects_cheap_config(self, mode_file, monkeypatch):
-        """Persisted cheap mode -> load_config reads config-cheap.yaml (1 slot)."""
+        """Persisted cheap mode -> load_config reads config-cheap.yaml (2 slots)."""
         monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
         mode_file.write_text("cheap\n")
         monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 1
+        assert cfg["server"]["session_slot_pool_size"] == 2
 
     def test_fast_mode_selects_fast_config(self, mode_file, monkeypatch):
         """Persisted fast mode -> load_config reads config-fast.yaml (3 slots)."""
@@ -153,13 +154,28 @@ class TestFastConfigProfile:
 
 
 class TestCheapConfigProfile:
-    def test_cheap_config_is_1_slot(self):
-        """config-cheap.yaml uses a 1-slot pool and 1/1 schedule entries."""
+    def test_cheap_config_is_2_slot(self):
+        """config-cheap.yaml uses a 2-slot pool, 2/2 schedule entries, each
+        carrying the full-model ctx_size override (262144, LP-0MSMZOAJW002UR2A)."""
         cfg = _load("config-cheap.yaml")
         srv = cfg["server"]
-        assert srv["session_slot_pool_size"] == 1
+        assert srv["session_slot_pool_size"] == 2
         entries = srv["slot_schedule"]["entries"]
-        assert [e["slots"] for e in entries] == [1, 1]
+        assert [e["slots"] for e in entries] == [2, 2]
+        assert all(e.get("ctx_size") == 262144 for e in entries)
+
+    def test_cheap_config_keeps_static_ctx_for_boot_catchup(self):
+        """The cheap profile's static local_model_ctx_size stays at the
+        models.ini base (131072) — deliberately NOT aligned with the schedule
+        entries' 262144 — so the slot-scheduler boot catch-up fires and
+        applies the per-period 256K override (LP-0MSMZOAJW002UR2A)."""
+        cfg = _load("config-cheap.yaml")
+        srv = cfg["server"]
+        assert srv["local_model_ctx_size"] == 131072
+        assert all(
+            e.get("ctx_size", 0) != srv["local_model_ctx_size"]
+            for e in srv["slot_schedule"]["entries"]
+        )
 
     def test_cheap_config_has_remote_providers(self):
         """config-cheap.yaml keeps remote providers enabled (LP-0MSMIPPJI007GU9N)."""
@@ -202,8 +218,10 @@ class TestCheapConfigProfile:
         fast = _load("config-fast.yaml")
         assert cheap["models"] == fast["models"]
 
-    def test_cheap_config_differs_from_fast_only_by_slot_pool(self):
-        """The only intended cheap-vs-fast server difference is the slot pool."""
+    def test_cheap_config_differs_from_fast_only_by_slot_pool_and_ctx(self):
+        """The only intended cheap-vs-fast server differences are the local
+        slot pool (2 vs 3) and the per-period ctx_size (262144 vs 131072).
+        Everything else (models, static ctx, routing thresholds) is identical."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
@@ -211,6 +229,16 @@ class TestCheapConfigProfile:
         cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
         cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
         assert cheap_srv == fast_srv
+
+        # The intended diffs, asserted explicitly:
+        assert cheap["server"]["session_slot_pool_size"] == 2
+        assert fast["server"]["session_slot_pool_size"] == 3
+        cheap_entries = cheap["server"]["slot_schedule"]["entries"]
+        fast_entries = fast["server"]["slot_schedule"]["entries"]
+        assert [e["slots"] for e in cheap_entries] == [2, 2]
+        assert [e["slots"] for e in fast_entries] == [3, 3]
+        assert all(e.get("ctx_size") == 262144 for e in cheap_entries)
+        assert all(e.get("ctx_size") == 131072 for e in fast_entries)
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
         """The local model context size is unchanged between profiles."""

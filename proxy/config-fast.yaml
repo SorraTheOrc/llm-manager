@@ -578,14 +578,23 @@ server:
   # Entries with the same slot count as the current value are skipped
   # (no unnecessary restart) UNLESS the per-period ctx_size differs.
   # Midnight wrapping is supported.
+  # Fast mode stays 3 slots @ 131072 total ctx (per-slot ~43.7K) — the
+  # 3x87.4K per-slot variant was rejected NO-GO (LP-0MSAOQTJS000FFVM /
+  # LP-0MSEGPO77005CYCQ). The explicit ctx_size: 131072 pins below ensure a
+  # future models.ini [Qwen3] ctx-size raise (the model max is 262144) cannot
+  # leak into fast mode: the slot-scheduler only applies per-period ctx via a
+  # transition/catch-up restart, and static local_model_ctx_size (131072)
+  # matches these entries so fast boots correct from the shared base.
   slot_schedule:
     enabled: true
     drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
     entries:
       - time: "23:59"
         slots: 3
+        ctx_size: 131072
       - time: "10:00"
         slots: 3
+        ctx_size: 131072
   # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
   # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
   # times. A manual API switch (POST /admin/set-mode) overrides the schedule
