@@ -727,11 +727,25 @@ async def admin_metrics():
     except Exception:
         pass
 
+    # Session-list index observability (LP-0MSNM9IAC000GVXT): index size,
+    # index-hit vs cold-scan counts, last scan duration.
+    index_obs = {}
+    try:
+        recorder = getattr(srv, "session_recorder", None)
+        if recorder is None:
+            from proxy.session_recorder import SessionRecorder
+            recorder = SessionRecorder.from_config(srv.config)
+            srv.session_recorder = recorder
+        index_obs = recorder.get_index_observability()
+    except Exception:
+        index_obs = {}
+
     return {
         "models_max": models_max,
         "loaded_models": loaded_models,
         "per_model": per_model,
         "process_rss_bytes": process_rss,
+        "index_observability": index_obs,
         "session_metrics": srv.session_manager.get_metrics(),
         "restore_success_total": int(srv.session_restore_observability.get("restore_success_total", 0)),
         "restore_fallback_total": dict(srv.session_restore_observability.get("restore_fallback_total", {})),

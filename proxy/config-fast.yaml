@@ -119,6 +119,10 @@ logging:
 #         Default: proxy/session-recordings/
 session_recording:
   path: proxy/session-recordings/
+  # Maximum entries in the in-memory session metadata index (LP-0MSNKMZCP003T8OG).
+  max_index_entries: 1000
+  # Cold-start scan bound: rebuild from at most this many most-recent dirs.
+  cold_scan_dir_limit: 50
 
 # ---------------------------------------------------------------------------
 # Audit model configuration

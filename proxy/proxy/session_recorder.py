@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,11 @@ _SHARED_INDEX_LOCK = threading.RLock()
 # Recording paths whose shared index has already been warmed (populated via
 # write updates or a cold scan). Guards against re-scanning on every call.
 _INDEX_WARM_PATHS: set[str] = set()
+
+# Observability counters for the shared index, keyed by recording path
+# (LP-0MSNM9IAC000GVXT).
+_INDEX_OBS: dict[str, dict[str, Any]] = {}
+_OBS_LOCK = threading.RLock()
 
 # ---------------------------------------------------------------------------
 # SessionRecorder
@@ -407,19 +413,65 @@ class SessionRecorder:
         """Populate the shared index via a bounded cold scan if not yet warm.
 
         Runs at most once per recording path (per process). Uses only the
-        ``COLD_SCAN_DIR_LIMIT`` most-recent session directories so a cold
+        ``cold_scan_dir_limit`` most-recent session directories so a cold
         start never re-reads the full recordings tree.
         """
         with _SHARED_INDEX_LOCK:
             if self.recording_path in _INDEX_WARM_PATHS:
+                self._record_index_hit()
                 return
             # An index already populated by write-path updates is warm — do
             # not re-scan the recordings tree (LP-0MSNM9BDV007DQXB AC1).
             if self._index:
                 _INDEX_WARM_PATHS.add(self.recording_path)
+                self._record_index_hit()
                 return
+            start = time.monotonic()
             self._rebuild_index_from_scan()
+            duration = time.monotonic() - start
             _INDEX_WARM_PATHS.add(self.recording_path)
+            self._record_cold_scan(duration)
+
+    def _record_index_hit(self) -> None:
+        """Count a list_sessions* call served from the warm index."""
+        with _OBS_LOCK:
+            obs = _INDEX_OBS.setdefault(self.recording_path, {
+                "index_size": 0,
+                "index_hits": 0,
+                "cold_scans": 0,
+                "last_scan_duration_seconds": 0.0,
+            })
+            obs["index_hits"] += 1
+
+    def _record_cold_scan(self, duration: float) -> None:
+        """Count a cold-scan fallback and record its duration."""
+        with _OBS_LOCK:
+            obs = _INDEX_OBS.setdefault(self.recording_path, {
+                "index_size": 0,
+                "index_hits": 0,
+                "cold_scans": 0,
+                "last_scan_duration_seconds": 0.0,
+            })
+            obs["cold_scans"] += 1
+            obs["last_scan_duration_seconds"] = duration
+
+    def get_index_observability(self) -> dict[str, Any]:
+        """Return index observability counters for this recording path.
+
+        Fields: index_size, index_hits, cold_scans,
+        last_scan_duration_seconds. Read-only snapshot; no behaviour change.
+        """
+        with _OBS_LOCK:
+            obs = _INDEX_OBS.get(self.recording_path, {
+                "index_size": 0,
+                "index_hits": 0,
+                "cold_scans": 0,
+                "last_scan_duration_seconds": 0.0,
+            })
+            result = dict(obs)
+        with _SHARED_INDEX_LOCK:
+            result["index_size"] = len(self._index)
+        return result
 
     def _rebuild_index_from_scan(self) -> None:
         """Cold-start scan: visit the newest cold_scan_dir_limit dirs only.

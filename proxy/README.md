@@ -14,6 +14,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
+- **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
 - **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per active slot, and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view.
@@ -1526,6 +1527,67 @@ The proxy logs client disconnect events at INFO level with the session ID and sl
 ```
 client_disconnect session=<session_id> slot=<slot_id>
 ```
+
+In addition to per-stream detection, a background **disconnect reaper** cancels
+non-streaming in-flight requests whose client disconnected mid-request, so
+abandoned connections do not accumulate server-side CLOSE-WAIT sockets
+(LP-0MSNM9UCC002CHYU). Idle keep-alive sockets are closed via
+`server.timeout_keep_alive` (default 5s).
+
+
+## Session Recordings
+
+Raw client↔proxy↔provider traffic is recorded to disk for debugging and
+analysis (see [Session-Based Incremental Ingestion](#session-based-incremental-ingestion)
+for the related cache feature). Recordings are organised per session:
+
+```
+<recording-path>/
+    <session-id>/
+        <timestamp>-request.json
+        <timestamp>-proxy_to_provider-request.json
+        <timestamp>-response.json
+```
+
+### Session list is index-backed and bounded
+
+The `/admin/sessions` endpoint (web UI session dropdown) is served from an
+**in-memory metadata index** — it does **not** re-scan the recordings tree on
+every call (LP-0MSNKMZCP003T8OG). Behaviour:
+
+- **Warm reads**: after recordings are written, `list_sessions()` and
+  `list_sessions_by_model()` serve from the shared index with **zero file
+  reads**. The index is shared between the write path and the UI so both see
+  the same state.
+- **Bounded cold start**: after a proxy restart the index is rebuilt lazily
+  on the first request, visiting only the **N most-recent session dirs** by
+  directory mtime (`server.session_recording.cold_scan_dir_limit`, default
+  `50`) and reading at most two small files per dir. `last_activity` is
+  derived from filename timestamps. The full recordings tree is never
+  re-read.
+- **15-session cap**: the endpoint returns at most the 15 most-recent
+  sessions (`MAX_SESSION_DROPDOWN_COUNT`), matching the UI dropdown.
+- **Bounded index size**: the index keeps at most
+  `server.session_recording.max_index_entries` entries (default `1000`); the
+  least-recently-active sessions are evicted when the cap is exceeded.
+
+### Observability
+
+`GET /admin/metrics` returns an `index_observability` block:
+
+```json
+"index_observability": {
+  "index_size": 3,
+  "index_hits": 1234,
+  "cold_scans": 1,
+  "last_scan_duration_seconds": 0.012
+}
+```
+
+- `index_hits` — list requests served from the warm index (zero disk reads).
+- `cold_scans` — list requests that triggered a bounded cold-start scan.
+- `last_scan_duration_seconds` — duration of the most recent cold scan.
+- `index_size` — current number of entries in the shared index.
 
 ## Session-Based Incremental Ingestion
 

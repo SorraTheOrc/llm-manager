@@ -119,6 +119,14 @@ logging:
 #         Default: proxy/session-recordings/
 session_recording:
   path: proxy/session-recordings/
+  # Maximum number of entries kept in the in-memory session metadata index
+  # (LP-0MSNKMZCP003T8OG). Least-recently-active sessions are evicted when
+  # the index exceeds this size.
+  max_index_entries: 1000
+  # Cold-start scan bound: after a restart, the index is rebuilt lazily from
+  # at most this many most-recent session directories (by dir mtime), never
+  # the full recordings tree.
+  cold_scan_dir_limit: 50
 
 # ---------------------------------------------------------------------------
 # Audit model configuration
@@ -294,6 +302,11 @@ models:
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
+  # Close idle keep-alive sockets and bound graceful-shutdown drain to
+  # prevent CLOSE-WAIT socket accumulation from abandoned connections
+  # (LP-0MSNM9UCC002CHYU).
+  timeout_keep_alive: 5
+  timeout_graceful_shutdown: 30
   # Fallback to host start is not permitted in production. This flag is
   # reserved for temporary developer troubleshooting only and must not be
   # committed in infra-managed production deployments.
