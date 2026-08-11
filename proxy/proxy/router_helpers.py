@@ -563,6 +563,25 @@ async def _get_per_model_queries(srv) -> dict[str, int]:
         return {}
 
 
+def _apply_queue_wait_to_timeout(
+    request_timeout: httpx.Timeout,
+    queue_wait_seconds: float,
+) -> httpx.Timeout:
+    """Reduce the adaptive timeout by the elapsed contention-queue wait.
+
+    Q2=a (LP-0MSORQVK50012Q4D): the queued wait subtracts from the
+    client-visible adaptive timeout budget, so total (wait + serve) stays
+    within ``llama_adaptive_timeout_*``. Floors at 1s so a near-cap wait still
+    leaves a minimal serve window.
+    """
+    try:
+        base = float(request_timeout.connect)
+    except Exception:
+        return request_timeout
+    reduced = max(1.0, base - max(0.0, float(queue_wait_seconds)))
+    return httpx.Timeout(reduced)
+
+
 def _get_lease_timeout_seconds(srv) -> float:
     """Return the configured lease timeout in seconds (default 180)."""
     try:
@@ -823,6 +842,16 @@ async def _decrement_local_active_queries(
             except Exception:
                 pass
 
+    # A local slot freed (stream end / request completion) — wake the
+    # cross-session contention queue (LP-0MSORQVK50012Q4D AC2). Best-effort:
+    # an idle queue is a no-op.
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(1)
+    except Exception:
+        pass
+
 
 async def _increment_local_active_queries(
     srv,
@@ -1049,6 +1078,14 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
             _free_slot_assignment(session_id)
         except Exception:
             pass
+    # A slot-persistence / lease release frees the backend — wake the
+    # cross-session contention queue (LP-0MSORQVK50012Q4D AC2).
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(1)
+    except Exception:
+        pass
     return removed
 
 
@@ -1135,6 +1172,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
     except Exception:
         pass
+    # Removed stale leases frees slots — wake the cross-session contention
+    # queue (LP-0MSORQVK50012Q4D AC2).
+    if removed > 0:
+        try:
+            from proxy.contention_queue import wake
+
+            await wake(removed)
+        except Exception:
+            pass
     return removed
 
 
@@ -1177,6 +1223,12 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                             )
                         except Exception:
                             pass
+                        try:
+                            from proxy.contention_queue import wake_all
+
+                            await wake_all()
+                        except Exception:
+                            pass
         else:
             # Legacy mode: no dispatch records system
             async with srv.local_active_queries_lock:
@@ -1190,6 +1242,12 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                             "dispatch records)",
                             prev,
                         )
+                    except Exception:
+                        pass
+                    try:
+                        from proxy.contention_queue import wake_all
+
+                        await wake_all()
                     except Exception:
                         pass
     except Exception:

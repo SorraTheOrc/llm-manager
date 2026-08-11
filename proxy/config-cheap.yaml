@@ -559,6 +559,20 @@ server:
   # (Option C, LP-0MSEGPO77005CYCQ F4).
   session_slot_pool_size: 2
 
+  # Per-mode contention policy (LP-0MSORQVK50012Q4D): when all local slots
+  # are busy, QUEUE the request (bounded, cross-session) instead of
+  # immediately falling back to the next remote provider. Context bypasses
+  # (context_too_large / large_context_bypass) are physical capacity limits
+  # and never queue. Fast mode (config-fast.yaml) keeps fallback.
+  contention_queue_policy: queue
+  # Max time (seconds) a queued request waits for a local slot before
+  # falling back to the next remote provider. Clamped to
+  # [1, session_guardrail_max_runtime_seconds] (LP-0MSORQVK50012Q4D F2).
+  contention_queue_max_wait_seconds: 60
+  # Max number of cross-session requests queued at once; beyond this, new
+  # requests fall back immediately. Clamped to [1, 16].
+  contention_queue_max_depth: 4
+
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
   # -----------------------------------------------------------------------

@@ -75,6 +75,54 @@ models:
 - `{"model": "claude-3-opus"}` → matches `anthropic` config via exact alias → routes to Anthropic API
 - No model specified + `current_model` is set → uses the currently loaded local model
 
+## Slot Contention: Per-Mode Queue vs Fallback (LP-0MSORQVK50012Q4D)
+
+When every local slot is busy (``local_active_queries >= session_slot_pool_size``),
+the proxy's behavior depends on the per-mode contention policy declared in the
+active mode config:
+
+| Mode (config file) | `contention_queue_policy` | Slot-contention behavior |
+|--------------------|---------------------------|--------------------------|
+| cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (60) and `contention_queue_max_depth` (4); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
+| fast (config-fast.yaml) | `fallback` | Today's behavior — skip to the next remote provider immediately |
+
+Key semantics (see `proxy/provider.py` ``_maybe_queue_for_local_slot`` and
+`proxy/contention_queue.py``):
+
+- **Cross-session**: the queue is process-global, so a request from session B
+  can wait (bounded) behind a long audit stream from session A. This is what
+  converts overnight contention fallbacks into queued-local dispatches.
+- **Context bypasses never queue**: requests that cannot fit the KV slot
+  (`context_too_large` / `large_context_bypass`, LP-0MSF8XDG7000PERM /
+  LP-0MRE4NBQ5009V5BX) fall back exactly as before — they are physical
+  capacity limits, not contention.
+- **Wake signals**: the queue wakes on BOTH `local_active_queries` decrement
+  (a local stream ended) AND slot-persistence / lease release (slot
+  save/restore frees the backend during model switches).
+- **Timeout accounting (Q2=a)**: the queued wait subtracts from the
+  client-visible adaptive timeout budget — total (wait + serve) stays within
+  `llama_adaptive_timeout_*` (base 60s + 0.015/token, capped at
+  `max_runtime_seconds`), so interactive clients never see queue wait + serve
+  exceed the adaptive envelope.
+- **Metrics**: queued count, queued duration, and fallback-after-queue count
+  are exposed via `proxy/contention_queue.py::metrics()` and the
+  `status_request` / `contention_queue_dispatch` /
+  `contention_queue_fallback_after_queue` log lines (Prometheus counters in
+  `proxy/metrics.py`) so the 24h proxy report can quantify the gain.
+
+Config reference:
+
+```yaml
+server:
+  # cheap profile
+  contention_queue_policy: queue              # or "fallback" (fast)
+  contention_queue_max_wait_seconds: 60      # clamped to [1, max_runtime_seconds]
+  contention_queue_max_depth: 4              # clamped to [1, 16]
+```
+
+The queue engages only in cheap operating mode (`proxy.mode.read_mode() ==
+"cheap"`); absent keys default to fallback for backward compatibility.
+
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
 When a routed stream fails, the proxy follows a **recovery-first** strategy

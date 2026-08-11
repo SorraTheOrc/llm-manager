@@ -1805,6 +1805,136 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     return (cur_active, max_local)
 
 
+# ---------------------------------------------------------------------------
+# Bounded cross-session contention queue (LP-0MSORQVK50012Q4D)
+# ---------------------------------------------------------------------------
+
+def _contention_queue_enabled(config: dict) -> bool:
+    """True when the contention queue should engage: queue policy AND cheap mode.
+
+    The per-mode policy comes from the active mode config
+    (``contention_queue_policy``; config-cheap.yaml declares ``queue``,
+    config-fast.yaml declares ``fallback``). Belt-and-braces: the queue also
+    requires ``proxy.mode.read_mode() == "cheap"`` so an operator override of
+    LLAMA_PROXY_CONFIG cannot enable queueing in fast mode (LP-0MSORQVK50012Q4D
+    constraint 5). Fail-open: any error → queue disabled (today's behavior).
+    """
+    try:
+        from proxy.router import _get_contention_queue_config
+
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        cq = _get_contention_queue_config(server_cfg)
+        if cq["policy"] != "queue":
+            return False
+        from proxy.mode import read_mode
+
+        return read_mode() == "cheap"
+    except Exception:
+        return False
+
+
+async def _queue_context_bypass(
+    config: dict,
+    model_config: dict,
+    provider_cfg: dict,
+    request,
+    body_json: dict,
+    session_id: str | None,
+) -> tuple[bool, str | None]:
+    """Mirror of the smart-routing large-context skip decision.
+
+    Used ONLY at the contention-queue decision point so context bypasses
+    (``context_too_large`` / ``large_context_bypass``) are NEVER queued — they
+    fall back exactly as today (LP-0MSORQVK50012Q4D AC4). Keeps the same
+    thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
+    smart-routing block below; returns ``(skip_local, skip_reason)``.
+    """
+    _llama_model = provider_cfg.get("llama_model", "")
+    _cold_threshold, _warm_threshold = _effective_large_context_thresholds(config)
+    _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
+    _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
+        request, body_json, tokenizer=_tokenizer,
+    )
+    if _multiplier != 1.0:
+        _estimated_tokens = int(_estimated_tokens * _multiplier)
+    _skip_local = _should_skip_local(
+        _llama_model, session_id, body_json, _cold_threshold,
+        estimated_tokens=_estimated_tokens,
+        warm_cache_threshold=_warm_threshold,
+    )
+    if _skip_local:
+        if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
+            _skip_reason = "context_too_large"
+        else:
+            _skip_reason = "large_context_bypass"
+    else:
+        _skip_reason = None
+    return _skip_local, _skip_reason
+
+
+def _set_queue_wait_on_request(request, elapsed: float) -> None:
+    """Record the elapsed contention-queue wait on the request so
+    ``proxy_to_local`` can subtract it from the adaptive timeout budget
+    (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``)."""
+    try:
+        setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
+    except Exception:
+        pass
+
+
+async def _maybe_queue_for_local_slot(
+    config: dict,
+    cur_local: int,
+    max_local: int,
+    request,
+    body_json: dict,
+    model_config: dict,
+    provider_cfg: dict,
+    session_id: str | None,
+) -> tuple[str, str | None, float | None]:
+    """Queue-wait for a local slot (cheap mode, queue policy) instead of
+    immediately falling back to the next remote provider.
+
+    Returns ``(action, reason, elapsed_seconds)`` where action is one of:
+
+      - ``"dispatch"`` — a slot freed within the caps; the caller should
+        dispatch local. *elapsed_seconds* is the queue wait (for the Q2=a
+        budget subtraction).
+      - ``"fallback"`` — caps exceeded; the caller falls back to the next
+        remote provider exactly as today.
+      - ``"context_bypass"`` — the request cannot fit a KV slot; it was
+        never queued; the caller records ``cached_tokens_skip`` with the
+        returned *reason*.
+      - ``"fallback_policy"`` — policy is fallback / not cheap mode; the
+        caller keeps today's ``local_concurrency_limit`` behavior.
+    """
+    if not _contention_queue_enabled(config):
+        return ("fallback_policy", None, None)
+    # Context bypasses never queue (AC4): a request that cannot fit the KV
+    # slot must fall back exactly as today.
+    skip_local, skip_reason = await _queue_context_bypass(
+        config, model_config, provider_cfg, request, body_json, session_id,
+    )
+    if skip_local:
+        return ("context_bypass", skip_reason, None)
+
+    from proxy.router import _get_contention_queue_config
+
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    cq = _get_contention_queue_config(server_cfg)
+
+    from proxy import contention_queue
+
+    elapsed = await contention_queue.wait_for_local_slot(
+        max_wait_seconds=cq["max_wait_seconds"],
+        max_depth=cq["max_depth"],
+        slot_free_check=lambda: _get_local_concurrency_info(config)[0] < max_local,
+    )
+    if elapsed is None:
+        return ("fallback", None, None)
+    return ("dispatch", None, elapsed)
+
+
 
 
 
@@ -3683,18 +3813,86 @@ async def _proxy_with_fallback_cycle(
                 # provider without marking local as unavailable.
                 cur_local, max_local = _get_local_concurrency_info(config)
                 if cur_local >= max_local:
-                    _record_attempt(
-                        attempts,
-                        provider=provider_name,
-                        type=provider_type,
-                        status="local_concurrency_limit",
-                        active=cur_local,
-                        max=max_local,
+                    # Per-mode contention queue (LP-0MSORQVK50012Q4D): in cheap
+                    # mode with policy=queue, a request that finds local slots
+                    # exhausted QUEUES (bounded by caps) instead of immediately
+                    # falling back to the next remote provider. When a slot
+                    # frees within the caps it is dispatched local; when the
+                    # caps are exceeded it falls back exactly as today.
+                    _cq_action, _cq_reason, _cq_elapsed = (
+                        await _maybe_queue_for_local_slot(
+                            config, cur_local, max_local, request, body_json,
+                            model_config, provider_cfg, _session_id,
+                        )
                     )
-                    fallback_reason = "local_concurrency_limit"
-                    prev_provider = provider_name
-                    all_slot_exhaustion = False
-                    continue
+                    if _cq_action == "dispatch":
+                        # A slot freed within the caps — dispatch local below.
+                        _set_queue_wait_on_request(request, _cq_elapsed)
+                        logger.info(
+                            "contention_queue_dispatch provider=%s session=%s "
+                            "queued_duration=%.2fs",
+                            provider_name, _session_id or "unknown",
+                            _cq_elapsed or 0.0,
+                        )
+                        try:
+                            from proxy.metrics import record_contention_queued
+
+                            record_contention_queued(_cq_elapsed or 0.0)
+                        except Exception:
+                            pass
+                    elif _cq_action == "fallback":
+                        # Caps exceeded — fall back to the next remote provider
+                        # exactly as today (fallback-after-queue recorded).
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="fallback_after_queue",
+                            active=cur_local,
+                            max=max_local,
+                        )
+                        fallback_reason = "fallback_after_queue"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        logger.info(
+                            "contention_queue_fallback_after_queue provider=%s "
+                            "session=%s",
+                            provider_name, _session_id or "unknown",
+                        )
+                        try:
+                            from proxy.metrics import record_contention_fallback_after_queue
+
+                            record_contention_fallback_after_queue()
+                        except Exception:
+                            pass
+                        continue
+                    elif _cq_action == "context_bypass":
+                        # Context bypasses never queue (AC4): fall back exactly
+                        # as today with the context skip reason.
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="cached_tokens_skip",
+                            reason=_cq_reason,
+                        )
+                        fallback_reason = _cq_reason
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
+                    else:  # fallback_policy — fast mode unchanged
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_concurrency_limit",
+                            active=cur_local,
+                            max=max_local,
+                        )
+                        fallback_reason = "local_concurrency_limit"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
 
                 # Smart routing: skip local when cache is cold and request is large
                 # (LP-0MRCSSBTM002NK3B). This avoids expensive full re-prefill of

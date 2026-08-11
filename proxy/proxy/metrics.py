@@ -46,6 +46,10 @@ proxy_http_errors_total = None
 # Token-rate observation metrics
 llama_token_rate_gauge = None
 llama_token_rate_histogram = None
+# Contention-queue metrics (LP-0MSORQVK50012Q4D F4 AC3)
+llama_contention_queued_total = None
+llama_contention_queued_duration_seconds = None
+llama_contention_fallback_after_queue_total = None
 
 if _enabled:
     try:
@@ -80,6 +84,20 @@ if _enabled:
                 llama_token_rate_histogram = None
         else:
             llama_token_rate_histogram = None
+        # Contention-queue metrics (LP-0MSORQVK50012Q4D F4 AC3): counters for
+        # queued requests, queued duration (sum), and fallback-after-queue.
+        llama_contention_queued_total = Counter(
+            'llama_contention_queued_total',
+            'Requests queued on local slot contention (cheap-mode queue policy)',
+        )
+        llama_contention_queued_duration_seconds = Counter(
+            'llama_contention_queued_duration_seconds',
+            'Total seconds requests waited in the local-slot contention queue',
+        )
+        llama_contention_fallback_after_queue_total = Counter(
+            'llama_contention_fallback_after_queue_total',
+            'Requests that fell back to remote after the contention-queue caps',
+        )
     except Exception:  # pragma: no cover - defensive
         _enabled = False
 
@@ -166,6 +184,36 @@ def record_http_error(endpoint: str, status: str, reason: str):
         return
     try:
         proxy_http_errors_total.labels(endpoint=endpoint, status=status, reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_contention_queued(duration_seconds: float):
+    """Record a request queued on local slot contention (LP-0MSORQVK50012Q4D F4).
+
+    Increments the queued counter and adds *duration_seconds* to the total
+    queued duration. Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled:
+        return
+    try:
+        if llama_contention_queued_total is not None:
+            llama_contention_queued_total.inc()
+        if llama_contention_queued_duration_seconds is not None:
+            llama_contention_queued_duration_seconds.inc(max(0.0, float(duration_seconds)))
+    except Exception:
+        pass
+
+
+def record_contention_fallback_after_queue():
+    """Record a fallback-after-queue event (LP-0MSORQVK50012Q4D F4).
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_contention_fallback_after_queue_total is None:
+        return
+    try:
+        llama_contention_fallback_after_queue_total.inc()
     except Exception:
         pass
 

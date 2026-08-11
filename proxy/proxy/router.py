@@ -68,6 +68,7 @@ from proxy.utils import (  # noqa: E402
 
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
+    _apply_queue_wait_to_timeout,
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _call_with_backend_retries,
@@ -121,6 +122,52 @@ def _get_local_max_concurrent_queries(server_config: dict) -> int:
         return max(1, int(val or 1))
     except (ValueError, TypeError):
         return 1
+
+
+def _get_contention_queue_config(server_config: dict) -> dict:
+    """
+    Resolve the per-mode contention-queue policy and caps with sane clamps.
+
+    Returns a dict with keys:
+      - ``policy``: "queue" or "fallback" (absent keys default to fallback,
+        fast-mode behavior)
+      - ``max_wait_seconds``: clamped to [1, session_guardrail_max_runtime_seconds]
+      - ``max_depth``: clamped to [1, 16]
+
+    Invalid values are logged and clamped, never crash (LP-0MSORQVK50012Q4D
+    F2 AC3/AC4). The policy applies during cheap operating mode only (the
+    caller gates on proxy.mode.read_mode() == "cheap").
+    """
+    policy = str(
+        server_config.get("contention_queue_policy", "fallback") or "fallback"
+    ).strip().lower()
+    if policy not in ("queue", "fallback"):
+        policy = "fallback"
+    # Wait cap: [1, session_guardrail_max_runtime_seconds]
+    try:
+        max_runtime = int(
+            server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
+        )
+    except (TypeError, ValueError):
+        max_runtime = 1800
+    raw_wait = server_config.get("contention_queue_max_wait_seconds", 60)
+    try:
+        wait = float(raw_wait) if raw_wait is not None else 60.0
+    except (TypeError, ValueError):
+        wait = 60.0
+    max_wait_seconds = max(1.0, min(wait, float(max(1, max_runtime))))
+    # Depth cap: [1, 16]
+    raw_depth = server_config.get("contention_queue_max_depth", 4)
+    try:
+        depth = int(raw_depth) if raw_depth is not None else 4
+    except (TypeError, ValueError):
+        depth = 4
+    max_depth = max(1, min(depth, 16))
+    return {
+        "policy": policy,
+        "max_wait_seconds": max_wait_seconds,
+        "max_depth": max_depth,
+    }
 
 
 def _get_local_active_count(srv) -> int:
@@ -762,6 +809,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Compute request timeout (adaptive if enabled)
     request_timeout = _compute_request_timeout(server_config, body_json)
+    # Contention-queue wait subtracts from the client-visible adaptive
+    # timeout budget (Q2=a, LP-0MSORQVK50012Q4D): total (wait + serve) stays
+    # within llama_adaptive_timeout_* so clients never see queue wait + serve
+    # exceed the adaptive envelope. provider.py sets this attribute when a
+    # queued request wins a slot.
+    _queue_wait = float(getattr(request, "_contention_queue_wait_seconds", 0.0) or 0.0)
+    if _queue_wait > 0:
+        request_timeout = _apply_queue_wait_to_timeout(request_timeout, _queue_wait)
 
     if is_streaming:
         session_guard = session_single_flight_coordinator.acquire(

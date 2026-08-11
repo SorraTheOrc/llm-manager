@@ -218,16 +218,22 @@ class TestCheapConfigProfile:
         fast = _load("config-fast.yaml")
         assert cheap["models"] == fast["models"]
 
-    def test_cheap_config_differs_from_fast_only_by_slot_pool_and_ctx(self):
+    def test_cheap_config_differs_from_fast_only_by_slot_pool_ctx_and_contention(self):
         """The only intended cheap-vs-fast server differences are the local
-        slot pool (2 vs 3) and the per-period ctx_size (262144 vs 131072).
-        Everything else (models, static ctx, routing thresholds) is identical."""
+        slot pool (2 vs 3), the per-period ctx_size (262144 vs 131072), and the
+        per-mode contention-queue policy (cheap=queue vs fast=fallback,
+        LP-0MSORQVK50012Q4D F2). Everything else (models, static ctx, routing
+        thresholds) is identical."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
         fast_srv = dict(fast["server"])
         cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
         cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
+        # Cheap declares queue + caps; fast declares fallback (no caps).
+        cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
+        cheap_srv.pop("contention_queue_max_wait_seconds", None)
+        cheap_srv.pop("contention_queue_max_depth", None)
         assert cheap_srv == fast_srv
 
         # The intended diffs, asserted explicitly:
@@ -239,6 +245,10 @@ class TestCheapConfigProfile:
         assert [e["slots"] for e in fast_entries] == [3, 3]
         assert all(e.get("ctx_size") == 262144 for e in cheap_entries)
         assert all(e.get("ctx_size") == 131072 for e in fast_entries)
+        assert cheap["server"]["contention_queue_policy"] == "queue"
+        assert cheap["server"]["contention_queue_max_wait_seconds"] == 60
+        assert cheap["server"]["contention_queue_max_depth"] == 4
+        assert fast["server"]["contention_queue_policy"] == "fallback"
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
         """The local model context size is unchanged between profiles."""
