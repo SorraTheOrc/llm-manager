@@ -119,6 +119,14 @@ logging:
 #         Default: proxy/session-recordings/
 session_recording:
   path: proxy/session-recordings/
+  # Maximum number of entries kept in the in-memory session metadata index
+  # (LP-0MSNKMZCP003T8OG). Least-recently-active sessions are evicted when
+  # the index exceeds this size.
+  max_index_entries: 1000
+  # Cold-start scan bound: after a restart, the index is rebuilt lazily from
+  # at most this many most-recent session directories (by dir mtime), never
+  # the full recordings tree.
+  cold_scan_dir_limit: 50
 
 # ---------------------------------------------------------------------------
 # Audit model configuration
@@ -202,6 +210,10 @@ models:
     aliases:
     - plan*
     force_full_prompt: true
+    # Native tokenizer for exact routing/persistence token estimates
+    # (LP-0MSEQ71IF0003FRT); replaces the server-level
+    # token_estimate_multiplier heuristic for this model.
+    tokenizer: qwen3
 
   author:
     providers:
@@ -239,6 +251,8 @@ models:
     aliases:
     - author
     force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
 
   code:
     providers:
@@ -283,9 +297,16 @@ models:
     aliases:
     - code
     force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
+  # Close idle keep-alive sockets and bound graceful-shutdown drain to
+  # prevent CLOSE-WAIT socket accumulation from abandoned connections
+  # (LP-0MSNM9UCC002CHYU).
+  timeout_keep_alive: 5
+  timeout_graceful_shutdown: 30
   # Fallback to host start is not permitted in production. This flag is
   # reserved for temporary developer troubleshooting only and must not be
   # committed in infra-managed production deployments.
@@ -392,10 +413,12 @@ server:
   # tokenizer).
   local_large_context_cold_cache_threshold: 30000
 
-  # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
-  # When the slot cache is warm (cached prefix) but estimated prompt tokens
-  # exceed this value, local routing is bypassed to avoid GPU prefill contention
-  # on very large contexts. Set to 0 to disable. Default: 60000.
+  # Context-too-large bypass threshold (skip reason `context_too_large`;
+  # LP-0MRE4NBQ5009V5BX, renamed from `warm_cache_bypass` in
+  # LP-0MSF8XDG7000PERM). When the estimated prompt context exceeds this
+  # value, local routing is bypassed regardless of cache state (the old name
+  # was a misnomer: this is a context-size cap, not a cache-warmth signal).
+  # Set to 0 to disable. Default: 60000.
   #
   # This is a HARD PHYSICAL CAPACITY LIMIT: it is clamped to the actual
   # per-slot context (local_model_ctx_size / active_slots, minus output
@@ -415,15 +438,6 @@ server:
   # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
   # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
   local_model_ctx_size: 131072
-  # Token estimate multiplier (LP-0MSEGPO77005CYCQ F2, AC1).
-  # tiktoken (cl100k) undercounts Qwen3 native tokens ~1.69x for dense prose
-  # (60K fixture: tiktoken est 47680 vs actual ~77060, ratio 1.69). Applied
-  # consistently to BOTH the routing estimate (provider.py) and the slot
-  # persistence estimate (session.py) via _get_token_estimate_multiplier, so
-  # the routing clamp and the persistence cap compare Qwen3-native token
-  # counts. Per-model token_estimate_multiplier overrides this server-level
-  # value for routing. Set to 1.0 to disable.
-  token_estimate_multiplier: 1.69
   # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
   # When a session's estimated context reaches this fraction of the
   # effective per-slot context (ctx_size / slots - 4096 headroom), the
@@ -549,18 +563,36 @@ server:
   #                   slot count becomes active.
   #     slots:        The ``--parallel N`` value to apply from this time
   #                   onward until the next entry.
+  #     ctx_size:     OPTIONAL per-period total context (llama-server
+  #                   ``--ctx-size``) while this entry is active; overrides
+  #                   the global ``local_model_ctx_size`` below
+  #                   (LP-0MSLNK96T0018W4D).
   #
-  # Example (peak hours 10:00-11:59 = 4 slots, off-peak = 8):
+  # Time-based slot count transitions (LP-0MSF9RUSQ007M346).
+  #
+  # Each entry maps a time-of-day to a slot count. Entries may also carry
+  # an optional per-period ctx_size (LP-0MSLNK96T0018W4D): the total
+  # context across all slots (llama-server --ctx-size) while that entry is
+  # active, overriding the global local_model_ctx_size below. When absent,
+  # the global local_model_ctx_size applies. The routing clamp and
+  # session_slot_max_prompt_tokens derive per-slot thresholds from the
+  # ACTIVE period's (ctx_size, slots) — keep clamp × slots <= the real
+  # rounded n_ctx (llama.cpp pads n_ctx_seq up to 256).
+  #
+  # Example:
   #   slot_schedule:
   #     enabled: true
+  #     drain_minutes: 3  # DEPRECATED — ignored
   #     entries:
   #       - time: "10:00"
-  #         slots: 4
-  #       - time: "12:00"
-  #         slots: 8
+  #         slots: 3
+  #       - time: "23:59"
+  #         slots: 2
+  #         ctx_size: 262144
   #
   # Entries with the same slot count as the current value are skipped
-  # (no unnecessary restart). Midnight wrapping is supported.
+  # (no unnecessary restart) UNLESS the per-period ctx_size differs.
+  # Midnight wrapping is supported.
   slot_schedule:
     enabled: true
     drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
@@ -569,6 +601,22 @@ server:
         slots: 3
       - time: "10:00"
         slots: 3
+  # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
+  # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
+  # times. A manual API switch (POST /admin/set-mode) overrides the schedule
+  # until the next scheduled transition (LP-0MSMF25V9002AY1J). The active
+  # entry is the most
+  # recent one at or before the current time (circular wrap, so the last
+  # entry covers 00:00-00:59). Set enabled: false to disable; an absent
+  # section uses this same built-in schedule.
+  mode_schedule:
+    enabled: true
+    entries:
+      - time: "01:00"
+        mode: cheap
+      - time: "10:00"
+        mode: fast
+
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
   # The effective timeout is base + session_slot_timeout_per_token_seconds x
@@ -585,9 +633,10 @@ server:
   # is absent or 0, the cap is derived from the effective per-slot clamp
   # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
   # source as the routing clamp (effective_per_slot_threshold in provider.py)
-  # — so it auto-adapts to slot-count/ctx-size changes (e.g. Option C day
-  # 3-slot → 39594; night 8-slot → 12288) instead of freezing at a static
-  # value. Set to a non-zero value to use an explicit static override.
+  # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
+  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
+  # freezing at a static value. Set to a non-zero value to use an explicit
+  # static override.
   # 0 = dynamic derivation (current live config).
   session_slot_max_prompt_tokens: 0
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +

@@ -41,6 +41,7 @@ def reset_cooldown_state():
     """Reset cooldown and failure-count state between tests to avoid cross-test leakage."""
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
     yield
 
 
@@ -3178,6 +3179,7 @@ class TestSharedFallbackPrimitives:
         """_handle_http_error_with_cooldown marks provider and records attempt."""
         provider._provider_unavailable_until.clear()
         provider._provider_failure_count.clear()
+        provider._usage_reset_at.clear()
         attempts = []
         response = Response(status_code=502, content=b"Bad gateway")
         cooldown = provider._handle_http_error_with_cooldown(

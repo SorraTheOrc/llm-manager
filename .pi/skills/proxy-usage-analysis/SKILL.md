@@ -1,12 +1,12 @@
 ---
 name: proxy-usage-analysis
-description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/proxy.log*) into per-session daytime/nighttime CSVs and a Markdown report with data-backed configuration recommendations and an error taxonomy with remediation recommendations. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
+description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/proxy.log*) into per-session fast/cheap CSVs and a Markdown report with data-backed configuration recommendations and an error taxonomy with remediation recommendations. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
 ---
 
 # Proxy Usage Analysis
 
 Turn the last 24 hours of llama-proxy session and fallback activity into a
-digestible per-session CSV record (split into daytime / nighttime buckets per
+digestible per-session CSV record (split into fast / cheap buckets per
 the slot schedule) and an operator-facing Markdown report with highlighted,
 data-backed recommendations — including an **error taxonomy** and quantified
 **remediation recommendations** for any proxy errors observed in the window
@@ -18,10 +18,11 @@ data-backed recommendations — including an **error taxonomy** and quantified
   (llama-server via the proxy) are used well, how much traffic fell back to
   remote providers, why, and what to change. The **Local model utilization**
   section answers "how much of the time was the local model busy?" (busy %,
-  idle %, streams, concurrency, hourly/day-night profile).
-- Investigating slot counts (6 daytime / 8 nighttime), context limits, or
-  routing thresholds: the report's fallback-reason breakdown and context
-  pressure stats show whether configuration changes are warranted.
+  idle %, streams, concurrency, hourly/fast-cheap profile).
+- Investigating slot counts (fast / cheap, as configured in the
+  `slot_schedule` of `proxy/config.yaml`), context limits, or routing
+  thresholds: the report's fallback-reason breakdown and context pressure
+  stats show whether configuration changes are warranted.
 - An error spike occurred (e.g. `Stream finished: reason=error`, `slot_save`
   ReadTimeouts, `backend_retry` timeouts, upstream 429s): the report's
   **Error analysis** section categorizes every error event and recommends
@@ -34,7 +35,10 @@ data-backed recommendations — including an **error taxonomy** and quantified
   siblings (`proxy.log.YYYY-MM-DD_HH`, 6-hourly rotation, 90-day retention).
 - Config (reference only, for slot schedule + thresholds):
   `proxy/config.yaml` in the llm project (auto-discovered by walking up from
-  the current directory, or pass `--config`).
+  the current directory, or pass `--config`). When the persisted operating
+  mode (`proxy/.mode`) selects a profile, the mode-selected config
+  (`config-fast.yaml` / `config-cheap.yaml`) is read instead, so bucketing
+  and recommendations match the config the running proxy actually uses.
 
 ## Usage
 
@@ -79,30 +83,37 @@ and stays at the root, untouched by archival.
 
 Written to `--output-dir` (default `~/proxy-usage-reports`):
 
-- `daytime_sessions.csv` — one row per **daytime** session (10:00–23:59,
-  6 slots per the configured schedule). One row per session, covering ALL
-  sessions in the window (local-only and fallback).
-- `nighttime_sessions.csv` — one row per **nighttime** session (00:00–09:59,
-  8 slots).
+- `fast_sessions.csv` — one row per **fast** session (the period(s)
+  with the fewest slots per the configured `slot_schedule` in the active
+  config profile). One row per session, covering ALL sessions in the window
+  (local-only and fallback).
+- `cheap_sessions.csv` — one row per **cheap** session (the period(s)
+  with the most slots; when all periods have the same slot count there is no
+  cheap bucket and this file is not produced).
 - `errors.csv` — one row per **error event** in the window (stream finish
   errors, stream errors, `slot_save` failures, `backend_retry` timeouts,
   upstream HTTP errors), with error type, timestamp, provider/model, session,
   config entry, error detail, HTTP status, retry attempt/signal, source log
   file, and the raw evidence line.
-- `errors.json` — aggregated error counts by type plus the window bounds.
+- `errors.json` — aggregated error counts by type plus a **provider/model
+  breakdown** (nested `{error_type: {provider: {model: count}}}`; providers or
+  models not derivable from the log line are keyed `(unknown)`) plus the window
+  bounds.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
-  dispatch denials, context sizes — each with **Total / Day / Night**
+  dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), fallback-reason and routing-skip breakdowns, per-model
-  breakdown, **Error analysis** (when the window has error events),
+  breakdown, **Error analysis** (when the window has error events) with a
+  taxonomy table plus a **Provider/model breakdown** table (error type ×
+  provider × model × count),
   **Local model utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency, hourly busy profile,
-  day/night split — when the window has local traffic), **Decode speed** and
+  fast/cheap split — when the window has local traffic), **Decode speed** and
   **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
-  eval-timing lines, split Total / Day / Night), and highlighted
-  recommendations. Every day/night count carries its share of the metric's
+  eval-timing lines, split Total / Fast / Cheap), and highlighted
+  recommendations. Every fast/cheap count carries its share of the metric's
   total (e.g. `285 (74.4%)`), and each recommendation's evidence cites the
-  total plus the day/night split.
+  total plus the fast/cheap split.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
@@ -114,7 +125,7 @@ local completion tokens ÷ local active span; empty when not derivable).
 ### Archival
 
 Before writing fresh outputs, the script moves any existing artifacts
-(`report.md`, `daytime_sessions.csv`, `nighttime_sessions.csv`, `errors.csv`,
+(`report.md`, `fast_sessions.csv`, `cheap_sessions.csv`, `errors.csv`,
 `errors.json`) into a dated subdirectory named by the **run date**
 (`YYYY-MM-DD/`); when that directory already exists (a same-day repeat, or a
 manual archive), a `_2`, `_3` … suffix is appended so archives are never
@@ -148,26 +159,39 @@ run (`Previous outputs archived to …`).
    the union of active intervals (at least one slot generating), total
    compute is the sum of clipped stream durations (slot-seconds), and peak
    concurrency comes from a sweep over interval endpoints. Busy seconds are
-   attributed to hours and to day/night periods (slot schedule) by
+   attributed to hours and to fast/cheap periods (slot schedule) by
    splitting at hour and period boundaries.
-5. **Day/night bucketing** — derived from the `slot_schedule` in
-   `proxy/config.yaml` (10:00 → 6 slots day, 23:59 → 8 slots night), keyed by
-   session start time; nothing is hardcoded.
+5. **Fast/cheap bucketing** — derived from the `slot_schedule` in the
+   active config profile (`proxy/config-fast.yaml` or
+   `proxy/config-cheap.yaml`; transition times and slot counts are read from
+   config; the period(s) with the fewest slots are labelled "fast", the
+   period(s) with the most "cheap"; equal counts collapse to a single fast
+   bucket), keyed by session start time; nothing is hardcoded.
 6. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
-   rendered into the report's **Error analysis** section plus
-   `errors.csv`/`errors.json`. Remediation recommendations (recovery-first,
+   rendered into the report's **Error analysis** section (taxonomy table plus
+   a **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
+   Provider/model attribution is best effort: `Stream finished: reason=error`
+   and `Stream error:` lines carry `provider=`/`model=` directly; `slot_save
+   failed` is always the local llama-server (provider `local`, model not in
+   the line); `[remote] upstream error` carries only a target URL so the
+   provider is inferred from the endpoint (e.g. `opencode.ai/zen/go` →
+   `opencode-go`, `opencode.ai/zen` → `opencode`, `api.deepseek.com` →
+   `deepseek`, `models.inference.ai.azure.com` → `github`; unknown endpoints
+   fall back to the bare hostname) and the model is unknown; `backend_retry`
+   carries neither. Undetermined values render as `-` in the report and
+   `(unknown)` in JSON. Remediation recommendations (recovery-first,
    informative-error, ctx-size pressure, 429 cooldown) are generated from
    these events and link to the relevant work items.
 8. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
    (discovered per file from the `name=Qwen3 on port <port>` spawn line;
-   the port changes on every restart). Samples are bucketed Total / Day /
-   Night via the slot schedule and summarised as median / p90 / p10 tok/s.
+   the port changes on every restart). Samples are bucketed Total / Fast /
+   Cheap via the slot schedule and summarised as median / p90 / p10 tok/s.
    Because llama-server.log lines carry no timestamps, each sample is
    bucketed by its log file's last-write time (approximate; documented in
    the report). The per-session CSV `decode_tok_s` column is derived from
@@ -178,8 +202,8 @@ run (`Previous outputs archived to …`).
 
 - **Session classification**: local-only vs fell back (local → remote) vs
   remote-only (never used local). A high remote-only share with
-  `warm_cache_bypass` reasons usually means routing thresholds are too low or
-  caches are cold.
+  `context_too_large` reasons usually means routing thresholds are too low
+  for the context sizes being routed.
 - **Fallback reasons**:
   - `local_concurrency_limit` / `local_lease_active` / `slot_exhaustion` →
     slot pool contention → raise `session_slot_pool_size` or the
@@ -189,9 +213,10 @@ run (`Previous outputs archived to …`).
     (`models.ini`), `local_large_context_*_threshold`, or
     `session_slot_max_prompt_tokens`. Related work item:
     **LP-0MSAOQTJS000FFVM** (evaluate increasing the local ctx-size).
-  - `warm_cache_bypass` → cache not warm at routing time → consider raising
-    `local_large_context_warm_cache_threshold` or improving slot-cache
-    warm-up / session affinity.
+  - `context_too_large` (legacy `warm_cache_bypass` in rotated logs) →
+    estimated context exceeds the per-slot hard cap → consider raising
+    local ctx-size (`models.ini`) or
+    `local_large_context_warm_cache_threshold`.
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
 - **Context pressure**: sessions whose max context approaches
@@ -199,18 +224,26 @@ run (`Previous outputs archived to …`).
 - **Local model utilization**: busy time is the share of the window with at
   least one local slot generating. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
-  fallback reasons), not that local is underprovisioned. `warm_cache_bypass`
-  is the largest lever: despite the name it fires when the *estimated
-  context* exceeds the effective warm-cache threshold (the per-slot clamp,
+  fallback reasons), not that local is underprovisioned. `context_too_large`
+  is the largest lever: despite the legacy name (`warm_cache_bypass`) it
+  fires when the *estimated context* exceeds the effective warm-cache
+  threshold (the per-slot clamp,
   `local_model_ctx_size // slots - headroom`, inflated by
   `token_estimate_multiplier`), so large-context sessions never reach local.
   Concurrency bursts beyond `session_slot_pool_size` show as
   `local_concurrency_limit` / `local_lease_active` fallbacks. Note the
   slots-vs-context trade-off: more slots shrink per-slot context and *raise*
   bypass volume, so do not add slots without a matching ctx-size increase.
-- **Day vs night**: a large fallback-rate gap between buckets suggests the
+- **Fast vs cheap**: a large fallback-rate gap between buckets suggests the
   slot schedule under-serves one period.
 - **Error analysis** (see the **Error analysis** section and `errors.csv`):
+  the taxonomy table counts each error type; the **Provider/model breakdown**
+  table splits each type by provider and model (e.g. a spike of
+  `Stream finished: reason=error` on `opencode-go/deepseek-v4-flash` vs
+  `local/Qwen3` pinpoints which provider/model to fix). Provider/model
+  attribution is best effort (see [How it works](#how-it-works)); values not
+  derivable from the log line show as `-` in the report and `(unknown)` in
+  `errors.json`.
   - `Stream finished: reason=error` — the client-visible synthetic error
     event (no payload). Remediation: recovery-first silent continue
     (LP-0MSDP2PDB004GV86) + informative-error fallback
@@ -227,14 +260,15 @@ run (`Previous outputs archived to …`).
 
 ## Testing
 
+Run the full suite via the test skill (canonical, cached pipeline):
+
 ```bash
-cd .pi/skills/proxy-usage-analysis
-python3 -m pytest tests -q
+/skill:test
 ```
 
 The suite covers log-line parsing, session aggregation, fallback attribution,
-day/night bucketing, recommendation rules, llama-server eval-timing parsing
-(decode + prompt eval, Qwen3 port filtering, day/night speed stats), and an
+fast/cheap bucketing, recommendation rules, llama-server eval-timing parsing
+(decode + prompt eval, Qwen3 port filtering, fast/cheap speed stats), and an
 end-to-end run, using fixtures copied from real `/var/log/llama-proxy`
 lines (`proxy.log` and `llama-server.log`).
 
@@ -247,7 +281,7 @@ lines (`proxy.log` and `llama-server.log`).
   interruption (llama-server is restarted immediately at the transition time);
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
-  window; the day/night bucket is keyed by its first in-window stream.
+  window; the fast/cheap bucket is keyed by its first in-window stream.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
   within a 1h margin of the window (see `BUSY_WINDOW_MARGIN`); a stream that
   started more than 1h before the window start is not paired, and streams
@@ -257,7 +291,7 @@ lines (`proxy.log` and `llama-server.log`).
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
 - llama-server.log eval-timing lines carry no timestamps, so the speed
-  section's window filtering and day/night split are approximate: each
+  section's window filtering and fast/cheap split are approximate: each
   sample is bucketed by its log file's last-write time. Files whose Qwen3
   child port cannot be discovered are counted and skipped (never fatal).
 - The per-session CSV `decode_tok_s` is a session-level average over the

@@ -271,6 +271,171 @@ class TestListAllSessionsLimit:
     """Tests for list_all_sessions() respecting the 15-session limit."""
 
     @pytest.mark.asyncio
+    async def test_list_all_sessions_serves_index_updates(self, tmp_path, monkeypatch):
+        """Sessions recorded via record_request appear in list_all_sessions.
+
+        Covers the shared-index contract: router_helpers writes through a
+        fresh SessionRecorder while the UI reads through its cached instance;
+        both must see the same index (LP-0MSNM90VD0030GEL).
+        """
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        await recorder.record_request(
+            "sess-api-indexed", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hello"}]},
+            model="qwen3", provider="local",
+        )
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = None
+
+        response = await list_all_sessions(request=mock_request)
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+
+        ids = [s["session_id"] for s in body["sessions"]]
+        assert "sess-api-indexed" in ids
+        assert body["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_list_all_sessions_model_filter(self, tmp_path, monkeypatch):
+        """list_all_sessions with ?model= filters via the index (LP-0MSNM90VD0030GEL)."""
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        await recorder.record_request(
+            "sess-filter-alpha", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "a"}]},
+            model="alpha", provider="local",
+        )
+        await recorder.record_request(
+            "sess-filter-beta", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "b"}]},
+            model="beta", provider="local",
+        )
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = "alpha"
+
+        response = await list_all_sessions(request=mock_request)
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+
+        ids = [s["session_id"] for s in body["sessions"]]
+        assert "sess-filter-alpha" in ids
+        assert "sess-filter-beta" not in ids
+
+    @pytest.mark.asyncio
+    async def test_list_all_sessions_warm_no_disk_reads(self, tmp_path, monkeypatch):
+        """Warm /admin/sessions serves from the index with zero file reads.
+
+        After sessions are recorded through the write path, list_all_sessions
+        must complete without reading any recording files (LP-0MSNM9BDV007DQXB
+        AC1). A Path.read_bytes spy proves no content reads occur.
+        """
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        await recorder.record_request(
+            "sess-warm-1", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "one"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_request(
+            "sess-warm-2", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "two"}]},
+            model="qwen3", provider="local",
+        )
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = None
+
+        reads = {"n": 0}
+        original_read_bytes = Path.read_bytes
+
+        def counting_read_bytes(self):
+            reads["n"] += 1
+            return original_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+
+        response = await list_all_sessions(request=mock_request)
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+
+        ids = [s["session_id"] for s in body["sessions"]]
+        assert "sess-warm-1" in ids
+        assert "sess-warm-2" in ids
+        assert body["count"] == 2
+        # Warm path: the endpoint must not read any recording files.
+        assert reads["n"] == 0, f"Warm /admin/sessions read {reads['n']} files"
+
+    @pytest.mark.asyncio
+    async def test_list_all_sessions_payload_contract(self, tmp_path, monkeypatch):
+        """Returned sessions carry the full payload contract (F4 AC2)."""
+        from proxy.session_recorder import SessionRecorder
+        from proxy.ui import list_all_sessions
+
+        rec_dir = str(tmp_path / "session-recordings")
+        recorder = SessionRecorder(recording_path=rec_dir)
+
+        await recorder.record_request(
+            "sess-payload", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hi there"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_response(
+            "sess-payload", "provider_to_client",
+            {"choices": [{"text": "Hello"}]},
+            model="qwen3", provider="local",
+        )
+
+        monkeypatch.setattr("proxy.ui._get_recorder", lambda: recorder)
+        mock_srv = MagicMock()
+        mock_srv.session_manager = MagicMock()
+        mock_srv.session_manager.list_sessions.return_value = []
+        monkeypatch.setattr("proxy.ui._srv", lambda: mock_srv)
+
+        mock_request = MagicMock()
+        mock_request.query_params.get.return_value = None
+
+        response = await list_all_sessions(request=mock_request)
+        body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+
+        s = body["sessions"][0]
+        for field in ("session_id", "response_time", "last_activity",
+                      "model", "provider", "preview_text"):
+            assert field in s, f"Missing payload field {field}"
+        assert s["model"] == "qwen3"
+        assert s["provider"] == "local"
+        assert s["preview_text"] == "Hi there"
+
+    @pytest.mark.asyncio
     async def test_list_all_sessions_limited_to_15(self, tmp_path, monkeypatch):
         """list_all_sessions returns at most 15 sessions when many exist."""
         from proxy.session_recorder import SessionRecorder

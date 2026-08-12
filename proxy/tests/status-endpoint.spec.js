@@ -10,6 +10,7 @@ test.describe('LLama Local Status Endpoint', () => {
 
     const body = await response.json();
     expect(body).toHaveProperty('active_query');
+    expect(body).toHaveProperty('local_active_query');
     expect(body).toHaveProperty('model_switch_in_progress');
     expect(body).toHaveProperty('current_model');
     expect(body).toHaveProperty('llama_server_running');
@@ -17,6 +18,7 @@ test.describe('LLama Local Status Endpoint', () => {
     expect(body).toHaveProperty('total_slots');
 
     expect(typeof body.active_query).toBe('boolean');
+    expect(typeof body.local_active_query).toBe('boolean');
     expect(typeof body.model_switch_in_progress).toBe('boolean');
     expect(typeof body.llama_server_running).toBe('boolean');
     expect(typeof body.available_slots).toBe('number');

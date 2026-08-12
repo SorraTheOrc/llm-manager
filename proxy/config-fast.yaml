@@ -1,0 +1,837 @@
+# ---------------------------------------------------------------------------
+# Model Configuration
+# ---------------------------------------------------------------------------
+# Each model can define an ordered list of `providers` for automatic
+# failover. The `providers` list replaces the old top-level `endpoint`,
+# `api_key_env`, and `headers` fields on each model entry.
+#
+# Provider entry fields:
+#   name        - Unique identifier for this provider entry
+#   type        - "local" or "remote"
+#   For remote: endpoint, api_key_env, headers (optional),
+#               provider (optional, actual provider brand name used in
+#                        X-Resolved-Model header; falls back to name)
+#   For local:  llama_model
+#
+# Failure-domain grouping (LP-0MSG45I8Q0020N1F):
+#   Provider entries that share the same normalized endpoint form a SINGLE
+#   failure domain and are treated as one unit during mid-stream re-route /
+#   fallback resolution. When one entry of a gateway stalls or terminally
+#   fails, the chain skips every other entry on the same endpoint for the
+#   remainder of that request, hopping straight to the first entry of a
+#   different gateway. Entries on different endpoints are never grouped
+#   (e.g. https://opencode.ai/zen and https://opencode.ai/zen/go are distinct
+#   failure domains). Local / no-endpoint entries key on the `provider` brand
+#   (falling back to the entry name). Per-entry cooldowns and the ordered
+#   chain are unchanged; this grouping is per-request only (cross-request
+#   quarantine remains with the Tier-3 stall circuit breaker).
+#
+# Timed access (optional, both local and remote):
+#   available_times - List of "HH:MM-HH:MM" windows (24-hour, **UTC**)
+#                     during which this provider may be used. A provider
+#                     whose current UTC time is outside all its windows is
+#                     skipped during fallback resolution, exactly like a
+#                     provider in cooldown; it becomes eligible again when a
+#                     window reopens. Windows are end-exclusive and overnight
+#                     ranges (e.g. "22:00-02:00") wrap past midnight.
+#                     Omit the field (or use an empty list) to leave a
+#                     provider unrestricted. Malformed entries are logged and
+#                     ignored (fail-open). The deepseek-v4-flash provider is
+#                     currently timed to off-peak UTC windows (see its entries).
+#                     Example:
+#                       - name: deepseek-v4-flash
+#                         type: remote
+#                         endpoint: https://api.deepseek.com
+#                         api_key_env: DEEPSEEK_API_KEY
+#                         model: deepseek-v4-flash
+#                         available_times: ["10:00-12:00", "14:00-16:00"]
+#
+# Example with providers list:
+#   mimo-v2.5:
+#     providers:
+#       - name: remote-primary
+#         type: remote
+#         endpoint: https://api.provider-a.com/v1
+#         api_key_env: PROVIDER_A_KEY
+#       - name: remote-fallback
+#         type: remote
+#         endpoint: https://api.provider-b.com/v1
+#         api_key_env: PROVIDER_B_KEY
+#     aliases:
+#       - mimo*
+#
+# Custom system prompts per model/alias:
+# Each model entry may include a `system_prompt` object to configure
+# a default system prompt that is injected into requests targeting
+# the model or any of its aliases.
+#
+#   assistant-model:
+#     type: local
+#     aliases: ["assistant", "asst"]
+#     llama_model: gemma4
+#     system_prompt:
+#       mode: "prepend"   # "override" or "prepend" (required)
+#       file: "proxy/prompts/assistant.txt"  # path relative to repo root
+#
+# Prompt resolution precedence (first match wins):
+#   1) Local override:   .sorraAgents/prompts/<alias>.txt
+#   2) Repo default:     <system_prompt.file> resolved against repo root
+#   3) No prompt if none present
+#
+# See proxy/MODEL_ADD.md for the full guide.
+# ---------------------------------------------------------------------------
+
+default_model: code
+# default_remote is commented out: the openai provider was removed (LP-0MQNQUR7K005GDP6).
+# default_remote:
+#   api_key_env: OPENAI_API_KEY
+#   enabled: false
+#   endpoint: https://api.openai.com/v1
+
+# Optional named provider endpoints (e.g., Tailscale based host mapping)
+providers:
+  Proxy:
+    host: "http://100.79.231.101:8000"
+    type: local
+
+logging:
+  directory: /var/log/llama-proxy
+  level: INFO
+  retention_days: 90
+  rotation_hours: 6
+  # Verbose per-chunk SSE logging (LP-0MS9GAN2P002NR4M).
+  # When false (default), STREAM CHUNK lines are logged at DEBUG level and
+  # are not written to proxy.log at the default INFO level, cutting log
+  # volume by >99% over a 24h window.
+  # Set to true (or start with `--verbose` / LLAMA_PROXY_VERBOSE=1) to write
+  # per-chunk SSE data to proxy.log for debugging stream issues.
+  verbose_chunks: false
+
+# ---------------------------------------------------------------------------
+# Session Recording
+# ---------------------------------------------------------------------------
+# Records raw client-proxy-provider message payloads to disk for later
+# debugging, auditing, and analysis. Recording is always-on and uses
+# non-blocking file writes (asyncio background tasks).
+#
+# Fields:
+#   path: Directory where recordings are stored.
+#         Default: proxy/session-recordings/
+session_recording:
+  path: proxy/session-recordings/
+  # Maximum entries in the in-memory session metadata index (LP-0MSNKMZCP003T8OG).
+  max_index_entries: 1000
+  # Cold-start scan bound: rebuild from at most this many most-recent dirs.
+  cold_scan_dir_limit: 50
+
+# ---------------------------------------------------------------------------
+# Audit model configuration
+# ---------------------------------------------------------------------------
+# The audit skill (skill/audit/) uses these settings to determine which
+# model to call for audit operations. The resolver maps short names to
+# provider-prefixed model IDs (e.g., ``deepseek-v4-flash-free`` →
+# ``opencode/deepseek-v4-flash-free``).
+#
+# Canonical model IDs (discovered via ``pi --list-models``):
+#   opencode/deepseek-v4-flash-free
+#   opencode-go/deepseek-v4-flash
+#   openrouter/openrouter/free
+#
+# See proxy/provider_resolver.py for the full mapping table.
+audit_model: "deepseek-v4-flash-free"
+audit_model_fallbacks:
+  - "openrouter/free"
+  - "deepseek-v4-flash"
+
+models:
+  embed:
+    providers:
+      - name: local-embed
+        type: local
+        llama_model: mxbai-embed
+    aliases:
+    - embeddings
+    - embed
+  github:
+    providers:
+      - name: github-primary
+        type: remote
+        provider: github
+        endpoint: https://models.inference.ai.azure.com
+    aliases:
+    - github-*
+  # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, OpenCode Go #2, then DeepSeek direct.
+  # Slot exhaustion on the local model falls through to remote tiers.
+  # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
+  plan:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    aliases:
+    - plan*
+    force_full_prompt: true
+    # Native tokenizer for exact routing/persistence token estimates
+    # (LP-0MSEQ71IF0003FRT); replaces the server-level
+    # token_estimate_multiplier heuristic for this model.
+    tokenizer: qwen3
+
+  author:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: opencode-mimo-v2.5-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: mimo-v2.5-free
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    aliases:
+    - author
+    force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
+
+  code:
+    providers:
+      - name: local-qwen3-next
+        type: local
+        llama_model: Qwen3
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    aliases:
+    - code
+    force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
+server:
+  embeddings_model: mxbai-embed
+  host: 0.0.0.0
+  # Fallback to host start is not permitted in production. This flag is
+  # reserved for temporary developer troubleshooting only and must not be
+  # committed in infra-managed production deployments.
+  # For this environment we allow host-start so the proxy can spawn the
+  # podman-backed container via the host start script wrapper.
+  llama_allow_host_fallback: true
+  llama_embed_load_timeout: 30
+  # Router model-health monitoring cadence (seconds).
+  # Preferred key (used by backend health loop):
+  llama_model_health_interval_seconds: 10
+  # Legacy alias retained for compatibility with older configs.
+  llama_health_check_interval: 10
+  # Reduce false-positive unload/reload churn under transient probe failures.
+  llama_model_health_failures_before_recovery: 2
+  llama_model_health_probe_attempts: 2
+  llama_model_health_probe_timeout_seconds: 5
+  llama_model_health_probe_backoff_seconds: 0.5
+  llama_model_health_grace_period_seconds: 15
+  # --- GPU-wedge self-healing (LP-0MS91DHQ9003EGB0) ---
+  # A wedged llama-server is still HTTP-reachable but its GPU kernels never
+  # complete (GPU ~100% busy with all slots idle, no tokens produced). The
+  # model-health loop detects this signature and unloads/reloads the model.
+  # Detection reads gpu_busy_percent from sysfs (AMD) with a rocm-smi
+  # fallback; when neither is available detection is skipped.
+  #
+  # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
+  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is pinned at 100% regardless
+  # of actual GPU state (30/30 samples read 100 while power draw showed the
+  # GPU idle at ~54W vs ~115W when computing). The busy+idle signature
+  # therefore false-positives on every idle period, causing constant
+  # unload/reload churn (144 unloads in one day, killing in-flight requests).
+  # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle
+  # power) is indistinguishable from normal idle from GPU sensors, so the
+  # busy counter cannot be trusted. Enable only on hardware with a reliable
+  # busy counter; the power-draw discriminator below reduces false positives
+  # and auto-disables detection when the counter is found pinned.
+  llama_gpu_wedge_detection_enabled: false
+  # GPU busy % at or above which the GPU is considered busy.
+  llama_gpu_wedge_busy_threshold_percent: 90
+  # Consecutive health-loop checks with the wedge signature before recovery.
+  # With the default 10s interval, 2 checks bounds detection to ~20-30s.
+  llama_gpu_wedge_idle_checks_required: 2
+  # Power draw (W) below which the GPU is considered NOT genuinely computing.
+  # busy>=threshold + idle slots + power below this = pinned/unreliable busy
+  # counter (or stalled engine) -> never unloads; detection auto-disables if
+  # this state persists for llama_gpu_wedge_pinned_checks_required checks.
+  llama_gpu_wedge_power_low_threshold_watts: 90
+  # Consecutive pinned-counter observations (busy high + idle + low power)
+  # before GPU-wedge detection is disabled for the process lifetime.
+  llama_gpu_wedge_pinned_checks_required: 4
+  llama_model_load_timeout: 600
+  llama_models_max: 2
+  llama_request_timeout: 1500
+  # Provider fallback cooldown: seconds to wait before retrying a failed provider
+  provider_cooldown_seconds: 60
+  # Chain-hold retry (LP-0MSH94Z7K007VKC9): when EVERY provider in a model's
+  # fallback chain is exhausted, hold the request for chain_hold_seconds
+  # (default 300) instead of erroring immediately, then start a NEW cycle from
+  # the FIRST provider — giving short cooldowns (60s provider cooldown, 180s
+  # stall circuit breaker, available_times window edges) time to expire.
+  #   - Streaming requests receive periodic SSE feedback comments
+  #     (`: chain exhausted (...); retrying from <first> in <Ns>`) so clients
+  #     can surface live progress (companion item SA-0MSHAKSEA001LQ6T).
+  #   - Non-streaming requests are held silently (deferred response).
+  #   - A client disconnect aborts the hold promptly.
+  #   - 0 disables the wait (retries immediately).
+  chain_hold_seconds: 300
+  # Maximum number of hold-retry cycles before returning the exhaustion error
+  # response unchanged. 0 = infinite (keep holding/retrying until the client
+  # disconnects).
+  chain_hold_max_cycles: 3
+  # Local slot-exhaustion grace retries before remote fallback.
+  # Helps right-after-restart races where slot probes briefly report 0 available.
+  local_slot_exhaustion_retry_attempts: 1
+  local_slot_exhaustion_retry_delay_seconds: 0.1
+  # Adaptive timeout: base + per_token * prompt_tokens
+  llama_adaptive_timeout_enabled: true
+  llama_adaptive_timeout_base_seconds: 60
+  llama_adaptive_timeout_per_token_seconds: 0.015
+  # Remote-specific adaptive timeout overrides (optional).
+  # When set, these values are used instead of the local adaptive timeout
+  # parameters for remote provider requests. Remote providers may have
+  # different latency characteristics requiring shorter timeouts.
+  # Falls back to the local values above when not configured.
+  llama_remote_request_timeout_base_seconds: 60
+  llama_remote_request_timeout_per_token_seconds: 0.015
+  # Large-context cold-cache fallback threshold (LP-0MRCSSBTM002NK3B).
+  # When the slot cache is cold (invalidated) and estimated prompt tokens exceed
+  # this value, local routing is bypassed and the request falls through to the
+  # next remote provider immediately. Set to 0 to disable.
+  #
+  # This is an ECONOMIC new-token threshold, not a physical capacity limit. It
+  # defines the lower edge of the (cold, warm] band where the cached_ratio
+  # routing check operates (new_tokens = estimated * (1 - ratio) > cold).
+  # It must stay BELOW the effective warm threshold (per-slot context cap,
+  # see LP-0MSAZXXDY005AWA1) or the band collapses to zero width and the
+  # ratio check becomes unreachable dead code (LP-0MSI2M5BT004BCDP).
+  #
+  # CAVEAT (ctx-size eval F2/F3, LP-0MSAOQTJS000FFVM): prompt token estimates
+  # use tiktoken (cl100k), which undercounts Qwen3-native tokens ~1.69x for
+  # dense prose. A prompt can pass this clamp yet exceed the KV slot at decode
+  # time -> llama-server HTTP 400 -> remote fallback. See docs/llama-router.md
+  # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
+  # tokenizer).
+  local_large_context_cold_cache_threshold: 30000
+
+  # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
+  # When the slot cache is warm (cached prefix) but estimated prompt tokens
+  # exceed this value, local routing is bypassed to avoid GPU prefill contention
+  # on very large contexts. Set to 0 to disable. Default: 60000.
+  #
+  # This is a HARD PHYSICAL CAPACITY LIMIT: it is clamped to the actual
+  # per-slot context (local_model_ctx_size / active_slots, minus output
+  # headroom, LP-0MSAZXXDY005AWA1) so prompts that cannot fit the KV slot are
+  # never routed local. Unlike the cold threshold it is NOT an economic
+  # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
+  local_large_context_warm_cache_threshold: 100000
+
+  # Total context size of the local model (across ALL slots). Must match the
+  # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
+  # ctx-size = 131072). Used to compute the actual per-slot context
+  # (ctx_size / active_slots) which clamps the large-context routing
+  # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
+  #
+  # Option C (3x43.7K = 131072/3, pool 3, schedule 3/3) restored per
+  # LP-0MSEGPO77005CYCQ F4: the ctx-size evaluation (LP-0MSAOQTJS000FFVM)
+  # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
+  # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
+  local_model_ctx_size: 131072
+  # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
+  # When a session's estimated context reaches this fraction of the
+  # effective per-slot context (ctx_size / slots - 4096 headroom), the
+  # proxy logs a context_pressure WARNING suggesting session compaction.
+  # KV reads scale linearly with context, so sessions at ~80% of the
+  # per-slot limit decode far slower than short sessions. 0 disables.
+  context_pressure_warn_ratio: 0.8
+
+  # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
+  # Startup validation that computes the effective per-slot large-context
+  # routing threshold (local_model_ctx_size // slots - 4096 output headroom,
+  # mirroring provider.py) for the static session_slot_pool_size AND every
+  # slot_schedule entry. When the threshold falls below
+  # min_local_routing_threshold (default 10000), a WARNING is logged at
+  # startup. A threshold this small means every realistic agent session
+  # exceeds the clamp, silently bypassing ALL local traffic to remote
+  # (the 2026-08-02 failure mode, LP-0MSAOJTJS000FFVM). Set to 0 to disable
+  # the minimum check.
+  #
+  # Set min_local_routing_threshold_fatal: true to make startup FAIL (raise)
+  # instead of warning when the threshold is below the minimum.
+  min_local_routing_threshold: 10000
+  min_local_routing_threshold_fatal: false
+  llama_router_mode: true
+  max_concurrent_queries: 16
+  # Local-model concurrency limit (LP-0MR5MAJNM005R905).
+  # Limits concurrent requests to local providers. Remote providers
+  # continue to use max_concurrent_queries. When this limit is reached,
+  # requests with fallback providers skip to the next provider immediately.
+  #
+  # NOTE: This value is now derived from `session_slot_pool_size` by default.
+  # The `local_max_concurrent_queries` key is preserved for explicit override
+  # only. In normal operation, change `session_slot_pool_size` to control the
+  # number of parallel dispatch leases.
+  local_max_concurrent_queries: 1
+  # Local dispatch lease timeout in seconds.
+  # An idle session holds an inactive lease for this duration after its
+  # last request completes, preventing other sessions from acquiring the
+  # local backend.  The lease is released when the timeout expires,
+  # allowing other sessions to use the local backend.
+  #
+  # local_dispatch_lease_per_token_seconds: Additional lease time (seconds)
+  #   added per estimated prompt token for large-context requests, reused from
+  #   llama_adaptive_timeout_per_token_seconds (0.015) if not explicitly set.
+  #   This prevents mid-stream lease expiry during cache prefill.
+  #   Applied to BOTH explicit and anonymous/non-explicit sessions
+  #   (LP-0MSEHMMBK0062ZPI) so large anonymous prefills hold their lease for
+  #   the full prefill duration instead of the base 60s.
+  # local_dispatch_lease_max_seconds: Hard upper bound for the adaptive lease
+  #   timeout, defaults to 1500 (same as default llama_request_timeout).
+  # local_dispatch_lease_prefill_poll_seconds: During the prefill phase of an
+  #   explicit-session request (dispatched, no stream data chunks yet), the proxy
+  #   polls llama-server for observed prefill progress (per-slot n_past /
+  #   n_prompt_tokens_processed from /slots, falling back to kv_cache_tokens) and
+  #   extends the dispatch lease while progress is advancing, so very large
+  #   prefills beyond the adaptive cap (1500s) keep their lease. Cadence in
+  #   seconds; 0 disables progress-based extension entirely (LP-0MSE05J53004C6EL).
+  # local_dispatch_lease_prefill_buffer_seconds: Safety buffer added to the lease
+  #   expiry after each observed prefill progress advance. Must comfortably exceed
+  #   the dispatch cleanup-loop cadence (~10s) so a refresh cannot lose to cleanup.
+  #   Default 30.
+  # Reduced from 180s to 60s to prevent long cross-session blocking, then
+  # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
+  # events) showed 100% of denies caused by idle lease holders, never GPU
+  # saturation (active>=3: 0). Inter-turn reclaim gaps: median 0.2s, p90 0.7s,
+  # p95 1.6s — well under 15s. Deny-avoidance simulation: T=15 avoids ~1/3 of
+  # denies (~9% model error). Prefill protection is preserved: the adaptive
+  # lease (60 + tokens x 0.015, cap 1500s) and prefill-progress extension apply
+  # to the in-flight request; only the post-stream cooldown (fixed base) shrinks.
+  local_dispatch_lease_timeout_seconds: 15
+  session_single_flight_mode: queue
+  session_single_flight_max_queue_depth: 1
+  # Session single-flight queue timeout (LP-0MS14PM88007NNUJ).
+  # When a session has an active in-flight request and mode is "queue",
+  # subsequent requests wait for this duration before being rejected.
+  # Prevents stuck requests from starving subsequent requests indefinitely.
+  # Default: 120 seconds.
+  session_single_flight_queue_timeout_seconds: 120
+  # Directory for KV-cache slot snapshots written by slot save/restore
+  # (llama-server prompt_save/prompt_load). Must be writable by the proxy
+  # user; retention is handled by scripts/cleanup-slot-cache.sh.
+  session_slot_save_path: /home/rgardler/projects/llm/slot-cache
+  # Number of parallel sessions (GPU contexts) for local dispatch.
+  # Controls how many concurrent Pi agent sessions can hold dispatch leases
+  # and process requests through the local llama-server simultaneously.
+  #
+  # MUST match llama-server's --parallel / -np flag passed in start-llama.sh.
+  # Mismatch causes slot exhaustion or restore failures:
+  #   - pool_size < --parallel → some server slots go unused
+  #   - pool_size > --parallel → sessions map to slot IDs that do not exist
+  # The start script reads LLAMA_PARALLEL env var (set by lifecycle from this
+  # value) to automatically keep them aligned.
+  #
+  # The dispatch lease system (``_try_acquire_local_dispatch``) allows up to N
+  # concurrent sessions, where N = session_slot_pool_size. When a session holds
+  # an active or inactive (post-request cooldown) lease, its slot is reserved.
+  # Other sessions are blocked only when all N slots are occupied.
+  #
+  #
+  # Server restart required to change this value (no hot reload).
+  # Option C (3 slots) restored per LP-0MSEGPO77005CYCQ F4.
+  session_slot_pool_size: 3
+
+  # Per-mode contention policy (LP-0MSORQVK50012Q4D): fast mode keeps today's
+  # fallback behavior — slot contention falls back to the next remote
+  # provider immediately (no queueing). Cheap mode (config-cheap.yaml)
+  # declares ``queue`` with caps.
+  contention_queue_policy: fallback
+
+  # -----------------------------------------------------------------------
+  # Slot schedule (LP-0MRXZU90M007WNWT)
+  # -----------------------------------------------------------------------
+  # Time-based slot count scheduling. When enabled, the proxy automatically
+  # varies the number of concurrent slots (``--parallel N``) based on the
+  # time of day. Transitions apply immediately: at the scheduled time the
+  # proxy restarts llama-server with the new slot count. There is NO drain
+  # window and no 503 rejection period (LP-0MSF9RUSQ007M346); in-flight
+  # requests are terminated by the restart and clients retry.
+  #
+  # Disabled by default (no schedule → static slot count from
+  # ``session_slot_pool_size`` above).
+  #
+  # Fields:
+  #   enabled:        Set to true to activate scheduling.
+  #   drain_minutes:  DEPRECATED — parsed for backward compatibility but
+  #                   IGNORED. Transitions no longer have a drain window.
+  #   entries:        List of transition rules. Each entry has:
+  #     time:         "HH:MM" format (24-hour). The time at which the new
+  #                   slot count becomes active.
+  #     slots:        The ``--parallel N`` value to apply from this time
+  #                   onward until the next entry.
+  #     ctx_size:     OPTIONAL per-period total context (llama-server
+  #                   ``--ctx-size``) while this entry is active; overrides
+  #                   the global ``local_model_ctx_size`` below
+  #                   (LP-0MSLNK96T0018W4D).
+  #
+  # Time-based slot count transitions (LP-0MSF9RUSQ007M346).
+  #
+  # Each entry maps a time-of-day to a slot count. Entries may also carry
+  # an optional per-period ctx_size (LP-0MSLNK96T0018W4D): the total
+  # context across all slots (llama-server --ctx-size) while that entry is
+  # active, overriding the global local_model_ctx_size below. When absent,
+  # the global local_model_ctx_size applies. The routing clamp and
+  # session_slot_max_prompt_tokens derive per-slot thresholds from the
+  # ACTIVE period's (ctx_size, slots) — keep clamp × slots <= the real
+  # rounded n_ctx (llama.cpp pads n_ctx_seq up to 256).
+  #
+  # Example:
+  #   slot_schedule:
+  #     enabled: true
+  #     drain_minutes: 3  # DEPRECATED — ignored
+  #     entries:
+  #       - time: "10:00"
+  #         slots: 3
+  #       - time: "23:59"
+  #         slots: 2
+  #         ctx_size: 262144
+  #
+  # Entries with the same slot count as the current value are skipped
+  # (no unnecessary restart) UNLESS the per-period ctx_size differs.
+  # Midnight wrapping is supported.
+  # Fast mode stays 3 slots @ 131072 total ctx (per-slot ~43.7K) — the
+  # 3x87.4K per-slot variant was rejected NO-GO (LP-0MSAOQTJS000FFVM /
+  # LP-0MSEGPO77005CYCQ). The explicit ctx_size: 131072 pins below ensure a
+  # future models.ini [Qwen3] ctx-size raise (the model max is 262144) cannot
+  # leak into fast mode: the slot-scheduler only applies per-period ctx via a
+  # transition/catch-up restart, and static local_model_ctx_size (131072)
+  # matches these entries so fast boots correct from the shared base.
+  slot_schedule:
+    enabled: true
+    drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
+    entries:
+      - time: "23:59"
+        slots: 3
+        ctx_size: 131072
+      - time: "10:00"
+        slots: 3
+        ctx_size: 131072
+  # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
+  # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
+  # times. A manual API switch (POST /admin/set-mode) overrides the schedule
+  # until the next scheduled transition (LP-0MSMF25V9002AY1J). The active
+  # entry is the most
+  # recent one at or before the current time (circular wrap, so the last
+  # entry covers 00:00-00:59). Set enabled: false to disable; an absent
+  # section uses this same built-in schedule.
+  mode_schedule:
+    enabled: true
+    entries:
+      - time: "01:00"
+        mode: cheap
+      - time: "10:00"
+        mode: fast
+
+
+  # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
+  # The effective timeout is base + session_slot_timeout_per_token_seconds x
+  # estimated tokens, capped at session_slot_max_timeout_seconds (adaptive
+  # scaling defined below). 3.0s covers small-context saves; larger contexts
+  # get headroom from the per-token coefficient.
+  session_slot_timeout_seconds: 3.0
+  # --- Slot persistence safeguards (LP-0MS91DHPZ001VWQO) ---
+  # Skip slot save/restore when the request context exceeds this many
+  # estimated tokens. llama-server serializes the whole KV cache on save,
+  # so large contexts ReadTimeout and can wedge the GPU.
+  #
+  # DYNAMIC DERIVATION (LP-0MSEGPO77005CYCQ F3, amended AC2): when this key
+  # is absent or 0, the cap is derived from the effective per-slot clamp
+  # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
+  # source as the routing clamp (effective_per_slot_threshold in provider.py)
+  # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
+  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
+  # freezing at a static value. Set to a non-zero value to use an explicit
+  # static override.
+  # 0 = dynamic derivation (current live config).
+  session_slot_max_prompt_tokens: 0
+  # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
+  # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
+  # 0 disables the add-on (fixed timeout only).
+  #
+  # F3 rebalance (LP-0MSI1RWLM007N367): coefficient 0.001 -> 0.0015 so
+  # mid-size contexts get a bit more headroom; the cap stays 60s to preserve
+  # the no-wedge invariant (the circuit breaker still trips within a bounded
+  # window for genuinely stalled saves). The load-aware gate below is the
+  # primary fix; this rebalance is belt-and-braces.
+  session_slot_timeout_per_token_seconds: 0.0015
+  session_slot_max_timeout_seconds: 60
+  # Load-aware save/restore gating (LP-0MSI1RWLM007N367 F3): skip slot
+  # save/restore when ANOTHER local session is actively streaming. llama-server
+  # serializes each KV-cache copy behind its slot work, so saves issued under
+  # concurrent load exceed the adaptive timeout (ReadTimeout at ~1.8% of saves
+  # under load). The busy signal is proxy-side dispatch-lease state (no
+  # llama-server calls); the requesting session's own lease is excluded.
+  # Enabled explicitly here (the deployed config turns the gate on). Set to
+  # false to disable it.
+  session_slot_skip_when_busy: true
+  # Circuit breaker: after this many consecutive save/restore failures for
+  # a slot, stop issuing persistence calls for that slot until the cooldown
+  # expires. Prevents piling doomed KV-cache copies onto a wedged GPU.
+  session_slot_max_consecutive_failures: 3
+  session_slot_failure_cooldown_seconds: 300
+  slot_unavailable_retry_after: 5
+  session_guardrail_max_runtime_seconds: 1800
+  session_guardrail_max_completion_tokens: 16384
+  session_guardrail_repetition_min_pattern_chars: 64
+  session_guardrail_repetition_min_repeats: 10
+  session_guardrail_invalidate_on_cutoff: true
+  session_guardrail_invalidate_on_repetition: false
+  # Token-rate guardrail settings (disabled by default)
+  # Maximum tokens/second threshold. Set to 0 to disable token-rate guardrail.
+  # Per-chunk read timeout for SSE streaming (LP-0MRB29HJ1009OR6G).
+  # When the upstream stops sending data without emitting a [DONE] event
+  # or closing the connection, the proxy waits this long for the next
+  # chunk before synthesising a final finish_reason:stop event and ending
+  # the stream.  Increased from 30 to 120 for local Qwen3 reasoning models
+  # which can have long pauses during complex reasoning (LP-0MS14PM7J003XPS8).
+  # Default: 120 seconds.
+  stream_idle_timeout_seconds: 120
+
+  # Upstream stall idle timeout (LP-0MRE52D3C001KP1H).
+  # When the remote upstream stops sending data mid-stream without closing
+  # the connection or sending a finish_reason, the proxy waits this long
+  # for the next chunk before detecting a stall, closing the connection,
+  # and retrying with bounded exponential backoff.
+  # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
+  # Raised from 30s to 120s to tolerate long reasoning pauses from remote
+  # reasoning models (e.g. opencode-go/deepseek-v4-flash on large contexts)
+  # which can pause >30s between chunks while still being alive
+  # (LP-0MS9FR9LG002AJ4C). Matches the local stream_idle_timeout_seconds
+  # (120s) used for Qwen3 reasoning pauses (LP-0MS14PM7J003XPS8).
+  # Since retries now only occur while zero content has been delivered, a
+  # genuinely dead upstream fails fast once content starts flowing.
+  # Raised from 120 to 240s (LP-0MSF5I7XN009ENWQ / LP-0MSF1PUM90099ZSW F4):
+  # opencode-go/deepseek-v4-flash frequently pause >120s mid-generation while
+  # still alive, so the lower bound produced false stalls (~31% of requests).
+  # Trade-off: true failures are detected more slowly (up to 240s of silence).
+  # The stall-gap distribution analysis (LP-0MSF5IAXE005BG33) will refine this.
+  # Default: 240 seconds.
+  upstream_idle_timeout_seconds: 240
+
+  # Cross-request stall circuit breaker (LP-0MRFEXXVC001RYKB).
+  # Tracks stall frequency per provider within a sliding time window.
+  # When the stall count exceeds the threshold within the window, the
+  # provider is marked unavailable for the cooldown duration, causing
+  # subsequent requests to skip directly to the next provider.
+  #
+  # This is Tier 3 of the retry system (complementing Tier 1 per-stream
+  # retries and Tier 2 provider cooldown). All keys are optional; defaults
+  # apply silently when absent.
+  # Sliding window duration in seconds. Stalls older than this are ignored.
+  upstream_stall_window_seconds: 300
+  # Stall count threshold within window before triggering cooldown.
+  upstream_stall_threshold: 3
+  # Cooldown duration in seconds for providers exceeding threshold.
+  upstream_stall_cooldown_seconds: 180
+
+  # Upstream retry connection timeout (LP-0MRE8FYKV008WOTB).
+  # When the proxy retries a stalled upstream connection, this timeout
+  # controls how long to wait for the retry connection to be established.
+  # Decoupled from upstream_idle_timeout_seconds so operators can tune
+  # retry connection timeouts independently (typically shorter).
+  # Default: 30 seconds.
+  upstream_retry_connect_timeout_seconds: 30
+
+  # Remote HTTP client configuration (LP-0MRE8G3JK0099Y4J).
+  # Controls connection pooling and timeouts for remote upstream requests.
+  # The shared pool replaces per-request httpx.AsyncClient() creation.
+  remote_http_client:
+    # Connection-level timeout for establishing new connections.
+    connect_timeout_seconds: 30
+    # Read timeout for the entire response (generous to not interfere
+    # with per-request adaptive timeouts).
+    read_timeout_seconds: 300
+    # Maximum number of connections in the pool.
+    pool_connections: 50
+    # Maximum number of keepalive connections to maintain.
+    pool_keepalive_connections: 10
+    # Time in seconds before an idle keepalive connection is closed.
+    keepalive_seconds: 60
+
+  # Upstream retry configuration (LP-0MRE8G94H005ZBLV).
+  # Controls per-stream retry behavior for remote upstream connections.
+  # Aligned with Pi's default retry settings (maxRetries=3, maxRetryDelayMs=60000).
+  # Note: these are per-stream retries; after they exhaust, the provider-level
+  # cooldown in provider.py applies separately.
+  upstream_retry_max_attempts: 3
+  upstream_retry_base_delay_seconds: 2.0
+  upstream_retry_max_delay_seconds: 60.0
+
+  # Upstream request-level timeout (LP-0MRF77A0E0026B9T).
+  # How long to wait for the initial HTTP response from the upstream provider.
+  # Prevents 15+ minute silent hangs when the upstream is slow to respond or
+  # silently returns empty content. This is different from the per-chunk idle
+  # timeout (upstream_idle_timeout_seconds) which detects mid-stream stalls.
+  # Default: 120 seconds.
+  upstream_request_timeout_seconds: 120
+
+  # Empty-response retry configuration (LP-0MRF77A0E0026B9T).
+  # When an upstream returns a complete but semantically empty response
+  # (no content, stopReason: stop, total_tokens: 0), retry with the same
+  # model up to this many additional attempts before falling through to
+  # the next provider in the fallback chain.
+  # Default: 1 retry (1 additional attempt).
+  upstream_empty_retry_max_attempts: 1
+  # Base delay (in seconds) before retrying on empty response.
+  # Default: 2.0 seconds.
+  upstream_empty_retry_base_delay_seconds: 2.0
+
+  # Heartbeat interval (in seconds) for SSE streaming.
+  # During idle periods (e.g. long pre-fill on large prompts), the proxy
+  # emits {"type":"heartbeat"} events every N seconds to keep the client
+  # connection alive and prevent client-side timeouts.  Default: 10.
+  stream_heartbeat_interval_seconds: 10
+  session_guardrail_max_token_rate: 0
+  # Rolling window duration in seconds for token-rate calculation.
+  # The guardrail only triggers if the rate exceeds max_token_rate for the
+  # entire window duration (sustained violation, not a spike).
+  session_guardrail_token_rate_window_seconds: 5
+  session_require_restore_signal: false
+  backend_retry_attempts: 8
+  backend_retry_base_delay_seconds: 0.25
+  backend_retry_max_delay_seconds: 2.0
+  backend_retry_jitter_ratio: 0.25
+  llama_watchdog_interval_seconds: 5
+  llama_backend_probe_timeout_seconds: 2
+  llama_self_heal_max_attempts: 3
+  llama_self_heal_window_seconds: 300
+  llama_self_heal_backoff_base_seconds: 1
+  llama_self_heal_retry_after_seconds: 30
+  llama_router_preload:
+  - embeddings
+  - code
+  llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
+  llama_server_port: 8080
+  # Must be an absolute path or a script resolvable from PATH.
+  # The host-based start-llama.sh is at the project root.
+  llama_start_script: start-llama.sh
+  llama_startup_timeout: 300
+  port: 8000
+
+  # -----------------------------------------------------------------------
+  # TTS (Text-to-Speech) server configuration
+  # -----------------------------------------------------------------------
+  # Host and port for the qwentts.cpp TTS server.
+  tts_server_host: localhost
+  tts_server_port: 8081
+  # Path to the tts-server binary start script.
+  tts_start_script: proxy/scripts/start-qwentts.sh
+  # Talker LM GGUF model path. When unset, auto-detected from qwentts.cpp/models/.
+  tts_model_path: ""
+  # Codec (tokenizer) GGUF model path. When unset, auto-detected from qwentts.cpp/models/.
+  tts_codec_path: ""
+  # Set to false to skip TTS server startup entirely.
+  tts_enabled: true
+  # Timeout in seconds for TTS server requests. Default: 30.
+  tts_timeout_seconds: 30
+
+  # -----------------------------------------------------------------------
+  # TTS self-healing configuration
+  # -----------------------------------------------------------------------
+  # Maximum number of restart attempts within the time window.
+  tts_self_heal_max_attempts: 3
+  # Time window in seconds for counting restart attempts.
+  tts_self_heal_window_seconds: 120
+  # Interval in seconds between TTS health checks.
+  tts_self_heal_interval_seconds: 10
+  # Timeout in seconds for TTS health probe requests.
+  tts_self_heal_probe_timeout_seconds: 3

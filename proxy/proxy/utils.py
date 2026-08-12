@@ -430,12 +430,18 @@ def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dic
 # ===================================================================
 
 def load_config(config_path: str | None = None) -> dict:
-    """Load configuration from YAML file."""
+    """Load configuration from YAML file.
+
+    When *config_path* is ``None`` the active config is resolved by
+    ``proxy.mode.resolve_config_path()``: ``LLAMA_PROXY_CONFIG`` env var if
+    set (start-proxy.sh exports it from the persisted mode), else the
+    mode-selected profile (``config-fast.yaml`` / ``config-cheap.yaml``),
+    else ``proxy/config.yaml`` (default/fallback).
+    """
     if config_path is None:
-        config_path = os.environ.get(
-            "LLAMA_PROXY_CONFIG",
-            str(Path(__file__).parent.parent / "config.yaml")
-        )
+        from proxy.mode import resolve_config_path
+
+        config_path = str(resolve_config_path())
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)

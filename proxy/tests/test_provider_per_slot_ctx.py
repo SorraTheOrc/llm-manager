@@ -190,3 +190,103 @@ class TestColdWarmBandReachable:
         assert _should_skip_local(
             "Qwen3", "band_sess2", body, cold, warm_cache_threshold=warm
         ) is True
+
+
+class TestGetActiveLocalCtxSize:
+    """Per-period ctx_size resolution (LP-0MSLNK96T0018W4D)."""
+
+    def test_falls_back_to_config(self):
+        """No live scheduler → static local_model_ctx_size from config."""
+        from proxy.provider import _get_active_local_ctx_size
+
+        config = {"server": {"local_model_ctx_size": 131072}}
+        assert _get_active_local_ctx_size(config) == 131072
+
+    def test_flat_config(self):
+        from proxy.provider import _get_active_local_ctx_size
+
+        config = {"local_model_ctx_size": 262144}
+        assert _get_active_local_ctx_size(config) == 262144
+
+    def test_zero_when_unset(self):
+        from proxy.provider import _get_active_local_ctx_size
+
+        assert _get_active_local_ctx_size({"server": {}}) == 0
+
+    def test_scheduler_override_wins(self, monkeypatch):
+        """When the live scheduler exposes a per-period ctx_size it wins."""
+        from proxy.provider import _get_active_local_ctx_size
+
+        config = {"server": {"local_model_ctx_size": 131072}}
+        sched = type("S", (), {"get_active_ctx_size": lambda self, now=None: 262144})()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        assert _get_active_local_ctx_size(config) == 262144
+
+    def test_scheduler_none_falls_back(self, monkeypatch):
+        """A scheduler with no per-period ctx falls back to config."""
+        from proxy.provider import _get_active_local_ctx_size
+
+        config = {"server": {"local_model_ctx_size": 131072}}
+        sched = type("S", (), {"get_active_ctx_size": lambda self, now=None: None})()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        assert _get_active_local_ctx_size(config) == 131072
+
+
+class TestEffectiveLargeContextThresholdsPerPeriod:
+    """Thresholds must use the ACTIVE period's (ctx_size, slots)
+    (LP-0MSLNK96T0018W4D)."""
+
+    def test_night_period_2slots_262144(self, monkeypatch):
+        """Night: 2 slots @ 262144 → per-slot cap 126,976."""
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 60000,
+            "local_large_context_warm_cache_threshold": 200000,
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,
+        }}
+        sched = type(
+            "S",
+            (),
+            {
+                "get_active_ctx_size": lambda self, now=None: 262144,
+                "get_active_slot": lambda self, now=None: 2,
+            },
+        )()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        cold, warm = _effective_large_context_thresholds(config)
+        # 262144 // 2 - 4096 = 126976 → warm clamped down to the per-slot cap.
+        assert warm == 126976
+        assert cold == 60000  # cold stays as the economic threshold
+
+    def test_day_period_3slots_131072(self, monkeypatch):
+        """Day: 3 slots @ 131072 → per-slot cap 39,594."""
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 60000,
+            "local_large_context_warm_cache_threshold": 200000,
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 3,
+        }}
+        sched = type(
+            "S",
+            (),
+            {
+                "get_active_ctx_size": lambda self, now=None: None,
+                "get_active_slot": lambda self, now=None: 3,
+            },
+        )()
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        cold, warm = _effective_large_context_thresholds(config)
+        # 131072 // 3 - 4096 = 39594
+        assert warm == 39594

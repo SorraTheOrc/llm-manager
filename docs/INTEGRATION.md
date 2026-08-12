@@ -76,12 +76,22 @@ For live GPU offload verification steps, see `docs/gpu-offload-verification.md`.
 ## Running all tests
 
 ```bash
+# All project tests via the canonical cached pipeline (preferred)
+/skill:test
+
 # All proxy tests (includes mocked integration tests)
 python3 -m pytest proxy/tests/ -v
 
 # All project tests (build scripts + proxy)
 python3 -m pytest tests/ proxy/tests/ -v
 ```
+
+The `/skill:test` invocation is the canonical, **cached** runner: it executes
+the full suite in quiet mode (`pytest -q -r a --disable-warnings`) and caches
+results per git state (2-hour TTL, git-state fingerprint) so a green run at an
+unchanged commit is reused instead of re-executed. The direct `python3 -m
+pytest` commands below it bypass the cache and are documented for targeted
+runs only.
 
 ## On-demand live-server tests (opt-in, disabled by default)
 

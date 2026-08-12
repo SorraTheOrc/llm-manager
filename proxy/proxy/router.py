@@ -13,11 +13,14 @@ Functions in this module:
 
 import asyncio
 import json
+import logging
 import time
 
 import httpx
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+
+logger = logging.getLogger("llama-proxy.router")
 
 
 # Lazy server import — avoids circular imports when server.py imports us
@@ -68,11 +71,13 @@ from proxy.utils import (  # noqa: E402
 
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
+    _apply_queue_wait_to_timeout,
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _call_with_backend_retries,
     _call_with_empty_retry,
     _check_slot_availability,
+    _client_identity_extra,
     _compute_request_timeout,
     _decrement_active_queries,
     _decrement_local_active_queries,
@@ -120,6 +125,80 @@ def _get_local_max_concurrent_queries(server_config: dict) -> int:
         return max(1, int(val or 1))
     except (ValueError, TypeError):
         return 1
+
+
+def _get_contention_queue_config(server_config: dict) -> dict:
+    """
+    Resolve the per-mode contention-queue policy and caps with sane clamps.
+
+    Returns a dict with keys:
+      - ``policy``: "queue" or "fallback" (absent keys default to fallback,
+        fast-mode behavior)
+      - ``max_wait_seconds``: clamped to [1, session_guardrail_max_runtime_seconds]
+      - ``max_depth``: clamped to [1, 16]
+
+    Invalid values are logged and clamped, never crash (LP-0MSORQVK50012Q4D
+    F2 AC3/AC4). The policy applies during cheap operating mode only (the
+    caller gates on proxy.mode.read_mode() == "cheap").
+    """
+    policy = str(
+        server_config.get("contention_queue_policy", "fallback") or "fallback"
+    ).strip().lower()
+    if policy not in ("queue", "fallback"):
+        logger.warning(
+            "Invalid contention_queue_policy=%r — coercing to 'fallback' "
+            "(valid: queue, fallback)",
+            server_config.get("contention_queue_policy"),
+        )
+        policy = "fallback"
+    # Wait cap: [1, session_guardrail_max_runtime_seconds]
+    try:
+        max_runtime = int(
+            server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid session_guardrail_max_runtime_seconds=%r — using default 1800",
+            server_config.get("session_guardrail_max_runtime_seconds"),
+        )
+        max_runtime = 1800
+    raw_wait = server_config.get("contention_queue_max_wait_seconds", 60)
+    try:
+        wait = float(raw_wait) if raw_wait is not None else 60.0
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_max_wait_seconds=%r — using default 60",
+            raw_wait,
+        )
+        wait = 60.0
+    max_wait_seconds = max(1.0, min(wait, float(max(1, max_runtime))))
+    if max_wait_seconds != wait:
+        logger.warning(
+            "contention_queue_max_wait_seconds=%r clamped to %s "
+            "(bounds [1, session_guardrail_max_runtime_seconds=%s])",
+            raw_wait, max_wait_seconds, max_runtime,
+        )
+    # Depth cap: [1, 16]
+    raw_depth = server_config.get("contention_queue_max_depth", 4)
+    try:
+        depth = int(raw_depth) if raw_depth is not None else 4
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_max_depth=%r — using default 4",
+            raw_depth,
+        )
+        depth = 4
+    max_depth = max(1, min(depth, 16))
+    if max_depth != depth:
+        logger.warning(
+            "contention_queue_max_depth=%r clamped to %s (bounds [1, 16])",
+            raw_depth, max_depth,
+        )
+    return {
+        "policy": policy,
+        "max_wait_seconds": max_wait_seconds,
+        "max_depth": max_depth,
+    }
 
 
 def _get_local_active_count(srv) -> int:
@@ -411,6 +490,7 @@ async def _cleanup_after_request(
     decrement_local: bool = True,
     session_explicit: bool = False,
     model_name: str | None = None,
+    request: Request | None = None,
 ) -> None:
     """Decrement active query counters and clean up dispatch records.
 
@@ -429,6 +509,10 @@ async def _cleanup_after_request(
 
     When *model_name* is provided, the per-model active query counter
     is also decremented.
+
+    When *request* is provided, ``lease_released`` log events carry the
+    caller's client identity (``client_ip`` / ``client_port``) for poller
+    attribution (LP-0MSKV3IEQ004ZV88).
     """
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
@@ -453,6 +537,7 @@ async def _cleanup_after_request(
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
                                     session_id[:8] if session_id else "unknown",
+                                    extra=_client_identity_extra(request),
                                 )
                             except Exception:
                                 pass
@@ -472,6 +557,7 @@ async def _cleanup_after_request(
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
                                 session_id[:8] if session_id else "unknown",
+                                extra=_client_identity_extra(request),
                             )
                         except Exception:
                             pass
@@ -754,6 +840,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
     # Compute request timeout (adaptive if enabled)
     request_timeout = _compute_request_timeout(server_config, body_json)
+    # Contention-queue wait subtracts from the client-visible adaptive
+    # timeout budget (Q2=a, LP-0MSORQVK50012Q4D): total (wait + serve) stays
+    # within llama_adaptive_timeout_* so clients never see queue wait + serve
+    # exceed the adaptive envelope. provider.py sets this attribute when a
+    # queued request wins a slot.
+    _queue_wait = float(getattr(request, "_contention_queue_wait_seconds", 0.0) or 0.0)
+    if _queue_wait > 0:
+        request_timeout = _apply_queue_wait_to_timeout(request_timeout, _queue_wait)
 
     if is_streaming:
         session_guard = session_single_flight_coordinator.acquire(
@@ -817,6 +911,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
+                            request=request,
                         )
                         try:
                             await client.aclose()
@@ -875,6 +970,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
+                            request=request,
                         )
                         return Response(
                             content=body_bytes,
@@ -1450,6 +1546,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 decrement_local=True,
                                 session_explicit=session_explicit,
                                 model_name=model_name,
+                                request=request,
                             )
 
                     return StreamingResponse(
@@ -1463,6 +1560,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 srv, session_id,
                 decrement_local=False,
                 model_name=model_name,
+                request=request,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:
@@ -1628,11 +1726,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             srv, session_id,
                             decrement_local=True,
                             session_explicit=session_explicit,
+                            request=request,
                         )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=True,
+                request=request,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:

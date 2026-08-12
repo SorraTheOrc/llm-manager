@@ -20,6 +20,9 @@ timestamp) so files can be inspected individually without external context.
 import asyncio
 import json
 import logging
+import re
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,42 @@ DEFAULT_RECORDING_PATH = "proxy/session-recordings/"
 # hundreds of stale sessions.
 MAX_SESSION_DROPDOWN_COUNT = 15
 
+# Maximum number of entries kept in the shared metadata index per recording
+# path. Bounds memory usage of the index; when exceeded the least-recently-
+# active session is evicted (LP-0MSNM94A1006WAOJ). Configurable via
+# ``session_recording.max_index_entries`` in config.yaml.
+DEFAULT_MAX_INDEX_ENTRIES = 1000
+
+# Maximum number of session directories visited by a cold-start scan when
+# the in-memory metadata index is empty. Bounds worst-case scan cost so a
+# cold /admin/sessions call never re-reads the full recordings tree
+# (LP-0MSNKMZCP003T8OG).
+COLD_SCAN_DIR_LIMIT = 50
+
+# ---------------------------------------------------------------------------
+# Shared metadata index (module-level, keyed by recording path)
+# ---------------------------------------------------------------------------
+#
+# The write path (proxy/router_helpers.py) constructs a fresh SessionRecorder
+# for every request batch, while the UI reads through a cached instance
+# (proxy/ui.py ``_get_recorder``). A per-instance index would therefore be
+# invisible to the UI. The index is shared at module level, keyed by the
+# recording path, so writes and reads observe the same state.
+#
+# Entry shape matches ``_extract_session_preview`` output:
+#     session_id, response_time, last_activity, model, provider, preview_text
+_SHARED_INDEX: dict[str, dict[str, dict[str, Any]]] = {}
+_SHARED_INDEX_LOCK = threading.RLock()
+
+# Recording paths whose shared index has already been warmed (populated via
+# write updates or a cold scan). Guards against re-scanning on every call.
+_INDEX_WARM_PATHS: set[str] = set()
+
+# Observability counters for the shared index, keyed by recording path
+# (LP-0MSNM9IAC000GVXT).
+_INDEX_OBS: dict[str, dict[str, Any]] = {}
+_OBS_LOCK = threading.RLock()
+
 # ---------------------------------------------------------------------------
 # SessionRecorder
 # ---------------------------------------------------------------------------
@@ -60,15 +99,34 @@ class SessionRecorder:
             directory. Defaults to ``proxy/session-recordings/``.
     """
 
-    def __init__(self, recording_path: str = DEFAULT_RECORDING_PATH):
+    def __init__(
+        self,
+        recording_path: str = DEFAULT_RECORDING_PATH,
+        max_index_entries: int = DEFAULT_MAX_INDEX_ENTRIES,
+        cold_scan_dir_limit: int = COLD_SCAN_DIR_LIMIT,
+    ):
         """Initialize the recorder and ensure the recording directory exists.
 
         Args:
             recording_path: Filesystem path for storing recordings.
                 Created automatically if it does not exist.
+            max_index_entries: Maximum number of entries in the shared
+                metadata index for this recording path. Oldest sessions are
+                evicted when the index exceeds this size.
+            cold_scan_dir_limit: Maximum number of session directories
+                visited by the cold-start scan when the index is empty.
         """
         # Strip trailing slash for consistent path matching
         self.recording_path = recording_path.rstrip("/")
+        self.max_index_entries = max_index_entries
+        self.cold_scan_dir_limit = cold_scan_dir_limit
+
+        # Shared metadata index for this recording path (module-level, so
+        # writer instances and the UI's cached instance see the same state).
+        with _SHARED_INDEX_LOCK:
+            self._index = _SHARED_INDEX.setdefault(
+                self.recording_path, {}
+            )
 
         # Ensure the root directory exists
         try:
@@ -99,7 +157,21 @@ class SessionRecorder:
         """
         sr_cfg = config.get("session_recording", {}) if isinstance(config, dict) else {}
         path = sr_cfg.get("path", default_path) if isinstance(sr_cfg, dict) else default_path
-        return cls(recording_path=path)
+        max_entries = (
+            sr_cfg.get("max_index_entries", DEFAULT_MAX_INDEX_ENTRIES)
+            if isinstance(sr_cfg, dict)
+            else DEFAULT_MAX_INDEX_ENTRIES
+        )
+        cold_scan_limit = (
+            sr_cfg.get("cold_scan_dir_limit", COLD_SCAN_DIR_LIMIT)
+            if isinstance(sr_cfg, dict)
+            else COLD_SCAN_DIR_LIMIT
+        )
+        return cls(
+            recording_path=path,
+            max_index_entries=max_entries,
+            cold_scan_dir_limit=cold_scan_limit,
+        )
 
     # ------------------------------------------------------------------
     # Recording methods
@@ -233,12 +305,294 @@ class SessionRecorder:
             )
             return None
 
+        # Update the shared metadata index so list_sessions* can serve the
+        # session without re-reading the recordings tree (LP-0MSNM90VD0030GEL).
+        self._update_index(
+            session_id, direction, timestamp, payload, model, provider,
+        )
+
         return str(filepath)
 
     @staticmethod
     def _write_file(path: Path, data: bytes) -> None:
         """Synchronous file write — runs in a thread pool executor."""
         path.write_bytes(data)
+
+    # ------------------------------------------------------------------
+    # Metadata index (shared, per recording path)
+    # ------------------------------------------------------------------
+
+    def _update_index(
+        self,
+        session_id: str,
+        direction: str,
+        timestamp: str,
+        payload: Any,
+        model: str | None,
+        provider: str | None,
+    ) -> None:
+        """Update the shared metadata index after a successful write.
+
+        Entry fields mirror ``_extract_session_preview``: session_id,
+        response_time (first provider_to_client response), last_activity
+        (latest recording), model/provider (first non-None seen), and
+        preview_text (first client_to_proxy user message).
+        """
+        with _SHARED_INDEX_LOCK:
+            entry = self._index.get(session_id)
+            if entry is None:
+                entry = {
+                    "session_id": session_id,
+                    "response_time": "",
+                    "last_activity": "",
+                    "model": None,
+                    "provider": None,
+                    "preview_text": "",
+                }
+                self._index[session_id] = entry
+
+            # last_activity = latest recording timestamp
+            if not entry["last_activity"] or timestamp > entry["last_activity"]:
+                entry["last_activity"] = timestamp
+
+            # response_time = first provider_to_client response
+            if direction == DIR_PROVIDER_TO_CLIENT and not entry["response_time"]:
+                entry["response_time"] = timestamp
+
+            # model/provider: first non-None value wins
+            if model and not entry["model"]:
+                entry["model"] = model
+            if provider and not entry["provider"]:
+                entry["provider"] = provider
+
+            # preview_text: first client_to_proxy user message
+            if direction == DIR_CLIENT_TO_PROXY and not entry["preview_text"]:
+                raw = self._extract_message_text(payload)
+                entry["preview_text"] = (
+                    self._truncate_preview(raw) if raw else ""
+                )
+
+            self._evict_oldest_if_over_cap()
+
+    def _evict_oldest_if_over_cap(self) -> None:
+        """Drop the least-recently-active sessions when the index exceeds cap.
+
+        Caller must hold ``_SHARED_INDEX_LOCK``. Keeps the index bounded so
+        memory usage does not grow with the full recordings tree.
+        """
+        while len(self._index) > self.max_index_entries:
+            oldest_sid = min(
+                self._index,
+                key=lambda sid: (
+                    self._index[sid].get("last_activity")
+                    or self._index[sid].get("response_time")
+                    or ""
+                ),
+            )
+            del self._index[oldest_sid]
+
+    def get_index_entry(self, session_id: str) -> dict[str, Any] | None:
+        """Return a copy of the shared index entry for *session_id*.
+
+        Returns None if the session has no index entry yet.
+        """
+        with _SHARED_INDEX_LOCK:
+            entry = self._index.get(session_id)
+            return dict(entry) if entry is not None else None
+
+    def get_all_index_entries(self) -> list[dict[str, Any]]:
+        """Return copies of all shared index entries for this recording path.
+
+        Useful for tests and observability to inspect the full (unbounded by
+        the dropdown cap) index contents.
+        """
+        with _SHARED_INDEX_LOCK:
+            return [dict(e) for e in self._index.values()]
+
+    def _ensure_index_warm(self) -> None:
+        """Populate the shared index via a bounded cold scan if not yet warm.
+
+        Runs at most once per recording path (per process). Uses only the
+        ``cold_scan_dir_limit`` most-recent session directories so a cold
+        start never re-reads the full recordings tree.
+        """
+        with _SHARED_INDEX_LOCK:
+            if self.recording_path in _INDEX_WARM_PATHS:
+                self._record_index_hit()
+                return
+            # An index already populated by write-path updates is warm — do
+            # not re-scan the recordings tree (LP-0MSNM9BDV007DQXB AC1).
+            if self._index:
+                _INDEX_WARM_PATHS.add(self.recording_path)
+                self._record_index_hit()
+                return
+            start = time.monotonic()
+            self._rebuild_index_from_scan()
+            duration = time.monotonic() - start
+            _INDEX_WARM_PATHS.add(self.recording_path)
+            self._record_cold_scan(duration)
+
+    def _record_index_hit(self) -> None:
+        """Count a list_sessions* call served from the warm index."""
+        with _OBS_LOCK:
+            obs = _INDEX_OBS.setdefault(self.recording_path, {
+                "index_size": 0,
+                "index_hits": 0,
+                "cold_scans": 0,
+                "last_scan_duration_seconds": 0.0,
+            })
+            obs["index_hits"] += 1
+
+    def _record_cold_scan(self, duration: float) -> None:
+        """Count a cold-scan fallback and record its duration."""
+        with _OBS_LOCK:
+            obs = _INDEX_OBS.setdefault(self.recording_path, {
+                "index_size": 0,
+                "index_hits": 0,
+                "cold_scans": 0,
+                "last_scan_duration_seconds": 0.0,
+            })
+            obs["cold_scans"] += 1
+            obs["last_scan_duration_seconds"] = duration
+
+    def get_index_observability(self) -> dict[str, Any]:
+        """Return index observability counters for this recording path.
+
+        Fields: index_size, index_hits, cold_scans,
+        last_scan_duration_seconds. Read-only snapshot; no behaviour change.
+        """
+        with _OBS_LOCK:
+            obs = _INDEX_OBS.get(self.recording_path, {
+                "index_size": 0,
+                "index_hits": 0,
+                "cold_scans": 0,
+                "last_scan_duration_seconds": 0.0,
+            })
+            result = dict(obs)
+        with _SHARED_INDEX_LOCK:
+            result["index_size"] = len(self._index)
+        return result
+
+    def _rebuild_index_from_scan(self) -> None:
+        """Cold-start scan: visit the newest cold_scan_dir_limit dirs only.
+
+        Uses the bounded per-dir extractor so each visited dir costs at most
+        a couple of small file reads regardless of how many recordings the
+        dir holds (LP-0MSNM97PA000XA0M).
+        """
+        base = Path(self.recording_path)
+        if not base.is_dir():
+            return
+        try:
+            dirs = [d for d in base.iterdir() if d.is_dir()]
+        except OSError:
+            return
+        # Newest first by directory mtime
+        dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        for d in dirs[: self.cold_scan_dir_limit]:
+            preview = self._extract_session_preview_bounded(d)
+            if preview is not None:
+                self._index[preview["session_id"]] = preview
+        self._evict_oldest_if_over_cap()
+
+    # Filename pattern for recorder files: ``<iso-timestamp>-request.json``
+    # / ``<iso-timestamp>-response.json``. The leading ISO timestamp lets us
+    # derive last_activity without reading file contents.
+    _FILENAME_TS_RE = re.compile(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2})?)"
+    )
+
+    def _extract_session_preview_bounded(self, session_dir: Path) -> dict[str, Any] | None:
+        """Extract session preview reading at most two recording files.
+
+        Bounded variant of ``_extract_session_preview`` for the cold-start
+        scan: a session dir may hold hundreds of files (large sessions are
+        multi-GB), so reading every file is exactly the disk-thrash the index
+        is meant to avoid. Instead:
+
+        - ``last_activity`` is derived from the newest **filename** timestamp
+          (no content read);
+        - ``response_time``/model/provider come from the earliest response
+          file (read once);
+        - ``preview_text`` comes from the earliest request file (read once).
+
+        Returns the same preview dict shape as ``_extract_session_preview``,
+        or None when the directory has no valid recording files.
+        """
+        sid = session_dir.name
+        try:
+            files = sorted(
+                f for f in session_dir.iterdir()
+                if f.is_file() and f.name.endswith(".json")
+            )
+        except OSError:
+            return None
+        if not files:
+            return None
+
+        # Derive last_activity from the newest filename timestamp.
+        last_activity = ""
+        for f in files:
+            m = self._FILENAME_TS_RE.match(f.name)
+            if m and m.group(1) > last_activity:
+                last_activity = m.group(1)
+
+        # Earliest request file → preview_text (client_to_proxy payload).
+        req_file = next(
+            (f for f in files if f.name.endswith("-request.json")), None
+        )
+        preview_text = ""
+        first_req_payload: Any = None
+        if req_file is not None:
+            try:
+                req_content = json.loads(req_file.read_bytes())
+            except (json.JSONDecodeError, OSError):
+                req_content = None
+            if isinstance(req_content, dict):
+                first_req_payload = req_content.get("payload")
+                if not last_activity:
+                    last_activity = req_content.get("timestamp", "")
+
+        # Earliest response file → response_time, model, provider.
+        resp_file = next(
+            (f for f in files if f.name.endswith("-response.json")), None
+        )
+        response_time = ""
+        model: Any = None
+        provider: Any = None
+        if resp_file is not None:
+            try:
+                resp_content = json.loads(resp_file.read_bytes())
+            except (json.JSONDecodeError, OSError):
+                resp_content = None
+            if isinstance(resp_content, dict):
+                response_time = resp_content.get("timestamp", "")
+                model = resp_content.get("model")
+                provider = resp_content.get("provider")
+
+        # Fall back to request metadata when no response file exists.
+        if resp_file is None and isinstance(req_content, dict):
+            response_time = req_content.get("timestamp", "")
+            model = req_content.get("model")
+            provider = req_content.get("provider")
+
+        if not last_activity:
+            last_activity = response_time
+        if not last_activity:
+            return None
+
+        if first_req_payload is not None:
+            raw_text = self._extract_message_text(first_req_payload)
+            preview_text = self._truncate_preview(raw_text) if raw_text else ""
+
+        return {
+            "session_id": sid,
+            "response_time": response_time or "",
+            "last_activity": last_activity,
+            "model": model,
+            "provider": provider,
+            "preview_text": preview_text,
+        }
 
     # ------------------------------------------------------------------
     # Query / retrieval methods
@@ -456,8 +810,9 @@ class SessionRecorder:
     def list_sessions_by_model(self, model: str) -> list[dict[str, Any]]:
         """Return session IDs that have recordings for a specific model.
 
-        Scans session directories and returns preview data (first response
-        timestamp, model, provider) for each session matching the model.
+        Serves from the shared metadata index (warmed lazily via a bounded
+        cold scan), so repeated calls do not re-read the recordings tree
+        (LP-0MSNKMZCP003T8OG).
 
         When no recordings with matching model metadata are found (e.g.
         recordings from before the model enrichment field was added), falls
@@ -473,77 +828,48 @@ class SessionRecorder:
         if not model:
             return []
 
-        base = Path(self.recording_path)
-        if not base.is_dir():
-            return []
+        self._ensure_index_warm()
 
-        model_sessions: list[dict[str, Any]] = []
-        all_sessions: list[dict[str, Any]] = []
-        try:
-            for entry in sorted(base.iterdir()):
-                if not entry.is_dir():
-                    continue
-                preview = self._extract_session_preview(entry)
-                if preview is None:
-                    continue
-                if preview.get("model") == model:
-                    model_sessions.append(preview)
-                else:
-                    # Check if any recording in this session matches the model
-                    found_model = False
-                    for f in entry.iterdir():
-                        if not f.is_file() or not f.name.endswith(".json"):
-                            continue
-                        try:
-                            content = json.loads(f.read_bytes())
-                            if content.get("model") == model:
-                                found_model = True
-                                break
-                        except (json.JSONDecodeError, OSError):
-                            continue
-                    if found_model:
-                        model_sessions.append(preview)
-                    elif preview.get("response_time"):
-                        all_sessions.append(preview)
-        except OSError as e:
-            logger.warning("Failed to list sessions by model %s: %s", model, e)
-            return []
+        with _SHARED_INDEX_LOCK:
+            entries = list(self._index.values())
 
-        # Prefer model-enriched sessions over unattributed ones
+        model_sessions = [e for e in entries if e.get("model") == model]
         if model_sessions:
-            model_sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
+            model_sessions.sort(
+                key=lambda s: s.get("last_activity") or s.get("response_time") or "",
+                reverse=True,
+            )
             return model_sessions
 
         # Fall back to all sessions when no model metadata exists yet
-        all_sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
+        all_sessions = [e for e in entries if e.get("response_time")]
+        all_sessions.sort(
+            key=lambda s: s.get("last_activity") or s.get("response_time") or "",
+            reverse=True,
+        )
         return all_sessions
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """Return all session IDs that have recording directories.
 
+        Serves from the shared metadata index, warmed lazily via a bounded
+        cold scan when the index is empty (proxy restart / externally
+        written recordings). Repeated calls perform zero recording-file
+        reads (LP-0MSNKMZCP003T8OG).
+
         Returns a list of dicts with ``session_id``, ``response_time``,
-        ``model``, and ``provider``, sorted by most recent activity.
+        ``model``, and ``provider``, sorted by most recent activity and
+        capped at ``MAX_SESSION_DROPDOWN_COUNT``.
         """
-        base = Path(self.recording_path)
-        if not base.is_dir():
-            return []
+        self._ensure_index_warm()
 
-        sessions: list[dict[str, Any]] = []
-        try:
-            for entry in sorted(base.iterdir()):
-                if not entry.is_dir():
-                    continue
-                preview = self._extract_session_preview(entry)
-                if preview is not None:
-                    sessions.append(preview)
-        except OSError as e:
-            logger.warning(
-                "Failed to list sessions in %s: %s",
-                self.recording_path, e,
-            )
-            return []
+        with _SHARED_INDEX_LOCK:
+            sessions = list(self._index.values())
 
-        sessions.sort(key=lambda s: s.get("last_activity", s["response_time"]), reverse=True)
+        sessions.sort(
+            key=lambda s: s.get("last_activity") or s.get("response_time") or "",
+            reverse=True,
+        )
         return sessions[:MAX_SESSION_DROPDOWN_COUNT]
 
     @staticmethod

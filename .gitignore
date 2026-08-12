@@ -34,6 +34,10 @@ ds4/
 # Session recordings — runtime artifacts
 proxy/session-recordings/
 
+# Operating-mode state file (fast/cheap) — runtime state, not committed
+proxy/.mode
+proxy/.mode.override-until
+
 
 bundles/
 logs/
@@ -47,3 +51,6 @@ qwentts.cpp/models/
 # Generated benchmark/test artifacts (not source)
 benchmark-results/
 test-results/
+
+# implement.py runtime state (was accidentally tracked; never commit)
+.implement_state.json

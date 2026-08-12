@@ -46,6 +46,7 @@ class _DummyRequest:
 def reset_cooldown_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
     yield
 
 

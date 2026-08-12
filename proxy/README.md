@@ -14,9 +14,10 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Client Disconnect Detection**: Automatically detects client disconnections during streaming, cancels in-flight backend processing, releases scheduler slots, removes queued jobs, and maintains accurate `active_queries` counters
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
+- **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
 - **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
-- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens
+- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view.
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
 
@@ -54,15 +55,15 @@ The body preview automatically filters out messages with `role: "system"` to pre
 ### Usage analysis (proxy-usage-analysis skill)
 
 The `proxy-usage-analysis` skill turns the last 24h of proxy logs into
-per-session daytime/nighttime CSVs and a Markdown report with data-backed
+per-session fast/cheap CSVs and a Markdown report with data-backed
 configuration recommendations (fallback reasons, slot contention, context
-pressure, day/night comparison). It parses the structured INFO lines the
+pressure, fast/cheap comparison). It parses the structured INFO lines the
 proxy emits — `Stream started`/`Stream finished` (with authoritative
 `tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
 
 To run it, invoke the skill (`/skill:proxy-usage-analysis`); it writes
-`~/proxy-usage-reports/{daytime_sessions,nighttime_sessions}.csv` and
+`~/proxy-usage-reports/{fast_sessions,cheap_sessions}.csv` and
 `~/proxy-usage-reports/report.md` by default (override with `--output-dir`).
 Operators can instead call the underlying script directly:
 
@@ -74,9 +75,9 @@ python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 ```
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
-`daytime_sessions.csv`, `nighttime_sessions.csv`
-(one row per session; day/night split derived from the `slot_schedule` in
-`config.yaml`), and `report.md` (aggregates + recommendations). Existing
+`fast_sessions.csv`, `cheap_sessions.csv`
+(one row per session; fast/cheap split derived from the `slot_schedule` in
+the active config profile), and `report.md` (aggregates + recommendations). Existing
 outputs are archived into a dated subdirectory before each run overwrites
 them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
 runs the report daily at 05:00 (see SKILL.md).
@@ -817,11 +818,91 @@ By default, the endpoint returns only the first 200 characters of content
 mode is enabled. Without debug mode, the endpoint is accessible only from
 localhost (127.0.0.1).
 
+### Operating modes (fast / cheap)
+
+The proxy runs in one of two operator-selected operating modes:
+
+- **fast** — cloud-backed: remote providers are eligible and requests can
+  fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
+  3-slot pool).
+- **cheap** — 1-slot local pool with the same models/provider chains as
+  fast: remote providers (including paid tiers) stay enabled and are used
+  when local slots are exhausted (`proxy/config-cheap.yaml`,
+  LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
+  local slot pool (1 vs 3).
+
+The active mode is persisted in `proxy/.mode` (gitignored runtime state);
+when absent the mode defaults to **fast** (current behavior). The mode
+survives restarts: `scripts/start-proxy.sh` reads the persisted mode at
+startup, selects the matching config profile, and exports
+`LLAMA_PROXY_CONFIG` so the server and API-key resolution use the same
+profile.
+
+Switch modes from the web UI (Admin Endpoints card) or via the admin API:
+
+```bash
+# Query the current mode
+curl http://localhost:8000/admin/mode
+# -> {"mode": "fast"}
+
+# Switch to cheap mode (persists the mode, then restarts the proxy)
+curl -X POST http://localhost:8000/admin/set-mode \
+  -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
+```
+
+Requesting the mode that is already active is a noop (no restart).
+Switching to a different mode persists the new mode and triggers a **full
+proxy restart** in the background — the endpoint responds before the
+restart kills the process. In-flight requests are terminated and clients
+retry (same semantics as slot-schedule transitions). A second switch while
+a restart is pending is a noop if the mode matches, otherwise rejected with
+`409` (avoids restart loops).
+
+### Automatic mode schedule
+
+By default the proxy **enforces a time-of-day schedule** (local server
+time):
+
+- **cheap** from `01:00` until `10:00`
+- **fast** from `10:00` until `01:00` (i.e. 10:00 through midnight, plus
+  00:00–00:59)
+
+A background scheduler checks every 30s (and immediately at startup). A
+**manual API switch** (or UI switch through `set-mode`) is respected until
+the **next scheduled transition** instead of being reverted on the next
+tick: e.g. switching to `fast` at 02:00 (scheduled cheap) keeps the proxy
+in fast until 10:00, even across restarts/reboots. The override expiry is
+persisted in `proxy/.mode.override-until` (gitignored runtime state) and is
+computed from the `mode_schedule` at switch time. Once the next scheduled
+transition passes, the schedule reasserts control (the timer applies the
+scheduled mode through the normal `set-mode` path — persist + background
+restart). With `enabled: false` or a schedule that never changes mode, a
+manual switch persists until the next API call. A switch in progress
+(pending restart) is left alone and retried on the next check.
+
+The schedule is configured in the `mode_schedule` section of the active
+config profile (same section in `config.yaml` / `config-fast.yaml` /
+`config-cheap.yaml`):
+
+```yaml
+mode_schedule:
+  enabled: true
+  entries:
+    - time: "01:00"
+      mode: cheap
+    - time: "10:00"
+      mode: fast
+```
+
+Set `enabled: false` to disable the timer; an absent section uses the
+built-in schedule above. Entries follow the same "most recent time at or
+before now, wrapping circularly" rule as `slot_schedule`.
+
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `LLAMA_PROXY_CONFIG` | Path to config file (default: `./config.yaml`) |
+| `LLAMA_PROXY_CONFIG` | Path to config file. When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml` (default fallback: `./config.yaml`) |
 | `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
 | `LLAMA_START_SCRIPT` | Override the start script path |
 | `OPENAI_API_KEY` | API key for OpenAI |
@@ -1184,6 +1265,7 @@ Response:
 ```json
 {
   "active_query": false,
+  "local_active_query": false,
   "model_switch_in_progress": false,
   "current_model": "qwen3",
   "llama_server_running": true,
@@ -1197,6 +1279,7 @@ Response:
 | Field                     | Type          | Description                                                                 |
 |---------------------------|---------------|-----------------------------------------------------------------------------|
 | `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
+| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight (remote provider streams are excluded — LP-0MSL2ZLLS009RVKR). |
 | `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
 | `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
@@ -1348,6 +1431,27 @@ curl -X POST http://localhost:8000/admin/reload-config
 curl -X POST http://localhost:8000/admin/switch-model/qwen2.5
 ```
 
+#### Current Mode
+```bash
+curl http://localhost:8000/admin/mode
+```
+Returns the currently persisted operating mode:
+```json
+{"mode": "fast"}
+```
+
+#### Set Mode (fast / cheap)
+```bash
+curl -X POST http://localhost:8000/admin/set-mode \
+  -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
+```
+Switches the proxy between **fast** (cloud-backed) and **cheap**
+(1-slot local pool, same models as fast — remote providers enabled)
+operating modes. Requesting the active mode is a noop; a
+different mode is persisted (survives restarts) and triggers a full proxy
+restart in the background. Invalid modes return `400`; a switch while a
+restart is pending returns `409` when the mode differs.
+
 #### Stop LLama Server
 ```bash
 curl -X POST http://localhost:8000/admin/stop-server
@@ -1423,6 +1527,67 @@ The proxy logs client disconnect events at INFO level with the session ID and sl
 ```
 client_disconnect session=<session_id> slot=<slot_id>
 ```
+
+In addition to per-stream detection, a background **disconnect reaper** cancels
+non-streaming in-flight requests whose client disconnected mid-request, so
+abandoned connections do not accumulate server-side CLOSE-WAIT sockets
+(LP-0MSNM9UCC002CHYU). Idle keep-alive sockets are closed via
+`server.timeout_keep_alive` (default 5s).
+
+
+## Session Recordings
+
+Raw client↔proxy↔provider traffic is recorded to disk for debugging and
+analysis (see [Session-Based Incremental Ingestion](#session-based-incremental-ingestion)
+for the related cache feature). Recordings are organised per session:
+
+```
+<recording-path>/
+    <session-id>/
+        <timestamp>-request.json
+        <timestamp>-proxy_to_provider-request.json
+        <timestamp>-response.json
+```
+
+### Session list is index-backed and bounded
+
+The `/admin/sessions` endpoint (web UI session dropdown) is served from an
+**in-memory metadata index** — it does **not** re-scan the recordings tree on
+every call (LP-0MSNKMZCP003T8OG). Behaviour:
+
+- **Warm reads**: after recordings are written, `list_sessions()` and
+  `list_sessions_by_model()` serve from the shared index with **zero file
+  reads**. The index is shared between the write path and the UI so both see
+  the same state.
+- **Bounded cold start**: after a proxy restart the index is rebuilt lazily
+  on the first request, visiting only the **N most-recent session dirs** by
+  directory mtime (`server.session_recording.cold_scan_dir_limit`, default
+  `50`) and reading at most two small files per dir. `last_activity` is
+  derived from filename timestamps. The full recordings tree is never
+  re-read.
+- **15-session cap**: the endpoint returns at most the 15 most-recent
+  sessions (`MAX_SESSION_DROPDOWN_COUNT`), matching the UI dropdown.
+- **Bounded index size**: the index keeps at most
+  `server.session_recording.max_index_entries` entries (default `1000`); the
+  least-recently-active sessions are evicted when the cap is exceeded.
+
+### Observability
+
+`GET /admin/metrics` returns an `index_observability` block:
+
+```json
+"index_observability": {
+  "index_size": 3,
+  "index_hits": 1234,
+  "cold_scans": 1,
+  "last_scan_duration_seconds": 0.012
+}
+```
+
+- `index_hits` — list requests served from the warm index (zero disk reads).
+- `cold_scans` — list requests that triggered a bounded cold-start scan.
+- `last_scan_duration_seconds` — duration of the most recent cold scan.
+- `index_size` — current number of entries in the shared index.
 
 ## Session-Based Incremental Ingestion
 
@@ -2002,6 +2167,39 @@ tail -f /var/log/llama-proxy/llama-server.log
 # Systemd journal
 journalctl -u llama-proxy -f
 ```
+
+### Web UI: per-slot log view (`/logs`)
+
+The logs page opens on the **Slots** tab, which renders one live log section per
+**active slot** (a slot is active while it is processing or still carries a
+mapped dispatch session — recently finished generations stay inspectable until
+the session ends). Each section has a header (slot id, session id, status) and a
+live log pane streaming that slot's relevant lines from both `proxy.log` and
+`llama-server.log` (lines carry a `proxy`/`llama` source badge). Sections share
+equal heights so every slot is visible at once; clicking a section expands it to
+fill the log area and clicking again restores the equal-height layout. The slot
+list comes from the existing `/events` SSE stream, so it refreshes as slots
+become active/inactive and survives a busy llama-server via the
+`_last_slot_details_cache` fallback.
+
+The unfiltered two-pane log view and the session-recording view are available
+unchanged on the **All Logs** tab.
+
+**Per-slot filtering rule** (`proxy/proxy/slot_log_filter.py`, pytest-covered in
+`proxy/tests/test_slot_log_filter.py`):
+
+- `llama-server.log` lines are attributed by their slot id marker (`id <N> |` or
+  `id=<N>`, e.g. `slot update_slots: id  2 | task ...`); non-slot lines
+  (`srv ...`) never match.
+- `proxy.log` lines are attributed primarily by `session=<uuid>` against the
+  slot's mapped dispatch session, falling back to `slot=<n>` markers. Lines
+  tagged `slot=none` (session not yet assigned) or without markers are
+  excluded from slot sections but remain visible on the All Logs tab.
+
+Streaming reuses the existing `/logs/tail` SSE fan-out: the optional `slot` and
+`session` query params filter a single file tail server-side
+(`/logs/tail?source=llama&slot=2&session=<uuid>`), and the unfiltered
+`source=proxy|llama` behaviour is unchanged when those params are omitted.
 
 ## TTS (Text-to-Speech) /v1/audio/speech
 

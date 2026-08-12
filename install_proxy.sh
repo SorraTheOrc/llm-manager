@@ -34,6 +34,13 @@ echo "[2/5] Installing Python dependencies..."
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip > /dev/null
 pip install -r "$PROXY_DIR/requirements.txt"
+
+# Vendor the Qwen3 tokenizer.json (checksum-verified; no runtime network
+# access needed — LP-0MSEQ71IF0003FRT). Idempotent: skips when the vendored
+# file already exists with the expected sha256.
+if [ -x "$SCRIPT_DIR/scripts/vendor_qwen3_tokenizer.sh" ]; then
+    "$SCRIPT_DIR/scripts/vendor_qwen3_tokenizer.sh" || echo "WARNING: Qwen3 tokenizer vendoring failed (routing falls back to tiktoken+multiplier)" >&2
+fi
 echo
 
 echo "[3/5] Setting up log directory..."

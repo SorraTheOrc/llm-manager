@@ -52,6 +52,27 @@ def _srv():
     return _m
 
 
+def contention_queue_snapshot(server_config) -> dict:
+    """Live contention-queue metrics for the status payload.
+
+    Delegates to ``contention_queue.status_fields`` so the gating (queue
+    policy + cheap mode, F4 AC4) and field names stay consistent with the
+    status_request log line (LP-0MSORQVK50012Q4D F4 AC3). Returns {} when
+    queueing is inactive.
+    """
+    try:
+        from proxy.contention_queue import status_fields
+
+        server_cfg = (
+            server_config.get("server", {})
+            if isinstance(server_config, dict)
+            else {}
+        )
+        return status_fields(server_cfg)
+    except Exception:
+        return {}
+
+
 # ===================================================================
 # Backend signal counters (connect/read/timeout/other/concurrency)
 # ===================================================================

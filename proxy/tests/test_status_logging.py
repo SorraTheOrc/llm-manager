@@ -18,13 +18,14 @@ pytestmark = pytest.mark.refactor_parity
 # ---------------------------------------------------------------------------
 
 
-def _make_request(headers=None, client_host="127.0.0.1", has_client=True):
-    """Build a minimal mock Request for calling _resolve_client_ip."""
+def _make_request(headers=None, client_host="127.0.0.1", has_client=True, client_port=None):
+    """Build a minimal mock Request for calling client-identity resolvers."""
     req = MagicMock()
     req.headers = headers or {}
     if has_client:
         req.client = MagicMock()
         req.client.host = client_host
+        req.client.port = client_port
     else:
         req.client = None
     return req
@@ -80,6 +81,82 @@ def test_resolve_client_ip_unknown_when_no_client():
     assert _resolve_client_ip(req) == ("unknown", "direct")
 
 
+def test_resolve_client_port_direct():
+    """A direct connection resolves request.client.port; IP source stays 'direct'."""
+    from proxy.handlers import _resolve_client_ip, _resolve_client_port
+
+    req = _make_request(headers={}, client_host="192.168.0.191", client_port=51842)
+    assert _resolve_client_port(req) == 51842
+    assert _resolve_client_ip(req) == ("192.168.0.191", "direct")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"x-forwarded-for": "203.0.113.7"},
+        {"x-real-ip": "198.51.100.9"},
+    ],
+)
+def test_resolve_client_port_unknown_for_header_paths(headers):
+    """Header-based (reverse-proxy) paths carry no source port -> 'unknown'.
+
+    Even when a direct connection exists, the header is authoritative for the
+    client identity and no port travels with it.
+    """
+    from proxy.handlers import _resolve_client_port
+
+    req = _make_request(headers=headers, client_host="10.0.0.5", client_port=51842)
+    assert _resolve_client_port(req) == "unknown"
+
+
+def test_resolve_client_port_unknown_when_no_client():
+    """Without a client address or headers, the port resolves to 'unknown'."""
+    from proxy.handlers import _resolve_client_port
+
+    req = _make_request(headers={}, has_client=False)
+    assert _resolve_client_port(req) == "unknown"
+
+
+def test_resolve_client_id_precedence_x_session_id():
+    """x-session-id wins over the other session headers."""
+    from proxy.handlers import _resolve_client_id
+
+    req = _make_request(
+        headers={
+            "x-session-id": "sess-abc",
+            "session_id": "sess-def",
+            "x-client-request-id": "req-123",
+        }
+    )
+    assert _resolve_client_id(req) == "sess-abc"
+
+
+def test_resolve_client_id_precedence_session_id():
+    """session_id wins when x-session-id is absent."""
+    from proxy.handlers import _resolve_client_id
+
+    req = _make_request(
+        headers={"session_id": "sess-def", "x-client-request-id": "req-123"}
+    )
+    assert _resolve_client_id(req) == "sess-def"
+
+
+def test_resolve_client_id_precedence_x_client_request_id():
+    """x-client-request-id is used when neither session header is present."""
+    from proxy.handlers import _resolve_client_id
+
+    req = _make_request(headers={"x-client-request-id": "req-123"})
+    assert _resolve_client_id(req) == "req-123"
+
+
+def test_resolve_client_id_none_when_no_header():
+    """No session header -> None so the field can be omitted (not 'unknown')."""
+    from proxy.handlers import _resolve_client_id
+
+    req = _make_request(headers={})
+    assert _resolve_client_id(req) is None
+
+
 # ---------------------------------------------------------------------------
 # Endpoint logging tests (via ASGI transport)
 # ---------------------------------------------------------------------------
@@ -87,6 +164,31 @@ def test_resolve_client_ip_unknown_when_no_client():
 
 def _status_records(caplog):
     return [r for r in caplog.records if "status_request" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_status_request_logs_local_active_query(caplog):
+    """The status_request log line carries local_active_query (LP-0MSL2ZLLS009RVKR)."""
+    from proxy.server import app
+
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get("/llama/local/status")
+
+    assert resp.status_code == 200
+    records = _status_records(caplog)
+    assert records, "Expected status_request log record"
+    assert hasattr(records[-1], "local_active_query")
+    assert records[-1].local_active_query is False
 
 
 @pytest.mark.asyncio
@@ -167,9 +269,11 @@ async def test_status_request_logs_all_response_fields(caplog):
     for field in (
         "client_ip",
         "client_ip_source",
+        "client_port",
         "latency_ms",
         "llama_server_running",
         "active_query",
+        "local_active_query",
         "model_switch_in_progress",
         "current_model",
         "available_slots",
@@ -183,6 +287,90 @@ async def test_status_request_logs_all_response_fields(caplog):
     assert isinstance(rec.latency_ms, int)
     assert isinstance(rec.available_slots, int)
     assert isinstance(rec.total_slots, int)
+
+
+@pytest.mark.asyncio
+async def test_status_request_logs_client_port_direct(caplog):
+    """Direct pollers are attributable by source port: client_port is logged.
+
+    client_ip / client_ip_source keep their current semantics (additive
+    change only, LP-0MSKV3IEQ004ZV88).
+    """
+    from proxy.server import app
+
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get("/llama/local/status")
+
+    assert resp.status_code == 200
+    records = _status_records(caplog)
+    assert records, "Expected status_request log record"
+    rec = records[-1]
+    assert rec.client_port == 123  # httpx ASGITransport default client port
+    assert rec.client_ip == "127.0.0.1"
+    assert rec.client_ip_source == "direct"
+
+
+@pytest.mark.asyncio
+async def test_status_request_logs_client_id_when_present(caplog):
+    """status_request carries client_id when a session header is present."""
+    from proxy.server import app
+
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get(
+                "/llama/local/status",
+                headers={"X-Session-Id": "sess-poll-42"},
+            )
+
+    assert resp.status_code == 200
+    records = _status_records(caplog)
+    assert records, "Expected status_request log record"
+    assert records[-1].client_id == "sess-poll-42"
+
+
+@pytest.mark.asyncio
+async def test_status_request_omits_client_id_when_absent(caplog):
+    """status_request omits client_id entirely when no session header is sent."""
+    from proxy.server import app
+
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        with patch.object(
+            srv_module, "query_llama_status", new_callable=AsyncMock
+        ) as mock_qls:
+            mock_qls.return_value = {"llama_server_running": True}
+            resp = await ac.get("/llama/local/status")
+
+    assert resp.status_code == 200
+    records = _status_records(caplog)
+    assert records, "Expected status_request log record"
+    assert not hasattr(records[-1], "client_id"), (
+        "client_id must be omitted (absent), not rendered as None"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +391,11 @@ def _make_status_record():
     )
     record.client_ip = "192.168.0.191"
     record.client_ip_source = "direct"
+    record.client_port = 51842
     record.latency_ms = 12
     record.llama_server_running = True
     record.active_query = False
+    record.local_active_query = False
     record.model_switch_in_progress = False
     record.current_model = "Qwen3"
     record.available_slots = 3
@@ -225,15 +415,39 @@ def test_key_value_formatter_renders_status_request_payload():
     assert "status_request" in text
     assert "client_ip=192.168.0.191" in text
     assert "client_ip_source=direct" in text
+    assert "client_port=51842" in text
     assert "latency_ms=12" in text
     assert "llama_server_running=true" in text
     assert "active_query=false" in text
+    assert "local_active_query=false" in text
     assert "model_switch_in_progress=false" in text
     assert "current_model=Qwen3" in text
     assert "available_slots=3" in text
     assert "total_slots=3" in text
     assert "local_owner_session_id=None" in text
     assert "local_owner_lease_remaining_seconds=None" in text
+
+
+def test_key_value_formatter_renders_client_id():
+    """client_id renders as key=value when present on the record."""
+    from proxy.utils import KeyValueFormatter
+
+    record = _make_status_record()
+    record.client_id = "sess-poll-42"
+    formatter = KeyValueFormatter("%(asctime)s - %(levelname)s - %(message)s")
+    text = formatter.format(record)
+    assert "client_id=sess-poll-42" in text
+
+
+def test_key_value_formatter_renders_client_port_unknown():
+    """client_port=unknown renders as key=value for header-based paths."""
+    from proxy.utils import KeyValueFormatter
+
+    record = _make_status_record()
+    record.client_port = "unknown"
+    formatter = KeyValueFormatter("%(asctime)s - %(levelname)s - %(message)s")
+    text = formatter.format(record)
+    assert "client_port=unknown" in text
 
 
 def test_key_value_formatter_skips_reserved_attributes():

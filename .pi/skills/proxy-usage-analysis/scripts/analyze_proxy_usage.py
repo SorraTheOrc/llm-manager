@@ -1,5 +1,5 @@
 """Proxy usage analysis — turn the last 24h of llama-proxy logs into
-per-session CSVs (daytime/nighttime) and an operator-facing report.
+per-session CSVs (fast/cheap) and an operator-facing report.
 
 Usage:
     python3 analyze_proxy_usage.py --log-dir /var/log/llama-proxy \\
@@ -33,7 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="analyze_proxy_usage.py",
         description=(
             "Analyze the last N hours of llama-proxy logs: per-session CSVs split "
-            "by day/night (from the slot schedule) plus a recommendations report."
+            "by fast/cheap (from the slot schedule) plus a recommendations report."
         ),
     )
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help=f"log directory (default: {DEFAULT_LOG_DIR})")
@@ -118,10 +118,12 @@ def main(argv: list[str] | None = None) -> int:
             f"(local {data['local_requests']} / remote {data['remote_requests']}), "
             f"{data['fallback_events']} fallback events "
             f"({data['fallback_rate'] * 100:.1f}%), "
+            f"{data.get('contention_dispatch', 0)} queued-dispatched-local, "
+            f"{data.get('contention_fallback_after_queue', 0)} fallback-after-queue, "
             f"{errors} error event(s){decode_summary}{busy_summary}."
         )
         print(f"Outputs written to {args.output_dir}: "
-              f"daytime_sessions.csv, nighttime_sessions.csv, errors.csv, report.md")
+              f"fast_sessions.csv, cheap_sessions.csv, errors.csv, report.md")
         if run.archived_to:
             print(f"Previous outputs archived to {run.archived_to}")
     return 0

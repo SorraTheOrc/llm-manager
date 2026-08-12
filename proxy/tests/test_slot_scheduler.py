@@ -870,3 +870,301 @@ class TestSlotSchedulerTransitionSafety:
                 f"drain_minutes={drain_minutes}: expected ~1800s to transition, "
                 f"got {sleep_s}"
             )
+
+
+# ===================================================================
+# Per-period ctx_size (LP-0MSLNK96T0018W4D)
+# ===================================================================
+
+
+class TestSlotScheduleConfigCtxSize:
+    """Tests for parsing and exposing per-period ctx_size."""
+
+    def test_parses_ctx_size_per_entry(self):
+        """Entries with ctx_size parse it; entries without get None."""
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        cfg = SlotScheduleConfig({
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 2, "ctx_size": 262144},
+            ],
+        })
+        assert len(cfg.entries) == 2
+        assert cfg.entries[0].ctx_size is None
+        assert cfg.entries[1].ctx_size == 262144
+
+    def test_invalid_ctx_size_falls_back_to_none(self):
+        """Non-positive or unparseable ctx_size values are treated as None."""
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        cfg = SlotScheduleConfig({
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3, "ctx_size": 0},
+                {"time": "11:00", "slots": 3, "ctx_size": -5},
+                {"time": "12:00", "slots": 3, "ctx_size": "abc"},
+            ],
+        })
+        assert all(e.ctx_size is None for e in cfg.entries)
+
+    def test_get_active_ctx_size(self):
+        """get_active_ctx_size reflects the active entry's per-period ctx."""
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        cfg = SlotScheduleConfig({
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 2, "ctx_size": 262144},
+            ],
+        })
+        # Before 10:00 the schedule wraps to the last entry (23:59, 262144).
+        assert cfg.get_active_ctx_size(dt_time(8, 0)) == 262144
+        # During the day entry (no override) → None.
+        assert cfg.get_active_ctx_size(dt_time(15, 0)) is None
+        # After 23:59 → 262144.
+        assert cfg.get_active_ctx_size(dt_time(23, 59)) == 262144
+
+    def test_get_active_entry_matches_get_active_slot(self):
+        """get_active_entry is consistent with get_active_slot."""
+        from proxy.slot_scheduler import SlotScheduleConfig
+
+        cfg = SlotScheduleConfig({
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [{"time": "10:00", "slots": 3, "ctx_size": 131072}],
+        })
+        entry = cfg.get_active_entry(dt_time(12, 0))
+        assert entry is not None
+        assert entry.slots == cfg.get_active_slot(dt_time(12, 0))
+        assert entry.ctx_size == 131072
+
+
+class TestSlotSchedulerCtxTransitions:
+    """Scheduler behaviour for per-period ctx_size transitions."""
+
+    @pytest.mark.asyncio
+    async def test_pending_restart_carries_ctx(self):
+        """set_pending_restart stores ctx_size; clear resets both."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        mock_srv.config = {"server": {}}
+        scheduler = SlotScheduler(mock_srv)
+        scheduler.set_pending_restart(2, 262144)
+        assert scheduler.pending_restart_slot == 2
+        assert scheduler.pending_restart_ctx == 262144
+        scheduler.clear_pending_restart()
+        assert scheduler.pending_restart_slot is None
+        assert scheduler.pending_restart_ctx is None
+
+    @pytest.mark.asyncio
+    async def test_perform_restart_passes_ctx_size(self):
+        """perform_restart forwards the pending entry's ctx_size."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        mock_srv.config = {"server": {"local_model_ctx_size": 131072}}
+        mock_srv.restart_services = AsyncMock(return_value=True)
+        scheduler = SlotScheduler(mock_srv)
+        scheduler.set_pending_restart(2, 262144)
+        result = await scheduler.perform_restart()
+        assert result is True
+        mock_srv.restart_services.assert_called_once_with(
+            slot_count=2, ctx_size=262144, reason="scheduled_slot_change"
+        )
+
+    @pytest.mark.asyncio
+    async def test_perform_restart_ctx_falls_back_to_base(self):
+        """Entry without ctx_size passes the base local_model_ctx_size."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        mock_srv.config = {"server": {"local_model_ctx_size": 131072}}
+        mock_srv.restart_services = AsyncMock(return_value=True)
+        scheduler = SlotScheduler(mock_srv)
+        scheduler.set_pending_restart(3)  # no ctx → base
+        result = await scheduler.perform_restart()
+        assert result is True
+        mock_srv.restart_services.assert_called_once_with(
+            slot_count=3, ctx_size=131072, reason="scheduled_slot_change"
+        )
+
+    @pytest.mark.asyncio
+    async def test_perform_restart_no_ctx_when_clamp_disabled(self):
+        """Legacy config (no local_model_ctx_size) passes no ctx_size kwarg."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        mock_srv.config = {"server": {}}
+        mock_srv.restart_services = AsyncMock(return_value=True)
+        scheduler = SlotScheduler(mock_srv)
+        scheduler.set_pending_restart(8)
+        result = await scheduler.perform_restart()
+        assert result is True
+        mock_srv.restart_services.assert_called_once_with(
+            slot_count=8, reason="scheduled_slot_change"
+        )
+
+    @pytest.mark.asyncio
+    async def test_catchup_applies_entry_ctx(self):
+        """Catch-up after a transition time applies the entry's ctx_size."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 2, "ctx_size": 262144},
+            ],
+        }
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 3,
+                "local_model_ctx_size": 131072,
+                "slot_schedule": schedule,
+            }
+        }
+        mock_srv.restart_services = AsyncMock(return_value=True)
+        scheduler = SlotScheduler(mock_srv)
+        # At 01:00 the schedule wraps to the 23:59 entry (2 slots @ 262144)
+        # while the static config is 3 @ 131072 → catch-up must fire.
+        now_dt = datetime(2026, 7, 23, 1, 0, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                await scheduler._run_check_cycle()
+        mock_srv.restart_services.assert_called_once_with(
+            slot_count=2, ctx_size=262144, reason="scheduled_slot_change"
+        )
+        assert scheduler.pending_restart_slot is None
+
+    @pytest.mark.asyncio
+    async def test_same_slot_different_ctx_arms_transition(self):
+        """A ctx-only change (same slot count) still arms a restart."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 3, "ctx_size": 262144},
+            ],
+        }
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 3,
+                "local_model_ctx_size": 131072,
+                "slot_schedule": schedule,
+            }
+        }
+        mock_srv.restart_services = AsyncMock(return_value=True)
+        scheduler = SlotScheduler(mock_srv)
+        # At 15:00 the active entry is 10:00 (3 slots, no ctx). The next
+        # entry 23:59 has the SAME slot count but a different ctx_size →
+        # a transition must still be armed.
+        now_dt = datetime(2026, 7, 23, 15, 0, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                await scheduler._run_check_cycle()
+        assert scheduler.pending_restart_slot == 3
+        assert scheduler.pending_restart_ctx == 262144
+
+    @pytest.mark.asyncio
+    async def test_same_slot_same_ctx_skips_transition(self):
+        """Entries with identical (slots, ctx) do not arm a restart."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 3},
+            ],
+        }
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 3,
+                "local_model_ctx_size": 131072,
+                "slot_schedule": schedule,
+            }
+        }
+        scheduler = SlotScheduler(mock_srv)
+        now_dt = datetime(2026, 7, 23, 15, 0, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                await scheduler._run_check_cycle()
+        assert scheduler.pending_restart_slot is None
+
+    @pytest.mark.asyncio
+    async def test_restart_matches_entry_by_ctx_pair(self):
+        """Phase 1 matches the pending entry by (slots, ctx) — a ctx-only
+        entry with the same slot count as another entry is disambiguated."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 3, "ctx_size": 262144},
+            ],
+        }
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 3,
+                "local_model_ctx_size": 131072,
+                "slot_schedule": schedule,
+            }
+        }
+        mock_srv.restart_services = AsyncMock(return_value=True)
+        scheduler = SlotScheduler(mock_srv)
+        # Arm the 23:59 (3 slots @ 262144) entry, then advance to 23:59.
+        scheduler.set_pending_restart(3, 262144)
+        now_dt = datetime(2026, 7, 23, 23, 59, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                await scheduler._run_check_cycle()
+        mock_srv.restart_services.assert_called_once_with(
+            slot_count=3, ctx_size=262144, reason="scheduled_slot_change"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sleep_seconds_ctx_only_transition(self):
+        """Sleep until a ctx-only transition (same slot count) fires."""
+        from proxy.slot_scheduler import SlotScheduler
+
+        mock_srv = MagicMock()
+        schedule = {
+            "enabled": True,
+            "drain_minutes": 15,
+            "entries": [
+                {"time": "10:00", "slots": 3},
+                {"time": "23:59", "slots": 3, "ctx_size": 262144},
+            ],
+        }
+        mock_srv.config = {
+            "server": {
+                "session_slot_pool_size": 3,
+                "local_model_ctx_size": 131072,
+                "slot_schedule": schedule,
+            }
+        }
+        scheduler = SlotScheduler(mock_srv)
+        now_dt = datetime(2026, 7, 23, 15, 0, 0)
+        with patch.object(scheduler, '_now_dt', return_value=now_dt):
+            with patch.object(scheduler, '_now', return_value=now_dt.time()):
+                sleep_s = scheduler._calculate_sleep_seconds()
+        # 23:59 - 15:00 = 8h59m = 32340s
+        assert 32339 <= sleep_s <= 32341, f"got {sleep_s}"

@@ -730,6 +730,13 @@
                 <p style="color: var(--text-secondary); margin-bottom: 1rem;">
                     Real-time per-slot status for the local llama-server.
                 </p>
+                <div class="mode-control" style="display: flex; align-items: center; gap: 12px; margin-bottom: 1rem; flex-wrap: wrap;">
+                    <span style="color: var(--text-secondary);">Operating Mode:</span>
+                    <strong id="mainModeStatus">__CURRENT_MODE__</strong>
+                    <button class="btn-switch" onclick="setMode('fast')">Fast</button>
+                    <button class="btn-switch" onclick="setMode('cheap')">Cheap</button>
+                    <span style="color: var(--text-secondary); font-size: 0.85rem;">Fast = cloud-backed &middot; Cheap = 1-slot local pool, same models as fast. Switching restarts the proxy.</span>
+                </div>
                 <div id="slotStatusGrid" class="endpoint-grid">
                     <!-- Slot cards are rendered here by JavaScript -->
                 </div>
@@ -915,6 +922,18 @@
                     </div>
                     <div class="endpoint">
                         <div class="endpoint-header">
+                            <span class="method method-get">GET</span>
+                            <span class="endpoint-path">/admin/mode</span>
+                            <span style="margin-left:auto;">Current: <strong id="currentMode">__CURRENT_MODE__</strong></span>
+                        </div>
+                        <p class="endpoint-desc">Fast = cloud-backed (day); Cheap = 1-slot local pool, same models as fast (night). Switching mode restarts the proxy.</p>
+                        <div style="display:flex; gap:8px; margin-top:8px;">
+                            <button class="btn-switch" onclick="setMode('fast')">Fast</button>
+                            <button class="btn-switch" onclick="setMode('cheap')">Cheap</button>
+                        </div>
+                    </div>
+                    <div class="endpoint">
+                        <div class="endpoint-header">
                             <span class="method method-post">POST</span>
                             <span class="endpoint-path">/admin/stop-server</span>
                             <button class="btn-switch" style="margin-left:auto; background:#d32f2f;" onclick="stopServer()">Stop</button>
@@ -938,6 +957,8 @@ API Endpoints
   Admin endpoints:
     Reload srv.config:  POST __BASE__/admin/reload-srv.config
     Switch model:   POST __BASE__/admin/switch-model/{model}
+    Current mode:   GET  __BASE__/admin/mode
+    Set mode:       POST __BASE__/admin/set-mode  {"mode": "fast"|"cheap"}
     Stop server:    POST __BASE__/admin/stop-server
 </pre>
             </div>
@@ -1331,6 +1352,42 @@ API Endpoints
                 statusEl.style.display = 'block';
                 setTimeout(() => statusEl.style.display = 'none', 5000);
                 await refreshStatus();
+            }
+        }
+
+        async function setMode(mode) {
+            const btn = event && event.target ? event.target : null;
+            try {
+                const resp = await fetch('/admin/set-mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode: mode })
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    const modeEl = document.getElementById('currentMode');
+                    if (modeEl) modeEl.textContent = data.mode;
+                    const mainModeEl = document.getElementById('mainModeStatus');
+                    if (mainModeEl) mainModeEl.textContent = data.mode;
+                    statusEl.className = data.restart ? 'status-message loading' : 'status-message success';
+                    statusEl.textContent = data.message || `Mode set to ${data.mode}`;
+                    statusEl.style.display = 'block';
+                    if (data.restart) {
+                        setTimeout(() => {
+                            statusEl.textContent = 'Proxy restarting — the page will reload shortly...';
+                        }, 2500);
+                        setTimeout(() => window.location.reload(), 8000);
+                    } else {
+                        setTimeout(() => statusEl.style.display = 'none', 3000);
+                    }
+                } else {
+                    throw new Error(data.detail || 'Failed to set mode');
+                }
+            } catch (e) {
+                statusEl.className = 'status-message error';
+                statusEl.textContent = `Error: ${e.message}`;
+                statusEl.style.display = 'block';
+                setTimeout(() => statusEl.style.display = 'none', 5000);
             }
         }
 
