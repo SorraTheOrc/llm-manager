@@ -43,7 +43,7 @@ SAMPLE_ROWS = [
         "max_context_size": "150000",
         "local_requests": "0",
         "remote_requests": "10",
-        "fallback_reason": "warm_cache_bypass",
+        "fallback_reason": "context_too_large",
         "dispatch_denied": "0",
     },
     {

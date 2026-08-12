@@ -8,7 +8,7 @@ Methodology:
 - A session's peak context (max_context_size) is compared against each
   config's effective routing clamp (per_slot_ctx - 4096 output headroom).
   If max_context <= clamp, the session is not blocked by the
-  warm_cache_bypass / large_context_bypass path (context-based routing).
+  context_too_large / large_context_bypass path (context-based routing).
 - Concurrency: a config with S slots can serve at most S concurrent
   sessions. We project concurrency-limited sessions separately using the
   dispatch_denied / local_concurrency_limit signal from the CSV.

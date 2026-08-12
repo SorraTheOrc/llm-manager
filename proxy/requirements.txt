@@ -14,6 +14,11 @@ pyyaml>=6.0
 # see proxy/utils.py count_text_tokens and LP-0MRDE669Y003V1SO)
 tiktoken>=0.13.0
 
+# Native (model-specific) tokenizers for exact routing/persistence token
+# estimates (LP-0MSEQ71IF0003FRT; vendored tokenizer.json loaded via
+# proxy/tokenizers.py — no runtime network access needed)
+tokenizers>=0.19
+
 # Type hints support
 typing-extensions>=4.9.0
 

@@ -213,6 +213,22 @@ comments and follow best practices.
 
  - Ensure the model's `type` value is consulted when routing. For `type: local` entries, use the existing `proxy_to_local(request, path)` helper and pass the configured `llama_model`. For `type: remote` entries, use `proxy_to_remote` and the configured `endpoint`/`api_key_env`.
 
+## Native tokenizer (optional, LP-0MSEQ71IF0003FRT)
+
+ - When a local model's tokenizer differs from tiktoken's cl100k encoding (e.g. Qwen3 undercounts ~1.69x for dense prose), add a `tokenizer: <name>` field to the model entry so routing/persistence estimates use exact native counts:
+
+   ```yaml
+   plan:
+     tokenizer: qwen3   # named reference into the lazy registry
+     providers:
+       - name: local-qwen3
+         type: local
+         llama_model: Qwen3
+   ```
+
+ - Add a matching registry entry in `proxy/proxy/tokenizers.py` (`TOKENIZER_REGISTRY`) pointing at a vendored `tokenizer.json`, and vendor the file via `scripts/vendor_qwen3_tokenizer.sh` (checksum-verified; committed to the repo, no runtime network needed).
+ - With a native tokenizer active the `token_estimate_multiplier` is forced to 1.0 for that model; models without a `tokenizer` field keep the tiktoken + multiplier fallback. See `docs/llama-router.md`.
+
 ## Capability validation
 
 - The proxy does not require or use a `supports` field. The proxy forwards requests to the configured backend

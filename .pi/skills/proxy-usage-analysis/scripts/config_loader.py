@@ -122,10 +122,15 @@ def _parse_config_text_regex(text: str) -> dict:
 
 
 def find_config_path(explicit: str | None = None, start: Path | None = None) -> Path | None:
-    """Locate ``proxy/config.yaml``.
+    """Locate ``proxy/config.yaml`` (mode-aware).
 
     An explicit ``--config`` path wins. Otherwise walk up from ``start``
     (default: the current working directory) looking for ``proxy/config.yaml``.
+    When the persisted operating mode (``proxy/.mode``, LP-0MSLMYEEU002IBH6)
+    selects a profile, the mode-selected file (``config-fast.yaml`` /
+    ``config-cheap.yaml``) is returned instead so bucketing/recommendations
+    read the config the running proxy actually uses; ``config.yaml`` remains
+    the default when no mode is persisted (or the mode file is missing).
     """
     if explicit:
         p = Path(explicit).expanduser()
@@ -134,11 +139,31 @@ def find_config_path(explicit: str | None = None, start: Path | None = None) -> 
     for _ in range(8):
         candidate = cursor / "proxy" / "config.yaml"
         if candidate.is_file():
-            return candidate
+            return _mode_preferred_config(candidate)
         if cursor.parent == cursor:
             break
         cursor = cursor.parent
     return None
+
+
+def _mode_preferred_config(config_yaml: Path) -> Path:
+    """Return the mode-selected profile when a valid mode is persisted.
+
+    Reads ``proxy/.mode`` next to ``config.yaml``; ``fast``/``cheap`` select
+    ``config-fast.yaml``/``config-cheap.yaml`` when those files exist.
+    Anything else (missing/invalid mode, missing profile) falls back to
+    ``config.yaml`` (the default/fallback profile).
+    """
+    mode_file = config_yaml.parent / ".mode"
+    try:
+        mode = mode_file.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return config_yaml
+    if mode in ("fast", "cheap"):
+        selected = config_yaml.parent / f"config-{mode}.yaml"
+        if selected.is_file():
+            return selected
+    return config_yaml
 
 
 def load_proxy_config(path: Path | None) -> dict | None:

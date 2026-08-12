@@ -108,10 +108,10 @@ async def test_log_tail_missing_file_returns_error(transport):
 # ---------------------------------------------------------------------------
 
 
-async def _collect_sse_first_chunk(handler, request, lines=2, source="proxy"):
+async def _collect_sse_first_chunk(handler, request, lines=2, source="proxy", **kwargs):
     """Call an SSE handler directly and collect the first chunk."""
 
-    response = await handler(request, lines=lines, source=source)
+    response = await handler(request, lines=lines, source=source, **kwargs)
     try:
         async for chunk in response.body_iterator:
             return chunk
@@ -192,3 +192,136 @@ async def test_log_tail_invalid_source_defaults_to_proxy(temp_log_dir):
     assert chunk is not None
     # Invalid source falls back to proxy, so source should be "proxy"
     assert '"source": "proxy"' in chunk
+
+
+# ---------------------------------------------------------------------------
+# Slot-aware /logs/tail (LP-0MSHET5SI000LYSK)
+# Optional `slot` / `session` query params filter the stream per slot without
+# changing the existing source=proxy|llama behaviour.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def temp_slot_log_dir():
+    """Temporary directory with slot-marked llama + proxy log files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        llama_path = Path(tmpdir) / "llama-server.log"
+        llama_path.write_text(
+            "[57463] slot update_slots: id  2 | task 209403 | n_tokens = 16750, ...\n"
+            "[57463] slot update_slots: id  3 | task 209410 | n_tokens = 9000, ...\n"
+            "srv  log_server_r: server listening on port 8080\n"
+            "[57463] slot      release: id  2 | task 209403\n"
+        )
+        proxy_path = Path(tmpdir) / "proxy.log"
+        proxy_path.write_text(
+            "slot_save success session=11111111-2222-3333-4444-555555555555 slot=2\n"
+            "lease_renewed session=11111111-2222-3333-4444-555555555555\n"
+            "dispatch line session=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee slot=none\n"
+            "generic line without markers\n"
+        )
+        yield tmpdir
+
+
+@pytest.mark.asyncio
+async def test_log_tail_llama_slot_filter_initial(temp_slot_log_dir):
+    """source=llama&slot=2 returns only the slot-2 llama lines initially."""
+    from proxy.ui import tail_logs
+
+    from proxy import server as srv_module
+
+    request = await _make_starlette_request()
+
+    with patch.object(srv_module, "log_dir", Path(temp_slot_log_dir)):
+        with patch.object(srv_module, "log_tail_clients", set()):
+            chunk = await _collect_sse_first_chunk(tail_logs, request, lines=10, source="llama", slot=2)
+
+    assert chunk is not None
+    assert '"initial"' in chunk
+    assert '"source": "llama"' in chunk
+    assert '"slot": 2' in chunk
+    assert "id  2" in chunk
+    # Slot 3 and non-slot lines must be filtered out
+    assert "id  3" not in chunk
+    assert "log_server_r" not in chunk
+
+
+@pytest.mark.asyncio
+async def test_log_tail_llama_slot_filter_excludes_other_slot(temp_slot_log_dir):
+    """source=llama&slot=3 keeps only the slot-3 lines."""
+    from proxy.ui import tail_logs
+
+    from proxy import server as srv_module
+
+    request = await _make_starlette_request()
+
+    with patch.object(srv_module, "log_dir", Path(temp_slot_log_dir)):
+        with patch.object(srv_module, "log_tail_clients", set()):
+            chunk = await _collect_sse_first_chunk(tail_logs, request, lines=10, source="llama", slot=3)
+
+    assert chunk is not None
+    assert "id  3" in chunk
+    assert "id  2" not in chunk
+
+
+@pytest.mark.asyncio
+async def test_log_tail_proxy_slot_filter_by_session(temp_slot_log_dir):
+    """source=proxy&slot=2&session=<uuid> keeps only lines for that session."""
+    from proxy.ui import tail_logs
+
+    from proxy import server as srv_module
+
+    request = await _make_starlette_request()
+
+    with patch.object(srv_module, "log_dir", Path(temp_slot_log_dir)):
+        with patch.object(srv_module, "log_tail_clients", set()):
+            chunk = await _collect_sse_first_chunk(
+                tail_logs, request, lines=10, source="proxy", slot=2,
+                session="11111111-2222-3333-4444-555555555555",
+            )
+
+    assert chunk is not None
+    assert '"source": "proxy"' in chunk
+    assert "slot_save success" in chunk
+    assert "lease_renewed" in chunk
+    # Unmapped (slot=none) and marker-less lines must be excluded
+    assert "slot=none" not in chunk
+    assert "generic line" not in chunk
+
+
+@pytest.mark.asyncio
+async def test_log_tail_proxy_slot_filter_fallback_without_session(temp_slot_log_dir):
+    """source=proxy&slot=2 without session uses the slot=<n> fallback."""
+    from proxy.ui import tail_logs
+
+    from proxy import server as srv_module
+
+    request = await _make_starlette_request()
+
+    with patch.object(srv_module, "log_dir", Path(temp_slot_log_dir)):
+        with patch.object(srv_module, "log_tail_clients", set()):
+            chunk = await _collect_sse_first_chunk(tail_logs, request, lines=10, source="proxy", slot=2)
+
+    assert chunk is not None
+    assert "slot_save success" in chunk
+    # lease_renewed has no slot= marker and no session filter -> excluded
+    assert "lease_renewed" not in chunk
+
+
+@pytest.mark.asyncio
+async def test_log_tail_without_slot_param_is_unfiltered(temp_slot_log_dir):
+    """Omitting the slot param preserves the existing unfiltered behaviour."""
+    from proxy.ui import tail_logs
+
+    from proxy import server as srv_module
+
+    request = await _make_starlette_request()
+
+    with patch.object(srv_module, "log_dir", Path(temp_slot_log_dir)):
+        with patch.object(srv_module, "log_tail_clients", set()):
+            chunk = await _collect_sse_first_chunk(tail_logs, request, lines=10, source="llama")
+
+    assert chunk is not None
+    assert "id  2" in chunk
+    assert "id  3" in chunk
+    assert "log_server_r" in chunk
+    assert '"slot"' not in chunk

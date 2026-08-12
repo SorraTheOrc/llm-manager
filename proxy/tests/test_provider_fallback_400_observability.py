@@ -40,6 +40,7 @@ def reset_cooldown_state():
     """Reset cooldown and failure-count state between tests to avoid cross-test leakage."""
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
     yield
 
 

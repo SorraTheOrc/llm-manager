@@ -198,9 +198,32 @@ if [ "$PORT_IN_USE" -eq 1 ]; then
   exit 1
 fi
 
-# ---- Resolve API keys from config.yaml ---------------------------------
+# ---- Resolve operating mode and config file -----------------------------
+# The persisted mode (proxy/.mode, written by POST /admin/set-mode) selects
+# the config profile: fast -> config-fast.yaml, cheap -> config-cheap.yaml.
+# Absent/invalid state defaults to fast (current behavior). LLAMA_PROXY_CONFIG
+# is exported so the server's load_config() uses the same profile, and API
+# keys are resolved from the SELECTED config (cheap mode has no remote
+# providers, so missing cloud keys must not fail startup).
 
-CONFIG_FILE="$REPO_ROOT/config.yaml"
+MODE_FILE="$REPO_ROOT/.mode"
+MODE="fast"
+if [ -f "$MODE_FILE" ]; then
+  MODE_CONTENT="$(tr -d '[:space:]' < "$MODE_FILE")"
+  case "$MODE_CONTENT" in
+    fast|cheap) MODE="$MODE_CONTENT" ;;
+    *) echo "Warning: unknown mode '$MODE_CONTENT' in $MODE_FILE, defaulting to fast" >&2 ;;
+  esac
+fi
+
+CONFIG_FILE="$REPO_ROOT/config-$MODE.yaml"
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "Warning: $CONFIG_FILE not found, falling back to config.yaml" >&2
+  CONFIG_FILE="$REPO_ROOT/config.yaml"
+fi
+export LLAMA_PROXY_CONFIG="$CONFIG_FILE"
+echo "Operating mode: $MODE (config: $CONFIG_FILE)" >&2
+
 AUTH_FILE="$HOME/.pi/agent/auth.json"
 
 resolve_api_keys() {

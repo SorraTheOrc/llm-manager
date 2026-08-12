@@ -626,6 +626,376 @@ class TestListAndRetrieve:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Metadata index (LP-0MSNM90VD0030GEL)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMetadataIndex:
+    """Tests for the in-memory metadata index backing list_sessions*.
+
+    Pins the behaviour required by the /admin/sessions disk-thrash fix:
+    record_request/record_response update the shared index; list_sessions*
+    serve from the index (zero disk reads when warm) and fall back to a
+    bounded cold scan when the index is empty.
+    """
+
+    @pytest.mark.asyncio
+    async def test_record_request_updates_index(self, recorder, temp_recording_dir):
+        """record_request populates the shared index entry for the session."""
+        await recorder.record_request(
+            "sess-idx-req", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hello index"}]},
+            model="qwen3", provider="local",
+        )
+
+        # The index entry must exist and carry the recorded metadata.
+        entry = recorder.get_index_entry("sess-idx-req")
+        assert entry is not None
+        assert entry["session_id"] == "sess-idx-req"
+        assert entry["last_activity"]
+        assert entry["model"] == "qwen3"
+        assert entry["provider"] == "local"
+        assert entry["preview_text"] == "Hello index"
+
+    @pytest.mark.asyncio
+    async def test_record_response_sets_response_time(self, recorder, temp_recording_dir):
+        """The first provider_to_client response sets response_time in the index."""
+        await recorder.record_request(
+            "sess-idx-resp", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Hi"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_response(
+            "sess-idx-resp", "provider_to_client",
+            {"choices": [{"text": "Hello"}]},
+            model="qwen3", provider="local",
+        )
+
+        entry = recorder.get_index_entry("sess-idx-resp")
+        assert entry is not None
+        assert entry["response_time"]
+        assert entry["last_activity"] >= entry["response_time"]
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_serves_from_index_after_file_removal(self, recorder, temp_recording_dir):
+        """Warm list_sessions returns sessions from the index, not disk.
+
+        Delete the recording file after writing; list_sessions must still
+        return the session (proves zero disk reads when the index is warm).
+        """
+        filepath = await recorder.record_request(
+            "sess-idx-warm", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "Warm"}]},
+            model="qwen3", provider="local",
+        )
+        assert filepath is not None
+        os.remove(filepath)
+
+        sessions = recorder.list_sessions()
+        ids = [s["session_id"] for s in sessions]
+        assert "sess-idx-warm" in ids
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_ordered_by_last_activity_desc(self, recorder, temp_recording_dir):
+        """Index-backed list_sessions is ordered by last_activity descending."""
+        for i in range(5):
+            await recorder.record_request(
+                f"sess-order-{i}", "client_to_proxy",
+                {"messages": [{"role": "user", "content": f"msg {i}"}]},
+                model="qwen3", provider="local",
+            )
+
+        sessions = recorder.list_sessions()
+        ids = [s["session_id"] for s in sessions]
+        # Most recently recorded session first (timestamps are monotonic).
+        assert ids[0] == "sess-order-4"
+        times = [s["last_activity"] for s in sessions]
+        assert times == sorted(times, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_by_model_filters_index(self, recorder, temp_recording_dir):
+        """list_sessions_by_model returns only sessions matching the model."""
+        await recorder.record_request(
+            "sess-model-alpha", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "a"}]},
+            model="alpha", provider="local",
+        )
+        await recorder.record_request(
+            "sess-model-beta", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "b"}]},
+            model="beta", provider="local",
+        )
+
+        alpha = recorder.list_sessions_by_model("alpha")
+        ids = [s["session_id"] for s in alpha]
+        assert "sess-model-alpha" in ids
+        assert "sess-model-beta" not in ids
+
+    def test_empty_index_falls_back_to_bounded_scan(self, tmp_path, monkeypatch):
+        """A cold index triggers a bounded scan, not a full-tree read."""
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = tmp_path / "bounded-recordings"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create 100 session dirs directly on disk (bypassing record_*),
+        # so the recorder's index starts cold.
+        for i in range(100):
+            sess_dir = rec_dir / f"sess-cold-{i:03d}"
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            recording = {
+                "session_id": f"sess-cold-{i:03d}",
+                "direction": "client_to_proxy",
+                "timestamp": f"2026-07-07T10:{i % 60:02d}:00.000000+00:00",
+                "payload": {"messages": [{"role": "user", "content": f"m {i}"}]},
+                "model": "qwen3",
+                "provider": "local",
+            }
+            (sess_dir / f"2026-07-07T10:{i % 60:02d}:00.000000-request.json").write_text(
+                json.dumps(recording)
+            )
+
+        from proxy import session_recorder as sr_module
+        original = SessionRecorder._extract_session_preview
+        calls = {"n": 0}
+
+        def counting_preview(session_dir):
+            calls["n"] += 1
+            return original(session_dir)
+
+        monkeypatch.setattr(SessionRecorder, "_extract_session_preview", staticmethod(counting_preview))
+        monkeypatch.setattr(sr_module, "COLD_SCAN_DIR_LIMIT", 25)
+
+        recorder = SessionRecorder(recording_path=str(rec_dir))
+        sessions = recorder.list_sessions()
+
+        # Bounded scan: no full-tree read (100 dirs exist, limit is 25).
+        assert calls["n"] <= 25, f"Cold scan visited {calls['n']} dirs, expected <= 25"
+        assert len(sessions) <= 15
+
+    @pytest.mark.asyncio
+    async def test_index_survives_restart_via_lazy_rebuild(self, recorder, temp_recording_dir):
+        """A fresh recorder instance rebuilds the index via bounded scan (AC5)."""
+        await recorder.record_request(
+            "sess-restart-a", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "A"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_request(
+            "sess-restart-b", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "B"}]},
+            model="qwen3", provider="local",
+        )
+
+        # Simulate a proxy restart: new recorder instance, same path.
+        from proxy.session_recorder import SessionRecorder
+        fresh = SessionRecorder(recording_path=temp_recording_dir)
+        sessions = fresh.list_sessions()
+
+        ids = {s["session_id"] for s in sessions}
+        assert "sess-restart-a" in ids
+        assert "sess-restart-b" in ids
+
+    @pytest.mark.asyncio
+    async def test_index_bounded_by_max_entries(self, tmp_path):
+        """Index never exceeds its configured max size (AC3)."""
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = str(tmp_path / "bounded-index")
+        # Small cap so the eviction path is exercised without huge loops.
+        recorder = SessionRecorder(
+            recording_path=rec_dir, max_index_entries=3,
+        )
+        for i in range(10):
+            await recorder.record_request(
+                f"sess-cap-{i:02d}", "client_to_proxy",
+                {"messages": [{"role": "user", "content": f"m{i}"}]},
+                model="qwen3", provider="local",
+            )
+
+        # Capped at 15 anyway, but the index itself must be bounded by 3.
+        assert len(recorder.get_all_index_entries()) <= 3
+
+    @pytest.mark.asyncio
+    async def test_index_evicts_oldest_when_over_cap(self, tmp_path):
+        """Over-cap insertion evicts the least-recently-active session."""
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = str(tmp_path / "evict-index")
+        recorder = SessionRecorder(
+            recording_path=rec_dir, max_index_entries=3,
+        )
+        # Session 0 is oldest (first written).
+        await recorder.record_request(
+            "sess-old", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "old"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_request(
+            "sess-mid", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "mid"}]},
+            model="qwen3", provider="local",
+        )
+        await recorder.record_request(
+            "sess-new", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "new"}]},
+            model="qwen3", provider="local",
+        )
+        # Fourth write pushes the index over the cap of 3 → oldest evicted.
+        await recorder.record_request(
+            "sess-latest", "client_to_proxy",
+            {"messages": [{"role": "user", "content": "latest"}]},
+            model="qwen3", provider="local",
+        )
+
+        entries = recorder.get_all_index_entries()
+        ids = {e["session_id"] for e in entries}
+        assert "sess-old" not in ids, "Oldest session should be evicted"
+        assert "sess-latest" in ids
+        assert len(ids) == 3
+
+    def test_max_index_entries_from_config(self, tmp_path):
+        """max_index_entries is read from session_recording config."""
+        from proxy.session_recorder import SessionRecorder
+
+        cfg = {
+            "session_recording": {
+                "path": str(tmp_path / "cfg-index"),
+                "max_index_entries": 7,
+            }
+        }
+        recorder = SessionRecorder.from_config(cfg)
+        assert recorder.max_index_entries == 7
+
+    def test_max_index_entries_default(self, tmp_path):
+        """Default max index entries is the module constant."""
+        from proxy.session_recorder import (
+            DEFAULT_MAX_INDEX_ENTRIES,
+            SessionRecorder,
+        )
+        recorder = SessionRecorder(recording_path=str(tmp_path / "def-index"))
+        assert recorder.max_index_entries == DEFAULT_MAX_INDEX_ENTRIES
+
+    # ------------------------------------------------------------------
+    # Bounded cold-start scan (LP-0MSNM97PA000XA0M)
+    # ------------------------------------------------------------------
+
+    def test_cold_scan_dir_limit_configurable(self, tmp_path):
+        """Cold-scan dir limit is configurable (F3 AC1)."""
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = tmp_path / "cfg-scan"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(30):
+            sess_dir = rec_dir / f"sess-scan-{i:02d}"
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            (sess_dir / f"2026-07-07T10:{i % 60:02d}:00.000000+00:00-request.json").write_text(
+                json.dumps({
+                    "session_id": f"sess-scan-{i:02d}",
+                    "direction": "client_to_proxy",
+                    "timestamp": f"2026-07-07T10:{i % 60:02d}:00.000000+00:00",
+                    "payload": {"messages": [{"role": "user", "content": f"m{i}"}]},
+                })
+            )
+
+        # Limit of 5 → only the 5 newest dirs (by mtime) are scanned.
+        recorder = SessionRecorder(
+            recording_path=str(rec_dir), cold_scan_dir_limit=5,
+        )
+        sessions = recorder.list_sessions()
+        # 5 scanned, capped at 15 → at most 5 sessions returned.
+        assert len(sessions) <= 5
+
+    def test_cold_scan_reads_at_most_one_file_per_dir(self, tmp_path, monkeypatch):
+        """Cold scan reads ≤1 recording file per dir (F3 AC2).
+
+        Filename timestamps supply last_activity, so per-dir content reads
+        are bounded regardless of how many files a session dir holds.
+        """
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = tmp_path / "one-file-scan"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        # Two session dirs, each with 10 recording files.
+        for sid in ("sess-multi-a", "sess-multi-b"):
+            sess_dir = rec_dir / sid
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            for i in range(10):
+                (sess_dir / f"2026-07-07T10:{i:02d}:00.000000+00:00-request.json").write_text(
+                    json.dumps({
+                        "session_id": sid,
+                        "direction": "client_to_proxy",
+                        "timestamp": f"2026-07-07T10:{i:02d}:00.000000+00:00",
+                        "payload": {"messages": [{"role": "user", "content": f"m{i}"}]},
+                    })
+                )
+
+        reads = {"n": 0}
+        original_read_bytes = Path.read_bytes
+
+        def counting_read_bytes(self):
+            reads["n"] += 1
+            return original_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+
+        recorder = SessionRecorder(recording_path=str(rec_dir))
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 2
+        # 2 dirs scanned; at most 1 file read per dir (plus the two mkdir's
+        # parent dirs are not files). Allow small slack for any path probe.
+        assert reads["n"] <= 4, f"Expected ≤1 file read per dir, got {reads['n']}"
+
+    def test_cold_scan_last_activity_from_filename_timestamp(self, tmp_path):
+        """last_activity is derived from filename, not file content (F3 AC2)."""
+        from proxy.session_recorder import SessionRecorder
+
+        rec_dir = tmp_path / "fn-scan"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        sess_dir = rec_dir / "sess-fn"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        # Filename timestamp (10:05) is NEWER than content timestamp (10:00).
+        (sess_dir / "2026-07-07T10:05:00.000000+00:00-request.json").write_text(
+            json.dumps({
+                "session_id": "sess-fn",
+                "direction": "client_to_proxy",
+                "timestamp": "2026-07-07T10:00:00.000000+00:00",
+                "payload": {"messages": [{"role": "user", "content": "hello"}]},
+            })
+        )
+
+        recorder = SessionRecorder(recording_path=str(rec_dir))
+        sessions = recorder.list_sessions()
+
+        assert len(sessions) == 1
+        # last_activity comes from the filename (10:05), not the body (10:00).
+        assert sessions[0]["last_activity"] == "2026-07-07T10:05:00.000000+00:00"
+
+    def test_cold_scan_dir_limit_default(self, tmp_path):
+        """Default cold-scan dir limit is the module constant."""
+        from proxy.session_recorder import (
+            COLD_SCAN_DIR_LIMIT,
+            SessionRecorder,
+        )
+        recorder = SessionRecorder(recording_path=str(tmp_path / "def-scan"))
+        assert recorder.cold_scan_dir_limit == COLD_SCAN_DIR_LIMIT
+
+    def test_cold_scan_dir_limit_from_config(self, tmp_path):
+        """cold_scan_dir_limit is read from session_recording config."""
+        from proxy.session_recorder import SessionRecorder
+
+        cfg = {
+            "session_recording": {
+                "path": str(tmp_path / "cfg-scan2"),
+                "cold_scan_dir_limit": 11,
+            }
+        }
+        recorder = SessionRecorder.from_config(cfg)
+        assert recorder.cold_scan_dir_limit == 11
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Configuration integration (AC5)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -933,7 +1303,7 @@ class TestSessionPreviewExtraction:
             "payload": {"messages": [{"role": "user", "content": "Second message"}]},
         }
         (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(req1))
-        (sess_dir / "2026-07-07T10:01:00.000000-request.json").write_text(json.dumps(req2))
+        (sess_dir / "2026-07-07T10:01:00.000000+00:00-request.json").write_text(json.dumps(req2))
 
         recorder = SessionRecorder(recording_path=temp_recording_dir)
         sessions = recorder.list_sessions()
@@ -953,7 +1323,7 @@ class TestSessionPreviewExtraction:
             "timestamp": "2026-07-07T10:00:00.000000+00:00",
             "payload": {"messages": [{"role": "user", "content": "Hello"}]},
         }
-        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(req))
+        (sess_dir / "2026-07-07T10:00:00.000000+00:00-request.json").write_text(json.dumps(req))
 
         # Early response
         resp = {
@@ -964,7 +1334,7 @@ class TestSessionPreviewExtraction:
             "model": "test-model",
             "provider": "test-provider",
         }
-        (sess_dir / "2026-07-07T10:00:05.000000-response.json").write_text(json.dumps(resp))
+        (sess_dir / "2026-07-07T10:00:05.000000+00:00-response.json").write_text(json.dumps(resp))
 
         # Later request (second turn)
         req2 = {
@@ -973,7 +1343,7 @@ class TestSessionPreviewExtraction:
             "timestamp": "2026-07-07T10:01:00.000000+00:00",
             "payload": {"messages": [{"role": "user", "content": "Follow up"}]},
         }
-        (sess_dir / "2026-07-07T10:01:00.000000-request.json").write_text(json.dumps(req2))
+        (sess_dir / "2026-07-07T10:01:00.000000+00:00-request.json").write_text(json.dumps(req2))
 
         recorder = SessionRecorder(recording_path=temp_recording_dir)
         sessions = recorder.list_sessions()
@@ -1004,7 +1374,7 @@ class TestSessionPreviewExtraction:
             "model": "qwen3",
             "provider": "local",
         }
-        (sess_dir / "2026-07-07T10:00:00.000000-request.json").write_text(json.dumps(req))
+        (sess_dir / "2026-07-07T10:00:00.000000+00:00-request.json").write_text(json.dumps(req))
 
         recorder = SessionRecorder(recording_path=temp_recording_dir)
         sessions = recorder.list_sessions()

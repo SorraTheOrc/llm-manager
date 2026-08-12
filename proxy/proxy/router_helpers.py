@@ -563,6 +563,25 @@ async def _get_per_model_queries(srv) -> dict[str, int]:
         return {}
 
 
+def _apply_queue_wait_to_timeout(
+    request_timeout: httpx.Timeout,
+    queue_wait_seconds: float,
+) -> httpx.Timeout:
+    """Reduce the adaptive timeout by the elapsed contention-queue wait.
+
+    Q2=a (LP-0MSORQVK50012Q4D): the queued wait subtracts from the
+    client-visible adaptive timeout budget, so total (wait + serve) stays
+    within ``llama_adaptive_timeout_*``. Floors at 1s so a near-cap wait still
+    leaves a minimal serve window.
+    """
+    try:
+        base = float(request_timeout.connect)
+    except Exception:
+        return request_timeout
+    reduced = max(1.0, base - max(0.0, float(queue_wait_seconds)))
+    return httpx.Timeout(reduced)
+
+
 def _get_lease_timeout_seconds(srv) -> float:
     """Return the configured lease timeout in seconds (default 180)."""
     try:
@@ -823,6 +842,16 @@ async def _decrement_local_active_queries(
             except Exception:
                 pass
 
+    # A local slot freed (stream end / request completion) — wake the
+    # cross-session contention queue (LP-0MSORQVK50012Q4D AC2). Best-effort:
+    # an idle queue is a no-op.
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(1)
+    except Exception:
+        pass
+
 
 async def _increment_local_active_queries(
     srv,
@@ -992,7 +1021,29 @@ async def _try_acquire_local_dispatch(
         return (True, None, 0, 1.0)
 
 
-async def _release_local_dispatch(srv, session_id: str) -> bool:
+def _client_identity_extra(request: Request | None) -> dict:
+    """Build the client-identity ``extra`` dict for structured log events.
+
+    Returns the resolved ``client_ip`` / ``client_ip_source`` / ``client_port``
+    when a Request is in scope, or an empty dict when it is not (background
+    cleanup paths degrade gracefully — identity omitted, event still logged)
+    (LP-0MSKV3IEQ004ZV88).
+    """
+    if request is None:
+        return {}
+    try:
+        from proxy.handlers import _resolve_client_ip, _resolve_client_port
+        client_ip, client_ip_source = _resolve_client_ip(request)
+        return {
+            "client_ip": client_ip,
+            "client_ip_source": client_ip_source,
+            "client_port": _resolve_client_port(request),
+        }
+    except Exception:
+        return {}
+
+
+async def _release_local_dispatch(srv, session_id: str, request: Request | None = None) -> bool:
     """Explicitly release the dispatch lease for *session_id*.
 
     Removes the dispatch record from ``local_dispatch_records`` under
@@ -1014,6 +1065,7 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
                     srv.logger.info(
                         "lease_released session=%s reason=explicit_release",
                         session_id[:8] if session_id else "unknown",
+                        extra=_client_identity_extra(request),
                     )
                 except Exception:
                     pass
@@ -1026,6 +1078,14 @@ async def _release_local_dispatch(srv, session_id: str) -> bool:
             _free_slot_assignment(session_id)
         except Exception:
             pass
+    # A slot-persistence / lease release frees the backend — wake the
+    # cross-session contention queue (LP-0MSORQVK50012Q4D AC2).
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(1)
+    except Exception:
+        pass
     return removed
 
 
@@ -1112,6 +1172,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
     except Exception:
         pass
+    # Removed stale leases frees slots — wake the cross-session contention
+    # queue (LP-0MSORQVK50012Q4D AC2).
+    if removed > 0:
+        try:
+            from proxy.contention_queue import wake
+
+            await wake(removed)
+        except Exception:
+            pass
     return removed
 
 
@@ -1154,6 +1223,12 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                             )
                         except Exception:
                             pass
+                        try:
+                            from proxy.contention_queue import wake_all
+
+                            await wake_all()
+                        except Exception:
+                            pass
         else:
             # Legacy mode: no dispatch records system
             async with srv.local_active_queries_lock:
@@ -1169,6 +1244,73 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                         )
                     except Exception:
                         pass
+                    try:
+                        from proxy.contention_queue import wake_all
+
+                        await wake_all()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+async def _recover_stuck_global_active_queries(srv) -> None:
+    """Detect and reset a stuck ``active_queries`` counter.
+
+    If ``active_queries > 0`` but there is no evidence of in-flight
+    work — ``local_active_queries == 0`` and no active dispatch
+    records — the global counter is likely stuck (e.g., an abandoned
+    stream whose decrement path never ran). Resets to 0 and logs a
+    WARNING-level message.
+
+    Mirrors ``_recover_stuck_local_active_queries`` and is designed to
+    be called from ``_dispatch_cleanup_loop`` (server.py) right after
+    the local recovery, providing a periodic in-process self-recovery
+    mechanism (no proxy restart required).
+
+    Rationale for the no-active-work check: the global counter is only
+    incremented on the main routing path (router.py), which always
+    increments ``local_active_queries`` as well — either via
+    ``_try_acquire_local_dispatch`` for explicit sessions or via
+    ``_increment_local_active_queries`` for anonymous ones. Remote
+    concurrency-limit fallback never touches the global counter.
+    Therefore a positive ``active_queries`` with no local activity
+    means the counter leaked and can be safely reset.
+
+    In legacy mode (no ``local_dispatch_records`` attribute) the only
+    remaining signal is the local counter: if it is 0 and the global
+    counter is positive, the global counter leaked.
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is not None:
+            async with srv.local_active_queries_lock:
+                has_active = any(
+                    r.get("active", False) for r in records.values()
+                )
+            if has_active:
+                # Legitimate in-flight local work — keep the counter.
+                return
+
+        async with srv.local_active_queries_lock:
+            local_active = int(getattr(srv, "local_active_queries", 0) or 0)
+        if local_active > 0:
+            # Local requests in flight — keep the global counter.
+            return
+
+        async with srv.active_queries_lock:
+            if srv.active_queries > 0:
+                prev = srv.active_queries
+                srv.active_queries = 0
+                try:
+                    srv.logger.warning(
+                        "active_queries counter recovered: "
+                        "reset from %d to 0 (no active dispatch "
+                        "records or local queries in flight)",
+                        prev,
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
 

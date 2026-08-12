@@ -78,9 +78,17 @@ FALLBACK_CONCURRENCY = (
     "from=local-qwen3, to=opencode-go-deepseek, reason=local_concurrency_limit"
 )
 
+# Legacy reason value (pre-LP-0MSF8XDG7000PERM): rotated logs may still carry
+# ``warm_cache_bypass``; the parser normalizes it to ``context_too_large``.
 FALLBACK_WARM_CACHE = (
     "2026-08-02 13:57:06,974 - INFO - Fallback triggered for model=v1/chat/completions, "
     "from=local-qwen3, to=opencode-go-deepseek, reason=warm_cache_bypass"
+)
+
+# Current reason value emitted by the proxy.
+FALLBACK_CONTEXT_TOO_LARGE = (
+    "2026-08-02 13:57:06,974 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go-deepseek, reason=context_too_large"
 )
 
 FALLBACK_HTTP_400 = (
@@ -90,10 +98,20 @@ FALLBACK_HTTP_400 = (
 
 # --- routing_skip_local (session + reason, arrow before the explanation) ----
 
+# Legacy routing_skip line (pre-LP-0MSF8XDG7000PERM): ``warm_cache_bypass``
+# is normalized to ``context_too_large`` by the parser.
 ROUTING_SKIP_WARM = (
     "2026-08-02 14:02:20,157 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
     "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
     "cached_ratio=0.99 reason=warm_cache_bypass → skipping local, routing to next remote "
+    "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3"
+)
+
+# Current reason value emitted by the proxy.
+ROUTING_SKIP_CONTEXT_TOO_LARGE = (
+    "2026-08-02 14:02:20,157 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
     "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3"
 )
 
@@ -109,6 +127,19 @@ ROUTING_SKIP_LARGE_CONTEXT = (
 DISPATCH_DENIED = (
     "2026-08-02 14:03:06,616 - INFO - local_dispatch_denied session=019fc245 "
     "owner=019fc27d active=4"
+)
+
+# --- Contention-queue events (LP-0MSORQVK50012Q4D F4 AC3) -------------------
+
+CONTENTION_DISPATCH = (
+    "2026-08-02 14:10:00,000 - INFO - contention_queue_dispatch provider=local-qwen3 "
+    "session=019fc245-aaaa-7e5c-871e-57ab32f875f3 queued_duration=1.25s policy=queue depth=0"
+)
+
+CONTENTION_FALLBACK_AFTER_QUEUE = (
+    "2026-08-02 14:11:00,000 - INFO - contention_queue_fallback_after_queue "
+    "provider=local-qwen3 session=019fc245-bbbb-7e5c-871e-57ab32f875f3 "
+    "queued_duration=60.00s"
 )
 
 # --- Error events (real lines from /var/log/llama-proxy, Aug 3 window) ------

@@ -70,6 +70,7 @@ def reset_cooldown_state():
     tests to avoid cross-test leakage."""
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
     import proxy.stall_circuit_breaker as scb
     scb._initialized = False
     scb.stall_circuit_breaker = scb.StallCircuitBreaker()

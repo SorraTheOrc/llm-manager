@@ -117,13 +117,18 @@ Consequences:
 - Effective local capacity for dense prose is ~39K tokens regardless of slot
   size until the estimator is corrected.
 
-Mitigations (implemented in follow-up LP-0MSEGPO77005CYCQ F2/F3):
-- Server-level `token_estimate_multiplier: 1.69` is set in `proxy/config.yaml`
-  and applied consistently to BOTH the routing estimate (provider.py) and the
-  slot-persistence estimate (session.py) via `_get_token_estimate_multiplier`
-  in `proxy/proxy/provider.py`, so the routing clamp and the persistence cap
-  compare Qwen3-native token counts. Per-model `token_estimate_multiplier`
-  overrides the server-level value for routing.
+Mitigations (implemented in follow-up LP-0MSEGPO77005CYCQ F2/F3, replaced by
+LP-0MSEQ71IF0003FRT):
+- **Native tokenizer (current):** local Qwen3 models carry `tokenizer: qwen3`
+  in `proxy/config.yaml`, loading the vendored Qwen3 `tokenizer.json` via
+  `proxy/proxy/tokenizers.py`. `_get_tokenizer_for_model` in
+  `proxy/proxy/provider.py` resolves (tokenizer, multiplier) and is shared by
+  BOTH the routing estimate (provider.py) and the slot-persistence estimate
+  (session.py), so the routing clamp and the persistence cap compare exact
+  Qwen3-native token counts (multiplier forced to 1.0 when a native tokenizer
+  is active). The server-level `token_estimate_multiplier` heuristic was
+  removed — tiktoken+multiplier remains only as a fallback for models without
+  a named tokenizer.
 - The slot-persistence cap `session_slot_max_prompt_tokens` is derived
   dynamically from the effective per-slot clamp
   (`local_model_ctx_size // active_slots - 4096` output headroom, the same
@@ -160,3 +165,41 @@ server:
   local_large_context_fallback_threshold: 60000        # cold-cache new-token cap
   local_large_context_warm_cache_threshold: 100000     # total-context hard cap
 ```
+
+## Per-period ctx_size in slot_schedule (LP-0MSLNK96T0018W4D)
+
+`slot_schedule` entries may carry an optional `ctx_size`: the total context
+across all slots (llama-server `--ctx-size`) while that entry is active.
+When absent, the global `local_model_ctx_size` applies.
+
+```yaml
+server:
+  slot_schedule:
+    enabled: true
+    entries:
+      - time: "10:00"
+        slots: 3
+      - time: "23:59"
+        slots: 2
+        ctx_size: 262144   # overnight: 2 slots @ 256K
+```
+
+At a transition the proxy restarts llama-server with the new `--parallel`
+AND context size, and the routing clamp (`_effective_large_context_thresholds`)
+plus the `session_slot_max_prompt_tokens` dynamic derivation use the ACTIVE
+period's `(ctx_size, slots)` — so overnight the per-slot cap becomes
+`262144 // 2 - 4096 = 126976` while daytime stays `131072 // 3 - 4096 = 39594`.
+
+**Router-mode mechanism:** a global `--ctx-size` on the router command line
+would override per-model INI `ctx-size` for EVERY model (CLI args take highest
+precedence in llama.cpp's preset merge), ballooning the embed model's KV cache.
+Instead `start-llama.sh` patches ONLY the local model's `ctx-size` into a temp
+copy of the preset (`LLAMA_CTX_SIZE`/`LLAMA_CTX_MODEL` exported by the proxy
+lifecycle) and points `--models-preset` at it.
+
+**Consistency invariant (F3 lesson):** the routing clamp must never admit
+prompts larger than the real per-slot context after llama.cpp rounds
+`n_ctx_seq` UP to a multiple of 256 (`262144/2 → 131072/slot`,
+`131072/3 → 43776/slot`). The clamp `(ctx_size // slots - 4096)` is always ≤
+the rounded per-slot context — enforced by
+`proxy/tests/test_ctx_slot_validation.py::TestCtxSlotConsistency`.

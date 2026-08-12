@@ -42,7 +42,7 @@
         button.llama-btn { background:var(--accent-llama); color:#fff; }
         button.llama-btn:hover { background:var(--accent-llama-hover); }
         button:disabled { opacity:0.5; cursor:not-allowed; }
-        .log-panes { display:grid; grid-template-columns:1fr 1fr; gap:1rem; height: calc(100vh - 200px); }
+        .log-panes { display:grid; grid-template-columns:1fr 1fr; gap:1rem; height: calc(100vh - 240px); }
         .pane { display:flex; flex-direction:column; overflow:hidden; }
         .pane-header { display:flex; align-items:center; gap:0.5rem; padding:0.5rem; background:var(--bg-card); border-radius:8px 8px 0 0; border:1px solid var(--border); border-bottom:none; }
         .pane-header.proxy { color:var(--accent); font-weight:600; }
@@ -157,6 +157,89 @@
         .provider-badge.local { background: rgba(79,140,255,0.2); color: var(--accent); }
         .provider-badge.remote { background: rgba(255,140,79,0.2); color: var(--accent-llama); }
 
+        /* Tabs (Slots default / All Logs secondary) */
+        .tabs { display:flex; gap:0.5rem; margin-bottom:0.75rem; }
+        .tab {
+            padding:0.45rem 1.1rem;
+            border-radius:6px;
+            background:var(--bg-card);
+            color:var(--text-secondary);
+            border:1px solid var(--border);
+            font-size:0.9rem;
+            cursor:pointer;
+        }
+        .tab:hover { color:var(--text-primary); }
+        .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+        /* Slots tab — one live log section per slot reported by llama-server */
+        .slot-sections {
+            display:flex;
+            flex-direction:column;
+            gap:0.75rem;
+            height: calc(100vh - 240px);
+            overflow-y:auto;
+        }
+        .slot-section {
+            flex: 1 1 0;
+            min-height: 150px;
+            display:flex;
+            flex-direction:column;
+            overflow:hidden;
+            border:1px solid var(--border);
+            border-radius:8px;
+            background:var(--bg-card);
+        }
+        .slot-section.expanded { flex: 20 1 0; }
+        .slot-section-header {
+            display:flex;
+            align-items:center;
+            gap:0.6rem;
+            padding:0.45rem 0.6rem;
+            cursor:pointer;
+            user-select:none;
+            background:rgba(255,255,255,0.03);
+            border-bottom:1px solid var(--border);
+        }
+        .slot-section-header:hover { background:rgba(79,140,255,0.12); }
+        .slot-id { font-weight:600; color:var(--accent); }
+        .slot-session { font-size:0.8rem; color:var(--text-secondary); font-family:monospace; }
+        .slot-expand-hint { margin-left:auto; font-size:0.72rem; color:var(--text-secondary); }
+        .slot-autoscroll-label {
+            display:flex; align-items:center; gap:0.25rem;
+            color:var(--text-secondary); font-size:0.78rem; cursor:pointer;
+        }
+        .slot-status-badge {
+            font-size:0.75rem;
+            padding:0.18rem 0.5rem;
+            border-radius:4px;
+            font-weight:500;
+            white-space:nowrap;
+        }
+        .slot-status-badge.idle { background:#1b5e20; color:#a5d6a7; }
+        .slot-status-badge.processing { background:#e65100; color:#ffcc80; }
+        .slot-status-badge.waiting { background:#1565c0; color:#90caf9; }
+        .slot-status-badge.working { background:#4a148c; color:#ce93d8; }
+        .slot-log {
+            flex:1;
+            overflow:auto;
+            padding:0.4rem 0.75rem;
+            font-family:monospace;
+            font-size:0.85rem;
+            white-space:pre-wrap;
+            background: linear-gradient(180deg, var(--bg-card), rgba(15,18,30,1));
+        }
+        .slot-log .line { border-bottom:1px solid rgba(255,255,255,0.02); }
+        .src-badge {
+            display:inline-block;
+            padding:0 0.3rem;
+            border-radius:3px;
+            font-size:0.68rem;
+            font-weight:600;
+            margin-right:0.35rem;
+        }
+        .src-badge.proxy { background:rgba(79,140,255,0.25); color:var(--accent); }
+        .src-badge.llama { background:rgba(255,140,79,0.25); color:var(--accent-llama); }
+
         .version-footer {
             position: fixed;
             bottom: 0;
@@ -185,17 +268,31 @@
       </div>
     </div>
 
-    <!-- Session bar (top-level dropdown) -->
-    <div class="session-bar">
-      <select id="sessionSelect">
-        <option value="">Select a session...</option>
-      </select>
-      <button class="proxy-btn" id="refreshSessions" style="font-size:0.75rem;">Refresh</button>
-      <span id="sessionInfo" class="muted" style="font-size:0.8rem;"></span>
+    <!-- Tabs: Slots (default) / All Logs (secondary) -->
+    <div class="tabs">
+      <button id="tabSlots" class="tab active" type="button">Slots</button>
+      <button id="tabAllLogs" class="tab" type="button">All Logs</button>
     </div>
 
-    <!-- Two-pane log view (default visible, shown for "Raw" and initial load) -->
-    <div id="twoPaneContent">
+    <!-- Slots tab: one live log section per slot reported by llama-server -->
+    <div id="tabSlotsContent" class="tab-content">
+      <div id="slotSummary" class="muted" style="margin-bottom:0.5rem; font-size:0.85rem;"></div>
+      <div id="slotSections" class="slot-sections"></div>
+    </div>
+
+    <!-- All Logs tab: original two-pane log view + session recordings -->
+    <div id="tabAllLogsContent" class="tab-content" style="display:none;">
+      <!-- Session bar (top-level dropdown) -->
+      <div class="session-bar">
+        <select id="sessionSelect">
+          <option value="">Select a session...</option>
+        </select>
+        <button class="proxy-btn" id="refreshSessions" style="font-size:0.75rem;">Refresh</button>
+        <span id="sessionInfo" class="muted" style="font-size:0.8rem;"></span>
+      </div>
+
+      <!-- Two-pane log view -->
+      <div id="twoPaneContent">
       <div class="summary">
         <h3>Request Summary</h3>
         <div class="summary-grid">
@@ -252,6 +349,7 @@
     <!-- Recording panel (hidden by default) -->
     <div id="recordingPanel" class="session-recording-panel" style="display:none;">
       <div id="recordingContent"></div>
+    </div>
     </div>
 
   </div>
@@ -849,16 +947,305 @@
     document.getElementById('llamaClear').addEventListener('click', () => llamaLog.innerHTML = '');
     document.getElementById('llamaDownload').addEventListener('click', () => downloadLog(llamaLog, 'llama-server.log'));
 
+    // ===================================================================
+    // Tabs: Slots (default) / All Logs (secondary)
+    // ===================================================================
+
+    const tabSlotsBtn = document.getElementById('tabSlots');
+    const tabAllLogsBtn = document.getElementById('tabAllLogs');
+    const tabSlotsContent = document.getElementById('tabSlotsContent');
+    const tabAllLogsContent = document.getElementById('tabAllLogsContent');
+
+    function switchTab(name) {
+      const isSlots = name === 'slots';
+      tabSlotsBtn.classList.toggle('active', isSlots);
+      tabAllLogsBtn.classList.toggle('active', !isSlots);
+      tabSlotsContent.style.display = isSlots ? 'block' : 'none';
+      tabAllLogsContent.style.display = isSlots ? 'none' : 'block';
+      if (isSlots) {
+        // Reconnect slot streams (section DOM is preserved across switches)
+        connectSlotEvents();
+        currentSlots.forEach(connectSlotTails);
+      } else {
+        disconnectSlotEvents();
+        disconnectSlotTails();
+      }
+    }
+
+    tabSlotsBtn.addEventListener('click', () => switchTab('slots'));
+    tabAllLogsBtn.addEventListener('click', () => switchTab('all'));
+
+    // ===================================================================
+    // Slots tab — one live log section per slot reported by llama-server
+    //
+    // The active-slot list comes from the existing /events SSE stream
+    // (enriched slot details with session_id, is_processing, progress).
+    // Each section tails both log files via the slot-aware /logs/tail
+    // endpoint (?source=llama|proxy&slot=N&session=<uuid>) which filters
+    // server-side using the same rule as the pytest-covered
+    // proxy.slot_log_filter module.
+    // ===================================================================
+
+    let slotEventSource = null;
+    let slotTailSources = {};  // slotId -> {proxy: EventSource, llama: EventSource}
+    let expandedSlotId = null;
+    let currentSlots = [];     // last slot list from /events (all slots)
+
+    // Every slot reported by llama-server is rendered (matching the home-page
+    // slot-card convention) so the Slots tab is never empty when the server is
+    // up; the status badge reflects processing/session state live. This fixes
+    // the "slots screen is empty" rejection (audit 2026-08-10): a strict
+    // processing-or-mapped-session filter rendered nothing while slots were
+    // idle or their dispatch sessions were not yet assigned.
+    function allSlotsFrom(slots) {
+      if (!Array.isArray(slots)) return [];
+      return slots.filter(function (s) {
+        return !!s && s.slot_id !== undefined && s.slot_id !== null;
+      });
+    }
+
+    // A slot is "active" when it is processing or still carries a mapped
+    // dispatch session (recently-finished generations stay inspectable).
+    // Used only for the summary count, not for section visibility.
+    function activeSlotsFrom(slots) {
+      return allSlotsFrom(slots).filter(function (s) {
+        const hasSession = s.session_id !== undefined && s.session_id !== null && s.session_id !== '';
+        return s.is_processing === true || hasSession;
+      });
+    }
+
+    function slotStatus(slot) {
+      const hasSession = slot.session_id !== undefined && slot.session_id !== null;
+      const hasProgress = slot.n_tokens !== undefined && slot.n_tokens !== null &&
+        slot.progress !== undefined && slot.progress !== null;
+      const isProcessing = slot.is_processing === true;
+      const genDone = slot.generation_done === true;
+      if (hasSession && !hasProgress && isProcessing) return { cls: 'waiting', label: 'Waiting for Decoder' };
+      if (hasSession && genDone) return { cls: 'working', label: 'Working' };
+      if (hasProgress && isProcessing) {
+        const pct = Math.round(slot.progress * 100);
+        const total = slot.total_tokens !== null && slot.total_tokens !== undefined ? ' of ' + slot.total_tokens : '';
+        return { cls: 'processing', label: 'Processed ' + slot.n_tokens + total + ' (' + pct + '%) tokens' };
+      }
+      if (isProcessing) return { cls: 'processing', label: 'Processing' };
+      if (hasSession) return { cls: 'working', label: 'Active' };
+      return { cls: 'idle', label: 'Idle' };
+    }
+
+    function shortSession(sessionId) {
+      return sessionId.length > 24 ? sessionId.substring(0, 8) + '…' : sessionId;
+    }
+
+    function findSlotSection(slotId) {
+      return document.querySelector('.slot-section[data-slot-id="' + slotId + '"]');
+    }
+
+    function buildSlotSection(slot, sessionId) {
+      const div = document.createElement('div');
+      div.className = 'slot-section';
+      div.dataset.slotId = slot.slot_id;
+      div.dataset.sessionId = sessionId;
+      const st = slotStatus(slot);
+      div.innerHTML =
+        '<div class="slot-section-header" title="Click to expand/collapse">' +
+          '<span class="slot-id">Slot ' + slot.slot_id + '</span>' +
+          (sessionId
+            ? '<span class="slot-session" title="' + escapeHtml(sessionId) + '">' + escapeHtml(shortSession(sessionId)) + '</span>'
+            : '<span class="slot-session muted">no session yet</span>') +
+          '<span class="slot-status-badge ' + st.cls + '">' + st.label + '</span>' +
+          '<span class="slot-expand-hint">expand</span>' +
+          '<label class="slot-autoscroll-label" title="Auto-scroll">' +
+            '<input type="checkbox" class="slot-autoscroll" checked /> Auto' +
+          '</label>' +
+        '</div>' +
+        '<div class="slot-log"></div>';
+      div.querySelector('.slot-section-header').addEventListener('click', function (ev) {
+        if (ev.target.closest('label') || ev.target.closest('input')) return;
+        toggleSlotExpand(Number(div.dataset.slotId));
+      });
+      return div;
+    }
+
+    function renderSlotSections(slots) {
+      const container = document.getElementById('slotSections');
+      if (!container) return;
+      const summary = document.getElementById('slotSummary');
+      const slotsList = allSlotsFrom(slots);
+      const active = activeSlotsFrom(slots);
+      currentSlots = slotsList;
+
+      if (summary) {
+        if (slotsList.length === 0) {
+          summary.textContent = 'No slot data available — llama-server not responding or no slots configured.';
+        } else if (active.length === 0) {
+          summary.textContent = slotsList.length + ' slot' + (slotsList.length !== 1 ? 's' : '') +
+            ' (all idle) — new activity appears here live.';
+        } else {
+          summary.textContent = active.length + ' active of ' + slotsList.length + ' slot' +
+            (slotsList.length !== 1 ? 's' : '');
+        }
+      }
+
+      const existing = new Map();
+      Array.from(container.querySelectorAll('.slot-section')).forEach(function (sec) {
+        existing.set(Number(sec.dataset.slotId), sec);
+      });
+
+      const seen = new Set();
+      for (const slot of slotsList) {
+        const sid = slot.slot_id;
+        seen.add(sid);
+        const sessionId = slot.session_id || '';
+        const sec = existing.get(sid);
+        if (sec && sec.dataset.sessionId === sessionId) {
+          // Keep the DOM so streamed log content survives; refresh header
+          updateSlotHeader(sec, slot, sessionId);
+          continue;
+        }
+        if (sec) {
+          // Session changed for this slot — rebuild the section from scratch
+          sec.remove();
+          existing.delete(sid);
+          stopSlotTails(sid);
+        }
+        container.appendChild(buildSlotSection(slot, sessionId));
+      }
+
+      // Remove sections for slots that are no longer active
+      for (const [sid, sec] of existing) {
+        if (!seen.has(sid)) {
+          sec.remove();
+          stopSlotTails(sid);
+        }
+      }
+
+      // Connect tails for every slot section (no-op for already-connected ones)
+      slotsList.forEach(connectSlotTails);
+
+      // Expansion bookkeeping: if the expanded slot vanished, reset
+      if (expandedSlotId !== null && !seen.has(expandedSlotId)) expandedSlotId = null;
+      applyExpansion();
+    }
+
+    function updateSlotHeader(sec, slot, sessionId) {
+      const st = slotStatus(slot);
+      const badge = sec.querySelector('.slot-status-badge');
+      if (badge) { badge.className = 'slot-status-badge ' + st.cls; badge.textContent = st.label; }
+      const sess = sec.querySelector('.slot-session');
+      if (sess) {
+        sess.textContent = sessionId ? shortSession(sessionId) : 'no session yet';
+        if (sessionId) sess.title = sessionId;
+      }
+    }
+
+    function connectSlotEvents() {
+      if (slotEventSource) return;
+      const es = new EventSource('/events');
+      slotEventSource = es;
+      es.onmessage = function (e) {
+        try {
+          const data = JSON.parse(e.data);
+          if (data && data.type === 'status' && data.slots !== undefined) {
+            renderSlotSections(data.slots);
+          }
+        } catch (err) {}
+      };
+      es.onerror = function () { /* EventSource auto-reconnects */ };
+    }
+
+    function disconnectSlotEvents() {
+      if (slotEventSource) { slotEventSource.close(); slotEventSource = null; }
+    }
+
+    function connectSlotTails(slot) {
+      const sid = slot.slot_id;
+      const key = String(sid);
+      if (slotTailSources[key]) return;
+      const section = findSlotSection(sid);
+      if (!section) return;
+      const sessionId = slot.session_id || null;
+      const n = Math.max(1, parseInt(sharedLinesInput.value || '200'));
+
+      const sources = {};
+      ['proxy', 'llama'].forEach(function (src) {
+        let url = '/logs/tail?lines=' + n + '&source=' + src + '&slot=' + sid;
+        if (sessionId) url += '&session=' + encodeURIComponent(sessionId);
+        const es = new EventSource(url);
+        sources[src] = es;
+        es.onmessage = function (e) {
+          try {
+            const obj = JSON.parse(e.data);
+            if (obj.initial !== undefined) {
+              obj.initial.split(String.fromCharCode(10)).forEach(function (l) {
+                if (l) appendSlotLine(sid, src, l);
+              });
+            } else if (obj.line !== undefined) {
+              appendSlotLine(sid, src, obj.line);
+            }
+          } catch (err) {}
+        };
+        es.onerror = function () { /* EventSource auto-reconnects */ };
+      });
+      slotTailSources[key] = sources;
+    }
+
+    function stopSlotTails(slotId) {
+      const key = String(slotId);
+      const sources = slotTailSources[key];
+      if (!sources) return;
+      Object.values(sources).forEach(function (es) { try { es.close(); } catch (err) {} });
+      delete slotTailSources[key];
+    }
+
+    function disconnectSlotTails() {
+      Object.keys(slotTailSources).forEach(function (k) { stopSlotTails(Number(k)); });
+    }
+
+    function appendSlotLine(slotId, source, text) {
+      const section = findSlotSection(slotId);
+      if (!section) return;
+      const logEl = section.querySelector('.slot-log');
+      const autoCb = section.querySelector('.slot-autoscroll');
+      if (!logEl) return;
+      const div = document.createElement('div');
+      div.className = 'line';
+      const badge = document.createElement('span');
+      badge.className = 'src-badge ' + source;
+      badge.textContent = source === 'llama' ? 'llama' : 'proxy';
+      div.appendChild(badge);
+      div.appendChild(document.createTextNode(' ' + text));
+      logEl.appendChild(div);
+      if (autoCb && autoCb.checked) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function toggleSlotExpand(slotId) {
+      expandedSlotId = (expandedSlotId === slotId) ? null : slotId;
+      applyExpansion();
+    }
+
+    function applyExpansion() {
+      document.querySelectorAll('.slot-section').forEach(function (sec) {
+        const sid = Number(sec.dataset.slotId);
+        const isExpanded = sid === expandedSlotId;
+        sec.classList.toggle('expanded', isExpanded);
+        const hint = sec.querySelector('.slot-expand-hint');
+        if (hint) hint.textContent = isExpanded ? 'collapse' : 'expand';
+      });
+    }
+
     // Initialise
     connectProxy();
     connectLlama();
     loadSessions();
     startPolling();
+    connectSlotEvents();  // Slots tab is the default tab
 
     window.addEventListener('beforeunload', () => {
       if (esProxy) esProxy.close();
       if (esLlama) esLlama.close();
       if (pollTimer) clearInterval(pollTimer);
+      if (slotEventSource) slotEventSource.close();
+      disconnectSlotTails();
     });
   </script>
 __LOG_VIEWER_SCRIPT__</body>

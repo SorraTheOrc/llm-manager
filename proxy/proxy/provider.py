@@ -20,6 +20,7 @@ Provides:
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -53,6 +54,25 @@ _BACKOFF_MAX_SECONDS = 45.0
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details.
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+
+# Usage-limit reset tracking (LP-0MSLJPOCC0001ROJ): failure-domain key ->
+# absolute epoch timestamp when the usage limit resets (including the
+# 2-minute safety margin). Providers in a domain with a pending usage reset
+# are skipped by every routing decision until the reset time passes.
+_usage_reset_at: dict[str, float] = {}
+
+# 2-minute safety margin added to the computed usage-limit reset time so a
+# clock-skewed upstream does not start re-serving 429s the moment the limit
+# nominally resets.
+_USAGE_LIMIT_RESET_MARGIN_SECONDS = 120
+
+# Fallback durations per metadata.limitName when the upstream message carries
+# no explicit "Resets in ..." duration (daily/weekly/monthly periods).
+_PERIOD_DEFAULT_SECONDS = {
+    "daily": 24 * 3600,
+    "weekly": 7 * 24 * 3600,
+    "monthly": 30 * 24 * 3600,
+}
 
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
@@ -231,19 +251,28 @@ def _extract_usage_from_sse_text(sse_text: str) -> dict | None:
     return last_usage
 
 
-def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
+def _estimate_prompt_tokens_for_routing(body_json: dict, tokenizer=None) -> int:
     """Estimate prompt token count for smart-routing decisions.
 
     Concatenates all message content (including reasoning_content
-    and tool_calls) and uses tiktoken (via ``count_text_tokens``) for
-    accurate token counting.  Falls back to a conservative byte-based
-    heuristic (1 byte per token) when tiktoken is unavailable.
+    and tool_calls) and counts tokens using the native tokenizer when one
+    is supplied (LP-0MSEQ71IF0003FRT), otherwise tiktoken (via
+    ``count_text_tokens``) for accurate token counting.  Falls back to a
+    conservative byte-based heuristic (1 byte per token) when tiktoken is
+    unavailable.
 
     Using tiktoken guarantees correct routing decisions regardless of
     content density — the previous byte heuristic with ``// 2`` could
     underestimate by 2× for very dense content (hex, compact JSON with
     bpt ~1.2), causing the cache-cold bypass to miss requests with 70K+
     actual tokens.
+
+    Args:
+        body_json: Parsed request body.
+        tokenizer: Optional native tokenizer (e.g. from
+            ``_get_tokenizer_for_model``). When provided, counts with it
+            directly (exact Qwen3-native counts); falls back to tiktoken
+            on any encode error.
     """
     if not isinstance(body_json, dict):
         return 0
@@ -293,6 +322,15 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
     if not parts:
         return 0
 
+    # Primary path: native tokenizer when provided (exact Qwen3 counts).
+    if tokenizer is not None:
+        try:
+            text = " ".join(parts)
+            return len(tokenizer.encode(text).ids)
+        except Exception:
+            # Fall through to tiktoken on any native-encode error.
+            pass
+
     # Primary path: use tiktoken for accurate token counting.
     # This correctly handles all content densities (code, JSON, text).
     try:
@@ -305,6 +343,54 @@ def _estimate_prompt_tokens_for_routing(body_json: dict) -> int:
         # JSON ~4, text ~4) guaranteeing the bypass always fires for large
         # requests even when tiktoken is unavailable.
         return max(1, total_bytes // 1)
+
+
+def _get_tokenizer_for_model(
+    model_config: dict | None,
+    server_config: dict | None = None,
+) -> tuple[object | None, float]:
+    """Resolve the native tokenizer + effective multiplier for a model.
+
+    Single ordered resolution chain (LP-0MSEQ71IF0003FRT):
+
+    1. Model entry has ``tokenizer: <name>`` that loads -> use that
+       tokenizer, **multiplier forced to 1.0** (a native tokenizer is
+       exact; applying the ~1.69x cl100k multiplier on top would
+       over-count ~69% and wrongly push requests remote).
+    2. No tokenizer named -> ``cl100k_base`` **+ multiplier** (per-model
+       override wins, else server-level, else 1.0) — today's behavior,
+       unchanged.
+    3. Named tokenizer exists but fails to load (missing file / import
+       error) -> warn + fall back to step 2.
+
+    Shared by BOTH the routing estimate (provider.py
+    ``_estimate_prompt_tokens_for_routing``) and the persistence estimate
+    (session.py ``_estimate_slot_prompt_tokens``) so the routing clamp and
+    the persistence cap can never disagree (AC3).
+
+    Returns:
+        ``(tokenizer_or_None, multiplier)``.
+    """
+    multiplier = _get_token_estimate_multiplier(server_config or {}, model_config)
+    if not isinstance(model_config, dict):
+        return None, multiplier
+    tokenizer_name = model_config.get("tokenizer")
+    if not tokenizer_name:
+        return None, multiplier
+    try:
+        from proxy.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(tokenizer_name)
+    except Exception:
+        tokenizer = None
+    if tokenizer is None:
+        logger.warning(
+            "tokenizer %r unavailable; falling back to tiktoken + multiplier %.3f",
+            tokenizer_name,
+            multiplier,
+        )
+        return None, multiplier
+    return tokenizer, 1.0
 
 
 def _get_token_estimate_multiplier(config: dict, model_config: dict | None = None) -> float:
@@ -361,11 +447,11 @@ def _get_large_context_threshold(config: dict) -> int:
 
 
 def _get_warm_cache_threshold(config: dict) -> int:
-    """Read the warm-cache total-context threshold from config.
+    """Read the context-too-large (warm-cache) total-context threshold.
 
-    When ``estimated_tokens`` exceeds this value, local is bypassed even
-    if the cache is warm (because total context is too large for the local
-    model slot).
+    When ``estimated_tokens`` exceeds this value, local is bypassed with
+    skip reason ``context_too_large`` (LP-0MSF8XDG7000PERM) regardless of
+    cache state — total context is too large for the local model slot.
 
     Supports both nested and flat config keys for production and test
     compatibility.  Config default: 100000.
@@ -434,6 +520,28 @@ def _get_active_local_slots(config: dict) -> int:
 # (LP-0MSDCLQ2W001LGWC). Configurable via ``context_pressure_warn_ratio``
 # on the server config; 0 disables the warning.
 _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
+
+
+def _get_active_local_ctx_size(config: dict) -> int:
+    """Return the currently active local context size (schedule-aware).
+
+    Prefers the live slot scheduler's per-period ``ctx_size`` (the ACTIVE
+    schedule entry's override, LP-0MSLNK96T0018W4D); falls back to the
+    static ``local_model_ctx_size`` from config, which ``restart_services``
+    keeps in sync with the last applied transition. Mirrors
+    ``_get_active_local_slots``.
+    """
+    try:
+        import proxy.server as _srv
+
+        scheduler = getattr(_srv, "slot_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "get_active_ctx_size"):
+            ctx = scheduler.get_active_ctx_size()
+            if ctx and int(ctx) > 0:
+                return int(ctx)
+    except Exception:
+        pass
+    return _get_local_model_ctx_size(config)
 
 
 def _get_context_pressure_warn_ratio(config: dict) -> float:
@@ -560,7 +668,7 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     """
     cold = _get_large_context_threshold(config)
     warm = _get_warm_cache_threshold(config)
-    ctx_size = _get_local_model_ctx_size(config)
+    ctx_size = _get_active_local_ctx_size(config)
     slots = _get_active_local_slots(config)
 
     cap = effective_per_slot_threshold(ctx_size, slots)
@@ -575,21 +683,23 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     return cold, warm
 
 
-def _collect_local_slot_counts(config: dict) -> list[int]:
-    """All slot counts the proxy may run with: static pool + schedule entries.
+def _collect_local_ctx_pairs(config: dict) -> list[tuple[int, int]]:
+    """All (ctx_size, slots) pairs the proxy may run with.
 
-    Returns the static ``session_slot_pool_size`` (when > 0) followed by the
-    ``slots`` value of every entry in an enabled ``slot_schedule``. Slot counts
-    are de-duplicated while preserving order.
+    The static ``local_model_ctx_size``/``session_slot_pool_size`` pair plus
+    every ``slot_schedule`` entry, where an entry's per-period ``ctx_size``
+    overrides the global value (falling back to it when unset)
+    (LP-0MSLNK96T0018W4D). Pairs are de-duplicated while preserving order.
     """
     server_cfg = config.get("server", config)
-    counts: list[int] = []
+    ctx_size = _get_local_model_ctx_size(config)
+    pairs: list[tuple[int, int]] = []
     try:
         pool = int(server_cfg.get("session_slot_pool_size", 0) or 0)
     except (ValueError, TypeError):
         pool = 0
     if pool > 0:
-        counts.append(pool)
+        pairs.append((ctx_size, pool))
 
     try:
         from proxy.slot_scheduler import SlotScheduleConfig
@@ -599,9 +709,10 @@ def _collect_local_slot_counts(config: dict) -> list[int]:
         schedule = None
     if schedule is not None and schedule.enabled:
         for entry in schedule.entries:
-            if entry.slots > 0 and entry.slots not in counts:
-                counts.append(entry.slots)
-    return counts
+            entry_ctx = entry.ctx_size if entry.ctx_size is not None else ctx_size
+            if entry.slots > 0 and (entry_ctx, entry.slots) not in pairs:
+                pairs.append((entry_ctx, entry.slots))
+    return pairs
 
 
 def _get_min_local_routing_threshold(config: dict) -> int:
@@ -627,11 +738,14 @@ def validate_local_routing_config(config: dict) -> list[str]:
     """Validate the ctx-size / slot-count routing clamp configuration.
 
     Computes the effective per-slot large-context routing threshold
-    (``local_model_ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``,
-    mirroring ``_effective_large_context_thresholds``) for EVERY slot count
-    the proxy may run with — the static ``session_slot_pool_size`` AND all
-    ``slot_schedule`` entries — and reports a problem when the threshold
-    falls below the configured minimum (default 10000 tokens).
+    (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``, mirroring
+    ``_effective_large_context_thresholds``) for EVERY (ctx_size, slots)
+    pair the proxy may run with — the static
+    ``local_model_ctx_size``/``session_slot_pool_size`` AND all
+    ``slot_schedule`` entries (each entry's per-period ``ctx_size``
+    overriding the global when set, LP-0MSLNK96T0018W4D) — and reports a
+    problem when the threshold falls below the configured minimum (default
+    10000 tokens).
 
     A threshold this small means every realistic agent session exceeds the
     clamp, silently bypassing ALL local traffic to remote providers (the
@@ -642,10 +756,6 @@ def validate_local_routing_config(config: dict) -> list[str]:
     set, each problem is prefixed with ``FATAL: `` so callers can fail
     startup; otherwise callers log a WARNING.
     """
-    ctx_size = _get_local_model_ctx_size(config)
-    if ctx_size <= 0:
-        return []  # clamp disabled; nothing to validate
-
     min_threshold = _get_min_local_routing_threshold(config)
     if min_threshold <= 0:
         return []  # minimum check disabled (min_local_routing_threshold: 0)
@@ -656,8 +766,10 @@ def validate_local_routing_config(config: dict) -> list[str]:
     )
 
     problems: list[str] = []
-    for slots in _collect_local_slot_counts(config):
-        threshold = effective_per_slot_threshold(ctx_size, slots)
+    for ctx, slots in _collect_local_ctx_pairs(config):
+        if ctx <= 0:
+            continue  # clamp disabled for this pair
+        threshold = effective_per_slot_threshold(ctx, slots)
         if threshold <= 0:
             # Per-slot context leaves no room for output tokens; the clamp
             # leaves thresholds unchanged rather than clamping, so nothing
@@ -665,9 +777,9 @@ def validate_local_routing_config(config: dict) -> list[str]:
             continue
         if threshold < min_threshold:
             msg = (
-                f"local_model_ctx_size={ctx_size} with {slots} slots yields "
+                f"local_model_ctx_size={ctx} with {slots} slots yields "
                 f"effective per-slot large-context routing threshold "
-                f"{threshold} ({ctx_size}//{slots} - "
+                f"{threshold} ({ctx}//{slots} - "
                 f"{_LOCAL_ROUTING_OUTPUT_HEADROOM} headroom), below the "
                 f"minimum of {min_threshold}. Every prompt above {threshold} "
                 f"tokens bypasses local to remote, silently disabling local "
@@ -681,6 +793,7 @@ def validate_local_routing_config(config: dict) -> list[str]:
 async def _estimate_effective_prompt_tokens_for_routing(
     request,
     body_json: dict,
+    tokenizer=None,
 ) -> int:
     """Estimate prompt tokens for routing, including active session history.
 
@@ -693,8 +806,12 @@ async def _estimate_effective_prompt_tokens_for_routing(
 
     - incoming request token estimate
     - existing session history token estimate (if a session header resolves)
+
+    ``tokenizer`` (optional native tokenizer, LP-0MSEQ71IF0003FRT) is passed
+    through to both estimates so routing clamps compare Qwen3-native counts
+    consistently with the persistence cap.
     """
-    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
+    estimated_tokens = _estimate_prompt_tokens_for_routing(body_json, tokenizer=tokenizer)
 
     try:
         from proxy.session import _resolve_session_id_header
@@ -718,7 +835,7 @@ async def _estimate_effective_prompt_tokens_for_routing(
             return estimated_tokens
 
         session_tokens = _estimate_prompt_tokens_for_routing(
-            {"messages": session_messages}
+            {"messages": session_messages}, tokenizer=tokenizer
         )
         if session_tokens > estimated_tokens:
             logger.info(
@@ -745,10 +862,11 @@ def _should_skip_local(
 
     Implements a two-tier check:
 
-    1. **Warm-cache threshold (hard cap):** If ``estimated_tokens`` exceeds
-       ``warm_cache_threshold``, bypass local regardless of cache state.
-       This prevents routing excessively large total contexts to local even
-       when the cache is warm.
+    1. **Context-too-large threshold (hard cap):** If ``estimated_tokens``
+       exceeds ``warm_cache_threshold``, bypass local regardless of cache
+       state (skip reason ``context_too_large``). This prevents routing
+       excessively large total contexts to local even when the cache is
+       warm.
 
     2. **Cold-cache new-token check:** Calculates the number of uncached
        tokens: ``new_tokens = int(estimated_tokens * (1 - cached_ratio))``.
@@ -815,6 +933,8 @@ def resolve_provider(
       brand — LP-0MSG45I8Q0020N1F)
     - Is not in cooldown (entry name OR provider brand —
       LP-0MSG45LOO007K236)
+    - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
+      reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
@@ -845,12 +965,29 @@ def resolve_provider(
         name = provider_cfg.get("name", "")
         if failed_provider and name == failed_provider:
             continue
-        if failed_domain is not None and _failure_domain_key(provider_cfg) == failed_domain:
+        domain = _failure_domain_key(provider_cfg)
+        if failed_domain is not None and domain == failed_domain:
             logger.info(
                 "Skipping provider=%s: same failure domain as %s (%s)",
                 name,
                 failed_provider,
-                failed_domain,
+                domain,
+            )
+            continue
+        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ). Quarantine is keyed
+        # on the API-key ACCOUNT, not the endpoint: distinct api_key_env
+        # entries on the same gateway have independent limits
+        # (LP-0MSMBWB23009XYPW).
+        usage_key = _usage_limit_account_key(provider_cfg)
+        reset_remaining = _usage_reset_remaining(usage_key)
+        if reset_remaining > 0:
+            logger.info(
+                "Skipping provider=%s: usage_limit_reset_pending "
+                "(account=%s, reset_at=%s, reset_in=%ds)",
+                name,
+                usage_key,
+                datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
+                int(reset_remaining),
             )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
@@ -1265,11 +1402,11 @@ def validate_chain_hold_config(config: dict) -> list[str]:
         try:
             if float(seconds) < 0:
                 problems.append(
-                    "server.chain_hold_seconds must be >= 0 (got %r)" % (seconds,)
+                    f"server.chain_hold_seconds must be >= 0 (got {seconds!r})"
                 )
         except (ValueError, TypeError):
             problems.append(
-                "server.chain_hold_seconds must be a number (got %r)" % (seconds,)
+                f"server.chain_hold_seconds must be a number (got {seconds!r})"
             )
 
     max_cycles = config.get("chain_hold_max_cycles")
@@ -1279,12 +1416,11 @@ def validate_chain_hold_config(config: dict) -> list[str]:
         try:
             if int(max_cycles) < 0:
                 problems.append(
-                    "server.chain_hold_max_cycles must be >= 0 (got %r)" % (max_cycles,)
+                    f"server.chain_hold_max_cycles must be >= 0 (got {max_cycles!r})"
                 )
         except (ValueError, TypeError):
             problems.append(
-                "server.chain_hold_max_cycles must be an integer (got %r)"
-                % (max_cycles,)
+                f"server.chain_hold_max_cycles must be an integer (got {max_cycles!r})"
             )
 
     # Unbounded busy-retry: zero hold interval with unlimited cycles.
@@ -1669,6 +1805,141 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     return (cur_active, max_local)
 
 
+# ---------------------------------------------------------------------------
+# Bounded cross-session contention queue (LP-0MSORQVK50012Q4D)
+# ---------------------------------------------------------------------------
+
+def _contention_queue_enabled(config: dict) -> bool:
+    """True when the contention queue should engage: queue policy AND cheap mode.
+
+    The per-mode policy comes from the active mode config
+    (``contention_queue_policy``; config-cheap.yaml declares ``queue``,
+    config-fast.yaml declares ``fallback``). Belt-and-braces: the queue also
+    requires ``proxy.mode.read_mode() == "cheap"`` so an operator override of
+    LLAMA_PROXY_CONFIG cannot enable queueing in fast mode (LP-0MSORQVK50012Q4D
+    constraint 5). Fail-open: any error → queue disabled (today's behavior).
+    """
+    try:
+        from proxy.router import _get_contention_queue_config
+
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        cq = _get_contention_queue_config(server_cfg)
+        if cq["policy"] != "queue":
+            return False
+        from proxy.mode import read_mode
+
+        return read_mode() == "cheap"
+    except Exception:
+        return False
+
+
+async def _queue_context_bypass(
+    config: dict,
+    model_config: dict,
+    provider_cfg: dict,
+    request,
+    body_json: dict,
+    session_id: str | None,
+) -> tuple[bool, str | None]:
+    """Mirror of the smart-routing large-context skip decision.
+
+    Used ONLY at the contention-queue decision point so context bypasses
+    (``context_too_large`` / ``large_context_bypass``) are NEVER queued — they
+    fall back exactly as today (LP-0MSORQVK50012Q4D AC4). Keeps the same
+    thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
+    smart-routing block below; returns ``(skip_local, skip_reason)``.
+    """
+    _llama_model = provider_cfg.get("llama_model", "")
+    _cold_threshold, _warm_threshold = _effective_large_context_thresholds(config)
+    _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
+    _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
+        request, body_json, tokenizer=_tokenizer,
+    )
+    if _multiplier != 1.0:
+        _estimated_tokens = int(_estimated_tokens * _multiplier)
+    _skip_local = _should_skip_local(
+        _llama_model, session_id, body_json, _cold_threshold,
+        estimated_tokens=_estimated_tokens,
+        warm_cache_threshold=_warm_threshold,
+    )
+    if _skip_local:
+        if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
+            _skip_reason = "context_too_large"
+        else:
+            _skip_reason = "large_context_bypass"
+    else:
+        _skip_reason = None
+    return _skip_local, _skip_reason
+
+
+def _set_queue_wait_on_request(request, elapsed: float) -> None:
+    """Record the elapsed contention-queue wait on the request so
+    ``proxy_to_local`` can subtract it from the adaptive timeout budget
+    (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``)."""
+    try:
+        setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
+    except Exception:
+        pass
+
+
+async def _maybe_queue_for_local_slot(
+    config: dict,
+    cur_local: int,
+    max_local: int,
+    request,
+    body_json: dict,
+    model_config: dict,
+    provider_cfg: dict,
+    session_id: str | None,
+) -> tuple[str, str | None, float | None]:
+    """Queue-wait for a local slot (cheap mode, queue policy) instead of
+    immediately falling back to the next remote provider.
+
+    Returns ``(action, reason, elapsed_seconds)`` where action is one of:
+
+      - ``"dispatch"`` — a slot freed within the caps; the caller should
+        dispatch local. *elapsed_seconds* is the queue wait (for the Q2=a
+        budget subtraction).
+      - ``"fallback"`` — caps exceeded; the caller falls back to the next
+        remote provider exactly as today.
+      - ``"context_bypass"`` — the request cannot fit a KV slot; it was
+        never queued; the caller records ``cached_tokens_skip`` with the
+        returned *reason*.
+      - ``"fallback_policy"`` — policy is fallback / not cheap mode; the
+        caller keeps today's ``local_concurrency_limit`` behavior.
+    """
+    if not _contention_queue_enabled(config):
+        return ("fallback_policy", None, None)
+    # Context bypasses never queue (AC4): a request that cannot fit the KV
+    # slot must fall back exactly as today.
+    skip_local, skip_reason = await _queue_context_bypass(
+        config, model_config, provider_cfg, request, body_json, session_id,
+    )
+    if skip_local:
+        return ("context_bypass", skip_reason, None)
+
+    from proxy.router import _get_contention_queue_config
+
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    cq = _get_contention_queue_config(server_cfg)
+
+    import time as _time
+
+    from proxy import contention_queue
+
+    _wait_started = _time.monotonic()
+    elapsed = await contention_queue.wait_for_local_slot(
+        max_wait_seconds=cq["max_wait_seconds"],
+        max_depth=cq["max_depth"],
+        slot_free_check=lambda: _get_local_concurrency_info(config)[0] < max_local,
+    )
+    if elapsed is None:
+        # Caps exceeded — the caller falls back. Surface the measured wait so
+        # the fallback-after-queue event can record elapsed wait time (F4 AC2).
+        return ("fallback", None, _time.monotonic() - _wait_started)
+    return ("dispatch", None, elapsed)
+
+
 
 
 
@@ -1828,6 +2099,24 @@ def _normalize_endpoint_for_failure_domain(endpoint: str) -> str | None:
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
+def _usage_limit_account_key(provider_cfg: dict) -> str:
+    """Return a canonical key identifying the upstream ACCOUNT for usage-limit
+    quarantine (LP-0MSMBWB23009XYPW).
+
+    Usage limits are per-account (per API key), NOT per endpoint: entries that
+    share a gateway but use different ``api_key_env`` values (e.g.
+    ``opencode-go`` and ``opencode-go-2`` on https://opencode.ai/zen/go) have
+    independent limits and must be quarantined independently. The key combines
+    ``api_key_env`` with the normalized endpoint so distinct accounts on the
+    same gateway stay separate. Entries without an ``api_key_env`` cannot be
+    distinguished by account and fall back to the failure-domain key.
+    """
+    api_key_env = provider_cfg.get("api_key_env")
+    if api_key_env:
+        return f"{api_key_env}@{_failure_domain_key(provider_cfg)}"
+    return _failure_domain_key(provider_cfg)
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
@@ -1839,6 +2128,9 @@ def _resolve_provider_with_exclusions(
     ``excluded_domains`` holds failure-domain keys (see ``_failure_domain_key``)
     that already stalled / terminally failed during THIS request, so the chain
     skips straight past same-gateway API-key siblings (LP-0MSG45I8Q0020N1F).
+    Usage-limit account keys (see ``_usage_limit_account_key``) are checked
+    against the same set so an account exhausted by a usage-limit error is not
+    retried via another entry sharing that account (LP-0MSMBWB23009XYPW).
     """
     providers: list[dict[str, Any]] | None = model_config.get("providers")
     if not providers:
@@ -1850,12 +2142,38 @@ def _resolve_provider_with_exclusions(
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
             continue
-        if _failure_domain_key(provider_cfg) in excluded_domains:
+        domain = _failure_domain_key(provider_cfg)
+        if domain in excluded_domains:
             logger.info(
                 "Skipping provider=%s: same failure domain as an already-failed "
                 "entry (domain=%s)",
                 name,
-                _failure_domain_key(provider_cfg),
+                domain,
+            )
+            continue
+        # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
+        # upstream usage-limit error (GoUsageLimitError etc.) and is
+        # quarantined until the computed reset time + margin passes. Keyed on
+        # the API-key account, not the endpoint: distinct api_key_env entries
+        # on the same gateway have independent limits (LP-0MSMBWB23009XYPW).
+        usage_key = _usage_limit_account_key(provider_cfg)
+        if usage_key in excluded_domains:
+            logger.info(
+                "Skipping provider=%s: same usage-limit account as an "
+                "already-exhausted entry (account=%s)",
+                name,
+                usage_key,
+            )
+            continue
+        reset_remaining = _usage_reset_remaining(usage_key)
+        if reset_remaining > 0:
+            logger.info(
+                "Skipping provider=%s: usage_limit_reset_pending "
+                "(account=%s, reset_at=%s, reset_in=%ds)",
+                name,
+                usage_key,
+                datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
+                int(reset_remaining),
             )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
@@ -1947,6 +2265,109 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
         return True
 
     return False
+
+
+def _parse_resets_in(message: str) -> float | None:
+    """Parse a ``Resets in ...`` duration from an upstream error message.
+
+    Handles the observed opencode format (``Resets in 22hr 43min.``) plus
+    plural/full-word variants: hours, minutes, seconds, and days (used by
+    monthly limits). Returns the duration in seconds, or ``None`` when the
+    message carries no parseable reset duration.
+    """
+    match = re.search(r"resets?\s+in\s+(.+?)(?:\.|$)", message or "", re.IGNORECASE)
+    if not match:
+        return None
+    total = 0.0
+    found = False
+    for num_str, unit in re.findall(
+        r"(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)",
+        match.group(1),
+        re.IGNORECASE,
+    ):
+        value = float(num_str)
+        u = unit.lower()
+        if u in ("d", "day", "days"):
+            total += value * 86400
+        elif u in ("h", "hr", "hrs", "hour", "hours"):
+            total += value * 3600
+        elif u in ("m", "min", "mins", "minute", "minutes"):
+            total += value * 60
+        elif u in ("s", "sec", "secs", "second", "seconds"):
+            total += value
+        found = True
+    return total if found else None
+
+
+def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | None:
+    """Return seconds until the usage limit resets for a 429 usage-limit error.
+
+    Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
+    error variant that carries a reset duration in its message (including
+    ``FreeUsageLimitError`` responses that include one). The reset duration is
+    parsed from the provider message (``Resets in 22hr 43min``); when the
+    message has no explicit duration, ``metadata.limitName``
+    (daily/weekly/monthly) supplies the period. The 2-minute safety margin is
+    added to the returned duration.
+
+    Returns ``None`` when the response is not a 429 usage-limit error or no
+    reset duration can be computed — callers then fall back to the existing
+    ``FreeUsageLimitError`` 3-hour cooldown / generic rate-limit handling.
+
+    Expected upstream format (observed from opencode.ai/zen):
+        HTTP 429
+        Body: {"type": "error", "error": {"type": "GoUsageLimitError",
+              "message": "Weekly usage limit reached. Resets in 22hr 43min."},
+              "metadata": {"limitName": "weekly"}}
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return None
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    err_type = None
+    message = None
+    limit_name = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            err_type = str(error.get("type", "")).strip().lower()
+            message = error.get("message")
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            limit_name = str(metadata.get("limitName", "")).strip().lower()
+
+    if err_type not in ("gousagelimiterror", "freeusagelimiterror"):
+        return None
+
+    seconds = _parse_resets_in(message) if message else None
+    if seconds is None and limit_name in _PERIOD_DEFAULT_SECONDS:
+        seconds = _PERIOD_DEFAULT_SECONDS[limit_name]
+    if seconds is None:
+        return None
+    return float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS
+
+
+def _usage_reset_remaining(failure_domain: str) -> float:
+    """Return the remaining seconds before a usage-limit reset for an account
+    / failure-domain key (see ``_usage_limit_account_key``).
+
+    Returns 0.0 when the domain has no pending usage reset or its reset time
+    has passed (expired entries are cleaned up lazily, mirroring the cooldown
+    dict behaviour).
+    """
+    expiry = _usage_reset_at.get(failure_domain)
+    if expiry is None:
+        return 0.0
+    remaining = expiry - time.time()
+    if remaining <= 0:
+        del _usage_reset_at[failure_domain]
+        return 0.0
+    return remaining
 
 
 # ---------------------------------------------------------------------------
@@ -3069,6 +3490,30 @@ async def _proxy_with_remote_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
+                # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
+                # FreeUsageLimitError-with-reset-time quarantines the failing
+                # API-key ACCOUNT until the computed reset time + 2m margin.
+                # Not the whole endpoint: distinct api_key_env entries on the
+                # same gateway have independent limits (LP-0MSMBWB23009XYPW).
+                _reset_seconds = _usage_limit_reset_seconds(response, body_text)
+                if _reset_seconds is not None:
+                    _reset_account = _usage_limit_account_key(provider_cfg)
+                    _usage_reset_at[_reset_account] = time.time() + _reset_seconds
+                    fallback_reason = "usage_limit_reset"
+                    prev_provider = provider_name
+                    attempted_domains.add(_reset_account)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="usage_limit_reset",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                        reset_in_seconds=int(_reset_seconds),
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
                 # FreeUsageLimitError: apply 3-hour cooldown on affected provider
                 # so the fallback chain routes to paid alternatives instead of
                 # repeatedly retrying the exhausted free tier.
@@ -3373,18 +3818,96 @@ async def _proxy_with_fallback_cycle(
                 # provider without marking local as unavailable.
                 cur_local, max_local = _get_local_concurrency_info(config)
                 if cur_local >= max_local:
-                    _record_attempt(
-                        attempts,
-                        provider=provider_name,
-                        type=provider_type,
-                        status="local_concurrency_limit",
-                        active=cur_local,
-                        max=max_local,
+                    # Per-mode contention queue (LP-0MSORQVK50012Q4D): in cheap
+                    # mode with policy=queue, a request that finds local slots
+                    # exhausted QUEUES (bounded by caps) instead of immediately
+                    # falling back to the next remote provider. When a slot
+                    # frees within the caps it is dispatched local; when the
+                    # caps are exceeded it falls back exactly as today.
+                    _cq_action, _cq_reason, _cq_elapsed = (
+                        await _maybe_queue_for_local_slot(
+                            config, cur_local, max_local, request, body_json,
+                            model_config, provider_cfg, _session_id,
+                        )
                     )
-                    fallback_reason = "local_concurrency_limit"
-                    prev_provider = provider_name
-                    all_slot_exhaustion = False
-                    continue
+                    if _cq_action == "dispatch":
+                        # A slot freed within the caps — dispatch local below.
+                        _set_queue_wait_on_request(request, _cq_elapsed)
+                        try:
+                            from proxy import contention_queue
+
+                            _cq_m = contention_queue.metrics()
+                        except Exception:
+                            _cq_m = {}
+                        logger.info(
+                            "contention_queue_dispatch provider=%s session=%s "
+                            "queued_duration=%.2fs policy=queue depth=%d",
+                            provider_name, _session_id or "unknown",
+                            _cq_elapsed or 0.0,
+                            _cq_m.get("contention_queue_depth", 0),
+                        )
+                        try:
+                            from proxy.metrics import record_contention_queued
+
+                            record_contention_queued(_cq_elapsed or 0.0)
+                        except Exception:
+                            pass
+                    elif _cq_action == "fallback":
+                        # Caps exceeded — fall back to the next remote provider
+                        # exactly as today (fallback-after-queue recorded with
+                        # the elapsed queue wait, F4 AC2).
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="fallback_after_queue",
+                            active=cur_local,
+                            max=max_local,
+                            elapsed_wait_seconds=round(_cq_elapsed or 0.0, 3),
+                        )
+                        fallback_reason = "fallback_after_queue"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        logger.info(
+                            "contention_queue_fallback_after_queue provider=%s "
+                            "session=%s queued_duration=%.2fs",
+                            provider_name, _session_id or "unknown",
+                            _cq_elapsed or 0.0,
+                        )
+                        try:
+                            from proxy.metrics import record_contention_fallback_after_queue
+
+                            record_contention_fallback_after_queue()
+                        except Exception:
+                            pass
+                        continue
+                    elif _cq_action == "context_bypass":
+                        # Context bypasses never queue (AC4): fall back exactly
+                        # as today with the context skip reason.
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="cached_tokens_skip",
+                            reason=_cq_reason,
+                        )
+                        fallback_reason = _cq_reason
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
+                    else:  # fallback_policy — fast mode unchanged
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_concurrency_limit",
+                            active=cur_local,
+                            max=max_local,
+                        )
+                        fallback_reason = "local_concurrency_limit"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
 
                 # Smart routing: skip local when cache is cold and request is large
                 # (LP-0MRCSSBTM002NK3B). This avoids expensive full re-prefill of
@@ -3401,17 +3924,22 @@ async def _proxy_with_fallback_cycle(
                 _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
                     config
                 )
+                # Resolve the native tokenizer + multiplier via the shared
+                # helper (LP-0MSEQ71IF0003FRT): a named tokenizer (e.g.
+                # ``tokenizer: qwen3`` on the model entry) replaces the
+                # tiktoken-vs-Qwen3 mismatch (~1.69x undercount,
+                # LP-0MSAOQTJS000FFVM F2/F3) with exact counts and forces
+                # the multiplier to 1.0; without a tokenizer, the server-
+                # level / per-model token_estimate_multiplier still applies
+                # (LP-0MSEGPO77005CYCQ F2).
+                _tokenizer, _multiplier = _get_tokenizer_for_model(
+                    model_config, config
+                )
                 _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
                     request,
                     body_json,
+                    tokenizer=_tokenizer,
                 )
-                # Apply token estimate multiplier to account for tokenizer
-                # mismatch (e.g., cl100k_base vs Qwen3 native tokenizer
-                # undercounts ~1.69x — LP-0MSAOQTJS000FFVM F2/F3). Server-level
-                # token_estimate_multiplier is applied, with a per-model
-                # token_estimate_multiplier override winning (F2
-                # LP-0MSEGPO77005CYCQ).
-                _multiplier = _get_token_estimate_multiplier(config, model_config)
                 if _multiplier != 1.0:
                     _estimated_tokens = int(_estimated_tokens * _multiplier)
                 # Compute once for reuse in logs and reason detection
@@ -3439,8 +3967,9 @@ async def _proxy_with_fallback_cycle(
                 # fraction of their earlier speed. Warn so agents/operators
                 # compact before decode degrades.
                 if should_warn_context_pressure(_estimated_tokens, config):
+                    _active_ctx = _get_active_local_ctx_size(config)
                     _per_slot = effective_per_slot_threshold(
-                        _get_local_model_ctx_size(config),
+                        _active_ctx,
                         _get_active_local_slots(config),
                     )
                     logger.warning(
@@ -3453,7 +3982,7 @@ async def _proxy_with_fallback_cycle(
                         _per_slot,
                         context_pressure_ratio(
                             _estimated_tokens,
-                            _get_local_model_ctx_size(config),
+                            _active_ctx,
                             _get_active_local_slots(config),
                         ),
                         _get_context_pressure_warn_ratio(config),
@@ -3467,12 +3996,13 @@ async def _proxy_with_fallback_cycle(
                     warm_cache_threshold=_warm_threshold,
                 )
                 if _skip_local:
-                    # Determine reason: warm_cache_threshold triggers when
-                    # estimated_tokens > warm_cache_threshold (total context
-                    # too large regardless of cache state).  Otherwise the
-                    # cold-cache new-token check triggered.
+                    # Determine reason: the context-too-large hard cap fires
+                    # when estimated_tokens > warm_cache_threshold (total
+                    # context too large regardless of cache state), logged as
+                    # ``context_too_large`` (LP-0MSF8XDG7000PERM).  Otherwise
+                    # the cold-cache new-token check triggered.
                     if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
-                        _skip_reason = "warm_cache_bypass"
+                        _skip_reason = "context_too_large"
                     else:
                         _skip_reason = "large_context_bypass"
                     logger.info(
@@ -3803,6 +4333,30 @@ async def _proxy_with_fallback_cycle(
                             status="http_error_no_cooldown",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
+                    # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
+                    # FreeUsageLimitError-with-reset-time quarantines the failing
+                    # API-key ACCOUNT until the computed reset time + 2m margin.
+                    # Not the whole endpoint: distinct api_key_env entries on the
+                    # same gateway have independent limits (LP-0MSMBWB23009XYPW).
+                    _reset_seconds = _usage_limit_reset_seconds(response, body_text)
+                    if _reset_seconds is not None:
+                        _reset_account = _usage_limit_account_key(provider_cfg)
+                        _usage_reset_at[_reset_account] = time.time() + _reset_seconds
+                        fallback_reason = "usage_limit_reset"
+                        prev_provider = provider_name
+                        attempted_domains.add(_reset_account)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="usage_limit_reset",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            reset_in_seconds=int(_reset_seconds),
                         )
                         all_slot_exhaustion = False
                         continue

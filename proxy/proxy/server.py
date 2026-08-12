@@ -20,6 +20,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
+from proxy import mode as mode_module
+from proxy.disconnect_reaper import DisconnectReaperMiddleware
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
 from proxy.slot_scheduler import SlotScheduler
 
@@ -86,6 +88,9 @@ counts_filename = "request_counts.json"
 counts_dirty = False
 counts_persist_task: asyncio.Task | None = None
 periodic_broadcast_task: asyncio.Task | None = None
+
+# CLOSE-WAIT disconnect reaper instance (LP-0MSNM9UCC002CHYU).
+_disconnect_reaper: Any = None
 
 # Active local queries counter (global, all providers)
 active_queries: int = 0
@@ -159,7 +164,11 @@ async def _dispatch_cleanup_loop() -> None:
             await asyncio.sleep(10.0)
             # Import via _srv() to get the current module state
             import proxy.server as _srv
-            from proxy.router_helpers import _cleanup_stale_local_dispatch, _recover_stuck_local_active_queries
+            from proxy.router_helpers import (
+                _cleanup_stale_local_dispatch,
+                _recover_stuck_global_active_queries,
+                _recover_stuck_local_active_queries,
+            )
             removed = await _cleanup_stale_local_dispatch(_srv)
             if removed:
                 try:
@@ -170,6 +179,7 @@ async def _dispatch_cleanup_loop() -> None:
                 except Exception:
                     pass
             await _recover_stuck_local_active_queries(_srv)
+            await _recover_stuck_global_active_queries(_srv)
         except asyncio.CancelledError:
             logger.info("Dispatch lease cleanup task cancelled")
             return
@@ -681,6 +691,68 @@ def _startup_launch_slot_scheduler():
         slot_scheduler = None
 
 
+def _startup_launch_mode_scheduler():
+    """Start the automatic fast/cheap mode-scheduler background thread.
+
+    Enforces the ``mode_schedule`` (default cheap 01:00-10:00, fast
+    10:00-01:00). A manual API override (persisted override-until expiry)
+    is respected until the next scheduled transition, so a restart
+    mid-override does NOT revert it (LP-0MSMF25V9002AY1J). The first check
+    runs immediately so schedule transitions apply right away instead of
+    waiting a full interval.
+    """
+    try:
+        srv_config = _srv().config
+        server_config = (
+            srv_config.get("server", {}) if isinstance(srv_config, dict) else None
+        )
+        schedule = mode_module.ModeScheduleConfig.from_server_config(server_config)
+        if schedule.enabled:
+            mode_module.start_mode_scheduler(schedule)
+            logger.info(
+                "Mode scheduler: enabled with %d entries: %s",
+                len(schedule.entries),
+                [(e.time.strftime("%H:%M"), e.mode) for e in schedule.entries],
+            )
+        else:
+            logger.debug("Mode scheduler: disabled via config (enabled: false)")
+    except Exception as e:
+        logger.warning("Failed to start mode scheduler: %s", e)
+
+
+def _startup_launch_disconnect_reaper():
+    """Start the CLOSE-WAIT disconnect reaper background loop.
+
+    Cancels in-flight request tasks whose client disconnected mid-request,
+    so abandoned sockets do not accumulate in CLOSE-WAIT
+    (LP-0MSNM9UCC002CHYU).
+    """
+    global _disconnect_reaper
+    try:
+        from proxy.disconnect_reaper import DisconnectReaper
+        reaper = DisconnectReaper()
+        _disconnect_reaper = reaper
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(reaper.start())
+        except RuntimeError:
+            # No running loop (sync call path) — the lifespan caller runs
+            # inside a loop, so this is a defensive fallback only.
+            pass
+        logger.info("Disconnect reaper: started")
+    except Exception as e:
+        logger.warning("Failed to start disconnect reaper: %s", e)
+
+
+async def _shutdown_disconnect_reaper():
+    """Stop the disconnect reaper and clear its registry."""
+    global _disconnect_reaper
+    if _disconnect_reaper is not None:
+        await _disconnect_reaper.stop()
+        _disconnect_reaper = None
+
+
 def _startup_register_session_routes(app):
     """Register session recording admin routes on the FastAPI app.
 
@@ -801,6 +873,8 @@ async def lifespan(app: FastAPI):
     _startup_start_dispatch_cleanup()
     _startup_register_session_routes(app)
     _startup_launch_slot_scheduler()
+    _startup_launch_mode_scheduler()
+    _startup_launch_disconnect_reaper()
 
     yield
 
@@ -814,6 +888,7 @@ async def lifespan(app: FastAPI):
     await _shutdown_http_client()
     _shutdown_llama_server()
     await _shutdown_slot_scheduler()
+    await _shutdown_disconnect_reaper()
 
 
 app = FastAPI(
@@ -821,6 +896,9 @@ app = FastAPI(
     description="Proxy server for routing OpenAI API requests",
     lifespan=lifespan
 )
+
+# Register the CLOSE-WAIT disconnect-reaper middleware (LP-0MSNM9UCC002CHYU).
+app.add_middleware(DisconnectReaperMiddleware)
 
 # Include handlers from the extracted handlers module
 from . import handlers  # noqa: E402
@@ -858,8 +936,14 @@ def _resolve_log_path(source: str = "proxy") -> Path:
 
 
 @app.get("/logs/tail")
-async def tail_logs(request: Request, lines: int = 100, source: str = "proxy"):
-    return await _ui_tail_logs(request, lines, source)
+async def tail_logs(
+    request: Request,
+    lines: int = 100,
+    source: str = "proxy",
+    slot: int | None = None,
+    session: str | None = None,
+):
+    return await _ui_tail_logs(request, lines, source, slot, session)
 
 @app.get("/logs")
 async def view_logs(request: Request):
@@ -980,7 +1064,12 @@ def main():
         host=host,
         port=port,
         reload=False,
-        log_level="info"
+        log_level="info",
+        # Close keep-alive sockets whose client has gone idle, and bound the
+        # graceful-shutdown drain. Prevents CLOSE-WAIT socket accumulation
+        # from abandoned connections (LP-0MSNM9UCC002CHYU).
+        timeout_keep_alive=server_cfg.get("timeout_keep_alive", 5),
+        timeout_graceful_shutdown=server_cfg.get("timeout_graceful_shutdown", 30),
     )
 
 

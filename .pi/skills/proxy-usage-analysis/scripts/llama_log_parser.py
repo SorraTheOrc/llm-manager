@@ -10,7 +10,7 @@ lines carry **no timestamp**:
     [32999]        eval time =    3776.71 ms /   153 tokens (   24.68 ms per token,    40.51 tokens per second)
 
 Because there are no per-line timestamps, each sample's timestamp is
-approximated by the log file's last-write (mtime) time; day/night bucketing
+approximated by the log file's last-write (mtime) time; fast/cheap bucketing
 and window filtering use that approximation (documented in the report).
 
 Parsing is tolerant: lines that do not match the eval-timing shape are
@@ -50,9 +50,9 @@ KIND_PROMPT_EVAL = "prompt_eval"
 
 # Bucket keys used by SpeedStats.
 TOTAL = "total"
-DAY = "day"
-NIGHT = "night"
-_BUCKET_KEYS = (TOTAL, DAY, NIGHT)
+FAST = "fast"
+CHEAP = "cheap"
+_BUCKET_KEYS = (TOTAL, FAST, CHEAP)
 
 
 @dataclass
@@ -211,8 +211,8 @@ class SpeedBucket:
 class SpeedStats:
     """Aggregated llama-server eval-timing speed stats.
 
-    ``decode`` and ``prompt_eval`` map a bucket key (``total``/``day``/
-    ``night``) to a :class:`SpeedBucket`. ``files_skipped`` counts discovered
+    ``decode`` and ``prompt_eval`` map a bucket key (``total``/``fast``/
+    ``cheap``) to a :class:`SpeedBucket`. ``files_skipped`` counts discovered
     files whose Qwen3 port could not be determined (their eval lines cannot
     be attributed).
     """
@@ -259,7 +259,7 @@ def build_speed_stats(
     """Aggregate eval-timing samples across ``files`` into :class:`SpeedStats`.
 
     Each sample is bucketed by its (mtime-approximated) timestamp using the
-    slot schedule's day/night periods; the total bucket always accumulates
+    slot schedule's fast/cheap periods; the total bucket always accumulates
     every sample. Files whose Qwen3 port cannot be discovered are counted in
     ``files_skipped`` and their eval lines are ignored (never fatal).
     """
@@ -291,10 +291,10 @@ def build_speed_stats(
         for ev in iter_eval_timings(
             path, port, window_start, window_end, live_span_start=live_span_start
         ):
-            bucket_key = DAY
+            bucket_key = FAST
             if schedule is not None and getattr(schedule, "periods", None):
                 label = schedule.period_for(ev.ts).label
-                bucket_key = NIGHT if label == NIGHT else DAY
+                bucket_key = CHEAP if label == CHEAP else FAST
             group = samples[ev.kind]
             group[TOTAL].append(ev.tok_s)
             group[bucket_key].append(ev.tok_s)

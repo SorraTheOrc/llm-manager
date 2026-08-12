@@ -28,10 +28,19 @@ Testing
   ```
   . .venv/bin/activate && python -m pytest proxy/tests/test_query_llama_status.py -q
   ```
-- Full test suite (proxy):
+- Full test suite (canonical, cached):
+  ```
+  /skill:test
+  ```
+  (equivalently `python3 .pi/.../run_tests.py --json` — see the test skill).
+  Full-suite results are cached per git state by `run_tests.py` (2-hour TTL,
+  git-state fingerprint) so repeated verification at the same commit reuses a
+  green run instead of re-executing the suite.
+- Full test suite (proxy, direct):
   ```
   . .venv/bin/activate && python -m pytest -q
   ```
+  Prefer `/skill:test` above; the direct command bypasses the cache.
 
 > **Safety:** the default test run never spawns or kills real OS processes and
 > never touches the live proxy/llama-server/TTS server. Live tests are opt-in

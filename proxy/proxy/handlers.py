@@ -21,6 +21,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from proxy import mode as mode_module
 from proxy.provider import get_model_type
 
 logger = logging.getLogger("llama-proxy")
@@ -49,6 +50,41 @@ def _resolve_client_ip(request: Request) -> tuple[str, str]:
         return request.client.host, "direct"
 
     return "unknown", "direct"
+
+
+def _resolve_client_port(request: Request) -> int | str:
+    """Resolve the client source port for structured logging.
+
+    Returns ``request.client.port`` for direct connections, or the string
+    ``"unknown"`` when the client identity came from a reverse-proxy header
+    (X-Forwarded-For / X-Real-IP — these carry no source port) or when no
+    client address/port is present (LP-0MSKV3IEQ004ZV88).
+
+    The header check mirrors ``_resolve_client_ip`` precedence: when a header
+    is present the effective client identity is the header value, so the
+    direct connection's port must not be attributed to it.
+    """
+    if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
+        return "unknown"
+    if request.client and request.client.port is not None:
+        return request.client.port
+    return "unknown"
+
+
+def _resolve_client_id(request: Request) -> str | None:
+    """Resolve a stable client identifier from the session headers.
+
+    Returns the first present of ``x-session-id`` / ``session_id`` /
+    ``x-client-request-id`` (matching the session-header convention in
+    ``proxy/proxy/session.py``), or ``None`` when none are present so the
+    field can be omitted — not rendered as ``unknown`` — from the structured
+    log (LP-0MSKV3IEQ004ZV88).
+    """
+    for header_name in ("x-session-id", "session_id", "x-client-request-id"):
+        value = request.headers.get(header_name)
+        if value:
+            return value
+    return None
 
 # APIRouter for use by the main server app
 router = APIRouter()
@@ -328,6 +364,7 @@ async def get_llama_local_status(request: Request):
     Fields returned::
 
         {"active_query": bool,
+         "local_active_query": bool,
          "model_switch_in_progress": bool,
          "current_model": str | None,
          "llama_server_running": bool,
@@ -344,14 +381,24 @@ async def get_llama_local_status(request: Request):
     orchestrators see available capacity during idle windows —
     LP-0MSI06HPB0043MV1).
 
+    ``local_active_query`` mirrors ``active_query`` but is derived from the
+    local-only counter (``local_active_queries``), so remote provider
+    streams (e.g. opencode-go → deepseek-v4-flash) do not make it true.
+    Local activity is a subset of all activity, so
+    ``local_active_query=true`` implies ``active_query=true``
+    (LP-0MSL2ZLLS009RVKR).
+
     Timeout is configurable via the ``STATUS_QUERY_TIMEOUT`` env var
     (seconds, default 1.0).
 
     Each call is logged with a ``status_request`` structured message that
-    includes the client IP (with source: header vs direct), the response
-    fields and request latency (ms). The client IP resolves via
-    X-Forwarded-For / X-Real-IP headers when present (reverse-proxy safe),
-    falling back to the direct connection address.
+    includes the client IP (with source: header vs direct), the client source
+    port (direct connections only; ``unknown`` for reverse-proxy header
+    paths), a stable ``client_id`` from the session headers when present
+    (``x-session-id`` → ``session_id`` → ``x-client-request-id``; omitted
+    when none are sent), the response fields and request latency (ms). The
+    client IP resolves via X-Forwarded-For / X-Real-IP headers when present
+    (reverse-proxy safe), falling back to the direct connection address.
     """
     import os  # noqa: local import for config access
 
@@ -399,6 +446,17 @@ async def get_llama_local_status(request: Request):
             active = srv.active_queries > 0
     except Exception:
         active = False
+
+    # -- local active queries (non-blocking snapshot, LP-0MSL2ZLLS009RVKR) --
+    # The global counter above also counts remote provider streams, so herdr
+    # dispatch needs a local-only signal. local_active_query=true implies
+    # active_query=true (local activity is a subset of all activity).
+    local_active_query = False
+    try:
+        async with srv.local_active_queries_lock:
+            local_active_query = srv.local_active_queries > 0
+    except Exception:
+        local_active_query = False
 
     # -- slots query (lightweight, short timeout) -------------------------
     available_slots = 0
@@ -450,25 +508,43 @@ async def get_llama_local_status(request: Request):
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
     client_ip, client_ip_source = _resolve_client_ip(request)
-    logger.info(
-        "status_request",
-        extra={
-            "client_ip": client_ip,
-            "client_ip_source": client_ip_source,
-            "latency_ms": _latency_ms,
-            "llama_server_running": llama_running,
-            "active_query": active,
-            "model_switch_in_progress": switch_in_progress,
-            "current_model": cm,
-            "available_slots": available_slots,
-            "total_slots": total_slots,
-            "local_owner_session_id": local_owner_session_id,
-            "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
-        },
-    )
+    status_extra = {
+        "client_ip": client_ip,
+        "client_ip_source": client_ip_source,
+        "client_port": _resolve_client_port(request),
+        "latency_ms": _latency_ms,
+        "llama_server_running": llama_running,
+        "active_query": active,
+        "local_active_query": local_active_query,
+        "model_switch_in_progress": switch_in_progress,
+        "current_model": cm,
+        "available_slots": available_slots,
+        "total_slots": total_slots,
+        "local_owner_session_id": local_owner_session_id,
+        "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+    }
+    # Stable client identifier from session headers — omitted (not "unknown")
+    # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
+    client_id = _resolve_client_id(request)
+    if client_id:
+        status_extra["client_id"] = client_id
+    # Contention-queue metrics (LP-0MSORQVK50012Q4D F4 AC1): queue depth,
+    # queued count/duration, fallback-after-queue count — only when the
+    # per-mode policy is queue (fast mode logs unchanged, F4 AC4).
+    try:
+        from proxy.contention_queue import status_fields
+
+        server_cfg_for_queue = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+        _cq_fields = status_fields(server_cfg_for_queue)
+        if _cq_fields:
+            status_extra.update(_cq_fields)
+    except Exception:
+        pass
+    logger.info("status_request", extra=status_extra)
 
     return {
         "active_query": bool(active),
+        "local_active_query": bool(local_active_query),
         "model_switch_in_progress": bool(switch_in_progress),
         "current_model": cm,
         "llama_server_running": bool(llama_running),
@@ -476,7 +552,27 @@ async def get_llama_local_status(request: Request):
         "total_slots": total_slots,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+        # Contention-queue snapshot (LP-0MSORQVK50012Q4D F4 AC3): live queue
+        # depth + cumulative queued/fallback counters, exposed for the 24h
+        # report aggregation (empty when policy != queue or mode != cheap).
+        **contention_queue_snapshot(srv.config),
     }
+
+
+def contention_queue_snapshot(server_config) -> dict:
+    """Live contention-queue metrics for the status payload.
+
+    Delegates to ``observability.contention_queue_snapshot`` (which calls
+    ``contention_queue.status_fields``) so the gating (queue policy + cheap
+    mode, F4 AC4) and field names stay consistent with the status_request
+    log line. Returns {} when queueing is inactive.
+    """
+    try:
+        from proxy.observability import contention_queue_snapshot as _cq_snap
+
+        return _cq_snap(server_config)
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -663,11 +759,25 @@ async def admin_metrics():
     except Exception:
         pass
 
+    # Session-list index observability (LP-0MSNM9IAC000GVXT): index size,
+    # index-hit vs cold-scan counts, last scan duration.
+    index_obs = {}
+    try:
+        recorder = getattr(srv, "session_recorder", None)
+        if recorder is None:
+            from proxy.session_recorder import SessionRecorder
+            recorder = SessionRecorder.from_config(srv.config)
+            srv.session_recorder = recorder
+        index_obs = recorder.get_index_observability()
+    except Exception:
+        index_obs = {}
+
     return {
         "models_max": models_max,
         "loaded_models": loaded_models,
         "per_model": per_model,
         "process_rss_bytes": process_rss,
+        "index_observability": index_obs,
         "session_metrics": srv.session_manager.get_metrics(),
         "restore_success_total": int(srv.session_restore_observability.get("restore_success_total", 0)),
         "restore_fallback_total": dict(srv.session_restore_observability.get("restore_fallback_total", {})),
@@ -682,6 +792,79 @@ async def admin_metrics():
         "backend_ready": bool(srv.backend_ready),
         "backend_recovery": srv._backend_recovery_snapshot(),
         "backend_signals": dict(srv.backend_signal_counts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# /admin/mode  and  /admin/set-mode  —  operating-mode switching (fast/cheap)
+# ---------------------------------------------------------------------------
+# The proxy runs in one of two operator-selected modes:
+#   fast  — cloud-backed (remote providers eligible; config-fast.yaml)
+#   cheap — 1-slot local pool, same models/provider chains as fast
+#           (remote providers incl. paid tiers enabled; config-cheap.yaml,
+#           LP-0MSMIPPJI007GU9N)
+# The active mode is persisted in proxy/.mode and survives restarts. See
+# proxy/proxy/mode.py (LP-0MSLMYEEU002IBH6).
+
+
+@router.get("/admin/mode")
+async def get_operating_mode():
+    """Return the currently persisted operating mode.
+
+    Returns ``{"mode": "fast"}`` or ``{"mode": "cheap"}``. When no mode
+    has ever been persisted, defaults to ``fast`` (current behavior).
+    """
+    return {"mode": mode_module.read_mode()}
+
+
+@router.post("/admin/set-mode")
+async def set_operating_mode(request: Request):
+    """Switch the proxy between fast and cheap operating modes.
+
+    Accepts a JSON body with a ``mode`` parameter (``"fast"`` or
+    ``"cheap"``). Requesting the mode that is already active returns
+    success with **no restart** (noop). Requesting a different mode
+    persists the new mode and triggers a **full proxy restart**
+    (``scripts/start-proxy.sh --restart``) in the background — the
+    endpoint responds *before* the restart is triggered so clients get a
+    clean response.
+
+    Returns ``400`` for an invalid/missing mode, ``409`` when a
+    mode-switch restart is already in progress and the requested mode
+    differs (avoids restart loops).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    mode = (body.get("mode") or "").strip().lower()
+    if mode not in mode_module.VALID_MODES:
+        raise HTTPException(status_code=400, detail="mode must be 'fast' or 'cheap'")
+
+    try:
+        # A manual switch is respected until the next scheduled mode change
+        # (LP-0MSMF25V9002AY1J): derive the schedule from the server config
+        # so set_mode can persist the override expiry alongside the mode.
+        server_config = (
+            _srv().config.get("server", {})
+            if isinstance(_srv().config, dict)
+            else None
+        )
+        schedule = mode_module.ModeScheduleConfig.from_server_config(server_config)
+        persisted, restart = mode_module.set_mode(mode, manual=True, schedule=schedule)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return {
+        "status": "success",
+        "mode": persisted,
+        "restart": restart,
+        "message": (
+            f"Mode is already {persisted}"
+            if not restart
+            else f"Switched to {persisted} mode; proxy restarting"
+        ),
     }
 
 
@@ -812,7 +995,7 @@ async def release_lease(request: Request):
 
     try:
         from proxy.router_helpers import _release_local_dispatch
-        await _release_local_dispatch(srv, session_id)
+        await _release_local_dispatch(srv, session_id, request=request)
     except Exception as e:
         logger.exception(
             "Failed to release dispatch lease for session %s",
