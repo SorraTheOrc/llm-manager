@@ -82,6 +82,35 @@ def default_state_file() -> Path:
     return proxy_dir() / "grandfathering-state.json"
 
 
+def registry_from_config(
+    server_config: dict | None,
+    state_file: str | Path | None = None,
+) -> "GrandfatheringRegistry":
+    """Build a ``GrandfatheringRegistry`` from the server config section.
+
+    Reads ``server.mode_switch_grandfathering``:
+
+    - ``enabled`` (default True) — master switch; ``enabled: false`` turns the
+      whole feature off (``is_grandfathered`` always returns False).
+    - ``fallback_grace_seconds`` (default = session TTL) — the grace window
+      used when the mode schedule is disabled.
+
+    The mode schedule is derived from ``server.mode_schedule`` via
+    ``ModeScheduleConfig.from_server_config`` so grandfathering expiry follows
+    the same schedule that drives mode switching.
+    """
+    section = (server_config or {}).get("mode_switch_grandfathering") or {}
+    enabled = bool(section.get("enabled", True))
+    grace_seconds = section.get("fallback_grace_seconds")
+    schedule = ModeScheduleConfig.from_server_config(server_config)
+    return GrandfatheringRegistry(
+        state_file=state_file or default_state_file(),
+        mode_schedule=schedule,
+        enabled=enabled,
+        grace_seconds=grace_seconds,
+    )
+
+
 def next_mode_transition(
     schedule: ModeScheduleConfig, now: datetime
 ) -> datetime:

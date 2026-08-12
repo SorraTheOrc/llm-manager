@@ -858,6 +858,38 @@ retry (same semantics as slot-schedule transitions). A second switch while
 a restart is pending is a noop if the mode matches, otherwise rejected with
 `409` (avoids restart loops).
 
+#### Session grandfathering across mode switches
+
+Since a mode switch restarts the proxy and re-selects the config profile, a
+session that was using a remote model (e.g. `github`, or the
+opencode/opencode-go/deepseek fallback tiers of `plan`/`author`/`code`)
+would normally lose that access mid-conversation if the new mode restricted
+it. The proxy therefore **grandfathers in-flight sessions**: sessions that
+made at least one request before the switch keep using their model —
+including its full provider chain (local-first, with the remote fallbacks;
+remote-only for `github`) — until the **earlier** of:
+
+- the next scheduled mode transition (per the active `mode_schedule`), or
+- the session going idle (no request for the session TTL, default 3h).
+
+When the mode schedule is disabled, a configurable fallback grace window
+(default = session TTL) bounds grandfathered access instead.
+
+Grandfathering is keyed on the client-supplied `X-Session-Id` (the same
+trust model as session tracking): only explicit sessions with prior activity
+are eligible; anonymous requests and brand-new sessions are never
+grandfathered. Bindings are persisted to disk (beside `proxy/.mode`) and
+restored at startup, so a session reconnecting after the mode-switch restart
+is recognized. This **deliberately relaxes the cheap-mode "no paid calls"
+guarantee for grandfathered sessions only**, and only within the grace
+deadline; normal cheap-mode traffic is unaffected. Grandfathered remote
+requests are marked with a `grandfathered=true` log line and a
+`grandfathered` backend signal so usage analysis can distinguish them.
+
+Enable/disable via `server.mode_switch_grandfathering` in the config
+profiles (`enabled: false` turns the feature off; `fallback_grace_seconds`
+overrides the grace window when the mode schedule is disabled).
+
 ### Automatic mode schedule
 
 By default the proxy **enforces a time-of-day schedule** (local server

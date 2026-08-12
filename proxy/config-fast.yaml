@@ -621,6 +621,24 @@ server:
       - time: "10:00"
         mode: fast
 
+  # -----------------------------------------------------------------------
+  # Session grandfathering across mode switches (LP-0MSMF5LXO006YDNM)
+  # -----------------------------------------------------------------------
+  # When the proxy switches fast<->cheap, sessions that were ALREADY active
+  # (recorded session->model bindings persisted beside proxy/.mode) may keep
+  # using their model - including its full provider chain (local-first, with
+  # the opencode/opencode-go/deepseek remote fallbacks, or remote-only for
+  # github) - until the EARLIER of the next scheduled mode transition or the
+  # session idle TTL. This deliberately RELAXES the cheap-mode "no paid calls"
+  # guarantee for those grandfathered sessions only, and only within the grace
+  # deadline. New sessions (and requests without a session id) are never
+  # grandfathered. Set enabled: false to turn the whole feature off.
+  # fallback_grace_seconds: only used when mode_schedule is disabled
+  # (default = session TTL, 3h).
+  mode_switch_grandfathering:
+    enabled: true
+    # fallback_grace_seconds: 10800
+
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
   # The effective timeout is base + session_slot_timeout_per_token_seconds x

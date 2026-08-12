@@ -18,6 +18,7 @@ from proxy.grandfathering import (
     next_mode_transition,
 )
 from proxy.mode import ModeScheduleConfig
+from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS
 
 # A fixed, far-future epoch so the session-TTL bound never interferes with
 # tests that exercise the schedule/grace bounds (and vice versa).
@@ -339,3 +340,64 @@ class TestPrune:
         reloaded = GrandfatheringRegistry(path, mode_schedule=None)
         assert reloaded.get("expired") is None
         assert reloaded.prune(now=T0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Config knob (F3 AC): server.mode_switch_grandfathering parsing
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryFromConfig:
+    def test_defaults_enabled_with_session_ttl_grace(self, tmp_path):
+        """Absent section → enabled, mode schedule parsed, grace = session TTL."""
+        from proxy.grandfathering import registry_from_config
+
+        reg = registry_from_config({}, state_file=tmp_path / "s.json")
+        assert reg.enabled is True
+        assert reg.grace_seconds == DEFAULT_SESSION_TTL_SECONDS
+        assert reg.mode_schedule is not None and reg.mode_schedule.enabled
+
+    def test_enabled_false_turns_feature_off(self, tmp_path):
+        from proxy.grandfathering import registry_from_config
+
+        reg = registry_from_config(
+            {"mode_switch_grandfathering": {"enabled": False}},
+            state_file=tmp_path / "s.json",
+        )
+        assert reg.enabled is False
+        reg.record("sess-1", "github", mode="fast", now=T0)
+        assert reg.is_grandfathered(
+            "sess-1", "cheap", {}, {}, now=T0
+        ) is False
+
+    def test_custom_grace_seconds_parsed(self, tmp_path):
+        from proxy.grandfathering import registry_from_config
+
+        reg = registry_from_config(
+            {"mode_switch_grandfathering": {"fallback_grace_seconds": 900}},
+            state_file=tmp_path / "s.json",
+        )
+        assert reg.grace_seconds == 900
+
+    def test_mode_schedule_derived_from_server_config(self, tmp_path):
+        from proxy.grandfathering import registry_from_config
+
+        reg = registry_from_config(
+            {
+                "mode_schedule": {
+                    "enabled": True,
+                    "entries": [{"time": "10:00", "mode": "fast"}],
+                }
+            },
+            state_file=tmp_path / "s.json",
+        )
+        assert reg.mode_schedule is not None
+        assert reg.mode_schedule.active_mode(dt_time(11, 0)) == "fast"
+
+    def test_default_state_file_beside_mode(self, tmp_path, monkeypatch):
+        from proxy.grandfathering import default_state_file, proxy_dir
+
+        monkeypatch.setattr(
+            "proxy.grandfathering.proxy_dir", lambda: tmp_path
+        )
+        assert default_state_file() == tmp_path / "grandfathering-state.json"

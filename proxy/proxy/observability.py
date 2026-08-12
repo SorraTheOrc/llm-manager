@@ -84,6 +84,7 @@ backend_signal_counts: dict = {
     "other_failures": 0,
     "concurrency_rejects": 0,
     "gpu_wedge": 0,
+    "grandfathered": 0,
 }
 
 
