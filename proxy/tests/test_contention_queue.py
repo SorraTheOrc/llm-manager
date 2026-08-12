@@ -62,6 +62,18 @@ def _ok_response() -> Response:
     )
 
 
+def _remote_passthrough_response() -> Response:
+    """A distinctive remote response whose exact bytes must pass through to
+    the client unchanged in fast mode (F1 AC5 byte-for-byte guarantee).
+
+    Real UTF-8 (non-ASCII) bytes so byte-identity is non-trivial."""
+    return Response(
+        content='{"choices":[{"message":{"content":"é中文 bytes"}}]}'.encode("utf-8"),
+        status_code=200,
+        media_type="application/json",
+    )
+
+
 class _MutableConcurrency:
     """Mutable stand-in for ``_get_local_concurrency_info``.
 
@@ -425,7 +437,7 @@ async def test_fast_mode_fallback_policy_unchanged(mixed_model_config):
 
     async def _mock_proxy_to_remote(_req, _path, _pc):
         call_log.append("remote")
-        return _ok_response()
+        return _remote_passthrough_response()
 
     request = _DummyRequest()
     cfg = {
@@ -452,6 +464,78 @@ async def test_fast_mode_fallback_policy_unchanged(mixed_model_config):
     assert metrics["contention_queued_count"] == 0
     assert metrics["contention_fallback_after_queue_count"] == 0
     assert contention_queue.queue_depth() == 0
+    # F1 AC5 byte-for-byte: the client-visible response is byte-identical to
+    # what the remote provider returned (no queue layer mutates the payload).
+    assert result.body == _remote_passthrough_response().body, (
+        "fast-mode fallback response must reach the client byte-for-byte"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fast_mode_fallback_dispatch_bytes_unchanged(mixed_model_config):
+    """AC5 literal wire check: in fast mode the contention fallback forwards
+    the ORIGINAL request body bytes and headers to the remote provider and
+    returns the remote response body byte-for-byte — the queue feature must
+    not mutate the wire bytes on the fast-mode (fallback policy) path."""
+    concurrency = _MutableConcurrency(active=1, max_=1)
+    call_log = []
+
+    # Non-ASCII payload so byte-identity is non-trivial (UTF-8 encoding).
+    request_body = (
+        '{"model":"test","messages":[{"role":"user","content":"é中文 payload"}]}'
+    ).encode("utf-8")
+    request = _DummyRequest(body=request_body)
+    request.headers = {"x-test-header": "abc", "content-type": "application/json"}
+    remote_response = _remote_passthrough_response()
+
+    forwarded_body: bytes | None = None
+    forwarded_headers: dict | None = None
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        nonlocal forwarded_body, forwarded_headers
+        call_log.append("remote")
+        forwarded_body = await _req.body()
+        forwarded_headers = dict(_req.headers)
+        return remote_response
+
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "session_slot_pool_size": 1,
+            "contention_queue_policy": "fallback",
+        },
+    }
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+        patch("proxy.mode.read_mode", return_value="fast"),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert call_log == ["remote"], "fast mode must fall back to remote immediately"
+    # The exact request bytes reach the remote provider untouched.
+    assert forwarded_body == request_body, (
+        "fallback dispatch must forward the original request body byte-for-byte, "
+        f"got {forwarded_body!r}"
+    )
+    # The original request headers are forwarded unchanged (no rewrite).
+    assert forwarded_headers == request.headers, (
+        "fallback dispatch must forward the original request headers, "
+        f"got {forwarded_headers!r}"
+    )
+    # The client receives the remote response body byte-for-byte.
+    assert result.body == remote_response.body, (
+        "client must receive the remote response body unchanged, "
+        f"got {result.body!r}"
+    )
+    # No queue involvement in fast mode.
+    assert contention_queue.queue_depth() == 0
+    metrics = contention_queue.metrics()
+    assert metrics["contention_queued_count"] == 0
+    assert metrics["contention_fallback_after_queue_count"] == 0
 
 
 @pytest.mark.asyncio
