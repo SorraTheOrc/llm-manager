@@ -1923,15 +1923,20 @@ async def _maybe_queue_for_local_slot(
     server_cfg = config.get("server", config) if isinstance(config, dict) else {}
     cq = _get_contention_queue_config(server_cfg)
 
+    import time as _time
+
     from proxy import contention_queue
 
+    _wait_started = _time.monotonic()
     elapsed = await contention_queue.wait_for_local_slot(
         max_wait_seconds=cq["max_wait_seconds"],
         max_depth=cq["max_depth"],
         slot_free_check=lambda: _get_local_concurrency_info(config)[0] < max_local,
     )
     if elapsed is None:
-        return ("fallback", None, None)
+        # Caps exceeded — the caller falls back. Surface the measured wait so
+        # the fallback-after-queue event can record elapsed wait time (F4 AC2).
+        return ("fallback", None, _time.monotonic() - _wait_started)
     return ("dispatch", None, elapsed)
 
 
@@ -3828,11 +3833,18 @@ async def _proxy_with_fallback_cycle(
                     if _cq_action == "dispatch":
                         # A slot freed within the caps — dispatch local below.
                         _set_queue_wait_on_request(request, _cq_elapsed)
+                        try:
+                            from proxy import contention_queue
+
+                            _cq_m = contention_queue.metrics()
+                        except Exception:
+                            _cq_m = {}
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
-                            "queued_duration=%.2fs",
+                            "queued_duration=%.2fs policy=queue depth=%d",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
+                            _cq_m.get("contention_queue_depth", 0),
                         )
                         try:
                             from proxy.metrics import record_contention_queued
@@ -3842,7 +3854,8 @@ async def _proxy_with_fallback_cycle(
                             pass
                     elif _cq_action == "fallback":
                         # Caps exceeded — fall back to the next remote provider
-                        # exactly as today (fallback-after-queue recorded).
+                        # exactly as today (fallback-after-queue recorded with
+                        # the elapsed queue wait, F4 AC2).
                         _record_attempt(
                             attempts,
                             provider=provider_name,
@@ -3850,14 +3863,16 @@ async def _proxy_with_fallback_cycle(
                             status="fallback_after_queue",
                             active=cur_local,
                             max=max_local,
+                            elapsed_wait_seconds=round(_cq_elapsed or 0.0, 3),
                         )
                         fallback_reason = "fallback_after_queue"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s",
+                            "session=%s queued_duration=%.2fs",
                             provider_name, _session_id or "unknown",
+                            _cq_elapsed or 0.0,
                         )
                         try:
                             from proxy.metrics import record_contention_fallback_after_queue

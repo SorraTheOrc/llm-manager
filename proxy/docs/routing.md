@@ -108,7 +108,15 @@ Key semantics (see `proxy/provider.py` ``_maybe_queue_for_local_slot`` and
   are exposed via `proxy/contention_queue.py::metrics()` and the
   `status_request` / `contention_queue_dispatch` /
   `contention_queue_fallback_after_queue` log lines (Prometheus counters in
-  `proxy/metrics.py`) so the 24h proxy report can quantify the gain.
+  `proxy/metrics.py`) so the 24h proxy report can quantify the gain. The
+  `contention_queue_dispatch` line carries `queued_duration`, `policy`, and
+  `depth`; the `contention_queue_fallback_after_queue` line carries
+  `queued_duration` (the elapsed wait, F4 AC2). The status endpoint
+  (`/llama/local/status`) includes a live contention-queue snapshot via
+  `observability.contention_queue_snapshot`. The 24h report pipeline
+  (`.pi/skills/proxy-usage-analysis`) parses and aggregates these lines into
+  `contention_dispatch` / `contention_fallback_after_queue` counts plus
+  total queued duration (`contention_queued_duration_seconds`).
 
 Config reference:
 

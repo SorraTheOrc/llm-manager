@@ -85,6 +85,11 @@ class AnalysisResult:
     lines_skipped: int
     total_lines: int
     dispatch_denied_events: list[LogEvent] = field(default_factory=list)
+    # Contention-queue events (LP-0MSORQVK50012Q4D F4 AC3): queued requests
+    # dispatched local after a slot freed, and queued requests that fell back
+    # to a remote provider after the wait/depth caps were exceeded.
+    contention_dispatch_events: list[LogEvent] = field(default_factory=list)
+    contention_fallback_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -467,6 +472,8 @@ def aggregate(
     routing_skip_events: list[LogEvent] = []
     dispatch_denied_events: list[LogEvent] = []
     error_events: list[LogEvent] = []
+    contention_dispatch_events: list[LogEvent] = []
+    contention_fallback_events: list[LogEvent] = []
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -506,6 +513,12 @@ def aggregate(
                 routing_skips.setdefault(ev.session, []).append(ev)
                 builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
+        if ev.kind == "contention_dispatch":
+            contention_dispatch_events.append(ev)
+            continue
+        if ev.kind == "contention_fallback_after_queue":
+            contention_fallback_events.append(ev)
+            continue
         if ev.kind in ("stream_started", "stream_finished"):
             if not ev.session:
                 unattributed += 1
@@ -537,5 +550,7 @@ def aggregate(
         total_lines=total_lines,
         dispatch_denied_events=dispatch_denied_events,
         error_events=error_events,
+        contention_dispatch_events=contention_dispatch_events,
+        contention_fallback_events=contention_fallback_events,
         busy=busy,
     )

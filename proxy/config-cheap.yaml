@@ -188,7 +188,9 @@ models:
     aliases:
     - github-*
   # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, OpenCode Go #2, then DeepSeek direct.
-  # Slot exhaustion on the local model falls through to remote tiers.
+  # Slot exhaustion on the local model is queued up to the contention caps
+  # (policy=queue, see server.contention_queue_* below) and only then falls
+  # through to remote tiers (LP-0MSORQVK50012Q4D).
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
   plan:
     providers:
@@ -482,7 +484,9 @@ server:
   # Local-model concurrency limit (LP-0MR5MAJNM005R905).
   # Limits concurrent requests to local providers. Remote providers
   # continue to use max_concurrent_queries. When this limit is reached,
-  # requests with fallback providers skip to the next provider immediately.
+  # requests with fallback providers are QUEUED up to the contention caps
+  # below (policy=queue, LP-0MSORQVK50012Q4D); only when the caps are
+  # exceeded do they skip to the next provider.
   #
   # NOTE: This value is now derived from `session_slot_pool_size` by default.
   # The `local_max_concurrent_queries` key is preserved for explicit override

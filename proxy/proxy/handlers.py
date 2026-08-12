@@ -552,7 +552,27 @@ async def get_llama_local_status(request: Request):
         "total_slots": total_slots,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+        # Contention-queue snapshot (LP-0MSORQVK50012Q4D F4 AC3): live queue
+        # depth + cumulative queued/fallback counters, exposed for the 24h
+        # report aggregation (empty when policy != queue or mode != cheap).
+        **contention_queue_snapshot(srv.config),
     }
+
+
+def contention_queue_snapshot(server_config) -> dict:
+    """Live contention-queue metrics for the status payload.
+
+    Delegates to ``observability.contention_queue_snapshot`` (which calls
+    ``contention_queue.status_fields``) so the gating (queue policy + cheap
+    mode, F4 AC4) and field names stay consistent with the status_request
+    log line. Returns {} when queueing is inactive.
+    """
+    try:
+        from proxy.observability import contention_queue_snapshot as _cq_snap
+
+        return _cq_snap(server_config)
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------

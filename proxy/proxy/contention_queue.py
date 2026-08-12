@@ -28,14 +28,14 @@ A — bounded by the wait/depth caps.
 import asyncio
 import time
 from collections import deque
-from typing import Callable, Optional
+from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Cross-session queue state (module-level = process-wide)
 # ---------------------------------------------------------------------------
 
 _waiters: deque = deque()  # deque of (enqueued_at, asyncio.Event)
-_condition: Optional[asyncio.Condition] = None
+_condition: asyncio.Condition | None = None
 
 # Metrics (F4 AC1/AC8): queued count, queued duration, fallback-after-queue
 queued_count = 0
@@ -78,15 +78,27 @@ def metrics() -> dict:
 def status_fields(server_config: dict) -> dict:
     """Queue fields for the status_request log line.
 
-    Returns an empty dict when the per-mode policy is not ``queue`` so fast
-    mode (fallback policy) logs stay unchanged (F4 AC4). Otherwise exposes
-    queue depth, queued count, queued duration, and fallback-after-queue
-    count (F4 AC1).
+    Returns an empty dict when the per-mode policy is not ``queue`` OR the
+    proxy is not in cheap operating mode, so fast mode (fallback policy)
+    logs stay unchanged (F4 AC4). The mode gate mirrors
+    ``provider._contention_queue_enabled`` (which requires
+    ``proxy.mode.read_mode() == "cheap"``) so a config override pointing at
+    a queue-policy config while mode=fast never emits queue fields.
+    Otherwise exposes queue depth, queued count, queued duration, and
+    fallback-after-queue count (F4 AC1).
     """
     policy = str(
         (server_config or {}).get("contention_queue_policy", "fallback") or "fallback"
     ).strip().lower()
     if policy != "queue":
+        return {}
+    try:
+        from proxy.mode import read_mode
+
+        if read_mode() != "cheap":
+            return {}
+    except Exception:
+        # Mode unreadable — fail closed: do not emit queue fields.
         return {}
     m = metrics()
     return {
@@ -136,7 +148,7 @@ async def wait_for_local_slot(
     max_wait_seconds: float,
     max_depth: int,
     slot_free_check: Callable[[], bool],
-) -> Optional[float]:
+) -> float | None:
     """Wait (bounded, cross-session) for a local slot to free.
 
     Returns the elapsed wait in seconds when a slot freed within the caps
@@ -168,7 +180,7 @@ async def wait_for_local_slot(
                 return None
             try:
                 await asyncio.wait_for(ev.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 fallback_after_queue_count += 1
                 return None
             if slot_free_check():

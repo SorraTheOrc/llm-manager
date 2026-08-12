@@ -129,6 +129,19 @@ DISPATCH_DENIED = (
     "owner=019fc27d active=4"
 )
 
+# --- Contention-queue events (LP-0MSORQVK50012Q4D F4 AC3) -------------------
+
+CONTENTION_DISPATCH = (
+    "2026-08-02 14:10:00,000 - INFO - contention_queue_dispatch provider=local-qwen3 "
+    "session=019fc245-aaaa-7e5c-871e-57ab32f875f3 queued_duration=1.25s policy=queue depth=0"
+)
+
+CONTENTION_FALLBACK_AFTER_QUEUE = (
+    "2026-08-02 14:11:00,000 - INFO - contention_queue_fallback_after_queue "
+    "provider=local-qwen3 session=019fc245-bbbb-7e5c-871e-57ab32f875f3 "
+    "queued_duration=60.00s"
+)
+
 # --- Error events (real lines from /var/log/llama-proxy, Aug 3 window) ------
 
 # Stream finished with reason=error (client-visible synthetic error; carries

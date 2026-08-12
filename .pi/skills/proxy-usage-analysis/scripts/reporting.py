@@ -316,6 +316,10 @@ def build_report(
     ap(f"| Fallback events | {len(summary.fallback_events)} ({fallback_rate * 100:.1f}%) | "
        f"{fast_fb} ({_pct(fast_fb, len(summary.fallback_events)):.1f}%) | "
        f"{cheap_fb} ({_pct(cheap_fb, len(summary.fallback_events)):.1f}%) |")
+    ap(f"| Queued → dispatched local | {len(summary.contention_dispatch_events)} | "
+       f"- | {len(summary.contention_dispatch_events)} |")
+    ap(f"| Fallback after queue | {len(summary.contention_fallback_events)} | "
+       f"- | {len(summary.contention_fallback_events)} |")
     ap(f"| Dispatch denied | {summary.dispatch_denied_count} | "
        f"{d['dispatch_denied']} ({_pct(d['dispatch_denied'], summary.dispatch_denied_count):.1f}%) | "
        f"{n['dispatch_denied']} ({_pct(n['dispatch_denied'], summary.dispatch_denied_count):.1f}%) |")
@@ -715,6 +719,13 @@ def summary_to_json(summary: AnalysisResult) -> dict:
         "remote_requests": summary.remote_requests,
         "fallback_events": len(summary.fallback_events),
         "fallback_rate": round((len(summary.fallback_events) / total) if total else 0.0, 4),
+        "contention_dispatch": len(summary.contention_dispatch_events),
+        "contention_fallback_after_queue": len(summary.contention_fallback_events),
+        "contention_queued_duration_seconds": round(
+            sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)
+            + sum(float(e.queued_duration or 0.0) for e in summary.contention_fallback_events),
+            3,
+        ),
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
         "fast_sessions": sum(1 for s in sessions if s.bucket != "cheap"),

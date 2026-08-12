@@ -13,11 +13,14 @@ Functions in this module:
 
 import asyncio
 import json
+import logging
 import time
 
 import httpx
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+
+logger = logging.getLogger("llama-proxy.router")
 
 
 # Lazy server import — avoids circular imports when server.py imports us
@@ -142,6 +145,11 @@ def _get_contention_queue_config(server_config: dict) -> dict:
         server_config.get("contention_queue_policy", "fallback") or "fallback"
     ).strip().lower()
     if policy not in ("queue", "fallback"):
+        logger.warning(
+            "Invalid contention_queue_policy=%r — coercing to 'fallback' "
+            "(valid: queue, fallback)",
+            server_config.get("contention_queue_policy"),
+        )
         policy = "fallback"
     # Wait cap: [1, session_guardrail_max_runtime_seconds]
     try:
@@ -149,20 +157,43 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             server_config.get("session_guardrail_max_runtime_seconds", 1800) or 1800
         )
     except (TypeError, ValueError):
+        logger.warning(
+            "Invalid session_guardrail_max_runtime_seconds=%r — using default 1800",
+            server_config.get("session_guardrail_max_runtime_seconds"),
+        )
         max_runtime = 1800
     raw_wait = server_config.get("contention_queue_max_wait_seconds", 60)
     try:
         wait = float(raw_wait) if raw_wait is not None else 60.0
     except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_max_wait_seconds=%r — using default 60",
+            raw_wait,
+        )
         wait = 60.0
     max_wait_seconds = max(1.0, min(wait, float(max(1, max_runtime))))
+    if max_wait_seconds != wait:
+        logger.warning(
+            "contention_queue_max_wait_seconds=%r clamped to %s "
+            "(bounds [1, session_guardrail_max_runtime_seconds=%s])",
+            raw_wait, max_wait_seconds, max_runtime,
+        )
     # Depth cap: [1, 16]
     raw_depth = server_config.get("contention_queue_max_depth", 4)
     try:
         depth = int(raw_depth) if raw_depth is not None else 4
     except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_max_depth=%r — using default 4",
+            raw_depth,
+        )
         depth = 4
     max_depth = max(1, min(depth, 16))
+    if max_depth != depth:
+        logger.warning(
+            "contention_queue_max_depth=%r clamped to %s (bounds [1, 16])",
+            raw_depth, max_depth,
+        )
     return {
         "policy": policy,
         "max_wait_seconds": max_wait_seconds,

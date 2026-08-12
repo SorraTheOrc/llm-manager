@@ -118,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
             f"(local {data['local_requests']} / remote {data['remote_requests']}), "
             f"{data['fallback_events']} fallback events "
             f"({data['fallback_rate'] * 100:.1f}%), "
+            f"{data.get('contention_dispatch', 0)} queued-dispatched-local, "
+            f"{data.get('contention_fallback_after_queue', 0)} fallback-after-queue, "
             f"{errors} error event(s){decode_summary}{busy_summary}."
         )
         print(f"Outputs written to {args.output_dir}: "

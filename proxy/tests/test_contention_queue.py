@@ -38,7 +38,6 @@ from fastapi import Response
 
 from proxy import contention_queue
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -149,10 +148,14 @@ def _queue_cfg(**overrides) -> dict:
 
 @pytest.mark.asyncio
 async def test_queue_on_contention_dispatches_local_when_slot_frees(
-    mixed_model_config,
+    mixed_model_config, caplog,
 ):
     """Cheap mode + queue policy: a request that finds slots busy QUEUES; when
-    the slot frees within the caps it dispatches local."""
+    the slot frees within the caps it dispatches local. The dispatch log line
+    carries queue depth + policy (F4 AC1)."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
     concurrency = _MutableConcurrency(active=1, max_=1)
     call_log = []
 
@@ -198,6 +201,12 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
     assert metrics["contention_queued_duration_seconds"] >= 0.0
     assert metrics["contention_fallback_after_queue_count"] == 0
 
+    # F4 AC1: the dispatch log line carries queue depth + policy.
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_dispatch" in messages
+    assert "policy=queue" in messages
+    assert "depth=" in messages
+
 
 # ---------------------------------------------------------------------------
 # AC2: fallback to next remote provider after max_wait exceeded
@@ -205,9 +214,13 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
 
 
 @pytest.mark.asyncio
-async def test_fallback_after_max_wait_exceeded(mixed_model_config):
+async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
     """When the wait cap is exceeded (no slot frees), fall back to the next
-    remote provider exactly as today."""
+    remote provider exactly as today. The fallback-after-queue event records
+    the elapsed wait time (F4 AC2)."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
     concurrency = _MutableConcurrency(active=1, max_=1)
     call_log = []
 
@@ -242,6 +255,11 @@ async def test_fallback_after_max_wait_exceeded(mixed_model_config):
     metrics = contention_queue.metrics()
     assert metrics["contention_queued_count"] == 1
     assert metrics["contention_fallback_after_queue_count"] == 1
+
+    # F4 AC2: the fallback-after-queue log line carries the elapsed wait.
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_fallback_after_queue" in messages
+    assert "queued_duration=" in messages
 
 
 # ---------------------------------------------------------------------------
@@ -602,21 +620,40 @@ def test_metrics_not_emitted_when_fallback_policy():
 
 
 def test_metrics_emitted_when_queue_policy():
-    """status_request fields helper exposes queue metrics for queue policy."""
+    """status_request fields helper exposes queue metrics for queue policy
+    while in cheap mode."""
     from proxy.contention_queue import status_fields
 
-    fields = status_fields(
-        {
-            "contention_queue_policy": "queue",
-            "contention_queue_max_wait_seconds": 60,
-            "contention_queue_max_depth": 4,
-        }
-    )
+    with patch("proxy.mode.read_mode", return_value="cheap"):
+        fields = status_fields(
+            {
+                "contention_queue_policy": "queue",
+                "contention_queue_max_wait_seconds": 60,
+                "contention_queue_max_depth": 4,
+            }
+        )
     assert fields.get("contention_queue_policy") == "queue"
     assert "contention_queue_depth" in fields
     assert "contention_queued_count" in fields
     assert "contention_queued_duration_seconds" in fields
     assert "contention_fallback_after_queue_count" in fields
+
+
+def test_metrics_suppressed_when_queue_policy_but_fast_mode():
+    """status_fields returns {} for queue-policy config while mode=fast (F4
+    AC4): a config override must never emit queue fields unless the proxy is
+    actually in cheap operating mode."""
+    from proxy.contention_queue import status_fields
+
+    with patch("proxy.mode.read_mode", return_value="fast"):
+        fields = status_fields(
+            {
+                "contention_queue_policy": "queue",
+                "contention_queue_max_wait_seconds": 60,
+                "contention_queue_max_depth": 4,
+            }
+        )
+    assert fields == {}
 
 
 @pytest.mark.asyncio
@@ -739,6 +776,39 @@ def test_contention_queue_config_clamps():
     assert cfg["policy"] == "fallback"
     assert cfg["max_wait_seconds"] == 60
     assert cfg["max_depth"] == 4
+
+
+def test_contention_queue_config_logs_invalid_values(caplog):
+    """Invalid contention values are logged (F2 AC3): the resolved policy is
+    coerced and caps are clamped with a warning, never silently."""
+    import logging
+
+    from proxy.router import _get_contention_queue_config
+
+    caplog.set_level(logging.WARNING, logger="llama-proxy.router")
+    _get_contention_queue_config(
+        {
+            "contention_queue_policy": "bogus",
+            "contention_queue_max_wait_seconds": "abc",
+            "contention_queue_max_depth": "xyz",
+        }
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "Invalid contention_queue_policy" in messages
+    assert "Invalid contention_queue_max_wait_seconds" in messages
+    assert "Invalid contention_queue_max_depth" in messages
+
+    # Clamped values are also logged.
+    caplog.clear()
+    _get_contention_queue_config(
+        {
+            "contention_queue_policy": "queue",
+            "contention_queue_max_wait_seconds": 99999,
+            "contention_queue_max_depth": 999,
+        }
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "clamped" in messages
 
 
 def test_cheap_config_declares_queue_policy():

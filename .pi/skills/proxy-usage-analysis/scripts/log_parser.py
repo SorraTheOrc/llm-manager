@@ -37,6 +37,15 @@ RE_FALLBACK = re.compile(
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
 
+# Contention-queue events (LP-0MSORQVK50012Q4D F4 AC3): the proxy emits
+# ``contention_queue_dispatch`` (a queued request was dispatched local after
+# a slot freed) and ``contention_queue_fallback_after_queue`` (caps exceeded
+# → fell back to the next remote provider). Both carry queued_duration; the
+# dispatch line additionally carries policy + depth.
+RE_CONTENTION_DURATION = re.compile(r"queued_duration=([\d.]+)s")
+RE_CONTENTION_DEPTH = re.compile(r"\bdepth=(\d+)")
+RE_CONTENTION_POLICY = re.compile(r"\bpolicy=(\S+)")
+
 # Error-line extractors.
 RE_BACKEND_ATTEMPT = re.compile(r"attempt=(\d+/\d+)")
 RE_BACKEND_SIGNAL = re.compile(r"signal=([\w_]+)")
@@ -55,6 +64,8 @@ STREAM_FINISHED = "Stream finished"
 FALLBACK = "Fallback triggered"
 ROUTING_SKIP = "routing_skip_local"
 DISPATCH_DENIED = "local_dispatch_denied"
+CONTENTION_DISPATCH = "contention_queue_dispatch"
+CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
 
 # Reason-value normalization (backward compatibility). ``warm_cache_bypass``
 # was the pre-LP-0MSF8XDG7000PERM name for the warm-cache hard-cap skip. The
@@ -127,7 +138,8 @@ class LogEvent:
     """One parsed structured log line.
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
-    ``routing_skip``, ``dispatch_denied``, or an error kind (``stream_error``,
+    ``routing_skip``, ``dispatch_denied``, ``contention_dispatch``,
+    ``contention_fallback_after_queue``, or an error kind (``stream_error``,
     ``stream_finish_error``, ``slot_save_error``, ``backend_retry``,
     ``upstream_http_error``). Only the fields relevant to each kind are
     populated.
@@ -146,6 +158,11 @@ class LogEvent:
     dst: str | None = None
     owner: str | None = None
     active: int | None = None
+    # Contention-queue fields (contention_dispatch /
+    # contention_fallback_after_queue kinds, LP-0MSORQVK50012Q4D F4 AC3).
+    queued_duration: str | None = None
+    depth: str | None = None
+    policy: str | None = None
     # Error-taxonomy fields (populated for error kinds only).
     error: str | None = None
     entry: str | None = None
@@ -250,6 +267,26 @@ def parse_log_line(line: str) -> LogEvent | None:
         session, owner, active = m2.groups()
         return LogEvent(
             "dispatch_denied", ts, session=session, owner=owner, active=int(active)
+        )
+    if msg.startswith(CONTENTION_DISPATCH):
+        # "contention_queue_dispatch provider=... session=... queued_duration=1.23s policy=queue depth=0"
+        return LogEvent(
+            "contention_dispatch",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            session=_session_from(msg),
+            queued_duration=_first(RE_CONTENTION_DURATION, msg),
+            depth=_first(RE_CONTENTION_DEPTH, msg),
+            policy=_first(RE_CONTENTION_POLICY, msg),
+        )
+    if msg.startswith(CONTENTION_FALLBACK_AFTER_QUEUE):
+        # "contention_queue_fallback_after_queue provider=... session=... queued_duration=1.23s"
+        return LogEvent(
+            "contention_fallback_after_queue",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            session=_session_from(msg),
+            queued_duration=_first(RE_CONTENTION_DURATION, msg),
         )
     if msg.startswith(STREAM_ERROR):
         # "Stream error: session=... provider=... model=... error=NameError"

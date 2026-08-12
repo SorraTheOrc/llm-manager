@@ -36,6 +36,10 @@ SLOT_CONTENTION_REASONS = {
     "slot_exhaustion",
     "slot_saturated",
     "local_dispatch_denied",
+    # LP-0MSORQVK50012Q4D: after the bounded contention queue, only
+    # requests that exceeded the wait/depth caps still fall back — a
+    # (hopefully reduced) subset of the old immediate-fallback behavior.
+    "fallback_after_queue",
 }
 
 # Reasons that point at remote provider issues (informational).

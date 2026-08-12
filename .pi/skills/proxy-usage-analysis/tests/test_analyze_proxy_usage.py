@@ -147,6 +147,22 @@ class TestLogLineParsing:
         assert ev.owner == "019fc27d"
         assert ev.active == 4
 
+    def test_contention_dispatch(self):
+        ev = log_parser.parse_log_line(fixtures.CONTENTION_DISPATCH)
+        assert ev.kind == "contention_dispatch"
+        assert ev.provider == "local-qwen3"
+        assert ev.session == "019fc245-aaaa-7e5c-871e-57ab32f875f3"
+        assert ev.queued_duration == "1.25"
+        assert ev.policy == "queue"
+        assert ev.depth == "0"
+
+    def test_contention_fallback_after_queue(self):
+        ev = log_parser.parse_log_line(fixtures.CONTENTION_FALLBACK_AFTER_QUEUE)
+        assert ev.kind == "contention_fallback_after_queue"
+        assert ev.provider == "local-qwen3"
+        assert ev.session == "019fc245-bbbb-7e5c-871e-57ab32f875f3"
+        assert ev.queued_duration == "60.00"
+
     @pytest.mark.parametrize(
         "line",
         [
@@ -514,6 +530,24 @@ class TestSessionAggregation:
             _schedule(),
         )
         assert len(res.fallback_events) == 2
+
+    def test_contention_events_collected_globally(self):
+        """Contention-queue dispatch / fallback lines land in their own
+        collections (LP-0MSORQVK50012Q4D F4 AC3)."""
+        lines = [
+            fixtures.CONTENTION_DISPATCH,
+            fixtures.CONTENTION_FALLBACK_AFTER_QUEUE,
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+        assert len(res.contention_dispatch_events) == 1
+        assert len(res.contention_fallback_events) == 1
+        assert res.contention_dispatch_events[0].queued_duration == "1.25"
+        assert res.contention_fallback_events[0].queued_duration == "60.00"
 
     def test_empty_input(self):
         res = aggregation.aggregate([], WINDOW_START, WINDOW_END, _schedule())
@@ -1303,6 +1337,10 @@ class TestEndToEnd:
         assert isinstance(data, dict)
         assert data["sessions"] == 2
         assert data["fallback_events"] >= 1
+        # Contention-queue fields present (LP-0MSORQVK50012Q4D F4 AC3).
+        assert "contention_dispatch" in data
+        assert "contention_fallback_after_queue" in data
+        assert "contention_queued_duration_seconds" in data
         # Local-model utilization stats are exposed.
         busy = data["local_busy"]
         assert busy["streams"] == 2
