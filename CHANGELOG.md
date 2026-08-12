@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.1.13 (2026-08-12)
+
 ## v0.1.12 (2026-08-08)
 ### Features
 - Hold requests for 5 min when a fallback chain's final model is unavailable, then restart the chain cycle from the first model (LP-0MSH94Z7K007VKC9)
