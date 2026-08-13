@@ -258,6 +258,95 @@ test.describe('Slot Logs Tab', () => {
     await expect(page.locator('.slot-section[data-slot-id="2"]')).toHaveCount(1);
   });
 
+  test('slot sections are ordered numerically by slot id regardless of payload order', async ({ page }) => {
+    // Regression for the manual-review rejection (2026-08-13): llama-server
+    // /slots can return slots in non-numeric order (and the shared cache may
+    // reshuffle); sections must render in numeric order (0, 1, 2, ...).
+    const shuffled = statusPayload([
+      { slot_id: 2, is_processing: true, n_decoded: 10, n_tokens: 10, progress: 0.05, total_tokens: 200, session_id: SESSION_B, generation_done: false },
+      { slot_id: 0, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 3, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 1, is_processing: false, n_decoded: 0, generation_done: false },
+    ]);
+    await page.addInitScript(installFakeEventSource, [eventsRoute([shuffled])]);
+
+    await page.goto('/logs');
+    await expect(page.locator('#slotSections .slot-section')).toHaveCount(4);
+
+    const ids = await page.$$eval('#slotSections .slot-section', (secs) =>
+      secs.map((s) => Number(s.dataset.slotId))
+    );
+    expect(ids).toEqual([0, 1, 2, 3]);
+  });
+
+  test('a slot joining mid-range keeps the numeric DOM order', async ({ page }) => {
+    // Initial payload is missing slot 1 (sections 0 and 2 render first); a
+    // later payload adds slot 1. The new section must slot into position,
+    // not be appended at the end ([0,2,1] would be wrong).
+    const first = statusPayload([
+      { slot_id: 0, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 2, is_processing: false, n_decoded: 0, generation_done: false },
+    ]);
+    const second = statusPayload([
+      { slot_id: 0, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 1, is_processing: false, n_decoded: 0, generation_done: false },
+      { slot_id: 2, is_processing: false, n_decoded: 0, generation_done: false },
+    ]);
+    const routes = [
+      { urlContains: '/events', delayMs: 100, payloads: [first] },
+      { urlContains: '/events', delayMs: 700, payloads: [second] },
+    ];
+    await page.addInitScript(installFakeEventSource, routes);
+
+    await page.goto('/logs');
+    await expect(page.locator('#slotSections .slot-section')).toHaveCount(2);
+
+    // Slot 1 joins mid-range; DOM order must stay numeric
+    await expect(page.locator('.slot-section[data-slot-id="1"]')).toHaveCount(1);
+    const ids = await page.$$eval('#slotSections .slot-section', (secs) =>
+      secs.map((s) => Number(s.dataset.slotId))
+    );
+    expect(ids).toEqual([0, 1, 2]);
+  });
+
+  test('a working slot with no log lines yet shows a status placeholder, cleared when lines arrive', async ({ page }) => {
+    // Regression for the manual-review rejection (2026-08-13): during
+    // pre-fill/working periods llama-server has not emitted slot log lines
+    // yet, so the pane must not look empty — show a status-aware placeholder.
+    const routes = [
+      {
+        urlContains: '/events',
+        delayMs: 100,
+        payloads: [
+          statusPayload([
+            { slot_id: 1, is_processing: true, n_decoded: 0, session_id: SESSION_A, generation_done: false },
+          ]),
+        ],
+      },
+      {
+        urlContains: 'source=llama&slot=1',
+        delayMs: 400,
+        payloads: [
+          { line: '[57463] slot update_slots: id  1 | task 209403 | n_tokens = 16750, ...', source: 'llama', slot: 1 },
+        ],
+      },
+    ];
+    await page.addInitScript(installFakeEventSource, routes);
+
+    await page.goto('/logs');
+    const section = page.locator('.slot-section[data-slot-id="1"]');
+    const logEl = section.locator('.slot-log');
+
+    // Before any line arrives, a placeholder is visible (never an empty pane)
+    await expect(logEl.locator('.slot-empty-hint')).toBeVisible();
+    await expect(logEl.locator('.slot-empty-hint')).toContainText(/no log lines|waiting|pre-fill/i);
+    await expect(logEl.locator('.line')).toHaveCount(0);
+
+    // Once the first relevant line arrives, the placeholder is removed
+    await expect(logEl.locator('.line')).toHaveCount(1);
+    await expect(logEl.locator('.slot-empty-hint')).toHaveCount(0);
+  });
+
   test('idle slots are still rendered so the Slots tab is never empty', async ({ page }) => {
     // Regression for the manual-review rejection (2026-08-10): when no slot
     // is processing and no dispatch session is mapped yet, every slot must
