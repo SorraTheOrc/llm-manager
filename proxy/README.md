@@ -1652,8 +1652,9 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 - **Cache-aware large-context routing**: The proxy tracks KV cache warmth per-session
   (not just per-model) to avoid expensive full re-prefill when a session's backend
   slot has been evicted or reassigned. New sessions default to **cold** (bypass
-  threshold: 30K tokens by default); sessions with confirmed cache persistence are
-  **warm** (bypass threshold: 100K tokens). See
+  threshold: 38K tokens in fast mode / 60K in cheap mode, see
+  [Large-Context Routing](#large-context-routing-cache-aware-bypass)); sessions with
+  confirmed cache persistence are **warm** (bypass threshold: 100K tokens). See
   [Large-Context Routing](#large-context-routing-cache-aware-bypass) for details.
 - **Context window limits**: llama-server's KV cache has finite capacity. The Qwen3 model is configured with a **128k (131,072) token context window**. Very long conversations may exceed this limit. The context window size is set in [`models.ini`](../models.ini) (router mode) and [`proxy/scripts/start-proxy.sh`](proxy/scripts/start-proxy.sh) (single-model mode).
 
@@ -1786,8 +1787,8 @@ contaminate another session's routing decisions:
 
 - **Cold** — The session's backend KV slot is invalidated or has never been
   populated. Large-context requests bypass local at the **cold threshold**
-  (default: 30K tokens, configurable via
-  `local_large_context_cold_cache_threshold`).
+  (mode-aware, LP-0MSOMVOPH004ATAK: 38K tokens in fast mode, 60K in cheap
+  mode; configurable via `local_large_context_cold_cache_threshold`).
 - **Warm** — The session has confirmed cache persistence. Large-context requests
   bypass local only at the **warm threshold** (default: 100K tokens,
   configurable via `local_large_context_warm_cache_threshold`).
@@ -1810,9 +1811,17 @@ disabled, non-streaming proxy-only mode) does **not** warm the cache.
 #### Configuration
 
 ```yaml
-local_large_context_cold_cache_threshold: 30000   # tokens; 0 = disable cold bypass
+local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 = disable cold bypass
 local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
 ```
+
+The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`
+and the default `config.yaml` use `38000`, `config-cheap.yaml` uses `60000`.
+Each value stays below its mode's effective warm clamp (fast `131072//3 − 4096
+= 39594`; cheap resolves to `100000` via its 2×262144 schedule entries, and is
+also below the boot-transient clamp 61440) so the (cold, warm] band never
+collapses (LP-0MSI2M5BT004BCDP). Prompts above the per-slot warm clamp are
+never routed local (`context_too_large` — physical capacity).
 
 When a threshold is set to `0`, the corresponding bypass is disabled entirely.
 

@@ -411,7 +411,11 @@ server:
   # time -> llama-server HTTP 400 -> remote fallback. See docs/llama-router.md
   # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
   # tokenizer).
-  local_large_context_cold_cache_threshold: 30000
+  #
+  # MODE-AWARE value (LP-0MSOMVOPH004ATAK): this default profile mirrors the
+  # fast-mode profile (3 slots x 131072); keep it aligned with config-fast.yaml
+  # (38000). See the mode-aware note there.
+  local_large_context_cold_cache_threshold: 38000
 
   # Context-too-large bypass threshold (skip reason `context_too_large`;
   # LP-0MRE4NBQ5009V5BX, renamed from `warm_cache_bypass` in

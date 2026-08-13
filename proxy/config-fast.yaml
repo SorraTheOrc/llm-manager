@@ -402,7 +402,13 @@ server:
   # time -> llama-server HTTP 400 -> remote fallback. See docs/llama-router.md
   # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
   # tokenizer).
-  local_large_context_cold_cache_threshold: 30000
+  #
+  # MODE-AWARE value (LP-0MSOMVOPH004ATAK): fast mode runs 3 slots x 131072,
+  # so the effective warm threshold clamps to 39594 (131072//3 - 4096). Cold
+  # 38000 stays BELOW it, keeping the (38000, 39594] band non-empty for the
+  # cached_ratio check (dead-code guard LP-0MSI2M5BT004BCDP) while recapturing
+  # cold-cache prompts in the old (30000, 38000] bypass band for local.
+  local_large_context_cold_cache_threshold: 38000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
