@@ -1,6 +1,10 @@
 target-version = "py312"
 line-length = 120
 
+# Exclude non-Python files (YAML configs, etc.) — ruff treats them as
+# Python and reports false-positive "invalid-syntax" errors (LP-0MSP5EZWU004C46E).
+exclude = ["*.yaml", "*.yml"]
+
 [lint]
 select = [
     "F",      # Pyflakes (logic errors)
