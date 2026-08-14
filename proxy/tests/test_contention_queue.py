@@ -68,7 +68,7 @@ def _remote_passthrough_response() -> Response:
 
     Real UTF-8 (non-ASCII) bytes so byte-identity is non-trivial."""
     return Response(
-        content='{"choices":[{"message":{"content":"é中文 bytes"}}]}'.encode("utf-8"),
+        content='{"choices":[{"message":{"content":"é中文 bytes"}}]}'.encode(),
         status_code=200,
         media_type="application/json",
     )
@@ -483,7 +483,7 @@ async def test_fast_mode_fallback_dispatch_bytes_unchanged(mixed_model_config):
     # Non-ASCII payload so byte-identity is non-trivial (UTF-8 encoding).
     request_body = (
         '{"model":"test","messages":[{"role":"user","content":"é中文 payload"}]}'
-    ).encode("utf-8")
+    ).encode()
     request = _DummyRequest(body=request_body)
     request.headers = {"x-test-header": "abc", "content-type": "application/json"}
     remote_response = _remote_passthrough_response()
