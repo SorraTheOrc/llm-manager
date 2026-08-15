@@ -664,8 +664,8 @@ async def _query_prefill_progress(
     llama_port: int,
     model_name: str | None = None,
     slot_id: int | None = None,
-) -> int | None:
-    """Poll llama-server for observed prefill progress (KV tokens processed).
+) -> tuple[int | None, bool]:
+    """Observe llama-server prefill state: ``(progress, alive)``.
 
     Non-blocking: every query is wrapped in ``asyncio.wait_for`` using the
     same ``STATUS_QUERY_TIMEOUT`` (default 1.0s) pattern as the
@@ -674,29 +674,45 @@ async def _query_prefill_progress(
 
     Progress sources, in preference order:
 
-    1. Per-slot: ``/slots`` -> ``n_past`` / ``n_prompt_tokens_processed``
-       for the specific slot (accurate when other slots are busy).
+    1. Per-slot: ``/slots`` -> per-slot state from ``_query_slots_progress``
+       (``n_past`` / ``n_prompt_tokens_processed`` when the build reports
+       them, plus the ``is_processing`` liveness flag).
     2. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
        ``n_past`` if present).
 
-    Returns ``None`` when progress cannot be observed (query failure,
-    timeout, or no token count reported).
+    Returns ``(progress, alive)``:
+
+    - *progress* is the latest observed prefill progress (``None`` when no
+      numeric progress can be observed).
+    - *alive* is True when the slot is observed actively processing
+      (``is_processing``), even when the llama.cpp build exposes no numeric
+      progress fields (b8782 removed ``n_past``/``n_prompt_tokens_processed``
+      from ``/slots``; LP-0MSUO5Z0K007HBSS). This lets the caller extend the
+      lease on liveness rather than progress advance alone.
+
+    When progress is unobservable AND the slot is not observed processing,
+    a throttled warning is logged so silent query failures are visible in
+    production (LP-0MSUO5Z0K007HBSS AC2).
     """
     timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+    alive = False
 
     if slot_id is not None:
         try:
             from proxy.observability import _query_slots_progress
 
-            progress = await asyncio.wait_for(
+            states = await asyncio.wait_for(
                 _query_slots_progress(
                     llama_port, timeout=timeout, model=model_name
                 ),
                 timeout=timeout + 0.5,
             )
-            value = progress.get(slot_id)
-            if isinstance(value, (int, float)) and value >= 0:
-                return int(value)
+            state = states.get(slot_id)
+            if isinstance(state, dict):
+                alive = bool(state.get("processing", False))
+                value = state.get("progress")
+                if isinstance(value, (int, float)) and value >= 0:
+                    return int(value), alive
         except Exception:
             pass
 
@@ -707,11 +723,50 @@ async def _query_prefill_progress(
         for key in ("kv_cache_tokens", "n_past"):
             value = status.get(key)
             if isinstance(value, (int, float)) and value > 0:
-                return int(value)
+                return int(value), True
     except Exception:
         pass
 
-    return None
+    if not alive:
+        _warn_prefill_progress_unobservable(srv)
+    return None, alive
+
+
+_last_prefill_progress_warn_ts = 0.0
+"""Monotonic timestamp of the last 'prefill progress unobservable' warning.
+
+Used to throttle the warning to one per ``_PREFILL_WARN_INTERVAL`` seconds so
+a permanently-broken progress source cannot spam the log at the 10s poll
+cadence (LP-0MSUO5Z0K007HBSS AC2).
+"""
+
+_PREFILL_WARN_INTERVAL = 60.0
+"""Seconds between repeated 'prefill progress unobservable' warnings."""
+
+
+def _warn_prefill_progress_unobservable(srv) -> None:
+    """Throttled warning when neither progress source can observe prefill
+    progress (per-slot query failed / returned nothing usable, and the
+    aggregate status query yielded no token counts).
+
+    The prefill poll runs every ``local_dispatch_lease_prefill_poll_seconds``
+    (default 10s) per stream, so without throttling a persistent failure
+    would emit a warning every poll. Warn at most once per
+    ``_PREFILL_WARN_INTERVAL`` seconds (LP-0MSUO5Z0K007HBSS AC2).
+    """
+    global _last_prefill_progress_warn_ts
+    now = time.monotonic()
+    if now - _last_prefill_progress_warn_ts < _PREFILL_WARN_INTERVAL:
+        return
+    _last_prefill_progress_warn_ts = now
+    try:
+        srv.logger.warning(
+            "prefill_progress_unobservable: no per-slot or aggregate prefill "
+            "progress; lease extension relies on the adaptive acquisition "
+            "estimate and liveness signal"
+        )
+    except Exception:
+        pass
 
 
 async def _extend_lease_during_prefill(
@@ -723,15 +778,27 @@ async def _extend_lease_during_prefill(
     slot_id: int | None = None,
     last_progress: int = 0,
 ) -> tuple[int, bool]:
-    """Observe prefill progress and extend the dispatch lease while advancing.
+    """Observe prefill state and extend the dispatch lease while advancing.
 
     During the prefill phase of an explicit-session request (dispatched, no
-    stream data chunks yet), llama-server reports advancing KV-cache usage
-    (per-slot ``n_past``/``n_prompt_tokens_processed``, or aggregate
-    ``kv_cache_tokens``). While that progress advances, the session's
-    dispatch lease ``expires_at`` is pushed out to ``now + safety buffer``
-    so a very large prefill — beyond the adaptive token-estimate cap of
-    1500s — cannot lose its lease mid-prefill (LP-0MSE05J53004C6EL).
+    stream data chunks yet), llama-server reports per-slot state that
+    advances as the cache prefill progresses. While the slot is observed
+    alive (``is_processing``) or the reported progress advances, the
+    session's dispatch lease ``expires_at`` is pushed out to
+    ``now + safety buffer`` so a very large prefill — beyond the adaptive
+    token-estimate cap of 1500s — cannot lose its lease mid-prefill
+    (LP-0MSE05J53004C6EL).
+
+    Extension triggers:
+
+    - **Progress advance** — observed numeric progress (per-slot
+      ``n_past``/``n_prompt_tokens_processed`` or aggregate
+      ``kv_cache_tokens``) is greater than *last_progress*.
+    - **Liveness** — no numeric progress is reported by the llama.cpp build
+      (b8782 removed the fields from ``/slots``) but the slot is observed
+      actively processing (``is_processing``); the lease is extended on
+      liveness so streams are never orphaned mid-prefill just because the
+      build stopped reporting a counter (LP-0MSUO5Z0K007HBSS).
 
     Returns ``(last_progress, extended)``:
 
@@ -739,7 +806,7 @@ async def _extend_lease_during_prefill(
       pass back on the next poll so extension stops when progress stalls.
     - *extended* is True when ``expires_at`` was pushed out.
 
-    When progress is unobservable (query failure/timeout/None), the lease is
+    When progress is unobservable AND the slot is not alive, the lease is
     left untouched — it keeps the adaptive token-estimate value applied at
     acquisition rather than being dropped (fallback). When disabled
     (``local_dispatch_lease_prefill_poll_seconds: 0``) this is a no-op.
@@ -748,10 +815,11 @@ async def _extend_lease_during_prefill(
     if poll_seconds <= 0 or buffer_seconds <= 0:
         return last_progress, False
 
-    progress = await _query_prefill_progress(
+    progress, alive = await _query_prefill_progress(
         srv, llama_port, model_name=model_name, slot_id=slot_id
     )
-    if progress is None or progress <= last_progress:
+    advancing = progress is not None and progress > last_progress
+    if not advancing and not alive:
         # Unobservable or stalled: no extension. Unobservable keeps the
         # adaptive estimate applied at acquisition (fallback).
         return last_progress, False
@@ -766,17 +834,26 @@ async def _extend_lease_during_prefill(
                     record["expires_at"] = time.monotonic() + buffer_seconds
                     extended = True
                     try:
-                        srv.logger.info(
-                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                            session_key[:8] if session_key else "unknown",
-                            progress,
-                            buffer_seconds,
-                        )
+                        if advancing:
+                            srv.logger.info(
+                                "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                                session_key[:8] if session_key else "unknown",
+                                progress,
+                                buffer_seconds,
+                            )
+                        else:
+                            srv.logger.info(
+                                "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
+                                session_key[:8] if session_key else "unknown",
+                                buffer_seconds,
+                            )
                     except Exception:
                         pass
     except Exception:
         pass
-    return progress, extended
+    if advancing:
+        return progress, extended
+    return last_progress, extended
 
 
 async def _decrement_local_active_queries(

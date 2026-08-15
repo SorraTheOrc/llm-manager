@@ -26,9 +26,13 @@ HTTP JSON parsing and URL building patterns found in both
   endpoint with an optional ``model`` query parameter, returning a list of
   per-slot dicts with keys ``slot_id``, ``is_processing``, and ``n_decoded``.
 - ``_query_slots_progress(llama_port, timeout, model)`` — Query the ``/slots``
-  endpoint and return a dict mapping slot id -> prefill progress tokens
-  (max of ``n_past`` / ``n_prompt_tokens_processed``), used by the
-  prefill-progress dispatch-lease extension (LP-0MSE05J53004C6EL).
+  endpoint and return a dict mapping slot id -> prefill state
+  ``{"progress": int|None, "processing": bool}`` where *progress* is the max
+  of ``n_past`` / ``n_prompt_tokens_processed`` (older llama.cpp builds) and
+  *processing* is the slot's ``is_processing`` flag (the only per-slot
+  liveness signal llama.cpp b8782 still exposes), used by the
+  prefill-progress dispatch-lease extension (LP-0MSE05J53004C6EL,
+  LP-0MSUO5Z0K007HBSS).
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
@@ -264,14 +268,21 @@ async def _query_slots_progress(
     timeout: float = 2.0,
     model: str | None = None,
     _client: httpx.AsyncClient | None = None,
-) -> dict[int, int]:
-    """Query the llama-server ``/slots`` endpoint for per-slot prefill progress.
+) -> dict[int, dict]:
+    """Query the llama-server ``/slots`` endpoint for per-slot prefill state.
 
-    Returns a dict mapping slot id -> progress tokens, where progress is the
-    maximum of the slot's ``n_past`` and ``n_prompt_tokens_processed`` fields.
-    Both advance as llama-server ingests prompt tokens during the cache
-    prefill phase, so an increasing value signals active prefill on that
-    slot (LP-0MSE05J53004C6EL).
+    Returns a dict mapping slot id -> ``{"progress": int|None,
+    "processing": bool}``:
+
+    - *progress* — the maximum of the slot's ``n_past`` and
+      ``n_prompt_tokens_processed`` fields when present (older llama.cpp
+      builds that still report per-slot prefill progress;
+      LP-0MSE05J53004C6EL), else ``None``. llama.cpp b8782 removed both
+      fields from the ``/slots`` response (LP-0MSUO5Z0K007HBSS).
+    - *processing* — the slot's ``is_processing`` flag, the only per-slot
+      liveness signal b8782 still exposes. While True the slot is actively
+      working a request (prefill or generation), so the dispatch lease can
+      be kept alive on liveness even when no numeric progress is reported.
 
     Returns an empty dict on any failure (HTTP error, connection error,
     timeout, or unexpected response shape), mirroring ``_query_slots_detail``.
@@ -290,7 +301,7 @@ async def _query_slots_progress(
         if slots_resp.status_code == 200:
             slots_data = await _safe_parse_json_response(slots_resp)
             if isinstance(slots_data, list):
-                result: dict[int, int] = {}
+                result: dict[int, dict] = {}
                 for i, slot in enumerate(slots_data):
                     if not isinstance(slot, dict):
                         continue
@@ -299,8 +310,11 @@ async def _query_slots_progress(
                         c for c in (slot.get("n_past"), slot.get("n_prompt_tokens_processed"))
                         if isinstance(c, (int, float)) and c >= 0
                     ]
-                    if candidates:
-                        result[sid] = int(max(candidates))
+                    progress = int(max(candidates)) if candidates else None
+                    result[sid] = {
+                        "progress": progress,
+                        "processing": bool(slot.get("is_processing", False)),
+                    }
                 return result
     except Exception as exc:
         _srv().logger.debug(

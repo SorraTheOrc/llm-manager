@@ -487,7 +487,9 @@ server:
   #   explicit-session request (dispatched, no stream data chunks yet), the proxy
   #   polls llama-server for observed prefill progress (per-slot n_past /
   #   n_prompt_tokens_processed from /slots, falling back to kv_cache_tokens) and
-  #   extends the dispatch lease while progress is advancing, so very large
+  #   extends the dispatch lease while the request is alive (per-slot is_processing
+  #   liveness flag when the build does not report numeric progress; b8782 —
+  #   LP-0MSUO5Z0K007HBSS), so very large
   #   prefills beyond the adaptive cap (1500s) keep their lease. Cadence in
   #   seconds; 0 disables progress-based extension entirely (LP-0MSE05J53004C6EL).
   # local_dispatch_lease_prefill_buffer_seconds: Safety buffer added to the lease
