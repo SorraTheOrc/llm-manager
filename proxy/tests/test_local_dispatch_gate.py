@@ -1782,7 +1782,7 @@ async def test_recover_global_resets_in_legacy_mode():
 def _make_orphan_srv(records: dict | None = None, logger=None) -> SimpleNamespace:
     """Build a server with dispatch tracking for orphan-cleanup tests."""
     return SimpleNamespace(
-        config={"server": {"local_dispatch_lease_timeout_seconds": 15}},
+        config={"server": {"local_dispatch_lease_timeout_seconds": 30}},
         local_active_queries=1,
         local_active_queries_lock=asyncio.Lock(),
         local_dispatch_records=records if records is not None else {},

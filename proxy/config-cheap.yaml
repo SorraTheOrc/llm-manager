@@ -546,7 +546,11 @@ server:
   # denies (~9% model error). Prefill protection is preserved: the adaptive
   # lease (60 + tokens x 0.015, cap 1500s) and prefill-progress extension apply
   # to the in-flight request; only the post-stream cooldown (fixed base) shrinks.
-  local_dispatch_lease_timeout_seconds: 15
+  # Raised back to 30s (LP-0MSUO82NF002HUMC) as a safety net after the 15s
+  # verification (LP-0MSKOHV55003XFTB) showed a 15x increase in mid-request
+  # orphan cleanups; T1-T3 (prefill-progress liveness extension, anonymous
+  # chunk-refresh, active-slot orphan verification) address the root causes.
+  local_dispatch_lease_timeout_seconds: 30
   session_single_flight_mode: queue
   session_single_flight_max_queue_depth: 1
   # Session single-flight queue timeout (LP-0MS14PM88007NNUJ).
