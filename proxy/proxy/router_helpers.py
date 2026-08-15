@@ -958,12 +958,15 @@ async def _increment_local_active_queries(
     session_key: str | None = None,
     backend: str | None = None,
     body_json: dict | None = None,
+    model_name: str | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
     When *session_key* and *backend* are provided, a corresponding
     dispatch record is created in *local_dispatch_records* to track
-    lease ownership.
+    lease ownership. *model_name* is stored on the record so orphan
+    cleanup can verify the session's slot against llama-server's
+    ``/slots`` before freeing the lease (LP-0MSUO6XRP001MCB2).
 
     When *body_json* is provided, the lease timeout is extended
     adaptively based on the estimated prompt token count, so that
@@ -989,6 +992,7 @@ async def _increment_local_active_queries(
                         "started_at": time.monotonic(),
                         "active": True,
                         "expires_at": time.monotonic() + lease_timeout,
+                        "model_name": model_name,
                     }
         except Exception:
             pass
@@ -1000,6 +1004,7 @@ async def _try_acquire_local_dispatch(
     session_key: str,
     backend: str,
     body_json: dict | None = None,
+    model_name: str | None = None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -1114,6 +1119,7 @@ async def _try_acquire_local_dispatch(
                     "started_at": now,
                     "active": True,
                     "expires_at": now + lease_timeout,
+                    "model_name": model_name,
                 }
 
             return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
@@ -1189,6 +1195,48 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
+async def _query_slot_processing(srv, session_id: str, model_name: str | None) -> bool:
+    """Check whether the session's llama-server slot is still processing.
+
+    Queries llama-server ``/slots`` (via ``_query_slots_progress``) for the
+    slot assigned to *session_id* and returns its ``is_processing`` flag —
+    the only per-slot liveness signal llama.cpp b8782 exposes. Used by
+    orphan cleanup to avoid freeing the dispatch lease / slot registry
+    entry for a stream that is still generating on the backend
+    (LP-0MSUO6XRP001MCB2).
+
+    Returns False (do not treat as alive) when the session has no slot
+    assignment, no *model_name* is known (the router requires a model
+    param), or the query fails/times out — the caller then proceeds with
+    normal orphan cleanup.
+    """
+    if not session_id or not model_name:
+        return False
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        slot_id = _assigned_slot_for_session(session_id)
+        if slot_id is None:
+            return False  # no slot assignment — cannot verify
+
+        server_cfg = srv.config.get("server", {})
+        llama_port = server_cfg.get("llama_server_port", 8080)
+
+        from proxy.observability import _query_slots_progress
+
+        timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+        states = await asyncio.wait_for(
+            _query_slots_progress(llama_port, timeout=timeout, model=model_name),
+            timeout=timeout + 0.5,
+        )
+        state = states.get(slot_id)
+        if isinstance(state, dict):
+            return bool(state.get("processing", False))
+        return False
+    except Exception:
+        return False
+
+
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
@@ -1200,10 +1248,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
     2. **Active records** whose *expires_at* has passed — these represent
        abandoned/orphaned streams where the stream was started but never
-       finished (no *active=False* transition). Logged at WARNING level
-       with ``reason=orphan_cleanup`` distinct from normal idle-timeout
-       release, plus an INFO-level ``lease_released reason=orphan_cleanup``
-       for parity with existing log consumers.
+       finished (no *active=False* transition). Before freeing, the record's
+       slot is verified against llama-server ``/slots``: if the slot is
+       still processing, the lease is extended by the chunk-refresh buffer
+       instead (``lease_verified_active ... stream_abandoned=False``), so a
+       long silent generation cannot lose its lease mid-flight
+       (LP-0MSUO6XRP001MCB2). Genuinely idle slots are orphan-cleaned as
+       before, logged at WARNING level with ``reason=orphan_cleanup`` plus
+       an INFO-level ``lease_released reason=orphan_cleanup`` for parity
+       with existing log consumers.
 
     Active records whose *expires_at* is still in the future are preserved
     (legitimate in-flight requests).
@@ -1212,6 +1265,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     """
     now = time.monotonic()
     removed = 0
+    verify_candidates: list[tuple[str, dict]] = []
+
+    # Phase 1 (under lock): collect expired records. Inactive records are
+    # freed immediately; expired ACTIVE records are deferred to phase 3 so
+    # the slot liveness check runs OUTSIDE the records lock (it performs
+    # an HTTP query to llama-server).
     try:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
@@ -1239,7 +1298,53 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                 else:
-                    # Abandoned/orphaned active record past its expires_at
+                    verify_candidates.append((sid, record))
+    except Exception:
+        pass
+
+    # Phase 2 (outside the lock): verify which candidates still have a
+    # processing slot on llama-server. A failed / unverifiable query means
+    # "not verified alive" — the record is orphan-cleaned below (fail-open,
+    # matching pre-existing behaviour).
+    alive: set[str] = set()
+    for sid, record in verify_candidates:
+        try:
+            if await _query_slot_processing(
+                srv, sid, record.get("model_name")
+            ):
+                alive.add(sid)
+        except Exception:
+            pass
+
+    # Phase 3 (under lock again): apply the verdict. Re-check the record
+    # still exists and is still expired — it may have been refreshed by the
+    # stream loop (chunk-refresh / prefill extension) or released since
+    # phase 1.
+    if verify_candidates:
+        try:
+            async with srv.local_dispatch_records_lock:
+                for sid, record in verify_candidates:
+                    current = srv.local_dispatch_records.get(sid)
+                    if current is None:
+                        continue  # released concurrently — nothing to do
+                    if current.get("expires_at", 0) > time.monotonic():
+                        continue  # refreshed since phase 1 — preserved
+                    if sid in alive:
+                        # Slot still generating: extend the lease instead of
+                        # freeing (LP-0MSUO6XRP001MCB2).
+                        current["expires_at"] = (
+                            time.monotonic() + _get_chunk_refresh_buffer_seconds(srv)
+                        )
+                        try:
+                            srv.logger.info(
+                                "lease_verified_active session=%s "
+                                "reason=active_slot stream_abandoned=False",
+                                sid[:8] if sid else "unknown",
+                            )
+                        except Exception:
+                            pass
+                        continue
+                    # Genuinely orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
                     removed += 1
                     # Free the slot registry entry so the slot can be
@@ -1270,8 +1375,8 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
-    except Exception:
-        pass
+        except Exception:
+            pass
     # Removed stale leases frees slots — wake the cross-session contention
     # queue (LP-0MSORQVK50012Q4D AC2).
     if removed > 0:

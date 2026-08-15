@@ -535,7 +535,9 @@ server:
   #   arrival during an active stream. Explicit sessions refresh on chunks with the
   #   full base lease; anonymous sessions get this dedicated buffer (default 30s) so
   #   a short base lease (15s) cannot orphan-clean a long silent generation
-  #   (LP-0MSUO6HLX0089MNQ).
+  #   (LP-0MSUO6HLX0089MNQ). The same buffer extends the lease when orphan cleanup
+  #   verifies a session's slot is still processing on llama-server (active-stream
+  #   verification, LP-0MSUO6XRP001MCB2).
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
   # events) showed 100% of denies caused by idle lease holders, never GPU
