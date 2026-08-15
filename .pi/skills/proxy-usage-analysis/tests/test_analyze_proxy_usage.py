@@ -192,6 +192,29 @@ class TestLogLineParsing:
         ev = log_parser.parse_log_line(fixtures.STREAM_STARTED_SESSION_UNKNOWN)
         assert ev.session is None
 
+    def test_mode_switch_parsed(self):
+        """Mode scheduler applied-mode lines build the mode timeline
+        (LP-0MSPZUD4G007IYGH AC1)."""
+        ev = log_parser.parse_log_line(fixtures.MODE_SWITCH_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.ts == datetime(2026, 8, 15, 1, 0, 8, 679000)
+        ev2 = log_parser.parse_log_line(fixtures.MODE_SWITCH_FAST)
+        assert ev2.kind == "mode_switch"
+        assert ev2.mode == "fast"
+
+    def test_mode_scheduler_enabled_line_ignored(self):
+        """The ``enabled with N entries`` announcement carries no applied
+        mode and is not a timeline event."""
+        assert log_parser.parse_log_line(fixtures.MODE_SCHEDULER_ENABLED_IGNORED) is None
+
+    def test_status_request_lines_ignored(self):
+        """status_request lines expose total_slots but are not parsed (they
+        are corroborating evidence only)."""
+        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_CHEAP) is None
+        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST) is None
+
 
 class TestErrorLineParsing:
     """Error events are parsed into distinct error kinds with the fields the
@@ -726,6 +749,135 @@ class TestBucketing:
     def test_minute_of_day_uses_fractional_minutes(self):
         assert bucketing.minute_of_day(datetime(2026, 8, 2, 23, 58, 30)) == pytest.approx(1438.5)
 
+    def test_mode_map_period_for_labels_by_mode_not_slot_counts(self):
+        """A cheap-profile schedule has equal slot counts all day; the mode
+        map must still label its hours "cheap" (LP-0MSPZUD4G007IYGH AC3)."""
+        mm = fixtures.mode_map_fixture()
+        cheap_ts = datetime(2026, 8, 15, 2, 0, 0)
+        fast_ts = datetime(2026, 8, 15, 10, 30, 0)
+        mm.transitions = [
+            (datetime(2026, 8, 15, 1, 0, 0), "cheap"),
+            (datetime(2026, 8, 15, 10, 0, 0), "fast"),
+        ]
+        p = mm.period_for(cheap_ts)
+        assert p.label == "cheap"
+        assert p.slots == 2
+        assert p.ctx_size == 262144
+        p2 = mm.period_for(fast_ts)
+        assert p2.label == "fast"
+        assert p2.slots == 3
+        assert p2.ctx_size == 131072
+
+    def test_mode_map_mode_at_uses_nearest_prior_transition(self):
+        mm = fixtures.mode_map_fixture()
+        mm.transitions = [
+            (datetime(2026, 8, 14, 10, 0, 0), "fast"),
+            (datetime(2026, 8, 15, 1, 0, 0), "cheap"),
+            (datetime(2026, 8, 15, 10, 0, 0), "fast"),
+        ]
+        assert mm.mode_at(datetime(2026, 8, 14, 10, 30, 0)) == "fast"
+        assert mm.mode_at(datetime(2026, 8, 15, 2, 0, 0)) == "cheap"
+        assert mm.mode_at(datetime(2026, 8, 15, 10, 30, 0)) == "fast"
+
+    def test_mode_map_without_transitions_falls_back_to_analysis_mode(self):
+        mm = fixtures.mode_map_fixture()
+        assert mm.mode_at(datetime(2026, 8, 15, 2, 0, 0)) == "fast"  # default_mode
+
+
+# ---------------------------------------------------------------------------
+# Mode-timeline bucketing (LP-0MSPZUD4G007IYGH)
+# ---------------------------------------------------------------------------
+
+
+class TestModeTimelineBucketing:
+    """Sessions are bucketed by the operating mode active at their first
+    in-window stream (reconstructed from ``Mode scheduler`` log lines), so a
+    window crossing the 01:00/10:00 transitions splits fast vs cheap instead
+    of collapsing everything into the analysis-time bucket."""
+
+    MODE_WINDOW_START = datetime(2026, 8, 14, 10, 29, 0)
+    MODE_WINDOW_END = datetime(2026, 8, 15, 10, 29, 0)
+
+    def _lines(self):
+        return [
+            # Prior transition (inside the 48h timeline margin, before window start).
+            "2026-08-14 10:00:02,000 - INFO - Mode scheduler: applied scheduled mode fast",
+            fixtures.STATUS_REQUEST_FAST,
+            # Cheap transition + a cheap-hour session (02:00).
+            fixtures.MODE_SWITCH_CHEAP,
+            fixtures.STATUS_REQUEST_CHEAP,
+            "2026-08-15 02:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=cheap-sess request=[]",
+            "2026-08-15 02:00:10,000 - INFO - Stream finished: reason=stop tokens=50000/100/50100 session=cheap-sess provider=local model=Qwen3 request=[]",
+            # Fast transition + fast-hour sessions (Aug 14 11:00, Aug 15 10:20).
+            fixtures.MODE_SWITCH_FAST,
+            "2026-08-14 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=fast-early request=[]",
+            "2026-08-14 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=fast-early provider=local model=Qwen3 request=[]",
+            "2026-08-15 10:20:00,000 - INFO - Stream started: provider=local model=Qwen3 session=fast-late request=[]",
+            "2026-08-15 10:20:10,000 - INFO - Stream finished: reason=stop tokens=200/20/220 session=fast-late provider=local model=Qwen3 request=[]",
+        ]
+
+    def test_sessions_bucketed_by_mode_transitions(self):
+        mm = fixtures.mode_map_fixture()
+        res = aggregation.aggregate(
+            _events(self._lines()),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # Timeline reconstructed from the applied-mode lines.
+        assert mm.transitions == [
+            (datetime(2026, 8, 14, 10, 0, 2), "fast"),
+            (datetime(2026, 8, 15, 1, 0, 8, 679000), "cheap"),
+            (datetime(2026, 8, 15, 10, 0, 18, 41000), "fast"),
+        ]
+        s = res.sessions["cheap-sess"]
+        assert s.bucket == "cheap"
+        assert s.slots == 2
+        assert s.ctx_size == 262144
+        assert s.max_context_size == 50000
+        assert res.sessions["fast-early"].bucket == "fast"
+        assert res.sessions["fast-early"].slots == 3
+        assert res.sessions["fast-early"].ctx_size == 131072
+        assert res.sessions["fast-late"].bucket == "fast"
+        assert res.sessions["fast-late"].slots == 3
+        assert res.sessions["fast-late"].ctx_size == 131072
+
+    def test_window_without_transitions_keeps_legacy_bucketing(self):
+        """A single-mode window (no transitions observed) keeps the legacy
+        slot-count bucketing from the analysis-time schedule (AC notes)."""
+        mm = fixtures.mode_map_fixture()
+        lines = [
+            "2026-08-15 02:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-15 02:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 15, 0, 0),
+            datetime(2026, 8, 15, 3, 0),
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # No mode lines -> transitions empty -> analysis-time schedule buckets.
+        assert mm.transitions == []
+        assert res.sessions["s1"].bucket == "fast"
+        assert res.sessions["s1"].slots == 3
+
+    def test_mode_switch_lines_counted_as_parsed_lines(self):
+        mm = fixtures.mode_map_fixture()
+        res = aggregation.aggregate(
+            _events(self._lines()),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # In-window structured lines: 2 mode switches (Aug 15 01:00/10:00;
+        # the Aug 14 10:00 line lies in the margin, outside the window)
+        # + 3 stream starts + 3 stream finishes.
+        assert res.total_lines == 8
+        assert res.lines_skipped == 0
+
 
 # ---------------------------------------------------------------------------
 # Recommendation rules
@@ -1059,6 +1211,66 @@ class TestConfigLoader:
         found = config_loader.find_config_path(start=tmp_path)
         assert found == tmp_path / "proxy" / "config.yaml"
 
+    def test_yaml_parse_captures_per_period_ctx_size(self):
+        """slot_schedule entries with an explicit ctx_size expose it as
+        ctx_by_time (LP-0MSMZOAJW002UR2A / LP-0MSPZUD4G007IYGH AC4)."""
+        text = """\
+server:
+  slot_schedule:
+    enabled: true
+    entries:
+      - time: "23:59"
+        slots: 2
+        ctx_size: 262144
+      - time: "10:00"
+        slots: 3
+        ctx_size: 131072
+"""
+        cfg = config_loader.parse_config_text(text)
+        schedule = cfg["slot_schedule"]
+        assert schedule["entries"] == [("23:59", 2), ("10:00", 3)]
+        assert schedule["ctx_by_time"] == {"23:59": 262144, "10:00": 131072}
+
+    def test_regex_fallback_captures_per_period_ctx_size(self):
+        text = """\
+server:
+  slot_schedule:
+    enabled: true
+    entries:
+      - time: "23:59"
+        slots: 2
+        ctx_size: 262144
+      - time: "10:00"
+        slots: 3
+"""
+        cfg = config_loader._parse_config_text_regex(text)
+        schedule = cfg["slot_schedule"]
+        assert schedule["entries"] == [("23:59", 2), ("10:00", 3)]
+        assert schedule.get("ctx_by_time") == {"23:59": 262144}
+
+    def test_discover_configs_loads_profiles_and_analysis_mode(self, tmp_path):
+        """discover_configs loads all three profiles plus the persisted mode
+        (LP-0MSPZUD4G007IYGH)."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("local_model_ctx_size: 131072\n")
+        (tmp_path / "proxy" / "config-cheap.yaml").write_text("local_model_ctx_size: 262144\n")
+        (tmp_path / "proxy" / "config-fast.yaml").write_text("local_model_ctx_size: 131072\n")
+        (tmp_path / "proxy" / ".mode").write_text("cheap\n")
+        configs = config_loader.discover_configs(start=tmp_path)
+        assert configs["base"] == tmp_path / "proxy" / "config.yaml"
+        assert configs["profiles"]["fast"]["local_model_ctx_size"] == 131072
+        assert configs["profiles"]["cheap"]["local_model_ctx_size"] == 262144
+        assert configs["analysis_mode"] == "cheap"
+        assert configs["analysis_config"] is configs["profiles"]["cheap"]
+
+    def test_discover_configs_no_mode_uses_default(self, tmp_path):
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("local_model_ctx_size: 131072\n")
+        (tmp_path / "proxy" / "config-cheap.yaml").write_text("local_model_ctx_size: 262144\n")
+        configs = config_loader.discover_configs(start=tmp_path)
+        assert configs["analysis_mode"] is None
+        assert configs["analysis_config"] is configs["profiles"]["default"]
+
 
 # ---------------------------------------------------------------------------
 # End-to-end run over fixture log files
@@ -1349,6 +1561,77 @@ class TestEndToEnd:
         assert busy["peak_concurrency"] == 1
         # Round-trips through json.
         json.dumps(data)
+
+    def test_mode_aware_end_to_end_split(self, tmp_path):
+        """Regression (LP-0MSPZUD4G007IYGH): a window crossing the
+        01:00/10:00 mode transitions splits sessions fast/cheap by the mode
+        active at their start — cheap sessions land in cheap_sessions.csv with
+        the cheap profile's slots/ctx even though the analysis-time mode is
+        fast. Uses real ``Mode scheduler`` + ``status_request`` lines."""
+        log_dir = tmp_path / "logs_mode"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(TestModeTimelineBucketing._lines(TestModeTimelineBucketing)) + "\n")
+        out_dir = tmp_path / "out_mode"
+        mm = fixtures.mode_map_fixture()
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=TestModeTimelineBucketing.MODE_WINDOW_START,
+            window_end=TestModeTimelineBucketing.MODE_WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+            mode_map=mm,
+        )
+        assert len(result.summary.sessions) == 3
+        assert result.summary.sessions["cheap-sess"].bucket == "cheap"
+        assert result.summary.sessions["cheap-sess"].slots == 2
+        assert result.summary.sessions["cheap-sess"].ctx_size == 262144
+
+        with (out_dir / "fast_sessions.csv").open() as f:
+            fast_rows = list(csv.DictReader(f))
+        with (out_dir / "cheap_sessions.csv").open() as f:
+            cheap_rows = list(csv.DictReader(f))
+        assert {r["session_id"] for r in fast_rows} == {"fast-early", "fast-late"}
+        assert {r["session_id"] for r in cheap_rows} == {"cheap-sess"}
+        cheap = cheap_rows[0]
+        assert cheap["bucket"] == "cheap"
+        assert cheap["slots"] == "2"
+        assert cheap["ctx_size"] == "262144"
+        fast = next(r for r in fast_rows if r["session_id"] == "fast-late")
+        assert fast["slots"] == "3"
+        assert fast["ctx_size"] == "131072"
+
+        # The report's Session summary reflects the actual mode split.
+        md = (out_dir / "report.md").read_text()
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Sessions | 3 | 2 (66.7%) | 1 (33.3%) |" in section
+        assert "| Local requests | 3 (100.0%) | 2 (100.0%) | 1 (100.0%) |" in section
+
+        # JSON summary exposes the split too.
+        data = reporting.summary_to_json(result.summary, mm)
+        assert data["fast_sessions"] == 2
+        assert data["cheap_sessions"] == 1
+
+    def test_mode_aware_context_pressure_uses_per_session_profile(self, tmp_path):
+        """Context-pressure recommendations use each session's own profile
+        (cheap 262144/2, fast 131072/3) instead of the analysis-time ctx."""
+        log_dir = tmp_path / "logs_mode2"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(TestModeTimelineBucketing._lines(TestModeTimelineBucketing)) + "\n")
+        out_dir = tmp_path / "out_mode2"
+        mm = fixtures.mode_map_fixture()
+        _ = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=TestModeTimelineBucketing.MODE_WINDOW_START,
+            window_end=TestModeTimelineBucketing.MODE_WINDOW_END,
+            output_dir=out_dir,
+            config=fixtures.MODE_FAST_CONFIG,
+            mode_map=mm,
+        )
+        md = (out_dir / "report.md").read_text()
+        # cheap-sess peaked at 50000 tokens vs per-slot 262144/2 = 131072
+        # (38%: no pressure); fast sessions are far below 131072/3. No
+        # context-pressure recommendation should fire.
+        assert "Context sizes approaching per-slot limits" not in md
 
     def test_error_report_section_and_artifacts(self, tmp_path):
         log_dir = tmp_path / "logs_err"

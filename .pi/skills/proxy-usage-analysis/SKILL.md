@@ -83,13 +83,13 @@ and stays at the root, untouched by archival.
 
 Written to `--output-dir` (default `~/proxy-usage-reports`):
 
-- `fast_sessions.csv` — one row per **fast** session (the period(s)
-  with the fewest slots per the configured `slot_schedule` in the active
-  config profile). One row per session, covering ALL sessions in the window
-  (local-only and fallback).
-- `cheap_sessions.csv` — one row per **cheap** session (the period(s)
-  with the most slots; when all periods have the same slot count there is no
-  cheap bucket and this file is not produced).
+- `fast_sessions.csv` — one row per **fast** session (sessions whose start
+  fell in a fast-mode period; the period(s) with the fewest slots per the
+  mode's `slot_schedule`). One row per session, covering ALL sessions in the
+  window (local-only and fallback).
+- `cheap_sessions.csv` — one row per **cheap** session (sessions whose start
+  fell in a cheap-mode period; produced only when the window contains cheap
+  hours).
 - `errors.csv` — one row per **error event** in the window (stream finish
   errors, stream errors, `slot_save` failures, `backend_retry` timeouts,
   upstream HTTP errors), with error type, timestamp, provider/model, session,
@@ -118,9 +118,10 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
 (provider + model), time of move to a remote model (empty if never fell
-back), fallback reason (empty if never fell back), bucket, slots,
-local/remote request counts, dispatch denials, decode tok/s (derived from
-local completion tokens ÷ local active span; empty when not derivable).
+back), fallback reason (empty if never fell back), bucket, slots, ctx size
+(per-period context of the profile active for that session), local/remote
+request counts, dispatch denials, decode tok/s (derived from local
+completion tokens ÷ local active span; empty when not derivable).
 
 ### Archival
 
@@ -145,9 +146,10 @@ run (`Previous outputs archived to …`).
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`, plus the error lines
-   (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
-   error`). Unparseable lines are counted and skipped, never fatal.
+   `routing_skip_local`, `local_dispatch_denied`, plus the operating-mode
+   lines (`Mode scheduler: applied scheduled mode fast|cheap`) and the error
+   lines (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote]
+   upstream error`). Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
@@ -161,12 +163,21 @@ run (`Previous outputs archived to …`).
    concurrency comes from a sweep over interval endpoints. Busy seconds are
    attributed to hours and to fast/cheap periods (slot schedule) by
    splitting at hour and period boundaries.
-5. **Fast/cheap bucketing** — derived from the `slot_schedule` in the
-   active config profile (`proxy/config-fast.yaml` or
-   `proxy/config-cheap.yaml`; transition times and slot counts are read from
-   config; the period(s) with the fewest slots are labelled "fast", the
-   period(s) with the most "cheap"; equal counts collapse to a single fast
-   bucket), keyed by session start time; nothing is hardcoded.
+5. **Fast/cheap bucketing** — each session is bucketed by the **operating
+   mode** active at its first in-window stream, reconstructed from the
+   `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
+   (LP-0MSPZUD4G007IYGH) — so a window crossing the 01:00/10:00 mode
+   transitions splits fast vs cheap correctly even when the analysis itself
+   runs in fast mode. The mode timeline is built with a 48h margin beyond
+   the window (a single streaming pass also serves the busy-time pairing),
+   so the nearest prior transition is always available. The bucket label is
+   the mode name, and the slots / per-period ctx come from that mode's
+   config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
+   2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
+   per-slot context figures reflect the profile that was actually active.
+   Windows with no mode transition observed (single-mode windows) keep the
+   legacy behavior: bucketing from the slot schedule of the analysis-time
+   config profile; nothing is hardcoded.
 6. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,
@@ -282,6 +293,11 @@ lines (`proxy.log` and `llama-server.log`).
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
   window; the fast/cheap bucket is keyed by its first in-window stream.
+- The mode timeline is reconstructed from `Mode scheduler` lines within a
+  48h margin of the window; sessions starting before the earliest observed
+  transition in the available logs fall back to the analysis-time mode
+  (documented in LP-0MSPZUD4G007IYGH). A window entirely inside one mode
+  (no transition observed) keeps the legacy slot-schedule bucketing.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
   within a 1h margin of the window (see `BUSY_WINDOW_MARGIN`); a stream that
   started more than 1h before the window start is not paired, and streams

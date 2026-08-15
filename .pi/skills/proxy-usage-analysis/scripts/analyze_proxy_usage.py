@@ -94,10 +94,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.json:
-        print(json.dumps(reporting.summary_to_json(run.summary), indent=2, sort_keys=True))
+        print(json.dumps(reporting.summary_to_json(run.summary, run.mode_map), indent=2, sort_keys=True))
         return 0
     if not args.quiet:
-        data = reporting.summary_to_json(run.summary)
+        data = reporting.summary_to_json(run.summary, run.mode_map)
         decode = data.get("decode_speed") or {}
         decode_summary = (
             f", decode speed {decode.get('samples', 0)} samples "
