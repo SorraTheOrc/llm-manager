@@ -671,6 +671,10 @@ server:
   # window for genuinely stalled saves). The load-aware gate below is the
   # primary fix; this rebalance is belt-and-braces.
   session_slot_timeout_per_token_seconds: 0.0015
+  # Upper bound on the adaptive save/restore timeout (LP-0MS91DHPZ001VWQO).
+  # Prevents the adaptive window from growing unbounded on very large
+  # contexts; keeps the circuit breaker within a bounded window so a wedged
+  # GPU still trips and recovers instead of holding indefinitely.
   session_slot_max_timeout_seconds: 60
   # Load-aware save/restore gating (LP-0MSI1RWLM007N367 F3): skip slot
   # save/restore when ANOTHER local session is actively streaming. llama-server
@@ -685,6 +689,9 @@ server:
   # a slot, stop issuing persistence calls for that slot until the cooldown
   # expires. Prevents piling doomed KV-cache copies onto a wedged GPU.
   session_slot_max_consecutive_failures: 3
+  # Cooldown duration (seconds) after the circuit breaker trips for a slot.
+  # Persistence resumes for the slot after this interval expires. 300s
+  # (5 min) gives the GPU time to recover from a wedge before retrying.
   session_slot_failure_cooldown_seconds: 300
   slot_unavailable_retry_after: 5
   session_guardrail_max_runtime_seconds: 1800
