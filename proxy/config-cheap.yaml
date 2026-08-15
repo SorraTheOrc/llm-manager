@@ -530,6 +530,12 @@ server:
   #   expiry after each observed prefill progress advance. Must comfortably exceed
   #   the dispatch cleanup-loop cadence (~10s) so a refresh cannot lose to cleanup.
   #   Default 30.
+  # local_dispatch_lease_chunk_refresh_buffer_seconds: Safety buffer added to the
+  #   dispatch lease expiry for NON-explicit (anonymous) sessions on each data-chunk
+  #   arrival during an active stream. Explicit sessions refresh on chunks with the
+  #   full base lease; anonymous sessions get this dedicated buffer (default 30s) so
+  #   a short base lease (15s) cannot orphan-clean a long silent generation
+  #   (LP-0MSUO6HLX0089MNQ).
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
   # events) showed 100% of denies caused by idle lease holders, never GPU

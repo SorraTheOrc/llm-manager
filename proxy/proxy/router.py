@@ -84,6 +84,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_per_model_query,
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
+    _get_chunk_refresh_buffer_seconds,
     _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
@@ -1289,11 +1290,23 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 # so that streams lasting longer than
                                 # local_dispatch_lease_timeout_seconds do not lose
                                 # their lease mid-stream.
-                                if _has_actual_data and session_id and session_explicit:
+                                #
+                                # Non-explicit (anonymous) sessions also refresh
+                                # here: they acquire an adaptive lease but have no
+                                # prefill-progress path, so data-chunk refresh is
+                                # their only runtime protection against a 15s base
+                                # lease expiring during long silent generation
+                                # (LP-0MSUO6HLX0089MNQ). They refresh by a dedicated
+                                # safety buffer (default 30s) instead of the base
+                                # lease timeout.
+                                if _has_actual_data and session_id:
                                     try:
                                         _lease_lock = getattr(srv, 'local_dispatch_records_lock', None)
                                         if _lease_lock is not None:
-                                            _lease_timeout = _get_lease_timeout_seconds(srv)
+                                            if session_explicit:
+                                                _lease_timeout = _get_lease_timeout_seconds(srv)
+                                            else:
+                                                _lease_timeout = _get_chunk_refresh_buffer_seconds(srv)
                                             async with _lease_lock:
                                                 if session_id in srv.local_dispatch_records:
                                                     srv.local_dispatch_records[session_id]['expires_at'] = (

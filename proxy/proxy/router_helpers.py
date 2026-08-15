@@ -593,6 +593,29 @@ def _get_lease_timeout_seconds(srv) -> float:
         return 60.0
 
 
+def _get_chunk_refresh_buffer_seconds(srv) -> float:
+    """Return the chunk-refresh safety buffer in seconds (default 30).
+
+    Applied to non-explicit (anonymous) sessions: each data-chunk arrival
+    on an active stream pushes ``expires_at`` out to ``now + buffer`` so a
+    15s base lease cannot orphan-clean a stream mid-generation when gaps
+    between chunks exceed the base (LP-0MSUO6HLX0089MNQ). Explicit sessions
+    already refresh on chunks with the full lease timeout; anonymous
+    sessions get this dedicated buffer so the refresh is generous without
+    depending on the (short) base lease.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        return float(
+            server_cfg.get(
+                "local_dispatch_lease_chunk_refresh_buffer_seconds", 30
+            )
+            or 30
+        )
+    except Exception:
+        return 30.0
+
+
 def _get_adaptive_lease_timeout_seconds(
     srv,
     body_json: dict | None = None,
