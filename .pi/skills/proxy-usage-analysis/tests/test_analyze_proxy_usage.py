@@ -1353,7 +1353,67 @@ class TestBusyStats:
         assert busy.streams == 1
         assert busy.busy_seconds == 10.0
         assert busy.unfinished_streams == 1
+        assert busy.pre_window_unfinished == 0
 
+    def test_pre_window_unfinished_streams_not_counted_in_caveat(self):
+        # A stream started more than BUSY_WINDOW_MARGIN (1h) before the window
+        # start with no logged finish is a pre-window leftover from an earlier
+        # window (LP-0MSVRRO3L0056N6C): it is NOT an in-window abort and must
+        # not inflate unfinished_streams; it is tracked separately.
+        events = [
+            # Pre-window leftover: started 2h before the window, never finished.
+            _local_event("stream_started", datetime(2026, 8, 2, 12, 0, 0), "stale"),
+            # In-window completed stream so busy stats exist.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.streams == 1
+        assert busy.busy_seconds == 10.0
+        assert busy.unfinished_streams == 0
+        assert busy.pre_window_unfinished == 1
+
+    def test_in_window_and_pre_window_unfinished_split(self):
+        # Both classes coexist: an in-window abort (no finish) and a stale
+        # pre-window start (no finish) are counted separately.
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 30, 0), "abort"),
+            _local_event("stream_started", datetime(2026, 8, 2, 12, 30, 0), "stale"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.unfinished_streams == 1
+        assert busy.pre_window_unfinished == 1
+
+    def test_stream_started_within_margin_before_window_counts_unfinished(self):
+        # A stream started within BUSY_WINDOW_MARGIN (1h) before the window
+        # start with no finish may have consumed in-window compute -> counts
+        # as unfinished for this window.
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 13, 30, 0), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.unfinished_streams == 1
+        assert busy.pre_window_unfinished == 0
+
+    def test_stream_started_after_window_end_not_counted_unfinished(self):
+        # A stream started after the window end has no in-window compute; it
+        # belongs to the next window's report, not this one.
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 15, 30, 0), "later"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.unfinished_streams == 0
+        assert busy.pre_window_unfinished == 0
     def test_no_local_traffic_returns_none(self):
         events = [
             log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 0), provider="opencode-go"),
@@ -1561,6 +1621,36 @@ class TestEndToEnd:
         assert busy["peak_concurrency"] == 1
         # Round-trips through json.
         json.dumps(data)
+
+    def test_report_note_splits_unfinished_and_pre_window(self, tmp_path):
+        """Regression (LP-0MSVRRO3L0056N6C): the busy-time note splits
+        unfinished streams into in-window aborts (started without a logged
+        finish) vs pre-window leftovers (started more than 1h before the
+        window) instead of lumping them together."""
+        log_dir = tmp_path / "logs_note"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "2026-08-02 12:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=aaaa request=[]\n"
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=bbbb request=[]\n"
+            "2026-08-02 14:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=bbbb provider=local model=Qwen3 request=[]\n"
+            "2026-08-02 14:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=cccc request=[]\n"
+        )
+        out_dir = tmp_path / "out_note"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        assert result.summary.busy is not None
+        assert result.summary.busy.unfinished_streams == 1  # cccc (in-window abort)
+        assert result.summary.busy.pre_window_unfinished == 1  # aaaa (stale)
+        md = (out_dir / "report.md").read_text()
+        util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "1 local stream(s) started" in util
+        assert "1 pre-window leftover" in util
+        assert "pre-window leftover" in util
 
     def test_mode_aware_end_to_end_split(self, tmp_path):
         """Regression (LP-0MSPZUD4G007IYGH): a window crossing the

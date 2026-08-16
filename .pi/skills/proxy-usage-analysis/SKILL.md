@@ -170,14 +170,20 @@ run (`Previous outputs archived to …`).
    authoritative `tokens=prompt/completion/total` from `Stream finished`
    lines (payloads in logs are truncated and never used for sizes).
 4. **Local model utilization (busy time)** — local `Stream started` /
-   `Stream finished` events are collected across a 1h margin beyond the
-   window (so streams crossing the window boundary pair correctly), paired
-   per session (FIFO), clipped back to the window, and merged. Busy time is
-   the union of active intervals (at least one slot generating), total
-   compute is the sum of clipped stream durations (slot-seconds), and peak
-   concurrency comes from a sweep over interval endpoints. Busy seconds are
-   attributed to hours and to fast/cheap periods (slot schedule) by
-   splitting at hour and period boundaries.
+   `Stream finished` events are collected across the analysis's effective
+   margin beyond the window (48h, shared with the mode timeline in step 5;
+   see `MODE_TIMELINE_MARGIN`), paired per session (FIFO), clipped back to
+   the window, and merged. Busy time is the union of active intervals (at
+   least one slot generating), total compute is the sum of clipped stream
+   durations (slot-seconds), and peak concurrency comes from a sweep over
+   interval endpoints. Busy seconds are attributed to hours and to
+   fast/cheap periods (slot schedule) by splitting at hour and period
+   boundaries. Streams whose start has no paired finish are counted in
+   `unfinished_streams` **only when they started inside the window or within
+   `BUSY_WINDOW_MARGIN` (1h) before it**; streams started earlier are stale
+   pre-window leftovers from earlier windows, tracked separately in
+   `pre_window_unfinished`, and streams started after the window end belong
+   to the next window (LP-0MSVRRO3L0056N6C).
 5. **Fast/cheap bucketing** — each session is bucketed by the **operating
    mode** active at its first in-window stream, reconstructed from the
    `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
@@ -314,11 +320,14 @@ lines (`proxy.log` and `llama-server.log`).
   (documented in LP-0MSPZUD4G007IYGH). A window entirely inside one mode
   (no transition observed) keeps the legacy slot-schedule bucketing.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
-  within a 1h margin of the window (see `BUSY_WINDOW_MARGIN`); a stream that
-  started more than 1h before the window start is not paired, and streams
-  whose start has no logged finish (aborted/still running) are counted in
-  `unfinished_streams` and excluded — busy time is a conservative lower
-  bound.
+  across the analysis's effective margin (48h, see `MODE_TIMELINE_MARGIN`)
+  and clips streams to the window; a stream that started more than
+  `BUSY_WINDOW_MARGIN` (1h) before the window start is a pre-window
+  leftover and is NOT counted in `unfinished_streams` (tracked separately
+  in `pre_window_unfinished`), while streams started inside the window or
+  within the 1h margin whose start has no logged finish (aborted/still
+  running) are counted in `unfinished_streams` and excluded — busy time is
+  a conservative lower bound.
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
 - llama-server.log eval-timing lines carry no timestamps, so the speed

@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 
 import bucketing
 from log_parser import (
+    BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
     LOCAL_PROVIDER,
     LogEvent,
@@ -156,6 +157,10 @@ class BusyStats:
     avg_concurrency: float
     avg_stream_duration: float
     unfinished_streams: int
+    # Streams that started more than ``BUSY_WINDOW_MARGIN`` before the window
+    # start and have no logged finish: stale pre-window leftovers from earlier
+    # windows, tracked separately from in-window aborts (LP-0MSVRRO3L0056N6C).
+    pre_window_unfinished: int
     # Busy seconds attributed to fast/cheap periods (from the slot schedule)
     # and to each hour of the window (hour-of-day -> seconds).
     fast_busy_seconds: float
@@ -404,11 +409,16 @@ def compute_busy_stats(
     ``log_parser.iter_events(margin=...)``); each stream is clipped back to
     ``[window_start, window_end]``. Streams whose start has no paired finish
     are counted in ``unfinished_streams`` (their compute time is unknown, so
-    busy time is a conservative lower bound). Fast/cheap attribution is
-    mode-aware when the logs show mode transitions (LP-0MSPZUD4G007IYGH), so
-    busy seconds during cheap hours count as cheap even when the analysis
-    runs in fast mode. Returns ``None`` when there is no local traffic in the
-    window.
+    busy time is a conservative lower bound) **only when the stream started
+    inside the window or within ``BUSY_WINDOW_MARGIN`` before it**; streams
+    that started more than ``BUSY_WINDOW_MARGIN`` before the window are stale
+    pre-window leftovers from earlier windows and are tracked separately in
+    ``pre_window_unfinished`` (LP-0MSVRRO3L0056N6C). Streams started after
+    the window end are not counted (they belong to the next window).
+    Fast/cheap attribution is mode-aware when the logs show mode transitions
+    (LP-0MSPZUD4G007IYGH), so busy seconds during cheap hours count as cheap
+    even when the analysis runs in fast mode. Returns ``None`` when there is
+    no local traffic in the window.
     """
     started: dict[str, list[datetime]] = {}
     finished: dict[str, list[datetime]] = {}
@@ -420,6 +430,8 @@ def compute_busy_stats(
 
     intervals: list[tuple[datetime, datetime]] = []
     unfinished = 0
+    pre_window_unfinished = 0
+    margin_start = window_start - BUSY_WINDOW_MARGIN
     for session_id, starts in started.items():
         ss = sorted(starts)
         ff = sorted(finished.get(session_id, []))
@@ -427,7 +439,16 @@ def compute_busy_stats(
             cb, ce = max(b, window_start), min(e, window_end)
             if ce > cb:
                 intervals.append((cb, ce))
-        unfinished += max(0, len(ss) - len(ff))
+        # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
+        # the remaining starts are unpaired (no logged finish). Only starts
+        # within the busy margin before the window (or inside it) count as
+        # this window's unfinished; earlier starts are pre-window leftovers;
+        # starts after the window end belong to the next window.
+        for ts in ss[len(ff):]:
+            if ts < margin_start:
+                pre_window_unfinished += 1
+            elif ts <= window_end:
+                unfinished += 1
     if not intervals:
         return None
 
@@ -486,6 +507,7 @@ def compute_busy_stats(
         avg_concurrency=round(total_compute / busy_seconds, 2) if busy_seconds else 0.0,
         avg_stream_duration=round(total_compute / len(intervals), 1) if intervals else 0.0,
         unfinished_streams=unfinished,
+        pre_window_unfinished=pre_window_unfinished,
         fast_busy_seconds=round(bucket_busy.get("fast", 0.0), 1),
         cheap_busy_seconds=round(bucket_busy.get("cheap", 0.0), 1),
         fast_window_seconds=round(fast_window, 1),

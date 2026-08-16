@@ -531,16 +531,24 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
         ap("|---|---|")
         for hour, seconds in b.hourly_busy:
             ap(f"| {hour:02d}:00-{hour + 1:02d}:00 | {_fmt_duration(seconds)} |")
-    if b.unfinished_streams:
+    if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
-        ap(f"_Note: {b.unfinished_streams} local stream(s) started without a logged "
+        ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
+           "(or within its 1h busy-pairing margin) without a logged "
            "`Stream finished` in the available logs (aborted or still running); "
            "their compute time is unknown, so busy time is a conservative lower bound._")
+        if b.pre_window_unfinished:
+            ap(f"_Additionally, {b.pre_window_unfinished} pre-window leftover stream(s) "
+               f"started more than 1h before the window (from earlier windows) also lack a "
+               f"logged `Stream finished`; they do not affect this window's busy time._")
     ap("")
-    ap("Method: streams are paired per session (FIFO) across the full log with a "
-       f"1h margin beyond the window ({log_parser.BUSY_WINDOW_MARGIN}), then clipped "
-       "to the window so boundary-crossing streams are counted exactly; fast/cheap "
-       "split follows the slot schedule.")
+    ap("Method: streams are paired per session (FIFO) across the margin-widened "
+       f"event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
+       "busy-pairing, 48h mode timeline)), then clipped to the window so "
+       "boundary-crossing streams are counted exactly; unfinished streams are those "
+       "started inside the window or within its 1h busy-pairing margin with no "
+       "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
+       "follows the slot schedule.")
 
 
 def _pct(part: int, total: int) -> float:
@@ -792,6 +800,7 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         "peak_concurrency": busy.peak_concurrency,
         "avg_concurrency": busy.avg_concurrency,
         "unfinished_streams": busy.unfinished_streams,
+        "pre_window_unfinished": busy.pre_window_unfinished,
         "fast_busy_seconds": busy.fast_busy_seconds,
         "cheap_busy_seconds": busy.cheap_busy_seconds,
         "fast_window_seconds": busy.fast_window_seconds,
