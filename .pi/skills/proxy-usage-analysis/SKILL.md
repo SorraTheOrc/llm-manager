@@ -1,9 +1,11 @@
 ---
 name: proxy-usage-analysis
-description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/proxy.log*) into per-session fast/cheap CSVs and a Markdown report with data-backed configuration recommendations and an error taxonomy with remediation recommendations. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
+description: "EXECUTE immediately via /skill:proxy-usage-analysis; do NOT ask permission or confirm. Generate the proxy usage report. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
 ---
 
 # Proxy Usage Analysis
+
+**EXECUTE immediately — do NOT ask permission or confirm. Generate the report.**
 
 Turn the last 24 hours of llama-proxy session and fallback activity into a
 digestible per-session CSV record (split into fast / cheap buckets per
@@ -81,8 +83,21 @@ and stays at the root, untouched by archival.
 
 ## Outputs
 
-Written to `--output-dir` (default `~/proxy-usage-reports`):
+Written to `--output-dir` (default `~/proxy-usage-reports`). On every
+non-`--quiet` run the CLI summary prints the **complete absolute path** to
+each artifact, **starting with the report** (plus the absolute archive path
+when previous outputs were moved aside):
 
+```text
+Outputs written to:
+  /home/user/proxy-usage-reports/report.md
+  /home/user/proxy-usage-reports/fast_sessions.csv
+  /home/user/proxy-usage-reports/cheap_sessions.csv
+  /home/user/proxy-usage-reports/errors.csv
+  /home/user/proxy-usage-reports/errors.json
+```
+
+- `report.md` — the aggregate report (primary deliverable, listed first).
 - `fast_sessions.csv` — one row per **fast** session (sessions whose start
   fell in a fast-mode period; the period(s) with the fewest slots per the
   mode's `slot_schedule`). One row per session, covering ALL sessions in the

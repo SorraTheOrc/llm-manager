@@ -1806,6 +1806,78 @@ class TestDefaultOutputDir:
         assert (out / "cheap_sessions.csv").exists()
 
 
+class TestSummaryOutputPaths:
+    """The stdout summary lists the complete absolute path to every output
+    artifact, starting with the report (report.md first, all five artifacts,
+    ~ expanded, absolute archive path)."""
+
+    def _write_logs(self, tmp_path: Path) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        return log_dir
+
+    def _args(self, tmp_path: Path, out: Path) -> list[str]:
+        return [
+            "--log-dir", str(self._write_logs(tmp_path)),
+            "--start", "2026-08-02 14:00:00",
+            "--end", "2026-08-02 15:00:00",
+            "--output-dir", str(out),
+        ]
+
+    def test_summary_lists_full_paths_report_first(self, tmp_path, capsys):
+        import analyze_proxy_usage as cli
+
+        out = tmp_path / "out"
+        rc = cli.main(self._args(tmp_path, out))
+        assert rc == 0
+        captured = capsys.readouterr().out
+        assert "Outputs written to:" in captured
+        listed = [ln.strip() for ln in captured.splitlines() if ln.strip().startswith(str(out))]
+        expected = [
+            out.resolve() / "report.md",
+            out.resolve() / "fast_sessions.csv",
+            out.resolve() / "cheap_sessions.csv",
+            out.resolve() / "errors.csv",
+            out.resolve() / "errors.json",
+        ]
+        # Report first, then every artifact, each a complete absolute path.
+        assert listed == [str(p) for p in expected], f"unexpected output lines: {listed}"
+
+    def test_home_dir_default_is_expanded(self, tmp_path, monkeypatch, capsys):
+        import analyze_proxy_usage as cli
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        rc = cli.main(
+            [
+                "--log-dir", str(self._write_logs(tmp_path)),
+                "--start", "2026-08-02 14:00:00",
+                "--end", "2026-08-02 15:00:00",
+            ]
+        )
+        assert rc == 0
+        captured = capsys.readouterr().out
+        expected = (home / "proxy-usage-reports" / "report.md").resolve()
+        assert str(expected) in captured
+        assert "~" not in captured.split("Outputs written to:", 1)[1]
+
+    def test_archive_path_is_absolute(self, tmp_path, capsys):
+        import analyze_proxy_usage as cli
+
+        out = tmp_path / "out"
+        args = self._args(tmp_path, out)
+        assert cli.main(args) == 0
+        # Second run: the first run's outputs move into a dated archive dir.
+        assert cli.main(args) == 0
+        captured = capsys.readouterr().out
+        archive_lines = [ln for ln in captured.splitlines() if "archived to" in ln]
+        assert len(archive_lines) == 1
+        path = archive_lines[0].split("archived to ", 1)[1]
+        assert Path(path).is_absolute()
+        assert Path(path).is_dir()
+
+
 class TestReportRestructure:
     """Report layout: consolidated tables with total/fast/cheap columns, and
     no per-session fallback list."""
