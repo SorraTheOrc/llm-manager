@@ -593,6 +593,29 @@ def _get_lease_timeout_seconds(srv) -> float:
         return 60.0
 
 
+def _get_chunk_refresh_buffer_seconds(srv) -> float:
+    """Return the chunk-refresh safety buffer in seconds (default 30).
+
+    Applied to non-explicit (anonymous) sessions: each data-chunk arrival
+    on an active stream pushes ``expires_at`` out to ``now + buffer`` so a
+    15s base lease cannot orphan-clean a stream mid-generation when gaps
+    between chunks exceed the base (LP-0MSUO6HLX0089MNQ). Explicit sessions
+    already refresh on chunks with the full lease timeout; anonymous
+    sessions get this dedicated buffer so the refresh is generous without
+    depending on the (short) base lease.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        return float(
+            server_cfg.get(
+                "local_dispatch_lease_chunk_refresh_buffer_seconds", 30
+            )
+            or 30
+        )
+    except Exception:
+        return 30.0
+
+
 def _get_adaptive_lease_timeout_seconds(
     srv,
     body_json: dict | None = None,
@@ -664,8 +687,8 @@ async def _query_prefill_progress(
     llama_port: int,
     model_name: str | None = None,
     slot_id: int | None = None,
-) -> int | None:
-    """Poll llama-server for observed prefill progress (KV tokens processed).
+) -> tuple[int | None, bool]:
+    """Observe llama-server prefill state: ``(progress, alive)``.
 
     Non-blocking: every query is wrapped in ``asyncio.wait_for`` using the
     same ``STATUS_QUERY_TIMEOUT`` (default 1.0s) pattern as the
@@ -674,29 +697,45 @@ async def _query_prefill_progress(
 
     Progress sources, in preference order:
 
-    1. Per-slot: ``/slots`` -> ``n_past`` / ``n_prompt_tokens_processed``
-       for the specific slot (accurate when other slots are busy).
+    1. Per-slot: ``/slots`` -> per-slot state from ``_query_slots_progress``
+       (``n_past`` / ``n_prompt_tokens_processed`` when the build reports
+       them, plus the ``is_processing`` liveness flag).
     2. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
        ``n_past`` if present).
 
-    Returns ``None`` when progress cannot be observed (query failure,
-    timeout, or no token count reported).
+    Returns ``(progress, alive)``:
+
+    - *progress* is the latest observed prefill progress (``None`` when no
+      numeric progress can be observed).
+    - *alive* is True when the slot is observed actively processing
+      (``is_processing``), even when the llama.cpp build exposes no numeric
+      progress fields (b8782 removed ``n_past``/``n_prompt_tokens_processed``
+      from ``/slots``; LP-0MSUO5Z0K007HBSS). This lets the caller extend the
+      lease on liveness rather than progress advance alone.
+
+    When progress is unobservable AND the slot is not observed processing,
+    a throttled warning is logged so silent query failures are visible in
+    production (LP-0MSUO5Z0K007HBSS AC2).
     """
     timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+    alive = False
 
     if slot_id is not None:
         try:
             from proxy.observability import _query_slots_progress
 
-            progress = await asyncio.wait_for(
+            states = await asyncio.wait_for(
                 _query_slots_progress(
                     llama_port, timeout=timeout, model=model_name
                 ),
                 timeout=timeout + 0.5,
             )
-            value = progress.get(slot_id)
-            if isinstance(value, (int, float)) and value >= 0:
-                return int(value)
+            state = states.get(slot_id)
+            if isinstance(state, dict):
+                alive = bool(state.get("processing", False))
+                value = state.get("progress")
+                if isinstance(value, (int, float)) and value >= 0:
+                    return int(value), alive
         except Exception:
             pass
 
@@ -707,11 +746,50 @@ async def _query_prefill_progress(
         for key in ("kv_cache_tokens", "n_past"):
             value = status.get(key)
             if isinstance(value, (int, float)) and value > 0:
-                return int(value)
+                return int(value), True
     except Exception:
         pass
 
-    return None
+    if not alive:
+        _warn_prefill_progress_unobservable(srv)
+    return None, alive
+
+
+_last_prefill_progress_warn_ts = 0.0
+"""Monotonic timestamp of the last 'prefill progress unobservable' warning.
+
+Used to throttle the warning to one per ``_PREFILL_WARN_INTERVAL`` seconds so
+a permanently-broken progress source cannot spam the log at the 10s poll
+cadence (LP-0MSUO5Z0K007HBSS AC2).
+"""
+
+_PREFILL_WARN_INTERVAL = 60.0
+"""Seconds between repeated 'prefill progress unobservable' warnings."""
+
+
+def _warn_prefill_progress_unobservable(srv) -> None:
+    """Throttled warning when neither progress source can observe prefill
+    progress (per-slot query failed / returned nothing usable, and the
+    aggregate status query yielded no token counts).
+
+    The prefill poll runs every ``local_dispatch_lease_prefill_poll_seconds``
+    (default 10s) per stream, so without throttling a persistent failure
+    would emit a warning every poll. Warn at most once per
+    ``_PREFILL_WARN_INTERVAL`` seconds (LP-0MSUO5Z0K007HBSS AC2).
+    """
+    global _last_prefill_progress_warn_ts
+    now = time.monotonic()
+    if now - _last_prefill_progress_warn_ts < _PREFILL_WARN_INTERVAL:
+        return
+    _last_prefill_progress_warn_ts = now
+    try:
+        srv.logger.warning(
+            "prefill_progress_unobservable: no per-slot or aggregate prefill "
+            "progress; lease extension relies on the adaptive acquisition "
+            "estimate and liveness signal"
+        )
+    except Exception:
+        pass
 
 
 async def _extend_lease_during_prefill(
@@ -723,15 +801,27 @@ async def _extend_lease_during_prefill(
     slot_id: int | None = None,
     last_progress: int = 0,
 ) -> tuple[int, bool]:
-    """Observe prefill progress and extend the dispatch lease while advancing.
+    """Observe prefill state and extend the dispatch lease while advancing.
 
     During the prefill phase of an explicit-session request (dispatched, no
-    stream data chunks yet), llama-server reports advancing KV-cache usage
-    (per-slot ``n_past``/``n_prompt_tokens_processed``, or aggregate
-    ``kv_cache_tokens``). While that progress advances, the session's
-    dispatch lease ``expires_at`` is pushed out to ``now + safety buffer``
-    so a very large prefill — beyond the adaptive token-estimate cap of
-    1500s — cannot lose its lease mid-prefill (LP-0MSE05J53004C6EL).
+    stream data chunks yet), llama-server reports per-slot state that
+    advances as the cache prefill progresses. While the slot is observed
+    alive (``is_processing``) or the reported progress advances, the
+    session's dispatch lease ``expires_at`` is pushed out to
+    ``now + safety buffer`` so a very large prefill — beyond the adaptive
+    token-estimate cap of 1500s — cannot lose its lease mid-prefill
+    (LP-0MSE05J53004C6EL).
+
+    Extension triggers:
+
+    - **Progress advance** — observed numeric progress (per-slot
+      ``n_past``/``n_prompt_tokens_processed`` or aggregate
+      ``kv_cache_tokens``) is greater than *last_progress*.
+    - **Liveness** — no numeric progress is reported by the llama.cpp build
+      (b8782 removed the fields from ``/slots``) but the slot is observed
+      actively processing (``is_processing``); the lease is extended on
+      liveness so streams are never orphaned mid-prefill just because the
+      build stopped reporting a counter (LP-0MSUO5Z0K007HBSS).
 
     Returns ``(last_progress, extended)``:
 
@@ -739,7 +829,7 @@ async def _extend_lease_during_prefill(
       pass back on the next poll so extension stops when progress stalls.
     - *extended* is True when ``expires_at`` was pushed out.
 
-    When progress is unobservable (query failure/timeout/None), the lease is
+    When progress is unobservable AND the slot is not alive, the lease is
     left untouched — it keeps the adaptive token-estimate value applied at
     acquisition rather than being dropped (fallback). When disabled
     (``local_dispatch_lease_prefill_poll_seconds: 0``) this is a no-op.
@@ -748,10 +838,11 @@ async def _extend_lease_during_prefill(
     if poll_seconds <= 0 or buffer_seconds <= 0:
         return last_progress, False
 
-    progress = await _query_prefill_progress(
+    progress, alive = await _query_prefill_progress(
         srv, llama_port, model_name=model_name, slot_id=slot_id
     )
-    if progress is None or progress <= last_progress:
+    advancing = progress is not None and progress > last_progress
+    if not advancing and not alive:
         # Unobservable or stalled: no extension. Unobservable keeps the
         # adaptive estimate applied at acquisition (fallback).
         return last_progress, False
@@ -766,17 +857,26 @@ async def _extend_lease_during_prefill(
                     record["expires_at"] = time.monotonic() + buffer_seconds
                     extended = True
                     try:
-                        srv.logger.info(
-                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                            session_key[:8] if session_key else "unknown",
-                            progress,
-                            buffer_seconds,
-                        )
+                        if advancing:
+                            srv.logger.info(
+                                "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                                session_key[:8] if session_key else "unknown",
+                                progress,
+                                buffer_seconds,
+                            )
+                        else:
+                            srv.logger.info(
+                                "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
+                                session_key[:8] if session_key else "unknown",
+                                buffer_seconds,
+                            )
                     except Exception:
                         pass
     except Exception:
         pass
-    return progress, extended
+    if advancing:
+        return progress, extended
+    return last_progress, extended
 
 
 async def _decrement_local_active_queries(
@@ -858,12 +958,15 @@ async def _increment_local_active_queries(
     session_key: str | None = None,
     backend: str | None = None,
     body_json: dict | None = None,
+    model_name: str | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
     When *session_key* and *backend* are provided, a corresponding
     dispatch record is created in *local_dispatch_records* to track
-    lease ownership.
+    lease ownership. *model_name* is stored on the record so orphan
+    cleanup can verify the session's slot against llama-server's
+    ``/slots`` before freeing the lease (LP-0MSUO6XRP001MCB2).
 
     When *body_json* is provided, the lease timeout is extended
     adaptively based on the estimated prompt token count, so that
@@ -889,6 +992,7 @@ async def _increment_local_active_queries(
                         "started_at": time.monotonic(),
                         "active": True,
                         "expires_at": time.monotonic() + lease_timeout,
+                        "model_name": model_name,
                     }
         except Exception:
             pass
@@ -900,6 +1004,7 @@ async def _try_acquire_local_dispatch(
     session_key: str,
     backend: str,
     body_json: dict | None = None,
+    model_name: str | None = None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -1014,6 +1119,7 @@ async def _try_acquire_local_dispatch(
                     "started_at": now,
                     "active": True,
                     "expires_at": now + lease_timeout,
+                    "model_name": model_name,
                 }
 
             return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
@@ -1089,6 +1195,48 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
+async def _query_slot_processing(srv, session_id: str, model_name: str | None) -> bool:
+    """Check whether the session's llama-server slot is still processing.
+
+    Queries llama-server ``/slots`` (via ``_query_slots_progress``) for the
+    slot assigned to *session_id* and returns its ``is_processing`` flag —
+    the only per-slot liveness signal llama.cpp b8782 exposes. Used by
+    orphan cleanup to avoid freeing the dispatch lease / slot registry
+    entry for a stream that is still generating on the backend
+    (LP-0MSUO6XRP001MCB2).
+
+    Returns False (do not treat as alive) when the session has no slot
+    assignment, no *model_name* is known (the router requires a model
+    param), or the query fails/times out — the caller then proceeds with
+    normal orphan cleanup.
+    """
+    if not session_id or not model_name:
+        return False
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        slot_id = _assigned_slot_for_session(session_id)
+        if slot_id is None:
+            return False  # no slot assignment — cannot verify
+
+        server_cfg = srv.config.get("server", {})
+        llama_port = server_cfg.get("llama_server_port", 8080)
+
+        from proxy.observability import _query_slots_progress
+
+        timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+        states = await asyncio.wait_for(
+            _query_slots_progress(llama_port, timeout=timeout, model=model_name),
+            timeout=timeout + 0.5,
+        )
+        state = states.get(slot_id)
+        if isinstance(state, dict):
+            return bool(state.get("processing", False))
+        return False
+    except Exception:
+        return False
+
+
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
@@ -1100,10 +1248,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
     2. **Active records** whose *expires_at* has passed — these represent
        abandoned/orphaned streams where the stream was started but never
-       finished (no *active=False* transition). Logged at WARNING level
-       with ``reason=orphan_cleanup`` distinct from normal idle-timeout
-       release, plus an INFO-level ``lease_released reason=orphan_cleanup``
-       for parity with existing log consumers.
+       finished (no *active=False* transition). Before freeing, the record's
+       slot is verified against llama-server ``/slots``: if the slot is
+       still processing, the lease is extended by the chunk-refresh buffer
+       instead (``lease_verified_active ... stream_abandoned=False``), so a
+       long silent generation cannot lose its lease mid-flight
+       (LP-0MSUO6XRP001MCB2). Genuinely idle slots are orphan-cleaned as
+       before, logged at WARNING level with ``reason=orphan_cleanup`` plus
+       an INFO-level ``lease_released reason=orphan_cleanup`` for parity
+       with existing log consumers.
 
     Active records whose *expires_at* is still in the future are preserved
     (legitimate in-flight requests).
@@ -1112,6 +1265,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     """
     now = time.monotonic()
     removed = 0
+    verify_candidates: list[tuple[str, dict]] = []
+
+    # Phase 1 (under lock): collect expired records. Inactive records are
+    # freed immediately; expired ACTIVE records are deferred to phase 3 so
+    # the slot liveness check runs OUTSIDE the records lock (it performs
+    # an HTTP query to llama-server).
     try:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
@@ -1139,7 +1298,53 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                 else:
-                    # Abandoned/orphaned active record past its expires_at
+                    verify_candidates.append((sid, record))
+    except Exception:
+        pass
+
+    # Phase 2 (outside the lock): verify which candidates still have a
+    # processing slot on llama-server. A failed / unverifiable query means
+    # "not verified alive" — the record is orphan-cleaned below (fail-open,
+    # matching pre-existing behaviour).
+    alive: set[str] = set()
+    for sid, record in verify_candidates:
+        try:
+            if await _query_slot_processing(
+                srv, sid, record.get("model_name")
+            ):
+                alive.add(sid)
+        except Exception:
+            pass
+
+    # Phase 3 (under lock again): apply the verdict. Re-check the record
+    # still exists and is still expired — it may have been refreshed by the
+    # stream loop (chunk-refresh / prefill extension) or released since
+    # phase 1.
+    if verify_candidates:
+        try:
+            async with srv.local_dispatch_records_lock:
+                for sid, record in verify_candidates:
+                    current = srv.local_dispatch_records.get(sid)
+                    if current is None:
+                        continue  # released concurrently — nothing to do
+                    if current.get("expires_at", 0) > time.monotonic():
+                        continue  # refreshed since phase 1 — preserved
+                    if sid in alive:
+                        # Slot still generating: extend the lease instead of
+                        # freeing (LP-0MSUO6XRP001MCB2).
+                        current["expires_at"] = (
+                            time.monotonic() + _get_chunk_refresh_buffer_seconds(srv)
+                        )
+                        try:
+                            srv.logger.info(
+                                "lease_verified_active session=%s "
+                                "reason=active_slot stream_abandoned=False",
+                                sid[:8] if sid else "unknown",
+                            )
+                        except Exception:
+                            pass
+                        continue
+                    # Genuinely orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
                     removed += 1
                     # Free the slot registry entry so the slot can be
@@ -1170,8 +1375,8 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
-    except Exception:
-        pass
+        except Exception:
+            pass
     # Removed stale leases frees slots — wake the cross-session contention
     # queue (LP-0MSORQVK50012Q4D AC2).
     if removed > 0:

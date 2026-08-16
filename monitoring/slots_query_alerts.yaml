@@ -1,0 +1,32 @@
+# Prometheus alert rules for llama-server /slots query failures
+#
+# LP-0MSVP7XJ6008QPKX: after the scheduled cheap-mode restart, llama-server's
+# /slots endpoint returned HTTP 500 during the model reload (11,011× in the
+# 01:00–10:00 proxy log). The status endpoint reported total_slots=0 and the
+# herdr downtime worker fail-closed → zero dispatches overnight, silently.
+#
+# The proxy now (a) serves the last known slot counts on transient /slots
+# failure (bounded by SLOT_COUNTS_STALE_AFTER_SECONDS) and (b) increments
+# llama_slots_query_failures_total{reason=...} on every failed query so a
+# sustained /slots outage surfaces here instead of passing unnoticed.
+
+groups:
+  - name: llama-slots.rules
+    rules:
+      - alert: LlamaSlotsQueryFailuresHigh
+        expr: rate(llama_slots_query_failures_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llama-server /slots query failure rate high"
+          description: "The proxy failed to query llama-server /slots at {{ $value }} failures/sec over the last 5 minutes on {{ $labels.instance }}. This usually means llama-server is reloading a model (e.g. after a cheap-mode restart) or is unhealthy. The status endpoint is serving last-known slot counts (slots_stale=true) so herdr may see stale capacity. Investigate llama-server health and model-load state."
+
+      - alert: LlamaSlotsQueryFailuresCritical
+        expr: rate(llama_slots_query_failures_total[5m]) > 10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "llama-server /slots query failures sustained"
+          description: "llama-server /slots has been failing at {{ $value }} failures/sec for 10 minutes on {{ $labels.instance }}. Sustained failure means the status endpoint can only serve last-known counts (bounded by SLOT_COUNTS_STALE_AFTER_SECONDS, after which it fail-closes to 0/0 and blocks herdr dispatch). Investigate immediately: check llama-server process, model load state, and /slots directly."

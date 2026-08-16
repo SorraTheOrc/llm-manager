@@ -220,10 +220,11 @@ class TestCheapConfigProfile:
 
     def test_cheap_config_differs_from_fast_only_by_slot_pool_ctx_and_contention(self):
         """The only intended cheap-vs-fast server differences are the local
-        slot pool (2 vs 3), the per-period ctx_size (262144 vs 131072), and the
+        slot pool (2 vs 3), the per-period ctx_size (262144 vs 131072), the
         per-mode contention-queue policy (cheap=queue vs fast=fallback,
-        LP-0MSORQVK50012Q4D F2). Everything else (models, static ctx, routing
-        thresholds) is identical."""
+        LP-0MSORQVK50012Q4D F2), and the mode-aware cold-cache threshold
+        (cheap 60000 vs fast 38000, LP-0MSOMVOPH004ATAK). Everything else
+        (models, static ctx, warm threshold) is identical."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
@@ -234,6 +235,11 @@ class TestCheapConfigProfile:
         cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
         cheap_srv.pop("contention_queue_max_wait_seconds", None)
         cheap_srv.pop("contention_queue_max_depth", None)
+        # Mode-aware cold-cache threshold (LP-0MSOMVOPH004ATAK): the economic
+        # new-token threshold differs per mode so each stays below its own
+        # effective warm clamp (cheap 100000, fast 39594).
+        cheap_srv.pop("local_large_context_cold_cache_threshold", None)
+        fast_srv.pop("local_large_context_cold_cache_threshold", None)
         assert cheap_srv == fast_srv
 
         # The intended diffs, asserted explicitly:
@@ -249,6 +255,9 @@ class TestCheapConfigProfile:
         assert cheap["server"]["contention_queue_max_wait_seconds"] == 60
         assert cheap["server"]["contention_queue_max_depth"] == 4
         assert fast["server"]["contention_queue_policy"] == "fallback"
+        assert cheap["server"]["local_large_context_cold_cache_threshold"] == 60000
+        assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
+        assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
         """The local model context size is unchanged between profiles."""

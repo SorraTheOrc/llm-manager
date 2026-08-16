@@ -180,6 +180,47 @@ UPSTREAM_429 = (
 
 # --- Lines the parser must ignore -------------------------------------------
 
+# Operating-mode scheduler lines (LP-0MSM5K4TX004MICX): the applied-mode
+# lines are parsed into a mode timeline (LP-0MSPZUD4G007IYGH); the
+# ``enabled with N entries`` announcement carries no applied mode and is
+# ignored.
+MODE_SWITCH_CHEAP = (
+    "2026-08-15 01:00:08,679 - INFO - Mode scheduler: applied scheduled mode cheap"
+)
+MODE_SWITCH_FAST = (
+    "2026-08-15 10:00:18,041 - INFO - Mode scheduler: applied scheduled mode fast"
+)
+MODE_SCHEDULER_ENABLED_IGNORED = (
+    "2026-08-15 10:00:26,165 - INFO - Mode scheduler: enabled with 2 entries: "
+    "[('01:00', 'cheap'), ('10:00', 'fast')]"
+)
+
+# status_request lines expose the running mode's total_slots and contention
+# policy (real lines from /var/log/llama-proxy): used as corroborating
+# evidence in the mode-bucketing regression fixture (never parsed).
+STATUS_REQUEST_CHEAP = (
+    "2026-08-15 07:00:19,968 - INFO - status_request active_query=true available_slots=0 "
+    "client_ip=192.168.0.199 client_ip_source=direct client_port=57414 "
+    "contention_fallback_after_queue_count=328 contention_queue_depth=1 "
+    "contention_queue_policy=queue contention_queued_count=339 "
+    "contention_queued_duration_seconds=17959.429 current_model=Qwen3 latency_ms=3024 "
+    "llama_server_running=true local_active_query=true "
+    "local_owner_lease_remaining_seconds=304.8219530270435 "
+    "local_owner_session_id=01a003ed-2bce-7dc2-bf15-21fcba2411c9 "
+    "model_switch_in_progress=false total_slots=2"
+)
+STATUS_REQUEST_FAST = (
+    "2026-08-15 10:05:00,000 - INFO - status_request active_query=true available_slots=2 "
+    "client_ip=192.168.0.191 client_ip_source=direct client_port=54852 "
+    "contention_fallback_after_queue_count=0 contention_queue_depth=0 "
+    "contention_queue_policy=fallback contention_queued_count=0 "
+    "contention_queued_duration_seconds=0.0 current_model=Qwen3 latency_ms=3025 "
+    "llama_server_running=true local_active_query=true "
+    "local_owner_lease_remaining_seconds=298.6892733310815 "
+    "local_owner_session_id=01a003ed-2bce-7dc2-bf15-21fcba2411c9 "
+    "model_switch_in_progress=false total_slots=3"
+)
+
 ROUTING_CHECK_IGNORED = (
     "2026-08-02 13:57:33,529 - INFO - routing_check provider=local-qwen3 model=Qwen3 "
     "estimated_tokens=12217 cold_threshold=39594 warm_threshold=39594 new_tokens=12217 "
@@ -307,7 +348,45 @@ server:
 """
 
 # ---------------------------------------------------------------------------
-# Synthetic end-to-end fixture: two sessions across one rotated file boundary
+# Per-mode config profiles (mirror the real deployment, LP-0MSMZOAJW002UR2A):
+# fast = 3 slots @ 131072 ctx; cheap = 2 slots @ 262144 ctx (per-period ctx
+# pinned via slot_schedule ctx_size).
+# ---------------------------------------------------------------------------
+
+MODE_FAST_CONFIG = {
+    "local_model_ctx_size": 131072,
+    "session_slot_pool_size": 3,
+    "slot_schedule": {
+        "enabled": True,
+        "entries": [("23:59", 3), ("10:00", 3)],
+        "ctx_by_time": {"23:59": 131072, "10:00": 131072},
+    },
+}
+
+MODE_CHEAP_CONFIG = {
+    "local_model_ctx_size": 131072,
+    "session_slot_pool_size": 2,
+    "slot_schedule": {
+        "enabled": True,
+        "entries": [("23:59", 2), ("10:00", 2)],
+        "ctx_by_time": {"23:59": 262144, "10:00": 262144},
+    },
+}
+
+
+def mode_map_fixture() -> object:
+    """Mode schedule map over the fixture profiles (imported lazily to avoid
+    a hard dependency at module load)."""
+    import bucketing
+
+    return bucketing.ModeScheduleMap.from_profiles(
+        {"fast": MODE_FAST_CONFIG, "cheap": MODE_CHEAP_CONFIG},
+        analysis_mode="fast",
+        default_slots=None,
+    )
+
+
+# --- Synthetic end-to-end fixture: two sessions across one rotated file boundary
 # ---------------------------------------------------------------------------
 
 # Session S1: local-only, starts 13:30 (before window start at 14:00), active in window.

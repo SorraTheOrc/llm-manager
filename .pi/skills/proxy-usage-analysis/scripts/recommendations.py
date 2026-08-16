@@ -90,11 +90,16 @@ def _dn(total: int, fast: int, cheap: int) -> str:
     return f"Fast {fast} ({_pct(fast, total):.1f}%) / Cheap {cheap} ({_pct(cheap, total):.1f}%)"
 
 
-def _reason_counts_by_bucket(result: AnalysisResult, schedule) -> dict[str, Counter]:
+def _reason_counts_by_bucket(
+    result: AnalysisResult,
+    schedule,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> dict[str, Counter]:
     """Per-bucket fallback-reason counts (combined global + per-session).
 
     Mirrors ``_combined_reason_counts``: per-session reasons are bucketed by
-    the session's bucket, global fallback events by their own timestamp.
+    the session's bucket, global fallback events by their own timestamp
+    (mode-aware when the logs show mode transitions, LP-0MSPZUD4G007IYGH).
     """
     buckets: dict[str, Counter] = {"fast": Counter(), "cheap": Counter()}
     for s in result.sessions.values():
@@ -102,7 +107,12 @@ def _reason_counts_by_bucket(result: AnalysisResult, schedule) -> dict[str, Coun
             buckets[_bucket_key(s.bucket)][s.fallback_reason] += 1
     for ev in result.fallback_events:
         if ev.reason:
-            label = schedule.period_for(ev.ts).label if schedule.periods else "fast"
+            if mode_map is not None and mode_map.transitions:
+                label = mode_map.period_for(ev.ts).label
+            elif schedule.periods:
+                label = schedule.period_for(ev.ts).label
+            else:
+                label = "fast"
             buckets[_bucket_key(label)][ev.reason] += 1
     return buckets
 
@@ -124,7 +134,18 @@ def _combined_reason_counts(result: AnalysisResult) -> Counter:
     return counts
 
 
-def _slot_counts(config: dict | None, result: AnalysisResult) -> tuple[int | None, int | None]:
+def _slot_counts(
+    config: dict | None,
+    result: AnalysisResult,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> tuple[int | None, int | None]:
+    if mode_map is not None:
+        fast = mode_map.schedules.get("fast")
+        cheap = mode_map.schedules.get("cheap")
+        return (
+            fast.fast_slots if fast is not None else None,
+            cheap.fast_slots if cheap is not None else None,
+        )
     if config:
         schedule = bucketing.schedule_from_config(config, config.get("session_slot_pool_size"))
         return schedule.fast_slots, schedule.cheap_slots
@@ -149,7 +170,11 @@ def _bucket_stats(result: AnalysisResult) -> dict[str, dict]:
     return stats
 
 
-def generate_recommendations(result: AnalysisResult, config: dict | None) -> list[Recommendation]:
+def generate_recommendations(
+    result: AnalysisResult,
+    config: dict | None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> list[Recommendation]:
     recs: list[Recommendation] = []
 
     sessions = list(result.sessions.values())
@@ -157,12 +182,12 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     reason_counts = _combined_reason_counts(result)
     total_fallbacks = sum(reason_counts.values())
     fallback_rate = (total_fallbacks / total_requests) if total_requests else 0.0
-    fast_slots, cheap_slots = _slot_counts(config, result)
+    fast_slots, cheap_slots = _slot_counts(config, result, mode_map)
     bucket_stats = _bucket_stats(result)
     schedule = bucketing.schedule_from_config(
         config, (config or {}).get("session_slot_pool_size")
     )
-    bucket_reasons = _reason_counts_by_bucket(result, schedule)
+    bucket_reasons = _reason_counts_by_bucket(result, schedule, mode_map)
 
     slot_counts_str = _slot_counts_str(fast_slots, cheap_slots)
     cfg_ctx = (config or {}).get("local_model_ctx_size")
@@ -263,12 +288,22 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         )
 
     # --- 4. Context pressure ------------------------------------------------
-    if cfg_ctx:
+    if cfg_ctx is not None or mode_map is not None:
         pressured = []
         for s in sessions:
             if not s.max_context_size or not s.slots:
                 continue
-            per_slot = cfg_ctx / s.slots
+            if mode_map is not None:
+                # Per-session context comes from the profile active for that
+                # session (per-period ctx_size when pinned, else the profile's
+                # global local_model_ctx_size): 262144 for cheap (2 slots),
+                # 131072 for fast (3 slots).
+                per_slot_ctx = s.ctx_size if s.ctx_size is not None else mode_map.ctx_for(s.bucket)
+            else:
+                per_slot_ctx = cfg_ctx
+            if per_slot_ctx is None:
+                continue
+            per_slot = per_slot_ctx / s.slots
             ratio = s.max_context_size / per_slot
             if ratio >= CONTEXT_PRESSURE_RATIO:
                 pressured.append((s.session_id, s.max_context_size, per_slot, ratio, s.bucket))

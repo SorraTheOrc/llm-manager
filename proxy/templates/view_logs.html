@@ -228,6 +228,12 @@
             white-space:pre-wrap;
             background: linear-gradient(180deg, var(--bg-card), rgba(15,18,30,1));
         }
+        .slot-empty-hint {
+            color:var(--text-secondary);
+            font-style:italic;
+            font-size:0.8rem;
+            padding:0.5rem 0;
+        }
         .slot-log .line { border-bottom:1px solid rgba(255,255,255,0.02); }
         .src-badge {
             display:inline-block;
@@ -1063,7 +1069,38 @@
         if (ev.target.closest('label') || ev.target.closest('input')) return;
         toggleSlotExpand(Number(div.dataset.slotId));
       });
+      refreshSlotEmptyHint(div, slot);
       return div;
+    }
+
+    // Show a status-aware placeholder in the slot log pane while no relevant
+    // lines have arrived yet. During pre-fill/working periods llama-server has
+    // not emitted slot log lines, so a blank pane reads as a broken section;
+    // the placeholder ("no log lines yet — waiting for pre-fill/decoding…")
+    // keeps the section informative until the first line streams in
+    // (manual-review rejection 2026-08-13).
+    function refreshSlotEmptyHint(section, slot) {
+      const logEl = section.querySelector('.slot-log');
+      if (!logEl) return;
+      const hint = logEl.querySelector('.slot-empty-hint');
+      const hasLines = !!logEl.querySelector('.line');
+      if (hasLines) {
+        if (hint) hint.remove();
+        return;
+      }
+      const st = slotStatus(slot);
+      if (st.cls === 'idle') {
+        if (hint) hint.remove();
+        return;
+      }
+      const msg = 'no log lines yet — ' + (st.cls === 'processing' || st.cls === 'working'
+        ? 'waiting for pre-fill/decoding…'
+        : 'waiting for slot activity…');
+      if (hint) { hint.textContent = msg; return; }
+      const el = document.createElement('div');
+      el.className = 'slot-empty-hint';
+      el.textContent = msg;
+      logEl.appendChild(el);
     }
 
     function renderSlotSections(slots) {
@@ -1071,6 +1108,9 @@
       if (!container) return;
       const summary = document.getElementById('slotSummary');
       const slotsList = allSlotsFrom(slots);
+      // Numeric slot order (0, 1, 2, ...) regardless of /slots payload order
+      // or shared-cache reshuffling (manual-review rejection 2026-08-13).
+      slotsList.sort(function (a, b) { return a.slot_id - b.slot_id; });
       const active = activeSlotsFrom(slots);
       currentSlots = slotsList;
 
@@ -1119,6 +1159,15 @@
         }
       }
 
+      // Physical reorder: keep DOM children in numeric slot order. New or
+      // rebuilt sections are appended at the end, so without this a slot
+      // joining mid-range would land out of order (e.g. [0,2] + 1 -> [0,2,1]).
+      const sections = Array.from(container.querySelectorAll('.slot-section'));
+      sections.sort(function (a, b) {
+        return Number(a.dataset.slotId) - Number(b.dataset.slotId);
+      });
+      sections.forEach(function (sec) { container.appendChild(sec); });
+
       // Connect tails for every slot section (no-op for already-connected ones)
       slotsList.forEach(connectSlotTails);
 
@@ -1136,6 +1185,7 @@
         sess.textContent = sessionId ? shortSession(sessionId) : 'no session yet';
         if (sessionId) sess.title = sessionId;
       }
+      refreshSlotEmptyHint(sec, slot);
     }
 
     function connectSlotEvents() {
@@ -1207,6 +1257,8 @@
       const logEl = section.querySelector('.slot-log');
       const autoCb = section.querySelector('.slot-autoscroll');
       if (!logEl) return;
+      const hint = logEl.querySelector('.slot-empty-hint');
+      if (hint) hint.remove();
       const div = document.createElement('div');
       div.className = 'line';
       const badge = document.createElement('span');

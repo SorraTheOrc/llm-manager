@@ -370,6 +370,7 @@ async def get_llama_local_status(request: Request):
          "llama_server_running": bool,
          "available_slots": int,
          "total_slots": int,
+         "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None}],
          "local_owner_session_id": str | None,
          "local_owner_lease_remaining_seconds": float | None}
 
@@ -380,6 +381,25 @@ async def get_llama_local_status(request: Request):
     ``session_slot_pool_size`` is reported instead (fail-open, so
     orchestrators see available capacity during idle windows —
     LP-0MSI06HPB0043MV1).
+
+    When llama-server is running with a model loaded but the ``/slots``
+    query fails (e.g. HTTP 500 while the model reloads after a cheap-mode
+    restart), the last known slot counts are served instead of 0/0
+    (graceful degradation, LP-0MSVP7XJ6008QPKX), bounded by
+    ``SLOT_COUNTS_STALE_AFTER_SECONDS`` (default 1h). ``slots_stale`` is
+    ``true`` whenever the served counts came from that cache rather than a
+    fresh query, so a future silent failure (worker alive but zero
+    dispatches across an idle window) is observable.
+
+    ``slots`` carries the per-slot details (``slot_id``, ``is_processing``,
+    ``n_decoded``) from llama-server's ``/slots`` endpoint so consumers such
+    as herdr's downtime worker can track the SAME slots staying free across
+    polls (LP-0MSORPUMX002LLIA). It is an empty array when llama-server is
+    not running, no model is loaded yet, or the slots query fails or times
+    out — never a malformed payload. The fetch reuses
+    ``_query_slots_detail()``'s own httpx timeout bounded by the
+    ``STATUS_QUERY_TIMEOUT`` window so a slow /slots response cannot blow the
+    endpoint's response budget.
 
     ``local_active_query`` mirrors ``active_query`` but is derived from the
     local-only counter (``local_active_queries``), so remote provider
@@ -461,6 +481,13 @@ async def get_llama_local_status(request: Request):
     # -- slots query (lightweight, short timeout) -------------------------
     available_slots = 0
     total_slots = 0
+    slots: list[dict] = []
+    # slots_stale: True when the served counts came from the last-known cache
+    # because the fresh /slots query failed (LP-0MSVP7XJ6008QPKX). Set in the
+    # counts block below; logged and returned in the payload so a future
+    # silent failure (worker alive, zero dispatches across an idle window)
+    # is observable.
+    slots_stale = False
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -470,8 +497,28 @@ async def get_llama_local_status(request: Request):
             try:
                 llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                 client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                from proxy.observability import _query_slots
+                from proxy.observability import _query_slots, _query_slots_detail, last_known_slot_counts
                 available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
+                # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
+                # (e.g. HTTP 500 during a model reload after cheap-mode restart)
+                # previously surfaced as total_slots=0, fail-closing the herdr
+                # downtime worker. Serve the last known counts when fresh, and
+                # flag the degraded state so monitoring sees it.
+                if total_slots == 0:
+                    last_known = last_known_slot_counts()
+                    if last_known is not None:
+                        available_slots, total_slots = last_known
+                        slots_stale = True
+                # Per-slot details (LP-0MSORPUMX002LLIA): best-effort, empty
+                # list on any failure (helper catches HTTP/connect/timeout
+                # errors internally; the handler guard keeps the response
+                # well-formed even on unexpected exceptions). Bounded by the
+                # STATUS_QUERY_TIMEOUT window via the helper's own httpx
+                # timeout, so a slow /slots response cannot blow the
+                # endpoint's response budget (AC3).
+                detail = await _query_slots_detail(llama_port, timeout=timeout, model=cm)
+                if isinstance(detail, list):
+                    slots = detail
             except Exception:
                 # slots query is best-effort; default to 0 on failure
                 pass
@@ -520,6 +567,7 @@ async def get_llama_local_status(request: Request):
         "current_model": cm,
         "available_slots": available_slots,
         "total_slots": total_slots,
+        "slots_stale": slots_stale,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
     }
@@ -550,6 +598,14 @@ async def get_llama_local_status(request: Request):
         "llama_server_running": bool(llama_running),
         "available_slots": available_slots,
         "total_slots": total_slots,
+        # True when the counts came from the last-known cache because the
+        # fresh /slots query failed (LP-0MSVP7XJ6008QPKX). Additive field;
+        # consumers that ignore unknown fields are unaffected.
+        "slots_stale": bool(slots_stale),
+        # Per-slot details (LP-0MSORPUMX002LLIA): compact slot dicts from
+        # llama-server's /slots endpoint, empty when not running / no model /
+        # query failure, so herdr can track same-slot idleness.
+        "slots": slots,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Contention-queue snapshot (LP-0MSORQVK50012Q4D F4 AC3): live queue

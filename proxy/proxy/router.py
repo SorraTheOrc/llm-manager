@@ -28,6 +28,30 @@ def _srv():
     import proxy.server as _m
     return _m
 
+
+def _log_local_stream_client_disconnect(srv, session_id, model_name):
+    """Log a terminal ``Stream finished: reason=client_disconnect`` line.
+
+    Emitted when a local stream is aborted because the client disconnected
+    mid-stream (in-loop ``is_disconnected()`` check, GeneratorExit from the
+    ASGI framework closing the generator, or the disconnect reaper cancelling
+    the in-flight request task). The line is parseable by the
+    proxy-usage-analysis log_parser as a ``stream_finished`` event with
+    reason ``client_disconnect`` (distinct from the ``reason=error``
+    synthetic events), so the stream pairs and its compute time becomes known
+    instead of being reported as "aborted or still running"
+    (LP-0MSVRRTAB0078TMK). Logging is best-effort and must never change
+    stream behaviour (AC4).
+    """
+    try:
+        srv.logger.info(
+            "Stream finished: reason=client_disconnect session=%s provider=local model=%s",
+            session_id or "unknown",
+            model_name,
+        )
+    except Exception:
+        pass
+
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
@@ -84,6 +108,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_per_model_query,
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
+    _get_chunk_refresh_buffer_seconds,
     _get_lease_timeout_seconds,
     _get_request_preview,
     _handle_session,
@@ -761,6 +786,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_key=session_id,
             backend="local",
             body_json=body_json if isinstance(body_json, dict) else None,
+            model_name=model_name,
         )
         if not acquired:
             srv.logger.info(
@@ -816,6 +842,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             session_key=session_id,
             backend="local",
             body_json=body_json if isinstance(body_json, dict) else None,
+            model_name=model_name,
         )
 
     # Token accounting
@@ -1289,11 +1316,23 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 # so that streams lasting longer than
                                 # local_dispatch_lease_timeout_seconds do not lose
                                 # their lease mid-stream.
-                                if _has_actual_data and session_id and session_explicit:
+                                #
+                                # Non-explicit (anonymous) sessions also refresh
+                                # here: they acquire an adaptive lease but have no
+                                # prefill-progress path, so data-chunk refresh is
+                                # their only runtime protection against a 15s base
+                                # lease expiring during long silent generation
+                                # (LP-0MSUO6HLX0089MNQ). They refresh by a dedicated
+                                # safety buffer (default 30s) instead of the base
+                                # lease timeout.
+                                if _has_actual_data and session_id:
                                     try:
                                         _lease_lock = getattr(srv, 'local_dispatch_records_lock', None)
                                         if _lease_lock is not None:
-                                            _lease_timeout = _get_lease_timeout_seconds(srv)
+                                            if session_explicit:
+                                                _lease_timeout = _get_lease_timeout_seconds(srv)
+                                            else:
+                                                _lease_timeout = _get_chunk_refresh_buffer_seconds(srv)
                                             async with _lease_lock:
                                                 if session_id in srv.local_dispatch_records:
                                                     srv.local_dispatch_records[session_id]['expires_at'] = (
@@ -1353,6 +1392,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         _dc = await request.is_disconnected()
                                         if isinstance(_dc, bool) and _dc:
                                             disconnected = True
+                                            # Terminal line so the aborted stream
+                                            # is attributable (LP-0MSVRRTAB0078TMK)
+                                            _log_local_stream_client_disconnect(
+                                                srv, session_id, model_name
+                                            )
                                             srv.logger.info(
                                                 "client_disconnect session=%s slot=%s",
                                                 session_id[:8] if session_id else "unknown",
@@ -1398,8 +1442,22 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
                             # Client disconnected or generator is being closed.
-                            # Skip the final event yield and proceed directly to cleanup.
-                            pass
+                            # Log a terminal line so the aborted stream is
+                            # attributable (LP-0MSVRRTAB0078TMK), then skip the
+                            # final event yield and proceed directly to cleanup.
+                            _log_local_stream_client_disconnect(
+                                srv, session_id, model_name
+                            )
+                        except asyncio.CancelledError:
+                            # The disconnect reaper (LP-0MQTHP828000JYM6) cancels
+                            # the in-flight request task when the client drops
+                            # the connection. Log a terminal line so the aborted
+                            # stream is attributable, then re-raise so the task
+                            # cancellation propagates normally (LP-0MSVRRTAB0078TMK).
+                            _log_local_stream_client_disconnect(
+                                srv, session_id, model_name
+                            )
+                            raise
                         except Exception as exc:
                             # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
                             # Log and let the finally block handle cleanup so backend_ready

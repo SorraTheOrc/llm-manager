@@ -162,9 +162,24 @@ Config keys (both nested under `server:` and flat forms are supported):
 
 ```yaml
 server:
-  local_large_context_fallback_threshold: 60000        # cold-cache new-token cap
-  local_large_context_warm_cache_threshold: 100000     # total-context hard cap
+  local_large_context_cold_cache_threshold: 38000     # cold-cache new-token cap
+  local_large_context_warm_cache_threshold: 100000    # total-context hard cap
 ```
+
+> **Mode-aware cold threshold (LP-0MSOMVOPH004ATAK):** the cold threshold is
+> raised per mode so each stays BELOW its own effective warm clamp (the
+> (cold, warm] band must never collapse — dead-code guard
+> LP-0MSI2M5BT004BCDP):
+>
+> - `proxy/config-fast.yaml` — `38000` (warm clamps to `131072//3 − 4096 =
+>   39594`; recaptures the old (30000, 38000] cold-cache bypass band).
+> - `proxy/config-cheap.yaml` — `60000` (warm resolves to `100000` via the
+>   2×262144 schedule entries; also below the boot-transient clamp 61440,
+>   LP-0MSMZOAJW002UR2A; recaptures ~50 cold-cache requests/night).
+> - `proxy/config.yaml` (default/fallback) — `38000`, mirroring fast mode.
+>
+> Prompts above the per-slot warm clamp are **never** routed local
+> (`context_too_large` — physical capacity, unchanged).
 
 ## Per-period ctx_size in slot_schedule (LP-0MSLNK96T0018W4D)
 

@@ -84,6 +84,37 @@ def _make_srv(records: dict | None = None) -> SimpleNamespace:
     )
 
 
+def _make_mock_cm(aiter_func):
+    """Create (cm, response) matching _call_with_backend_retries' contract."""
+
+    async def _aiter():
+        async for chunk in aiter_func():
+            yield chunk
+
+    mock_resp = type("MockStreamResponse", (), {
+        "status_code": 200,
+        "headers": {"content-type": "text/event-stream"},
+        "aiter_bytes": staticmethod(aiter_func),
+        "aread": AsyncMock(return_value=b""),
+    })
+
+    class _MockCM:
+        async def __aenter__(self):
+            return mock_resp()
+
+        async def __aexit__(self, *args):
+            pass
+
+    return _MockCM(), mock_resp()
+
+
+async def _collect_streamed_chunks(resp):
+    collected = b""
+    async for chunk in resp.body_iterator:
+        collected += chunk
+    return collected
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Unit tests: _increment_local_active_queries + _cleanup_stale_local_dispatch
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -403,3 +434,196 @@ async def test_router_non_streaming_anonymous_adaptive_lease(monkeypatch):
         f"{_EXPECTED_LARGE_TOKENS} tokens x 0.015), got base 60s behaviour"
     )
     assert observed["lease"] <= 1500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chunk-refresh lease path for non-explicit sessions (LP-0MSUO6HLX0089MNQ)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _chunk_refresh_config() -> dict:
+    """Config with a short base lease so a multi-chunk stream outlives it."""
+    cfg = dict(BASE_SERVER_CONFIG)
+    cfg["server"]["local_dispatch_lease_timeout_seconds"] = 0.3
+    cfg["server"]["local_dispatch_lease_per_token_seconds"] = 0.0
+    cfg["server"]["local_dispatch_lease_chunk_refresh_buffer_seconds"] = 1.0
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_chunk_refresh_buffer_defaults():
+    """Default chunk-refresh safety buffer is 30s (production config)."""
+    from proxy.router_helpers import _get_chunk_refresh_buffer_seconds
+
+    srv = _make_srv()
+    assert _get_chunk_refresh_buffer_seconds(srv) == 30.0, (
+        "Default chunk-refresh buffer should be 30s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chunk_refresh_buffer_explicit_config():
+    """Explicit chunk-refresh buffer config is honoured."""
+    from proxy.router_helpers import _get_chunk_refresh_buffer_seconds
+
+    srv = _make_srv()
+    srv.config["server"]["local_dispatch_lease_chunk_refresh_buffer_seconds"] = 12
+    assert _get_chunk_refresh_buffer_seconds(srv) == 12.0
+
+
+@pytest.mark.asyncio
+async def test_router_streaming_anonymous_chunk_refresh(monkeypatch):
+    """AC1: a non-explicit (anonymous) session with an active stream gets its
+    dispatch lease refreshed on data-chunk arrival — the lease survives a
+    stream longer than the 0.3s base lease with no orphan_cleanup.
+
+    This mirrors the explicit-session chunk-refresh path but exercises the
+    anonymous branch (``_has_actual_data and session_id`` without
+    ``session_explicit``), which uses the dedicated chunk-refresh buffer
+    (LP-0MSUO6HLX0089MNQ).
+    """
+    from proxy.router import proxy_to_local
+
+    monkeypatch.setattr(server, "config", _chunk_refresh_config())
+
+    # Anonymous session: no explicit header.
+    monkeypatch.setattr(
+        "proxy.router._handle_session",
+        AsyncMock(return_value={
+            "session_id": "anon-stream",
+            "session_id_header": "anon-stream",
+            "session_explicit": False,
+            "session_created": True,
+            "is_delta_request": False,
+            "session_fallback_reason": None,
+            "delta_messages": [],
+            "original_message_count": 1,
+            "body_override": None,
+            "body_json": None,
+        }),
+    )
+
+    # A stream whose total duration (0.8s) exceeds the 0.3s base lease;
+    # chunks arrive every 0.25s, so without chunk-refresh the record would
+    # be orphan-cleaned mid-stream (cleanup loop cadence ~0.1s in tests).
+    async def _multi_chunk_stream():
+        await asyncio.sleep(0.25)
+        yield b'data: {"choices": [{"delta": {"content": "one"}, "index": 0}]}\n\n'
+        await asyncio.sleep(0.25)
+        yield b'data: {"choices": [{"delta": {"content": "two"}, "index": 0}]}\n\n'
+        await asyncio.sleep(0.25)
+        yield b'data: {"choices": [{"delta": {"content": "three"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    cm, resp = _make_mock_cm(_multi_chunk_stream)
+    monkeypatch.setattr("proxy.router._call_with_backend_retries", AsyncMock(return_value=(cm, resp)))
+    monkeypatch.setattr(
+        "proxy.router._call_with_empty_retry",
+        AsyncMock(return_value=resp),
+    )
+    monkeypatch.setattr("proxy.router._update_session_and_slot", AsyncMock(return_value=None))
+
+    # Snapshot the dispatch record's expires_at as chunks arrive: capture it
+    # from the stream generator between yields (the router refreshes after
+    # consuming each chunk, before requesting the next).
+    snapshots = []
+    _orig_aiter = resp.aiter_bytes
+
+    async def _observing_aiter():
+        async for chunk in _orig_aiter():
+            record = server.local_dispatch_records.get("anon-stream")
+            if record is not None:
+                snapshots.append({
+                    "t": time.monotonic(),
+                    "expires_at": record["expires_at"],
+                    "active": record.get("active"),
+                })
+            yield chunk
+
+    resp.aiter_bytes = _observing_aiter
+
+    response = await proxy_to_local(
+        _dummy_request({"model": "test", "messages": [{"role": "user", "content": "hello"}]}, stream=True),
+        "v1/chat/completions",
+    )
+    collected = await _collect_streamed_chunks(response)
+    assert b"one" in collected and b"three" in collected, (
+        "Streamed response should contain all chunks"
+    )
+
+    assert len(snapshots) >= 3, (
+        f"Expected to observe the dispatch record across >=3 chunks, got {len(snapshots)}"
+    )
+    # Every chunk-refresh pushes expires_at forward: the lease remaining at
+    # each observation stays above the 0.3s base lease horizon (buffer 1.0s
+    # minus the 0.25s chunk cadence leaves ~0.75s steady-state headroom).
+    # The first snapshot may precede the first chunk's refresh (acquisition
+    # lease only), so it is excluded from the headroom assertion.
+    for snap in snapshots[1:]:
+        assert snap["active"] is True
+        remaining = snap["expires_at"] - snap["t"]
+        assert remaining > 0.3, (
+            f"Lease remaining ({remaining:.2f}s) must exceed the base 0.3s "
+            f"lease while the stream is active — chunk-refresh not applied"
+        )
+
+    # The lease must be seen advancing as chunks arrive (refreshed, not
+    # just initially long): later expiries exceed earlier ones.
+    expiries = [s["expires_at"] for s in snapshots]
+    assert max(expiries) > snapshots[0]["expires_at"] + 0.2, (
+        f"Chunk-refresh must push expires_at forward (first {snapshots[0]['expires_at']:.2f}, "
+        f"max {max(expiries):.2f})"
+    )
+
+    # No orphan_cleanup may have been emitted for the anonymous stream.
+    orphan_warnings = [
+        call for call in server.logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert not orphan_warnings, (
+        f"Expected no orphan_cleanup warnings, got {len(orphan_warnings)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_loop_preserves_anonymous_chunk_refreshed_lease(monkeypatch):
+    """AC2: after chunk-refresh extends an anonymous lease, repeated cleanup
+    loop runs never orphan-clean it — the record survives while active."""
+    from proxy.router_helpers import (
+        _cleanup_stale_local_dispatch,
+        _increment_local_active_queries,
+    )
+
+    srv = _make_srv()
+    srv.config["server"]["local_dispatch_lease_timeout_seconds"] = 0.3
+    srv.config["server"]["local_dispatch_lease_chunk_refresh_buffer_seconds"] = 0.5
+
+    await _increment_local_active_queries(
+        srv,
+        session_key="anon-refresh",
+        backend="local",
+        body_json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    record = srv.local_dispatch_records["anon-refresh"]
+    # Simulate the stream having run past the base lease; a chunk just
+    # arrived and refreshed expires_at to now + 0.5s buffer.
+    record["started_at"] -= 0.4
+    record["expires_at"] = time.monotonic() + 0.5
+
+    for iteration in range(5):
+        removed = await _cleanup_stale_local_dispatch(srv)
+        assert removed == 0, (
+            f"Cleanup iteration {iteration} removed {removed} record(s); an "
+            f"active chunk-refreshed lease must be preserved"
+        )
+        assert "anon-refresh" in srv.local_dispatch_records, (
+            f"Cleanup iteration {iteration} orphan-cleaned the refreshed lease"
+        )
+
+    assert srv.local_dispatch_records["anon-refresh"]["expires_at"] > time.monotonic()
+    orphan_warnings = [
+        call for call in srv.logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert not orphan_warnings

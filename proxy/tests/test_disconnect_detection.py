@@ -162,6 +162,15 @@ def _make_mock_stream_response(chunks, status=200):
     return mock_resp
 
 
+def _make_mock_stream_response_from_aiter(aiter_func, status=200):
+    """Create a mock httpx response whose aiter_bytes is a custom async generator."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = status
+    mock_resp.headers = {"content-type": "text/event-stream"}
+    mock_resp.aiter_bytes = aiter_func
+    return mock_resp
+
+
 @pytest.fixture
 def mock_server():
     """Create a minimal mock server object."""
@@ -384,6 +393,243 @@ async def test_router_stream_disconnect_active_queries_not_leaked(mock_server):
         assert mock_decrement.called, (
             "active_queries must be decremented on disconnect"
         )
+
+
+@pytest.mark.asyncio
+async def test_router_stream_in_loop_disconnect_logs_terminal_finish(mock_server):
+    """In-loop is_disconnected() detection logs a terminal
+    'Stream finished: reason=client_disconnect' line (LP-0MSVRRTAB0078TMK)."""
+    from proxy.router import proxy_to_local
+
+    mock_req = _make_mock_request(is_disconnected=True)
+
+    # >= 10 chunks so the disconnect check counter reaches 10 mid-stream.
+    chunks = [b'data: {"choices": [{"delta": {"content": "A"}, "index": 0}]}\n\n'] * 15
+
+    mock_resp = _make_mock_stream_response(chunks)
+
+    with (
+        patch("proxy.router._srv", return_value=mock_server),
+        patch("proxy.router._is_self_healing_active", return_value=False),
+        patch("proxy.router._check_slot_availability", return_value=None),
+        patch("proxy.router._increment_active_queries"),
+        patch("proxy.router._decrement_active_queries"),
+        patch("proxy.router._handle_session") as mock_session,
+        patch("proxy.router._build_slot_context", return_value=(None, None, 3.0)),
+        patch("proxy.router._call_with_backend_retries", new_callable=AsyncMock) as mock_retry,
+        patch("proxy.router.httpx.AsyncClient") as mock_client_cls,
+        patch("proxy.router._schedule_token_increment"),
+        patch("proxy.router._schedule_recv_token_increment"),
+        patch("proxy.router.count_text_tokens", return_value=5),
+        patch("proxy.router._extract_delta_text_from_sse_chunk", return_value=""),
+        patch("proxy.router.evaluate_stream_guardrail", return_value=None),
+        patch("proxy.router.log_request"),
+        patch("proxy.router.log_response_chunk"),
+    ):
+        mock_session.return_value = {
+            "session_id": "test-session-123",
+            "session_created": True,
+            "is_delta_request": False,
+            "session_fallback_reason": None,
+            "delta_messages": None,
+            "body_override": None,
+            "body_json": {"messages": [], "model": "test-model", "stream": True},
+            "original_message_count": 0,
+        }
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_resp
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=mock_cm)
+        mock_client.aclose = AsyncMock()
+        mock_client_cls.return_value = mock_client
+        mock_retry.return_value = (mock_cm, mock_resp)
+
+        mock_req.body = AsyncMock(return_value=json.dumps(
+            {"messages": [], "model": "test-model", "stream": True}
+        ).encode())
+
+        result = await proxy_to_local(mock_req, "v1/chat/completions")
+        assert isinstance(result, StreamingResponse)
+        async for chunk in result.body_iterator:
+            pass
+
+        terminal_calls = [
+            c for c in mock_server.logger.info.call_args_list
+            if "Stream finished: reason=client_disconnect" in str(c)
+        ]
+        assert terminal_calls, (
+            "expected a terminal client_disconnect finish line on in-loop disconnect"
+        )
+        # logger.info is a MagicMock, so the format string + args are captured
+        # separately (the proxy logs ``session=%s provider=local model=%s``).
+        args = terminal_calls[0].args
+        assert "session=%s provider=local model=%s" in args[0]
+        assert "test-session-123" in args
+        assert "test-model" in args
+
+
+@pytest.mark.asyncio
+async def test_router_stream_generator_exit_logs_terminal_finish(mock_server):
+    """GeneratorExit (client disconnect / generator close) logs a terminal
+    'Stream finished: reason=client_disconnect' line (LP-0MSVRRTAB0078TMK)."""
+    from proxy.router import proxy_to_local
+
+    mock_req = _make_mock_request(is_disconnected=False)
+    chunks = [b'data: {"choices": [{"delta": {"content": "A"}, "index": 0}]}\n\n'] * 3
+
+    mock_resp = _make_mock_stream_response(chunks)
+
+    with (
+        patch("proxy.router._srv", return_value=mock_server),
+        patch("proxy.router._is_self_healing_active", return_value=False),
+        patch("proxy.router._check_slot_availability", return_value=None),
+        patch("proxy.router._increment_active_queries"),
+        patch("proxy.router._decrement_active_queries"),
+        patch("proxy.router._handle_session") as mock_session,
+        patch("proxy.router._build_slot_context", return_value=(None, None, 3.0)),
+        patch("proxy.router._call_with_backend_retries", new_callable=AsyncMock) as mock_retry,
+        patch("proxy.router.httpx.AsyncClient") as mock_client_cls,
+        patch("proxy.router._schedule_token_increment"),
+        patch("proxy.router._schedule_recv_token_increment"),
+        patch("proxy.router.count_text_tokens", return_value=5),
+        patch("proxy.router._extract_delta_text_from_sse_chunk", return_value=""),
+        patch("proxy.router.evaluate_stream_guardrail", return_value=None),
+        patch("proxy.router.log_request"),
+        patch("proxy.router.log_response_chunk"),
+    ):
+        mock_session.return_value = {
+            "session_id": "test-session-123",
+            "session_created": True,
+            "is_delta_request": False,
+            "session_fallback_reason": None,
+            "delta_messages": None,
+            "body_override": None,
+            "body_json": {"messages": [], "model": "test-model", "stream": True},
+            "original_message_count": 0,
+        }
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_resp
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=mock_cm)
+        mock_client.aclose = AsyncMock()
+        mock_client_cls.return_value = mock_client
+        mock_retry.return_value = (mock_cm, mock_resp)
+
+        mock_req.body = AsyncMock(return_value=json.dumps(
+            {"messages": [], "model": "test-model", "stream": True}
+        ).encode())
+
+        result = await proxy_to_local(mock_req, "v1/chat/completions")
+        assert isinstance(result, StreamingResponse)
+
+        # Consume one chunk, then close the generator (simulates client
+        # disconnect / framework generator close).
+        gen = result.body_iterator.__aiter__()
+        chunk = await gen.__anext__()
+        assert chunk is not None
+        await gen.aclose()
+
+        terminal_calls = [
+            c for c in mock_server.logger.info.call_args_list
+            if "Stream finished: reason=client_disconnect" in str(c)
+        ]
+        assert terminal_calls, (
+            "expected a terminal client_disconnect finish line on GeneratorExit"
+        )
+        args = terminal_calls[0].args
+        assert "session=%s provider=local model=%s" in args[0]
+        assert "test-session-123" in args
+        assert "test-model" in args
+
+
+@pytest.mark.asyncio
+async def test_router_stream_reaper_cancel_logs_terminal_finish(mock_server):
+    """Disconnect-reaper task cancellation (CancelledError) logs a terminal
+    'Stream finished: reason=client_disconnect' line (LP-0MSVRRTAB0078TMK)."""
+    from proxy.router import proxy_to_local
+
+    mock_req = _make_mock_request(is_disconnected=False)
+
+    _hang = asyncio.Event()
+
+    async def _hanging_aiter():
+        yield b'data: {"choices": [{"delta": {"content": "A"}, "index": 0}]}\n\n'
+        await _hang.wait()  # upstream stalls after the first chunk
+
+    mock_resp = _make_mock_stream_response_from_aiter(_hanging_aiter)
+
+    with (
+        patch("proxy.router._srv", return_value=mock_server),
+        patch("proxy.router._is_self_healing_active", return_value=False),
+        patch("proxy.router._check_slot_availability", return_value=None),
+        patch("proxy.router._increment_active_queries"),
+        patch("proxy.router._decrement_active_queries"),
+        patch("proxy.router._handle_session") as mock_session,
+        patch("proxy.router._build_slot_context", return_value=(None, None, 3.0)),
+        patch("proxy.router._call_with_backend_retries", new_callable=AsyncMock) as mock_retry,
+        patch("proxy.router.httpx.AsyncClient") as mock_client_cls,
+        patch("proxy.router._schedule_token_increment"),
+        patch("proxy.router._schedule_recv_token_increment"),
+        patch("proxy.router.count_text_tokens", return_value=5),
+        patch("proxy.router._extract_delta_text_from_sse_chunk", return_value=""),
+        patch("proxy.router.evaluate_stream_guardrail", return_value=None),
+        patch("proxy.router.log_request"),
+        patch("proxy.router.log_response_chunk"),
+    ):
+        mock_session.return_value = {
+            "session_id": "test-session-123",
+            "session_created": True,
+            "is_delta_request": False,
+            "session_fallback_reason": None,
+            "delta_messages": None,
+            "body_override": None,
+            "body_json": {"messages": [], "model": "test-model", "stream": True},
+            "original_message_count": 0,
+        }
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_resp
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=mock_cm)
+        mock_client.aclose = AsyncMock()
+        mock_client_cls.return_value = mock_client
+        mock_retry.return_value = (mock_cm, mock_resp)
+
+        mock_req.body = AsyncMock(return_value=json.dumps(
+            {"messages": [], "model": "test-model", "stream": True}
+        ).encode())
+
+        result = await proxy_to_local(mock_req, "v1/chat/completions")
+        assert isinstance(result, StreamingResponse)
+
+        # Consume the stream in a background task, then cancel it the way the
+        # disconnect reaper cancels the in-flight request task.
+        async def _consume():
+            async for _chunk in result.body_iterator:
+                pass
+
+        consume_task = asyncio.ensure_future(_consume())
+        await asyncio.sleep(0.05)  # generator is now streaming the first chunk
+        consume_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consume_task
+
+        terminal_calls = [
+            c for c in mock_server.logger.info.call_args_list
+            if "Stream finished: reason=client_disconnect" in str(c)
+        ]
+        assert terminal_calls, (
+            "expected a terminal client_disconnect finish line on reaper cancel"
+        )
+        args = terminal_calls[0].args
+        assert "session=%s provider=local model=%s" in args[0]
+        assert "test-session-123" in args
+        assert "test-model" in args
+
+        _hang.set()  # release the stalled upstream read
+        await asyncio.sleep(0.05)
 
 
 # ===================================================================

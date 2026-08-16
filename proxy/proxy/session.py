@@ -892,6 +892,23 @@ def _free_slot_assignment(session_id: str) -> None:
             return
 
 
+def _assigned_slot_for_session(session_id: str) -> int | None:
+    """Return the slot currently assigned to *session_id*, if any.
+
+    Read-only lookup: unlike ``_slot_id_for_session`` it never assigns a
+    new slot. Used by orphan-cleanup verification to check whether a
+    session's slot is still processing on llama-server before freeing the
+    dispatch lease (LP-0MSUO6XRP001MCB2). Returns ``None`` when the session
+    has no slot assignment or *session_id* is empty.
+    """
+    if not session_id:
+        return None
+    for sid, owner in list(_slot_owners.items()):
+        if owner == session_id:
+            return sid
+    return None
+
+
 def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
     safe_id = _sanitize_session_id(session_id)
     return str(Path(base_dir) / f"slot_{safe_id}.bin")

@@ -90,6 +90,14 @@ SLOT_SAVE_FAILED = "slot_save failed"
 BACKEND_RETRY = "backend_retry"
 UPSTREAM_ERROR = "[remote] upstream error"
 
+# Operating-mode switch lines (LP-0MSM5K4TX004MICX): the proxy logs each
+# applied mode transition as ``Mode scheduler: applied scheduled mode
+# <mode>``. These reconstruct the mode active during the analysis window so
+# sessions are bucketed by the mode that was actually running (fast vs cheap
+# profiles), not the mode at analysis time (LP-0MSPZUD4G007IYGH).
+MODE_SWITCH_PREFIX = "Mode scheduler: applied scheduled mode"
+RE_MODE_SWITCH = re.compile(r"Mode scheduler: applied scheduled mode (\w+)")
+
 # Best-effort provider attribution for ``[remote] upstream error`` lines: the
 # line carries only the target URL, so the provider is inferred from the
 # endpoint path/host. These patterns mirror the remote provider endpoints in
@@ -129,6 +137,17 @@ FALLBACK_ATTRIBUTION_WINDOW_SECONDS = 60
 # events that cross the window boundary. 1h generously covers long generations
 # that overrun the window end; rotated logs bound the pre-window side anyway.
 BUSY_WINDOW_MARGIN = timedelta(hours=1)
+
+# Margin by which ``iter_events`` widens the window for the operating-mode
+# timeline (``Mode scheduler: applied scheduled mode`` lines, see
+# MODE_SWITCH_PREFIX). The mode schedule switches at most twice a day, so a
+# 48h margin guarantees every in-window session finds the mode transition
+# that was active at its start (the nearest prior transition in the available
+# logs), even for windows that begin just after a transition. The effective
+# margin used by the analysis is max(BUSY_WINDOW_MARGIN, MODE_TIMELINE_MARGIN)
+# so a single streaming pass serves both the busy-time pairing and the mode
+# timeline.
+MODE_TIMELINE_MARGIN = timedelta(hours=48)
 
 LOCAL_PROVIDER = "local"
 
@@ -171,6 +190,8 @@ class LogEvent:
     signal: str | None = None
     src_file: str | None = None
     raw: str | None = None
+    # Operating-mode field (mode_switch kind only): "fast" | "cheap".
+    mode: str | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -288,6 +309,16 @@ def parse_log_line(line: str) -> LogEvent | None:
             session=_session_from(msg),
             queued_duration=_first(RE_CONTENTION_DURATION, msg),
         )
+    if msg.startswith(MODE_SWITCH_PREFIX):
+        # "Mode scheduler: applied scheduled mode cheap" — the mode that the
+        # scheduler applied at this timestamp (LP-0MSM5K4TX004MICX).
+        m = RE_MODE_SWITCH.search(msg)
+        if m is None:
+            return None
+        mode = m.group(1).lower()
+        if mode not in ("fast", "cheap"):
+            return None
+        return LogEvent("mode_switch", ts, mode=mode)
     if msg.startswith(STREAM_ERROR):
         # "Stream error: session=... provider=... model=... error=NameError"
         return LogEvent(

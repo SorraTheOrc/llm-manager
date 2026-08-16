@@ -101,6 +101,24 @@ class TestLogLineParsing:
         assert ev.session == "019fc27d-3a46-7e5c-871e-57ab32f875f3"
         assert ev.provider == "local"
 
+    def test_stream_finished_client_disconnect_reason(self):
+        # Terminal line logged by the proxy when a client disconnects
+        # mid-stream (LP-0MSVRRTAB0078TMK): parses as a normal stream_finished
+        # with reason=client_disconnect (NOT stream_finish_error, which is
+        # reserved for the synthetic reason=error event), so busy-time pairing
+        # treats the stream as finished and its compute time becomes known.
+        line = (
+            "2026-08-02 14:00:00,000 - INFO - Stream finished: reason=client_disconnect "
+            "session=019fc27d-3a46-7e5c-871e-57ab32f875f3 provider=local model=Qwen3"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "stream_finished"
+        assert ev.reason == "client_disconnect"
+        assert ev.session == "019fc27d-3a46-7e5c-871e-57ab32f875f3"
+        assert ev.provider == "local"
+        assert ev.model == "Qwen3"
+        assert ev.prompt is None
+
     def test_fallback_triggered(self):
         ev = log_parser.parse_log_line(fixtures.FALLBACK_CONCURRENCY)
         assert ev.kind == "fallback"
@@ -191,6 +209,29 @@ class TestLogLineParsing:
     def test_session_unknown_is_unattributed(self):
         ev = log_parser.parse_log_line(fixtures.STREAM_STARTED_SESSION_UNKNOWN)
         assert ev.session is None
+
+    def test_mode_switch_parsed(self):
+        """Mode scheduler applied-mode lines build the mode timeline
+        (LP-0MSPZUD4G007IYGH AC1)."""
+        ev = log_parser.parse_log_line(fixtures.MODE_SWITCH_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.ts == datetime(2026, 8, 15, 1, 0, 8, 679000)
+        ev2 = log_parser.parse_log_line(fixtures.MODE_SWITCH_FAST)
+        assert ev2.kind == "mode_switch"
+        assert ev2.mode == "fast"
+
+    def test_mode_scheduler_enabled_line_ignored(self):
+        """The ``enabled with N entries`` announcement carries no applied
+        mode and is not a timeline event."""
+        assert log_parser.parse_log_line(fixtures.MODE_SCHEDULER_ENABLED_IGNORED) is None
+
+    def test_status_request_lines_ignored(self):
+        """status_request lines expose total_slots but are not parsed (they
+        are corroborating evidence only)."""
+        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_CHEAP) is None
+        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST) is None
 
 
 class TestErrorLineParsing:
@@ -726,6 +767,135 @@ class TestBucketing:
     def test_minute_of_day_uses_fractional_minutes(self):
         assert bucketing.minute_of_day(datetime(2026, 8, 2, 23, 58, 30)) == pytest.approx(1438.5)
 
+    def test_mode_map_period_for_labels_by_mode_not_slot_counts(self):
+        """A cheap-profile schedule has equal slot counts all day; the mode
+        map must still label its hours "cheap" (LP-0MSPZUD4G007IYGH AC3)."""
+        mm = fixtures.mode_map_fixture()
+        cheap_ts = datetime(2026, 8, 15, 2, 0, 0)
+        fast_ts = datetime(2026, 8, 15, 10, 30, 0)
+        mm.transitions = [
+            (datetime(2026, 8, 15, 1, 0, 0), "cheap"),
+            (datetime(2026, 8, 15, 10, 0, 0), "fast"),
+        ]
+        p = mm.period_for(cheap_ts)
+        assert p.label == "cheap"
+        assert p.slots == 2
+        assert p.ctx_size == 262144
+        p2 = mm.period_for(fast_ts)
+        assert p2.label == "fast"
+        assert p2.slots == 3
+        assert p2.ctx_size == 131072
+
+    def test_mode_map_mode_at_uses_nearest_prior_transition(self):
+        mm = fixtures.mode_map_fixture()
+        mm.transitions = [
+            (datetime(2026, 8, 14, 10, 0, 0), "fast"),
+            (datetime(2026, 8, 15, 1, 0, 0), "cheap"),
+            (datetime(2026, 8, 15, 10, 0, 0), "fast"),
+        ]
+        assert mm.mode_at(datetime(2026, 8, 14, 10, 30, 0)) == "fast"
+        assert mm.mode_at(datetime(2026, 8, 15, 2, 0, 0)) == "cheap"
+        assert mm.mode_at(datetime(2026, 8, 15, 10, 30, 0)) == "fast"
+
+    def test_mode_map_without_transitions_falls_back_to_analysis_mode(self):
+        mm = fixtures.mode_map_fixture()
+        assert mm.mode_at(datetime(2026, 8, 15, 2, 0, 0)) == "fast"  # default_mode
+
+
+# ---------------------------------------------------------------------------
+# Mode-timeline bucketing (LP-0MSPZUD4G007IYGH)
+# ---------------------------------------------------------------------------
+
+
+class TestModeTimelineBucketing:
+    """Sessions are bucketed by the operating mode active at their first
+    in-window stream (reconstructed from ``Mode scheduler`` log lines), so a
+    window crossing the 01:00/10:00 transitions splits fast vs cheap instead
+    of collapsing everything into the analysis-time bucket."""
+
+    MODE_WINDOW_START = datetime(2026, 8, 14, 10, 29, 0)
+    MODE_WINDOW_END = datetime(2026, 8, 15, 10, 29, 0)
+
+    def _lines(self):
+        return [
+            # Prior transition (inside the 48h timeline margin, before window start).
+            "2026-08-14 10:00:02,000 - INFO - Mode scheduler: applied scheduled mode fast",
+            fixtures.STATUS_REQUEST_FAST,
+            # Cheap transition + a cheap-hour session (02:00).
+            fixtures.MODE_SWITCH_CHEAP,
+            fixtures.STATUS_REQUEST_CHEAP,
+            "2026-08-15 02:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=cheap-sess request=[]",
+            "2026-08-15 02:00:10,000 - INFO - Stream finished: reason=stop tokens=50000/100/50100 session=cheap-sess provider=local model=Qwen3 request=[]",
+            # Fast transition + fast-hour sessions (Aug 14 11:00, Aug 15 10:20).
+            fixtures.MODE_SWITCH_FAST,
+            "2026-08-14 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=fast-early request=[]",
+            "2026-08-14 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=fast-early provider=local model=Qwen3 request=[]",
+            "2026-08-15 10:20:00,000 - INFO - Stream started: provider=local model=Qwen3 session=fast-late request=[]",
+            "2026-08-15 10:20:10,000 - INFO - Stream finished: reason=stop tokens=200/20/220 session=fast-late provider=local model=Qwen3 request=[]",
+        ]
+
+    def test_sessions_bucketed_by_mode_transitions(self):
+        mm = fixtures.mode_map_fixture()
+        res = aggregation.aggregate(
+            _events(self._lines()),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # Timeline reconstructed from the applied-mode lines.
+        assert mm.transitions == [
+            (datetime(2026, 8, 14, 10, 0, 2), "fast"),
+            (datetime(2026, 8, 15, 1, 0, 8, 679000), "cheap"),
+            (datetime(2026, 8, 15, 10, 0, 18, 41000), "fast"),
+        ]
+        s = res.sessions["cheap-sess"]
+        assert s.bucket == "cheap"
+        assert s.slots == 2
+        assert s.ctx_size == 262144
+        assert s.max_context_size == 50000
+        assert res.sessions["fast-early"].bucket == "fast"
+        assert res.sessions["fast-early"].slots == 3
+        assert res.sessions["fast-early"].ctx_size == 131072
+        assert res.sessions["fast-late"].bucket == "fast"
+        assert res.sessions["fast-late"].slots == 3
+        assert res.sessions["fast-late"].ctx_size == 131072
+
+    def test_window_without_transitions_keeps_legacy_bucketing(self):
+        """A single-mode window (no transitions observed) keeps the legacy
+        slot-count bucketing from the analysis-time schedule (AC notes)."""
+        mm = fixtures.mode_map_fixture()
+        lines = [
+            "2026-08-15 02:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-15 02:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 15, 0, 0),
+            datetime(2026, 8, 15, 3, 0),
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # No mode lines -> transitions empty -> analysis-time schedule buckets.
+        assert mm.transitions == []
+        assert res.sessions["s1"].bucket == "fast"
+        assert res.sessions["s1"].slots == 3
+
+    def test_mode_switch_lines_counted_as_parsed_lines(self):
+        mm = fixtures.mode_map_fixture()
+        res = aggregation.aggregate(
+            _events(self._lines()),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # In-window structured lines: 2 mode switches (Aug 15 01:00/10:00;
+        # the Aug 14 10:00 line lies in the margin, outside the window)
+        # + 3 stream starts + 3 stream finishes.
+        assert res.total_lines == 8
+        assert res.lines_skipped == 0
+
 
 # ---------------------------------------------------------------------------
 # Recommendation rules
@@ -1059,6 +1229,66 @@ class TestConfigLoader:
         found = config_loader.find_config_path(start=tmp_path)
         assert found == tmp_path / "proxy" / "config.yaml"
 
+    def test_yaml_parse_captures_per_period_ctx_size(self):
+        """slot_schedule entries with an explicit ctx_size expose it as
+        ctx_by_time (LP-0MSMZOAJW002UR2A / LP-0MSPZUD4G007IYGH AC4)."""
+        text = """\
+server:
+  slot_schedule:
+    enabled: true
+    entries:
+      - time: "23:59"
+        slots: 2
+        ctx_size: 262144
+      - time: "10:00"
+        slots: 3
+        ctx_size: 131072
+"""
+        cfg = config_loader.parse_config_text(text)
+        schedule = cfg["slot_schedule"]
+        assert schedule["entries"] == [("23:59", 2), ("10:00", 3)]
+        assert schedule["ctx_by_time"] == {"23:59": 262144, "10:00": 131072}
+
+    def test_regex_fallback_captures_per_period_ctx_size(self):
+        text = """\
+server:
+  slot_schedule:
+    enabled: true
+    entries:
+      - time: "23:59"
+        slots: 2
+        ctx_size: 262144
+      - time: "10:00"
+        slots: 3
+"""
+        cfg = config_loader._parse_config_text_regex(text)
+        schedule = cfg["slot_schedule"]
+        assert schedule["entries"] == [("23:59", 2), ("10:00", 3)]
+        assert schedule.get("ctx_by_time") == {"23:59": 262144}
+
+    def test_discover_configs_loads_profiles_and_analysis_mode(self, tmp_path):
+        """discover_configs loads all three profiles plus the persisted mode
+        (LP-0MSPZUD4G007IYGH)."""
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("local_model_ctx_size: 131072\n")
+        (tmp_path / "proxy" / "config-cheap.yaml").write_text("local_model_ctx_size: 262144\n")
+        (tmp_path / "proxy" / "config-fast.yaml").write_text("local_model_ctx_size: 131072\n")
+        (tmp_path / "proxy" / ".mode").write_text("cheap\n")
+        configs = config_loader.discover_configs(start=tmp_path)
+        assert configs["base"] == tmp_path / "proxy" / "config.yaml"
+        assert configs["profiles"]["fast"]["local_model_ctx_size"] == 131072
+        assert configs["profiles"]["cheap"]["local_model_ctx_size"] == 262144
+        assert configs["analysis_mode"] == "cheap"
+        assert configs["analysis_config"] is configs["profiles"]["cheap"]
+
+    def test_discover_configs_no_mode_uses_default(self, tmp_path):
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text("local_model_ctx_size: 131072\n")
+        (tmp_path / "proxy" / "config-cheap.yaml").write_text("local_model_ctx_size: 262144\n")
+        configs = config_loader.discover_configs(start=tmp_path)
+        assert configs["analysis_mode"] is None
+        assert configs["analysis_config"] is configs["profiles"]["default"]
+
 
 # ---------------------------------------------------------------------------
 # End-to-end run over fixture log files
@@ -1141,6 +1371,90 @@ class TestBusyStats:
         assert busy.streams == 1
         assert busy.busy_seconds == 10.0
         assert busy.unfinished_streams == 1
+        assert busy.pre_window_unfinished == 0
+
+    def test_pre_window_unfinished_streams_not_counted_in_caveat(self):
+        # A stream started more than BUSY_WINDOW_MARGIN (1h) before the window
+        # start with no logged finish is a pre-window leftover from an earlier
+        # window (LP-0MSVRRO3L0056N6C): it is NOT an in-window abort and must
+        # not inflate unfinished_streams; it is tracked separately.
+        events = [
+            # Pre-window leftover: started 2h before the window, never finished.
+            _local_event("stream_started", datetime(2026, 8, 2, 12, 0, 0), "stale"),
+            # In-window completed stream so busy stats exist.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.streams == 1
+        assert busy.busy_seconds == 10.0
+        assert busy.unfinished_streams == 0
+        assert busy.pre_window_unfinished == 1
+
+    def test_in_window_and_pre_window_unfinished_split(self):
+        # Both classes coexist: an in-window abort (no finish) and a stale
+        # pre-window start (no finish) are counted separately.
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 30, 0), "abort"),
+            _local_event("stream_started", datetime(2026, 8, 2, 12, 30, 0), "stale"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.unfinished_streams == 1
+        assert busy.pre_window_unfinished == 1
+
+    def test_stream_started_within_margin_before_window_counts_unfinished(self):
+        # A stream started within BUSY_WINDOW_MARGIN (1h) before the window
+        # start with no finish may have consumed in-window compute -> counts
+        # as unfinished for this window.
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 13, 30, 0), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.unfinished_streams == 1
+        assert busy.pre_window_unfinished == 0
+
+    def test_stream_started_after_window_end_not_counted_unfinished(self):
+        # A stream started after the window end has no in-window compute; it
+        # belongs to the next window's report, not this one.
+        events = [
+            _local_event("stream_started", datetime(2026, 8, 2, 15, 30, 0), "later"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(events, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.unfinished_streams == 0
+        assert busy.pre_window_unfinished == 0
+
+    def test_client_disconnect_finish_pairs_with_start(self):
+        # A ``Stream finished: reason=client_disconnect`` terminal line (logged
+        # by the proxy on client abort, LP-0MSVRRTAB0078TMK) is a normal
+        # stream_finished event: the start pairs with it, its compute time is
+        # known (start -> disconnect), and it is NOT counted as unfinished.
+        started = log_parser.LogEvent(
+            "stream_started", datetime(2026, 8, 2, 14, 0, 0),
+            provider="local", model="Qwen3", session="s1",
+        )
+        finished = log_parser.parse_log_line(
+            "2026-08-02 14:00:10,000 - INFO - Stream finished: reason=client_disconnect "
+            "session=s1 provider=local model=Qwen3"
+        )
+        assert finished is not None and finished.kind == "stream_finished"
+        busy = aggregation.compute_busy_stats(
+            [started, finished], WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None
+        assert busy.streams == 1
+        assert busy.busy_seconds == 10.0
+        assert busy.unfinished_streams == 0
+        assert busy.pre_window_unfinished == 0
 
     def test_no_local_traffic_returns_none(self):
         events = [
@@ -1350,6 +1664,107 @@ class TestEndToEnd:
         # Round-trips through json.
         json.dumps(data)
 
+    def test_report_note_splits_unfinished_and_pre_window(self, tmp_path):
+        """Regression (LP-0MSVRRO3L0056N6C): the busy-time note splits
+        unfinished streams into in-window aborts (started without a logged
+        finish) vs pre-window leftovers (started more than 1h before the
+        window) instead of lumping them together."""
+        log_dir = tmp_path / "logs_note"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "2026-08-02 12:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=aaaa request=[]\n"
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=bbbb request=[]\n"
+            "2026-08-02 14:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=bbbb provider=local model=Qwen3 request=[]\n"
+            "2026-08-02 14:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=cccc request=[]\n"
+        )
+        out_dir = tmp_path / "out_note"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        assert result.summary.busy is not None
+        assert result.summary.busy.unfinished_streams == 1  # cccc (in-window abort)
+        assert result.summary.busy.pre_window_unfinished == 1  # aaaa (stale)
+        md = (out_dir / "report.md").read_text()
+        util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "1 local stream(s) started" in util
+        assert "1 pre-window leftover" in util
+        assert "pre-window leftover" in util
+
+    def test_mode_aware_end_to_end_split(self, tmp_path):
+        """Regression (LP-0MSPZUD4G007IYGH): a window crossing the
+        01:00/10:00 mode transitions splits sessions fast/cheap by the mode
+        active at their start — cheap sessions land in cheap_sessions.csv with
+        the cheap profile's slots/ctx even though the analysis-time mode is
+        fast. Uses real ``Mode scheduler`` + ``status_request`` lines."""
+        log_dir = tmp_path / "logs_mode"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(TestModeTimelineBucketing._lines(TestModeTimelineBucketing)) + "\n")
+        out_dir = tmp_path / "out_mode"
+        mm = fixtures.mode_map_fixture()
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=TestModeTimelineBucketing.MODE_WINDOW_START,
+            window_end=TestModeTimelineBucketing.MODE_WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+            mode_map=mm,
+        )
+        assert len(result.summary.sessions) == 3
+        assert result.summary.sessions["cheap-sess"].bucket == "cheap"
+        assert result.summary.sessions["cheap-sess"].slots == 2
+        assert result.summary.sessions["cheap-sess"].ctx_size == 262144
+
+        with (out_dir / "fast_sessions.csv").open() as f:
+            fast_rows = list(csv.DictReader(f))
+        with (out_dir / "cheap_sessions.csv").open() as f:
+            cheap_rows = list(csv.DictReader(f))
+        assert {r["session_id"] for r in fast_rows} == {"fast-early", "fast-late"}
+        assert {r["session_id"] for r in cheap_rows} == {"cheap-sess"}
+        cheap = cheap_rows[0]
+        assert cheap["bucket"] == "cheap"
+        assert cheap["slots"] == "2"
+        assert cheap["ctx_size"] == "262144"
+        fast = next(r for r in fast_rows if r["session_id"] == "fast-late")
+        assert fast["slots"] == "3"
+        assert fast["ctx_size"] == "131072"
+
+        # The report's Session summary reflects the actual mode split.
+        md = (out_dir / "report.md").read_text()
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Sessions | 3 | 2 (66.7%) | 1 (33.3%) |" in section
+        assert "| Local requests | 3 (100.0%) | 2 (100.0%) | 1 (100.0%) |" in section
+
+        # JSON summary exposes the split too.
+        data = reporting.summary_to_json(result.summary, mm)
+        assert data["fast_sessions"] == 2
+        assert data["cheap_sessions"] == 1
+
+    def test_mode_aware_context_pressure_uses_per_session_profile(self, tmp_path):
+        """Context-pressure recommendations use each session's own profile
+        (cheap 262144/2, fast 131072/3) instead of the analysis-time ctx."""
+        log_dir = tmp_path / "logs_mode2"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(TestModeTimelineBucketing._lines(TestModeTimelineBucketing)) + "\n")
+        out_dir = tmp_path / "out_mode2"
+        mm = fixtures.mode_map_fixture()
+        _ = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=TestModeTimelineBucketing.MODE_WINDOW_START,
+            window_end=TestModeTimelineBucketing.MODE_WINDOW_END,
+            output_dir=out_dir,
+            config=fixtures.MODE_FAST_CONFIG,
+            mode_map=mm,
+        )
+        md = (out_dir / "report.md").read_text()
+        # cheap-sess peaked at 50000 tokens vs per-slot 262144/2 = 131072
+        # (38%: no pressure); fast sessions are far below 131072/3. No
+        # context-pressure recommendation should fire.
+        assert "Context sizes approaching per-slot limits" not in md
+
     def test_error_report_section_and_artifacts(self, tmp_path):
         log_dir = tmp_path / "logs_err"
         log_dir.mkdir()
@@ -1521,6 +1936,78 @@ class TestDefaultOutputDir:
         assert (out / "report.md").exists()
         assert (out / "fast_sessions.csv").exists()
         assert (out / "cheap_sessions.csv").exists()
+
+
+class TestSummaryOutputPaths:
+    """The stdout summary lists the complete absolute path to every output
+    artifact, starting with the report (report.md first, all five artifacts,
+    ~ expanded, absolute archive path)."""
+
+    def _write_logs(self, tmp_path: Path) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        return log_dir
+
+    def _args(self, tmp_path: Path, out: Path) -> list[str]:
+        return [
+            "--log-dir", str(self._write_logs(tmp_path)),
+            "--start", "2026-08-02 14:00:00",
+            "--end", "2026-08-02 15:00:00",
+            "--output-dir", str(out),
+        ]
+
+    def test_summary_lists_full_paths_report_first(self, tmp_path, capsys):
+        import analyze_proxy_usage as cli
+
+        out = tmp_path / "out"
+        rc = cli.main(self._args(tmp_path, out))
+        assert rc == 0
+        captured = capsys.readouterr().out
+        assert "Outputs written to:" in captured
+        listed = [ln.strip() for ln in captured.splitlines() if ln.strip().startswith(str(out))]
+        expected = [
+            out.resolve() / "report.md",
+            out.resolve() / "fast_sessions.csv",
+            out.resolve() / "cheap_sessions.csv",
+            out.resolve() / "errors.csv",
+            out.resolve() / "errors.json",
+        ]
+        # Report first, then every artifact, each a complete absolute path.
+        assert listed == [str(p) for p in expected], f"unexpected output lines: {listed}"
+
+    def test_home_dir_default_is_expanded(self, tmp_path, monkeypatch, capsys):
+        import analyze_proxy_usage as cli
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        rc = cli.main(
+            [
+                "--log-dir", str(self._write_logs(tmp_path)),
+                "--start", "2026-08-02 14:00:00",
+                "--end", "2026-08-02 15:00:00",
+            ]
+        )
+        assert rc == 0
+        captured = capsys.readouterr().out
+        expected = (home / "proxy-usage-reports" / "report.md").resolve()
+        assert str(expected) in captured
+        assert "~" not in captured.split("Outputs written to:", 1)[1]
+
+    def test_archive_path_is_absolute(self, tmp_path, capsys):
+        import analyze_proxy_usage as cli
+
+        out = tmp_path / "out"
+        args = self._args(tmp_path, out)
+        assert cli.main(args) == 0
+        # Second run: the first run's outputs move into a dated archive dir.
+        assert cli.main(args) == 0
+        captured = capsys.readouterr().out
+        archive_lines = [ln for ln in captured.splitlines() if "archived to" in ln]
+        assert len(archive_lines) == 1
+        path = archive_lines[0].split("archived to ", 1)[1]
+        assert Path(path).is_absolute()
+        assert Path(path).is_dir()
 
 
 class TestReportRestructure:

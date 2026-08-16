@@ -16,6 +16,8 @@ rule_files:
   - "monitoring/llama_memory_alerts.yaml"
   - "monitoring/proxy_5xx_alerts.yaml"
   - "monitoring/gpu_vram_alerts.yaml"
+  - "monitoring/slots_query_alerts.yaml"
+  - "monitoring/remote_stream_alerts.yaml"
 
 # Scrape configurations
 scrape_configs:

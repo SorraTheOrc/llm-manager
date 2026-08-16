@@ -498,3 +498,172 @@ async def test_llama_local_status_active_query_false_after_recovery():
                                                     assert resp.json()["active_query"] is False, (
                                                         "Recovered counter should report active_query=false"
                                                     )
+
+
+# ======================================================================
+# Per-slot details in /llama/local/status (LP-0MSORPUMX002LLIA)
+# ======================================================================
+
+
+class TestPerSlotDetails:
+    """GET /llama/local/status exposes per-slot details from /slots.
+
+    LP-0MSORPUMX002LLIA: herdr's downtime worker needs the SAME N slots to
+    stay free for the whole idle threshold (WL-0MSG7P9N8009PCKG). The status
+    endpoint now includes a ``slots`` array with per-slot identity
+    (``slot_id``, ``is_processing``, ``n_decoded``) so consumers can track
+    individual slots instead of just counts.
+    """
+
+    _FAKE_SLOTS = [
+        {"slot_id": 0, "is_processing": False, "n_decoded": None},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 42},
+        {"slot_id": 2, "is_processing": False, "n_decoded": None},
+    ]
+
+    class _FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    async def _get(
+        self,
+        query_result,
+        slots_detail=None,
+        slots_detail_side_effect=None,
+        current_model="test-model",
+        config=None,
+    ):
+        """Issue /llama/local/status with controllable /slots detail responses.
+
+        Returns the parsed JSON body. ``_query_slots`` is always stubbed so
+        the test never touches a real llama-server on localhost.
+        """
+        from unittest.mock import AsyncMock
+
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return query_result
+
+        slots_detail_mock = AsyncMock(
+            return_value=slots_detail, side_effect=slots_detail_side_effect
+        )
+        slots_counts_mock = AsyncMock(return_value=(0, 0))
+        transport = httpx.ASGITransport(app=app)
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "current_model", current_model):
+                with patch.object(server, "model_switch_refcount", 0):
+                    with patch.object(server, "model_switch_lock", self._FakeLock()):
+                        with patch.object(server, "background_loads", {}):
+                            with patch.object(server, "local_dispatch_records", {}):
+                                with patch.object(
+                                    server,
+                                    "local_dispatch_records_lock",
+                                    self._FakeLock(),
+                                ):
+                                    with patch.object(
+                                        server,
+                                        "config",
+                                        config
+                                        if config is not None
+                                        else {"server": {"llama_server_port": 8080}},
+                                    ):
+                                        with patch(
+                                            "proxy.observability._query_slots_detail",
+                                            slots_detail_mock,
+                                        ):
+                                            with patch(
+                                                "proxy.observability._query_slots",
+                                                slots_counts_mock,
+                                            ):
+                                                async with httpx.AsyncClient(
+                                                    transport=transport,
+                                                    base_url="http://test",
+                                                ) as ac:
+                                                    resp = await ac.get(
+                                                        "/llama/local/status"
+                                                    )
+        assert resp.status_code == 200
+        return resp.json(), slots_detail_mock
+
+    @pytest.mark.asyncio
+    async def test_slots_present_when_running_and_model_loaded(self):
+        """AC1: slots array reflects per-slot state when llama-server is up."""
+        j, detail_mock = await self._get(
+            query_result={"llama_server_running": True},
+            slots_detail=self._FAKE_SLOTS,
+        )
+        assert j["slots"] == self._FAKE_SLOTS
+        assert j["total_slots"] == 0  # counts path unchanged (stubbed)
+        detail_mock.assert_awaited_once()
+        _, kwargs = detail_mock.await_args
+        assert kwargs["model"] == "test-model"
+
+    @pytest.mark.asyncio
+    async def test_slots_empty_when_server_not_running(self):
+        """AC2: slots is an empty array when llama-server is down."""
+        j, detail_mock = await self._get(
+            query_result={"llama_server_running": False},
+        )
+        assert j["llama_server_running"] is False
+        assert j["slots"] == []
+        detail_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slots_empty_on_slots_query_timeout(self):
+        """AC2/AC3: a slow /slots detail query must not blow the response budget.
+
+        The handler wraps the detail fetch in its own error handling, so a
+        timeout from the helper surfaces as an empty ``slots`` array while
+        the endpoint still returns HTTP 200.
+        """
+        j, _ = await self._get(
+            query_result={"llama_server_running": True},
+            slots_detail_side_effect=TimeoutError("slots timed out"),
+        )
+        assert j["slots"] == []
+
+    @pytest.mark.asyncio
+    async def test_slots_empty_when_no_model_loaded(self):
+        """AC2: no per-slot data when llama-server is up but no model is loaded.
+
+        Without a model name the /slots endpoint 400s, so the fail-open path
+        reports configured capacity and an empty slots array (explicit about
+        having no per-slot data).
+        """
+        j, detail_mock = await self._get(
+            query_result={"llama_server_running": True},
+            current_model=None,
+            config={"server": {"session_slot_pool_size": 5}},
+        )
+        assert j["total_slots"] == 5
+        assert j["available_slots"] == 5
+        assert j["slots"] == []
+        detail_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slot_dicts_are_compact_and_typed(self):
+        """AC4: each slot dict carries only the compact per-slot fields.
+
+        The endpoint passes through the helper's compact projection — no
+        streaming state or session identifiers leak into the payload.
+        """
+        j, _ = await self._get(
+            query_result={"llama_server_running": True},
+            slots_detail=self._FAKE_SLOTS,
+        )
+        assert isinstance(j["slots"], list)
+        assert len(j["slots"]) == 3
+        for slot in j["slots"]:
+            assert set(slot.keys()) == {"slot_id", "is_processing", "n_decoded"}
+            assert isinstance(slot["slot_id"], int)
+            assert isinstance(slot["is_processing"], bool)
+            assert slot["n_decoded"] is None or isinstance(slot["n_decoded"], int)

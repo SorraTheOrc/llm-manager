@@ -17,7 +17,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
 - **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
-- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view.
+- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
 
@@ -858,6 +858,38 @@ retry (same semantics as slot-schedule transitions). A second switch while
 a restart is pending is a noop if the mode matches, otherwise rejected with
 `409` (avoids restart loops).
 
+#### Session grandfathering across mode switches
+
+Since a mode switch restarts the proxy and re-selects the config profile, a
+session that was using a remote model (e.g. `github`, or the
+opencode/opencode-go/deepseek fallback tiers of `plan`/`author`/`code`)
+would normally lose that access mid-conversation if the new mode restricted
+it. The proxy therefore **grandfathers in-flight sessions**: sessions that
+made at least one request before the switch keep using their model —
+including its full provider chain (local-first, with the remote fallbacks;
+remote-only for `github`) — until the **earlier** of:
+
+- the next scheduled mode transition (per the active `mode_schedule`), or
+- the session going idle (no request for the session TTL, default 3h).
+
+When the mode schedule is disabled, a configurable fallback grace window
+(default = session TTL) bounds grandfathered access instead.
+
+Grandfathering is keyed on the client-supplied `X-Session-Id` (the same
+trust model as session tracking): only explicit sessions with prior activity
+are eligible; anonymous requests and brand-new sessions are never
+grandfathered. Bindings are persisted to disk (beside `proxy/.mode`) and
+restored at startup, so a session reconnecting after the mode-switch restart
+is recognized. This **deliberately relaxes the cheap-mode "no paid calls"
+guarantee for grandfathered sessions only**, and only within the grace
+deadline; normal cheap-mode traffic is unaffected. Grandfathered remote
+requests are marked with a `grandfathered=true` log line and a
+`grandfathered` backend signal so usage analysis can distinguish them.
+
+Enable/disable via `server.mode_switch_grandfathering` in the config
+profiles (`enabled: false` turns the feature off; `fallback_grace_seconds`
+overrides the grace window when the mode schedule is disabled).
+
 ### Automatic mode schedule
 
 By default the proxy **enforces a time-of-day schedule** (local server
@@ -967,6 +999,8 @@ The proxy uses two separate timeout values for upstream remote connections:
 | `server.upstream_retry_max_attempts` | `3` | Maximum number of retry attempts (initial attempt + retries) for a stalled upstream stream. Aligned with Pi's default maxRetries=3. |
 | `server.upstream_retry_base_delay_seconds` | `2.0` | Base delay for exponential backoff between retries. The actual delay is `min(base_delay * 2^attempt, max_delay)`. Aligned with Pi's default maxRetryDelayMs=60000. |
 | `server.upstream_retry_max_delay_seconds` | `60.0` | Maximum delay between retries (cap on exponential backoff). |
+| `server.upstream_max_stream_duration_seconds` | `14400` | Hard cap on total remote stream lifetime (LP-0MSVP7ZML003XZTJ). The per-chunk idle timeout only fires on silence, so a "connected but idle" upstream (keep-alives/heartbeats flowing, empty deltas) never terminates and can hold proxy state (local_active_query, slots) for hours. On expiry the stream is terminated with a synthetic `finish_reason: error` (error.type `stream_max_duration`) and NO retry, and `llama_remote_stream_terminated_total{reason="stream_max_duration"}` increments (alert: `RemoteStreamWatchdogTerminated`). |
+| `server.upstream_activity_timeout_seconds` | `1800` | Max time since the last CONTENT-bearing chunk before a remote stream is terminated (LP-0MSVP7ZML003XZTJ). Heartbeats/keep-alives/empty deltas do NOT count as content progress, so a connected-but-idle stream (e.g. a pi-agent pane holding a remote stream for 13+ hours) is cleaned up. Termination yields error.type `stream_activity_timeout`, no retry, and increments `llama_remote_stream_terminated_total{reason="stream_activity_timeout"}`. |
 | `server.upstream_request_timeout_seconds` | `120` | Upstream request-level timeout (LP-0MRF77A0E0026B9T). Caps the read timeout for the initial HTTP response from the upstream provider. Prevents 15+ minute silent hangs when the upstream is slow to respond or silently returns empty content. Different from the per-chunk idle timeout (`upstream_idle_timeout_seconds`) which detects mid-stream stalls. |
 | `server.upstream_empty_retry_max_attempts` | `1` | Maximum number of additional attempts when an upstream returns a semantically empty response (no content, stopReason: stop, total_tokens: 0). For **streaming** responses, a delta counts as content when it carries non-empty `content`, a non-empty `tool_calls` list, or non-empty `reasoning_content`, so tool-call-only and reasoning-only streams are never flagged empty (LP-0MS8XAPXT009W3CL). Default: 1 retry. |
 | `server.upstream_empty_retry_base_delay_seconds` | `2.0` | Base delay (in seconds) before retrying on empty response. |
@@ -1620,8 +1654,9 @@ Delta routing is only gated on explicit backend restore evidence when `server.se
 - **Cache-aware large-context routing**: The proxy tracks KV cache warmth per-session
   (not just per-model) to avoid expensive full re-prefill when a session's backend
   slot has been evicted or reassigned. New sessions default to **cold** (bypass
-  threshold: 30K tokens by default); sessions with confirmed cache persistence are
-  **warm** (bypass threshold: 100K tokens). See
+  threshold: 38K tokens in fast mode / 60K in cheap mode, see
+  [Large-Context Routing](#large-context-routing-cache-aware-bypass)); sessions with
+  confirmed cache persistence are **warm** (bypass threshold: 100K tokens). See
   [Large-Context Routing](#large-context-routing-cache-aware-bypass) for details.
 - **Context window limits**: llama-server's KV cache has finite capacity. The Qwen3 model is configured with a **128k (131,072) token context window**. Very long conversations may exceed this limit. The context window size is set in [`models.ini`](../models.ini) (router mode) and [`proxy/scripts/start-proxy.sh`](proxy/scripts/start-proxy.sh) (single-model mode).
 
@@ -1754,8 +1789,8 @@ contaminate another session's routing decisions:
 
 - **Cold** — The session's backend KV slot is invalidated or has never been
   populated. Large-context requests bypass local at the **cold threshold**
-  (default: 30K tokens, configurable via
-  `local_large_context_cold_cache_threshold`).
+  (mode-aware, LP-0MSOMVOPH004ATAK: 38K tokens in fast mode, 60K in cheap
+  mode; configurable via `local_large_context_cold_cache_threshold`).
 - **Warm** — The session has confirmed cache persistence. Large-context requests
   bypass local only at the **warm threshold** (default: 100K tokens,
   configurable via `local_large_context_warm_cache_threshold`).
@@ -1778,9 +1813,17 @@ disabled, non-streaming proxy-only mode) does **not** warm the cache.
 #### Configuration
 
 ```yaml
-local_large_context_cold_cache_threshold: 30000   # tokens; 0 = disable cold bypass
+local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 = disable cold bypass
 local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
 ```
+
+The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`
+and the default `config.yaml` use `38000`, `config-cheap.yaml` uses `60000`.
+Each value stays below its mode's effective warm clamp (fast `131072//3 − 4096
+= 39594`; cheap resolves to `100000` via its 2×262144 schedule entries, and is
+also below the boot-transient clamp 61440) so the (cold, warm] band never
+collapses (LP-0MSI2M5BT004BCDP). Prompts above the per-slot warm clamp are
+never routed local (`context_too_large` — physical capacity).
 
 When a threshold is set to `0`, the corresponding bypass is disabled entirely.
 

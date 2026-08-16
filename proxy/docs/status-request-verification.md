@@ -25,6 +25,13 @@ Field semantics (additive — existing fields unchanged):
   `x-client-request-id` (the session-header convention in
   `proxy/proxy/session.py`); **omitted entirely** (not `None`/`unknown`) when
   none are sent.
+- `slots_stale` — `true` when the reported `available_slots`/`total_slots`
+  came from the last-known counts cache because the fresh `/slots` query
+  failed (LP-0MSVP7XJ6008QPKX, e.g. HTTP 500 while llama-server reloads a
+  model after cheap-mode restart). Additive log/payload field; consumers
+  that ignore unknown fields are unaffected. Sustained `/slots` failure is
+  also surfaced by `llama_slots_query_failures_total` + the
+  `LlamaSlotsQueryFailures*` Prometheus alerts.
 
 ## Method
 
