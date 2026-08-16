@@ -280,6 +280,13 @@ run (`Previous outputs archived to …`).
     event (no payload). Remediation: recovery-first silent continue
     (LP-0MSDP2PDB004GV86) + informative-error fallback
     (LP-0MSDP2PH20079WQ7).
+  - `Stream finished: reason=client_disconnect` — terminal event logged by
+    the proxy when a local stream is aborted because the client disconnected
+    mid-stream (in-loop `is_disconnected()` check, GeneratorExit, or the
+    disconnect reaper cancelling the in-flight task; LP-0MSVRRTAB0078TMK).
+    It parses as a normal `stream_finished` (NOT an error), so the stream
+    pairs with its start and its compute time becomes known instead of being
+    reported as "aborted or still running".
   - `Stream error:` — proxy-side stream exception (e.g. `NameError`).
   - `slot_save failed` — local llama-server slot persistence
     ReadTimeouts; usually context pressure → raise local ctx-size
