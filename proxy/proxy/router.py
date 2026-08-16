@@ -28,6 +28,30 @@ def _srv():
     import proxy.server as _m
     return _m
 
+
+def _log_local_stream_client_disconnect(srv, session_id, model_name):
+    """Log a terminal ``Stream finished: reason=client_disconnect`` line.
+
+    Emitted when a local stream is aborted because the client disconnected
+    mid-stream (in-loop ``is_disconnected()`` check, GeneratorExit from the
+    ASGI framework closing the generator, or the disconnect reaper cancelling
+    the in-flight request task). The line is parseable by the
+    proxy-usage-analysis log_parser as a ``stream_finished`` event with
+    reason ``client_disconnect`` (distinct from the ``reason=error``
+    synthetic events), so the stream pairs and its compute time becomes known
+    instead of being reported as "aborted or still running"
+    (LP-0MSVRRTAB0078TMK). Logging is best-effort and must never change
+    stream behaviour (AC4).
+    """
+    try:
+        srv.logger.info(
+            "Stream finished: reason=client_disconnect session=%s provider=local model=%s",
+            session_id or "unknown",
+            model_name,
+        )
+    except Exception:
+        pass
+
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
@@ -1368,6 +1392,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         _dc = await request.is_disconnected()
                                         if isinstance(_dc, bool) and _dc:
                                             disconnected = True
+                                            # Terminal line so the aborted stream
+                                            # is attributable (LP-0MSVRRTAB0078TMK)
+                                            _log_local_stream_client_disconnect(
+                                                srv, session_id, model_name
+                                            )
                                             srv.logger.info(
                                                 "client_disconnect session=%s slot=%s",
                                                 session_id[:8] if session_id else "unknown",
@@ -1413,8 +1442,22 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         except GeneratorExit:
                             # Client disconnected or generator is being closed.
-                            # Skip the final event yield and proceed directly to cleanup.
-                            pass
+                            # Log a terminal line so the aborted stream is
+                            # attributable (LP-0MSVRRTAB0078TMK), then skip the
+                            # final event yield and proceed directly to cleanup.
+                            _log_local_stream_client_disconnect(
+                                srv, session_id, model_name
+                            )
+                        except asyncio.CancelledError:
+                            # The disconnect reaper (LP-0MQTHP828000JYM6) cancels
+                            # the in-flight request task when the client drops
+                            # the connection. Log a terminal line so the aborted
+                            # stream is attributable, then re-raise so the task
+                            # cancellation propagates normally (LP-0MSVRRTAB0078TMK).
+                            _log_local_stream_client_disconnect(
+                                srv, session_id, model_name
+                            )
+                            raise
                         except Exception as exc:
                             # httpx stream error (e.g. RemoteProtocolError, ReadTimeout).
                             # Log and let the finally block handle cleanup so backend_ready

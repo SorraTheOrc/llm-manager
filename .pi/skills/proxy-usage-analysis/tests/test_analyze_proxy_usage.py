@@ -101,6 +101,24 @@ class TestLogLineParsing:
         assert ev.session == "019fc27d-3a46-7e5c-871e-57ab32f875f3"
         assert ev.provider == "local"
 
+    def test_stream_finished_client_disconnect_reason(self):
+        # Terminal line logged by the proxy when a client disconnects
+        # mid-stream (LP-0MSVRRTAB0078TMK): parses as a normal stream_finished
+        # with reason=client_disconnect (NOT stream_finish_error, which is
+        # reserved for the synthetic reason=error event), so busy-time pairing
+        # treats the stream as finished and its compute time becomes known.
+        line = (
+            "2026-08-02 14:00:00,000 - INFO - Stream finished: reason=client_disconnect "
+            "session=019fc27d-3a46-7e5c-871e-57ab32f875f3 provider=local model=Qwen3"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "stream_finished"
+        assert ev.reason == "client_disconnect"
+        assert ev.session == "019fc27d-3a46-7e5c-871e-57ab32f875f3"
+        assert ev.provider == "local"
+        assert ev.model == "Qwen3"
+        assert ev.prompt is None
+
     def test_fallback_triggered(self):
         ev = log_parser.parse_log_line(fixtures.FALLBACK_CONCURRENCY)
         assert ev.kind == "fallback"
@@ -1414,6 +1432,30 @@ class TestBusyStats:
         assert busy is not None
         assert busy.unfinished_streams == 0
         assert busy.pre_window_unfinished == 0
+
+    def test_client_disconnect_finish_pairs_with_start(self):
+        # A ``Stream finished: reason=client_disconnect`` terminal line (logged
+        # by the proxy on client abort, LP-0MSVRRTAB0078TMK) is a normal
+        # stream_finished event: the start pairs with it, its compute time is
+        # known (start -> disconnect), and it is NOT counted as unfinished.
+        started = log_parser.LogEvent(
+            "stream_started", datetime(2026, 8, 2, 14, 0, 0),
+            provider="local", model="Qwen3", session="s1",
+        )
+        finished = log_parser.parse_log_line(
+            "2026-08-02 14:00:10,000 - INFO - Stream finished: reason=client_disconnect "
+            "session=s1 provider=local model=Qwen3"
+        )
+        assert finished is not None and finished.kind == "stream_finished"
+        busy = aggregation.compute_busy_stats(
+            [started, finished], WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None
+        assert busy.streams == 1
+        assert busy.busy_seconds == 10.0
+        assert busy.unfinished_streams == 0
+        assert busy.pre_window_unfinished == 0
+
     def test_no_local_traffic_returns_none(self):
         events = [
             log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 0), provider="opencode-go"),
