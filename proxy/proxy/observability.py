@@ -21,7 +21,14 @@ HTTP JSON parsing and URL building patterns found in both
 - ``_build_llama_url(llama_port, endpoint)`` — URL builder for llama-server
   endpoints.
 - ``_query_slots(client, llama_port, timeout)`` — Query the ``/slots``
-  endpoint, returning ``(available_slots, total_slots)``.
+  endpoint, returning ``(available_slots, total_slots)``. Records the last
+  successful counts (``_last_slot_counts_cache``) and increments
+  ``llama_slots_query_failures_total`` on failure (graceful degradation,
+  LP-0MSVP7XJ6008QPKX).
+- ``last_known_slot_counts()`` — Last successful ``(available, total)`` when
+  fresh (bounded by ``SLOT_COUNTS_STALE_AFTER_SECONDS``), served by the
+  status endpoint when a fresh ``/slots`` query fails so orchestrators see
+  known capacity instead of ``total_slots=0``.
 - ``_query_slots_detail(llama_port, timeout, model)`` — Query the ``/slots``
   endpoint with an optional ``model`` query parameter, returning a list of
   per-slot dicts with keys ``slot_id``, ``is_processing``, and ``n_decoded``.
@@ -160,6 +167,59 @@ def _build_llama_url(llama_port: int, endpoint: str) -> str:
     return f"http://localhost:{llama_port}{endpoint}"
 
 
+# ===================================================================
+# Last-known slot counts cache (graceful degradation, LP-0MSVP7XJ6008QPKX)
+#
+# After a cheap-mode restart, llama-server's /slots endpoint returns HTTP
+# 500 while the model reloads. Reporting total_slots=0 during that window
+# fail-closed the herdr downtime worker (isIdleStatus false → zero
+# dispatches overnight). We keep the last successful (available, total)
+# counts and serve them on transient /slots failure, bounded by
+# SLOT_COUNTS_STALE_AFTER_SECONDS so a genuinely-unavailable llama-server
+# eventually fail-closes instead of serving stale capacity forever.
+# ===================================================================
+
+_last_slot_counts_cache: tuple[int, int, float] | None = None
+"""Last successful (available, total, monotonic_ts) from ``_query_slots()``.
+
+Served by ``last_known_slot_counts()`` when a fresh /slots query fails so
+orchestrators (herdr downtime worker) still see known capacity instead of
+total_slots=0 (LP-0MSVP7XJ6008QPKX).
+"""
+
+
+def _slots_counts_stale_after_seconds() -> float:
+    """Staleness bound (seconds) for the last-known slot counts cache.
+
+    Configurable via ``SLOT_COUNTS_STALE_AFTER_SECONDS`` (default 3600s = 1h).
+    The bound exists so a llama-server that is genuinely down for a long
+    period eventually fail-closes (returns 0/0) instead of serving stale
+    capacity; the /slots failure-rate alert (monitoring/slots_query_alerts.yaml)
+    surfaces sustained failures.
+    """
+    import os
+
+    try:
+        return float(os.environ.get("SLOT_COUNTS_STALE_AFTER_SECONDS", "3600"))
+    except (TypeError, ValueError):
+        return 3600.0
+
+
+def last_known_slot_counts() -> tuple[int, int] | None:
+    """Return the last known (available, total) slot counts when fresh.
+
+    Returns ``None`` when no successful query has been recorded or the
+    cached counts are older than ``SLOT_COUNTS_STALE_AFTER_SECONDS``.
+    """
+    cache = _last_slot_counts_cache
+    if cache is None:
+        return None
+    available, total, ts = cache
+    if time.monotonic() - ts > _slots_counts_stale_after_seconds():
+        return None
+    return (available, total)
+
+
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None
 ) -> tuple:
@@ -175,6 +235,11 @@ async def _query_slots(
 
     The 2.0-second default timeout matches the original inline query in
     ``get_llama_local_status()``.
+
+    On a successful query with total > 0 the last-known counts cache is
+    updated (graceful degradation, LP-0MSVP7XJ6008QPKX); on failure the
+    ``llama_slots_query_failures_total`` metric is incremented so a
+    sustained /slots outage surfaces as an alert.
     """
     try:
         url = _build_llama_url(llama_port, "/slots")
@@ -188,10 +253,37 @@ async def _query_slots(
                 available_slots = sum(
                     1 for s in slots_data if not s.get("is_processing", True)
                 )
+                if total_slots > 0:
+                    _record_last_slot_counts(available_slots, total_slots)
                 return available_slots, total_slots
+            _record_slots_query_failure("invalid_payload")
+            return 0, 0
+        _record_slots_query_failure(f"http_{slots_resp.status_code}")
+        return 0, 0
+    except TimeoutError:
+        _record_slots_query_failure("timeout")
+    except Exception as exc:
+        if isinstance(exc, (ConnectionError, OSError)):
+            _record_slots_query_failure("connection_error")
+        else:
+            _record_slots_query_failure("unknown")
+    return 0, 0
+
+
+def _record_last_slot_counts(available_slots: int, total_slots: int) -> None:
+    """Store the last successful slot counts with a monotonic timestamp."""
+    global _last_slot_counts_cache
+    _last_slot_counts_cache = (available_slots, total_slots, time.monotonic())
+
+
+def _record_slots_query_failure(reason: str) -> None:
+    """Increment the /slots query failure metric (best-effort)."""
+    try:
+        from proxy.metrics import record_slots_query_failure
+
+        record_slots_query_failure(reason)
     except Exception:
         pass
-    return 0, 0
 
 
 async def _query_slots_detail(

@@ -2,9 +2,28 @@ import os
 import sys
 from typing import Any
 
+import pytest
+
 proxy_dir = os.path.join(os.getcwd())
 if proxy_dir not in sys.path:
     sys.path.insert(0, proxy_dir)
+
+
+@pytest.fixture(autouse=True)
+def _reset_slot_counts_cache():
+    """Reset the last-known slot counts cache before every test.
+
+    ``_query_slots()`` maintains a module-level cache of the last successful
+    (available, total) counts (graceful degradation, LP-0MSVP7XJ6008QPKX).
+    Without a reset, an earlier test that populated the cache would make a
+    later test observing a stubbed (0,0) /slots failure see degraded counts
+    instead of 0/0.
+    """
+    import proxy.observability as obs
+
+    obs._last_slot_counts_cache = None
+    yield
+    obs._last_slot_counts_cache = None
 
 
 def _find_live_e2e_summary_data() -> tuple[dict[str, Any] | None, str | None]:

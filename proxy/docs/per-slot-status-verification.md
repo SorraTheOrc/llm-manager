@@ -32,6 +32,29 @@ LP-0MSORPUMX002LLIA — proxy-side enabler for herdr same-slot idle tracking
   malformed payload. `total_slots` / `available_slots` behavior is
   unchanged.
 
+## Graceful degradation on `/slots` failure (LP-0MSVP7XJ6008QPKX)
+
+After a cheap-mode restart, llama-server's `/slots` endpoint can return
+HTTP 500 while the model reloads. Before this fix the status endpoint
+surfaced that as `total_slots=0`, fail-closing the herdr downtime worker
+(`isIdleStatus` false → zero dispatches overnight, silently).
+
+Now:
+
+- `_query_slots()` records the last successful `(available_slots,
+  total_slots)` counts (module-level cache in `proxy/observability.py`).
+- On a fresh `/slots` failure (HTTP error, timeout, connection error, or
+  unexpected payload), the status endpoint serves the last known counts
+  instead of 0/0, bounded by `SLOT_COUNTS_STALE_AFTER_SECONDS` (default
+  3600s; env-configurable) so a genuinely-unavailable llama-server
+  eventually fail-closes rather than serving stale capacity forever.
+- The payload and `status_request` log gain a `slots_stale` boolean that is
+  `true` whenever the served counts came from the cache (vs a fresh query),
+  so a future silent failure is observable.
+- Every failed query increments `llama_slots_query_failures_total{reason=...}`
+  (Prometheus counter), alerting via `monitoring/slots_query_alerts.yaml`
+  when the failure rate is sustained.
+
 ## Why
 
 herdr's downtime worker (ContextHub `packages/herdr/src/downtime-worker.ts`)
