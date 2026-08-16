@@ -56,6 +56,13 @@ llama_contention_fallback_after_queue_total = None
 # of silently wedging orchestrators (herdr downtime worker) into fail-closed
 # busy via total_slots=0.
 llama_slots_query_failures_total = None
+# Remote-stream watchdog terminations (LP-0MSVP7ZML003XZTJ): a remote
+# stream terminated by the max-duration or activity-timeout watchdog (a
+# "connected but idle" upstream that never goes silent). Counts by reason
+# so a runaway stream — e.g. a pi-agent pane held for 13+ hours — surfaces
+# as an alert instead of silently holding proxy state (local_active_query,
+# slots) indefinitely.
+llama_remote_stream_terminated_total = None
 
 if _enabled:
     try:
@@ -107,6 +114,11 @@ if _enabled:
         llama_slots_query_failures_total = Counter(
             'llama_slots_query_failures_total',
             'Total llama-server /slots query failures by reason',
+            ['reason'],
+        )
+        llama_remote_stream_terminated_total = Counter(
+            'llama_remote_stream_terminated_total',
+            'Remote streams terminated by the duration/activity watchdog by reason',
             ['reason'],
         )
     except Exception:  # pragma: no cover - defensive
@@ -247,6 +259,27 @@ def record_slots_query_failure(reason: str):
         return
     try:
         llama_slots_query_failures_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_remote_stream_terminated(reason: str):
+    """Increment llama_remote_stream_terminated_total with the given reason.
+
+    Args:
+        reason: A short identifier for the watchdog termination, e.g.
+            "stream_max_duration", "stream_activity_timeout".
+
+    LP-0MSVP7ZML003XZTJ: a remote stream that never terminates (connected
+    but idle) previously held proxy state indefinitely; this counter feeds
+    a Prometheus alert so runaway streams surface.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_remote_stream_terminated_total is None:
+        return
+    try:
+        llama_remote_stream_terminated_total.labels(reason=reason).inc()
     except Exception:
         pass
 

@@ -746,6 +746,25 @@ server:
   # Default: 240 seconds.
   upstream_idle_timeout_seconds: 240
 
+  # Remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
+  # The per-chunk idle timeout above only fires on SILENCE — an upstream
+  # that keeps sending keep-alives/heartbeats (or trickles empty deltas)
+  # while making no content progress defeats it and can hold proxy state
+  # (local_active_query, slots) for hours (observed: a pi-agent audit pane
+  # held a remote deepseek stream 13+ hours). These bounded deadlines
+  # terminate such "connected but idle" streams with a synthetic
+  # finish_reason: error (error.type stream_max_duration /
+  # stream_activity_timeout) and NO retry (restarting a stuck stream just
+  # re-sticks it), and increment llama_remote_stream_terminated_total{reason}
+  # so runaway streams surface as alerts (monitoring/remote_stream_alerts.yaml).
+  #
+  # Hard cap on total remote stream lifetime.
+  # Default: 14400 seconds (4h).
+  upstream_max_stream_duration_seconds: 14400
+  # Max time since the last CONTENT-bearing chunk; heartbeats/empty deltas
+  # do not count as progress. Default: 1800 seconds (30 min).
+  upstream_activity_timeout_seconds: 1800
+
   # Cross-request stall circuit breaker (LP-0MRFEXXVC001RYKB).
   # Tracks stall frequency per provider within a sliding time window.
   # When the stall count exceeds the threshold within the window, the

@@ -12,6 +12,7 @@ circular import issues.
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -604,6 +605,8 @@ async def _handle_remote_streaming(
     entry: str | None = None,
     upstream_idle_timeout_seconds: float | None = None,
     upstream_retry_connect_timeout_seconds: float | None = None,
+    upstream_max_stream_duration_seconds: float | None = None,
+    upstream_activity_timeout_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
 ) -> Response:
     """Handle streaming remote proxy request with upstream stall detection and retry.
@@ -611,6 +614,13 @@ async def _handle_remote_streaming(
     Features:
     - Per-chunk idle timeout: detects upstream silence within
       *upstream_idle_timeout_seconds* and closes the stalled connection.
+    - Watchdog budgets (LP-0MSVP7ZML003XZTJ): *upstream_max_stream_duration_seconds*
+      caps total remote stream lifetime; *upstream_activity_timeout_seconds* caps
+      time since the last CONTENT-bearing chunk. Either expiry terminates the
+      stream with a synthetic ``finish_reason: error`` (error.type
+      ``stream_max_duration`` / ``stream_activity_timeout``) and NO retry — a
+      "connected but idle" upstream (heartbeats flowing, no content) defeats the
+      per-chunk idle timeout and previously held proxy state indefinitely.
     - Automatic retry: on stall detection (asyncio.TimeoutError) or httpx
       ReadTimeout, retries the same provider with bounded exponential backoff
       (1s, 2s, 4s; max 3 retries).
@@ -633,6 +643,38 @@ async def _handle_remote_streaming(
             )
         except Exception:
             upstream_idle_timeout_seconds = 240.0
+
+    # Resolve remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
+    # A "connected but idle" upstream that never goes SILENT (heartbeats /
+    # keep-alives flowing, empty deltas) defeats the per-chunk idle timeout
+    # above and can hold proxy state (local_active_query, slots) for hours.
+    # These bounded deadlines terminate such streams with a synthetic
+    # finish_reason: error and NO retry (restarting a stuck stream re-sticks
+    # it), and increment a metric so runaway streams surface as alerts.
+    #
+    # - upstream_max_stream_duration_seconds (default 14400 = 4h): hard cap
+    #   on total remote stream lifetime.
+    # - upstream_activity_timeout_seconds (default 1800 = 30 min): max time
+    #   since the last CONTENT-bearing chunk; heartbeats/empty deltas do not
+    #   count as progress.
+    if upstream_max_stream_duration_seconds is None:
+        try:
+            upstream_max_stream_duration_seconds = float(
+                _srv().config.get("server", {}).get(
+                    "upstream_max_stream_duration_seconds", 14400
+                ) or 14400
+            )
+        except Exception:
+            upstream_max_stream_duration_seconds = 14400.0
+    if upstream_activity_timeout_seconds is None:
+        try:
+            upstream_activity_timeout_seconds = float(
+                _srv().config.get("server", {}).get(
+                    "upstream_activity_timeout_seconds", 1800
+                ) or 1800
+            )
+        except Exception:
+            upstream_activity_timeout_seconds = 1800.0
 
     # Resolve upstream_retry_connect_timeout_seconds from parameter or config
     if upstream_retry_connect_timeout_seconds is None:
@@ -792,6 +834,13 @@ async def _handle_remote_streaming(
 
         # Per-chunk idle timeout and retry state (LP-0MRE52D3C001KP1H)
         _retry_count = 0
+        # Remote-stream watchdog state (LP-0MSVP7ZML003XZTJ): bounded
+        # deadlines that terminate a "connected but idle" stream which the
+        # per-chunk idle timeout cannot catch (heartbeats flowing, no
+        # content progress). Updated on every content-bearing chunk.
+        _watchdog_started = time.monotonic()
+        _last_content_at = _watchdog_started
+        _watchdog_terminated_reason: str | None = None
         # Empty-response retry state (LP-0MRF77A0E0026B9T)
         _empty_retry_count = 0
         _should_empty_retry = False
@@ -1040,15 +1089,41 @@ async def _handle_remote_streaming(
             try:
                 _aiter = _current_response.aiter_bytes().__aiter__()
                 while True:
+                    # Watchdog-bounded read (LP-0MSVP7ZML003XZTJ): the
+                    # effective per-read budget is the minimum of the idle
+                    # timeout and the remaining max-duration / activity
+                    # budgets, so a deadline that elapses classifies as its
+                    # own reason instead of the ordinary idle-stall retry.
+                    _now = time.monotonic()
+                    _duration_remaining = (
+                        _watchdog_started + upstream_max_stream_duration_seconds
+                    ) - _now
+                    _activity_remaining = (
+                        _last_content_at + upstream_activity_timeout_seconds
+                    ) - _now
+                    _read_budget = min(
+                        upstream_idle_timeout_seconds,
+                        _duration_remaining,
+                        _activity_remaining,
+                    )
                     try:
                         chunk = await asyncio.wait_for(
                             _aiter.__anext__(),
-                            timeout=upstream_idle_timeout_seconds,
+                            timeout=max(0.0, _read_budget),
                         )
                     except TimeoutError:
-                        # Upstream stall detected — no data for
-                        # upstream_idle_timeout_seconds. Break inner loop to
-                        # trigger retry.
+                        _now = time.monotonic()
+                        if _now >= _watchdog_started + upstream_max_stream_duration_seconds:
+                            # Hard total-lifetime cap exceeded → terminate, no retry.
+                            _watchdog_terminated_reason = "stream_max_duration"
+                            break
+                        if _now >= _last_content_at + upstream_activity_timeout_seconds:
+                            # Connected-but-idle: no content progress within the
+                            # activity budget → terminate, no retry.
+                            _watchdog_terminated_reason = "stream_activity_timeout"
+                            break
+                        # Ordinary per-chunk idle stall (true silence) within
+                        # the watchdog budgets → existing retry path.
                         try:
                             _srv().logger.warning(
                                 "Upstream stall detected: idle timeout session=%s "
@@ -1082,6 +1157,10 @@ async def _handle_remote_streaming(
                                     delta = choice.get("delta", {})
                                     if _delta_has_content(delta):
                                         _has_content = True
+                                        # Content-bearing chunk = activity
+                                        # progress (LP-0MSVP7ZML003XZTJ):
+                                        # resets the activity watchdog.
+                                        _last_content_at = time.monotonic()
                                     # Token counting for text content remains
                                     # unchanged (content only).
                                     if isinstance(delta, dict) and "content" in delta:
@@ -1092,10 +1171,12 @@ async def _handle_remote_streaming(
                                     # empty-retry diagnostics (LP-0MS8XAPXT009W3CL).
                                     if isinstance(delta, dict) and delta.get("tool_calls"):
                                         _saw_tool_calls = True
+                                        _last_content_at = time.monotonic()
                                     if isinstance(delta, dict):
                                         _rc = delta.get("reasoning_content")
                                         if isinstance(_rc, str) and _rc.strip():
                                             _saw_reasoning = True
+                                            _last_content_at = time.monotonic()
                             except Exception:
                                 texts.append(payload)
                         if texts:
@@ -1160,12 +1241,63 @@ async def _handle_remote_streaming(
                     break
 
                 # If we break out of the inner loop without saw_done/saw_finish
-                # and without disconnect, it's a stall (asyncio.TimeoutError).
+                # and without disconnect, it's a stall (asyncio.TimeoutError)
+                # or a watchdog termination (LP-0MSVP7ZML003XZTJ).
                 # Content-aware retry (LP-0MS9FR9LG002AJ4C): only retry while
                 # zero content-bearing chunks were delivered. Once any content
                 # has been sent to the client, restarting the whole request
                 # would re-send a huge prompt and duplicate output, so the
                 # stream terminates immediately instead.
+                if _watchdog_terminated_reason:
+                    # Watchdog fired (max-duration or activity timeout): the
+                    # stream is stuck — restarting it would just re-stick it.
+                    # Terminate with a synthetic error + alert metric.
+                    try:
+                        from proxy.metrics import record_remote_stream_terminated
+
+                        record_remote_stream_terminated(_watchdog_terminated_reason)
+                    except Exception:
+                        pass
+                    _watchdog_message = (
+                        f"Upstream stream exceeded max duration "
+                        f"({upstream_max_stream_duration_seconds:.0f}s)"
+                        if _watchdog_terminated_reason == "stream_max_duration"
+                        else f"Upstream stream made no content progress for "
+                        f"{upstream_activity_timeout_seconds:.0f}s "
+                        f"(connected but idle)"
+                    )
+                    try:
+                        _srv().logger.warning(
+                            "Remote stream %s session=%s provider=%s model=%s "
+                            "duration=%.1fs",
+                            _watchdog_terminated_reason,
+                            session_id or "unknown",
+                            provider or "remote",
+                            model_name,
+                            time.monotonic() - _watchdog_started,
+                        )
+                    except Exception:
+                        pass
+                    _final_error_obj = _build_stream_error_event(
+                        provider=provider,
+                        model=model_name,
+                        entry=entry,
+                        error_type=_watchdog_terminated_reason,
+                        message=_watchdog_message,
+                        suggested_action=(
+                            "Upstream is stuck (connected but idle). Retry the "
+                            "request, or check upstream health."
+                        ),
+                        session_id=session_id,
+                    )
+                    _final_error_bytes = (
+                        f"data: {json.dumps(_final_error_obj)}\n\n"
+                    ).encode()
+                    if collected_chunks is not None:
+                        collected_chunks.append(_final_error_bytes)
+                    yield _final_error_bytes
+                    log_response_chunk(_final_error_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
+                    break
                 if _has_content:
                     _terminate_after_content = True
                 else:

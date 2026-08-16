@@ -1,0 +1,25 @@
+# Prometheus alert rules for remote-stream watchdog terminations
+#
+# LP-0MSVP7ZML003XZTJ: a pi-agent audit pane held a remote deepseek stream
+# 13+ hours in a "connected but idle" state — the per-chunk idle timeout only
+# fires on silence, so an upstream that keeps sending keep-alives/heartbeats
+# (or trickles empty deltas) never terminated, holding proxy state
+# (local_active_query, slots) indefinitely.
+#
+# The proxy now terminates such streams with a synthetic finish_reason: error
+# when either watchdog budget is exceeded (upstream_max_stream_duration_seconds,
+# upstream_activity_timeout_seconds) and increments
+# llama_remote_stream_terminated_total{reason=...} so a runaway stream
+# surfaces here instead of passing unnoticed.
+
+groups:
+  - name: llama-remote-stream.rules
+    rules:
+      - alert: RemoteStreamWatchdogTerminated
+        expr: rate(llama_remote_stream_terminated_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote stream terminated by duration/activity watchdog"
+          description: "The proxy terminated {{ $value }} remote stream(s)/sec over the last 5 minutes on {{ $labels.instance }} for reason '{{ $labels.reason }}'. The upstream stayed 'connected but idle' (no content progress) beyond upstream_max_stream_duration_seconds / upstream_activity_timeout_seconds. A sustained rate indicates a stuck upstream (e.g. a remote model stream that never completes) — check upstream health and the provider chain."
