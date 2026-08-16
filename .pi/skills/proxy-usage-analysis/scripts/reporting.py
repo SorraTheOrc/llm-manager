@@ -48,6 +48,7 @@ CSV_COLUMNS = [
     "fallback_reason",
     "bucket",
     "slots",
+    "ctx_size",
     "local_requests",
     "remote_requests",
     "dispatch_denied",
@@ -62,6 +63,9 @@ class AnalysisRun:
     summary: AnalysisResult
     files: list[Path] = field(default_factory=list)
     archived_to: Path | None = None
+    # Fast/cheap mode schedule map (per-mode profiles + mode timeline from the
+    # logs); None when not built (e.g. no config discovered).
+    mode_map: object | None = None
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -86,6 +90,7 @@ def _session_row(s: SessionStats) -> dict:
         "fallback_reason": s.fallback_reason or "",
         "bucket": s.bucket or "",
         "slots": str(s.slots) if s.slots else "",
+        "ctx_size": str(s.ctx_size) if s.ctx_size else "",
         "local_requests": str(s.local_requests),
         "remote_requests": str(s.remote_requests),
         "dispatch_denied": str(s.dispatch_denied),
@@ -251,8 +256,9 @@ def build_report(
     summary: AnalysisResult,
     config: dict | None,
     speed: llama_log_parser.SpeedStats | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
 ) -> str:
-    recs = recommendations.generate_recommendations(summary, config)
+    recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
     sessions = list(summary.sessions.values())
     total = summary.total_requests
@@ -271,6 +277,7 @@ def build_report(
         summary.fallback_events,
         summary.routing_skip_events,
         summary.dispatch_denied_events,
+        mode_map,
     )
 
     lines: list[str] = []
@@ -399,7 +406,9 @@ def build_report(
     )
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
-        "fast/cheap bucketing uses the session start time and the slot schedule in the active config profile."
+        "fast/cheap bucketing uses the session start time and the operating-mode profile active at "
+        "that time (reconstructed from `Mode scheduler` lines; windows without mode transitions use "
+        "the analysis-time config profile, LP-0MSPZUD4G007IYGH)."
     )
     ap(
         "- Sessions spanning a slot-schedule transition may observe 503s during the drain window; "
@@ -522,16 +531,24 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
         ap("|---|---|")
         for hour, seconds in b.hourly_busy:
             ap(f"| {hour:02d}:00-{hour + 1:02d}:00 | {_fmt_duration(seconds)} |")
-    if b.unfinished_streams:
+    if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
-        ap(f"_Note: {b.unfinished_streams} local stream(s) started without a logged "
+        ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
+           "(or within its 1h busy-pairing margin) without a logged "
            "`Stream finished` in the available logs (aborted or still running); "
            "their compute time is unknown, so busy time is a conservative lower bound._")
+        if b.pre_window_unfinished:
+            ap(f"_Additionally, {b.pre_window_unfinished} pre-window leftover stream(s) "
+               f"started more than 1h before the window (from earlier windows) also lack a "
+               f"logged `Stream finished`; they do not affect this window's busy time._")
     ap("")
-    ap("Method: streams are paired per session (FIFO) across the full log with a "
-       f"1h margin beyond the window ({log_parser.BUSY_WINDOW_MARGIN}), then clipped "
-       "to the window so boundary-crossing streams are counted exactly; fast/cheap "
-       "split follows the slot schedule.")
+    ap("Method: streams are paired per session (FIFO) across the margin-widened "
+       f"event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
+       "busy-pairing, 48h mode timeline)), then clipped to the window so "
+       "boundary-crossing streams are counted exactly; unfinished streams are those "
+       "started inside the window or within its 1h busy-pairing margin with no "
+       "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
+       "follows the slot schedule.")
 
 
 def _pct(part: int, total: int) -> float:
@@ -596,14 +613,21 @@ def _bucket_profile(
     fallback_events: list[log_parser.LogEvent],
     routing_skip_events: list[log_parser.LogEvent],
     dispatch_denied_events: list[log_parser.LogEvent],
+    mode_map: bucketing.ModeScheduleMap | None = None,
 ) -> dict:
     """Per-bucket (fast/cheap) totals for the report's summary tables.
 
     Covers sessions, requests, local/remote split, classification counts,
     context sizes, dispatch denials, and per-reason counters. Events without a
     session (fallbacks, routing skips, dispatch denials) are bucketed by their
-    own timestamp.
+    own timestamp (mode-aware when the logs show mode transitions,
+    LP-0MSPZUD4G007IYGH).
     """
+    def _label_at(ts: datetime) -> str:
+        if mode_map is not None and mode_map.transitions:
+            return mode_map.period_for(ts).label
+        return schedule.period_for(ts).label if schedule.periods else "fast"
+
     buckets = {
         "fast": {
             "sessions": 0, "requests": 0, "local": 0, "remote": 0,
@@ -635,15 +659,15 @@ def _bucket_profile(
     for ev in fallback_events:
         if not ev.reason:
             continue
-        label = schedule.period_for(ev.ts).label if schedule.periods else "fast"
+        label = _label_at(ev.ts)
         buckets[_bucket_key(label)]["fallback_reasons"][ev.reason] += 1
     for ev in routing_skip_events:
         if not ev.reason:
             continue
-        label = schedule.period_for(ev.ts).label if schedule.periods else "fast"
+        label = _label_at(ev.ts)
         buckets[_bucket_key(label)]["routing_skip_reasons"][ev.reason] += 1
     for ev in dispatch_denied_events:
-        label = schedule.period_for(ev.ts).label if schedule.periods else "fast"
+        label = _label_at(ev.ts)
         buckets[_bucket_key(label)]["dispatch_denied"] += 1
     return buckets
 
@@ -660,6 +684,7 @@ def run_analysis(
     output_dir: Path,
     config: dict | None = None,
     llama_log_dir: Path | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
     the CSVs and report into ``output_dir``.
@@ -668,27 +693,44 @@ def run_analysis(
     logs live in the same directory). llama-server eval-timing samples are
     parsed for the decode/prompt-eval speed sections; missing or unparseable
     llama-server files are skipped, never fatal.
+
+    Fast/cheap bucketing is mode-aware (LP-0MSPZUD4G007IYGH): the mode
+    timeline is reconstructed from ``Mode scheduler`` lines in the logs, and
+    each session is bucketed by the profile active at its start. ``mode_map``
+    may be passed explicitly (tests); otherwise it is built from the
+    discovered config profiles (``config-fast.yaml`` / ``config-cheap.yaml``)
+    and the persisted ``proxy/.mode``.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
     if llama_log_dir is None:
         llama_log_dir = log_dir
-    if config is None:
-        config = config_loader.load_proxy_config(config_loader.find_config_path())
+    if mode_map is None:
+        configs = config_loader.discover_configs()
+        if config is None:
+            config = configs["analysis_config"]
+        mode_map = bucketing.ModeScheduleMap.from_profiles(
+            configs["profiles"],
+            configs["analysis_mode"],
+            (config or {}).get("session_slot_pool_size"),
+        )
     schedule = bucketing.schedule_from_config(config, (config or {}).get("session_slot_pool_size"))
 
     files = log_parser.discover_log_files(log_dir, window_start)
+    # The effective margin covers both the busy-time pairing (1h) and the mode
+    # timeline (48h) in a single streaming pass.
+    margin = max(log_parser.BUSY_WINDOW_MARGIN, log_parser.MODE_TIMELINE_MARGIN)
     events = chain.from_iterable(
         log_parser.iter_events(
-            f, window_start, window_end, margin=log_parser.BUSY_WINDOW_MARGIN
+            f, window_start, window_end, margin=margin
         )
         for f in files
     )
-    summary = aggregation.aggregate(events, window_start, window_end, schedule)
+    summary = aggregation.aggregate(events, window_start, window_end, schedule, mode_map)
 
     llama_files = llama_log_parser.discover_llama_logs(llama_log_dir, window_start)
     summary.speed = llama_log_parser.build_speed_stats(
-        llama_files, window_start, window_end, schedule
+        llama_files, window_start, window_end, schedule, mode_map
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -696,11 +738,13 @@ def run_analysis(
     write_csvs(summary, output_dir)
     write_error_artifacts(summary, output_dir)
     report_path = output_dir / "report.md"
-    report_path.write_text(build_report(summary, config, summary.speed), encoding="utf-8")
-    return AnalysisRun(summary=summary, files=files, archived_to=archived_to)
+    report_path.write_text(
+        build_report(summary, config, summary.speed, mode_map), encoding="utf-8"
+    )
+    return AnalysisRun(summary=summary, files=files, archived_to=archived_to, mode_map=mode_map)
 
 
-def summary_to_json(summary: AnalysisResult) -> dict:
+def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None) -> dict:
     """Machine-readable summary of the analysis (one dict; JSON-serialisable)."""
     sessions = list(summary.sessions.values())
     local_only = sum(1 for s in sessions if s.remote_requests == 0)
@@ -733,7 +777,7 @@ def summary_to_json(summary: AnalysisResult) -> dict:
         "errors": len(summary.error_events),
         "errors_by_type": dict(summary.error_counts.most_common()),
         "errors_by_provider_model": error_provider_model_json(summary),
-        "recommendations": len(recommendations.generate_recommendations(summary, None)),
+        "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
@@ -756,6 +800,7 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         "peak_concurrency": busy.peak_concurrency,
         "avg_concurrency": busy.avg_concurrency,
         "unfinished_streams": busy.unfinished_streams,
+        "pre_window_unfinished": busy.pre_window_unfinished,
         "fast_busy_seconds": busy.fast_busy_seconds,
         "cheap_busy_seconds": busy.cheap_busy_seconds,
         "fast_window_seconds": busy.fast_window_seconds,

@@ -62,6 +62,17 @@ def _parse_iso(value: str) -> datetime:
         return datetime.fromisoformat(value)
 
 
+def _summary_output_paths(out_dir: Path) -> list[str]:
+    """Return the output artifact paths in the preferred summary order (report first)."""
+    return [
+        str(out_dir / "report.md"),
+        str(out_dir / "fast_sessions.csv"),
+        str(out_dir / "cheap_sessions.csv"),
+        str(out_dir / "errors.csv"),
+        str(out_dir / "errors.json"),
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -80,12 +91,14 @@ def main(argv: list[str] | None = None) -> int:
 
     config = config_loader.load_proxy_config(config_loader.find_config_path(args.config))
 
+    out_dir = Path(args.output_dir).expanduser().resolve()
+
     try:
         run = reporting.run_analysis(
             log_dir=Path(args.log_dir),
             window_start=window_start,
             window_end=window_end,
-            output_dir=Path(args.output_dir).expanduser(),
+            output_dir=out_dir,
             config=config,
             llama_log_dir=Path(args.llama_log_dir),
         )
@@ -94,10 +107,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.json:
-        print(json.dumps(reporting.summary_to_json(run.summary), indent=2, sort_keys=True))
+        print(json.dumps(reporting.summary_to_json(run.summary, run.mode_map), indent=2, sort_keys=True))
         return 0
     if not args.quiet:
-        data = reporting.summary_to_json(run.summary)
+        data = reporting.summary_to_json(run.summary, run.mode_map)
         decode = data.get("decode_speed") or {}
         decode_summary = (
             f", decode speed {decode.get('samples', 0)} samples "
@@ -122,10 +135,12 @@ def main(argv: list[str] | None = None) -> int:
             f"{data.get('contention_fallback_after_queue', 0)} fallback-after-queue, "
             f"{errors} error event(s){decode_summary}{busy_summary}."
         )
-        print(f"Outputs written to {args.output_dir}: "
-              f"fast_sessions.csv, cheap_sessions.csv, errors.csv, report.md")
+        output_lines = _summary_output_paths(out_dir)
+        print("Outputs written to:")
+        for line in output_lines:
+            print(f"  {line}")
         if run.archived_to:
-            print(f"Previous outputs archived to {run.archived_to}")
+            print(f"Previous outputs archived to {run.archived_to.resolve()}")
     return 0
 
 

@@ -299,3 +299,27 @@ Post-deploy confirmation: track the F4 7-day observation window via
 - **Correlation script** `scripts/slot-persistence-correlate.py` (or use the
   `--json` output) reproduces the cadence/load analysis above from `/var/log/llama-proxy`
   for any future window.
+
+---
+
+# 2026-08-15 Addendum: 7-day post-fix observation window complete
+
+**Work item:** LP-0MSI1RWLM007N367 (F4 observation window, parent AC2/AC3)
+
+The 7-day post-fix window (2026-08-08 → 2026-08-14, fix released v0.1.11 on
+2026-08-08) has elapsed. Full rows + analysis in
+[`observation-log.md`](observation-log.md):
+
+- **save failure rate 0.59%** (67/11267) vs 1.71% baseline → **−65.5%**
+- **restore failure rate 0.06%** (6/10000) vs 0.98% baseline → **−93.9%**
+- 79% of residual failures still cluster under ≥1 concurrent local stream
+  (58/73) — same confirmed save-starvation mechanism at reduced rate.
+- Residual ReadTimeouts are the **mid-request-onset class**: the load gate
+  samples busy state at request start, but the save executes at request end,
+  so concurrency that onsets during a request escapes the gate. This is the
+  documented residual path; failures are bounded (≈⅓ baseline rate) with
+  load context and a non-load residual (6 ConnectError during llama-server
+  restarts + 1 restore-400 capacity error).
+- **Verdict: parent AC2 satisfied via the bounded/residual-failures branch**
+  of the exit criteria (explicit rationale + load context, vs the ~1.8%
+  baseline). AC3 verification evidence posted as a work-item comment.

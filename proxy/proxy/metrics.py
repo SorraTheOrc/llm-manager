@@ -50,6 +50,19 @@ llama_token_rate_histogram = None
 llama_contention_queued_total = None
 llama_contention_queued_duration_seconds = None
 llama_contention_fallback_after_queue_total = None
+# /slots query failure metric (LP-0MSVP7XJ6008QPKX): count of llama-server
+# /slots query failures by reason, so a sustained /slots outage (e.g. a
+# stuck model reload after cheap-mode restart) surfaces as an alert instead
+# of silently wedging orchestrators (herdr downtime worker) into fail-closed
+# busy via total_slots=0.
+llama_slots_query_failures_total = None
+# Remote-stream watchdog terminations (LP-0MSVP7ZML003XZTJ): a remote
+# stream terminated by the max-duration or activity-timeout watchdog (a
+# "connected but idle" upstream that never goes silent). Counts by reason
+# so a runaway stream — e.g. a pi-agent pane held for 13+ hours — surfaces
+# as an alert instead of silently holding proxy state (local_active_query,
+# slots) indefinitely.
+llama_remote_stream_terminated_total = None
 
 if _enabled:
     try:
@@ -97,6 +110,16 @@ if _enabled:
         llama_contention_fallback_after_queue_total = Counter(
             'llama_contention_fallback_after_queue_total',
             'Requests that fell back to remote after the contention-queue caps',
+        )
+        llama_slots_query_failures_total = Counter(
+            'llama_slots_query_failures_total',
+            'Total llama-server /slots query failures by reason',
+            ['reason'],
+        )
+        llama_remote_stream_terminated_total = Counter(
+            'llama_remote_stream_terminated_total',
+            'Remote streams terminated by the duration/activity watchdog by reason',
+            ['reason'],
         )
     except Exception:  # pragma: no cover - defensive
         _enabled = False
@@ -214,6 +237,49 @@ def record_contention_fallback_after_queue():
         return
     try:
         llama_contention_fallback_after_queue_total.inc()
+    except Exception:
+        pass
+
+
+def record_slots_query_failure(reason: str):
+    """Increment llama_slots_query_failures_total with the given reason.
+
+    Args:
+        reason: A short identifier for the /slots failure cause, e.g.
+            "http_500", "http_400", "timeout", "connection_error",
+            "invalid_payload".
+
+    LP-0MSVP7XJ6008QPKX: a sustained /slots failure during a model reload
+    (cheap-mode restart) previously surfaced as total_slots=0 with no
+    signal; this counter feeds a Prometheus alert on the failure rate.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_slots_query_failures_total is None:
+        return
+    try:
+        llama_slots_query_failures_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_remote_stream_terminated(reason: str):
+    """Increment llama_remote_stream_terminated_total with the given reason.
+
+    Args:
+        reason: A short identifier for the watchdog termination, e.g.
+            "stream_max_duration", "stream_activity_timeout".
+
+    LP-0MSVP7ZML003XZTJ: a remote stream that never terminates (connected
+    but idle) previously held proxy state indefinitely; this counter feeds
+    a Prometheus alert so runaway streams surface.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_remote_stream_terminated_total is None:
+        return
+    try:
+        llama_remote_stream_terminated_total.labels(reason=reason).inc()
     except Exception:
         pass
 

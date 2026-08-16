@@ -273,16 +273,46 @@ async def test_prefill_lease_config_explicit_values():
 
 @pytest.mark.asyncio
 async def test_query_prefill_progress_uses_per_slot_slots_data(monkeypatch):
-    """Per-slot /slots progress is preferred when slot_id is known."""
+    """Per-slot /slots state is preferred when slot_id is known (progress
+    returned alongside the liveness flag)."""
     from proxy.router_helpers import _query_prefill_progress
 
     monkeypatch.setattr(
         "proxy.observability._query_slots_progress",
-        AsyncMock(return_value={3: 50000, 5: 100}),
+        AsyncMock(return_value={
+            3: {"progress": 50000, "processing": True},
+            5: {"progress": 100, "processing": False},
+        }),
     )
     srv = _make_srv()
-    assert await _query_prefill_progress(srv, 8080, model_name="qwen", slot_id=3) == 50000
-    assert await _query_prefill_progress(srv, 8080, model_name="qwen", slot_id=5) == 100
+    assert await _query_prefill_progress(srv, 8080, model_name="qwen", slot_id=3) == (50000, True)
+    assert await _query_prefill_progress(srv, 8080, model_name="qwen", slot_id=5) == (100, False)
+
+
+@pytest.mark.asyncio
+async def test_query_prefill_progress_liveness_when_no_numeric_progress(monkeypatch):
+    """llama.cpp b8782 failure mode: /slots exposes no n_past/
+    n_prompt_tokens_processed, but the slot's is_processing flag reports
+    the request is alive — (None, alive=True) must be returned so the
+    lease can be extended on liveness (LP-0MSUO5Z0K007HBSS)."""
+    from proxy.router_helpers import _query_prefill_progress
+
+    monkeypatch.setattr(
+        "proxy.observability._query_slots_progress",
+        AsyncMock(return_value={
+            3: {"progress": None, "processing": True},
+            5: {"progress": None, "processing": False},
+        }),
+    )
+    monkeypatch.setattr("proxy.observability.query_llama_status", AsyncMock(return_value={
+        "llama_server_running": True,
+        "n_ctx": 32768,
+        "kv_cache_tokens": None,
+        "router_mode": False,
+    }))
+    srv = _make_srv()
+    assert await _query_prefill_progress(srv, 8080, model_name="qwen", slot_id=3) == (None, True)
+    assert await _query_prefill_progress(srv, 8080, model_name="qwen", slot_id=5) == (None, False)
 
 
 @pytest.mark.asyncio
@@ -299,12 +329,12 @@ async def test_query_prefill_progress_falls_back_to_aggregate_status(monkeypatch
         "router_mode": False,
     }))
     srv = _make_srv()
-    assert await _query_prefill_progress(srv, 8080, slot_id=3) == 4321
+    assert await _query_prefill_progress(srv, 8080, slot_id=3) == (4321, True)
 
 
 @pytest.mark.asyncio
 async def test_query_prefill_progress_none_when_unobservable(monkeypatch):
-    """None when neither source reports progress."""
+    """(None, False) when neither source reports progress or liveness."""
     from proxy.router_helpers import _query_prefill_progress
 
     monkeypatch.setattr("proxy.observability._query_slots_progress", AsyncMock(return_value={}))
@@ -315,7 +345,40 @@ async def test_query_prefill_progress_none_when_unobservable(monkeypatch):
         "router_mode": False,
     }))
     srv = _make_srv()
-    assert await _query_prefill_progress(srv, 8080, slot_id=3) is None
+    assert await _query_prefill_progress(srv, 8080, slot_id=3) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_query_prefill_progress_warns_when_unobservable(monkeypatch):
+    """AC2: silent query failures are surfaced with a throttled warning —
+    the prefill extension must log when progress cannot be observed, and
+    the warning is rate-limited to one per interval (LP-0MSUO5Z0K007HBSS)."""
+    import proxy.router_helpers as rh
+
+    monkeypatch.setattr("proxy.observability._query_slots_progress", AsyncMock(return_value={}))
+    monkeypatch.setattr("proxy.observability.query_llama_status", AsyncMock(return_value={
+        "llama_server_running": True,
+        "n_ctx": 32768,
+        "kv_cache_tokens": None,
+        "router_mode": False,
+    }))
+    srv = _make_srv()
+    # Reset the throttle so this test observes the first warning.
+    monkeypatch.setattr(rh, "_last_prefill_progress_warn_ts", 0.0)
+
+    assert await rh._query_prefill_progress(srv, 8080, slot_id=3) == (None, False)
+    warn_lines = [str(call) for call in srv.logger.warning.call_args_list]
+    assert any("prefill_progress_unobservable" in line for line in warn_lines), (
+        "Expected a warning when prefill progress is unobservable"
+    )
+
+    # Throttled: a second unobservable poll within the interval does not log again.
+    srv.logger.warning.reset_mock()
+    assert await rh._query_prefill_progress(srv, 8080, slot_id=3) == (None, False)
+    assert not any(
+        "prefill_progress_unobservable" in str(call)
+        for call in srv.logger.warning.call_args_list
+    ), "Throttled warning must not repeat within the interval"
 
 
 @pytest.mark.asyncio
@@ -330,7 +393,7 @@ async def test_query_prefill_progress_uses_status_when_slot_unknown(monkeypatch)
         "router_mode": False,
     }))
     srv = _make_srv()
-    assert await _query_prefill_progress(srv, 8080) == 777
+    assert await _query_prefill_progress(srv, 8080) == (777, True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -339,7 +402,8 @@ async def test_query_prefill_progress_uses_status_when_slot_unknown(monkeypatch)
 
 
 def _install_fake_progress(monkeypatch, values):
-    """Install a _query_prefill_progress fake returning values in sequence."""
+    """Install a _query_prefill_progress fake returning (progress, alive)
+    tuples in sequence."""
     seq = iter(values)
 
     async def _fake_progress(*args, **kwargs):
@@ -359,7 +423,7 @@ async def test_extend_lease_while_progress_advances(monkeypatch):
     srv = _make_srv(records={
         "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": now + 0.3},
     })
-    _install_fake_progress(monkeypatch, [1000, 2000, 3000])
+    _install_fake_progress(monkeypatch, [(1000, True), (2000, True), (3000, True)])
 
     last_progress = 0
     for expected in (1000, 2000, 3000):
@@ -389,13 +453,58 @@ async def test_extend_lease_does_not_extend_when_progress_stalls(monkeypatch):
     srv = _make_srv(records={
         "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": original_expiry},
     })
-    _install_fake_progress(monkeypatch, [5000])
+    _install_fake_progress(monkeypatch, [(5000, False)])
 
     last_progress, extended = await _extend_lease_during_prefill(
         srv, "sess-1", llama_port=8080, slot_id=None, last_progress=5000
     )
     assert extended is False
     assert last_progress == 5000
+    assert srv.local_dispatch_records["sess-1"]["expires_at"] == original_expiry
+    assert not any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+
+
+@pytest.mark.asyncio
+async def test_extend_lease_on_liveness_when_numeric_progress_absent(monkeypatch):
+    """llama.cpp b8782 failure mode: no numeric progress is reported, but the
+    slot is observed processing — the lease is still extended on liveness so
+    a long prefill never loses its lease mid-flight (LP-0MSUO5Z0K007HBSS AC2)."""
+    from proxy.router_helpers import _extend_lease_during_prefill
+
+    now = time.monotonic()
+    srv = _make_srv(records={
+        "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": now + 0.3},
+    })
+    _install_fake_progress(monkeypatch, [(None, True)])
+
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
+    )
+    assert extended is True, "Lease must be extended on liveness when progress is unobservable"
+    assert last_progress == 0
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["expires_at"] - time.monotonic() >= 0.45
+    assert any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+
+
+@pytest.mark.asyncio
+async def test_extend_lease_noop_when_unobservable_and_not_alive(monkeypatch):
+    """No extension when progress is unobservable AND the slot is not alive
+    (build exposes neither numeric progress nor is_processing)."""
+    from proxy.router_helpers import _extend_lease_during_prefill
+
+    now = time.monotonic()
+    original_expiry = now + 0.3
+    srv = _make_srv(records={
+        "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": original_expiry},
+    })
+    _install_fake_progress(monkeypatch, [(None, False)])
+
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
+    )
+    assert extended is False
+    assert last_progress == 0
     assert srv.local_dispatch_records["sess-1"]["expires_at"] == original_expiry
     assert not any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
 
@@ -411,7 +520,7 @@ async def test_extend_lease_noop_when_progress_unobservable(monkeypatch):
     srv = _make_srv(records={
         "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": original_expiry},
     })
-    _install_fake_progress(monkeypatch, [None])
+    _install_fake_progress(monkeypatch, [(None, False)])
 
     last_progress, extended = await _extend_lease_during_prefill(
         srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
@@ -439,7 +548,7 @@ async def test_extend_lease_disabled_when_poll_cadence_zero(monkeypatch):
 
     async def _fake_progress(*args, **kwargs):
         calls.append(1)
-        return 1000
+        return (1000, True)
 
     monkeypatch.setattr("proxy.router_helpers._query_prefill_progress", _fake_progress)
 
@@ -461,7 +570,7 @@ async def test_extend_lease_skips_inactive_record(monkeypatch):
     srv = _make_srv(records={
         "sess-1": {"backend": "local", "started_at": now, "active": False, "expires_at": original_expiry},
     })
-    _install_fake_progress(monkeypatch, [5000])
+    _install_fake_progress(monkeypatch, [(5000, True)])
 
     last_progress, extended = await _extend_lease_during_prefill(
         srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
@@ -482,7 +591,7 @@ async def test_extend_lease_uses_configured_buffer(monkeypatch):
         records={"sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": now + 0.3}},
         config=config,
     )
-    _install_fake_progress(monkeypatch, [1000])
+    _install_fake_progress(monkeypatch, [(1000, True)])
 
     _, extended = await _extend_lease_during_prefill(
         srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
@@ -517,7 +626,7 @@ async def test_cleanup_loop_preserves_extended_prefill_lease(monkeypatch):
     record = srv.local_dispatch_records["sess-prefill"]
     record["started_at"] -= 120.0
 
-    _install_fake_progress(monkeypatch, [12345])
+    _install_fake_progress(monkeypatch, [(12345, True)])
     _, extended = await _extend_lease_during_prefill(
         srv, "sess-prefill", llama_port=8080, slot_id=None, last_progress=0
     )

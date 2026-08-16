@@ -255,13 +255,17 @@ def build_speed_stats(
     window_start: datetime,
     window_end: datetime,
     schedule: object | None,
+    mode_map: object | None = None,
 ) -> SpeedStats:
     """Aggregate eval-timing samples across ``files`` into :class:`SpeedStats`.
 
     Each sample is bucketed by its (mtime-approximated) timestamp using the
-    slot schedule's fast/cheap periods; the total bucket always accumulates
-    every sample. Files whose Qwen3 port cannot be discovered are counted in
-    ``files_skipped`` and their eval lines are ignored (never fatal).
+    fast/cheap periods — mode-aware (LP-0MSPZUD4G007IYGH) when the logs show
+    mode transitions, so samples written during cheap hours count as cheap
+    even when the analysis runs in fast mode; the total bucket always
+    accumulates every sample. Files whose Qwen3 port cannot be discovered are
+    counted in ``files_skipped`` and their eval lines are ignored (never
+    fatal).
     """
     samples = {
         KIND_DECODE: {key: [] for key in _BUCKET_KEYS},
@@ -269,6 +273,13 @@ def build_speed_stats(
     }
     files_parsed = 0
     files_skipped = 0
+
+    def _bucket_key_for(ts: datetime) -> str:
+        if mode_map is not None and getattr(mode_map, "transitions", None):
+            return CHEAP if mode_map.period_for(ts).label == CHEAP else FAST
+        if schedule is not None and getattr(schedule, "periods", None):
+            return CHEAP if schedule.period_for(ts).label == CHEAP else FAST
+        return FAST
 
     # The live llama-server.log's content starts when the previous file was
     # rotated (llama-server.1.log's last-write time); used to skip the live
@@ -291,10 +302,7 @@ def build_speed_stats(
         for ev in iter_eval_timings(
             path, port, window_start, window_end, live_span_start=live_span_start
         ):
-            bucket_key = FAST
-            if schedule is not None and getattr(schedule, "periods", None):
-                label = schedule.period_for(ev.ts).label
-                bucket_key = CHEAP if label == CHEAP else FAST
+            bucket_key = _bucket_key_for(ev.ts)
             group = samples[ev.kind]
             group[TOTAL].append(ev.tok_s)
             group[bucket_key].append(ev.tok_s)

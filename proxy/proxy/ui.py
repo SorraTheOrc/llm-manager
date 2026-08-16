@@ -848,6 +848,85 @@ async def proxy_openai_api(request: Request, path: str):
     return await get_coalescer().coalesce_or_execute(path, body, _process_request)
 
 
+def _apply_grandfathering(srv, request, model_name, model_cfg):
+    """Record the session→model binding and apply grandfathered routing.
+
+    When an explicit session (``X-Session-Id``) requests a model that the
+    current mode restricts (absent from the current config, or present with
+    fewer remote providers than the other mode's config — e.g. github, or the
+    opencode/opencode-go/deepseek tiers of plan/author/code), a binding
+    recorded in a DIFFERENT mode (i.e. the session had activity before the
+    switch) is grandfathered: the model config is resolved from the other
+    mode's config so the request keeps its full provider chain.
+
+    Returns the (possibly overridden) ``model_cfg``. Anonymous requests are
+    never recorded; missing registry/other-config degrade gracefully to
+    current-mode handling.
+    """
+    registry = getattr(srv, "grandfathering_registry", None)
+    if registry is None or not model_name:
+        return model_cfg
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        session_id, _ = _resolve_session_id_header(request.headers)
+        if not session_id:
+            return model_cfg
+        from proxy.mode import read_mode
+
+        current_mode = read_mode()
+        registry.record(session_id, model_name, current_mode)
+
+        other_config = getattr(srv, "other_mode_config", None)
+        if other_config is None:
+            return model_cfg
+        current_models = (
+            srv.config.get("models", {}) if isinstance(srv.config, dict) else {}
+        )
+        other_models = (
+            other_config.get("models", {}) if isinstance(other_config, dict) else {}
+        )
+        if not registry.is_grandfathered(
+            session_id, current_mode, current_models, other_models
+        ):
+            return model_cfg
+
+        from proxy.lifecycle import lookup_model_config
+
+        other_cfg = lookup_model_config(other_models, model_name)
+        if other_cfg is None:
+            # Config drift: the bound model no longer exists in the other
+            # mode's config → degrade to current-mode handling (no crash).
+            srv.logger.warning(
+                "Grandfathering: session %s bound to %r but model missing from "
+                "the other-mode config; degrading to current-mode handling",
+                session_id[:8] if session_id else session_id,
+                model_name,
+            )
+            return model_cfg
+
+        # Observability (AC 5): mark grandfathered routes so usage analysis
+        # can distinguish them from normal current-mode traffic.
+        try:
+            srv._record_backend_signal("grandfathered")
+        except Exception:
+            pass
+        srv.logger.info(
+            "Grandfathering: session %s keeps using model %s via %s-mode "
+            "config (grandfathered=true)",
+            session_id[:8] if session_id else session_id,
+            model_name,
+            current_mode,
+        )
+        return other_cfg
+    except Exception:
+        srv.logger.debug(
+            "Grandfathering hook failed; continuing with current-mode handling",
+            exc_info=True,
+        )
+        return model_cfg
+
+
 async def _do_proxy_openai_api(
     request: Request,
     path: str,
@@ -876,6 +955,12 @@ async def _do_proxy_openai_api(
 
     # Get model configuration
     model_cfg = srv.get_model_config(model_name) if model_name else None
+
+    # Grandfathering (LP-0MSMF5LXO006YDNM): record session→model usage and,
+    # for sessions that were active before a mode switch, resolve restricted
+    # models from the other mode's config so they keep their full provider
+    # chain (local-first + remote fallbacks) instead of being cut off.
+    model_cfg = _apply_grandfathering(srv, request, model_name, model_cfg)
 
     # Apply system prompt if configured
     if model_cfg is not None and "messages" in body_json and isinstance(body_json.get("messages"), list):

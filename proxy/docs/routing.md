@@ -86,8 +86,8 @@ active mode config:
 | cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (60) and `contention_queue_max_depth` (4); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
 | fast (config-fast.yaml) | `fallback` | Today's behavior — skip to the next remote provider immediately |
 
-Key semantics (see `proxy/provider.py` ``_maybe_queue_for_local_slot`` and
-`proxy/contention_queue.py``):
+Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
+`proxy/proxy/contention_queue.py`):
 
 - **Cross-session**: the queue is process-global, so a request from session B
   can wait (bounded) behind a long audit stream from session A. This is what
@@ -105,10 +105,10 @@ Key semantics (see `proxy/provider.py` ``_maybe_queue_for_local_slot`` and
   `max_runtime_seconds`), so interactive clients never see queue wait + serve
   exceed the adaptive envelope.
 - **Metrics**: queued count, queued duration, and fallback-after-queue count
-  are exposed via `proxy/contention_queue.py::metrics()` and the
+  are exposed via `proxy/proxy/contention_queue.py::metrics()` and the
   `status_request` / `contention_queue_dispatch` /
   `contention_queue_fallback_after_queue` log lines (Prometheus counters in
-  `proxy/metrics.py`) so the 24h proxy report can quantify the gain. The
+  `proxy/proxy/metrics.py`) so the 24h proxy report can quantify the gain. The
   `contention_queue_dispatch` line carries `queued_duration`, `policy`, and
   `depth`; the `contention_queue_fallback_after_queue` line carries
   `queued_duration` (the elapsed wait, F4 AC2). The status endpoint

@@ -123,6 +123,19 @@ provider_fallback_count: dict = {}
 # Background lease cleanup task (started in lifespan)
 _dispatch_cleanup_task: asyncio.Task | None = None
 
+# Session→model grandfathering registry (LP-0MSMF5LXO006YDNM). Loaded at
+# startup from the persisted state file; records which model each explicit
+# session uses so sessions active before a fast↔cheap mode switch keep their
+# model (and full provider chain) after the restart. None when disabled via
+# config (``server.mode_switch_grandfathering.enabled: false``).
+grandfathering_registry: Any | None = None
+# The OTHER mode's config (fast↔cheap), loaded once at startup. Used to
+# resolve restricted models for grandfathered sessions with their full
+# provider chain. None when the registry is disabled.
+other_mode_config: dict | None = None
+# Periodic prune task for the grandfathering registry.
+_grandfathering_prune_task: asyncio.Task | None = None
+
 
 # Lazy self-import helper returns this module (avoids circular imports)
 def _srv():
@@ -665,6 +678,104 @@ def _startup_start_dispatch_cleanup():
             logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
 
 
+def _startup_initialize_grandfathering():
+    """Load the grandfathering registry and the other-mode config at startup.
+
+    Builds the registry from ``server.mode_switch_grandfathering`` (enabled,
+    fallback_grace_seconds) and loads the OTHER mode's config file (fast↔cheap)
+    so grandfathered sessions can keep their full provider chain after a
+    mode-switch restart. Starts a periodic prune task. When disabled (or on
+    error) the registry is None and routing is unchanged.
+    """
+    global grandfathering_registry, other_mode_config, _grandfathering_prune_task
+    try:
+        from proxy.grandfathering import registry_from_config
+
+        server_config = config.get("server", {}) if isinstance(config, dict) else None
+        grandfathering_registry = registry_from_config(server_config)
+        if not grandfathering_registry.enabled:
+            grandfathering_registry = None
+            other_mode_config = None
+            logger.info(
+                "Grandfathering: disabled via config "
+                "(server.mode_switch_grandfathering.enabled: false)"
+            )
+            return
+
+        # The OTHER mode relative to the currently active one.
+        current_mode = mode_module.read_mode()
+        other_mode = (
+            mode_module.MODE_FAST
+            if current_mode == mode_module.MODE_CHEAP
+            else mode_module.MODE_CHEAP
+        )
+        other_path = mode_module.mode_config_file(other_mode)
+        other_mode_config = load_config(str(other_path))
+        logger.info(
+            "Grandfathering: enabled; other-mode config %s (current=%s)",
+            other_path.name,
+            current_mode,
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+            _grandfathering_prune_task = loop.create_task(
+                _grandfathering_prune_loop()
+            )
+        except RuntimeError:
+            # No running loop (sync call path) — prune is opportunistic.
+            _grandfathering_prune_task = None
+    except Exception as e:
+        logger.warning(
+            "Failed to initialize grandfathering; feature disabled: %s", e
+        )
+        grandfathering_registry = None
+        other_mode_config = None
+
+
+async def _grandfathering_prune_loop(
+    interval_seconds: float = 300.0,
+) -> None:
+    """Periodically prune expired grandfathering bindings and persist.
+
+    Saves every cycle (debounced write) so refreshed ``last_seen``
+    timestamps survive a crash; a full save also happens on shutdown.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            import proxy.server as _srv
+
+            if _srv.grandfathering_registry is not None:
+                removed = _srv.grandfathering_registry.prune()
+                _srv.grandfathering_registry.save()
+                if removed:
+                    logger.info(
+                        "Grandfathering: pruned %d expired binding(s)", removed
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Grandfathering prune loop error")
+
+
+def _shutdown_grandfathering():
+    """Persist the grandfathering registry on graceful shutdown."""
+    global grandfathering_registry, _grandfathering_prune_task
+    try:
+        if _grandfathering_prune_task is not None:
+            _grandfathering_prune_task.cancel()
+            _grandfathering_prune_task = None
+    except Exception:
+        pass
+    try:
+        if grandfathering_registry is not None:
+            grandfathering_registry.save()
+            logger.info("Grandfathering: registry saved on shutdown")
+    except Exception:
+        logger.exception("Failed to save grandfathering registry on shutdown")
+
+
 def _startup_launch_slot_scheduler():
     """Start the slot scheduler background task.
 
@@ -874,6 +985,7 @@ async def lifespan(app: FastAPI):
     _startup_register_session_routes(app)
     _startup_launch_slot_scheduler()
     _startup_launch_mode_scheduler()
+    _startup_initialize_grandfathering()
     _startup_launch_disconnect_reaper()
 
     yield
@@ -883,6 +995,7 @@ async def lifespan(app: FastAPI):
     # ------------------------------------------------------------------ #
     logger.info("Shutting down LLama Proxy Server")
     _shutdown_stop_session_cleanup()
+    _shutdown_grandfathering()
     await _shutdown_cleanup_tasks()
     _shutdown_tts_server()
     await _shutdown_http_client()

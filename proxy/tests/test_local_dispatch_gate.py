@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1771,3 +1772,173 @@ async def test_recover_global_resets_in_legacy_mode():
     )
     warning_msg = str(warning_calls[0])
     assert "5" in warning_msg, "Warning should include the previous counter value"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Active-stream verification in orphan cleanup (LP-0MSUO6XRP001MCB2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_orphan_srv(records: dict | None = None, logger=None) -> SimpleNamespace:
+    """Build a server with dispatch tracking for orphan-cleanup tests."""
+    return SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 30}},
+        local_active_queries=1,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records=records if records is not None else {},
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=logger or MagicMock(),
+    )
+
+
+def _expired_active_record(model_name: str = "Qwen3", started_at: float = 1.0) -> dict:
+    """An active dispatch record whose expires_at is far in the past (orphan
+    candidate) with the model name stored for slot verification."""
+    return {
+        "backend": "local",
+        "started_at": started_at,
+        "active": True,
+        "expires_at": 0.0,  # expired
+        "model_name": model_name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_skips_verified_active_slot(monkeypatch):
+    """AC1: an expired ACTIVE record whose slot is still processing on
+    llama-server is NOT freed — the lease is extended by the chunk-refresh
+    buffer instead, and no orphan_cleanup warning is emitted."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = _make_orphan_srv(records={
+        "sess-alive": _expired_active_record(),
+    })
+    # Slot liveness check: the session's slot reports processing.
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(return_value=True),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 0, "Verified-active slot must not be orphan-cleaned"
+    assert "sess-alive" in srv.local_dispatch_records, (
+        "Verified-active lease must be preserved"
+    )
+    # Lease was extended into the future by the chunk-refresh buffer (30s).
+    record = srv.local_dispatch_records["sess-alive"]
+    assert record["expires_at"] > time.monotonic(), (
+        "Verified-active lease must be extended past the present"
+    )
+    assert record["active"] is True
+    # No orphan_cleanup warning for a verified-live stream.
+    warnings = [
+        call for call in srv.logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert not warnings, (
+        f"Expected no orphan_cleanup warning for verified-active stream, got {len(warnings)}"
+    )
+    # A distinct INFO log marks the verified-active extension.
+    infos = [
+        str(call) for call in srv.logger.info.call_args_list
+        if "lease_verified_active" in str(call)
+    ]
+    assert len(infos) == 1, (
+        f"Expected lease_verified_active INFO log, got {len(infos)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_frees_unverified_slot(monkeypatch):
+    """AC1/AC3: an expired ACTIVE record whose slot is genuinely idle on
+    llama-server is orphan-cleaned as before (no active stream to lose)."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = _make_orphan_srv(records={
+        "sess-dead": _expired_active_record(),
+    })
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(return_value=False),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 1, "Idle-slot orphan must be cleaned"
+    assert "sess-dead" not in srv.local_dispatch_records
+    warnings = [
+        call for call in srv.logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert len(warnings) == 1, "Expected orphan_cleanup warning for idle-slot orphan"
+    # local_active_queries was decremented for the orphaned record.
+    assert srv.local_active_queries == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_fails_open_when_verification_errors(monkeypatch):
+    """Fail-open: when the slot-liveness query errors, the record is
+    orphan-cleaned as before (a verification failure must not block cleanup
+    or leak leases indefinitely)."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = _make_orphan_srv(records={
+        "sess-err": _expired_active_record(),
+    })
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(side_effect=RuntimeError("llama-server unreachable")),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 1, "Cleanup must proceed when verification errors"
+    assert "sess-err" not in srv.local_dispatch_records
+
+
+@pytest.mark.asyncio
+async def test_query_slot_processing_checks_own_slot(monkeypatch):
+    """_query_slot_processing returns True only when the session's OWN slot
+    reports processing; other slots' state is ignored."""
+    from proxy.router_helpers import _query_slot_processing
+
+    srv = _make_orphan_srv()
+    monkeypatch.setattr(
+        "proxy.session._assigned_slot_for_session", lambda sid: 2
+    )
+    monkeypatch.setattr(
+        "proxy.observability._query_slots_progress",
+        AsyncMock(return_value={2: {"progress": None, "processing": True}}),
+    )
+
+    assert await _query_slot_processing(srv, "sess-x", "Qwen3") is True
+
+
+@pytest.mark.asyncio
+async def test_query_slot_processing_false_when_slot_idle(monkeypatch):
+    """_query_slot_processing returns False when the session's slot is not
+    processing (or has no slot assignment / unknown model)."""
+    from proxy.router_helpers import _query_slot_processing
+
+    srv = _make_orphan_srv()
+    monkeypatch.setattr(
+        "proxy.session._assigned_slot_for_session", lambda sid: 2
+    )
+    monkeypatch.setattr(
+        "proxy.observability._query_slots_progress",
+        AsyncMock(return_value={2: {"progress": None, "processing": False}}),
+    )
+    assert await _query_slot_processing(srv, "sess-x", "Qwen3") is False
+
+    # No slot assignment → cannot verify → False.
+    monkeypatch.setattr(
+        "proxy.session._assigned_slot_for_session", lambda sid: None
+    )
+    assert await _query_slot_processing(srv, "sess-x", "Qwen3") is False
+
+    # No model name → cannot query the router → False.
+    monkeypatch.setattr(
+        "proxy.session._assigned_slot_for_session", lambda sid: 2
+    )
+    assert await _query_slot_processing(srv, "sess-x", None) is False

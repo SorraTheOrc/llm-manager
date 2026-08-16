@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 
 import bucketing
 from log_parser import (
+    BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
     LOCAL_PROVIDER,
     LogEvent,
@@ -64,6 +65,11 @@ class SessionStats:
     slots: int | None
     dispatch_denied: int
     routing_skips: int
+    # Per-period context window of the profile active for this session (from
+    # the mode profile's slot_schedule ctx_size, or its global
+    # local_model_ctx_size when the entry did not pin one); None when not
+    # derivable.
+    ctx_size: int | None = None
     # Decode speed derived from local streams: total local completion tokens /
     # local active span (first→last local stream event). None when not derivable.
     decode_tok_s: float | None = None
@@ -151,6 +157,10 @@ class BusyStats:
     avg_concurrency: float
     avg_stream_duration: float
     unfinished_streams: int
+    # Streams that started more than ``BUSY_WINDOW_MARGIN`` before the window
+    # start and have no logged finish: stale pre-window leftovers from earlier
+    # windows, tracked separately from in-window aborts (LP-0MSVRRO3L0056N6C).
+    pre_window_unfinished: int
     # Busy seconds attributed to fast/cheap periods (from the slot schedule)
     # and to each hour of the window (hour-of-day -> seconds).
     fast_busy_seconds: float
@@ -249,6 +259,7 @@ def _build_session(
     routing_skips: dict[str, list[LogEvent]],
     fallback_events: list[LogEvent],
     schedule: bucketing.SlotSchedule,
+    mode_map: bucketing.ModeScheduleMap | None = None,
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
@@ -275,7 +286,16 @@ def _build_session(
     else:
         move_ts, reason = None, None
 
-    period = schedule.period_for(start) if schedule.periods else None
+    # Bucket by the operating mode active at the session's first in-window
+    # stream (LP-0MSPZUD4G007IYGH): when the logs show mode transitions, the
+    # period is the mode's profile period labelled with the mode name; without
+    # transitions (a single-mode window) the legacy slot-count bucketing from
+    # the analysis-time schedule applies unchanged.
+    period: bucketing.SlotPeriod | None = None
+    if mode_map is not None and mode_map.transitions:
+        period = mode_map.period_for(start)
+    elif schedule.periods:
+        period = schedule.period_for(start)
 
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
@@ -310,6 +330,7 @@ def _build_session(
         fallback_reason=reason,
         bucket=period.label if period else None,
         slots=period.slots if period else None,
+        ctx_size=period.ctx_size if period else None,
         dispatch_denied=builder.dispatch_denied,
         routing_skips=len(builder.routing_skips),
         decode_tok_s=decode_tok_s,
@@ -319,17 +340,17 @@ def _build_session(
 def _segment_boundaries(
     start: datetime,
     end: datetime,
-    schedule: bucketing.SlotSchedule,
+    periods: list[bucketing.SlotPeriod],
 ) -> list[datetime]:
-    """All timestamps inside ``(start, end)`` where the hour-of-day or the
-    fast/cheap period (slot schedule) changes. Used to attribute busy seconds
-    to hours and fast/cheap buckets exactly."""
+    """All timestamps inside ``(start, end)`` where the hour-of-day or a
+    fast/cheap period (slot schedule) boundary falls. Used to attribute busy
+    seconds to hours and fast/cheap buckets exactly."""
     boundaries = {start, end}
     t = start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     while t < end:
         boundaries.add(t)
         t += timedelta(hours=1)
-    for period in schedule.periods:
+    for period in periods:
         for minutes in (period.start_minutes, period.end_minutes):
             day = start.replace(hour=0, minute=0, second=0, microsecond=0)
             while day <= end:
@@ -341,23 +362,36 @@ def _segment_boundaries(
 
 
 
+def _period_label_at(
+    dt: datetime,
+    schedule: bucketing.SlotSchedule,
+    mode_map: bucketing.ModeScheduleMap | None,
+) -> str:
+    """Fast/cheap label for ``dt``: mode-aware when the logs show mode
+    transitions (LP-0MSPZUD4G007IYGH), else the legacy slot-count label from
+    the analysis-time schedule."""
+    if mode_map is not None and mode_map.transitions:
+        return mode_map.period_for(dt).label
+    return schedule.period_for(dt).label if schedule.periods else "fast"
+
 
 
 def _attribute_interval(
     interval_start: datetime,
     interval_end: datetime,
-    schedule: bucketing.SlotSchedule,
+    periods: list[bucketing.SlotPeriod],
+    label_at,
     bucket_busy: dict[str, float],
     hourly: dict[int, float],
 ) -> None:
     """Add one merged busy interval's seconds to the fast/cheap and hourly
     buckets it overlaps, splitting at hour and period boundaries."""
-    b = _segment_boundaries(interval_start, interval_end, schedule)
+    b = _segment_boundaries(interval_start, interval_end, periods)
     for lo, hi in zip(b, b[1:]):
         if hi <= lo:
             continue
         mid = lo + (hi - lo) / 2
-        label = schedule.period_for(mid).label if schedule.periods else "fast"
+        label = label_at(mid)
         bucket_busy[label] = bucket_busy.get(label, 0.0) + (hi - lo).total_seconds()
         hourly[mid.hour] = hourly.get(mid.hour, 0.0) + (hi - lo).total_seconds()
 
@@ -367,6 +401,7 @@ def compute_busy_stats(
     window_start: datetime,
     window_end: datetime,
     schedule: bucketing.SlotSchedule,
+    mode_map: bucketing.ModeScheduleMap | None = None,
 ) -> BusyStats | None:
     """Compute local-model utilization from local stream events.
 
@@ -374,7 +409,15 @@ def compute_busy_stats(
     ``log_parser.iter_events(margin=...)``); each stream is clipped back to
     ``[window_start, window_end]``. Streams whose start has no paired finish
     are counted in ``unfinished_streams`` (their compute time is unknown, so
-    busy time is a conservative lower bound). Returns ``None`` when there is
+    busy time is a conservative lower bound) **only when the stream started
+    inside the window or within ``BUSY_WINDOW_MARGIN`` before it**; streams
+    that started more than ``BUSY_WINDOW_MARGIN`` before the window are stale
+    pre-window leftovers from earlier windows and are tracked separately in
+    ``pre_window_unfinished`` (LP-0MSVRRO3L0056N6C). Streams started after
+    the window end are not counted (they belong to the next window).
+    Fast/cheap attribution is mode-aware when the logs show mode transitions
+    (LP-0MSPZUD4G007IYGH), so busy seconds during cheap hours count as cheap
+    even when the analysis runs in fast mode. Returns ``None`` when there is
     no local traffic in the window.
     """
     started: dict[str, list[datetime]] = {}
@@ -387,6 +430,8 @@ def compute_busy_stats(
 
     intervals: list[tuple[datetime, datetime]] = []
     unfinished = 0
+    pre_window_unfinished = 0
+    margin_start = window_start - BUSY_WINDOW_MARGIN
     for session_id, starts in started.items():
         ss = sorted(starts)
         ff = sorted(finished.get(session_id, []))
@@ -394,7 +439,16 @@ def compute_busy_stats(
             cb, ce = max(b, window_start), min(e, window_end)
             if ce > cb:
                 intervals.append((cb, ce))
-        unfinished += max(0, len(ss) - len(ff))
+        # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
+        # the remaining starts are unpaired (no logged finish). Only starts
+        # within the busy margin before the window (or inside it) count as
+        # this window's unfinished; earlier starts are pre-window leftovers;
+        # starts after the window end belong to the next window.
+        for ts in ss[len(ff):]:
+            if ts < margin_start:
+                pre_window_unfinished += 1
+            elif ts <= window_end:
+                unfinished += 1
     if not intervals:
         return None
 
@@ -421,18 +475,24 @@ def compute_busy_stats(
         cur += delta
         peak = max(peak, cur)
 
+    mode_aware = mode_map is not None and bool(mode_map.transitions)
+    periods = mode_map.all_periods if mode_aware else schedule.periods
+
+    def label_at(mid: datetime) -> str:
+        return _period_label_at(mid, schedule, mode_map)
+
     bucket_busy: dict[str, float] = {}
     hourly: dict[int, float] = {}
     for s, e in merged:
-        _attribute_interval(s, e, schedule, bucket_busy, hourly)
+        _attribute_interval(s, e, periods, label_at, bucket_busy, hourly)
 
     fast_window = cheap_window = 0.0
-    bounds = _segment_boundaries(window_start, window_end, schedule)
+    bounds = _segment_boundaries(window_start, window_end, periods)
     for lo, hi in zip(bounds, bounds[1:]):
         if hi <= lo:
             continue
         mid = lo + (hi - lo) / 2
-        label = schedule.period_for(mid).label if schedule.periods else "fast"
+        label = _period_label_at(mid, schedule, mode_map)
         if label == "cheap":
             cheap_window += (hi - lo).total_seconds()
         else:
@@ -447,6 +507,7 @@ def compute_busy_stats(
         avg_concurrency=round(total_compute / busy_seconds, 2) if busy_seconds else 0.0,
         avg_stream_duration=round(total_compute / len(intervals), 1) if intervals else 0.0,
         unfinished_streams=unfinished,
+        pre_window_unfinished=pre_window_unfinished,
         fast_busy_seconds=round(bucket_busy.get("fast", 0.0), 1),
         cheap_busy_seconds=round(bucket_busy.get("cheap", 0.0), 1),
         fast_window_seconds=round(fast_window, 1),
@@ -460,11 +521,17 @@ def aggregate(
     window_start: datetime,
     window_end: datetime,
     schedule: bucketing.SlotSchedule,
+    mode_map: bucketing.ModeScheduleMap | None = None,
 ) -> AnalysisResult:
     """Group in-window events into sessions and compute per-session stats.
 
     ``events`` may be any iterable of parsed :class:`LogEvent` (e.g. chained
     across multiple log files). Events outside the window are ignored.
+
+    When ``mode_map`` is given, ``Mode scheduler: applied scheduled mode``
+    events (yielded by ``iter_events`` across the margin-widened window) are
+    collected into a mode timeline, and each session is bucketed by the mode
+    active at its first in-window stream (LP-0MSPZUD4G007IYGH).
     """
     builders: dict[str, _SessionBuilder] = {}
     routing_skips: dict[str, list[LogEvent]] = {}
@@ -482,8 +549,17 @@ def aggregate(
     # busy-time calculation; ``iter_events`` yields a margin beyond the window
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
     local_stream_events: list[LogEvent] = []
+    # Operating-mode transitions across the (margin-widened) event stream:
+    # the mode timeline used for fast/cheap session bucketing.
+    mode_transitions: list[tuple[datetime, str]] = []
 
     for ev in events:
+        if ev.kind == "mode_switch":
+            if ev.mode in ("fast", "cheap"):
+                mode_transitions.append((ev.ts, ev.mode))
+            if window_start <= ev.ts <= window_end:
+                total_lines += 1
+            continue
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             local_stream_events.append(ev)
         if not (window_start <= ev.ts <= window_end):
@@ -528,15 +604,18 @@ def aggregate(
             continue
         lines_skipped += 1
 
+    if mode_map is not None:
+        mode_map.transitions = sorted(mode_transitions)
+
     sessions: dict[str, SessionStats] = {}
     for sid, builder in builders.items():
         # Require at least one in-window stream *started* event (events have
         # already been window-filtered above).
         if not builder.started:
             continue
-        sessions[sid] = _build_session(builder, routing_skips, fallback_events, schedule)
+        sessions[sid] = _build_session(builder, routing_skips, fallback_events, schedule, mode_map)
 
-    busy = compute_busy_stats(local_stream_events, window_start, window_end, schedule)
+    busy = compute_busy_stats(local_stream_events, window_start, window_end, schedule, mode_map)
 
     return AnalysisResult(
         window_start=window_start,

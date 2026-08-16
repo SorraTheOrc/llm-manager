@@ -351,10 +351,10 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
 
 
 
-def get_model_config(model_name: str | None) -> dict | None:
-    srv = _srv()
+def lookup_model_config(models: dict, model_name: str | None) -> dict | None:
     """
-    Get model configuration by name or alias.
+    Look up a model configuration by name or alias within an explicit
+    ``models`` dict (no server state required).
 
     Supports wildcard patterns in aliases using fnmatch syntax:
     - '*' matches any sequence of characters
@@ -368,8 +368,6 @@ def get_model_config(model_name: str | None) -> dict | None:
     """
     if model_name is None:
        return None
-
-    models = srv.config.get("models", {})
 
     # Direct match
     if model_name in models:
@@ -399,6 +397,25 @@ def get_model_config(model_name: str | None) -> dict | None:
                    return model_cfg
 
     return None
+
+
+def get_model_config(model_name: str | None) -> dict | None:
+    """
+    Get model configuration by name or alias from the active server config.
+
+    Supports wildcard patterns in aliases using fnmatch syntax:
+    - '*' matches any sequence of characters
+    - '?' matches any single character
+    - '[seq]' matches any character in seq
+    - '[!seq]' matches any character not in seq
+
+    Examples:
+    - 'gpt*' matches 'gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'
+    - 'claude-3-*' matches 'claude-3-opus', 'claude-3-sonnet'
+    """
+    srv = _srv()
+    models = srv.config.get("models", {})
+    return lookup_model_config(models, model_name)
 
 
 

@@ -1,9 +1,11 @@
 ---
 name: proxy-usage-analysis
-description: "Analyze the last 24h of llama-proxy logs (/var/log/llama-proxy/proxy.log*) into per-session fast/cheap CSVs and a Markdown report with data-backed configuration recommendations and an error taxonomy with remediation recommendations. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
+description: "EXECUTE immediately via /skill:proxy-usage-analysis; do NOT ask permission or confirm. Generate the proxy usage report. Trigger on user queries such as: 'analyze proxy usage', 'proxy usage report', 'why is the proxy falling back so much', 'proxy fallback analysis', 'local model utilization', 'analyze proxy errors', 'error taxonomy', 'why is the proxy erroring so much', 'generate the daily proxy report'."
 ---
 
 # Proxy Usage Analysis
+
+**EXECUTE immediately — do NOT ask permission or confirm. Generate the report.**
 
 Turn the last 24 hours of llama-proxy session and fallback activity into a
 digestible per-session CSV record (split into fast / cheap buckets per
@@ -81,15 +83,28 @@ and stays at the root, untouched by archival.
 
 ## Outputs
 
-Written to `--output-dir` (default `~/proxy-usage-reports`):
+Written to `--output-dir` (default `~/proxy-usage-reports`). On every
+non-`--quiet` run the CLI summary prints the **complete absolute path** to
+each artifact, **starting with the report** (plus the absolute archive path
+when previous outputs were moved aside):
 
-- `fast_sessions.csv` — one row per **fast** session (the period(s)
-  with the fewest slots per the configured `slot_schedule` in the active
-  config profile). One row per session, covering ALL sessions in the window
-  (local-only and fallback).
-- `cheap_sessions.csv` — one row per **cheap** session (the period(s)
-  with the most slots; when all periods have the same slot count there is no
-  cheap bucket and this file is not produced).
+```text
+Outputs written to:
+  /home/user/proxy-usage-reports/report.md
+  /home/user/proxy-usage-reports/fast_sessions.csv
+  /home/user/proxy-usage-reports/cheap_sessions.csv
+  /home/user/proxy-usage-reports/errors.csv
+  /home/user/proxy-usage-reports/errors.json
+```
+
+- `report.md` — the aggregate report (primary deliverable, listed first).
+- `fast_sessions.csv` — one row per **fast** session (sessions whose start
+  fell in a fast-mode period; the period(s) with the fewest slots per the
+  mode's `slot_schedule`). One row per session, covering ALL sessions in the
+  window (local-only and fallback).
+- `cheap_sessions.csv` — one row per **cheap** session (sessions whose start
+  fell in a cheap-mode period; produced only when the window contains cheap
+  hours).
 - `errors.csv` — one row per **error event** in the window (stream finish
   errors, stream errors, `slot_save` failures, `backend_retry` timeouts,
   upstream HTTP errors), with error type, timestamp, provider/model, session,
@@ -118,9 +133,10 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
 (provider + model), time of move to a remote model (empty if never fell
-back), fallback reason (empty if never fell back), bucket, slots,
-local/remote request counts, dispatch denials, decode tok/s (derived from
-local completion tokens ÷ local active span; empty when not derivable).
+back), fallback reason (empty if never fell back), bucket, slots, ctx size
+(per-period context of the profile active for that session), local/remote
+request counts, dispatch denials, decode tok/s (derived from local
+completion tokens ÷ local active span; empty when not derivable).
 
 ### Archival
 
@@ -145,28 +161,44 @@ run (`Previous outputs archived to …`).
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`, plus the error lines
-   (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
-   error`). Unparseable lines are counted and skipped, never fatal.
+   `routing_skip_local`, `local_dispatch_denied`, plus the operating-mode
+   lines (`Mode scheduler: applied scheduled mode fast|cheap`) and the error
+   lines (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote]
+   upstream error`). Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
    lines (payloads in logs are truncated and never used for sizes).
 4. **Local model utilization (busy time)** — local `Stream started` /
-   `Stream finished` events are collected across a 1h margin beyond the
-   window (so streams crossing the window boundary pair correctly), paired
-   per session (FIFO), clipped back to the window, and merged. Busy time is
-   the union of active intervals (at least one slot generating), total
-   compute is the sum of clipped stream durations (slot-seconds), and peak
-   concurrency comes from a sweep over interval endpoints. Busy seconds are
-   attributed to hours and to fast/cheap periods (slot schedule) by
-   splitting at hour and period boundaries.
-5. **Fast/cheap bucketing** — derived from the `slot_schedule` in the
-   active config profile (`proxy/config-fast.yaml` or
-   `proxy/config-cheap.yaml`; transition times and slot counts are read from
-   config; the period(s) with the fewest slots are labelled "fast", the
-   period(s) with the most "cheap"; equal counts collapse to a single fast
-   bucket), keyed by session start time; nothing is hardcoded.
+   `Stream finished` events are collected across the analysis's effective
+   margin beyond the window (48h, shared with the mode timeline in step 5;
+   see `MODE_TIMELINE_MARGIN`), paired per session (FIFO), clipped back to
+   the window, and merged. Busy time is the union of active intervals (at
+   least one slot generating), total compute is the sum of clipped stream
+   durations (slot-seconds), and peak concurrency comes from a sweep over
+   interval endpoints. Busy seconds are attributed to hours and to
+   fast/cheap periods (slot schedule) by splitting at hour and period
+   boundaries. Streams whose start has no paired finish are counted in
+   `unfinished_streams` **only when they started inside the window or within
+   `BUSY_WINDOW_MARGIN` (1h) before it**; streams started earlier are stale
+   pre-window leftovers from earlier windows, tracked separately in
+   `pre_window_unfinished`, and streams started after the window end belong
+   to the next window (LP-0MSVRRO3L0056N6C).
+5. **Fast/cheap bucketing** — each session is bucketed by the **operating
+   mode** active at its first in-window stream, reconstructed from the
+   `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
+   (LP-0MSPZUD4G007IYGH) — so a window crossing the 01:00/10:00 mode
+   transitions splits fast vs cheap correctly even when the analysis itself
+   runs in fast mode. The mode timeline is built with a 48h margin beyond
+   the window (a single streaming pass also serves the busy-time pairing),
+   so the nearest prior transition is always available. The bucket label is
+   the mode name, and the slots / per-period ctx come from that mode's
+   config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
+   2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
+   per-slot context figures reflect the profile that was actually active.
+   Windows with no mode transition observed (single-mode windows) keep the
+   legacy behavior: bucketing from the slot schedule of the analysis-time
+   config profile; nothing is hardcoded.
 6. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,
@@ -248,6 +280,13 @@ run (`Previous outputs archived to …`).
     event (no payload). Remediation: recovery-first silent continue
     (LP-0MSDP2PDB004GV86) + informative-error fallback
     (LP-0MSDP2PH20079WQ7).
+  - `Stream finished: reason=client_disconnect` — terminal event logged by
+    the proxy when a local stream is aborted because the client disconnected
+    mid-stream (in-loop `is_disconnected()` check, GeneratorExit, or the
+    disconnect reaper cancelling the in-flight task; LP-0MSVRRTAB0078TMK).
+    It parses as a normal `stream_finished` (NOT an error), so the stream
+    pairs with its start and its compute time becomes known instead of being
+    reported as "aborted or still running".
   - `Stream error:` — proxy-side stream exception (e.g. `NameError`).
   - `slot_save failed` — local llama-server slot persistence
     ReadTimeouts; usually context pressure → raise local ctx-size
@@ -282,12 +321,20 @@ lines (`proxy.log` and `llama-server.log`).
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
   window; the fast/cheap bucket is keyed by its first in-window stream.
+- The mode timeline is reconstructed from `Mode scheduler` lines within a
+  48h margin of the window; sessions starting before the earliest observed
+  transition in the available logs fall back to the analysis-time mode
+  (documented in LP-0MSPZUD4G007IYGH). A window entirely inside one mode
+  (no transition observed) keeps the legacy slot-schedule bucketing.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
-  within a 1h margin of the window (see `BUSY_WINDOW_MARGIN`); a stream that
-  started more than 1h before the window start is not paired, and streams
-  whose start has no logged finish (aborted/still running) are counted in
-  `unfinished_streams` and excluded — busy time is a conservative lower
-  bound.
+  across the analysis's effective margin (48h, see `MODE_TIMELINE_MARGIN`)
+  and clips streams to the window; a stream that started more than
+  `BUSY_WINDOW_MARGIN` (1h) before the window start is a pre-window
+  leftover and is NOT counted in `unfinished_streams` (tracked separately
+  in `pre_window_unfinished`), while streams started inside the window or
+  within the 1h margin whose start has no logged finish (aborted/still
+  running) are counted in `unfinished_streams` and excluded — busy time is
+  a conservative lower bound.
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
 - llama-server.log eval-timing lines carry no timestamps, so the speed
