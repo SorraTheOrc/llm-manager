@@ -856,7 +856,7 @@ async def admin_metrics():
 # ---------------------------------------------------------------------------
 # The proxy runs in one of two operator-selected modes:
 #   fast  — cloud-backed (remote providers eligible; config-fast.yaml)
-#   cheap — 1-slot local pool, same models/provider chains as fast
+#   cheap — 2-slot local pool, same models/provider chains as fast
 #           (remote providers incl. paid tiers enabled; config-cheap.yaml,
 #           LP-0MSMIPPJI007GU9N)
 # The active mode is persisted in proxy/.mode and survives restarts. See
