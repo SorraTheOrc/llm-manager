@@ -13,6 +13,14 @@
 #                        X-Resolved-Model header; falls back to name)
 #   For local:  llama_model
 #
+# FreeUsageLimitError cooldown (LP-0MSMCM5UG00378G8):
+#   When a provider returns HTTP 429 with error.type = "FreeUsageLimitError"
+#   (no explicit reset duration), the proxy marks it unavailable for a
+#   per-provider cooldown: 24 hours (86400s) for `opencode-deepseek-free` and
+#   `opencode-big-pickle`, and 3 hours (10800s, LP-0MRGU0I91006ODFD) for all
+#   other providers. The override map lives in proxy/provider.py
+#   (`_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES`).
+#
 # Failure-domain grouping (LP-0MSG45I8Q0020N1F):
 #   Provider entries that share the same normalized endpoint form a SINGLE
 #   failure domain and are treated as one unit during mid-stream re-route /
