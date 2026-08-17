@@ -190,6 +190,13 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -230,6 +237,13 @@ models:
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
         model: mimo-v2.5-free
+        forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
         forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
@@ -276,6 +290,13 @@ models:
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
         forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote

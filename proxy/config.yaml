@@ -44,8 +44,12 @@
 #                     ranges (e.g. "22:00-02:00") wrap past midnight.
 #                     Omit the field (or use an empty list) to leave a
 #                     provider unrestricted. Malformed entries are logged and
-#                     ignored (fail-open). The deepseek-v4-flash provider is
-#                     currently timed to off-peak UTC windows (see its entries).
+#                     ignored (fail-open). The deepseek-v4-flash provider
+#                     (direct api.deepseek.com entry and all opencode-hosted
+#                     deepseek entries: opencode-deepseek-free, opencode-go-3-
+#                     deepseek, opencode-go-2-deepseek, opencode-go-deepseek)
+#                     are currently timed to off-peak UTC windows
+#                     (see their entries).
 #                     Example:
 #                       - name: deepseek-v4-flash
 #                         type: remote
@@ -187,6 +191,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -194,6 +199,14 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -201,6 +214,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -208,6 +222,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -235,6 +250,14 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: mimo-v2.5-free
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -242,6 +265,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -249,6 +273,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -274,6 +299,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -281,6 +307,14 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -288,6 +322,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -295,6 +330,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -328,6 +364,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -342,6 +379,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -349,6 +387,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek

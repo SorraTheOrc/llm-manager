@@ -120,6 +120,29 @@ def _load(name: str) -> dict:
         return yaml.safe_load(fh)
 
 
+def _opencode_deepseek_names(models: dict) -> set:
+    """Names of opencode-hosted deepseek provider entries across all models."""
+    return {
+        p["name"]
+        for mc in models.values()
+        for p in mc.get("providers", [])
+        if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+    }
+
+
+def _strip_available_times(models: dict) -> dict:
+    """Deep-copy models with available_times removed from every provider
+    (used to compare profile chains modulo the intentional fast-vs-default
+    timing difference, LP-0MSXPHTD9004DZ4P)."""
+    import copy
+
+    out = copy.deepcopy(models)
+    for mc in out.values():
+        for p in mc.get("providers", []):
+            p.pop("available_times", None)
+    return out
+
+
 class TestFastConfigProfile:
     def test_fast_config_is_3_slot(self):
         """config-fast.yaml keeps the 3-slot pool and 3/3 schedule."""
@@ -148,8 +171,25 @@ class TestFastConfigProfile:
         """config-fast.yaml mirrors config.yaml (current day settings)."""
         base = _load("config.yaml")
         fast = _load("config-fast.yaml")
-        assert fast["models"] == base["models"]
+        # Profiles share the same models/chains modulo the intentional timing
+        # difference: config.yaml times opencode-hosted deepseek, fast does
+        # NOT (LP-0MSXPHTD9004DZ4P).
+        assert _strip_available_times(fast["models"]) == _strip_available_times(base["models"])
         assert fast["server"]["session_slot_pool_size"] == base["server"]["session_slot_pool_size"]
+        # Default times all opencode-hosted deepseek entries; fast leaves them untimed.
+        assert _opencode_deepseek_names(base["models"]) == _opencode_deepseek_names(fast["models"])
+        assert all(
+            p.get("available_times") is not None
+            for mc in base["models"].values()
+            for p in mc.get("providers", [])
+            if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+        )
+        assert all(
+            "available_times" not in p
+            for mc in fast["models"].values()
+            for p in mc.get("providers", [])
+            if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+        )
         assert fast["default_model"] == base["default_model"]
 
 
@@ -213,10 +253,19 @@ class TestCheapConfigProfile:
         assert cfg["providers"][0]["type"] == "remote"
 
     def test_cheap_config_matches_fast_models(self):
-        """cheap and fast expose identical models/provider chains (LP-0MSMIPPJI007GU9N)."""
+        """cheap and fast expose identical models/provider chains modulo the
+        intentional timing difference: cheap times opencode-hosted deepseek
+        (LP-0MSXPHTD9004DZ4P), fast does not."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
-        assert cheap["models"] == fast["models"]
+        assert _strip_available_times(cheap["models"]) == _strip_available_times(fast["models"])
+        assert _opencode_deepseek_names(cheap["models"]) == _opencode_deepseek_names(fast["models"])
+        assert all(
+            p.get("available_times") is not None
+            for mc in cheap["models"].values()
+            for p in mc.get("providers", [])
+            if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+        )
 
     def test_cheap_config_differs_from_fast_only_by_slot_pool_ctx_and_contention(self):
         """The only intended cheap-vs-fast server differences are the local
