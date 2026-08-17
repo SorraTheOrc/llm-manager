@@ -1,0 +1,4 @@
+# Ruff configuration (created by audit remediation)
+
+[per-file-ignores]
+"/home/rgardler/projects/llm/scripts/rebuild-and-restart-mtp.sh" = ["E702", "E701"]
