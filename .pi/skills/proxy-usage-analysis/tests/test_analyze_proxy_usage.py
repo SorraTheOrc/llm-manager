@@ -1496,6 +1496,59 @@ class TestBusyStats:
         assert hourly[9] == 10.0
         assert hourly[10] == 15.0
 
+    def test_hourly_attribution_window_bounded_non_aligned(self):
+        # Window 09:30-10:45 is not hour-aligned: hourly_busy values must be
+        # window-correct per hour-of-day (partial first/last hours truncated
+        # to the window edges), so the report can render window-bounded
+        # buckets from them unchanged (LP-0MSVMLM7G009N74N AC2/AC5).
+        start = datetime(2026, 8, 2, 9, 30, 0)
+        end = datetime(2026, 8, 2, 10, 45, 0)
+        events = [
+            # 30s busy in the partial first hour (09:30-10:00 window part).
+            _local_event("stream_started", datetime(2026, 8, 2, 9, 40, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 9, 40, 30), "s1"),
+            # 15s busy in the partial last hour (10:00-10:45 window part).
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 30, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 30, 15), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(events, start, end, _schedule())
+        assert busy is not None
+        assert busy.busy_seconds == 45.0
+        hourly = dict(busy.hourly_busy)
+        assert hourly[9] == 30.0
+        assert hourly[10] == 15.0
+
+    def test_report_hourly_busy_table_window_bounded_with_pct_and_totals(self):
+        # Regression (LP-0MSVMLM7G009N74N): the hourly busy table spans exactly
+        # the report window (partial first/last rows truncated to the window
+        # edges), lists every hour including idle ones, carries a % column
+        # (busy / window-bounded bucket duration), and ends with a totals row
+        # matching the summary's overall busy %.
+        start = datetime(2026, 8, 2, 9, 30, 0)
+        end = datetime(2026, 8, 2, 11, 45, 0)
+        lines = [
+            # 30s busy in the partial first hour (09:30-10:00).
+            "2026-08-02 09:40:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 09:40:30,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            # 15s busy in the partial last hour (11:00-11:45); hour 10:00-11:00 idle.
+            "2026-08-02 11:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s2 request=[]",
+            "2026-08-02 11:30:15,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), start, end, _schedule())
+        assert summary.busy is not None
+        md = reporting.build_report(summary, None)
+        util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        # AC1: retitled.
+        assert "Busy time by hour:" in util
+        assert "Busy seconds by hour:" not in util
+        # AC2/AC3: window-bounded rows with a % column; idle middle hour listed.
+        assert "| Hour | Busy | % |" in util
+        assert "| 09:30-10:00 | 30s | 1.7% |" in util
+        assert "| 10:00-11:00 | 0s | 0.0% |" in util
+        assert "| 11:00-11:45 | 15s | 0.6% |" in util
+        # AC4: totals row = total busy over the window and overall busy %.
+        assert "| Totals | 45s | 0.6% |" in util
+
     def test_aggregate_populates_busy(self):
         lines = [
             "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
