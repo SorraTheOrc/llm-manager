@@ -763,6 +763,207 @@ async def test_remote_fallback_free_usage_limit_in_proxy_with_fallback(sample_mo
     )
 
 
+@pytest.mark.asyncio
+async def test_free_usage_limit_opencode_deepseek_free_24h_cooldown():
+    """opencode-deepseek-free should get a 24-hour (86400s) cooldown on FreeUsageLimitError."""
+    model_config = {
+        "providers": [
+            {
+                "name": "opencode-deepseek-free",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen",
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+            {
+                "name": "opencode-go-2-deepseek",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+        ],
+        "aliases": ["*"],
+    }
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(
+                status_code=429,
+                content=json.dumps({
+                    "type": "error",
+                    "error": {
+                        "type": "FreeUsageLimitError",
+                        "message": "Rate limit exceeded.",
+                    },
+                    "metadata": {},
+                }).encode("utf-8"),
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2
+
+    # opencode-deepseek-free should have a 24-hour cooldown
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("opencode-deepseek-free")
+    assert expiry is not None, "opencode-deepseek-free should have a cooldown expiry"
+    cooldown_seconds = expiry - now
+    assert cooldown_seconds >= 86300, (
+        f"Expected ~86400s cooldown for opencode-deepseek-free, got {cooldown_seconds:.1f}s"
+    )
+    assert cooldown_seconds <= 86500, (
+        f"Cooldown too large: {cooldown_seconds:.1f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_free_usage_limit_opencode_big_pickle_24h_cooldown():
+    """opencode-big-pickle should get a 24-hour (86400s) cooldown on FreeUsageLimitError."""
+    model_config = {
+        "providers": [
+            {
+                "name": "opencode-big-pickle",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen",
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+            {
+                "name": "opencode-go-deepseek",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+        ],
+        "aliases": ["*"],
+    }
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(
+                status_code=429,
+                content=json.dumps({
+                    "type": "error",
+                    "error": {
+                        "type": "FreeUsageLimitError",
+                        "message": "Rate limit exceeded.",
+                    },
+                    "metadata": {},
+                }).encode("utf-8"),
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2
+
+    # opencode-big-pickle should have a 24-hour cooldown
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("opencode-big-pickle")
+    assert expiry is not None, "opencode-big-pickle should have a cooldown expiry"
+    cooldown_seconds = expiry - now
+    assert cooldown_seconds >= 86300, (
+        f"Expected ~86400s cooldown for opencode-big-pickle, got {cooldown_seconds:.1f}s"
+    )
+    assert cooldown_seconds <= 86500, (
+        f"Cooldown too large: {cooldown_seconds:.1f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_free_usage_limit_non_overridden_provider_3h_cooldown():
+    """A provider NOT in the override map should still get the default 3-hour cooldown."""
+    model_config = {
+        "providers": [
+            {
+                "name": "opencode-mimo-v2.5-free",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen",
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+            {
+                "name": "opencode-go-mimo",
+                "type": "remote",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+        ],
+        "aliases": ["*"],
+    }
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return Response(
+                status_code=429,
+                content=json.dumps({
+                    "type": "error",
+                    "error": {
+                        "type": "FreeUsageLimitError",
+                        "message": "Rate limit exceeded.",
+                    },
+                    "metadata": {},
+                }).encode("utf-8"),
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_count == 2
+
+    # Should get the default 3-hour cooldown, not 24h
+    now = time.time()
+    expiry = provider._provider_unavailable_until.get("opencode-mimo-v2.5-free")
+    assert expiry is not None
+    cooldown_seconds = expiry - now
+    assert cooldown_seconds >= 10700, (
+        f"Expected ~10800s default cooldown, got {cooldown_seconds:.1f}s"
+    )
+    assert cooldown_seconds <= 10900, (
+        f"Cooldown too large: {cooldown_seconds:.1f}s"
+    )
+
+
 # ===================================================================
 # Local-to-remote fallback tests
 # ===================================================================
