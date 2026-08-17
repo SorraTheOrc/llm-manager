@@ -1,0 +1,97 @@
+{
+  "config": {
+    "run_type": "baseline",
+    "model": "plan",
+    "prompts": [
+      "Explain the concept of quantum computing in simple terms.",
+      "Write a short poem about artificial intelligence.",
+      "What are the key differences between Python and Rust?",
+      "Summarize the main causes of climate change.",
+      "Write a function to sort a list of integers in Python."
+    ],
+    "num_requests": 5,
+    "quantization": "",
+    "ctx_size": 0,
+    "base_url": "http://localhost:8000",
+    "concurrency": 1,
+    "max_tokens": 128,
+    "timeout": 60.0,
+    "snapshot_script": null,
+    "proxy_restart_time": null,
+    "llama_ready_time": null
+  },
+  "requests": [
+    {
+      "request_index": 0,
+      "prompt": "Explain the concept of quantum computing in simple terms.",
+      "status": "completed",
+      "total_duration_seconds": 11.6088,
+      "prompt_tokens": 21,
+      "completion_tokens": 128,
+      "tokens_per_second": 11.03,
+      "time_to_first_token_seconds": 0.135,
+      "error": null
+    },
+    {
+      "request_index": 1,
+      "prompt": "Write a short poem about artificial intelligence.",
+      "status": "completed",
+      "total_duration_seconds": 9.0959,
+      "prompt_tokens": 18,
+      "completion_tokens": 128,
+      "tokens_per_second": 14.07,
+      "time_to_first_token_seconds": 0.1058,
+      "error": null
+    },
+    {
+      "request_index": 2,
+      "prompt": "What are the key differences between Python and Rust?",
+      "status": "completed",
+      "total_duration_seconds": 27.5626,
+      "prompt_tokens": 20,
+      "completion_tokens": 128,
+      "tokens_per_second": 4.64,
+      "time_to_first_token_seconds": 0.3205,
+      "error": null
+    },
+    {
+      "request_index": 3,
+      "prompt": "Summarize the main causes of climate change.",
+      "status": "completed",
+      "total_duration_seconds": 13.9935,
+      "prompt_tokens": 20,
+      "completion_tokens": 128,
+      "tokens_per_second": 9.15,
+      "time_to_first_token_seconds": 0.1627,
+      "error": null
+    },
+    {
+      "request_index": 4,
+      "prompt": "Write a function to sort a list of integers in Python.",
+      "status": "completed",
+      "total_duration_seconds": 7.7947,
+      "prompt_tokens": 22,
+      "completion_tokens": 128,
+      "tokens_per_second": 16.42,
+      "time_to_first_token_seconds": 0.0906,
+      "error": null
+    }
+  ],
+  "summary": {
+    "total_requests": 5,
+    "completed": 5,
+    "errors": 0,
+    "avg_total_duration_seconds": 14.0111,
+    "avg_tokens_per_second": 11.06,
+    "avg_time_to_first_token_seconds": 0.1629,
+    "total_prompt_tokens": 101,
+    "total_completion_tokens": 640,
+    "p95_total_duration_seconds": 27.5626,
+    "p95_time_to_first_token_seconds": 0.3205,
+    "p95_tokens_per_second": 16.42,
+    "memory_snapshot_bytes": null,
+    "gpu_memory_used_bytes": null,
+    "gpu_memory_total_bytes": null
+  },
+  "timestamp": "2026-08-17T18:37:53.593469Z"
+}

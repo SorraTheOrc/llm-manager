@@ -324,6 +324,61 @@ models:
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
+
+  local-qwen3-mtp:
+    # MTP evaluation model (LP-0MSNI1B68001VE6C): Qwen3.6-35B-A3B served
+    # from the MTP-converted GGUF with llama-server --spec-type draft-mtp
+    # --spec-draft-n-max 2. Coexists with production Qwen3 serving; the
+    # plan/author/code chains above are UNCHANGED until rollout is approved
+    # post-benchmark. Requires an MTP-capable llama-server build (the local
+    # build b8782/e97492369 predates llama.cpp PR #22673 and lacks draft-mtp)
+    # and single-slot serving (--parallel 1), mirroring the proxy's
+    # LLAMA_PARALLEL when routed to this model.
+    providers:
+      - name: local-qwen3-mtp
+        type: local
+        llama_model: Qwen3-MTP
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    aliases:
+    - local-qwen3-mtp
+    - qwen3-mtp
+    force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
