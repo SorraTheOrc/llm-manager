@@ -109,7 +109,8 @@ providers:
 logging:
   directory: /var/log/llama-proxy
   level: INFO
-  retention_days: 90
+  retention_days: 7
+  compress_after_days: 1
   rotation_hours: 6
   # Verbose per-chunk SSE logging (LP-0MS9GAN2P002NR4M).
   # When false (default), STREAM CHUNK lines are logged at DEBUG level and
