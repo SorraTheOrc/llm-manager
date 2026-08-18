@@ -89,7 +89,7 @@ def test_rebuild_llama_dry_run_json():
 def test_deploy_only_copies_binary_and_libs_and_stops_server_first(tmp_path, monkeypatch):
     """--deploy-only on an existing build must stop the old server, then copy the
     binary and its sibling shared libs, then patch the RUNPATH — in that order."""
-    build_bin = _fake_build(tmp_path)
+    _, _ = _fake_build(tmp_path)
     tools, order = _fake_tools(tmp_path)
     deploy_bin = tmp_path / "deploy" / "bin"
     deploy_bin.mkdir(parents=True)
@@ -120,8 +120,8 @@ def test_deploy_only_copies_binary_and_libs_and_stops_server_first(tmp_path, mon
         "pkill must match by process NAME, not by the deploy path"
 
     # RUNPATH must point at $ORIGIN (+ rocm lib dirs), not the temp build dir
-    patchelf_lines = [l for l in lines if l.startswith("patchelf ")]
-    assert any("$ORIGIN" in l for l in patchelf_lines), f"RUNPATH must contain $ORIGIN: {patchelf_lines}"
+    patchelf_lines = [line for line in lines if line.startswith("patchelf ")]
+    assert any("$ORIGIN" in line for line in patchelf_lines), f"RUNPATH must contain $ORIGIN: {patchelf_lines}"
 
     # JSON reports the deployed version and the commit fallback
     assert data["ok"] == 1
