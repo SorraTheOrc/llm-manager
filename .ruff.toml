@@ -22,4 +22,4 @@ ignore = [
 
 # Test-specific overrides
 # Permit assert (S101), print (T201), and unused imports in test files
-per-file-ignores = { "tests/*" = ["S101", "T201", "F401"], "proxy/tests/*" = ["S101", "T201", "F401"], "scripts/rebuild-and-restart-mtp.sh" = ["E702", "E701"] }
+per-file-ignores = { "tests/*" = ["S101", "T201", "F401"], "proxy/tests/*" = ["S101", "T201", "F401"], "scripts/rebuild-and-restart-mtp.sh" = ["E701", "E702"], "scripts/rebuild-llama.sh" = ["E702", "E703"] }
