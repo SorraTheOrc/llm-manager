@@ -109,13 +109,15 @@ def test_deploy_only_copies_binary_and_libs_and_stops_server_first(tmp_path, mon
 
     # Ordering contract: stop (pkill) happens before the RUNPATH patch, and only
     # after the pkill attempt may the copy be performed. order.log records
-    # sequence; the first call MUST be pkill of the deploy path.
+    # sequence; the FIRST call MUST be pkill, matching the running process by
+    # NAME (-x llama-server) — never by full path (a wrapper shell embedding the
+    # path in its own cmdline would be killed too, LP-0MSXXKZOW0038XLK).
     lines = order.read_text(encoding="utf-8").strip().splitlines()
     assert lines, "no tool calls recorded"
     assert lines[0].startswith("pkill "), f"first call must be pkill, got: {lines[0]}"
-    assert str(deploy_bin / "llama-server") in lines[0]
-    assert any(l.startswith("patchelf ") for l in lines), "patchelf never invoked"
-    assert lines.index([l for l in lines if l.startswith("patchelf ")][0]) > 0
+    assert "-x" in lines[0] and "llama-server" in lines[0]
+    assert str(deploy_bin / "llama-server") not in lines[0], \
+        "pkill must match by process NAME, not by the deploy path"
 
     # RUNPATH must point at $ORIGIN (+ rocm lib dirs), not the temp build dir
     patchelf_lines = [l for l in lines if l.startswith("patchelf ")]

@@ -134,12 +134,15 @@ fi
 [[ -f "$SRC_BIN" ]] || { echo "Built binary not found at $SRC_BIN" >&2; emit_json 0 "" "" "" "\"missing ${SRC_BIN}\""; exit 2; }
 mkdir -p "$DEPLOY_DIR"
 
-# 1. Stop running llama-server processes bound to the deploy path BEFORE copying,
-#    otherwise `cp` fails with ETXTBSY ("Text file busy").
+# 1. Stop running llama-server processes BEFORE copying, otherwise `cp` fails
+#    with ETXTBSY ("Text file busy"). Match by process NAME (-x), NOT by the
+#    full path: a wrapper shell (e.g. `bash -c '... --deploy-path <path>'`)
+#    contains the path in its own command line, so `pkill -f <path>` would kill
+#    the invoking shell itself (observed during LP-0MSXXKZOW0038XLK deploy).
 if command -v pkill >/dev/null 2>&1 && command -v pgrep >/dev/null 2>&1; then
-  pkill -f "$DEPLOY_PATH" 2>/dev/null || true
+  pkill -x llama-server 2>/dev/null || true
   for _ in $(seq 1 30); do
-    pgrep -f "$DEPLOY_PATH" >/dev/null 2>&1 || break
+    pgrep -x llama-server >/dev/null 2>&1 || break
     sleep 1
   done
 else
