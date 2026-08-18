@@ -269,17 +269,24 @@ class TestCheapConfigProfile:
 
     def test_cheap_config_differs_from_fast_only_by_slot_pool_ctx_and_contention(self):
         """The only intended cheap-vs-fast server differences are the local
-        slot pool (2 vs 3), the per-period ctx_size (262144 vs 131072), the
-        per-mode contention-queue policy (cheap=queue vs fast=fallback,
-        LP-0MSORQVK50012Q4D F2), and the cold-cache threshold (cheap 30000
-        after revert vs fast 38000, LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K
-        AC7). Everything else (models, static ctx, warm threshold) is identical."""
+        slot pool (2 vs 3), the per-period ctx_size (cheap schedules 262144
+        override; fast pins 262144 inline per LP-0MSY0SDAS0031Y7F),
+        local_model_ctx_size (fast 262144 inline, cheap 131072 base + 262144
+        schedule override), the per-mode contention-queue policy (cheap=queue
+        vs fast=fallback, LP-0MSORQVK50012Q4D F2), and the cold-cache
+        threshold (cheap 30000 after revert vs fast 38000, LP-0MSOMVOPH004ATAK
+        / LP-0MSRM54YO007YG0K AC7). Everything else (models, warm threshold)
+        is identical."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
         fast_srv = dict(fast["server"])
         cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
         cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
+        # local_model_ctx_size differs intentionally per profile (fast
+        # 262144 inline; cheap 131072 base with 262144 schedule override),
+        # LP-0MSY0SDAS0031Y7F.
+        cheap_srv["local_model_ctx_size"] = fast_srv["local_model_ctx_size"]
         # Cheap declares queue + caps; fast declares fallback (no caps).
         cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
         cheap_srv.pop("contention_queue_max_wait_seconds", None)
@@ -298,7 +305,7 @@ class TestCheapConfigProfile:
         assert [e["slots"] for e in cheap_entries] == [2, 2]
         assert [e["slots"] for e in fast_entries] == [3, 3]
         assert all(e.get("ctx_size") == 262144 for e in cheap_entries)
-        assert all(e.get("ctx_size") == 131072 for e in fast_entries)
+        assert all(e.get("ctx_size") == 262144 for e in fast_entries)  # LP-0MSY0SDAS0031Y7F
         assert cheap["server"]["contention_queue_policy"] == "queue"
         assert cheap["server"]["contention_queue_max_wait_seconds"] == 60
         assert cheap["server"]["contention_queue_max_depth"] == 4
@@ -308,7 +315,16 @@ class TestCheapConfigProfile:
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
-        """The local model context size is unchanged between profiles."""
+        """The local model context size: fast inlines 262144 (operator
+        supersede LP-0MSY0SDAS0031Y7F) while cheap keeps the 131072 base and
+        applies the 262144 override only via its schedule entries.
+        """
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
-        assert cheap["server"]["local_model_ctx_size"] == fast["server"]["local_model_ctx_size"]
+        assert fast["server"]["local_model_ctx_size"] == 262144
+        assert cheap["server"]["local_model_ctx_size"] == 131072
+        assert all(
+            e.get("ctx_size") == 262144
+            for e in cheap["server"]["slot_schedule"]["entries"]
+        )
+        assert fast["server"]["local_model_ctx_size"] >= cheap["server"]["local_model_ctx_size"]

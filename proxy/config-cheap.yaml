@@ -15,14 +15,12 @@
 #     exhausted. Keep this file's models section in sync with
 #     config-fast.yaml (test_cheap_config_matches_fast_models guards it).
 #
-# BOOT CATCH-UP NOTE (LP-0MSMZOAJW002UR2A): local_model_ctx_size below stays
-# 131072 (the shared models.ini base) even though the schedule entries carry
-# ctx_size: 262144. The slot-scheduler applies the per-period ctx override
-# via a boot catch-up restart (it fires only when the static config differs
-# from the active schedule entry). DO NOT align local_model_ctx_size with the
-# entries' 262144: that would suppress the catch-up and cheap would boot at
-# 131072 total (2x65.5K) for the whole period. The catch-up transient runs at
-# 2x65.5K (clamp 61440 <= real per-slot 65536) — the safe direction.
+# CTX NOTE (LP-0MSMZOAJW002UR2A + LP-0MSY0SDAS0031Y7F): the shared
+# models.ini [Qwen3] base is now 262144 and the schedule entries carry
+# ctx_size: 262144, so cheap boots 2x262144 natively (no catch-up needed)
+# and local_model_ctx_size below runs the static clamp 61440 (131072//2 - 4096)
+# which is CONSERVATIVE vs the real per-slot 131072 — the safe direction. The
+# scheduled clamp resolves higher (min(100000, 262144//2 - 4096) = 100000).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -128,7 +126,8 @@ providers:
 logging:
   directory: /var/log/llama-proxy
   level: INFO
-  retention_days: 90
+  retention_days: 7
+  compress_after_days: 1
   rotation_hours: 6
   # Verbose per-chunk SSE logging (LP-0MS9GAN2P002NR4M).
   # When false (default), STREAM CHUNK lines are logged at DEBUG level and

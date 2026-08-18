@@ -63,7 +63,40 @@ Important: your existing setup uses a container image where `llama-server` is pr
    # Verify proxy health
    curl http://localhost:8000/health
 
-5) If you prefer not to install on the host
+6) Install logrotate drop-in (optional but recommended)
+
+   The proxy uses `TimedRotatingFileHandler` for in-process rotation (every
+   6 hours by default) with configurable retention.  A logrotate drop-in
+   provides compression and a safety net that survives proxy restarts:
+
+     sudo cp proxy/scripts/llama-proxy-logrotate /etc/logrotate.d/llama-proxy
+     sudo logrotate -s /var/lib/logrotate/llama-proxy.status \
+       /etc/logrotate.d/llama-proxy
+
+   Configuration knobs (in `config.yaml`, `config-fast.yaml`, or
+   `config-cheap.yaml`):
+
+   - `logging.retention_days` — how many days of rotated files to keep.
+     Default: **7** (was 90, reduced in LP-0MSNKMXIK004P7TL).
+   - `logging.compress_after_days` — plain-text rotated files older than
+     this are gzip-compressed to `.gz` (keeps the last day readable without
+     decompressing). Set to `0` to disable in-process compression. Default: **1**.
+   - `logging.rotation_hours` — rotation interval in hours. Default: **6**.
+   - `logging.level` — log level. Default: **INFO**.
+   - `logging.verbose_chunks` — write per-chunk SSE data at INFO level.
+     Default: **false** (cuts log volume by >99% at default INFO level).
+   - `logging.directory` — log directory. Default: **/var/log/llama-proxy**.
+
+   Logrotate settings (in the drop-in):
+
+   - `proxy.log` — rotated daily, kept 7 days, gzip compressed.
+   - `llama-server.log` — rotated daily, kept 15 days, gzip compressed.
+
+   The proxy compresses old retained files and prunes files beyond
+   `retention_days` on every startup, so the first run after a retention
+   change will clean up any backlog.
+
+7) If you prefer not to install on the host
 
    - Use the container-based fixes (make systemd allow writing to /run/user/$UID/libpod, run service as user, or fix podman rootless setup). Those are safer long-term but require more changes.
 

@@ -363,21 +363,22 @@ class TestLiveConfigsValidate:
         assert problems == [], f"{config_file}: {problems}"
 
     def test_fast_mode_cold_below_warm(self):
-        """Fast mode: cold 38000 < effective warm clamp 39594."""
+        """Fast mode: cold 38000 < effective warm clamp 83285 (3x262144,
+        LP-0MSY0SDAS0031Y7F)."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config-fast.yaml"))
         assert cold == 38000
-        assert warm == 39594
+        assert warm == 83285
         assert cold < warm
 
     def test_default_mode_cold_below_warm(self):
-        """Default profile (config.yaml) mirrors fast: cold 38000 < 39594."""
+        """Default profile (config.yaml) mirrors fast: cold 38000 < 83285."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 39594
+        assert warm == 83285
         assert cold < warm
 
     def test_cheap_mode_cold_below_warm(self):

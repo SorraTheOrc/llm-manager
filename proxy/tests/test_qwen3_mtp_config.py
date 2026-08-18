@@ -140,6 +140,28 @@ def test_models_ini_qwen3_mtp_same_ctx_as_qwen3():
     )
 
 
+def test_models_ini_reasoning_format_set_for_qwen3_presets():
+    """[Qwen3] and [Qwen3-MTP] must set reasoning-format = deepseek.
+
+    LP-0MSYLL3LY004CANG: the llama.cpp build deployed for the MTP
+    experiment (10480/01818e495) ends turns with a bare finish_reason=stop
+    after reasoning when reasoning-format is unset, so the model never emits
+    tool_calls. The old build kept generating until the tool call or the
+    length cap. A/B verification: with reasoning-format=deepseek the bare-stop
+    failure drops from 2/6 to 0/6 and tool-call rate is >= the old build.
+    """
+    config = configparser.ConfigParser()
+    config.read(MODELS_INI_PATH)
+    for section in ("Qwen3", "Qwen3-MTP"):
+        assert section in config.sections(), f"[{section}] section should exist"
+        assert "reasoning-format" in config[section], (
+            f"[{section}] should have reasoning-format"
+        )
+        assert config[section]["reasoning-format"] == "deepseek", (
+            f"[{section}] reasoning-format should be deepseek"
+        )
+
+
 # ---------------------------------------------------------------------------
 # proxy config checks
 # ---------------------------------------------------------------------------

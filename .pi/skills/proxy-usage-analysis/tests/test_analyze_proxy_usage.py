@@ -2265,3 +2265,59 @@ class TestArchiveOutputs:
         # Non-artifact files stay put (cron log lives at the root).
         assert (out / "cron.log").read_text() == "2026-08-07 05:00 ok\n"
         assert not (archived / "cron.log").exists()
+
+
+# ---------------------------------------------------------------------------
+# Time to completion
+# ---------------------------------------------------------------------------
+
+
+class TestTimeToCompletion:
+    """The report's ``## Time to completion`` section (session duration
+    percentiles, split Total / Fast / Cheap)."""
+
+    def test_percentile_basic(self):
+        assert reporting._percentile([], 50) is None
+        assert reporting._percentile([1.0, 2.0, 3.0, 4.0, 5.0], 50) == pytest.approx(3.0)
+        # Linear interpolation between neighbours for non-integer ranks.
+        assert reporting._percentile([1.0, 2.0, 3.0, 4.0, 5.0], 10) == pytest.approx(1.4)
+        assert reporting._percentile([1.0, 2.0, 3.0, 4.0, 5.0], 90) == pytest.approx(4.6)
+        # Single value: every percentile is that value.
+        assert reporting._percentile([7.0], 90) == 7.0
+
+    def test_report_section_splits_total_fast_cheap(self):
+        # Schedule: 00:00-12:00 -> 8 slots (cheap), 12:00-14:30 -> 4 slots
+        # (fast), 14:30-24:00 -> 8 slots (cheap). So in the 14:00-15:00 window
+        # sessions before 14:30 are fast and after 14:30 cheap.
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        # s1: 100s local-only (fast); s2: 300s local -> remote (fast);
+        # s3: 600s remote-only (cheap); s4: 200s local-only (cheap).
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:01:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:02:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s2 request=[]",
+            "2026-08-02 14:07:00,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:40:00,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s3 request=[]",
+            "2026-08-02 14:50:00,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s3 provider=opencode-go model=deepseek-v4-flash request=[]",
+            "2026-08-02 14:45:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s4 request=[]",
+            "2026-08-02 14:48:20,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s4 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, schedule)
+        assert len(summary.sessions) == 4
+        md = reporting.build_report(summary, None)
+        section = md.split("## Time to completion", 1)[1].split("## ", 1)[0]
+        # Header + 3 data rows (Total / Fast / Cheap).
+        assert "| Bucket | Sessions | p10 (s) | Median (s) | p90 (s) |" in section
+        # Durations: s1=100s (fast), s2=300s (fast), s4=200s (cheap), s3=600s (cheap).
+        # Total (4 values): median (200+300)/2 = 250s, p10 = 130s, p90 = 510s.
+        assert "| Total | 4 | 130.0 | 250.0 | 510.0 |" in section
+        # Fast (s1=100, s2=300): median 200s, p10 = 120s, p90 = 280s.
+        assert "| Fast | 2 | 120.0 | 200.0 | 280.0 |" in section
+        # Cheap (s4=200, s3=600): median 400s, p10 = 240s, p90 = 560s.
+        assert "| Cheap | 2 | 240.0 | 400.0 | 560.0 |" in section
+
+    def test_section_absent_for_empty_window(self):
+        md = reporting.build_report(aggregation.aggregate([], WINDOW_START, WINDOW_END, _schedule()), None)
+        # Section header renders with an empty-window note (like the speed sections).
+        assert "## Time to completion" in md
+        assert "_No sessions in window._" in md

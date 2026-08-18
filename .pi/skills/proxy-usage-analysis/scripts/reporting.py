@@ -379,6 +379,7 @@ def build_report(
         ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, count):.1f}%) | "
            f"{cheap} ({_pct(cheap, count):.1f}%) | {reqs} | {fb} |")
 
+    _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
 
@@ -578,6 +579,51 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
 
 def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Return the ``pct``-th percentile of *values* (0–100), or ``None`` when empty."""
+    if not values:
+        return None
+    s = sorted(values)
+    k = (pct / 100.0) * (len(s) - 1)
+    f = int(k)
+    c = f + 1
+    if c >= len(s):
+        return s[f]
+    return s[f] + (k - f) * (s[c] - s[f])
+
+
+def _append_ttc_section(
+    ap,
+    sessions: list[SessionStats],
+) -> None:
+    """Append the ``## Time to completion`` section to the report.
+
+    Shows p10 / median / p90 of session duration (stream-start → stream-end),
+    split by Total / Fast / Cheap.
+    """
+    ap("")
+    ap("## Time to completion")
+    ap("")
+    if not sessions:
+        ap("_No sessions in window._")
+        return
+    ap("Percentiles of session duration (``Stream started`` → last ``Stream finished`` in-window).")
+    ap("")
+    ap("| Bucket | Sessions | p10 (s) | Median (s) | p90 (s) |")
+    ap("|---|---|---|---|---|")
+    for label, bucket_key in (("Total", "all"), ("Fast", "fast"), ("Cheap", "cheap")):
+        if bucket_key == "all":
+            durations = [s.duration_seconds for s in sessions]
+        else:
+            durations = [s.duration_seconds for s in sessions if _bucket_key(s.bucket) == bucket_key]
+        p10 = _percentile(durations, 10)
+        med = _percentile(durations, 50)
+        p90 = _percentile(durations, 90)
+        ap(f"| {label} | {len(durations)} | "
+           f"{_speed_cell(p10)} | {_speed_cell(med)} | {_speed_cell(p90)} |")
+    ap("")
 
 
 def _speed_cell(value: float | None) -> str:
