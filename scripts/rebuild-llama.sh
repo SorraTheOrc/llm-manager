@@ -168,7 +168,6 @@ done
 #    temp build survives; next rebuild runs `rm -rf` on it).
 patchelf --set-rpath "\$ORIGIN:${ROCM_LIBS}" "$DEPLOY_PATH" || { echo "patchelf failed on $DEPLOY_PATH" >&2; emit_json 0 "" "" "" "\"patchelf failed\""; exit 2; }
 for lib in "${deployed_libs[@]}"; do
-  [[ "$lib" == *.so.* ]] || continue
   patchelf --set-rpath "\$ORIGIN:${ROCM_LIBS}" "$DEPLOY_DIR/$lib" 2>/dev/null || true
 done
 
