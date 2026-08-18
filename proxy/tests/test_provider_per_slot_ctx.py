@@ -117,23 +117,24 @@ class TestColdWarmBandReachable:
 
     def _production_config(self):
         """Mirror the live proxy/config.yaml routing settings (fast-mode
-        default profile; cold raised 30000→38000, LP-0MSOMVOPH004ATAK)."""
+        default profile; cold raised 30000→38000, LP-0MSOMVOPH004ATAK;
+        ctx 262144 per operator supersede LP-0MSY0SDAS0031Y7F)."""
         return {"server": {
             "local_large_context_cold_cache_threshold": 38000,
             "local_large_context_warm_cache_threshold": 100000,
-            "local_model_ctx_size": 131072,
+            "local_model_ctx_size": 262144,
             "session_slot_pool_size": 3,
         }}
 
     def test_production_config_returns_cold_below_warm(self):
         """AC1: under the production config, cold < warm so the band exists.
 
-        131072 ctx / 3 slots = 43690 per-slot, minus 4096 headroom =
-        39594 cap. Cold (38000) must stay below the clamped warm (39594).
+        262144 ctx / 3 slots = 87381 per-slot, minus 4096 headroom =
+        83285 cap. Cold (38000) must stay below the clamped warm (83285).
         """
         cold, warm = _effective_large_context_thresholds(self._production_config())
         assert cold == 38000
-        assert warm == 39594
+        assert warm == 83285
         assert cold < warm
 
     def test_only_warm_is_clamped_cold_passes_through(self):

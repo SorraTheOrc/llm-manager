@@ -536,15 +536,19 @@ server:
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
-  # ctx-size = 131072). Used to compute the actual per-slot context
-  # (ctx_size / active_slots) which clamps the large-context routing
-  # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
+  # ctx-size) and the slot_schedule ctx_size pins below. Used to compute the
+  # actual per-slot context (ctx_size / active_slots) which clamps the
+  # large-context routing thresholds (LP-0MSAZXXDY005AWA1). 0 disables the
+  # clamp.
   #
-  # Option C (3x43.7K = 131072/3, pool 3, schedule 3/3) restored per
-  # LP-0MSEGPO77005CYCQ F4: the ctx-size evaluation (LP-0MSAOQTJS000FFVM)
-  # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
-  # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
-  local_model_ctx_size: 131072
+  # Operator supersede 2026-08-18 (LP-0MSY0SDAS0031Y7F): raised to 262144
+  # (3x87.4K per-slot) per operator decision — the long-context NO-GO of
+  # LP-0MSAOQTJS000FFVM / LP-0MSEGPO77005CYCQ (4x65.5K / 3x87.4K / 2x131K)
+  # is superseded for this profile. Rationale: remote fallback tiers are
+  # rate-limited (opencode 429s observed 2026-08-18); the runtime already
+  # serves 262144 ctx and the 120 GB GPU has headroom (context ~47 GB at
+  # 3x262144 q8_0).
+  local_model_ctx_size: 262144
   # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
   # When a session's estimated context reaches this fraction of the
   # effective per-slot context (ctx_size / slots - 4096 headroom), the
