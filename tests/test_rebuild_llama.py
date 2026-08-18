@@ -89,7 +89,7 @@ def test_rebuild_llama_dry_run_json():
 def test_deploy_only_copies_binary_and_libs_and_stops_server_first(tmp_path, monkeypatch):
     """--deploy-only on an existing build must stop the old server, then copy the
     binary and its sibling shared libs, then patch the RUNPATH — in that order."""
-    _, _ = _fake_build(tmp_path)
+    _fake_build(tmp_path)  # side effect: create the fake build tree; return value unused
     tools, order = _fake_tools(tmp_path)
     deploy_bin = tmp_path / "deploy" / "bin"
     deploy_bin.mkdir(parents=True)
