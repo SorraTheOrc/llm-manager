@@ -323,7 +323,7 @@ case "$model" in
     REPOID=unsloth
     MODEL=unsloth/Qwen3.6-35B-A3B-MTP-GGUF
     QUANTIZATION=Q4_K_S
-    CONTEXT=131072 # 128k context window (canonical size, matches qwen3)
+    CONTEXT=262144 # matches [Qwen3] and models.ini [Qwen3-MTP] (fair A/B, LP-0MSY0SDAS0031Y7F / LP-0MSYLL3LY004CANG)
     BATCH_SIZE=4096
     UBATCH_SIZE=256
     CHAT_TEMPLATE_KWARGS=""
