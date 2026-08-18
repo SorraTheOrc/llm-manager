@@ -149,12 +149,17 @@ else
   echo "WARNING: pkill/pgrep unavailable; copying over a running binary may fail with ETXTBSY" >&2
 fi
 
-# 2. Copy the binary and its sibling shared libs.
-cp -f "$SRC_BIN" "$DEPLOY_PATH" || { echo "Failed to copy binary to $DEPLOY_PATH" >&2; emit_json 0 "" "" "" "\"copy failed for ${DEPLOY_PATH}\""; exit 2; }
+# 2. Copy the binary and its sibling shared libs, replacing the target ATOMICALLY
+#    (cp to a temp name, then rename into place). Once the proxy respawns the
+#    router it may exec/mmap the old build within a second — rename() replaces the
+#    directory entry without touching the executing inode, so it never hits ETXTBSY.
+cp -f "$SRC_BIN" "$DEPLOY_PATH.tmp" || { echo "Failed to stage binary to $DEPLOY_PATH.tmp" >&2; emit_json 0 "" "" "" "\"copy failed for ${DEPLOY_PATH}\""; exit 2; }
+mv -f "$DEPLOY_PATH.tmp" "$DEPLOY_PATH" || { echo "Failed to install binary to $DEPLOY_PATH" >&2; emit_json 0 "" "" "" "\"install failed for ${DEPLOY_PATH}\""; exit 2; }
 deployed_libs=()
 for lib in "$SRC_DIR"/lib*.so*; do
   [[ -e "$lib" ]] || continue
-  cp -f "$lib" "$DEPLOY_DIR/" || { echo "Failed to copy library $(basename "$lib") to $DEPLOY_DIR" >&2; }
+  cp -f "$lib" "$DEPLOY_DIR/$(basename "$lib").tmp" || { echo "Failed to copy library $(basename "$lib") to $DEPLOY_DIR" >&2; }
+  mv -f "$DEPLOY_DIR/$(basename "$lib").tmp" "$DEPLOY_DIR/$(basename "$lib")" || { echo "Failed to install library $(basename "$lib") in $DEPLOY_DIR" >&2; }
   deployed_libs+=("$(basename "$lib")")
 done
 
