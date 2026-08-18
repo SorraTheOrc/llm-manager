@@ -412,10 +412,10 @@ class TestDryRun:
             "\n"
             "[Qwen3]\n"
             "hf-repo = unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M\n"
-            "ctx-size = 131072\n"
+            "ctx-size = 262144\n"
         )
         models = rb._parse_models_ini(str(ini))
-        assert models["Qwen3"]["ctx_size"] == 131072
+        assert models["Qwen3"]["ctx_size"] == 262144
         assert models["Qwen3"]["quantization"] == "Q5_K_M"
 
     def test_dry_run_warns_on_prompt_exceeding_ctx(self, tmp_path, capsys):
