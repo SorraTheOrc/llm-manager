@@ -340,6 +340,25 @@ test_per_model_ctx_size_present() {
 }
 
 # ---------------------------------------------------------------
+# Test: Production models.ini [Qwen3] has reasoning-format = deepseek
+# (LP-0MSYLL3LY004CANG: the post-MTP llama.cpp build ends turns with a
+#  bare finish_reason=stop after reasoning when reasoning-format is unset,
+#  so tool_calls are never emitted; the old build kept generating until the
+#  tool call or the length cap)
+# ---------------------------------------------------------------
+test_per_model_reasoning_format_present() {
+    echo "Test: Production models.ini [Qwen3] has reasoning-format = deepseek"
+
+    local rf
+    rf=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "qwen3") found=1 }
+    found && /^reasoning-format/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$MODELS_INI")
+
+    [ "$rf" = "deepseek" ] && pass "[Qwen3] reasoning-format=deepseek (got: $rf)" || fail "[Qwen3] reasoning-format expected deepseek, got: '$rf'"
+}
+
+# ---------------------------------------------------------------
 # Test: Production models.ini [Qwen3] has per-model cache-type-k/v
 # (LP-0MSDCLQ2W001LGWC: KV-cache quantization for decode speed)
 # ---------------------------------------------------------------
@@ -550,6 +569,7 @@ echo "=========================================="
 
 test_script_exists
 test_per_model_ctx_size_present
+test_per_model_reasoning_format_present
 test_per_model_cache_type_present
 test_global_ngl_from_models_ini
 test_global_ngl_defaults_to_80

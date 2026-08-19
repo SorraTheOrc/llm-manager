@@ -339,8 +339,11 @@ class TestLiveConfigsValidate:
     """The live mode configs must pass startup validation with the
     mode-aware cold-cache thresholds (LP-0MSOMVOPH004ATAK AC1).
 
-    The cold threshold is raised per mode (fast 38000, cheap 60000); the
-    warm clamp must still resolve above it so the (cold, warm] band never
+    The cold threshold is raised for fast mode (38000) while cheap mode is
+    reverted to its pre-change 30000 after post-deploy validation showed the
+    60000 raise breached the cheap queue guardrails on two consecutive nights
+    (LP-0MSOMVOPH004ATAK AC6 / child LP-0MSRM54YO007YG0K AC7). The warm
+    clamp must still resolve above cold so the (cold, warm] band never
     collapses (LP-0MSI2M5BT004BCDP), and validate_local_routing_config
     must report no problems for either profile.
     """
@@ -360,37 +363,39 @@ class TestLiveConfigsValidate:
         assert problems == [], f"{config_file}: {problems}"
 
     def test_fast_mode_cold_below_warm(self):
-        """Fast mode: cold 38000 < effective warm clamp 39594."""
+        """Fast mode: cold 38000 < effective warm clamp 83285 (3x262144,
+        LP-0MSY0SDAS0031Y7F)."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config-fast.yaml"))
         assert cold == 38000
-        assert warm == 39594
+        assert warm == 83285
         assert cold < warm
 
     def test_default_mode_cold_below_warm(self):
-        """Default profile (config.yaml) mirrors fast: cold 38000 < 39594."""
+        """Default profile (config.yaml) mirrors fast: cold 38000 < 83285."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 39594
+        assert warm == 83285
         assert cold < warm
 
     def test_cheap_mode_cold_below_warm(self):
-        """Cheap mode: cold 60000 < effective warm (static pool 2 @ 131072
-        → clamp 61440; the scheduled 2×262144 period resolves higher)."""
+        """Cheap mode: cold 30000 < effective warm (static pool 2 @ 131072
+        → clamp 61440; the scheduled 2×262144 period resolves higher).
+        Reverted from 60000 per validation (LP-0MSRM54YO007YG0K AC7)."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
-        assert cold == 60000
+        assert cold == 30000
         assert warm >= 61440  # min(100000, 262144//2 - 4096) under schedule
         assert cold < warm
 
     def test_cheap_mode_scheduled_warm_resolves_100000(self, monkeypatch):
         """Cheap mode with the live schedule active (2 slots × 262144):
-        warm resolves to 100000 (min(100000, 126976)) — band (60000, 100000]
-        non-empty."""
+        warm resolves to 100000 (min(100000, 126976)) — band (30000, 100000]
+        non-empty after the 60000→30000 revert."""
         import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
 
@@ -404,6 +409,6 @@ class TestLiveConfigsValidate:
         )()
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
-        assert cold == 60000
+        assert cold == 30000
         assert warm == 100000
         assert cold < warm

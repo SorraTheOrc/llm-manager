@@ -13,6 +13,14 @@
 #                        X-Resolved-Model header; falls back to name)
 #   For local:  llama_model
 #
+# FreeUsageLimitError cooldown (LP-0MSMCM5UG00378G8):
+#   When a provider returns HTTP 429 with error.type = "FreeUsageLimitError"
+#   (no explicit reset duration), the proxy marks it unavailable for a
+#   per-provider cooldown: 24 hours (86400s) for `opencode-deepseek-free` and
+#   `opencode-big-pickle`, and 3 hours (10800s, LP-0MRGU0I91006ODFD) for all
+#   other providers. The override map lives in proxy/provider.py
+#   (`_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES`).
+#
 # Failure-domain grouping (LP-0MSG45I8Q0020N1F):
 #   Provider entries that share the same normalized endpoint form a SINGLE
 #   failure domain and are treated as one unit during mid-stream re-route /
@@ -97,7 +105,8 @@ providers:
 logging:
   directory: /var/log/llama-proxy
   level: INFO
-  retention_days: 90
+  retention_days: 7
+  compress_after_days: 1
   rotation_hours: 6
   # Verbose per-chunk SSE logging (LP-0MS9GAN2P002NR4M).
   # When false (default), STREAM CHUNK lines are logged at DEBUG level and
@@ -182,6 +191,13 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -222,6 +238,13 @@ models:
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
         model: mimo-v2.5-free
+        forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
         forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
@@ -269,6 +292,13 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -292,6 +322,61 @@ models:
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
+    force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
+
+  local-qwen3-mtp:
+    # MTP evaluation model (LP-0MSNI1B68001VE6C): Qwen3.6-35B-A3B served
+    # from the MTP-converted GGUF with llama-server --spec-type draft-mtp
+    # --spec-draft-n-max 2. Coexists with production Qwen3 serving; the
+    # plan/author/code chains above are UNCHANGED until rollout is approved
+    # post-benchmark. Requires an MTP-capable llama-server build (the local
+    # build b8782/e97492369 predates llama.cpp PR #22673 and lacks draft-mtp)
+    # and single-slot serving (--parallel 1), mirroring the proxy's
+    # LLAMA_PARALLEL when routed to this model.
+    providers:
+      - name: local-qwen3-mtp
+        type: local
+        llama_model: Qwen3-MTP
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    aliases:
+    - local-qwen3-mtp
+    - qwen3-mtp
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
@@ -403,11 +488,13 @@ server:
   # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
   # tokenizer).
   #
-  # MODE-AWARE value (LP-0MSOMVOPH004ATAK): fast mode runs 3 slots x 131072,
-  # so the effective warm threshold clamps to 39594 (131072//3 - 4096). Cold
-  # 38000 stays BELOW it, keeping the (38000, 39594] band non-empty for the
-  # cached_ratio check (dead-code guard LP-0MSI2M5BT004BCDP) while recapturing
-  # cold-cache prompts in the old (30000, 38000] bypass band for local.
+  # MODE-AWARE value (LP-0MSOMVOPH004ATAK): fast mode runs 3 slots x 262144
+  # (operator supersede 2026-08-18, LP-0MSY0SDAS0031Y7F: the 3x87.4K NO-GO of
+  # LP-0MSAOQTJS000FFVM / LP-0MSEGPO77005CYCQ accepted), so the effective warm
+  # threshold clamps to 83285 (262144//3 - 4096). Cold 38000 stays BELOW it,
+  # keeping the (38000, 83285] band non-empty for the cached_ratio check
+  # (dead-code guard LP-0MSI2M5BT004BCDP) while recapturing cold-cache prompts
+  # in the old (30000, 38000] bypass band for local.
   local_large_context_cold_cache_threshold: 38000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
@@ -424,15 +511,19 @@ server:
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
-  # ctx-size = 131072). Used to compute the actual per-slot context
-  # (ctx_size / active_slots) which clamps the large-context routing
-  # thresholds (LP-0MSAZXXDY005AWA1). 0 disables the clamp.
+  # ctx-size) and the slot_schedule ctx_size pins below. Used to compute the
+  # actual per-slot context (ctx_size / active_slots) which clamps the
+  # large-context routing thresholds (LP-0MSAZXXDY005AWA1). 0 disables the
+  # clamp.
   #
-  # Option C (3x43.7K = 131072/3, pool 3, schedule 3/3) restored per
-  # LP-0MSEGPO77005CYCQ F4: the ctx-size evaluation (LP-0MSAOQTJS000FFVM)
-  # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
-  # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
-  local_model_ctx_size: 131072
+  # Operator supersede 2026-08-18 (LP-0MSY0SDAS0031Y7F): raised to 262144
+  # (3x87.4K per-slot) per operator decision — the long-context NO-GO of
+  # LP-0MSAOQTJS000FFVM / LP-0MSEGPO77005CYCQ (4x65.5K / 3x87.4K / 2x131K)
+  # is superseded for fast mode. Rationale: remote fallback tiers are
+  # rate-limited (opencode 429s observed 2026-08-18); the runtime already
+  # serves 262144 ctx and the 120 GB GPU has headroom (context ~47 GB at
+  # 3x262144 q8_0).
+  local_model_ctx_size: 262144
   # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
   # When a session's estimated context reaches this fraction of the
   # effective per-slot context (ctx_size / slots - 4096 headroom), the
@@ -608,23 +699,24 @@ server:
   # Entries with the same slot count as the current value are skipped
   # (no unnecessary restart) UNLESS the per-period ctx_size differs.
   # Midnight wrapping is supported.
-  # Fast mode stays 3 slots @ 131072 total ctx (per-slot ~43.7K) — the
-  # 3x87.4K per-slot variant was rejected NO-GO (LP-0MSAOQTJS000FFVM /
-  # LP-0MSEGPO77005CYCQ). The explicit ctx_size: 131072 pins below ensure a
-  # future models.ini [Qwen3] ctx-size raise (the model max is 262144) cannot
-  # leak into fast mode: the slot-scheduler only applies per-period ctx via a
-  # transition/catch-up restart, and static local_model_ctx_size (131072)
-  # matches these entries so fast boots correct from the shared base.
+  # Fast mode stays 3 slots @ 262144 total ctx (per-slot ~87.4K) — operator
+  # supersede 2026-08-18 (LP-0MSY0SDAS0031Y7F) of the 3x87.4K NO-GO
+  # (LP-0MSAOQTJS000FFVM / LP-0MSEGPO77005CYCQ); see local_model_ctx_size
+  # above for rationale. The explicit ctx_size: 262144 pins below ensure a
+  # future models.ini [Qwen3] ctx-size change cannot leak into fast mode: the
+  # slot-scheduler only applies per-period ctx via a transition/catch-up
+  # restart, and static local_model_ctx_size (262144) matches these entries so
+  # fast boots correct from the shared base.
   slot_schedule:
     enabled: true
     drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
     entries:
       - time: "23:59"
         slots: 3
-        ctx_size: 131072
+        ctx_size: 262144
       - time: "10:00"
         slots: 3
-        ctx_size: 131072
+        ctx_size: 262144
   # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
   # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
   # times. A manual API switch (POST /admin/set-mode) overrides the schedule

@@ -18,7 +18,7 @@ import csv
 import json
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import chain
 from pathlib import Path
 
@@ -379,6 +379,7 @@ def build_report(
         ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, count):.1f}%) | "
            f"{cheap} ({_pct(cheap, count):.1f}%) | {reqs} | {fb} |")
 
+    _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
 
@@ -525,12 +526,37 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
     if b.hourly_busy:
         ap("")
-        ap("Busy seconds by hour:")
+        ap("Busy time by hour:")
         ap("")
-        ap("| Hour | Busy |")
-        ap("|---|---|")
-        for hour, seconds in b.hourly_busy:
-            ap(f"| {hour:02d}:00-{hour + 1:02d}:00 | {_fmt_duration(seconds)} |")
+        ap("| Hour | Busy | % |")
+        ap("|---|---|---|")
+        # Window-bounded hour buckets (LP-0MSVMLM7G009N74N): one row per hour
+        # from window_start to window_end, with the first/last rows truncated
+        # to the window edges and idle hours listed as 0s. Busy seconds come
+        # from ``BusyStats.hourly_busy`` (hour-of-day -> seconds), which is
+        # already window-correct because intervals are clipped to the window
+        # before attribution; the % is busy / window-bounded bucket duration.
+        # Limitation: buckets are keyed by hour-of-day, so windows longer than
+        # 24h that cover the same hour twice would collide — out of scope for
+        # the daily report (``DEFAULT_HOURS = 24``).
+        hourly = dict(b.hourly_busy)
+        cursor = summary.window_start
+        end = summary.window_end
+        while cursor < end:
+            # The first bucket ends at the next full hour boundary (truncated
+            # to the window end for a partial last hour); subsequent cursors
+            # are already on the hour so +1h is the next bucket boundary.
+            bucket_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            bucket_end = min(bucket_end, end)
+            duration = (bucket_end - cursor).total_seconds()
+            seconds = hourly.get(cursor.hour, 0.0)
+            pct = (seconds / duration * 100.0) if duration else 0.0
+            ap(f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% |")
+            cursor = bucket_end
+        # Totals row: total busy time over the window and the overall busy %,
+        # matching the summary table's "Busy time" values
+        # (``busy_seconds`` / ``window_seconds``).
+        ap(f"| Totals | {_fmt_duration(b.busy_seconds)} | {b.busy_pct:.1f}% |")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
@@ -553,6 +579,51 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
 
 def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Return the ``pct``-th percentile of *values* (0–100), or ``None`` when empty."""
+    if not values:
+        return None
+    s = sorted(values)
+    k = (pct / 100.0) * (len(s) - 1)
+    f = int(k)
+    c = f + 1
+    if c >= len(s):
+        return s[f]
+    return s[f] + (k - f) * (s[c] - s[f])
+
+
+def _append_ttc_section(
+    ap,
+    sessions: list[SessionStats],
+) -> None:
+    """Append the ``## Time to completion`` section to the report.
+
+    Shows p10 / median / p90 of session duration (stream-start → stream-end),
+    split by Total / Fast / Cheap.
+    """
+    ap("")
+    ap("## Time to completion")
+    ap("")
+    if not sessions:
+        ap("_No sessions in window._")
+        return
+    ap("Percentiles of session duration (``Stream started`` → last ``Stream finished`` in-window).")
+    ap("")
+    ap("| Bucket | Sessions | p10 (s) | Median (s) | p90 (s) |")
+    ap("|---|---|---|---|---|")
+    for label, bucket_key in (("Total", "all"), ("Fast", "fast"), ("Cheap", "cheap")):
+        if bucket_key == "all":
+            durations = [s.duration_seconds for s in sessions]
+        else:
+            durations = [s.duration_seconds for s in sessions if _bucket_key(s.bucket) == bucket_key]
+        p10 = _percentile(durations, 10)
+        med = _percentile(durations, 50)
+        p90 = _percentile(durations, 90)
+        ap(f"| {label} | {len(durations)} | "
+           f"{_speed_cell(p10)} | {_speed_cell(med)} | {_speed_cell(p90)} |")
+    ap("")
 
 
 def _speed_cell(value: float | None) -> str:

@@ -123,7 +123,11 @@ Outputs written to:
   provider × model × count),
   **Local model utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency, hourly busy profile,
-  fast/cheap split — when the window has local traffic), **Decode speed** and
+  fast/cheap split — when the window has local traffic). The **hourly busy
+  profile** sub-table lists one row per hour of the report window (partial
+  first/last hours truncated to the window edges, idle hours included as
+  `0s`), each with a busy-% column — busy seconds ÷ window-bounded bucket
+  duration — plus a totals row with the overall busy % of the window, **Decode speed** and
   **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
   eval-timing lines, split Total / Fast / Cheap), and highlighted
   recommendations. Every fast/cheap count carries its share of the metric's
@@ -178,7 +182,14 @@ run (`Previous outputs archived to …`).
    durations (slot-seconds), and peak concurrency comes from a sweep over
    interval endpoints. Busy seconds are attributed to hours and to
    fast/cheap periods (slot schedule) by splitting at hour and period
-   boundaries. Streams whose start has no paired finish are counted in
+   boundaries. The hourly sub-table ("Busy time by hour:") then renders one
+   row per hour of the report window — the first/last rows truncated to the
+   window edges and every hour listed even when idle — each with a busy-%
+   column (busy seconds ÷ window-bounded bucket duration) and a final totals
+   row matching the summary's `busy_seconds` / `window_seconds` busy %. The
+   bucket keys are hour-of-day, so windows longer than 24 hours that cover
+   the same hour twice would collide; the daily report (24h) never hits this
+   (documented limitation). Streams whose start has no paired finish are counted in
    `unfinished_streams` **only when they started inside the window or within
    `BUSY_WINDOW_MARGIN` (1h) before it**; streams started earlier are stale
    pre-window leftovers from earlier windows, tracked separately in
@@ -256,7 +267,10 @@ run (`Previous outputs archived to …`).
 - **Local model utilization**: busy time is the share of the window with at
   least one local slot generating. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
-  fallback reasons), not that local is underprovisioned. `context_too_large`
+  fallback reasons), not that local is underprovisioned. The "Busy time by
+  hour:" sub-table shows per-hour busy % across exactly the report window
+  (idle hours included), so a glance at the hourly pattern shows when local
+  was saturated vs idle; the totals row gives the window-wide busy %. `context_too_large`
   is the largest lever: despite the legacy name (`warm_cache_bypass`) it
   fires when the *estimated context* exceeds the effective warm-cache
   threshold (the per-slot clamp,
