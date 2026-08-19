@@ -312,6 +312,30 @@ case "$model" in
     EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj --jinja"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
+  qwen3-mtp)
+    # MTP (Multi-Token Prediction) evaluation variant of Qwen3.6-35B-A3B
+    # (LP-0MSNI1B68001VE6C). The MTP-converted GGUF carries the model's
+    # built-in prediction heads; --spec-type draft-mtp / --spec-draft-n-max 2
+    # enable speculative drafting via those heads (llama.cpp PR #22673).
+    # Requires an MTP-capable llama-server build (>= post-2026-05-16 master;
+    # build b8782/e97492369 does NOT support draft-mtp).
+    # MTP currently requires single-slot mode: leave LLAMA_PARALLEL=1 (-np 1).
+    REPOID=unsloth
+    MODEL=unsloth/Qwen3.6-35B-A3B-MTP-GGUF
+    QUANTIZATION=Q4_K_S
+    CONTEXT=262144 # matches [Qwen3] and models.ini [Qwen3-MTP] (fair A/B, LP-0MSY0SDAS0031Y7F / LP-0MSYLL3LY004CANG)
+    BATCH_SIZE=4096
+    UBATCH_SIZE=256
+    CHAT_TEMPLATE_KWARGS=""
+    REASONING_FORMAT=deepseek
+
+    TEMP=0.6
+    TOP_P=0.95
+    TOP_K=20
+    MIN_P=0
+
+    EXTRA_CMD_SWITCHES="--spec-type draft-mtp --spec-draft-n-max 2 --presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj --jinja"
+    ;;
   mxbai-embed)
     REPOID=magicunicorn
     MODEL=mxbai-embed-large-v1-Q8_0-GGUF
@@ -345,7 +369,7 @@ case "$model" in
     EXTRA_CMD_SWITCHES="--jinja"
     ;;
   *)
-    echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen2.5, MXBAI-Embed, gemma4, Router"
+    echo "Unrecognized model ('$model'). \nSupported models: GPT120, Qwen3, Qwen3-MTP, Qwen2.5, MXBAI-Embed, gemma4, Router"
     exit 1
     ;;
 esac

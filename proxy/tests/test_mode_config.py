@@ -120,6 +120,29 @@ def _load(name: str) -> dict:
         return yaml.safe_load(fh)
 
 
+def _opencode_deepseek_names(models: dict) -> set:
+    """Names of opencode-hosted deepseek provider entries across all models."""
+    return {
+        p["name"]
+        for mc in models.values()
+        for p in mc.get("providers", [])
+        if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+    }
+
+
+def _strip_available_times(models: dict) -> dict:
+    """Deep-copy models with available_times removed from every provider
+    (used to compare profile chains modulo the intentional fast-vs-default
+    timing difference, LP-0MSXPHTD9004DZ4P)."""
+    import copy
+
+    out = copy.deepcopy(models)
+    for mc in out.values():
+        for p in mc.get("providers", []):
+            p.pop("available_times", None)
+    return out
+
+
 class TestFastConfigProfile:
     def test_fast_config_is_3_slot(self):
         """config-fast.yaml keeps the 3-slot pool and 3/3 schedule."""
@@ -148,8 +171,25 @@ class TestFastConfigProfile:
         """config-fast.yaml mirrors config.yaml (current day settings)."""
         base = _load("config.yaml")
         fast = _load("config-fast.yaml")
-        assert fast["models"] == base["models"]
+        # Profiles share the same models/chains modulo the intentional timing
+        # difference: config.yaml times opencode-hosted deepseek, fast does
+        # NOT (LP-0MSXPHTD9004DZ4P).
+        assert _strip_available_times(fast["models"]) == _strip_available_times(base["models"])
         assert fast["server"]["session_slot_pool_size"] == base["server"]["session_slot_pool_size"]
+        # Default times all opencode-hosted deepseek entries; fast leaves them untimed.
+        assert _opencode_deepseek_names(base["models"]) == _opencode_deepseek_names(fast["models"])
+        assert all(
+            p.get("available_times") is not None
+            for mc in base["models"].values()
+            for p in mc.get("providers", [])
+            if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+        )
+        assert all(
+            "available_times" not in p
+            for mc in fast["models"].values()
+            for p in mc.get("providers", [])
+            if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+        )
         assert fast["default_model"] == base["default_model"]
 
 
@@ -213,31 +253,46 @@ class TestCheapConfigProfile:
         assert cfg["providers"][0]["type"] == "remote"
 
     def test_cheap_config_matches_fast_models(self):
-        """cheap and fast expose identical models/provider chains (LP-0MSMIPPJI007GU9N)."""
+        """cheap and fast expose identical models/provider chains modulo the
+        intentional timing difference: cheap times opencode-hosted deepseek
+        (LP-0MSXPHTD9004DZ4P), fast does not."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
-        assert cheap["models"] == fast["models"]
+        assert _strip_available_times(cheap["models"]) == _strip_available_times(fast["models"])
+        assert _opencode_deepseek_names(cheap["models"]) == _opencode_deepseek_names(fast["models"])
+        assert all(
+            p.get("available_times") is not None
+            for mc in cheap["models"].values()
+            for p in mc.get("providers", [])
+            if p.get("name", "").startswith("opencode-") and "deepseek" in p["name"]
+        )
 
     def test_cheap_config_differs_from_fast_only_by_slot_pool_ctx_and_contention(self):
         """The only intended cheap-vs-fast server differences are the local
-        slot pool (2 vs 3), the per-period ctx_size (262144 vs 131072), the
-        per-mode contention-queue policy (cheap=queue vs fast=fallback,
-        LP-0MSORQVK50012Q4D F2), and the mode-aware cold-cache threshold
-        (cheap 60000 vs fast 38000, LP-0MSOMVOPH004ATAK). Everything else
-        (models, static ctx, warm threshold) is identical."""
+        slot pool (2 vs 3), the per-period ctx_size (cheap schedules 262144
+        override; fast pins 262144 inline per LP-0MSY0SDAS0031Y7F),
+        local_model_ctx_size (fast 262144 inline, cheap 131072 base + 262144
+        schedule override), the per-mode contention-queue policy (cheap=queue
+        vs fast=fallback, LP-0MSORQVK50012Q4D F2), and the cold-cache
+        threshold (cheap 30000 after revert vs fast 38000, LP-0MSOMVOPH004ATAK
+        / LP-0MSRM54YO007YG0K AC7). Everything else (models, warm threshold)
+        is identical."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
         fast_srv = dict(fast["server"])
         cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
         cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
+        # local_model_ctx_size differs intentionally per profile (fast
+        # 262144 inline; cheap 131072 base with 262144 schedule override),
+        # LP-0MSY0SDAS0031Y7F.
+        cheap_srv["local_model_ctx_size"] = fast_srv["local_model_ctx_size"]
         # Cheap declares queue + caps; fast declares fallback (no caps).
         cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
         cheap_srv.pop("contention_queue_max_wait_seconds", None)
         cheap_srv.pop("contention_queue_max_depth", None)
-        # Mode-aware cold-cache threshold (LP-0MSOMVOPH004ATAK): the economic
-        # new-token threshold differs per mode so each stays below its own
-        # effective warm clamp (cheap 100000, fast 39594).
+        # Cold-cache threshold (LP-0MSOMVOPH004ATAK then reverted per
+        # LP-0MSRM54YO007YG0K AC7): cheap 30000, fast 38000.
         cheap_srv.pop("local_large_context_cold_cache_threshold", None)
         fast_srv.pop("local_large_context_cold_cache_threshold", None)
         assert cheap_srv == fast_srv
@@ -250,17 +305,26 @@ class TestCheapConfigProfile:
         assert [e["slots"] for e in cheap_entries] == [2, 2]
         assert [e["slots"] for e in fast_entries] == [3, 3]
         assert all(e.get("ctx_size") == 262144 for e in cheap_entries)
-        assert all(e.get("ctx_size") == 131072 for e in fast_entries)
+        assert all(e.get("ctx_size") == 262144 for e in fast_entries)  # LP-0MSY0SDAS0031Y7F
         assert cheap["server"]["contention_queue_policy"] == "queue"
         assert cheap["server"]["contention_queue_max_wait_seconds"] == 60
         assert cheap["server"]["contention_queue_max_depth"] == 4
         assert fast["server"]["contention_queue_policy"] == "fallback"
-        assert cheap["server"]["local_large_context_cold_cache_threshold"] == 60000
+        assert cheap["server"]["local_large_context_cold_cache_threshold"] == 30000
         assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
-        """The local model context size is unchanged between profiles."""
+        """The local model context size: fast inlines 262144 (operator
+        supersede LP-0MSY0SDAS0031Y7F) while cheap keeps the 131072 base and
+        applies the 262144 override only via its schedule entries.
+        """
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
-        assert cheap["server"]["local_model_ctx_size"] == fast["server"]["local_model_ctx_size"]
+        assert fast["server"]["local_model_ctx_size"] == 262144
+        assert cheap["server"]["local_model_ctx_size"] == 131072
+        assert all(
+            e.get("ctx_size") == 262144
+            for e in cheap["server"]["slot_schedule"]["entries"]
+        )
+        assert fast["server"]["local_model_ctx_size"] >= cheap["server"]["local_model_ctx_size"]

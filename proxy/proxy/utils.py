@@ -7,11 +7,14 @@ module-level state unless accessed via the lazy _srv() import pattern.
 """
 
 import asyncio
+import gzip
 import json
 import logging
 import os
 import re
+import shutil
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -531,12 +534,106 @@ class KeyValueFormatter(logging.Formatter):
         return f"{base} {' '.join(pairs)}"
 
 
+def _compress_file(path: Path) -> bool:
+    """Gzip-compress *path* to ``path.gz``. Idempotent; returns ``True``
+    only when a new ``.gz`` was created and the original was removed."""
+    gz_path = Path(str(path) + ".gz")
+    if gz_path.exists():
+        return False
+    try:
+        with path.open("rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        path.unlink()
+        return True
+    except OSError:
+        gz_path.unlink(missing_ok=True)
+        return False
+
+
+def prune_logs(
+    log_dir: Path,
+    retention_days: int,
+    logger: logging.Logger | None = None,
+    compress_after_days: int = 1,
+) -> int:
+    """Prune and compress rotated log files in *log_dir*.
+
+    Scans for ``proxy.log.YYYY-MM-DD_HH`` files (and ``.gz``-compressed
+    variants).  Files older than *retention_days* are deleted; files within
+    retention but older than *compress_after_days* are gzip-compressed. This
+    satisfies AC2 (compression) alongside AC1 (retention pruning).
+
+    Args:
+        log_dir: Directory containing the rotated log files.
+        retention_days: Number of days to retain rotated files.
+        logger: Optional logger for prune/compress messages.
+        compress_after_days: Rotate plain-text files older than this many
+            days into ``.gz``.  Set to ``0`` to skip compression.
+
+    Returns:
+        The number of files deleted. (Compressed files are not counted.)
+    """
+    if not log_dir.is_dir():
+        return 0
+
+    # Filenames carry hour precision (proxy.log.YYYY-MM-DD_HH), so truncate
+    # the cutoffs to the hour to avoid a file stamped N days ago at the same
+    # hour appearing older than the exact datetime cutoffs.
+    cutoff = (datetime.now() - timedelta(days=retention_days)).replace(minute=0, second=0, microsecond=0)
+    compress_cutoff = (datetime.now() - timedelta(days=compress_after_days)).replace(minute=0, second=0, microsecond=0)
+    deleted = 0
+
+    for log_file in sorted(log_dir.glob("proxy.log.*")):
+        if not log_file.is_file():
+            continue
+
+        # Try to parse the date from the filename: proxy.log.YYYY-MM-DD_HH
+        name = log_file.name
+        is_gz = name.endswith(".gz")
+        try:
+            if is_gz:
+                name = name[:-3]
+            date_str = name[len("proxy.log."):]
+            file_date = datetime.strptime(date_str, "%Y-%m-%d_%H")
+        except ValueError:
+            continue
+
+        if file_date < cutoff:
+            log_file.unlink()
+            deleted += 1
+            if logger is not None:
+                logger.info(
+                    "Pruned old rotated log %s (%s > %s days old)",
+                    log_file.name,
+                    file_date.strftime("%Y-%m-%d %H"),
+                    retention_days,
+                )
+        elif compress_after_days > 0 and not is_gz and file_date < compress_cutoff:
+            # Compress retained-but-old files
+            if _compress_file(log_file):
+                if logger is not None:
+                    logger.info(
+                        "Compressed rotated log %s (%s, %s days old)",
+                        log_file.name,
+                        file_date.strftime("%Y-%m-%d %H"),
+                        (datetime.now() - file_date).days,
+                    )
+
+    return deleted
+
+
 def setup_logging(config: dict) -> logging.Logger:
     """Setup logging with time-based rotation.
 
     Creates a TimedRotatingFileHandler and a console handler (using
     ContentOnlyConsoleHandler from the session module). Assigns the
     log_dir to the server module for use by other modules.
+
+    Rotated ``proxy.log.*`` files are pruned to the configured retention
+    (default 7 days) on startup, ensuring the log directory stays within
+    the expected disk footprint.  The in-process rotation is the primary
+    mechanism; a ``logrotate`` drop-in (see HOST_INSTALL.md) provides
+    a safety net for compression and pruning across restarts.
     """
     srv = _srv()
 
@@ -545,7 +642,8 @@ def setup_logging(config: dict) -> logging.Logger:
 
     log_config = config.get("logging", {})
     rotation_hours = log_config.get("rotation_hours", 6)
-    retention_days = log_config.get("retention_days", 90)
+    retention_days = log_config.get("retention_days", 7)
+    compress_after_days = log_config.get("compress_after_days", 1)
     log_level = log_config.get("level", "INFO")
 
     # Verbose per-chunk SSE logging: enabled by config logging.verbose_chunks
@@ -604,6 +702,23 @@ def setup_logging(config: dict) -> logging.Logger:
         "%(asctime)s - %(levelname)s - %(message)s"
     ))
     logger.addHandler(console_handler)
+
+    # Prune old rotated files on startup (AC4: 9.3 GB backlog cleaned).
+    # Compresses retained-but-old files for space savings (AC2).
+    # Runs before the logger is returned so the prune/compress events are logged.
+    try:
+        pruned = prune_logs(
+            dir_path, retention_days, logger=logger,
+            compress_after_days=compress_after_days,
+        )
+        if pruned > 0:
+            logger.info(
+                "Pruned %d old rotated log files (retention: %d days)",
+                pruned,
+                retention_days,
+            )
+    except Exception:
+        logger.exception("Failed to prune old log files (non-fatal)")
 
     logger.info(
         "Logging initialised at %s",

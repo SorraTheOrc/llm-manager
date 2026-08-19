@@ -15,14 +15,12 @@
 #     exhausted. Keep this file's models section in sync with
 #     config-fast.yaml (test_cheap_config_matches_fast_models guards it).
 #
-# BOOT CATCH-UP NOTE (LP-0MSMZOAJW002UR2A): local_model_ctx_size below stays
-# 131072 (the shared models.ini base) even though the schedule entries carry
-# ctx_size: 262144. The slot-scheduler applies the per-period ctx override
-# via a boot catch-up restart (it fires only when the static config differs
-# from the active schedule entry). DO NOT align local_model_ctx_size with the
-# entries' 262144: that would suppress the catch-up and cheap would boot at
-# 131072 total (2x65.5K) for the whole period. The catch-up transient runs at
-# 2x65.5K (clamp 61440 <= real per-slot 65536) — the safe direction.
+# CTX NOTE (LP-0MSMZOAJW002UR2A + LP-0MSY0SDAS0031Y7F): the shared
+# models.ini [Qwen3] base is now 262144 and the schedule entries carry
+# ctx_size: 262144, so cheap boots 2x262144 natively (no catch-up needed)
+# and local_model_ctx_size below runs the static clamp 61440 (131072//2 - 4096)
+# which is CONSERVATIVE vs the real per-slot 131072 — the safe direction. The
+# scheduled clamp resolves higher (min(100000, 262144//2 - 4096) = 100000).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -63,8 +61,12 @@
 #                     ranges (e.g. "22:00-02:00") wrap past midnight.
 #                     Omit the field (or use an empty list) to leave a
 #                     provider unrestricted. Malformed entries are logged and
-#                     ignored (fail-open). The deepseek-v4-flash provider is
-#                     currently timed to off-peak UTC windows (see its entries).
+#                     ignored (fail-open). The deepseek-v4-flash provider
+#                     (direct api.deepseek.com entry and all opencode-hosted
+#                     deepseek entries: opencode-deepseek-free, opencode-go-3-
+#                     deepseek, opencode-go-2-deepseek, opencode-go-deepseek)
+#                     are currently timed to off-peak UTC windows
+#                     (see their entries).
 #                     Example:
 #                       - name: deepseek-v4-flash
 #                         type: remote
@@ -124,7 +126,8 @@ providers:
 logging:
   directory: /var/log/llama-proxy
   level: INFO
-  retention_days: 90
+  retention_days: 7
+  compress_after_days: 1
   rotation_hours: 6
   # Verbose per-chunk SSE logging (LP-0MS9GAN2P002NR4M).
   # When false (default), STREAM CHUNK lines are logged at DEBUG level and
@@ -204,6 +207,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -211,6 +215,14 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: big-pickle
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -218,6 +230,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -225,6 +238,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -252,6 +266,14 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: mimo-v2.5-free
         forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
@@ -259,6 +281,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -266,6 +289,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -291,6 +315,72 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash-free
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+      - name: opencode-big-pickle
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: big-pickle
+        forward_session_headers: false
+      - name: opencode-go-3-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+      - name: opencode-go-2-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+      - name: opencode-go-deepseek
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    aliases:
+    - code
+    force_full_prompt: true
+    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
+    tokenizer: qwen3
+
+  local-qwen3-mtp:
+    # MTP evaluation model (LP-0MSNI1B68001VE6C): Qwen3.6-35B-A3B served
+    # from the MTP-converted GGUF with llama-server --spec-type draft-mtp
+    # --spec-draft-n-max 2. Coexists with production Qwen3 serving; the
+    # plan/author/code chains above are UNCHANGED until rollout is approved
+    # post-benchmark. Requires an MTP-capable llama-server build (the local
+    # build b8782/e97492369 predates llama.cpp PR #22673 and lacks draft-mtp)
+    # and single-slot serving (--parallel 1), mirroring the proxy's
+    # LLAMA_PARALLEL when routed to this model.
+    providers:
+      - name: local-qwen3-mtp
+        type: local
+        llama_model: Qwen3-MTP
+      - name: opencode-deepseek-free
+        type: remote
+        provider: opencode
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: deepseek-v4-flash-free
+        forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -305,6 +395,7 @@ models:
         api_key_env: OPENCODE_2_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-go-deepseek
         type: remote
         provider: opencode-go
@@ -312,6 +403,7 @@ models:
         api_key_env: OPENCODE_API_KEY
         model: deepseek-v4-flash
         forward_session_headers: false
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -320,7 +412,8 @@ models:
         model: deepseek-v4-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
-    - code
+    - local-qwen3-mtp
+    - qwen3-mtp
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
@@ -432,15 +525,18 @@ server:
   # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
   # tokenizer).
   #
-  # MODE-AWARE value (LP-0MSOMVOPH004ATAK): cheap mode runs 2 slots x 262144
-  # (per-period ctx override), so the effective warm threshold resolves to
-  # min(100000, 262144//2 - 4096 = 126976) = 100000. Cold 60000 stays BELOW
-  # both the warm 100000 and the boot-transient clamp 61440 (2 x 65536 before
-  # the catch-up restart, LP-0MSMZOAJW002UR2A), keeping the (60000, 100000]
-  # band non-empty (dead-code guard LP-0MSI2M5BT004BCDP) while recapturing
-  # cold-cache prompts in the old (30000, 60000] bypass band for local
-  # (~50 requests/night, 2026-08-13 overnight analysis).
-  local_large_context_cold_cache_threshold: 60000
+  # MODE-AWARE value (LP-0MSOMVOPH004ATAK, then REVERTED per validation
+  # LP-0MSRM54YO007YG0K AC7): cheap mode runs 2 slots x 262144 (per-period
+  # ctx override), so the effective warm threshold resolves to
+  # min(100000, 262144//2 - 4096 = 126976) = 100000. The raised cold 60000
+  # stayed BELOW warm 100000 and the boot-transient clamp 61440, but
+  # post-deploy guardrail validation failed on two consecutive nights
+  # (contention_fallback_after_queue 315/335 vs <2x baseline 230; sustained
+  # depth-4 samples), so cheap cold is reverted to the pre-change 30000.
+  # 30000 stays below both warm thresholds (band (30000, 100000] non-empty,
+  # dead-code guard LP-0MSI2M5BT004BCDP) and restores the pre-change
+  # bypass of the (30000, 60000] band in cheap mode.
+  local_large_context_cold_cache_threshold: 30000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens

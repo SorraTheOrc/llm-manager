@@ -1,0 +1,47 @@
+# Logrotate configuration for llama-proxy logs
+# Installed to /etc/logrotate.d/llama-proxy by HOST_INSTALL.md step 6.
+#
+# This provides a safety-net for rotation, compression and pruning,
+# complementing the in-process TimedRotatingFileHandler in proxy/utils.py
+# (which remains the primary mechanism and survives proxy restarts).
+#
+# To activate / test manually (does NOT need the proxy stopped):
+#   sudo cp proxy/scripts/llama-proxy-logrotate /etc/logrotate.d/llama-proxy
+#   sudo logrotate -s /var/lib/logrotate/llama-proxy.status \
+#     /etc/logrotate.d/llama-proxy
+
+# proxy.log rotates in-process every `logging.rotation_hours` (default 6h)
+# to proxy.log.YYYY-MM-DD_HH; prune_logs (startup) prunes those beyond
+# `logging.retention_days` (default 7) and gzips older retained files.
+# This drop-in is the safety net for when the proxy is down or the handler
+# fails: it rotates the current file daily, keeps 7 copies, and compresses.
+# copytruncate keeps the running handler's open file descriptor intact
+# (no SIGHUP/restart needed).
+/var/log/llama-proxy/proxy.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y-%m-%d_%H
+    create 0664 rgardler rgardler
+}
+
+# llama-server.log is rotated in-process by proxy/lifecycle.py
+# (rotate_llama_logs, keep=15). This entry is a safety net: rotate daily,
+# keep 15 copies, compress. copytruncate keeps llama-server's open fd valid.
+/var/log/llama-proxy/llama-server.log {
+    daily
+    rotate 15
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y-%m-%d
+    create 0664 rgardler rgardler
+}

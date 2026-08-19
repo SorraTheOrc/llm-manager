@@ -50,10 +50,23 @@ _provider_failure_count: dict[str, int] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
-# FreeUsageLimitError cooldown: 3 hours (10800 seconds)
+# FreeUsageLimitError cooldown: 3 hours (10800 seconds) by default.
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details.
+# Per-provider overrides for providers whose free-tier quota requires a
+# longer quarantine to avoid repeated futile fallback attempts (LP-0MSMCM5UG00378G8).
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
+_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES: dict[str, int] = {
+    "opencode-deepseek-free": 86400,   # 24 hours
+    "opencode-big-pickle": 86400,      # 24 hours
+}
+
+
+def _free_usage_limit_cooldown_for_provider(provider_name: str) -> int:
+    """Return the cooldown seconds for a FreeUsageLimitError on the given provider."""
+    return _FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES.get(
+        provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS
+    )
 
 # Usage-limit reset tracking (LP-0MSLJPOCC0001ROJ): failure-domain key ->
 # absolute epoch timestamp when the usage limit resets (including the
@@ -3514,13 +3527,16 @@ async def _proxy_with_remote_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
-                # FreeUsageLimitError: apply 3-hour cooldown on affected provider
+                # FreeUsageLimitError: apply cooldown on affected provider
                 # so the fallback chain routes to paid alternatives instead of
-                # repeatedly retrying the exhausted free tier.
+                # repeatedly retrying the exhausted free tier.  Some providers
+                # (opencode-deepseek-free, opencode-big-pickle) use a 24-hour
+                # cooldown to avoid futile repeated fallback attempts (LP-0MSMCM5UG00378G8).
                 if _is_free_usage_limit_error(response, body_text):
                     fallback_reason = "free_usage_limit"
                     prev_provider = provider_name
-                    mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                    cooldown_seconds = _free_usage_limit_cooldown_for_provider(provider_name)
+                    mark_provider_unavailable(provider_name, cooldown_seconds)
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
@@ -3529,7 +3545,7 @@ async def _proxy_with_remote_fallback_cycle(
                         status="free_usage_limit",
                         status_code=int(response.status_code),
                         body_snippet=(body_text[:512] if body_text else None),
-                        cooldown_seconds=_FREE_USAGE_LIMIT_COOLDOWN_SECONDS,
+                        cooldown_seconds=cooldown_seconds,
                     )
                     all_slot_exhaustion = False
                     continue
@@ -4361,13 +4377,16 @@ async def _proxy_with_fallback_cycle(
                         all_slot_exhaustion = False
                         continue
 
-                    # FreeUsageLimitError: apply 3-hour cooldown on affected provider
+                    # FreeUsageLimitError: apply cooldown on affected provider
                     # so the fallback chain routes to paid alternatives instead of
-                    # repeatedly retrying the exhausted free tier.
+                    # repeatedly retrying the exhausted free tier.  Some providers
+                    # (opencode-deepseek-free, opencode-big-pickle) use a 24-hour
+                    # cooldown to avoid futile repeated fallback attempts (LP-0MSMCM5UG00378G8).
                     if _is_free_usage_limit_error(response, body_text):
                         fallback_reason = "free_usage_limit"
                         prev_provider = provider_name
-                        mark_provider_unavailable(provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS)
+                        cooldown_seconds = _free_usage_limit_cooldown_for_provider(provider_name)
+                        mark_provider_unavailable(provider_name, cooldown_seconds)
                         attempted_domains.add(_failure_domain_key(provider_cfg))
                         _record_attempt(
                             attempts,
@@ -4376,7 +4395,7 @@ async def _proxy_with_fallback_cycle(
                             status="free_usage_limit",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
-                            cooldown_seconds=_FREE_USAGE_LIMIT_COOLDOWN_SECONDS,
+                            cooldown_seconds=cooldown_seconds,
                         )
                         all_slot_exhaustion = False
                         continue
