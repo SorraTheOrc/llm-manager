@@ -1818,8 +1818,11 @@ local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 
 local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
 ```
 
-The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`
-and the default `config.yaml` use `38000`, `config-cheap.yaml` uses `60000`.
+The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`,
+the default `config.yaml`, and `config-cheap.yaml` all use `38000` (cheap is
+symmetric with fast after the initial 60000 raise breached the cheap queue
+guardrails and was reverted — LP-0MSRM54YO007YG0K AC7 — then re-raised to
+38000, LP-0MSY0V4ZO002ANPL).
 Each value stays below its mode's effective warm clamp (fast `131072//3 − 4096
 = 39594`; cheap resolves to `100000` via its 2×262144 schedule entries, and is
 also below the boot-transient clamp 61440) so the (cold, warm] band never

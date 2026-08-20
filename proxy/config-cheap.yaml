@@ -525,18 +525,23 @@ server:
   # and follow-up LP-0MSEGPO77005CYCQ (token_estimate_multiplier / native
   # tokenizer).
   #
-  # MODE-AWARE value (LP-0MSOMVOPH004ATAK, then REVERTED per validation
-  # LP-0MSRM54YO007YG0K AC7): cheap mode runs 2 slots x 262144 (per-period
-  # ctx override), so the effective warm threshold resolves to
-  # min(100000, 262144//2 - 4096 = 126976) = 100000. The raised cold 60000
-  # stayed BELOW warm 100000 and the boot-transient clamp 61440, but
-  # post-deploy guardrail validation failed on two consecutive nights
+  # MODE-AWARE value (LP-0MSOMVOPH004ATAK): cheap mode runs 2 slots x
+  # 262144 (per-period ctx override), so the effective warm threshold
+  # resolves to min(100000, 262144//2 - 4096 = 126976) = 100000. The first
+  # bump to 60000 stayed BELOW warm 100000 and boot-clamp 61440, but
+  # post-deploy guardrail validation FAILED on two consecutive nights
   # (contention_fallback_after_queue 315/335 vs <2x baseline 230; sustained
-  # depth-4 samples), so cheap cold is reverted to the pre-change 30000.
-  # 30000 stays below both warm thresholds (band (30000, 100000] non-empty,
-  # dead-code guard LP-0MSI2M5BT004BCDP) and restores the pre-change
-  # bypass of the (30000, 60000] band in cheap mode.
-  local_large_context_cold_cache_threshold: 30000
+  # depth-4 samples) so it was reverted to pre-change 30000 (LP-0MSRM54YO007YG0K
+  # AC7, git 0a9bd1d). Post-revert windows at 30000 all held guardrails
+  # (fa Δ 0/4/38 ≤ 230, no sustained depth-4, Aug 18-20). A data-backed
+  # re-attempt (LP-0MSY0V4ZO002ANPL) re-raises cheap cold to 38000 — the
+  # same value fast/default already run (zero guardrail events in all fast
+  # windows Aug 13-20), with comfortable headroom: 38000 < cheap warm 100000
+  # and < boot-transient clamp 61440; the (38000, 100000] band stays
+  # non-empty (dead-code guard LP-0MSI2M5BT004BCDP); flip ~20-38/night,
+  # inside the safe envelope (~≤300 arrivals/night). Do NOT raise >=46000
+  # (measured inside the proven failure envelope of the 60000 experiment).
+  local_large_context_cold_cache_threshold: 38000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens

@@ -173,9 +173,11 @@ server:
 >
 > - `proxy/config-fast.yaml` — `38000` (warm clamps to `131072//3 − 4096 =
 >   39594`; recaptures the old (30000, 38000] cold-cache bypass band).
-> - `proxy/config-cheap.yaml` — `60000` (warm resolves to `100000` via the
+> - `proxy/config-cheap.yaml` — `38000` (warm resolves to `100000` via the
 >   2×262144 schedule entries; also below the boot-transient clamp 61440,
->   LP-0MSMZOAJW002UR2A; recaptures ~50 cold-cache requests/night).
+>   LP-0MSMZOAJW002UR2A; symmetric with fast after the 60000 raise failed
+>   guardrails and was reverted — see LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K
+>   / LP-0MSY0V4ZO002ANPL).
 > - `proxy/config.yaml` (default/fallback) — `38000`, mirroring fast mode.
 >
 > Prompts above the per-slot warm clamp are **never** routed local
