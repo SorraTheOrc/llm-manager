@@ -528,10 +528,13 @@ def aggregate(
     ``events`` may be any iterable of parsed :class:`LogEvent` (e.g. chained
     across multiple log files). Events outside the window are ignored.
 
-    When ``mode_map`` is given, ``Mode scheduler: applied scheduled mode``
-    events (yielded by ``iter_events`` across the margin-widened window) are
-    collected into a mode timeline, and each session is bucketed by the mode
-    active at its first in-window stream (LP-0MSPZUD4G007IYGH).
+    When ``mode_map`` is given, mode-switch events (``Mode scheduler:
+    applied scheduled mode`` for scheduled transitions plus the
+    ``Grandfathering: enabled; ... (current=<mode>)`` marker for manual
+    switches, LP-0MT1EE315007AKXG; yielded by ``iter_events`` across the
+    margin-widened window) are collected into a mode timeline, and each
+    session is bucketed by the mode active at its first in-window stream
+    (LP-0MSPZUD4G007IYGH).
     """
     builders: dict[str, _SessionBuilder] = {}
     routing_skips: dict[str, list[LogEvent]] = {}

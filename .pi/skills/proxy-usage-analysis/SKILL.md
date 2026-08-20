@@ -166,7 +166,9 @@ run (`Previous outputs archived to …`).
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
    `routing_skip_local`, `local_dispatch_denied`, plus the operating-mode
-   lines (`Mode scheduler: applied scheduled mode fast|cheap`) and the error
+   lines (`Mode scheduler: applied scheduled mode fast|cheap`; manual
+   switches, which log `Grandfathering: enabled; other-mode config ...
+   (current=fast|cheap)`, LP-0MT1EE315007AKXG) and the error
    lines (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote]
    upstream error`). Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
@@ -198,8 +200,12 @@ run (`Previous outputs archived to …`).
 5. **Fast/cheap bucketing** — each session is bucketed by the **operating
    mode** active at its first in-window stream, reconstructed from the
    `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
-   (LP-0MSPZUD4G007IYGH) — so a window crossing the 01:00/10:00 mode
-   transitions splits fast vs cheap correctly even when the analysis itself
+   plus the manual-switch marker `Grandfathering: enabled; other-mode
+   config ... (current=<mode>)` (a `POST /admin/set-mode` manual switch
+   restarts the proxy and logs the actually-active mode this way, without
+   an applied-scheduled-mode line; LP-0MT1EE315007AKXG) — so a window
+   crossing the 01:00/10:00 mode transitions, or containing a manual
+   switch, splits fast vs cheap correctly even when the analysis itself
    runs in fast mode. The mode timeline is built with a 48h margin beyond
    the window (a single streaming pass also serves the busy-time pairing),
    so the nearest prior transition is always available. The bucket label is
@@ -335,11 +341,13 @@ lines (`proxy.log` and `llama-server.log`).
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
   window; the fast/cheap bucket is keyed by its first in-window stream.
-- The mode timeline is reconstructed from `Mode scheduler` lines within a
-  48h margin of the window; sessions starting before the earliest observed
-  transition in the available logs fall back to the analysis-time mode
-  (documented in LP-0MSPZUD4G007IYGH). A window entirely inside one mode
-  (no transition observed) keeps the legacy slot-schedule bucketing.
+- The mode timeline is reconstructed from `Mode scheduler` lines
+  (scheduled) plus the `Grandfathering: enabled; ... (current=<mode>)`
+  marker (manual switches, LP-0MT1EE315007AKXG) within a 48h margin of the
+  window; sessions starting before the earliest observed transition in the
+  available logs fall back to the analysis-time mode (documented in
+  LP-0MSPZUD4G007IYGH). A window entirely inside one mode (no transition
+  observed) keeps the legacy slot-schedule bucketing.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
   across the analysis's effective margin (48h, see `MODE_TIMELINE_MARGIN`)
   and clips streams to the window; a stream that started more than

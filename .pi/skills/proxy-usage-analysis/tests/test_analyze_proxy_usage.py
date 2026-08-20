@@ -224,8 +224,36 @@ class TestLogLineParsing:
 
     def test_mode_scheduler_enabled_line_ignored(self):
         """The ``enabled with N entries`` announcement carries no applied
-        mode and is not a timeline event."""
+        mode and is not a timeline event (fires on both scheduled and manual
+        transitions, so it is not a reliable mode signal)."""
         assert log_parser.parse_log_line(fixtures.MODE_SCHEDULER_ENABLED_IGNORED) is None
+
+    def test_manual_mode_switch_grandfathering_parsed(self):
+        """A manual ``POST /admin/set-mode`` switch reports the actually-
+        active mode as ``Grandfathering: enabled; other-mode config ...
+        (current=<mode>)`` — a mode_switch event (LP-0MT1EE315007AKXG)."""
+        ev = log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.ts == datetime(2026, 8, 19, 18, 20, 16, 684000)
+
+    def test_manual_mode_switch_enabled_and_restart_lines_ignored(self):
+        """The manual-switch 'enabled with N entries' announcement (it fired
+        for the scheduled 10:00 transition too) and the 'router-mode restart
+        complete' corroboration line carry no reliable mode and stay outside
+        the timeline."""
+        assert log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_CHEAP) is None
+        assert log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_RESTART) is None
+
+    def test_manual_mode_switch_slot_scheduler_current_ignored(self):
+        """slot_scheduler logs ``(current=%d`` with a slot COUNT, not a mode;
+        the parser must not mistake it for a mode_switch."""
+        line = (
+            "2026-08-19 18:20:20,000 - INFO - Slot scheduler: arming transition "
+            "to 2 slots at 10:00 (current=3)"
+        )
+        assert log_parser.parse_log_line(line) is None
 
     def test_status_request_lines_ignored(self):
         """status_request lines expose total_slots but are not parsed (they
@@ -860,6 +888,64 @@ class TestModeTimelineBucketing:
         assert res.sessions["fast-late"].bucket == "fast"
         assert res.sessions["fast-late"].slots == 3
         assert res.sessions["fast-late"].ctx_size == 131072
+
+    def test_manual_mode_switch_buckets_sessions_cheap(self):
+        """Regression (LP-0MT1EE315007AKXG): a MANUAL switch to cheap mid-
+        window (logged only as ``Grandfathering: enabled ... (current=cheap)``,
+        no 'applied scheduled mode' line) must bucket subsequent sessions as
+        cheap — previously the whole window collapsed into fast (0 cheap)."""
+        mm = fixtures.mode_map_fixture()
+        lines = [
+            # Manual switch to cheap at 18:20 (inside the window).
+            fixtures.MANUAL_MODE_SWITCH_CHEAP,
+            fixtures.MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP,
+            fixtures.MANUAL_MODE_SWITCH_RESTART,
+            # Cheap-hour session after the manual switch.
+            "2026-08-19 18:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=manual-cheap request=[]",
+            "2026-08-19 18:30:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=manual-cheap provider=local model=Qwen3 request=[]",
+            # Fast-hour session before the manual switch.
+            "2026-08-19 12:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=manual-fast request=[]",
+            "2026-08-19 12:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=manual-fast provider=local model=Qwen3 request=[]",
+        ]
+        window_start = datetime(2026, 8, 19, 10, 0, 0)
+        window_end = datetime(2026, 8, 19, 20, 0, 0)
+        res = aggregation.aggregate(
+            _events(lines),
+            window_start,
+            window_end,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # Manual switch reconstructed as a cheap transition.
+        assert (datetime(2026, 8, 19, 18, 20, 16, 684000), "cheap") in mm.transitions
+        assert res.sessions["manual-fast"].bucket == "fast"
+        assert res.sessions["manual-fast"].slots == 3
+        assert res.sessions["manual-cheap"].bucket == "cheap"
+        assert res.sessions["manual-cheap"].slots == 2
+        assert res.sessions["manual-cheap"].ctx_size == 262144
+
+    def test_manual_switch_same_timestamp_as_scheduled_dedupes(self):
+        """When a manual switch and a scheduled 'applied scheduled mode' line
+        report the same mode at the same instant, the timeline keeps a single
+        transition (no spurious flip)."""
+        mm = fixtures.mode_map_fixture()
+        lines = [
+            "2026-08-19 10:00:18,000 - INFO - Mode scheduler: applied scheduled mode fast",
+            "2026-08-19 10:00:18,400 - INFO - Grandfathering: enabled; other-mode config config-cheap.yaml (current=fast)",
+            "2026-08-19 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-19 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 19, 9, 0, 0),
+            datetime(2026, 8, 19, 12, 0, 0),
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # Both lines say 'fast'; the session stays fast and no double-transition
+        # introduces a spurious cheap period.
+        assert res.sessions["s1"].bucket == "fast"
+        assert res.sessions["s1"].slots == 3
 
     def test_window_without_transitions_keeps_legacy_bucketing(self):
         """A single-mode window (no transitions observed) keeps the legacy

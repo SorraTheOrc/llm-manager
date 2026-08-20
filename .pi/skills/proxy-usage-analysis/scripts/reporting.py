@@ -408,7 +408,9 @@ def build_report(
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
         "fast/cheap bucketing uses the session start time and the operating-mode profile active at "
-        "that time (reconstructed from `Mode scheduler` lines; windows without mode transitions use "
+        "that time (reconstructed from `Mode scheduler` lines for scheduled "
+        "transitions plus the `Grandfathering: enabled; ... (current=<mode>)` marker for "
+        "manual switches, LP-0MT1EE315007AKXG; windows without mode transitions use "
         "the analysis-time config profile, LP-0MSPZUD4G007IYGH)."
     )
     ap(
@@ -766,8 +768,11 @@ def run_analysis(
     llama-server files are skipped, never fatal.
 
     Fast/cheap bucketing is mode-aware (LP-0MSPZUD4G007IYGH): the mode
-    timeline is reconstructed from ``Mode scheduler`` lines in the logs, and
-    each session is bucketed by the profile active at its start. ``mode_map``
+    timeline is reconstructed from ``Mode scheduler`` lines in the logs
+    (scheduled transitions) plus the ``Grandfathering: enabled; other-mode
+    config ... (current=<mode>)`` marker (manual ``POST /admin/set-mode``
+    switches, LP-0MT1EE315007AKXG), and each session is bucketed by the
+    profile active at its start. ``mode_map``
     may be passed explicitly (tests); otherwise it is built from the
     discovered config profiles (``config-fast.yaml`` / ``config-cheap.yaml``)
     and the persisted ``proxy/.mode``.
