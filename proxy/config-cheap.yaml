@@ -63,8 +63,8 @@
 #                     provider unrestricted. Malformed entries are logged and
 #                     ignored (fail-open). The deepseek-v4-flash provider
 #                     (direct api.deepseek.com entry and all opencode-hosted
-#                     deepseek entries: opencode-deepseek-free, opencode-go-3-
-#                     deepseek, opencode-go-2-deepseek, opencode-go-deepseek)
+#                     deepseek entries: opencode-go-3-deepseek, opencode-go-2-
+#                     deepseek, opencode-go-deepseek)
 #                     are currently timed to off-peak UTC windows
 #                     (see their entries).
 #                     Example:
@@ -159,18 +159,17 @@ session_recording:
 # ---------------------------------------------------------------------------
 # The audit skill (skill/audit/) uses these settings to determine which
 # model to call for audit operations. The resolver maps short names to
-# provider-prefixed model IDs (e.g., ``deepseek-v4-flash-free`` →
-# ``opencode/deepseek-v4-flash-free``).
+# provider-prefixed model IDs (e.g., ``deepseek-v4-flash`` →
+# ``opencode/deepseek-v4-flash``).
 #
 # Canonical model IDs (discovered via ``pi --list-models``):
-#   opencode/deepseek-v4-flash-free
+#   opencode/deepseek-v4-flash
 #   opencode-go/deepseek-v4-flash
-#   openrouter/openrouter/free
+#   openrouter/deepseek/deepseek-v4-flash
 #
 # See proxy/provider_resolver.py for the full mapping table.
-audit_model: "deepseek-v4-flash-free"
+audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  - "openrouter/free"
   - "deepseek-v4-flash"
 
 models:
@@ -190,7 +189,7 @@ models:
         endpoint: https://models.inference.ai.azure.com
     aliases:
     - github-*
-  # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, OpenCode Go #2, then DeepSeek direct.
+  # Cascading fallback: local Qwen3 first, then OpenCode Go, OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model is queued up to the contention caps
   # (policy=queue, see server.contention_queue_* below) and only then falls
   # through to remote tiers (LP-0MSORQVK50012Q4D).
@@ -200,14 +199,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -259,13 +250,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-mimo-v2.5-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: mimo-v2.5-free
-        forward_session_headers: false
       - name: opencode-go-3-deepseek
         type: remote
         provider: opencode-go
@@ -308,14 +292,6 @@ models:
       - name: local-qwen3-next
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode
@@ -373,14 +349,6 @@ models:
       - name: local-qwen3-mtp
         type: local
         llama_model: Qwen3-MTP
-      - name: opencode-deepseek-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
       - name: opencode-big-pickle
         type: remote
         provider: opencode

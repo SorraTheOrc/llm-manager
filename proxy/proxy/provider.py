@@ -57,7 +57,6 @@ _BACKOFF_MAX_SECONDS = 45.0
 # longer quarantine to avoid repeated futile fallback attempts (LP-0MSMCM5UG00378G8).
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
 _FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES: dict[str, int] = {
-    "opencode-deepseek-free": 86400,   # 24 hours
     "opencode-big-pickle": 86400,      # 24 hours
 }
 
@@ -3530,8 +3529,8 @@ async def _proxy_with_remote_fallback_cycle(
                 # FreeUsageLimitError: apply cooldown on affected provider
                 # so the fallback chain routes to paid alternatives instead of
                 # repeatedly retrying the exhausted free tier.  Some providers
-                # (opencode-deepseek-free, opencode-big-pickle) use a 24-hour
-                # cooldown to avoid futile repeated fallback attempts (LP-0MSMCM5UG00378G8).
+                # (opencode-big-pickle) use a 24-hour cooldown to avoid futile
+                # repeated fallback attempts (LP-0MSMCM5UG00378G8).
                 if _is_free_usage_limit_error(response, body_text):
                     fallback_reason = "free_usage_limit"
                     prev_provider = provider_name
@@ -4380,8 +4379,8 @@ async def _proxy_with_fallback_cycle(
                     # FreeUsageLimitError: apply cooldown on affected provider
                     # so the fallback chain routes to paid alternatives instead of
                     # repeatedly retrying the exhausted free tier.  Some providers
-                    # (opencode-deepseek-free, opencode-big-pickle) use a 24-hour
-                    # cooldown to avoid futile repeated fallback attempts (LP-0MSMCM5UG00378G8).
+                    # (opencode-big-pickle) use a 24-hour cooldown to avoid futile
+                    # repeated fallback attempts (LP-0MSMCM5UG00378G8).
                     if _is_free_usage_limit_error(response, body_text):
                         fallback_reason = "free_usage_limit"
                         prev_provider = provider_name

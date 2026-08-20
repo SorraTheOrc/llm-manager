@@ -286,9 +286,8 @@ logging:
 # Audit model configuration
 # The audit skill uses these settings to determine which model to call
 # for audit operations. See proxy/provider_resolver.py for details.
-audit_model: "deepseek-v4-flash-free"
+audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  - "openrouter/free"
   - "deepseek-v4-flash"
 
 # Model routing
@@ -429,9 +428,8 @@ maps short model names to provider-prefixed model identifiers.
 #### Configuration
 
 ```yaml
-audit_model: "deepseek-v4-flash-free"
+audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  - "openrouter/free"
   - "deepseek-v4-flash"
 ```
 
@@ -442,15 +440,10 @@ maps well-known short names to provider-prefixed model IDs:
 
 | Short name | Resolved IDs |
 |------------|-------------|
-| `deepseek-v4-flash-free` | `opencode/deepseek-v4-flash-free`, `openrouter/openrouter/free`, `opencode-go/deepseek-v4-flash` |
 | `deepseek-v4-flash` | `opencode/deepseek-v4-flash`, `opencode-go/deepseek-v4-flash`, `openrouter/deepseek/deepseek-v4-flash` |
-| `openrouter/free` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
-| `free-model` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
 
 Canonical model IDs were discovered via `pi --list-models`:
-- `opencode/deepseek-v4-flash-free`
 - `opencode-go/deepseek-v4-flash`
-- `openrouter/openrouter/free`
 - `openrouter/deepseek/deepseek-v4-flash`
 - `opencode/deepseek-v4-flash`
 
@@ -488,8 +481,8 @@ CLI:
 
 ```bash
 cd proxy && source .venv/bin/activate
-python -m proxy.provider_resolver deepseek-v4-flash-free openrouter/free
-# Output: Resolved to: opencode/deepseek-v4-flash-free, openrouter/openrouter/free, opencode-go/deepseek-v4-flash
+python -m proxy.provider_resolver deepseek-v4-flash
+# Output: Resolved to: opencode/deepseek-v4-flash, opencode-go/deepseek-v4-flash, openrouter/deepseek/deepseek-v4-flash
 ```
 
 ### Provider Fallback
@@ -605,7 +598,7 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Default cooldown**: 60 seconds
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
-- **FreeUsageLimitError (HTTP 429, LP-0MSMCM5UG00378G8)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s) by default. Two frequently-exhausted free-tier entries, `opencode-deepseek-free` and `opencode-big-pickle`, use a 24-hour (86400s) cooldown instead (override map `_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES` in `proxy/proxy/provider.py`) so the fallback chain routes to paid alternatives for a full day. 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
+- **FreeUsageLimitError (HTTP 429, LP-0MSMCM5UG00378G8)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s) by default. The frequently-exhausted free-tier entry `opencode-big-pickle` uses a 24-hour (86400s) cooldown instead (override map `_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES` in `proxy/proxy/provider.py`) so the fallback chain routes to paid alternatives for a full day. 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
 - **State**: Cooldown state is in-memory only and resets when the proxy restarts
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as

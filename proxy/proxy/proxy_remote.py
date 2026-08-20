@@ -364,7 +364,7 @@ async def proxy_to_remote(
 
     # Override model name in body if provider config specifies an upstream model ID.
     # This allows the proxy to present a different model name to the remote API
-    # than what the client originally sent (e.g. "deepseek-v4-flash-free" for a
+    # than what the client originally sent (e.g. "deepseek-v4-flash" for a
     # model alias like "qwen3-fallback").
     upstream_model = model_config.get("model")
     if upstream_model and body_json.get("model"):
