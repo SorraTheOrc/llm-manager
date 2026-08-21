@@ -31,8 +31,12 @@ slot-cache/
 # ds4 is a nested repo (separate project), not a submodule
 ds4/
 
-# Session recordings — runtime artifacts
+# Session recordings — runtime artifacts (default path now lives OUTSIDE the
+# repo at ~/.llm-proxy/session-recordings/, LP-0MT2TC7FG008BXIU). The patterns
+# below cover every historical on-disk location so a relative-path fallback can
+# never be committed to the source tree again.
 proxy/session-recordings/
+proxy/proxy/session-recordings/
 
 # Operating-mode state file (fast/cheap) — runtime state, not committed
 proxy/.mode
@@ -47,7 +51,6 @@ logs/
 # Python bytecode cache
 __pycache__/
 *.pyc
-proxy/session-recordings/
 qwentts.cpp/models/
 
 # Generated benchmark/test artifacts (not source)
