@@ -167,12 +167,14 @@ Session recording is configured under the ``session_recording`` key in
 
 ```yaml
 session_recording:
-  path: proxy/session-recordings/   # Directory for recording files
+  path: ~/.llm-proxy/session-recordings/   # Directory for recording files
   retention_days: 3                 # Prune recordings older than this (<= 0 disables)
   prune_interval_seconds: 3600      # How often the retention prune re-runs
 ```
 
-The ``path`` defaults to ``proxy/session-recordings/`` if not specified.
+The ``path`` defaults to ``~/.llm-proxy/session-recordings/`` if not
+specified — an absolute location outside the proxy source tree so runtime
+artifacts never pollute the repository (LP-0MT2TC7FG008BXIU).
 
 ### Retention pruning
 

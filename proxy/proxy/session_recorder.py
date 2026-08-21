@@ -15,11 +15,16 @@ Recording is organized on disk by session ID:
 
 Each JSON file wraps the payload with metadata (session_id, direction,
 timestamp) so files can be inspected individually without external context.
+
+The default recording path lives OUTSIDE the proxy source tree at
+``~/.llm-proxy/session-recordings/`` (LP-0MT2TC7FG008BXIU) so runtime
+artifacts never pollute the repository.
 """
 
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -43,7 +48,7 @@ VALID_DIRECTIONS = {DIR_CLIENT_TO_PROXY, DIR_PROXY_TO_PROVIDER, DIR_PROVIDER_TO_
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_RECORDING_PATH = "proxy/session-recordings/"
+DEFAULT_RECORDING_PATH = "~/.llm-proxy/session-recordings/"
 
 # Maximum number of sessions returned by list_sessions() and related
 # endpoints. Prevents the web UI dropdown from being overwhelmed with
@@ -104,7 +109,8 @@ class SessionRecorder:
 
     Attributes:
         recording_path: Absolute or relative path to the root recording
-            directory. Defaults to ``proxy/session-recordings/``.
+            directory. Defaults to ``~/.llm-proxy/session-recordings/``
+            (outside the proxy source tree).
     """
 
     def __init__(
@@ -130,8 +136,11 @@ class SessionRecorder:
             prune_interval_seconds: How often the background prune loop
                 re-runs.
         """
-        # Strip trailing slash for consistent path matching
-        self.recording_path = recording_path.rstrip("/")
+        # Strip trailing slash for consistent path matching, and expand
+        # ``~`` so the default (and any ``~``-based config path) resolves to
+        # an absolute location outside the proxy source tree
+        # (LP-0MT2TC7FG008BXIU).
+        self.recording_path = os.path.expanduser(recording_path).rstrip("/")
         self.max_index_entries = max_index_entries
         self.cold_scan_dir_limit = cold_scan_dir_limit
         self.retention_days = retention_days

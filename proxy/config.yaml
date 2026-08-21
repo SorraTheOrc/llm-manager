@@ -128,9 +128,9 @@ logging:
 #
 # Fields:
 #   path: Directory where recordings are stored.
-#         Default: proxy/session-recordings/
+#         Default: ~/.llm-proxy/session-recordings/ (outside the proxy tree)
 session_recording:
-  path: proxy/session-recordings/
+  path: ~/.llm-proxy/session-recordings/
   # Maximum number of entries kept in the in-memory session metadata index
   # (LP-0MSNKMZCP003T8OG). Least-recently-active sessions are evicted when
   # the index exceeds this size.

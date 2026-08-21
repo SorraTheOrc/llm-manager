@@ -124,9 +124,9 @@ logging:
 #
 # Fields:
 #   path: Directory where recordings are stored.
-#         Default: proxy/session-recordings/
+#         Default: ~/.llm-proxy/session-recordings/ (outside the proxy tree)
 session_recording:
-  path: proxy/session-recordings/
+  path: ~/.llm-proxy/session-recordings/
   # Maximum entries in the in-memory session metadata index (LP-0MSNKMZCP003T8OG).
   max_index_entries: 1000
   # Cold-start scan bound: rebuild from at most this many most-recent dirs.

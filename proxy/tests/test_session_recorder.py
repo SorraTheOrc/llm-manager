@@ -49,12 +49,24 @@ def recorder(temp_recording_dir):
 class TestSessionRecorderInit:
     """Verify SessionRecorder initialisation and default config."""
 
-    def test_default_recording_path(self):
-        """Default recording path is proxy/session-recordings/ (AC5)."""
+    def test_default_recording_path(self, tmp_path, monkeypatch):
+        """Default recording path is outside the proxy source tree (AC1)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         from proxy.session_recorder import SessionRecorder
         rec = SessionRecorder()
+        # Default lives outside the source tree (under $HOME/.llm-proxy).
         assert rec.recording_path.endswith("session-recordings")
-        assert rec.recording_path is not None
+        assert str(tmp_path) in rec.recording_path
+        assert ".llm-proxy" in rec.recording_path
+
+    def test_default_recording_path_expands_user(self, tmp_path, monkeypatch):
+        """A ~ in the default path expands to $HOME (AC1)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from proxy.session_recorder import DEFAULT_RECORDING_PATH, SessionRecorder
+        assert "~" in DEFAULT_RECORDING_PATH
+        rec = SessionRecorder()
+        assert not rec.recording_path.startswith("~")
+        assert rec.recording_path == str(tmp_path / ".llm-proxy" / "session-recordings")
 
     def test_custom_recording_path(self, temp_recording_dir):
         """Custom recording path is honoured."""
@@ -79,11 +91,13 @@ class TestSessionRecorderInit:
         rec = SessionRecorder.from_config(cfg)
         assert rec.recording_path == temp_recording_dir
 
-    def test_config_defaults_to_provided_path(self):
+    def test_config_defaults_to_provided_path(self, tmp_path, monkeypatch):
         """When config dict lacks session_recording key, use the default."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         from proxy.session_recorder import SessionRecorder
         rec = SessionRecorder.from_config({})
         assert rec.recording_path.endswith("session-recordings")
+        assert str(tmp_path) in rec.recording_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1022,12 +1036,14 @@ class TestConfigIntegration:
         rec = SessionRecorder.from_config(cfg)
         assert rec.recording_path == temp_recording_dir
 
-    def test_config_missing_path_key(self, tmp_path):
+    def test_config_missing_path_key(self, tmp_path, monkeypatch):
         """When path key is missing from config, a default is used."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         from proxy.session_recorder import SessionRecorder
         cfg = {"session_recording": {}}
         rec = SessionRecorder.from_config(cfg)
         assert rec.recording_path.endswith("session-recordings")
+        assert str(tmp_path) in rec.recording_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
