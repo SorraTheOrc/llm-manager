@@ -2,9 +2,9 @@ target-version = "py312"
 line-length = 120
 
 # Exclude non-Python files (YAML configs, bash scripts, etc.) — ruff treats
-# them as Python and reports false-positive "invalid-syntax" errors
-# (LP-0MSP5EZWU004C46E, LP-0MSYPB1G7008Q1S5).
-exclude = ["*.yaml", "*.yml", "start-llama.sh"]
+# them as Python and reports false-positive "invalid-syntax" errors.
+# Per-file-ignores cannot suppress invalid-syntax parse errors.
+exclude = ["*.yaml", "*.yml", "start-llama.sh", "scripts/rebuild-and-restart-mtp.sh", "scripts/rebuild-llama.sh"]
 
 [lint]
 select = [
@@ -23,4 +23,4 @@ ignore = [
 
 # Test-specific overrides
 # Permit assert (S101), print (T201), and unused imports in test files
-per-file-ignores = { "tests/*" = ["S101", "T201", "F401"], "proxy/tests/*" = ["S101", "T201", "F401"], "scripts/rebuild-and-restart-mtp.sh" = ["E701", "E702"], "scripts/rebuild-llama.sh" = ["E702", "E703"], "start-llama.sh" = ["E701", "E702", "E703"] }
+per-file-ignores = { "tests/*" = ["S101", "T201", "F401"], "proxy/tests/*" = ["S101", "T201", "F401"] }
