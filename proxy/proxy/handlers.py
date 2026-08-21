@@ -1055,7 +1055,7 @@ async def release_lease(request: Request):
     except Exception as e:
         logger.exception(
             "Failed to release dispatch lease for session %s",
-            session_id[:8] if session_id else "unknown",
+            session_id if session_id else "unknown",
         )
         raise HTTPException(
             status_code=500,

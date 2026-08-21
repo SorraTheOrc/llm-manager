@@ -1056,7 +1056,7 @@ async def _invalidate_session_and_slot(
                     try:
                         _srv().logger.info(
                             "lease_released session=%s reason=%s",
-                            session_id[:8] if session_id else "unknown",
+                            session_id if session_id else "unknown",
                             reason or "invalidation",
                         )
                     except Exception:

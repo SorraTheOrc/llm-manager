@@ -860,14 +860,14 @@ async def _extend_lease_during_prefill(
                         if advancing:
                             srv.logger.info(
                                 "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                                session_key[:8] if session_key else "unknown",
+                                session_key if session_key else "unknown",
                                 progress,
                                 buffer_seconds,
                             )
                         else:
                             srv.logger.info(
                                 "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
-                                session_key[:8] if session_key else "unknown",
+                                session_key if session_key else "unknown",
                                 buffer_seconds,
                             )
                     except Exception:
@@ -893,7 +893,7 @@ async def _decrement_local_active_queries(
         async with srv.local_active_queries_lock:
             srv.local_active_queries = max(0, srv.local_active_queries - 1)
     except Exception as exc:
-        session_hint = f" session={session_key[:8]}" if session_key else ""
+        session_hint = f" session={session_key}" if session_key else ""
         try:
             srv.logger.warning(
                 "Failed to decrement local_active_queries: %s: %s%s",
@@ -918,14 +918,14 @@ async def _decrement_local_active_queries(
                         try:
                             srv.logger.info(
                                 "lease_renewed session=%s timeout=%.0fs",
-                                session_key[:8] if session_key else "unknown",
+                                session_key if session_key else "unknown",
                                 lease_timeout,
                             )
                         except Exception as exc:
                             try:
                                 srv.logger.warning(
                                     "Failed to log lease_renewed for session=%s: %s: %s",
-                                    session_key[:8] if session_key else "unknown",
+                                    session_key if session_key else "unknown",
                                     type(exc).__name__,
                                     exc,
                                 )
@@ -935,7 +935,7 @@ async def _decrement_local_active_queries(
             try:
                 srv.logger.warning(
                     "Failed to mark dispatch record inactive for session=%s: %s: %s",
-                    session_key[:8] if session_key else "unknown",
+                    session_key if session_key else "unknown",
                     type(exc).__name__,
                     exc,
                 )
@@ -1170,7 +1170,7 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                 try:
                     srv.logger.info(
                         "lease_released session=%s reason=explicit_release",
-                        session_id[:8] if session_id else "unknown",
+                        session_id if session_id else "unknown",
                         extra=_client_identity_extra(request),
                     )
                 except Exception:
@@ -1293,7 +1293,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout",
-                            sid[:8] if sid else "unknown",
+                            sid if sid else "unknown",
                         )
                     except Exception:
                         pass
@@ -1339,7 +1339,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             srv.logger.info(
                                 "lease_verified_active session=%s "
                                 "reason=active_slot stream_abandoned=False",
-                                sid[:8] if sid else "unknown",
+                                sid if sid else "unknown",
                             )
                         except Exception:
                             pass
@@ -1367,11 +1367,11 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         srv.logger.warning(
                             "lease_released session=%s reason=orphan_cleanup "
                             "stream_abandoned=True",
-                            sid[:8] if sid else "unknown",
+                            sid if sid else "unknown",
                         )
                         srv.logger.info(
                             "lease_released session=%s reason=orphan_cleanup",
-                            sid[:8] if sid else "unknown",
+                            sid if sid else "unknown",
                         )
                     except Exception:
                         pass

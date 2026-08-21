@@ -156,12 +156,12 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         await _release_local_dispatch(_srv, session_id)
         logger.info(
             "lease_released session=%s reason=session_evicted",
-            session_id[:8] if session_id else "unknown",
+            session_id if session_id else "unknown",
         )
     except Exception:
         logger.exception(
             "Failed to release dispatch lease on session eviction for %s",
-            session_id[:8] if session_id else "unknown",
+            session_id if session_id else "unknown",
         )
 
 

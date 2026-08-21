@@ -561,7 +561,7 @@ async def _cleanup_after_request(
                             try:
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
-                                    session_id[:8] if session_id else "unknown",
+                                    session_id if session_id else "unknown",
                                     extra=_client_identity_extra(request),
                                 )
                             except Exception:
@@ -581,7 +581,7 @@ async def _cleanup_after_request(
                         try:
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
-                                session_id[:8] if session_id else "unknown",
+                                session_id if session_id else "unknown",
                                 extra=_client_identity_extra(request),
                             )
                         except Exception:
@@ -791,8 +791,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         if not acquired:
             srv.logger.info(
                 "local_dispatch_denied session=%s owner=%s active=%s",
-                session_id[:8] if session_id else "unknown",
-                owner[:8] if owner else "none",
+                session_id if session_id else "unknown",
+                owner if owner else "none",
                 active_count,
             )
             _record_backend_signal("local_dispatch_denied")
