@@ -23,7 +23,7 @@ import logging
 import re
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +61,14 @@ DEFAULT_MAX_INDEX_ENTRIES = 1000
 # cold /admin/sessions call never re-reads the full recordings tree
 # (LP-0MSNKMZCP003T8OG).
 COLD_SCAN_DIR_LIMIT = 50
+
+# Retention window for session recordings, in days. Recordings older than
+# this are pruned by the background prune loop (and at startup). A value
+# <= 0 disables pruning entirely (LP-0MT2TC3PB005H1RD).
+DEFAULT_RETENTION_DAYS = 3
+
+# How often the background prune loop re-runs, in seconds (LP-0MT2TC3PB005H1RD).
+DEFAULT_PRUNE_INTERVAL_SECONDS = 3600
 
 # ---------------------------------------------------------------------------
 # Shared metadata index (module-level, keyed by recording path)
@@ -104,6 +112,8 @@ class SessionRecorder:
         recording_path: str = DEFAULT_RECORDING_PATH,
         max_index_entries: int = DEFAULT_MAX_INDEX_ENTRIES,
         cold_scan_dir_limit: int = COLD_SCAN_DIR_LIMIT,
+        retention_days: int = DEFAULT_RETENTION_DAYS,
+        prune_interval_seconds: int = DEFAULT_PRUNE_INTERVAL_SECONDS,
     ):
         """Initialize the recorder and ensure the recording directory exists.
 
@@ -115,11 +125,17 @@ class SessionRecorder:
                 evicted when the index exceeds this size.
             cold_scan_dir_limit: Maximum number of session directories
                 visited by the cold-start scan when the index is empty.
+            retention_days: Recordings older than this many days are pruned
+                by the background prune loop. Values <= 0 disable pruning.
+            prune_interval_seconds: How often the background prune loop
+                re-runs.
         """
         # Strip trailing slash for consistent path matching
         self.recording_path = recording_path.rstrip("/")
         self.max_index_entries = max_index_entries
         self.cold_scan_dir_limit = cold_scan_dir_limit
+        self.retention_days = retention_days
+        self.prune_interval_seconds = prune_interval_seconds
 
         # Shared metadata index for this recording path (module-level, so
         # writer instances and the UI's cached instance see the same state).
@@ -167,10 +183,22 @@ class SessionRecorder:
             if isinstance(sr_cfg, dict)
             else COLD_SCAN_DIR_LIMIT
         )
+        retention_days = (
+            sr_cfg.get("retention_days", DEFAULT_RETENTION_DAYS)
+            if isinstance(sr_cfg, dict)
+            else DEFAULT_RETENTION_DAYS
+        )
+        prune_interval = (
+            sr_cfg.get("prune_interval_seconds", DEFAULT_PRUNE_INTERVAL_SECONDS)
+            if isinstance(sr_cfg, dict)
+            else DEFAULT_PRUNE_INTERVAL_SECONDS
+        )
         return cls(
             recording_path=path,
             max_index_entries=max_entries,
             cold_scan_dir_limit=cold_scan_limit,
+            retention_days=retention_days,
+            prune_interval_seconds=prune_interval,
         )
 
     # ------------------------------------------------------------------
@@ -317,6 +345,150 @@ class SessionRecorder:
     def _write_file(path: Path, data: bytes) -> None:
         """Synchronous file write — runs in a thread pool executor."""
         path.write_bytes(data)
+
+    # ------------------------------------------------------------------
+    # Retention pruning
+    # ------------------------------------------------------------------
+
+    async def prune_older_than(self, days: int) -> dict[str, Any]:
+        """Delete recordings older than *days* days (non-blocking).
+
+        Runs the synchronous scan in a thread pool executor so the event
+        loop stays responsive while potentially large trees are walked.
+        When *days* <= 0 pruning is disabled and nothing is deleted.
+
+        Safety: the scan only descends into immediate subdirectories of the
+        configured recording root. Symlinked files/directories are never
+        followed, so content reachable through a symlink outside the root is
+        never deleted. Only files matching the recorder naming convention
+        (``*-request.json`` / ``*-response.json``) are considered; other
+        files in session directories are left untouched.
+
+        Age determination (oldest-first preference, LP-0MT2TC3PB005H1RD):
+        1. ISO timestamp embedded in the filename;
+        2. ``timestamp`` field in the recorded JSON envelope;
+        3. file mtime as a last resort.
+
+        Args:
+            days: Retention window in days. Recordings older than this are
+                deleted. Values <= 0 disable pruning (no-op).
+
+        Returns:
+            A stats dict with keys: ``disabled``, ``files_scanned``,
+            ``files_deleted``, ``dirs_removed``, and ``errors``.
+        """
+        return await asyncio.to_thread(self._prune_older_than_sync, days)
+
+    def _prune_older_than_sync(self, days: int) -> dict[str, Any]:
+        """Synchronous pruning scan — runs in a thread pool executor."""
+        stats = {
+            "disabled": False,
+            "files_scanned": 0,
+            "files_deleted": 0,
+            "dirs_removed": 0,
+            "errors": 0,
+            "cutoff": None,
+        }
+        if days <= 0:
+            stats["disabled"] = True
+            return stats
+
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        stats["cutoff"] = cutoff.isoformat(timespec="seconds")
+
+        root = Path(self.recording_path)
+        if not root.is_dir():
+            return stats
+
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            # Never follow symlinked session directories out of the root.
+            if child.is_symlink():
+                continue
+            try:
+                self._prune_session_dir(child, cutoff, stats)
+            except OSError:
+                stats["errors"] += 1
+        return stats
+
+    def _prune_session_dir(self, session_dir: Path, cutoff: datetime, stats: dict) -> None:
+        """Delete recordings in *session_dir* older than *cutoff*.
+
+        Removes the directory itself when it becomes empty. Only recording
+        files matching the recorder naming convention are touched.
+        """
+        for f in sorted(session_dir.iterdir()):
+            if not f.is_file():
+                continue
+            if f.is_symlink():
+                # Never touch content reachable through symlinks.
+                continue
+            if not (f.name.endswith("-request.json") or f.name.endswith("-response.json")):
+                continue
+            stats["files_scanned"] += 1
+            ts = self._recording_file_timestamp(f)
+            if ts is not None and ts < cutoff:
+                try:
+                    f.unlink()
+                    stats["files_deleted"] += 1
+                except OSError:
+                    stats["errors"] += 1
+
+        # Remove the session directory when it holds no recording files.
+        try:
+            remaining = [
+                e for e in session_dir.iterdir()
+                if e.is_file()
+                and (e.name.endswith("-request.json") or e.name.endswith("-response.json"))
+            ]
+            if not remaining:
+                session_dir.rmdir()
+                stats["dirs_removed"] += 1
+        except OSError:
+            # Directory not empty (scratch files present) or permission issue.
+            pass
+
+    def _recording_file_timestamp(self, filepath: Path) -> datetime | None:
+        """Best-effort timestamp for a recording file.
+
+        Prefers the ISO timestamp embedded in the filename, falls back to
+        the ``timestamp`` envelope field, then to file mtime. Returns None
+        only when no timestamp can be derived at all.
+        """
+        m = self._FILENAME_TS_RE.match(filepath.name)
+        if m:
+            try:
+                return self._coerce_utc(datetime.fromisoformat(m.group(1)))
+            except ValueError:
+                pass
+        try:
+            content = json.loads(filepath.read_bytes())
+            ts = content.get("timestamp") if isinstance(content, dict) else None
+            if isinstance(ts, str):
+                try:
+                    return self._coerce_utc(datetime.fromisoformat(ts))
+                except ValueError:
+                    pass
+        except (json.JSONDecodeError, OSError):
+            pass
+        try:
+            return datetime.fromtimestamp(filepath.stat().st_mtime, tz=UTC)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _coerce_utc(dt: datetime) -> datetime:
+        """Normalise a parsed timestamp to an aware UTC datetime.
+
+        Older recordings embedded naive ISO timestamps (no tz offset); the
+        mtime fallback is always aware. Comparisons against the UTC cutoff
+        require both sides to be aware, so naive values are assumed UTC
+        (LP-0MT2TC3PB005H1RD).
+        """
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt
 
     # ------------------------------------------------------------------
     # Metadata index (shared, per recording path)

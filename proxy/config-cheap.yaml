@@ -153,6 +153,12 @@ session_recording:
   max_index_entries: 1000
   # Cold-start scan bound: rebuild from at most this many most-recent dirs.
   cold_scan_dir_limit: 50
+  # Retention window in days (LP-0MT2TC3PB005H1RD). Recordings older than
+  # this are pruned at startup and periodically while the proxy runs.
+  # Values <= 0 disable pruning entirely.
+  retention_days: 3
+  # How often the retention prune re-runs, in seconds.
+  prune_interval_seconds: 3600
 
 # ---------------------------------------------------------------------------
 # Audit model configuration

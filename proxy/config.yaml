@@ -139,6 +139,12 @@ session_recording:
   # at most this many most-recent session directories (by dir mtime), never
   # the full recordings tree.
   cold_scan_dir_limit: 50
+  # Retention window in days (LP-0MT2TC3PB005H1RD). Recordings older than
+  # this are pruned at startup and periodically while the proxy runs.
+  # Values <= 0 disable pruning entirely.
+  retention_days: 3
+  # How often the retention prune re-runs, in seconds.
+  prune_interval_seconds: 3600
 
 # ---------------------------------------------------------------------------
 # Audit model configuration
