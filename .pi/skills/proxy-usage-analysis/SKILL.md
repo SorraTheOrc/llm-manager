@@ -130,9 +130,18 @@ Outputs written to:
   duration — plus a totals row with the overall busy % of the window, **Decode speed** and
   **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
   eval-timing lines, split Total / Fast / Cheap), and highlighted
-  recommendations. Every fast/cheap count carries its share of the metric's
-  total (e.g. `285 (74.4%)`), and each recommendation's evidence cites the
-  total plus the fast/cheap split.
+  recommendations. Percentages in the Total/Fast/Cheap columns are
+  **category-relative**: the Total cell is the share of the overall metric,
+  the Fast cell the share of the fast-only total for that metric, and the
+  Cheap cell the share of the cheap-only total (e.g. a Fallback-reasons Fast
+  cell `3173 (60.3%)` means 60.3% of *fast* fallbacks; a Cheap cell
+  `353 (32.8%)` means 32.8% of *cheap* fallbacks), so fast and cheap are
+  directly comparable within each column. Rows that predate the category
+  split (Session summary Sessions/Requests/Dispatch denied, the `% of
+  fallbacks` / `% of skips` columns, and recommendation evidence's
+  within-group fast/cheap split) intentionally stay share-of-total or
+  share-of-group. Each recommendation's evidence cites the total plus the
+  fast/cheap split.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment

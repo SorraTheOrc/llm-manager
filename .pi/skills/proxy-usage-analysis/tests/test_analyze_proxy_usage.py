@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2210,6 +2211,127 @@ class TestReportRestructure:
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
+
+
+class TestCategoryRelativePercentages:
+    """Breakdown percentages in the Total/Fast/Cheap columns are
+    category-relative (LP-0MSVMS95E001Z78V): each fast % is the value's share
+    of the fast-only total for that metric, each cheap % its share of the
+    cheap-only total — so fast + cheap no longer sum to 100% per row. Uses a
+    mixed fast/cheap fixture where the new values differ from the old
+    per-row-split values.
+
+    Fixture (schedule: 6-slot fast period 10:00-23:59, 8-slot cheap otherwise):
+    - 5 sessions: f1..f4 fast (3 local/Qwen3 + 1 opencode-go deepseek),
+      c1 cheap (local/Qwen3); 2 messages each → 8 fast / 2 cheap requests.
+    - 6 fallback events: 3 fast + 1 cheap context_too_large, 1 fast + 1
+      cheap local_concurrency_limit → fast_fb=4, cheap_fb=2.
+    - 4 routing skips: 2 fast + 1 cheap context_too_large, 1 cheap
+      large_context_bypass → fast_skips=2, cheap_skips=2.
+    """
+
+    CONFIG = {
+        "session_slot_pool_size": 8,
+        "slot_schedule": {
+            "enabled": True,
+            "entries": [("23:59", 8), ("10:00", 6)],
+        },
+    }
+    FAST_TS = datetime(2026, 8, 2, 14, 0, 0)
+    CHEAP_TS = datetime(2026, 8, 2, 3, 0, 0)
+
+    def _session(self, sid, bucket, model="Qwen3", provider="local"):
+        d = _session(sid, messages=2, bucket=bucket, local_req=2, remote_req=0)
+        d["initial_provider"] = provider
+        d["initial_model"] = model
+        return d
+
+    def _build(self) -> aggregation.AnalysisResult:
+        res = aggregation.AnalysisResult(
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            sessions={},
+            fallback_events=[
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.CHEAP_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="local_concurrency_limit"),
+                log_parser.LogEvent("fallback", self.CHEAP_TS, reason="local_concurrency_limit"),
+            ],
+            routing_skip_events=[
+                log_parser.LogEvent("routing_skip", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("routing_skip", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("routing_skip", self.CHEAP_TS, reason="context_too_large"),
+                log_parser.LogEvent("routing_skip", self.CHEAP_TS, reason="large_context_bypass"),
+            ],
+            dispatch_denied_count=0,
+            dispatch_denied_events=[],
+            unattributed_events=0,
+            lines_skipped=0,
+            total_lines=0,
+        )
+        for d in [
+            self._session("f1", "fast"),
+            self._session("f2", "fast"),
+            self._session("f3", "fast"),
+            self._session("f4", "fast", model="deepseek-v4-flash", provider="opencode-go"),
+            self._session("c1", "cheap"),
+        ]:
+            s = aggregation.SessionStats(**d)
+            res.sessions[s.session_id] = s
+        return res
+
+    def _md(self) -> str:
+        return reporting.build_report(self._build(), self.CONFIG, speed=None, mode_map=None)
+
+    def test_fallback_events_row_percentages_are_category_rates(self):
+        # Fast = fast fallbacks ÷ fast requests (4/8 = 50.0%); Cheap = cheap
+        # fallbacks ÷ cheap requests (2/2 = 100.0%); Total stays 6/10 = 60.0%.
+        # Old behavior showed the fast/cheap split of total fallbacks
+        # (4/6 = 66.7% / 2/6 = 33.3%).
+        section = self._md().split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Fallback events | 6 (60.0%) | 4 (50.0%) | 2 (100.0%) |" in section
+
+    def test_fallback_reasons_percentages_are_category_relative(self):
+        # Fast = reason fast-count ÷ fast_fb (4); Cheap = reason cheap-count ÷
+        # cheap_fb (2). Old showed the per-row split (e.g. context_too_large
+        # cheap 1/4 = 25.0%); new shows the share within each category.
+        section = self._md().split("## Fallback reasons", 1)[1].split("## ", 1)[0]
+        assert "| context_too_large | 4 | 66.7% | 3 (75.0%) | 1 (50.0%) |" in section
+        assert "| local_concurrency_limit | 2 | 33.3% | 1 (25.0%) | 1 (50.0%) |" in section
+
+    def test_fallback_reasons_fast_and_cheap_no_longer_sum_to_row(self):
+        # Consistency property: per-category reason percentages sum to ~100%
+        # within each category (each column's own total), so operators can
+        # compare reasons across fast vs cheap columns directly.
+        # Fast column: 75.0% + 25.0% = 100.0% of fast_fb; Cheap: 50.0% + 50.0%
+        # = 100.0% of cheap_fb — but no single row sums to 100% (fast + cheap
+        # no longer sum to the row total).
+        section = self._md().split("## Fallback reasons", 1)[1].split("## ", 1)[0]
+        # Fast/Cheap cells are ``count (pct%)``; the ``% of fallbacks`` column
+        # and Total are bare percentages outside parens.
+        pcts = [float(p) for p in re.findall(r"\((\d+\.\d)%\)", section)]
+        assert pcts == [75.0, 50.0, 25.0, 50.0]
+        assert sum(pcts[0::2]) == pytest.approx(100.0)  # fast column
+        assert sum(pcts[1::2]) == pytest.approx(100.0)  # cheap column
+
+    def test_routing_skip_reasons_percentages_are_category_relative(self):
+        # Fast = reason fast-count ÷ fast_skips (2); Cheap = reason cheap-count
+        # ÷ cheap_skips (2). context_too_large: fast 2/2 = 100.0% (old was
+        # 2/3 = 66.7%), cheap 1/2 = 50.0% (old 1/3 = 33.3%).
+        section = self._md().split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
+        assert "| context_too_large | 3 | 75.0% | 2 (100.0%) | 1 (50.0%) |" in section
+        assert "| large_context_bypass | 1 | 25.0% | 0 (0.0%) | 1 (50.0%) |" in section
+
+    def test_per_model_breakdown_percentages_are_category_relative(self):
+        # Fast = model fast sessions ÷ total fast sessions (4); Cheap = model
+        # cheap sessions ÷ total cheap sessions (1). Old showed the per-model
+        # split (Qwen3 fast 3/4 = 75.0%; new 3/4 = 75.0%, cheap 1/4 = 25.0% →
+        # new 1/1 = 100.0%).
+        section = self._md().split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
+        assert "| local | Qwen3 | 4 | 3 (75.0%) | 1 (100.0%) | 8 | 0 |" in section
+        assert "| opencode-go | deepseek-v4-flash | 1 | 1 (25.0%) | 0 (0.0%) | 2 | 0 |" in section
 
 
 class TestArchiveOutputs:

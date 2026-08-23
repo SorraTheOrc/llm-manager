@@ -321,8 +321,8 @@ def build_report(
     fast_fb = sum(d["fallback_reasons"].values())
     cheap_fb = sum(n["fallback_reasons"].values())
     ap(f"| Fallback events | {len(summary.fallback_events)} ({fallback_rate * 100:.1f}%) | "
-       f"{fast_fb} ({_pct(fast_fb, len(summary.fallback_events)):.1f}%) | "
-       f"{cheap_fb} ({_pct(cheap_fb, len(summary.fallback_events)):.1f}%) |")
+       f"{fast_fb} ({_pct(fast_fb, d['requests']):.1f}%) | "
+       f"{cheap_fb} ({_pct(cheap_fb, n['requests']):.1f}%) |")
     ap(f"| Queued → dispatched local | {len(summary.contention_dispatch_events)} | "
        f"- | {len(summary.contention_dispatch_events)} |")
     ap(f"| Fallback after queue | {len(summary.contention_fallback_events)} | "
@@ -348,11 +348,13 @@ def build_report(
             d = profile["fast"]["fallback_reasons"].get(reason, 0)
             n = profile["cheap"]["fallback_reasons"].get(reason, 0)
             ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% | "
-               f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
+               f"{d} ({_pct(d, fast_fb):.1f}%) | {n} ({_pct(n, cheap_fb):.1f}%) |")
 
     _append_error_section(ap, summary)
 
     if summary.routing_skip_reason_counts:
+        fast_skips = sum(profile["fast"]["routing_skip_reasons"].values())
+        cheap_skips = sum(profile["cheap"]["routing_skip_reasons"].values())
         ap("")
         ap("## routing_skip_local reasons")
         ap("")
@@ -362,7 +364,7 @@ def build_report(
             d = profile["fast"]["routing_skip_reasons"].get(reason, 0)
             n = profile["cheap"]["routing_skip_reasons"].get(reason, 0)
             ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
-               f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
+               f"{d} ({_pct(d, fast_skips):.1f}%) | {n} ({_pct(n, cheap_skips):.1f}%) |")
 
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
@@ -370,14 +372,16 @@ def build_report(
     ap("")
     ap("| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |")
     ap("|---|---|---|---|---|---|---|")
+    total_fast_sessions = profile["fast"]["sessions"]
+    total_cheap_sessions = profile["cheap"]["sessions"]
     for (provider, model), count in initial.most_common():
         s_list = [s for s in sessions if s.initial_provider == provider and s.initial_model == model]
         fast = sum(1 for s in s_list if _bucket_key(s.bucket) == "fast")
         cheap = len(s_list) - fast
         reqs = sum(s.messages for s in s_list)
         fb = sum(1 for s in s_list if s.fell_back)
-        ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, count):.1f}%) | "
-           f"{cheap} ({_pct(cheap, count):.1f}%) | {reqs} | {fb} |")
+        ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, total_fast_sessions):.1f}%) | "
+           f"{cheap} ({_pct(cheap, total_cheap_sessions):.1f}%) | {reqs} | {fb} |")
 
     _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
