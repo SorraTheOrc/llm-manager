@@ -516,7 +516,8 @@ server:
   # inside the safe envelope (~≤300 arrivals/night). A further raise to
   # 42000 (LP-0MT50SMU1005ZAD6) adds ~5-16 recaptures/night over 38000
   # and stays well inside the safe envelope (< 46000; measured flip data:
-  # 38000→20-38, 42000→33-44, 46000→52-53, 60000→65-94 failure). Per-slot
+  # 38000→20-38, 42000→33-44, 46000→52-53, 60000→65-94 failure;
+  # LP-0MT50WCCP000DU00 cheap-only change). Per-slot
   # context math: 2 slots share 262144 = ~131072/slot; cold 42000 << warm
   # clamp 100000 and boot clamp 61440; band (42000, 100000] non-empty.
   # Do NOT raise >= 46000 (measured inside the proven failure envelope

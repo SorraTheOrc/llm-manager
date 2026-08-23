@@ -467,11 +467,13 @@ server:
   # MODE-AWARE value (LP-0MSOMVOPH004ATAK): fast mode runs 3 slots x 262144
   # (operator supersede 2026-08-18, LP-0MSY0SDAS0031Y7F: the 3x87.4K NO-GO of
   # LP-0MSAOQTJS000FFVM / LP-0MSEGPO77005CYCQ accepted), so the effective warm
-  # threshold clamps to 83285 (262144//3 - 4096). Cold 42000 stays BELOW it,
-  # keeping the (42000, 83285] band non-empty for the cached_ratio check
+  # threshold clamps to 83285 (262144//3 - 4096). Cold 38000 stays BELOW it,
+  # keeping the (38000, 83285] band non-empty for the cached_ratio check
   # (dead-code guard LP-0MSI2M5BT004BCDP) while recapturing cold-cache prompts
-  # in the old (30000, 42000] bypass band for local.
-  local_large_context_cold_cache_threshold: 42000
+  # in the old (30000, 38000] bypass band for local.
+  # NOTE: cheap mode raised its cold threshold to 42000 (LP-0MT50SMU1005ZAD6 /
+  # LP-0MT50WCCP000DU00) but fast/default stay at 38000 — cheap-only change.
+  local_large_context_cold_cache_threshold: 38000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
