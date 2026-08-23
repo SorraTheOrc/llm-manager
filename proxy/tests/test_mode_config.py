@@ -274,8 +274,8 @@ class TestCheapConfigProfile:
         local_model_ctx_size (fast 262144 inline, cheap 131072 base + 262144
         schedule override), the per-mode contention-queue policy (cheap=queue
         vs fast=fallback, LP-0MSORQVK50012Q4D F2), and the cold-cache
-        threshold (cheap 38000 re-raised to match fast, LP-0MSOMVOPH004ATAK
-        / LP-0MSRM54YO007YG0K AC7 / LP-0MSY0V4ZO002ANPL). Everything else
+        threshold (cheap 42000 raised from 38000, LP-0MSOMVOPH004ATAK
+        / LP-0MSRM54YO007YG0K AC7 / LP-0MSY0V4ZO002ANPL / LP-0MT50SMU1005ZAD6). Everything else
         (models, warm threshold) is identical."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
@@ -293,7 +293,8 @@ class TestCheapConfigProfile:
         cheap_srv.pop("contention_queue_max_depth", None)
         # Cold-cache threshold (LP-0MSOMVOPH004ATAK; reverted per
         # LP-0MSRM54YO007YG0K AC7 then re-raised to 38000 per
-        # LP-0MSY0V4ZO002ANPL): cheap 38000, fast 38000 (symmetric).
+        # LP-0MSY0V4ZO002ANPL, raised to 42000 per LP-0MT50SMU1005ZAD6):
+        # cheap 42000, fast 42000 (symmetric).
         cheap_srv.pop("local_large_context_cold_cache_threshold", None)
         fast_srv.pop("local_large_context_cold_cache_threshold", None)
         assert cheap_srv == fast_srv
@@ -311,8 +312,8 @@ class TestCheapConfigProfile:
         assert cheap["server"]["contention_queue_max_wait_seconds"] == 60
         assert cheap["server"]["contention_queue_max_depth"] == 4
         assert fast["server"]["contention_queue_policy"] == "fallback"
-        assert cheap["server"]["local_large_context_cold_cache_threshold"] == 38000
-        assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
+        assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
+        assert fast["server"]["local_large_context_cold_cache_threshold"] == 42000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
     def test_cheap_config_matches_fast_on_local_ctx(self):

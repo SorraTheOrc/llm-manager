@@ -513,9 +513,15 @@ server:
   # windows Aug 13-20), with comfortable headroom: 38000 < cheap warm 100000
   # and < boot-transient clamp 61440; the (38000, 100000] band stays
   # non-empty (dead-code guard LP-0MSI2M5BT004BCDP); flip ~20-38/night,
-  # inside the safe envelope (~≤300 arrivals/night). Do NOT raise >=46000
-  # (measured inside the proven failure envelope of the 60000 experiment).
-  local_large_context_cold_cache_threshold: 38000
+  # inside the safe envelope (~≤300 arrivals/night). A further raise to
+  # 42000 (LP-0MT50SMU1005ZAD6) adds ~5-16 recaptures/night over 38000
+  # and stays well inside the safe envelope (< 46000; measured flip data:
+  # 38000→20-38, 42000→33-44, 46000→52-53, 60000→65-94 failure). Per-slot
+  # context math: 2 slots share 262144 = ~131072/slot; cold 42000 << warm
+  # clamp 100000 and boot clamp 61440; band (42000, 100000] non-empty.
+  # Do NOT raise >= 46000 (measured inside the proven failure envelope
+  # of the 60000 experiment).
+  local_large_context_cold_cache_threshold: 42000
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
