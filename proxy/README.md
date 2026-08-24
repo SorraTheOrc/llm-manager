@@ -598,7 +598,7 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Default cooldown**: 60 seconds
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
-- **FreeUsageLimitError (HTTP 429, LP-0MSMCM5UG00378G8)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s) by default. The frequently-exhausted free-tier entry `opencode-big-pickle` uses a 24-hour (86400s) cooldown instead (override map `_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES` in `proxy/proxy/provider.py`) so the fallback chain routes to paid alternatives for a full day. 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
+- **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
 - **State**: Cooldown state is in-memory only and resets when the proxy restarts
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as

@@ -176,7 +176,6 @@ computed reset time passes. Routing decisions during the block log
 `usage_limit_reset_pending` with the reset time and do not contact the
 upstream; once the reset time arrives the domain becomes eligible again
 without operator intervention. `FreeUsageLimitError` responses without a
-reset time get a per-provider cooldown: 24 hours (86400s) for
-`opencode-big-pickle` (LP-0MSMCM5UG00378G8), and the default 3-hour
-cooldown (10800s) for all other providers. Tracked in
+reset time get the default 3-hour cooldown (10800s; per-provider overrides
+were retired with `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
 **LP-0MSLJPOCC0001ROJ**.

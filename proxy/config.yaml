@@ -16,9 +16,8 @@
 # FreeUsageLimitError cooldown (LP-0MSMCM5UG00378G8):
 #   When a provider returns HTTP 429 with error.type = "FreeUsageLimitError"
 #   (no explicit reset duration), the proxy marks it unavailable for a
-#   per-provider cooldown: 24 hours (86400s) for `opencode-big-pickle`, and 3
-#   hours (10800s, LP-0MRGU0I91006ODFD) for all other providers. The override
-#   map lives in proxy/provider.py (`_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES`).
+#   per-provider cooldown: 3 hours (10800s, LP-0MRGU0I91006ODFD) applied to all
+#   providers.
 #
 # Failure-domain grouping (LP-0MSG45I8Q0020N1F):
 #   Provider entries that share the same normalized endpoint form a SINGLE
@@ -189,13 +188,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
       - name: opencode-go-3-deepseek
         type: remote
         provider: opencode-go
@@ -282,13 +274,6 @@ models:
       - name: local-qwen3-next
         type: local
         llama_model: Qwen3
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
       - name: opencode-go-3-deepseek
         type: remote
         provider: opencode-go
@@ -339,13 +324,6 @@ models:
       - name: local-qwen3-mtp
         type: local
         llama_model: Qwen3-MTP
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
       - name: opencode-go-2-deepseek
         type: remote
         provider: opencode-go
