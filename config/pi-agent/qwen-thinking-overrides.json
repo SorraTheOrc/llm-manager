@@ -1,0 +1,66 @@
+{
+  "providers": {
+    "opencode": {
+      "modelOverrides": {
+        "qwen3.5-plus": {
+          "thinkingLevelMap": {
+            "off": null,
+            "high": "high",
+            "max": "max"
+          }
+        },
+        "qwen3.6-plus": {
+          "thinkingLevelMap": {
+            "off": null,
+            "high": "high",
+            "max": "max"
+          }
+        }
+      }
+    },
+    "opencode-go": {
+      "modelOverrides": {
+        "qwen3.6-plus": {
+          "thinkingLevelMap": {
+            "off": null,
+            "high": "high",
+            "max": "max"
+          },
+          "compat": {
+            "thinkingFormat": "qwen"
+          }
+        },
+        "qwen3.7-max": {
+          "thinkingLevelMap": {
+            "off": null,
+            "high": "high",
+            "max": "max"
+          },
+          "compat": {
+            "thinkingFormat": "qwen"
+          }
+        },
+        "qwen3.7-plus": {
+          "thinkingLevelMap": {
+            "off": null,
+            "high": "high",
+            "max": "max"
+          },
+          "compat": {
+            "thinkingFormat": "qwen"
+          }
+        },
+        "qwen3.8-max": {
+          "thinkingLevelMap": {
+            "off": null,
+            "high": "high",
+            "max": "max"
+          },
+          "compat": {
+            "thinkingFormat": "qwen"
+          }
+        }
+      }
+    }
+  }
+}
