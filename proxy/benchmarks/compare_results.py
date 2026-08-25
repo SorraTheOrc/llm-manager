@@ -72,6 +72,22 @@ def compute_deltas(baseline: dict, candidate: dict) -> dict:
             bs.get("memory_snapshot_bytes"),
             cs.get("memory_snapshot_bytes"),
         ),
+        # P95 percentile deltas (LP-0MSAOQTJS000FFVM F3 AC2): the summary
+        # records p95_*_seconds / p95_tokens_per_second per run (see
+        # run_benchmark.py _p95); expose them so the report covers the
+        # P95 axis called for by the acceptance criteria.
+        "p95_duration_delta_pct": safe_pct(
+            bs.get("p95_total_duration_seconds"),
+            cs.get("p95_total_duration_seconds"),
+        ),
+        "p95_tps_delta_pct": safe_pct(
+            bs.get("p95_tokens_per_second"),
+            cs.get("p95_tokens_per_second"),
+        ),
+        "p95_ttft_delta_pct": safe_pct(
+            bs.get("p95_time_to_first_token_seconds"),
+            cs.get("p95_time_to_first_token_seconds"),
+        ),
     }
 
     # Compute absolute completion token change
@@ -257,6 +273,9 @@ def generate_report(
     add_row("Avg duration (s)", bs.get("avg_total_duration_seconds"), cs.get("avg_total_duration_seconds"), "duration_delta_pct")
     add_row("Avg TPS", bs.get("avg_tokens_per_second"), cs.get("avg_tokens_per_second"), "tps_delta_pct")
     add_row("Avg TTFT (s)", bs.get("avg_time_to_first_token_seconds"), cs.get("avg_time_to_first_token_seconds"), "ttft_delta_pct")
+    add_row("P95 duration (s)", bs.get("p95_total_duration_seconds"), cs.get("p95_total_duration_seconds"), "p95_duration_delta_pct")
+    add_row("P95 TPS", bs.get("p95_tokens_per_second"), cs.get("p95_tokens_per_second"), "p95_tps_delta_pct")
+    add_row("P95 TTFT (s)", bs.get("p95_time_to_first_token_seconds"), cs.get("p95_time_to_first_token_seconds"), "p95_ttft_delta_pct")
     add_row("Total completion tokens", bs.get("total_completion_tokens"), cs.get("total_completion_tokens"), "completion_tokens_delta_pct")
 
     # Memory row (display in MB if available)

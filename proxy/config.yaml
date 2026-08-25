@@ -467,7 +467,8 @@ server:
   # tokenizer).
   #
   # MODE-AWARE value (LP-0MSOMVOPH004ATAK): this default profile mirrors the
-  # fast-mode profile (3 slots x 131072); keep it aligned with config-fast.yaml
+  # fast-mode profile (3 slots x 262144; superseded per LP-0MSY0SDAS0031Y7F);
+  # keep it aligned with config-fast.yaml
   # (38000). See the mode-aware note there.
   local_large_context_cold_cache_threshold: 38000
 
@@ -727,8 +728,9 @@ server:
   # is absent or 0, the cap is derived from the effective per-slot clamp
   # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
   # source as the routing clamp (effective_per_slot_threshold in provider.py)
-  # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
-  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
+  # — so it auto-adapts to slot-count/ctx-size changes (the live
+  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) at ctx 262144 → 83285,
+  # LP-0MSY0SDAS0031Y7F) instead of
   # freezing at a static value. Set to a non-zero value to use an explicit
   # static override.
   # 0 = dynamic derivation (current live config).

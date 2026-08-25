@@ -171,8 +171,10 @@ server:
 > (cold, warm] band must never collapse — dead-code guard
 > LP-0MSI2M5BT004BCDP):
 >
-> - `proxy/config-fast.yaml` — `38000` (warm clamps to `131072//3 − 4096 =
->   39594`; recaptures the old (30000, 38000] cold-cache bypass band).
+> - `proxy/config-fast.yaml` — `38000` (fast mode runs 3 slots × 262144 total
+>   ctx since the operator supersede LP-0MSY0SDAS0031Y7F, so the warm clamp is
+>   `262144//3 − 4096 =
+>   83285`; recaptures the old (30000, 38000] cold-cache bypass band).
 > - `proxy/config-cheap.yaml` — `38000` (warm resolves to `100000` via the
 >   2×262144 schedule entries; also below the boot-transient clamp 61440,
 >   LP-0MSMZOAJW002UR2A; symmetric with fast after the 60000 raise failed
@@ -205,7 +207,9 @@ At a transition the proxy restarts llama-server with the new `--parallel`
 AND context size, and the routing clamp (`_effective_large_context_thresholds`)
 plus the `session_slot_max_prompt_tokens` dynamic derivation use the ACTIVE
 period's `(ctx_size, slots)` — so overnight the per-slot cap becomes
-`262144 // 2 - 4096 = 126976` while daytime stays `131072 // 3 - 4096 = 39594`.
+`262144 // 2 - 4096 = 126976` while daytime stays `262144 // 3 - 4096 = 83285`
+(the shared `local_model_ctx_size: 262144` supersede LP-0MSY0SDAS0031Y7F
+applies when the daytime entry omits ctx_size).
 
 **Router-mode mechanism:** a global `--ctx-size` on the router command line
 would override per-model INI `ctx-size` for EVERY model (CLI args take highest
