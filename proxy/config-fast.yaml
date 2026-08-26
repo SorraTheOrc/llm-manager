@@ -707,6 +707,26 @@ server:
     enabled: true
     # fallback_grace_seconds: 10800
 
+  # -----------------------------------------------------------------------
+  # Bounded drain before a mode-switch restart (LP-0MT631JKW008WAKE)
+  # -----------------------------------------------------------------------
+  # A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode)
+  # restarts the proxy process. Historically the restart killed in-flight
+  # local streams mid-generation, surfacing a synthetic `finish_reason:
+  # error` to clients; the bounded drain fixes that: new chat requests are
+  # deferred (short 503 + Retry-After) and the process kill is delayed
+  # until in-flight local streams finish, bounded by max_seconds. The
+  # window is SHORT and bounded, preserving the "no long rejection window"
+  # property of slot-schedule transitions (LP-0MSF9RUSQ007M346).
+  mode_switch_drain:
+    enabled: true
+    # Maximum seconds to wait for in-flight local streams before the restart
+    # kills the process.
+    max_seconds: 30
+    # Extra seconds added to the "Retry-After" header past the drain deadline
+    # so clients retry after the restart has had time to complete.
+    retry_after_margin_seconds: 15
+
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
   # The effective timeout is base + session_slot_timeout_per_token_seconds x

@@ -847,10 +847,16 @@ curl -X POST http://localhost:8000/admin/set-mode \
 Requesting the mode that is already active is a noop (no restart).
 Switching to a different mode persists the new mode and triggers a **full
 proxy restart** in the background — the endpoint responds before the
-restart kills the process. In-flight requests are terminated and clients
-retry (same semantics as slot-schedule transitions). A second switch while
-a restart is pending is a noop if the mode matches, otherwise rejected with
-`409` (avoids restart loops).
+restart kills the process. A **bounded drain** protects in-flight local
+streams (LP-0MT631JKW008WAKE): while the drain is active (default 30s,
+`server.mode_switch_drain.max_seconds`), NEW chat requests are deferred
+with a short `503` + `Retry-After`, and the process kill is delayed until
+in-flight local streams finish (or the bound elapses). The window is short
+and bounded so the "no long rejection window" property of slot-schedule
+transitions is preserved (LP-0MSF9RUSQ007M346); `enabled: false` restores
+the old "just restart" behavior. A second switch while a restart is pending
+is a noop if the mode matches, otherwise rejected with `409` (avoids
+restart loops).
 
 #### Session grandfathering across mode switches
 
