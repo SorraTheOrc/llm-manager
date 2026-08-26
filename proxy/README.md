@@ -280,7 +280,7 @@ default_model: "gemma4"
 logging:
   directory: "/var/log/llama-proxy"
   rotation_hours: 6
-  retention_days: 90
+  retention_days: 7
   level: "INFO"
 
 # Audit model configuration
@@ -305,7 +305,7 @@ default_model: "gemma4"
 logging:
   directory: "/var/log/llama-proxy"
   rotation_hours: 6
-  retention_days: 90
+  retention_days: 7
   level: "INFO"
 
 # Model routing
@@ -2172,14 +2172,14 @@ Logs are written with time-based rotation:
 
 | File | Description | Rotation |
 |------|-------------|----------|
-| `proxy.log` | Proxy server logs (requests, responses, lifecycle) | Every 6 hours, 90 days retention |
+| `proxy.log` | Proxy server logs (requests, responses, lifecycle) | Every 6 hours, 7 days retention |
 | `llama-server.log` | llama-server stdout/stderr | On each restart, last 15 kept |
 | `request_counts.json` | Persisted request counters (endpoint keys) | Updated periodically and on reset |
 | `token_counts.json` | Persisted token counters (endpoint keys + totals) | Updated periodically and on reset |
 
 ### Proxy Log Settings
 - **Rotation**: Every 6 hours
-- **Retention**: 90 days
+- **Retention**: 7 days
 - **Format**: `TIMESTAMP - LEVEL - MESSAGE`
 
 Log entries include:
