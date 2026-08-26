@@ -278,6 +278,45 @@ class TestErrorLineParsing:
         assert ev.entry == "opencode-deepseek-free"
         assert ev.raw and "Stream finished: reason=error" in ev.raw
 
+    def test_stream_finished_reason_error_with_enriched_payload(self):
+        # LP-0MT6322OT00900OX: the proxy now appends the enriched error
+        # payload (type/message/suggested-action) to the stream-finish-error
+        # log line; the parser must surface it so the analysis can classify.
+        line = (
+            "2026-08-03 10:13:15,000 - INFO - Stream finished: reason=error "
+            "error_type=stall_exhausted error_message=Upstream stalled repeatedly "
+            "(2 retries exhausted; idle timeout 30s) "
+            "suggested_action=Provider placed in cooldown; the next provider in "
+            "the chain will be used "
+            "session=019fc52e-05a0-78d5-b59d-bcb91055b787 provider=opencode-go "
+            "model=deepseek-v4-flash entry=opencode-go-2-deepseek"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "stream_finish_error"
+        assert ev.error_type == "stall_exhausted"
+        assert ev.error_message == "Upstream stalled repeatedly (2 retries exhausted; idle timeout 30s)"
+        assert ev.suggested_action == (
+            "Provider placed in cooldown; the next provider in the chain will be used"
+        )
+        assert ev.provider == "opencode-go"
+        assert ev.model == "deepseek-v4-flash"
+        assert ev.entry == "opencode-go-2-deepseek"
+
+    def test_stream_finished_reason_error_partial_payload(self):
+        # Enriched event with only type (no message/action) — fields absent.
+        line = (
+            "2026-08-03 10:13:16,000 - INFO - Stream finished: reason=error "
+            "error_type=stream_exception "
+            "session=019fc52e-05a0-78d5-b59d-bcb91055b787 provider=local model=Qwen3"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "stream_finish_error"
+        assert ev.error_type == "stream_exception"
+        assert ev.error_message is None
+        assert ev.suggested_action is None
+
     def test_stream_error_line(self):
         ev = log_parser.parse_log_line(fixtures.STREAM_ERROR_LINE)
         assert ev is not None

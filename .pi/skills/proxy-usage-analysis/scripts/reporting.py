@@ -183,6 +183,16 @@ ERROR_TYPE_LABELS = {
 
 
 def _error_row(e: log_parser.LogEvent) -> dict:
+    # Enriched stream-error payload (LP-0MT6322OT00900OX): fold the
+    # error_type / message / suggested_action into the detail cell so the
+    # CSV/JSON artifacts surface the informative-error coverage.
+    detail = e.error or ""
+    if e.kind == "stream_finish_error" and e.error_type:
+        detail = e.error_type
+        if e.error_message:
+            detail += f": {e.error_message}"
+        if e.suggested_action:
+            detail += f" ({e.suggested_action})"
     return {
         "error_type": e.kind,
         "timestamp": _fmt_ts(e.ts),
@@ -190,7 +200,7 @@ def _error_row(e: log_parser.LogEvent) -> dict:
         "model": e.model or "",
         "session": e.session or "",
         "entry": e.entry or "",
-        "error_detail": e.error or "",
+        "error_detail": detail,
         "status": str(e.status) if e.status is not None else "",
         "attempt": e.attempt or "",
         "signal": e.signal or "",
@@ -476,6 +486,20 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
         label = ERROR_TYPE_LABELS.get(kind, kind)
         ap(f"| {label} | {provider or '-'} | {model or '-'} | {count} |")
     ap("")
+    # Enriched stream-error coverage (LP-0MT6322OT00900OX): when stream
+    # finish errors carry the informative error payload, report it so the
+    # operator can verify informative-error coverage without grepping logs.
+    enriched = [
+        e for e in summary.error_events
+        if e.kind == "stream_finish_error" and e.error_type
+    ]
+    if enriched:
+        types = sorted({e.error_type for e in enriched if e.error_type})
+        ap(
+            f"- {len(enriched)} of the `stream_finish_error` events carry the enriched error "
+            f"payload (types: {', '.join(types) or 'n/a'}) — informative-error fallback is "
+            "reaching the log line."
+        )
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "

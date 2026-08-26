@@ -442,13 +442,26 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
         if pm:
             top = ", ".join(f"{p}/{m}" if p and m else (p or m) for (p, m), _ in pm.most_common(3))
             provider_detail = f" Affected: {top}."
+        # Informative-error coverage (LP-0MT6322OT00900OX): when the stream
+        # finish errors carry the enriched payload, note the coverage.
+        enriched = [
+            e for e in result.error_events
+            if e.kind == "stream_finish_error" and e.error_type
+        ]
+        if enriched:
+            payload_note = (
+                f"{len(enriched)} of {stream_finish} carry the enriched error payload "
+                "(type/message/suggested-action) in the log and client-visible SSE event."
+            )
+        else:
+            payload_note = "Log lines carry no error payload; enriched coverage cannot be verified."
         recs.append(
             Recommendation(
                 severity="high",
                 title="Stream finish errors: adopt recovery-first + informative-error strategy",
                 detail=(
-                    f"{stream_finish} stream(s) ended with the synthetic `finish_reason: error` event "
-                    "(no error payload), which the client surfaces as an unspecified error. Recommended "
+                    f"{stream_finish} stream(s) ended with the synthetic `finish_reason: error` event. "
+                    f"{payload_note} Recommended "
                     "proxy-side remediation: (1) recovery-first silent continue — re-route to the next "
                     "healthy provider before content is delivered (see LP-0MSDP2PDB004GV86); (2) when "
                     "recovery is impossible, emit an informative error (type/message/provider/suggested "

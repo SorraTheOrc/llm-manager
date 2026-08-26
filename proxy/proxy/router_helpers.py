@@ -229,6 +229,12 @@ def log_response_chunk(
     entry name (e.g. ``opencode-go-2-deepseek``) so per-account traffic is
     attributable (LP-0MSC7F7BG0043TE1); it is omitted when absent.
 
+    For ``finish_reason: error`` events carrying an enriched ``error``
+    object (LP-0MSETOTWY000SU0Z), the line additionally carries
+    ``error_type``, ``error_message``, and ``suggested_action`` so the
+    proxy-usage analysis tool can classify the informative-error fallback
+    (LP-0MT60S55M000TK1H).
+
     When *body_json* is provided, a request preview (first 80 characters of
     the first non-system user message) is included in the finished line.
     """
@@ -277,6 +283,25 @@ def log_response_chunk(
                     tt = usage.get("total_tokens")
                     if pt is not None or ct is not None or tt is not None:
                         parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
+                # LP-0MT60S55M000TK1H: when the error is a synthetic stream-error
+                # event (LP-0MSETOTWY000SU0Z) carry the enriched error payload so
+                # the proxy-usage analysis tool can classify it (previously the
+                # log line reported "no error payload").
+                if finish_reason == "error":
+                    for choice in j.get("choices", []):
+                        if isinstance(choice, dict):
+                            err = choice.get("error")
+                            if isinstance(err, dict):
+                                err_type = err.get("type")
+                                err_msg = err.get("message")
+                                err_action = err.get("suggested_action")
+                                if err_type:
+                                    parts.append(f"error_type={err_type}")
+                                if err_msg:
+                                    parts.append(f"error_message={err_msg}")
+                                if err_action:
+                                    parts.append(f"suggested_action={err_action}")
+                                break  # only use the first choice's error
                 # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
                 if session_id:
                     parts.append(f"session={session_id}")
