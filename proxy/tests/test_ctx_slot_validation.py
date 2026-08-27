@@ -415,3 +415,52 @@ class TestLiveConfigsValidate:
         assert cold == 42000
         assert warm == 100000
         assert cold < warm
+
+
+class TestLiveConfigPersistenceCap:
+    """The persistence cap (``session_slot_max_prompt_tokens``) is pinned to
+    the per-slot routing clamp in every live profile
+    (LP-0MTBTCB8D000OQ0C rollout).
+
+    Cap == ``effective_per_slot_threshold(active_ctx, active_slots)`` means
+    every context admitted for slot save/restore also fits the routing clamp —
+    no dead-band where persistence is attempted for contexts the router would
+    never send local. The explicit static values supersede the dynamic
+    derivation (0 = derive; LP-0MSEGPO77005CYCQ F3) so the cap cannot drift
+    with schedule/slot-count changes.
+    """
+
+    def _load(self, name: str) -> dict:
+        import yaml
+        from proxy.mode import proxy_dir
+
+        with open(proxy_dir() / name) as fh:
+            return yaml.safe_load(fh)
+
+    @pytest.mark.parametrize(
+        "config_file,active_ctx,active_slots,expected_cap",
+        [
+            # Fast/default: 3-slot schedule @ ctx 262144 → 262144//3 - 4096.
+            ("config.yaml", 262144, 3, 83285),
+            ("config-fast.yaml", 262144, 3, 83285),
+            # Cheap: 2-slot schedule, per-period ctx_size 262144 override
+            # → 262144//2 - 4096 = 126976 (LP-0MTBTCTE8007E6VU pending).
+            ("config-cheap.yaml", 262144, 2, 126976),
+        ],
+    )
+    def test_persistence_cap_equals_routing_clamp(
+        self, config_file, active_ctx, active_slots, expected_cap
+    ):
+        """The static persistence cap equals the per-slot routing clamp for
+        the profile's active (ctx, slots) shape — no dead-band, no drift."""
+        from proxy.provider import effective_per_slot_threshold
+
+        cfg = self._load(config_file)
+        cap = cfg["server"]["session_slot_max_prompt_tokens"]
+        clamp = effective_per_slot_threshold(active_ctx, active_slots)
+        assert cap == expected_cap, f"{config_file}: cap {cap} != {expected_cap}"
+        assert cap > 0, f"{config_file}: cap must be an explicit static override"
+        assert cap == clamp, (
+            f"{config_file}: persistence cap {cap} != routing clamp {clamp} "
+            f"({active_ctx}//{active_slots} - 4096) — dead-band or drift"
+        )

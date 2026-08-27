@@ -739,16 +739,15 @@ server:
   # estimated tokens. llama-server serializes the whole KV cache on save,
   # so large contexts ReadTimeout and can wedge the GPU.
   #
-  # DYNAMIC DERIVATION (LP-0MSEGPO77005CYCQ F3, amended AC2): when this key
-  # is absent or 0, the cap is derived from the effective per-slot clamp
-  # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
-  # source as the routing clamp (effective_per_slot_threshold in provider.py)
-  # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
-  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
-  # freezing at a static value. Set to a non-zero value to use an explicit
-  # static override.
-  # 0 = dynamic derivation (current live config).
-  session_slot_max_prompt_tokens: 0
+  # STATIC OVERRIDE (LP-0MTBTCB8D000OQ0C rollout): explicit cap pinned to the
+  # routing clamp — effective_per_slot_threshold (provider.py) =
+  # local_model_ctx_size // active_slots - 4096 output headroom =
+  # 262144 // 3 - 4096 = 83285 for the 3-slot fast schedule (ctx 262144,
+  # LP-0MSY0SDAS0031Y7F). Cap == clamp ⇒ every context-eligible session
+  # restores from warm KV cache with no dead-band above the routing clamp.
+  # Supersedes the dynamic derivation (LP-0MSEGPO77005CYCQ F3; absent/0 =
+  # derive) for this profile.
+  session_slot_max_prompt_tokens: 83285
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
   # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
   # 0 disables the add-on (fixed timeout only).
