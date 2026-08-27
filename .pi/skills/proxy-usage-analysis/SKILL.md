@@ -26,10 +26,11 @@ data-backed recommendations — including an **error taxonomy** and quantified
   thresholds: the report's fallback-reason breakdown and context pressure
   stats show whether configuration changes are warranted.
 - An error spike occurred (e.g. `Stream finished: reason=error`, `slot_save`
-  ReadTimeouts, `backend_retry` timeouts, upstream 429s): the report's
+  ReadTimeouts, `backend_retry` timeouts, upstream HTTP errors): the report's
   **Error analysis** section categorizes every error event and recommends
   remediation (recovery-first silent continue, informative-error fallback,
-  ctx-size pressure, upstream 429 cooldown), quantified from the window.
+  ctx-size pressure, per-status upstream remediation), quantified from the
+  window.
 
 ## Inputs
 
@@ -112,15 +113,19 @@ Outputs written to:
   file, and the raw evidence line.
 - `errors.json` — aggregated error counts by type plus a **provider/model
   breakdown** (nested `{error_type: {provider: {model: count}}}`; providers or
-  models not derivable from the log line are keyed `(unknown)`) plus the window
-  bounds.
+  models not derivable from the log line are keyed `(unknown)`) plus
+  **upstream HTTP error breakdown by status** (`{status: count}` and
+  `{status: {provider: count}}`) plus the window bounds.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), fallback-reason and routing-skip breakdowns, per-model
   breakdown, **Error analysis** (when the window has error events) with a
-  taxonomy table plus a **Provider/model breakdown** table (error type ×
-  provider × model × count),
+  taxonomy table that includes a **Status** column (upstream HTTP errors are
+  split into one row per status code), a **Provider/model breakdown** table
+  (error type × provider × model × count), and an
+  **Upstream HTTP error breakdown by status** table (status × count ×
+  provider breakdown),
   **Local model utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency, hourly busy profile,
   fast/cheap split — when the window has local traffic). The **hourly busy
@@ -230,8 +235,10 @@ run (`Previous outputs archived to …`).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
-   rendered into the report's **Error analysis** section (taxonomy table plus
-   a **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
+   rendered into the report's **Error analysis** section (taxonomy table
+   **with a Status column** for upstream HTTP errors, plus an
+   **Upstream HTTP error breakdown by status** table, and a
+   **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
    Provider/model attribution is best effort: `Stream finished: reason=error`
    and `Stream error:` lines carry `provider=`/`model=` directly; `slot_save
    failed` is always the local llama-server (provider `local`, model not in
@@ -241,9 +248,14 @@ run (`Previous outputs archived to …`).
    `deepseek`, `models.inference.ai.azure.com` → `github`; unknown endpoints
    fall back to the bare hostname) and the model is unknown; `backend_retry`
    carries neither. Undetermined values render as `-` in the report and
-   `(unknown)` in JSON. Remediation recommendations (recovery-first,
-   informative-error, ctx-size pressure, 429 cooldown) are generated from
-   these events and link to the relevant work items.
+   `(unknown)` in JSON. Upstream HTTP errors are **broken out by HTTP status
+   code** (one taxonomy row per status, one recommendation per status) so
+   429 rate-limit events and 402 balance events are never conflated. The
+   `errors.json` artifact includes `upstream_by_status` and
+   `upstream_by_status_provider` keys. Remediation recommendations
+   (recovery-first, informative-error, ctx-size pressure, per-status upstream
+   remediation) are generated from these events and link to the relevant work
+   items.
 8. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
@@ -322,9 +334,37 @@ run (`Previous outputs archived to …`).
     (LP-0MSAOQTJS000FFVM).
   - `backend_retry` — upstream connect/read timeouts during retry backoff;
     transient unless clustered.
-  - `upstream error status=429` (`FreeUsageLimitError`) — the 3-hour
-    per-model cooldown (LP-0MRGU0I91006ODFD) should suppress repeat
-    fallbacks; persistent 429s indicate an upstream quota issue.
+  - `upstream error` (HTTP 429) — the 3-hour per-model cooldown
+    (LP-0MRGU0I91006ODFD) should suppress repeat fallbacks; persistent 429s
+    indicate an upstream quota/rate-limit issue.
+  - `upstream error` (HTTP 402) — account balance or subscription issue;
+    the proxy cannot recover — top up the account or switch provider.
+  - `upstream error` (HTTP 5xx) — server-side upstream error; monitor for
+    clustering (provider outage). Other 4xx codes carry the specific error
+    message in the `errors.csv` evidence column.
+
+  **Root-cause classification of observed `reason=error` events (LP-0MT60S55M000TK1H):**
+
+  A 2026-08-23 investigation of 13 `Stream finished: reason=error` events plus
+  7 `Stream error` exceptions across `opencode-go/deepseek-v4-flash` and
+  `local/Qwen3` providers classified the root causes into three categories:
+
+  1. **Mode-switch restart kills (4 events, local/Qwen3)** — `RemoteProtocolError`
+     when the mode-switch restart spawned during an in-flight stream. Per
+     LP-0MSF9RUSQ007M346 the drain window was deliberately removed ("just
+     restart, the client will deal with it"); in-flight streams die mid-generation.
+     Observed at 00:08:22, 01:00:24×2, and 10:00:03 transition windows.
+  2. **Genuine ReadTimeout (1 event, local/Qwen3)** — llama-server stalled under
+     high contention (available_slots=0, queue depth ~54) at 03:48:41.
+  3. **Remote chain exhaustion (8 events, opencode-go/deepseek-v4-flash)** —
+     empty response / stall retries exhausted (2 attempts) while all sibling
+     providers were in cooldown or usage-limit-reset-pending. Correct handling
+     (enriched error, no re-route after content/tool_calls); not a proxy defect.
+
+  The remaining 7 `Stream error` exceptions were proxy-side exceptions (not
+  `finish_reason: error` events) and are handled by the informative-error
+  fallback (LP-0MSDP2PH20079WQ7). All 13 events are now classified per this
+  taxonomy.
 
 ## Testing
 
