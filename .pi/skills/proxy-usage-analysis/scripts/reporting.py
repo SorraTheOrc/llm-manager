@@ -242,10 +242,23 @@ def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path,
 
     json_path = out_dir / "errors.json"
     by_type = dict(summary.error_counts.most_common())
+    by_status = {
+        str(status): count
+        for status, count in sorted(summary.upstream_error_by_status.items())
+    }
+    by_status_provider = {
+        str(status): {
+            provider: count
+            for provider, count in sorted(providers.items(), key=lambda kv: -kv[1])
+        }
+        for status, providers in sorted(summary.upstream_error_by_status_provider.items())
+    }
     payload = {
         "total": len(events),
         "by_type": by_type,
         "by_provider_model": error_provider_model_json(summary),
+        "upstream_by_status": by_status,
+        "upstream_by_status_provider": by_status_provider,
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
     }
@@ -462,8 +475,8 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
     ap("")
     ap("## Error analysis")
     ap("")
-    ap("| Error type | Count | Evidence excerpt |")
-    ap("|---|---|---|")
+    ap("| Error type | Status | Count | Evidence excerpt |")
+    ap("|---|---|---|---|")
     counts = summary.error_counts
     for kind, count in counts.most_common():
         first = next((e for e in summary.error_events if e.kind == kind), None)
@@ -472,7 +485,19 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
             excerpt = first.raw.strip()
             if len(excerpt) > 100:
                 excerpt = excerpt[:100] + "…"
-        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {count} | `{excerpt}` |")
+        # Split upstream HTTP errors into one row per status code.
+        if kind == "upstream_http_error":
+            by_status = {}
+            for e in summary.error_events:
+                if e.kind == "upstream_http_error" and e.status is not None:
+                    by_status[e.status] = by_status.get(e.status, 0) + 1
+            for status, scount in sorted(by_status.items()):
+                ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {status} | {scount} | `{excerpt}` |")
+            unlabeled = count - sum(by_status.values())
+            if unlabeled > 0:
+                ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | - | {unlabeled} | `{excerpt}` |")
+            continue
+        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | - | {count} | `{excerpt}` |")
     ap("")
     ap("### Provider/model breakdown")
     ap("")
@@ -486,6 +511,22 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
         label = ERROR_TYPE_LABELS.get(kind, kind)
         ap(f"| {label} | {provider or '-'} | {model or '-'} | {count} |")
     ap("")
+    # Upstream errors broken out by HTTP status code.
+    if summary.upstream_error_by_status:
+        ap("### Upstream HTTP error breakdown by status")
+        ap("")
+        ap("| Status | Count | Provider breakdown |")
+        ap("|---|---|---|")
+        for status, count in sorted(summary.upstream_error_by_status.items()):
+            providers = ", ".join(
+                f"{p} ({c})"
+                for p, c in sorted(
+                    summary.upstream_error_by_status_provider.get(status, {}).items(),
+                    key=lambda kv: -kv[1],
+                )
+            )
+            ap(f"| {status} | {count} | {providers} |")
+        ap("")
     # Enriched stream-error coverage (LP-0MT6322OT00900OX): when stream
     # finish errors carry the informative error payload, report it so the
     # operator can verify informative-error coverage without grepping logs.
@@ -503,7 +544,7 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
-        "fallback, ctx-size pressure, upstream 429 cooldown)."
+        "fallback, ctx-size pressure, upstream HTTP status-specific remediation)."
     )
 
 

@@ -134,6 +134,27 @@ class AnalysisResult:
         """Error events grouped by (error type, provider, model)."""
         return Counter((e.kind, e.provider, e.model) for e in self.error_events)
 
+    @property
+    def upstream_error_by_status(self) -> dict[int, int]:
+        """Upstream HTTP error events grouped by HTTP status code."""
+        counts: dict[int, int] = {}
+        for e in self.error_events:
+            if e.kind == "upstream_http_error" and e.status is not None:
+                counts[e.status] = counts.get(e.status, 0) + 1
+        return counts
+
+    @property
+    def upstream_error_by_status_provider(self) -> dict[int, dict[str, int]]:
+        """Upstream HTTP error events grouped by (status, provider)."""
+        result: dict[int, dict[str, int]] = {}
+        for e in self.error_events:
+            if e.kind == "upstream_http_error" and e.status is not None:
+                provider = e.provider or "(unknown)"
+                if e.status not in result:
+                    result[e.status] = {}
+                result[e.status][provider] = result[e.status].get(provider, 0) + 1
+        return result
+
 
 @dataclass
 class BusyStats:

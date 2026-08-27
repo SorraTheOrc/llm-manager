@@ -768,6 +768,35 @@ class TestErrorAggregation:
         )
         assert res.lines_skipped == 0
 
+    def test_upstream_error_by_status(self):
+        lines = [
+            fixtures.UPSTREAM_429,
+            # A 402 (Insufficient Balance) real line from api.deepseek.com:
+            "2026-08-03 11:00:00,000 - WARNING - [remote] upstream error status=402 "
+            "url=https://api.deepseek.com/v1/chat/completions "
+            "body={\"error\":{\"message\":\"Insufficient Balance\",\"type\":\"unknown_error\","
+            "\"param\":null,\"code\":\"invalid_request_error\"}}",
+            fixtures.UPSTREAM_429,
+        ]
+        res = aggregation.aggregate(
+            _events(lines), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        assert res.upstream_error_by_status == {429: 2, 402: 1}
+        by_sp = res.upstream_error_by_status_provider
+        assert by_sp[429] == {"opencode": 2}
+        assert by_sp[402] == {"deepseek": 1}
+
+    def test_upstream_error_by_status_ignores_missing_status(self):
+        lines = [
+            "2026-08-03 13:58:04,053 - WARNING - [remote] upstream error "
+            "url=https://api.deepseek.com/v1/chat/completions body={}",
+        ]
+        res = aggregation.aggregate(
+            _events(lines), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        assert res.upstream_error_by_status == {}
+        assert res.upstream_error_by_status_provider == {}
+
 
 # ---------------------------------------------------------------------------
 # Fast/cheap bucketing from the slot schedule
@@ -1187,6 +1216,35 @@ class TestErrorRecommendations:
         titles = " | ".join(r.title.lower() for r in recs)
         assert "429" in titles, f"expected 429/cooldown recommendation, got: {titles}"
         assert "LP-0MRGU0I91006ODFD" in " | ".join(r.detail for r in recs)
+
+    def test_upstream_402_triggers_balance_recommendation(self):
+        # Status 402 (Insufficient Balance) must NOT be reported as a
+        # rate-limit / cooldown issue: it is an account-funding problem.
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="unknown_error", status=402)
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title.lower() for r in recs)
+        assert "402" in titles, f"expected 402 recommendation, got: {titles}"
+        assert "429" not in titles
+        assert "balance" in titles, f"expected balance-related title, got: {titles}"
+
+    def test_upstream_errors_broken_out_by_status(self):
+        # Mixed statuses produce one recommendation per status, not a single
+        # lumped 'upstream HTTP error' recommendation.
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="FreeUsageLimitError", status=429),
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="unknown_error", status=402),
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, status=500),
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        status_titles = [r.title for r in recs if "429" in r.title or "402" in r.title or "500" in r.title]
+        joined = " ".join(status_titles)
+        assert "429" in joined and "402" in joined and "500" in joined, \
+            f"expected one recommendation per upstream status, got: {status_titles}"
 
     def test_backend_retry_errors_are_informational(self):
         errors = [
@@ -1968,6 +2026,10 @@ class TestEndToEnd:
         assert "slot_save_error" in report_md
         assert "upstream_http_error" in report_md
         assert "FreeUsageLimitError" in report_md
+        # Upstream errors are broken out by status code (LP-402 vs 429).
+        assert "| upstream HTTP error | 429 | 1 |" in report_md
+        assert "Upstream HTTP error breakdown by status" in report_md
+        assert "| 429 | 1 | opencode (1) |" in report_md
 
         errors_csv = out_dir / "errors.csv"
         assert errors_csv.exists()
