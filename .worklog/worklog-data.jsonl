@@ -1,10 +1,4 @@
 {"__worklog_sync__":{"kind":"delta","version":1}}
-{"data":{"auditedAt":"2026-08-27T21:19:28.721Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MSNKMXIK004P7TL"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:17:24.282Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT2TC3PB005H1RD"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:18:11.664Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT2TC7FG008BXIU"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:18:16.096Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT50SMU1005ZAD6"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:18:19.755Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT5YLL36000ZYRT"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:18:27.329Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT60S55M000TK1H"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:19:12.973Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT652JRM004ZLSI"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:19:20.154Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MTAQNAIH001RN1S"},"type":"audit_result"}
-{"data":{"auditedAt":"2026-08-27T21:19:22.390Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MTAQNAIO0069DUP"},"type":"audit_result"}
+{"data":{"auditedAt":"2026-08-27T21:19:43.550Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MSVOYYSG000PJFF"},"type":"audit_result"}
+{"data":{"auditedAt":"2026-08-27T21:19:35.211Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT01KP09005T4VE"},"type":"audit_result"}
+{"data":{"auditedAt":"2026-08-27T21:19:38.500Z","author":"rgardler","rawOutput":null,"readyToClose":true,"summary":"Approved by manual review","workItemId":"LP-0MT1JJH80004JZHE"},"type":"audit_result"}
