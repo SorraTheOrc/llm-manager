@@ -53,8 +53,48 @@ class TestValidateLocalRoutingConfig:
 
     def test_no_ctx_size_skips_validation(self):
         """When local_model_ctx_size is 0 or absent, nothing is validated."""
-        config = {"server": {}}
+        config = {"server": {"session_slot_pool_size": 3}}
         assert validate_local_routing_config(config) == []
+
+    def test_missing_session_slot_pool_size_is_fatal(self):
+        """session_slot_pool_size is required at launch (LP-0MTCZ35X7009IZKE).
+
+        The legacy ``local_max_concurrent_queries`` fallback was removed;
+        session_slot_pool_size must be present or startup FAILS (FATAL) so a
+        stale config cannot silently drop to a 1-slot pool.
+        """
+        # No server section at all
+        problems = validate_local_routing_config({})
+        assert any(
+            p.startswith("FATAL:") and "session_slot_pool_size" in p
+            for p in problems
+        )
+
+        # Server section present but key missing
+        problems = validate_local_routing_config({"server": {}})
+        assert any(
+            p.startswith("FATAL:") and "session_slot_pool_size" in p
+            for p in problems
+        )
+
+        # Legacy key present but session_slot_pool_size still missing
+        problems = validate_local_routing_config({
+            "server": {"local_max_concurrent_queries": 3},
+        })
+        assert any(
+            p.startswith("FATAL:") and "session_slot_pool_size" in p
+            for p in problems
+        )
+
+    def test_invalid_session_slot_pool_size_is_fatal(self):
+        """A non-positive / non-integer session_slot_pool_size is also FATAL."""
+        for bad in (0, -1, "abc", None):
+            config = {"server": {"session_slot_pool_size": bad}}
+            problems = validate_local_routing_config(config)
+            assert any(
+                p.startswith("FATAL:") and "session_slot_pool_size" in p
+                for p in problems
+            ), f"expected FATAL for session_slot_pool_size={bad!r}"
 
     def test_ctx_65536_slots_6_rejected(self):
         """AC1 / AC3: ctx 65536 with 6 slots → effective = 6826 < 10000."""

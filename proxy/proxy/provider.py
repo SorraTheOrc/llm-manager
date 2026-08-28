@@ -759,15 +759,37 @@ def validate_local_routing_config(config: dict) -> list[str]:
     startup; otherwise callers log a WARNING.
     """
     min_threshold = _get_min_local_routing_threshold(config)
-    if min_threshold <= 0:
-        return []  # minimum check disabled (min_local_routing_threshold: 0)
-
     fatal = bool(
         config.get("server", {}).get("min_local_routing_threshold_fatal", False)
         or config.get("min_local_routing_threshold_fatal", False)
     )
 
     problems: list[str] = []
+
+    # --- session_slot_pool_size is REQUIRED (LP-0MTCZ35X7009IZKE) ---------
+    # The legacy ``local_max_concurrent_queries`` fallback was removed; the
+    # slot pool is the single source of truth for both llama-server's
+    # --parallel and the local dispatch lease pool. Refuse to start when it
+    # is missing or invalid so a stale config cannot silently drop to a
+    # 1-slot pool (the original single-slot regression). Unconditional FATAL
+    # — independent of min_local_routing_threshold_fatal.
+    server_cfg = config.get("server", config)
+    raw_pool = server_cfg.get("session_slot_pool_size", None)
+    try:
+        pool_val = int(raw_pool or 0)
+    except (ValueError, TypeError):
+        pool_val = 0
+    if pool_val <= 0:
+        problems.append(
+            "FATAL: session_slot_pool_size is required in the server config "
+            "(controls llama-server --parallel and the local dispatch lease "
+            f"pool); found {raw_pool!r}. Add session_slot_pool_size to the "
+            "server section (LP-0MTCZ35X7009IZKE)."
+        )
+
+    if min_threshold <= 0:
+        return problems  # minimum check disabled (min_local_routing_threshold: 0)
+
     for ctx, slots in _collect_local_ctx_pairs(config):
         if ctx <= 0:
             continue  # clamp disabled for this pair
@@ -1782,10 +1804,11 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     """Lazily import and return (current_local_active, max_local) from config.
 
     Returns the current local active query count and the configured
-    local concurrency limit.  Uses ``session_slot_pool_size`` as the
-    primary config key (same value that controls ``--parallel`` in
-    llama-server). Falls back to the legacy ``local_max_concurrent_queries``
-    key for backward compatibility.  Defaults to (0, 1) on error.
+    local concurrency limit.  Reads ``session_slot_pool_size`` (same value
+    that controls ``--parallel`` in llama-server); the legacy
+    ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
+    and a missing value is caught at launch by
+    ``validate_local_routing_config``.  Defaults to (0, 1) on error.
     """
     cur_active = 0
     max_local = 1
@@ -1796,12 +1819,7 @@ def _get_local_concurrency_info(config: dict) -> tuple:
         pass
     try:
         server_cfg = config.get("server", config)
-        # Primary: session_slot_pool_size (same as router._get_local_max_concurrent_queries)
-        val = server_cfg.get("session_slot_pool_size", None)
-        if val is None:
-            # Fallback: local_max_concurrent_queries for backward compatibility
-            val = server_cfg.get("local_max_concurrent_queries", 1)
-        max_local = max(1, int(val or 1))
+        max_local = max(1, int(server_cfg.get("session_slot_pool_size", 1) or 1))
     except (ValueError, TypeError):
         pass
     return (cur_active, max_local)

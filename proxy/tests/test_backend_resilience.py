@@ -1007,7 +1007,7 @@ async def test_streaming_backend_error_does_not_leak_local_active_queries(monkey
                 "llama_router_mode": False,
                 "llama_server_port": 8080,
                 "max_concurrent_queries": 4,
-                "local_max_concurrent_queries": 1,
+                "session_slot_pool_size": 1,
                 "llama_request_timeout": 1,
             }
         },
@@ -1069,7 +1069,7 @@ async def test_streaming_upstream_error_does_not_leak_local_active_queries(monke
                 "llama_router_mode": False,
                 "llama_server_port": 8080,
                 "max_concurrent_queries": 4,
-                "local_max_concurrent_queries": 1,
+                "session_slot_pool_size": 1,
                 "llama_request_timeout": 1,
             }
         },

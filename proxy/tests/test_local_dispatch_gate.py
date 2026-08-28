@@ -32,7 +32,7 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
         {
             "server": {
                 "llama_server_port": 8080,
-                "local_max_concurrent_queries": 1,
+                "session_slot_pool_size": 1,
                 "max_concurrent_queries": 16,
             }
         },
@@ -121,7 +121,7 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
         {
             "server": {
                 "llama_server_port": 8080,
-                "local_max_concurrent_queries": 1,
+                "session_slot_pool_size": 1,
                 "local_dispatch_lease_timeout_seconds": 180,
                 "max_concurrent_queries": 16,
             }
@@ -989,7 +989,12 @@ async def test_expired_lease_frees_slot():
 
 @pytest.mark.asyncio
 async def test_get_local_max_concurrent_queries_reads_session_slot_pool_size():
-    """_get_local_max_concurrent_queries reads from session_slot_pool_size."""
+    """_get_local_max_concurrent_queries reads ONLY session_slot_pool_size.
+
+    The legacy ``local_max_concurrent_queries`` fallback was removed
+    (LP-0MTCZ35X7009IZKE). session_slot_pool_size is always present; a
+    missing value is caught at launch by validate_local_routing_config.
+    """
     from proxy.router import _get_local_max_concurrent_queries
 
     # session_slot_pool_size should take precedence
@@ -999,11 +1004,11 @@ async def test_get_local_max_concurrent_queries_reads_session_slot_pool_size():
     })
     assert result == 3, f"Expected 3, got {result}"
 
-    # without session_slot_pool_size, fall back to local_max_concurrent_queries
+    # without session_slot_pool_size, default to 1 (legacy key is ignored)
     result = _get_local_max_concurrent_queries({
         "local_max_concurrent_queries": 2,
     })
-    assert result == 2, f"Expected 2, got {result}"
+    assert result == 1, f"Expected 1 (no legacy fallback), got {result}"
 
     # with neither, default to 1
     result = _get_local_max_concurrent_queries({})
@@ -1028,8 +1033,8 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
 
     from proxy import server as srv
 
-    # Config: N=2 via session_slot_pool_size (also set local_max_concurrent_queries
-    # for backward compat so tests work with both old and new code)
+    # Config: N=2 via session_slot_pool_size (the legacy
+    # local_max_concurrent_queries key no longer exists — LP-0MTCZ35X7009IZKE)
     monkeypatch.setattr(
         srv,
         "config",
@@ -1037,7 +1042,6 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
             "server": {
                 "llama_server_port": 8080,
                 "session_slot_pool_size": 2,
-                "local_max_concurrent_queries": 2,
                 "max_concurrent_queries": 16,
             }
         },
@@ -1132,7 +1136,6 @@ async def test_n2_integration_release_then_retry(monkeypatch):
             "server": {
                 "llama_server_port": 8080,
                 "session_slot_pool_size": 2,
-                "local_max_concurrent_queries": 2,
                 "max_concurrent_queries": 16,
             }
         },
@@ -1245,7 +1248,6 @@ async def test_n1_backward_compat_integration(monkeypatch):
             "server": {
                 "llama_server_port": 8080,
                 "session_slot_pool_size": 1,
-                "local_max_concurrent_queries": 1,
                 "max_concurrent_queries": 16,
             }
         },

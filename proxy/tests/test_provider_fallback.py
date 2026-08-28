@@ -1558,7 +1558,7 @@ async def test_local_concurrency_limit_fallback(mixed_model_config):
     request = _DummyRequest()
     cfg = {
         "provider_cooldown_seconds": 60,
-        "server": {"local_max_concurrent_queries": 1},
+        "server": {"session_slot_pool_size": 1},
     }
     call_log = []
 
@@ -1594,7 +1594,7 @@ async def test_local_concurrency_below_limit_calls_local(mixed_model_config):
     request = _DummyRequest()
     cfg = {
         "provider_cooldown_seconds": 60,
-        "server": {"local_max_concurrent_queries": 1},
+        "server": {"session_slot_pool_size": 1},
     }
     call_log = []
 
@@ -3903,7 +3903,12 @@ async def test_cross_session_cooldown_does_not_affect_available_providers(mixed_
 
 @pytest.mark.asyncio
 async def test_get_local_concurrency_info_reads_session_slot_pool_size():
-    """_get_local_concurrency_info reads from session_slot_pool_size primarily."""
+    """_get_local_concurrency_info reads ONLY session_slot_pool_size.
+
+    The legacy ``local_max_concurrent_queries`` fallback was removed
+    (LP-0MTCZ35X7009IZKE). session_slot_pool_size is always present; a
+    missing value is caught at launch by validate_local_routing_config.
+    """
     from proxy.provider import _get_local_concurrency_info
 
     # session_slot_pool_size should take precedence
@@ -3913,11 +3918,11 @@ async def test_get_local_concurrency_info_reads_session_slot_pool_size():
     })
     assert result == (0, 3), f"Expected (0, 3), got {result}"
 
-    # without session_slot_pool_size, fall back to local_max_concurrent_queries
+    # without session_slot_pool_size, default to 1 (legacy key is ignored)
     result = _get_local_concurrency_info({
         "local_max_concurrent_queries": 2,
     })
-    assert result == (0, 2), f"Expected (0, 2), got {result}"
+    assert result == (0, 1), f"Expected (0, 1) (no legacy fallback), got {result}"
 
     # with neither, default to 1
     result = _get_local_concurrency_info({})

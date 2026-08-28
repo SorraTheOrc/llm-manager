@@ -505,16 +505,6 @@ server:
   min_local_routing_threshold_fatal: false
   llama_router_mode: true
   max_concurrent_queries: 16
-  # Local-model concurrency limit (LP-0MR5MAJNM005R905).
-  # Limits concurrent requests to local providers. Remote providers
-  # continue to use max_concurrent_queries. When this limit is reached,
-  # requests with fallback providers skip to the next provider immediately.
-  #
-  # NOTE: This value is now derived from `session_slot_pool_size` by default.
-  # The `local_max_concurrent_queries` key is preserved for explicit override
-  # only. In normal operation, change `session_slot_pool_size` to control the
-  # number of parallel dispatch leases.
-  local_max_concurrent_queries: 1
   # Local dispatch lease timeout in seconds.
   # An idle session holds an inactive lease for this duration after its
   # last request completes, preventing other sessions from acquiring the

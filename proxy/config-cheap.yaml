@@ -557,12 +557,6 @@ server:
   # requests with fallback providers are QUEUED up to the contention caps
   # below (policy=queue, LP-0MSORQVK50012Q4D); only when the caps are
   # exceeded do they skip to the next provider.
-  #
-  # NOTE: This value is now derived from `session_slot_pool_size` by default.
-  # The `local_max_concurrent_queries` key is preserved for explicit override
-  # only. In normal operation, change `session_slot_pool_size` to control the
-  # number of parallel dispatch leases.
-  local_max_concurrent_queries: 1
   # Local dispatch lease timeout in seconds.
   # An idle session holds an inactive lease for this duration after its
   # last request completes, preventing other sessions from acquiring the

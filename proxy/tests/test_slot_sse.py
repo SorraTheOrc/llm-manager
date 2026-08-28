@@ -625,6 +625,96 @@ class TestSlotProgressCache:
         from proxy.observability import _enrich_slot_details_with_progress
         assert _enrich_slot_details_with_progress([]) == []
 
+    # --- dispatch-lease metadata (LP-0MTCZ35X7009IZKE AC2) ---
+
+    def _fake_srv_with_lease(self, records: dict):
+        """Build a minimal srv exposing local_dispatch_records."""
+        from types import SimpleNamespace
+        return SimpleNamespace(local_dispatch_records=records)
+
+    def test_enrich_attaches_lease_metadata(self, monkeypatch):
+        """Slots with an active dispatch lease get lease_session_id,
+        lease_remaining_seconds and lease_active."""
+        import time as _time
+        from proxy.observability import _enrich_slot_details_with_progress
+        from proxy.session import _slot_owners
+
+        lease_expires = _time.monotonic() + 30.0
+        monkeypatch.setitem(
+            _slot_owners, 0, "sess-workitem-abc"
+        )
+        srv = self._fake_srv_with_lease({
+            "sess-workitem-abc": {
+                "backend": "local",
+                "started_at": _time.monotonic() - 2.0,
+                "active": True,
+                "expires_at": lease_expires,
+                "model_name": "Qwen3",
+            },
+        })
+        try:
+            slot_details = [{"slot_id": 0, "is_processing": False, "n_decoded": None}]
+            result = _enrich_slot_details_with_progress(slot_details, srv=srv)
+            slot = result[0]
+            assert slot["lease_session_id"] == "sess-workitem-abc"
+            assert slot["lease_active"] is True
+            # 30s lease with ~0 elapsed — remaining within (25, 30]
+            assert 25.0 < slot["lease_remaining_seconds"] <= 30.0
+        finally:
+            _slot_owners.pop(0, None)
+
+    def test_enrich_attaches_inactive_lease_cooldown(self, monkeypatch):
+        """A lease in the inactive (post-request cooldown) window still shows
+        on the card, flagged as inactive, with its remaining cooldown time."""
+        import time as _time
+        from proxy.observability import _enrich_slot_details_with_progress
+        from proxy.session import _slot_owners
+
+        lease_expires = _time.monotonic() + 12.0
+        monkeypatch.setitem(
+            _slot_owners, 1, "sess-cooldown-xyz"
+        )
+        srv = self._fake_srv_with_lease({
+            "sess-cooldown-xyz": {
+                "backend": "local",
+                "started_at": _time.monotonic() - 5.0,
+                "active": False,  # inactive cooldown lease
+                "expires_at": lease_expires,
+                "model_name": "Qwen3",
+            },
+        })
+        try:
+            slot_details = [{"slot_id": 1, "is_processing": False, "n_decoded": None}]
+            result = _enrich_slot_details_with_progress(slot_details, srv=srv)
+            slot = result[0]
+            assert slot["lease_session_id"] == "sess-cooldown-xyz"
+            assert slot["lease_active"] is False
+            assert 7.0 < slot["lease_remaining_seconds"] <= 12.0
+        finally:
+            _slot_owners.pop(1, None)
+
+    def test_enrich_no_lease_metadata_when_no_lease(self):
+        """A slot without a dispatch lease gets no lease fields at all."""
+        from proxy.observability import _enrich_slot_details_with_progress
+        from proxy.session import _slot_owners
+
+        # Ensure the slot has no owner (no lease)
+        _slot_owners.pop(2, None)
+        srv = self._fake_srv_with_lease({})
+        slot_details = [{"slot_id": 2, "is_processing": False, "n_decoded": None}]
+        result = _enrich_slot_details_with_progress(slot_details, srv=srv)
+        slot = result[0]
+        assert "lease_session_id" not in slot
+        assert "lease_remaining_seconds" not in slot
+        assert "lease_active" not in slot
+
+    def test_enrich_lease_without_srv_is_graceful(self):
+        """No srv → no lease metadata, no crash."""
+        from proxy.observability import _enrich_slot_details_with_progress
+        slot_details = [{"slot_id": 0, "is_processing": False, "n_decoded": None}]
+        result = _enrich_slot_details_with_progress(slot_details, srv=None)
+        assert "lease_session_id" not in result[0]
+
 
 class _TimePatcher:
     """Context manager that patches time.time() to return a fixed value."""

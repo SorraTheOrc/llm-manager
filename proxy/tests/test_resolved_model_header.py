@@ -158,7 +158,7 @@ def _mock_server_state(monkeypatch):
             "llama_router_mode": False,
             "llama_server_port": 8080,
             "max_concurrent_queries": 4,
-            "local_max_concurrent_queries": 1,
+            "session_slot_pool_size": 1,
             "llama_request_timeout": 30,
             "session_single_flight_mode": "bypass",
             "disconnect_cleanup_timeout": 1,
@@ -381,7 +381,7 @@ async def test_proxy_with_fallback_sets_resolved_model_header(monkeypatch):
             "provider_cooldown_seconds": 60,
             "local_slot_exhaustion_retry_attempts": 0,
             "local_slot_exhaustion_retry_delay_seconds": 0.2,
-            "local_max_concurrent_queries": 4,
+            "session_slot_pool_size": 4,
         }
     }
 
@@ -493,7 +493,7 @@ async def test_fallback_overrides_resolved_model_header(monkeypatch):
             "provider_cooldown_seconds": 60,
             "local_slot_exhaustion_retry_attempts": 0,
             "local_slot_exhaustion_retry_delay_seconds": 0.2,
-            "local_max_concurrent_queries": 4,
+            "session_slot_pool_size": 4,
         }
     }
 
@@ -729,7 +729,7 @@ async def test_proxy_with_fallback_uses_provider_field(monkeypatch):
             "provider_cooldown_seconds": 60,
             "local_slot_exhaustion_retry_attempts": 0,
             "local_slot_exhaustion_retry_delay_seconds": 0.2,
-            "local_max_concurrent_queries": 4,
+            "session_slot_pool_size": 4,
         }
     }
 
