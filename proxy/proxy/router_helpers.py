@@ -16,8 +16,10 @@ Includes:
 import asyncio
 import json
 import os
+import re
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1916,6 +1918,76 @@ async def _schedule_recv_token_increment(
 
 
 # ===================================================================
+# Local child-port discovery
+# ===================================================================
+
+_QWEN3_SPAWN_RE = re.compile(r"name=(\S+) on port (\d+)")
+
+_child_port_cache: dict[int, int | None] = {}
+"""Cached child port per llama-server pid.
+
+The router llama-server (port 8080) spawns child instances on dynamic ports
+(``--port 0``). The child port is discoverable from the spawn line in the
+llama-server log (``spawning server instance with name=Qwen3 on port 58113``).
+
+The router serializes ``GET /slots?model=...`` behind the busy child's
+generation loop (LP-0MTDGBRPU003Z7KU: measured 5-7s via the router vs 0.17s
+direct), so availability/status checks should target the child port directly.
+"""
+
+
+def _llama_log_path(srv) -> Path:
+    """Resolve the llama-server log path for a given server context."""
+    log_dir = getattr(srv, "log_dir", None)
+    if log_dir:
+        return Path(log_dir) / "llama-server.log"
+    return Path(__file__).parent / "logs" / "llama-server.log"
+
+
+def _discover_local_child_port(srv) -> int | None:
+    """Discover the local model child port from the llama-server log.
+
+    The router (``llama_server_port``) spawns model children on dynamic ports
+    (``--port 0``); the spawn line ``spawning server instance with
+    name=<model> on port <port>`` is written near the top of the fresh
+    llama-server log on startup. Returns the port for the first matching
+    spawn line, or ``None`` when the log is missing/unreadable or contains
+    no spawn line.
+
+    The result is cached per llama-server process pid so repeated calls
+    (every request) do not re-read the log; a new pid (restart) re-parses.
+    """
+    try:
+        proc = getattr(srv, "llama_process", None)
+        pid = getattr(proc, "pid", None) if proc is not None else None
+        if pid is None:
+            return None
+        if pid in _child_port_cache:
+            return _child_port_cache[pid]
+        log_path = _llama_log_path(srv)
+        if not log_path.exists():
+            _child_port_cache[pid] = None
+            return None
+        # Read the top of the log (spawn lines are written at startup).
+        read_size = min(65536, log_path.stat().st_size)
+        with open(log_path, "rb") as f:
+            head = f.read(read_size).decode("utf-8", errors="replace")
+        port = None
+        for line in head.splitlines():
+            m = _QWEN3_SPAWN_RE.search(line)
+            if m:
+                try:
+                    port = int(m.group(2))
+                except (TypeError, ValueError):
+                    port = None
+                break
+        _child_port_cache[pid] = port
+        return port
+    except Exception:
+        return None
+
+
+# ===================================================================
 # Slot availability check
 # ===================================================================
 
@@ -1926,11 +1998,24 @@ async def _check_slot_availability(
     slot_model_name: str | None,
     model_name: str | None,
     path: str,
+    lease_held: bool = False,
 ) -> JSONResponse | None:
     """Check llama-server slot availability.
 
     Returns a 503 JSONResponse if no slots are available, None otherwise.
+
+    When *lease_held* is True the check is skipped entirely: the caller has
+    already acquired a dispatch lease (``_try_acquire_local_dispatch``),
+    which gates concurrency to ``session_slot_pool_size`` — the /slots query
+    would be redundant and, via the router, can take 5-7s under load
+    (LP-0MTDGBRPU003Z7KU).
+
+    The query targets the discovered local child port (``_discover_local_child_port``)
+    instead of the router port when available — the router serializes
+    ``GET /slots?model=...`` behind the busy child's generation loop.
     """
+    if lease_held:
+        return None
     if not (path == "v1/chat/completions" or path.endswith("chat/completions")):
         return None
 
@@ -1938,7 +2023,9 @@ async def _check_slot_availability(
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
         )
-        slots_url = f"http://localhost:{llama_port}/slots?model={slot_model}"
+        child_port = _discover_local_child_port(srv)
+        slots_port = child_port if child_port is not None else llama_port
+        slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
         client = (
             srv._http_client
             if srv._http_client

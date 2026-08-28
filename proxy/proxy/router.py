@@ -775,6 +775,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Anonymous/auto-generated sessions are ephemeral and should not
     # acquire a persistent lease.
     # -------------------------------------------------------------------
+    acquired = False
     if session_id and session_explicit:
         local_max = _get_local_max_concurrent_queries(server_config)
         acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
@@ -811,9 +812,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             }
             return JSONResponse(status_code=503, content=payload)
 
-    # Check slot availability
+    # Check slot availability — skipped when the dispatch lease was acquired
+    # (the lease already gates concurrency to session_slot_pool_size; the
+    # router /slots?model= check is redundant and can take 5-7s under load,
+    # LP-0MTDGBRPU003Z7KU).
+    _lease_held = bool(session_id and session_explicit) and acquired
     slot_response = await _check_slot_availability(
-        srv, server_config, llama_port, slot_model_name, model_name, path
+        srv, server_config, llama_port, slot_model_name, model_name, path,
+        lease_held=_lease_held,
     )
     if slot_response is not None:
         return slot_response
