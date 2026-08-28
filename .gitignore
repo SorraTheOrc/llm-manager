@@ -59,3 +59,4 @@ test-results/
 
 # implement.py runtime state (was accidentally tracked; never commit)
 .implement_state.json
+.herdr-downtime-disabled
