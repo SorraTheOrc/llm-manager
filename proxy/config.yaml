@@ -762,6 +762,14 @@ server:
   # contexts; keeps the circuit breaker within a bounded window so a wedged
   # GPU still trips and recovers instead of holding indefinitely.
   session_slot_max_timeout_seconds: 60
+  # Availability-check timeout (seconds) for the pre-dispatch /slots?model=
+  # query (LP-0MTDH2U6V0062TUF). The check uses a dedicated per-call client
+  # with this short timeout so a slow router/child response fails fast and can
+  # never exhaust the shared _http_client pool (which previously caused
+  # slot_save PoolTimeouts and client-visible "Request timed out" under
+  # multi-session load — LP-0MTDGBRPU003Z7KU). 2.0s is short enough to fail
+  # fast under a busy child; the check is best-effort (failure -> skip).
+  session_slot_availability_timeout_seconds: 2.0
   # Load-aware save/restore gating (LP-0MSI1RWLM007N367 F3): skip slot
   # save/restore when ANOTHER local session is actively streaming. llama-server
   # serializes each KV-cache copy behind its slot work, so saves issued under

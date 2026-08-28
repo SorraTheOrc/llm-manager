@@ -2013,6 +2013,11 @@ async def _check_slot_availability(
     The query targets the discovered local child port (``_discover_local_child_port``)
     instead of the router port when available — the router serializes
     ``GET /slots?model=...`` behind the busy child's generation loop.
+
+    The query uses a dedicated per-call ``httpx.AsyncClient`` with a short
+    timeout (``session_slot_availability_timeout_seconds``, default 2.0) so a
+    slow router/child response fails fast and can never exhaust the shared
+    ``_http_client`` pool (LP-0MTDH2U6V0062TUF).
     """
     if lease_held:
         return None
@@ -2026,27 +2031,35 @@ async def _check_slot_availability(
         child_port = _discover_local_child_port(srv)
         slots_port = child_port if child_port is not None else llama_port
         slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
-        client = (
-            srv._http_client
-            if srv._http_client
-            else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+        availability_timeout = float(
+            server_config.get(
+                "session_slot_availability_timeout_seconds", 2.0
+            )
+            or 2.0
         )
-        slots_resp = await client.get(slots_url, timeout=5.0)
-        if slots_resp.status_code == 200:
-            slots_data = slots_resp.json()
-            available_slots = 0
-            total_slots = 0
-            if isinstance(slots_data, list):
-                total_slots = len(slots_data)
-                available_slots = sum(
-                    1
-                    for s in slots_data
-                    if not s.get("is_processing", True)
-                )
-            if available_slots == 0 and total_slots > 0:
-                return _build_slot_exhaustion_response(
-                    server_config, srv, total_slots
-                )
+        # Dedicated per-call client with a short timeout — never borrow the
+        # shared _http_client, so a slow /slots response cannot hold shared
+        # pool connections and starve slot_save/status under multi-session
+        # load (LP-0MTDH2U6V0062TUF).
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(availability_timeout)
+        ) as client:
+            slots_resp = await client.get(slots_url, timeout=availability_timeout)
+            if slots_resp.status_code == 200:
+                slots_data = slots_resp.json()
+                available_slots = 0
+                total_slots = 0
+                if isinstance(slots_data, list):
+                    total_slots = len(slots_data)
+                    available_slots = sum(
+                        1
+                        for s in slots_data
+                        if not s.get("is_processing", True)
+                    )
+                if available_slots == 0 and total_slots > 0:
+                    return _build_slot_exhaustion_response(
+                        server_config, srv, total_slots
+                    )
     except HTTPException:
         raise
     except Exception:

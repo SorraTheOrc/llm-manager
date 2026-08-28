@@ -143,6 +143,12 @@ class TestCheckSlotAvailability:
         captured = {}
 
         class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
             async def get(self, url, timeout=None):
                 captured["url"] = url
                 return self._resp
@@ -151,7 +157,11 @@ class TestCheckSlotAvailability:
         client._resp = self._mock_resp(
             [{"id": 0, "is_processing": False}, {"id": 1, "is_processing": False}]
         )
-        srv = self._make_srv(http_client=client)
+        srv = self._make_srv()
+        monkeypatch.setattr(
+            rh, "httpx",
+            SimpleNamespace(AsyncClient=lambda timeout: client, Timeout=lambda t: t),
+        )
         monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: 58113)
 
         result = await _check_slot_availability(
@@ -169,6 +179,12 @@ class TestCheckSlotAvailability:
         captured = {}
 
         class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
             async def get(self, url, timeout=None):
                 captured["url"] = url
                 return self._resp
@@ -181,7 +197,11 @@ class TestCheckSlotAvailability:
                 {"id": 2, "is_processing": True},
             ]
         )
-        srv = self._make_srv(http_client=client)
+        srv = self._make_srv()
+        monkeypatch.setattr(
+            rh, "httpx",
+            SimpleNamespace(AsyncClient=lambda timeout: client, Timeout=lambda t: t),
+        )
         monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: 58113)
 
         result = await _check_slot_availability(
@@ -200,6 +220,12 @@ class TestCheckSlotAvailability:
         captured = {}
 
         class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
             async def get(self, url, timeout=None):
                 captured["url"] = url
                 return self._resp
@@ -208,7 +234,11 @@ class TestCheckSlotAvailability:
         client._resp = self._mock_resp(
             [{"id": 0, "is_processing": False}]
         )
-        srv = self._make_srv(http_client=client)
+        srv = self._make_srv()
+        monkeypatch.setattr(
+            rh, "httpx",
+            SimpleNamespace(AsyncClient=lambda timeout: client, Timeout=lambda t: t),
+        )
         monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
 
         result = await _check_slot_availability(
