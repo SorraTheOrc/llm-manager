@@ -636,6 +636,7 @@ class TestSlotProgressCache:
         """Slots with an active dispatch lease get lease_session_id,
         lease_remaining_seconds and lease_active."""
         import time as _time
+
         from proxy.observability import _enrich_slot_details_with_progress
         from proxy.session import _slot_owners
 
@@ -667,6 +668,7 @@ class TestSlotProgressCache:
         """A lease in the inactive (post-request cooldown) window still shows
         on the card, flagged as inactive, with its remaining cooldown time."""
         import time as _time
+
         from proxy.observability import _enrich_slot_details_with_progress
         from proxy.session import _slot_owners
 
