@@ -65,14 +65,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from analyze_context_distribution import (
-    FAST_WARM_THRESHOLD,
-    CHEAP_WARM_THRESHOLD,
     TS_FMT,
-    iter_log_lines,
-    parse_pressure,
-    parse_routing_sample,
-    parse_skip,
     discover_log_files,
+    iter_log_lines,
+    parse_routing_sample,
 )
 
 FAST_CAP = 83285  # per-slot cap, fast (87.4K / 3 - 4096 headroom)
