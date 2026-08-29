@@ -301,10 +301,15 @@ class TestCheapConfigProfile:
         # cheap 42000, fast 38000 (asymmetric — cheap-only change).
         cheap_srv.pop("local_large_context_cold_cache_threshold", None)
         fast_srv.pop("local_large_context_cold_cache_threshold", None)
-        # Persistence cap pinned per profile to each mode's routing clamp
-        # (LP-0MTBTCB8D000OQ0C): cheap 126976 (2x262144), fast 83285 (3x262144).
+        # Persistence cap derived per profile from each mode's hard-routing
+        # cap (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4): static 0
+        # (derive) in both.
         cheap_srv.pop("session_slot_max_prompt_tokens", None)
         fast_srv.pop("session_slot_max_prompt_tokens", None)
+        # Hard-routing-cap ratios (LP-0MTBOX45O005LD1S AC5): each mode
+        # declares its own ratio key (cheap 0.6144, fast 0.84049).
+        cheap_srv.pop("local_hard_routing_cap_ratio_cheap", None)
+        fast_srv.pop("local_hard_routing_cap_ratio_fast", None)
         assert cheap_srv == fast_srv
 
         # The intended diffs, asserted explicitly:
@@ -321,10 +326,14 @@ class TestCheapConfigProfile:
         assert cheap["server"]["contention_queue_max_depth"] == 4
         assert fast["server"]["contention_queue_policy"] == "fallback"
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
-        # Per-mode persistence caps equal each profile's routing clamp
-        # (LP-0MTBTCB8D000OQ0C): 262144//2 - 4096 vs 262144//3 - 4096.
-        assert cheap["server"]["session_slot_max_prompt_tokens"] == 126976
-        assert fast["server"]["session_slot_max_prompt_tokens"] == 83285
+        # Per-mode persistence caps derive from each profile's hard-routing
+        # cap (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4): static 0 =
+        # derive from mode-aware cap at runtime.
+        assert cheap["server"]["session_slot_max_prompt_tokens"] == 0
+        assert fast["server"]["session_slot_max_prompt_tokens"] == 0
+        # Per-mode hard-routing-cap ratios (LP-0MTBOX45O005LD1S AC5).
+        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0.6144
+        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0.84049
         assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 

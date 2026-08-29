@@ -96,6 +96,7 @@ backend_signal_counts: dict = {
     "concurrency_rejects": 0,
     "gpu_wedge": 0,
     "grandfathered": 0,
+    "context_too_large": 0,  # LP-0MTBOX45O005LD1S fast-mode cap skip
 }
 
 

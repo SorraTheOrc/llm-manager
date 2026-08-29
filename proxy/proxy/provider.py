@@ -29,7 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy.utils import _is_empty_response
 
@@ -682,6 +682,20 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     # remains non-empty for Check 2 (cached_ratio routing) to operate in.
     if warm > 0:
         warm = min(warm, cap)
+        # LP-0MTBOX45O005LD1S AC4: also clamp warm to the hard-routing cap
+        # (mode-aware; the cap is expressed as a per-mode ratio) so
+        # ``context_too_large`` fires exactly at the hard cap — the SAME
+        # single source as ``session_slot_max_prompt_tokens`` persistence.
+        # No circularity: ``compute_hard_routing_cap`` derives its denominator
+        # from the RAW warm config + per-slot threshold, not this clamped warm.
+        try:
+            from proxy.mode import read_mode as _read_mode
+            _mode = _read_mode()
+        except Exception:
+            _mode = "fast"  # default mode, matching read_mode()
+        _hard_cap = compute_hard_routing_cap(_mode, config)
+        if _hard_cap > 0:
+            warm = min(warm, _hard_cap)
     return cold, warm
 
 
@@ -734,6 +748,203 @@ def _get_min_local_routing_threshold(config: dict) -> int:
         return max(0, int(val or 0))
     except (ValueError, TypeError):
         return _DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Hard local-routing caps (LP-0MTBOX45O005LD1S)
+# ---------------------------------------------------------------------------
+# Per-mode ratio of the effective per-slot context below which local routing
+# is allowed.  Ratios are applied against the *effective per-slot threshold*
+# (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``) so they
+# automatically rescale when ``slot_schedule`` changes.
+#
+# Resolved caps (operator-approved 2026-08-27):
+#   fast:  70 000 tokens  → ratio 70000/83285 ≈ 0.84049
+#   cheap: 61 440 tokens  → ratio 61440/100000 = 0.6144
+#
+# Denominators are the effective warm/routing clamp (decision #4):
+# ``min(warm_config, effective_per_slot_threshold)`` — the SAME value the
+# warm-context routing check is clamped to (see
+# ``_effective_large_context_thresholds``):
+#   fast  schedule (3 slots x 262144 ctx):
+#       per_slot = 262144//3 - 4096 = 83285; min(100000, 83285) = 83285
+#       → 0.84049 x 83285 = 70000 EXACT
+#   cheap schedule (2 slots x 262144 ctx):
+#       per_slot = 262144//2 - 4096 = 126976; min(100000, 126976) = 100000
+#       → 0.6144 x 100000 = 61440 EXACT
+#
+# A ratio of 0 (or absent) disables the hard cap.
+_DEFAULT_HARD_ROUTING_CAP_RATIO_FAST = 0.0
+_DEFAULT_HARD_ROUTING_CAP_RATIO_CHEAP = 0.0
+
+
+def _get_hard_routing_cap_ratio(config: dict, mode: str) -> float:
+    """Read the per-mode hard-routing-cap ratio from config.
+
+    Supports both nested (``server.local_hard_routing_cap_ratio_<mode>``) and
+    flat keys.  Mode must be ``"fast"`` or ``"cheap"``.
+    A ratio of 0 (or absent) disables the hard cap.
+
+    Args:
+        config: Proxy configuration dict.
+        mode: Operating mode ("fast" or "cheap").
+
+    Returns:
+        The ratio to apply (0.0 = disabled).
+    """
+    key = f"local_hard_routing_cap_ratio_{mode}"
+    val = config.get(key)
+    if val is None:
+        val = config.get("server", {}).get(key, 0)
+    try:
+        ratio = float(val or 0)
+    except (ValueError, TypeError):
+        ratio = 0.0
+    return max(0.0, ratio)
+
+
+def compute_hard_routing_cap(mode: str, config: dict) -> int:
+    """Resolve the hard-routing cap for *mode* against the active per-slot context.
+
+    Returns the absolute token count at which local is hard-skipped (fast) or
+    gated with a compaction response (cheap).  Computed as:
+        ``ratio × effective_warm_clamp``
+    rounded to the nearest integer, where ``effective_warm_clamp`` is
+    ``min(warm_cache_threshold, effective_per_slot_threshold(ctx_size, slots))``
+    — the SAME clamp the warm-context routing threshold resolves to
+    (LP-0MTBOX45O005LD1S decision #4): the approved ratios are expressed
+    against this clamp so the caps reproduce the approved absolutes (~70000 /
+    61440) under the current fast/cheap schedules.  Falls back to the raw
+    per-slot threshold when no warm threshold is configured (warm=0 disables
+    the clamp).
+
+    Rounding uses ``round()`` (not floor) to absorb float representation error
+    (0.6144 × 100000 = 61439.999… in IEEE-754; floor would yield 61439).
+
+    When the slot scheduler is available, the function uses the schedule-aware
+    slot count and ctx_size so the cap rescales automatically on schedule
+    transitions.  NOTE (cheap boot-static): when the slot scheduler is NOT
+    available, the cheap profile falls back to its static pair
+    (local_model_ctx_size=131072, 2 slots) → per-slot clamp
+    min(100000, 61440)=61440 → 0.6144 × 61440 ≈ 37749, NOT the approved
+    61440.  Production always runs the live scheduler (both schedule entries
+    override ctx to 262144), so the approved absolute holds; the transient
+    boot-static value is strictly more conservative (never routes local what
+    the scheduled view would allow) and is accepted per the item's "caps
+    rescale automatically when slot_schedule changes" caveat.
+
+    Args:
+        mode: Operating mode ("fast" or "cheap").
+        config: Proxy configuration dict.
+
+    Returns:
+        Absolute token cap (0 = disabled).
+    """
+    ratio = _get_hard_routing_cap_ratio(config, mode)
+    if ratio <= 0:
+        return 0
+    ctx_size = _get_active_local_ctx_size(config)
+    slots = _get_active_local_slots(config)
+    per_slot = effective_per_slot_threshold(ctx_size, slots)
+    if per_slot <= 0:
+        return 0
+    warm = _get_warm_cache_threshold(config)
+    if warm > 0:
+        per_slot = min(per_slot, warm)
+    if per_slot <= 0:
+        return 0
+    return round(ratio * per_slot)
+
+
+def check_hard_routing_cap(
+    estimated_tokens: int, mode: str, config: dict
+) -> bool:
+    """Whether ``estimated_tokens`` exceeds the hard-routing cap for *mode*.
+
+    Args:
+        estimated_tokens: Estimated prompt/context tokens for the request.
+        mode: Operating mode ("fast" or "cheap").
+        config: Proxy configuration dict.
+
+    Returns:
+        ``True`` when the estimate is above the cap (local must be skipped).
+    """
+    cap = compute_hard_routing_cap(mode, config)
+    if cap <= 0:
+        return False  # cap disabled
+    return estimated_tokens > cap
+
+
+def _build_compaction_gate_response(
+    estimated_tokens: int, cap: int, mode: str, session_id: str | None,
+    model_name: str | None,
+) -> Response:
+    """Build a 429 response that gates the request for client-side compaction.
+
+    Used only in cheap mode when the hard-routing cap is exceeded.  The
+    response includes:
+    - HTTP 429 status code
+    - ``X-Compaction-Gate: true`` header
+    - ``X-Compaction-Estimated-Tokens`` header
+    - ``X-Compaction-Cap`` header
+    - JSON body with ``error`` and compaction guidance
+
+    This is NOT a remote fallback — it tells the client to compact its
+    session before retrying.
+
+    Args:
+        estimated_tokens: The estimated token count that triggered the gate.
+        cap: The hard-routing cap that was exceeded.
+        mode: Operating mode ("cheap").
+        session_id: Session ID for the request (may be None).
+        model_name: Model name for the request.
+
+    Returns:
+        A FastAPI ``Response`` to return to the client.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "X-Compaction-Gate": "true",
+        "X-Compaction-Estimated-Tokens": str(estimated_tokens),
+        "X-Compaction-Cap": str(cap),
+        "X-Compaction-Mode": mode,
+    }
+    if session_id:
+        headers["X-Session-Id"] = session_id
+    headers["X-Resolved-Model"] = f"local/{model_name}" if model_name else "local/unknown"
+    payload = {
+        "error": {
+            "type": "compaction_gate",
+            "code": "context_too_large_for_local",
+            "message": (
+                f"Context ({estimated_tokens} tokens) exceeds the "
+                f"{mode}-mode local routing cap ({cap} tokens). "
+                "Compact the session before retrying (see the "
+                "context_pressure guidance signal)."
+            ),
+        },
+        "status": 429,
+        "estimated_tokens": estimated_tokens,
+        "cap": cap,
+        "mode": mode,
+    }
+    return JSONResponse(status_code=429, content=payload, headers=headers)
+
+
+def _is_compaction_gate_response(response) -> bool:
+    """Whether *response* is the cheap-mode compaction gate (429).
+
+    The gate is a TERMINAL response (LP-0MTBOX45O005LD1S AC2): it must
+    reach the client as-is and must never trigger the fallback cycle's
+    local-4xx branch, which would silently re-route to the next remote
+    provider.  Detected via the ``X-Compaction-Gate`` header emitted by
+    :func:`_build_compaction_gate_response`.
+    """
+    try:
+        headers = getattr(response, "headers", {}) or {}
+        return str(headers.get("X-Compaction-Gate", "")).lower() == "true"
+    except Exception:
+        return False
 
 
 def validate_local_routing_config(config: dict) -> list[str]:
@@ -4060,6 +4271,20 @@ async def _proxy_with_fallback_cycle(
                     continue
 
                 response = await ptr_local(request, path)
+
+                # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
+                # (429) is TERMINAL.  Without this, the local-4xx branch
+                # below would ``continue`` to the next provider → a silent
+                # remote fallback for a request the gate exists to reject.
+                if _is_compaction_gate_response(response):
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="compaction_gate",
+                        status_code=int(getattr(response, "status_code", 0) or 0),
+                    )
+                    return response
             else:
                 # Proactive rate-limit check for remote providers
                 # (LP-0MQNRDUP4008KT6T: rate limiter for remote models)

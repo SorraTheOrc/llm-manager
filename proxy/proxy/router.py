@@ -724,6 +724,83 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         server_config.get("session_single_flight_queue_timeout_seconds", 120) or 120
     )
 
+    # ── Hard local-routing cap (LP-0MTBOX45O005LD1S) ──
+    # Check BEFORE concurrency/lease/slot gating so requests above the cap
+    # never acquire a dispatch lease or consume slot resources.
+    # Fast mode: skip local with context_too_large when above cap.
+    # Cheap mode: return a 429 compaction-gate response (no silent remote).
+    #
+    # The estimate MUST use the provider's authoritative pipeline
+    # (``_get_tokenizer_for_model`` + ``_estimate_effective_prompt_tokens_for_routing``)
+    # — native tokenizer + session history + multiplier — IDENTICAL to the
+    # provider smart-routing block (provider.py ``_should_skip_local`` path),
+    # so the gate fires whenever the provider would skip local.  The body-
+    # only tiktoken estimate (``_estimate_tokens_sent``, which returns a DICT
+    # and would crash the cap comparison) undercounts session-heavy /
+    # native-tokenized requests (~1.69x vs Qwen3).  With a lower gate
+    # estimate an over-cap cheap request passes the gate, then the provider
+    # block fires ``context_too_large`` → routes to the next REMOTE provider
+    # = silent remote fallback in cheap mode (AC2 violation).
+    try:
+        from proxy.provider import (
+            _estimate_effective_prompt_tokens_for_routing,
+            _get_tokenizer_for_model,
+        )
+        _model_cfg = srv.get_model_config(model_name) if model_name else None
+        _tokenizer, _multiplier = _get_tokenizer_for_model(_model_cfg, server_config)
+        _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
+            request, body_json, tokenizer=_tokenizer,
+        )
+        if _multiplier != 1.0:
+            _estimated_tokens = int(_estimated_tokens * _multiplier)
+    except Exception:
+        # Fail-open: an estimate error must never break local routing.  The
+        # provider smart-routing block re-estimates per attempt anyway.
+        _estimated_tokens = 0
+    try:
+        from proxy.mode import read_mode as _read_mode
+        _mode = _read_mode()
+    except Exception:
+        _mode = "fast"
+    from proxy.provider import (
+        check_hard_routing_cap,
+        compute_hard_routing_cap,
+    )
+    if check_hard_routing_cap(_estimated_tokens, _mode, server_config):
+        _cap = compute_hard_routing_cap(_mode, server_config)
+        if _mode == "cheap":
+            # Cheap mode: return a 429 compaction-gate response.
+            srv.logger.info(
+                "compaction_gate session=%s tokens=%d cap=%d mode=%s",
+                session_id or "anonymous",
+                _estimated_tokens,
+                _cap,
+                _mode,
+            )
+            from proxy.provider import _build_compaction_gate_response
+            return _build_compaction_gate_response(
+                _estimated_tokens, _cap, _mode, session_id, model_name,
+            )
+        else:
+            # Fast mode: skip local with context_too_large.
+            srv.logger.info(
+                "context_too_large session=%s tokens=%d cap=%d mode=%s",
+                session_id or "anonymous",
+                _estimated_tokens,
+                _cap,
+                _mode,
+            )
+            _record_backend_signal("context_too_large")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Context ({_estimated_tokens} tokens) exceeds the "
+                    f"{model_name or 'model'} local routing cap ({_cap} tokens) "
+                    "in fast mode. Compact the session and retry."
+                ),
+                headers={"X-Context-Too-Large": "true"},
+            )
+
     # Check concurrency limit
     max_queries = server_config.get("max_concurrent_queries", 4)
     try:

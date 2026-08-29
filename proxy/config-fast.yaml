@@ -465,6 +465,17 @@ server:
   # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
   local_large_context_warm_cache_threshold: 100000
 
+  # Hard local-routing cap ratio (LP-0MTBOX45O005LD1S, operator-approved
+  # 2026-08-27): fast mode hard-skips local with context_too_large above the
+  # resolved cap; cheap mode returns a 429 compaction-gate response. The
+  # ratio is expressed against the effective warm/routing clamp
+  # min(warm_cache_threshold, per_slot - 4096) (decision #4):
+  #   70000 / 83285 ≈ 0.84049 (3 slots x 262144 ctx → per-slot clamp 83285)
+  #   → resolved cap = round(0.84049 x 83285) = 70000 EXACT
+  # 0 (or absent) disables the cap. The cap rescales automatically when
+  # slot_schedule changes (``compute_hard_routing_cap`` is schedule-aware).
+  local_hard_routing_cap_ratio_fast: 0.84049
+
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
   # ctx-size) and the slot_schedule ctx_size pins below. Used to compute the
@@ -729,15 +740,13 @@ server:
   # estimated tokens. llama-server serializes the whole KV cache on save,
   # so large contexts ReadTimeout and can wedge the GPU.
   #
-  # STATIC OVERRIDE (LP-0MTBTCB8D000OQ0C rollout): explicit cap pinned to the
-  # routing clamp — effective_per_slot_threshold (provider.py) =
-  # local_model_ctx_size // active_slots - 4096 output headroom =
-  # 262144 // 3 - 4096 = 83285 for the 3-slot fast schedule (ctx 262144,
-  # LP-0MSY0SDAS0031Y7F). Cap == clamp ⇒ every context-eligible session
-  # restores from warm KV cache with no dead-band above the routing clamp.
-  # Supersedes the dynamic derivation (LP-0MSEGPO77005CYCQ F3; absent/0 =
-  # derive) for this profile.
-  session_slot_max_prompt_tokens: 83285
+  # DERIVED (LP-0MTBOX45O005LD1S AC4): 0 = derive from the hard-routing cap
+  # (provider.py ``compute_hard_routing_cap``) as the single source, so
+  # persistence is never attempted above the routing cap (83285 static >
+  # 70000 cap would persist contexts the router refuses to dispatch). The
+  # derivation falls back to the per-slot routing clamp when no hard cap is
+  # configured (LP-0MSEGPO77005CYCQ F3).
+  session_slot_max_prompt_tokens: 0
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
   # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
   # 0 disables the add-on (fixed timeout only).

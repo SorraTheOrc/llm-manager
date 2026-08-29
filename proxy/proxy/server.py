@@ -389,6 +389,25 @@ def _startup_config_logging():
     config = load_config()
     logger = setup_logging(config)
     _startup_validate_local_routing_config(config)
+
+    # Log resolved hard-routing caps for both modes (LP-0MTBOX45O005LD1S).
+    # The caps are derived from per-mode ratios against the active per-slot
+    # threshold, so they rescale automatically when slot_schedule changes.
+    try:
+        from proxy.mode import read_mode as _read_mode
+        from proxy.provider import compute_hard_routing_cap
+        _mode = _read_mode()
+        _fast_cap = compute_hard_routing_cap("fast", config)
+        _cheap_cap = compute_hard_routing_cap("cheap", config)
+        logger.info(
+            "Hard-routing caps: fast=%s cheap=%s (mode=%s)",
+            _fast_cap if _fast_cap > 0 else "disabled",
+            _cheap_cap if _cheap_cap > 0 else "disabled",
+            _mode,
+        )
+    except Exception:
+        pass  # Logging is best-effort; don't block startup
+
     logger.info("Starting LLama Proxy Server")
     return config, logger
 
