@@ -22,8 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import analyze_context_distribution as analyzer  # noqa: E402
-
+import analyze_context_distribution as analyzer
 
 # --- Fixture log lines (real shapes from /var/log/llama-proxy) ----------
 
@@ -132,7 +131,7 @@ class TestParsePressureAndSkip:
 
 class TestSessionAggregation:
     def test_session_mode_is_dominant(self, tmp_path):
-        log = _write_log(tmp_path, [ROUTING_FAST_SMALL, ROUTING_FAST_LARGE])
+        _write_log(tmp_path, [ROUTING_FAST_SMALL, ROUTING_FAST_LARGE])
         res = analyzer.analyze_day(tmp_path, DAY)
         agg = res.sessions["herdr-1787669217-851654-15207"]
         assert agg.count == 2
@@ -141,13 +140,13 @@ class TestSessionAggregation:
         assert agg.mode == "fast"
 
     def test_window_filter_excludes_outside_lines(self, tmp_path):
-        log = _write_log(tmp_path, [OUTSIDE_WINDOW, ROUTING_FAST_SMALL])
+        _write_log(tmp_path, [OUTSIDE_WINDOW, ROUTING_FAST_SMALL])
         res = analyzer.analyze_day(tmp_path, DAY)
         assert len(res.sessions) == 1
         assert res.sessions["herdr-1787669217-851654-15207"].count == 1
 
     def test_multiple_sessions_and_modes(self, tmp_path):
-        log = _write_log(
+        _write_log(
             tmp_path, [ROUTING_FAST_SMALL, ROUTING_CHEAP, ROUTING_UNKNOWN_THRESHOLD]
         )
         res = analyzer.analyze_day(tmp_path, DAY)
@@ -178,7 +177,7 @@ class TestDistributionStats:
 class TestBreachCounts:
     def test_fast_and_cheap_breach_sessions(self, tmp_path):
         # One fast session at 100000 (> 83285), one cheap at 45000 (< 61440).
-        log = _write_log(tmp_path, [ROUTING_FAST_LARGE, ROUTING_CHEAP])
+        _write_log(tmp_path, [ROUTING_FAST_LARGE, ROUTING_CHEAP])
         res = analyzer.analyze_day(tmp_path, DAY)
         caps = {"fast": analyzer.FAST_CAP, "cheap": analyzer.CHEAP_CAP}
         breaches = analyzer.breach_summary(res, caps)
@@ -189,7 +188,7 @@ class TestBreachCounts:
         assert breaches["cheap"]["breach"] == 0
 
     def test_unknown_mode_excluded_from_buckets(self, tmp_path):
-        log = _write_log(tmp_path, [ROUTING_UNKNOWN_THRESHOLD])
+        _write_log(tmp_path, [ROUTING_UNKNOWN_THRESHOLD])
         res = analyzer.analyze_day(tmp_path, DAY)
         caps = {"fast": 83285, "cheap": 61440}
         breaches = analyzer.breach_summary(res, caps)
@@ -199,7 +198,7 @@ class TestBreachCounts:
 
 class TestWarningsAndSkips:
     def test_pressure_and_skip_counts(self, tmp_path):
-        log = _write_log(
+        _write_log(
             tmp_path,
             [
                 CONTEXT_PRESSURE,
@@ -213,13 +212,13 @@ class TestWarningsAndSkips:
         assert res.skip_counts == {}
 
     def test_pressure_counted_in_its_own_day(self, tmp_path):
-        log = _write_log(tmp_path, [CONTEXT_PRESSURE])
+        _write_log(tmp_path, [CONTEXT_PRESSURE])
         res = analyzer.analyze_day(tmp_path, datetime(2026, 8, 26))
         assert res.pressure_count == 1
         assert len(res.pressure_sessions) == 1
 
     def test_skip_reasons_tallied(self, tmp_path):
-        log = _write_log(tmp_path, [ROUTING_SKIP_TOO_LARGE, ROUTING_SKIP_BYPASS])
+        _write_log(tmp_path, [ROUTING_SKIP_TOO_LARGE, ROUTING_SKIP_BYPASS])
         res = analyzer.analyze_day(tmp_path, datetime(2026, 8, 26))
         assert res.skip_counts["context_too_large"] == 1
         assert res.skip_counts["large_context_bypass"] == 1
