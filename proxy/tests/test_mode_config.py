@@ -322,8 +322,11 @@ class TestCheapConfigProfile:
         assert all(e.get("ctx_size") == 262144 for e in cheap_entries)
         assert all(e.get("ctx_size") == 262144 for e in fast_entries)  # LP-0MSY0SDAS0031Y7F
         assert cheap["server"]["contention_queue_policy"] == "queue"
-        assert cheap["server"]["contention_queue_max_wait_seconds"] == 60
-        assert cheap["server"]["contention_queue_max_depth"] == 4
+        # Caps tuned per LP-0MTF6EVLW007PEHN (T4 recommendation,
+        # LP-0MTED3OFP006I7NO): wait 60→120, depth 4→8 (projected +35
+        # dispatches/window, T3 a26bc66).  Fast mode keeps no-queue fallback.
+        assert cheap["server"]["contention_queue_max_wait_seconds"] == 120
+        assert cheap["server"]["contention_queue_max_depth"] == 8
         assert fast["server"]["contention_queue_policy"] == "fallback"
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
         # Per-mode persistence caps derive from each profile's hard-routing

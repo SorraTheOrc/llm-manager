@@ -662,10 +662,17 @@ server:
   # Max time (seconds) a queued request waits for a local slot before
   # falling back to the next remote provider. Clamped to
   # [1, session_guardrail_max_runtime_seconds] (LP-0MSORQVK50012Q4D F2).
-  contention_queue_max_wait_seconds: 60
+  # Tuned 60→120 per LP-0MTF6EVLW007PEHN (T4 recommendation
+  # LP-0MTED3OFP006I7NO): project +35 dispatches/window; 180–300 not
+  # selected (diminishing returns; p95 wait → cap). Queue wait is
+  # subtracted from the adaptive-timeout budget (Q2=a, F4 AC2) so total
+  # wait+serve stays within llama_adaptive_timeout_*.
+  contention_queue_max_wait_seconds: 120
   # Max number of cross-session requests queued at once; beyond this, new
-  # requests fall back immediately. Clamped to [1, 16].
-  contention_queue_max_depth: 4
+  # requests fall back immediately. Clamped to [1, 16].  Tuned 4→8 per
+  # LP-0MTF6EVLW007PEHN (observed max depth 4 at 60s wait, T2; 120s/8
+  # keeps depth headroom without sustained deep queues).
+  contention_queue_max_depth: 8
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
