@@ -36,6 +36,8 @@ child's scope; this module reports ``compacted_over_budget`` (or
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
@@ -307,7 +309,8 @@ def log_compaction_event(
     - dry_run: advisory mode flag (true/false)
 
     Non-events (``action="noop"``) are NOT compaction events and emit
-    nothing unless ``dry_run`` is set (advisory mode projects them).
+    nothing — even in dry-run, a below-trigger session produces no
+    advisory noise.
 
     Args:
         plan_result: A ``plan_session_compaction`` result dict.
@@ -324,7 +327,7 @@ def log_compaction_event(
     """
     action = plan_result.get("action")
     est = estimate_tokens or estimate_session_tokens
-    if action in (None, "noop") and not dry_run:
+    if action in (None, "noop"):
         return None
 
     summary_text = plan_result.get("summary_text")
@@ -351,6 +354,133 @@ def log_compaction_event(
     else:
         emit.info(line)
     return fields
+
+
+# ---------------------------------------------------------------------------
+# Warn-only dry-run mode (LP-0MTGBPICV003JMXI)
+# ---------------------------------------------------------------------------
+
+
+def is_compaction_dry_run(config: dict) -> bool:
+    """True when compaction runs in warn-only advisory mode.
+
+    Reads ``server.compaction_dry_run`` (or flat ``compaction_dry_run``,
+    or the spec-style nested ``server.compaction.dry_run``). When enabled
+    the proxy must log what WOULD happen (would-summarize / would-drop)
+    without changing dispatch (AC1).
+    """
+    server = config.get("server", {}) if isinstance(config, dict) else {}
+    raw = server.get("compaction_dry_run")
+    if raw is None:
+        raw = config.get("compaction_dry_run")
+    if raw is None:
+        raw = server.get("compaction", {}).get("dry_run")
+    return bool(raw)
+
+
+class CompactionChurnCollector:
+    """Collects compaction churn per session per time window (AC2).
+
+    In-memory, thread-safe telemetry for the operational target
+    (< 1 compaction/session/hour). Timestamps come from an injectable
+    clock so tests are deterministic; production uses ``time.time``.
+    """
+
+    def __init__(
+        self, now_fn: Callable[[], float] | None = None
+    ) -> None:
+        self._lock = threading.Lock()
+        self._now = now_fn or time.time
+        self._events: dict[str, list[float]] = {}
+
+    def record(self, session_id: str) -> None:
+        """Record one compaction event for *session_id*."""
+        ts = self._now()
+        with self._lock:
+            self._events.setdefault(str(session_id), []).append(ts)
+
+    def churn_counts(self, window_seconds: float = 3600.0) -> dict[str, int]:
+        """Per-session event counts within the rolling window."""
+        cutoff = self._now() - window_seconds
+        with self._lock:
+            return {
+                sid: sum(1 for ts in stamps if ts > cutoff)
+                for sid, stamps in self._events.items()
+            }
+
+    def churn_report(
+        self, window_seconds: float = 3600.0, target_rate: float = 1.0
+    ) -> dict[str, dict[str, Any]]:
+        """Per-session churn stats: count, rate/hour, target breach."""
+        counts = self.churn_counts(window_seconds)
+        hours = max(window_seconds / 3600.0, 1e-9)
+        # Target is churn < 1 compaction/session/hour: exactly 1.0/hour
+        # does not breach it.
+        return {
+            sid: {
+                "count": n,
+                "rate_per_hour": round(n / hours, 3),
+                "exceeds_target": (n / hours) > target_rate,
+            }
+            for sid, n in counts.items()
+        }
+
+    def log_churn_report(
+        self,
+        window_seconds: float = 3600.0,
+        target_rate: float = 1.0,
+        logger_obj: logging.Logger | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Emit the churn report as structured lines; return the report."""
+        report = self.churn_report(window_seconds, target_rate)
+        emit = logger_obj if logger_obj is not None else logger
+        for sid, stats in report.items():
+            emit.warning(
+                "compaction_churn session=%s count=%d rate_per_hour=%.3f "
+                "exceeds_target=%s",
+                str(sid)[:8],
+                stats["count"],
+                stats["rate_per_hour"],
+                stats["exceeds_target"],
+            )
+        return report
+
+
+def run_dry_run_plan(
+    messages: list[dict[str, Any]],
+    config: dict,
+    mode: str = "fast",
+    summarizer: Summarizer | None = None,
+    estimate_tokens: TokenEstimator | None = None,
+    session_id: str = "",
+    logger_obj: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Compute and log the advisory compaction plan WITHOUT dispatch change.
+
+    Dry-run mode (AC1): plans what WOULD happen — summarization and, when
+    needed, the truncate backstop (``backstop=True``) so would-drop is
+    surfaced — emits the advisory event (``dry_run=true``), and returns the
+    plan. The session history is never mutated and never swapped: the
+    dispatcher ignores the plan's ``messages`` entirely.
+
+    Returns the plan result dict (see ``plan_session_compaction``).
+    """
+    plan = plan_session_compaction(
+        messages,
+        config,
+        mode,
+        summarizer=summarizer,
+        estimate_tokens=estimate_tokens,
+        backstop=True,
+    )
+    log_compaction_event(
+        plan,
+        session_id=session_id,
+        dry_run=True,
+        logger_obj=logger_obj,
+        estimate_tokens=estimate_tokens,
+    )
+    return plan
 
 
 def plan_session_compaction(

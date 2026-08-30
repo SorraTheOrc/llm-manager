@@ -119,6 +119,10 @@ server:
     llama_model: Qwen3
   summarizer_ctx_size: 8192        # default 8192; summariser KV footprint
   summarizer_max_tokens: 512       # default 512; summary output budget
+  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI): advisory logging only —
+  # logs what WOULD happen (would-summarize / would-drop) plus churn stats
+  # (compactions/session/hour, target < 1) without changing dispatch.
+  compaction_dry_run: false
 ```
 
 The config is validated at startup (`validate_compaction_config` in

@@ -553,6 +553,9 @@ server:
     llama_model: Qwen3
   summarizer_ctx_size: 8192
   summarizer_max_tokens: 512
+  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI): advisory logging only,
+  # zero dispatch behavior change; default false (live compaction).
+  compaction_dry_run: false
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
