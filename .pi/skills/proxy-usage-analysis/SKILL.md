@@ -126,13 +126,20 @@ Outputs written to:
   (error type × provider × model × count), and an
   **Upstream HTTP error breakdown by status** table (status × count ×
   provider breakdown),
-  **Local model utilization** (busy time %, idle time, streams served, avg
-  stream duration, total compute, avg/peak concurrency, hourly busy profile,
-  fast/cheap split — when the window has local traffic). The **hourly busy
-  profile** sub-table lists one row per hour of the report window (partial
-  first/last hours truncated to the window edges, idle hours included as
-  `0s`), each with a busy-% column — busy seconds ÷ window-bounded bucket
-  duration — plus a totals row with the overall busy % of the window, **Decode speed** and
+  **Summary by hour** (rendered at the top of the report, before the
+  Session summary and always — regardless of local traffic): one row per
+  hour of the report window (partial first/last hours truncated to the
+  window edges, idle hours included as `0s`) with busy time / busy-%
+  columns — busy seconds ÷ window-bounded bucket duration — plus three
+  per-session classification columns (Started local, completed local /
+  Started local, fell back / Started remote-only) counting the sessions
+  whose **first request** started in that hour, each cell as `n (pct%)` of
+  that hour's starts; a **Totals** row gives the window busy totals plus
+  the overall classification percentages (matching the Session summary
+  table), **Local model
+  utilization** (busy time %, idle time, streams served, avg
+  stream duration, total compute, avg/peak concurrency,
+  fast/cheap split — when the window has local traffic), **Decode speed** and
   **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
   eval-timing lines, split Total / Fast / Cheap), and highlighted
   recommendations. Percentages in the Total/Fast/Cheap columns are
@@ -198,12 +205,20 @@ run (`Previous outputs archived to …`).
    durations (slot-seconds), and peak concurrency comes from a sweep over
    interval endpoints. Busy seconds are attributed to hours and to
    fast/cheap periods (slot schedule) by splitting at hour and period
-   boundaries. The hourly sub-table ("Busy time by hour:") then renders one
-   row per hour of the report window — the first/last rows truncated to the
-   window edges and every hour listed even when idle — each with a busy-%
-   column (busy seconds ÷ window-bounded bucket duration) and a final totals
-   row matching the summary's `busy_seconds` / `window_seconds` busy %. The
-   bucket keys are hour-of-day, so windows longer than 24 hours that cover
+   boundaries. The top-of-report **Summary by hour** table
+   (LP-0MTFO210Q0044TTF) then renders one row per hour of the report window
+   — the first/last rows truncated to the window edges and every hour listed
+   even when idle — with a busy-% column (busy seconds ÷ window-bounded
+   bucket duration) plus the per-session classification columns: sessions
+   are counted once by the hour in which their **first request** started and
+   bucketed by journey (started local and completed local / started local
+   and fell back / started remote-only), each cell showing `n (pct%)` of
+   that hour's starts; a final totals row gives the window busy totals plus
+   the overall classification percentages (matching the Session summary
+   table). It renders regardless of local traffic (busy columns read `0s` /
+   `0.0%` when the window has no local streams; with no sessions a "No
+   data" note is shown). The bucket
+   keys are hour-of-day, so windows longer than 24 hours that cover
    the same hour twice would collide; the daily report (24h) never hits this
    (documented limitation). Streams whose start has no paired finish are counted in
    `unfinished_streams` **only when they started inside the window or within
@@ -294,10 +309,13 @@ run (`Previous outputs archived to …`).
 - **Local model utilization**: busy time is the share of the window with at
   least one local slot generating. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
-  fallback reasons), not that local is underprovisioned. The "Busy time by
-  hour:" sub-table shows per-hour busy % across exactly the report window
-  (idle hours included), so a glance at the hourly pattern shows when local
-  was saturated vs idle; the totals row gives the window-wide busy %. `context_too_large`
+  fallback reasons), not that local is underprovisioned. The **Summary by
+  hour** table at the top of the report shows per-hour busy % across exactly
+  the report window (idle hours included) alongside the per-session
+  classification of that hour's request starts (local-only / fell back /
+  remote-only), so a glance at the hourly pattern correlates demand with
+  provider usage and shows when local was saturated vs idle; the totals row
+  gives the window-wide busy % and the overall classification percentages. `context_too_large`
   is the largest lever: despite the legacy name (`warm_cache_bypass`) it
   fires when the *estimated context* exceeds the effective warm-cache
   threshold (the per-slot clamp,

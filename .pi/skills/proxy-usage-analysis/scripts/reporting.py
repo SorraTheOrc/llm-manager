@@ -316,6 +316,8 @@ def build_report(
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
 
+    _append_summary_by_hour(ap, summary)
+
     ap("")
     ap("## Session summary")
     ap("")
@@ -564,13 +566,129 @@ def _busy_cell(busy: float, window: float) -> str:
     return f"{_fmt_duration(busy)} ({busy / window * 100:.1f}%)" if window else f"{_fmt_duration(busy)}"
 
 
+SESSION_CLASSIFICATION_KEYS = ("local_only", "fell_back", "remote_only")
+
+
+def _session_classification(s: SessionStats) -> str:
+    """Journey classification of one session (``local_only`` / ``fell_back``
+    / ``remote_only``), matching the Session summary table's definitions:
+
+    - ``local_only`` — never used a remote provider (``remote_requests == 0``);
+    - ``fell_back`` — started local and moved to remote
+      (``remote_move_time`` set, LP-0MTFO210Q0044TTF: the session's journey
+      applies to the whole session regardless of when the fallback occurred);
+    - ``remote_only`` — never used local (``local_requests == 0`` and remote
+      traffic).
+
+    The three buckets are mutually exclusive and partition all sessions
+    (every session has at least one in-window ``Stream started``).
+    """
+    if s.remote_requests == 0:
+        return "local_only"
+    if s.fell_back:
+        return "fell_back"
+    return "remote_only"
+
+
+def _hourly_session_classification(sessions: list[SessionStats]) -> dict[int, Counter]:
+    """Session-classification counts keyed by the session's start hour.
+
+    Each session is counted once, in the hour of day in which its **first
+    request** (first in-window ``Stream started``) began; the count feeds the
+    Summary by hour table's three classification columns. Same hour-of-day
+    keying as ``BusyStats.hourly_busy``: windows longer than 24h that cover
+    the same hour twice would collide (daily reports never hit this).
+    """
+    by_hour: dict[int, Counter] = {}
+    for s in sessions:
+        by_hour.setdefault(s.start.hour, Counter())[_session_classification(s)] += 1
+    return by_hour
+
+
+def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
+    """Append the top-of-report ``## Summary by hour`` table.
+
+    One row per hour of the report window (window-bounded buckets, partial
+    first/last hours truncated to the window edges, idle hours listed as
+    ``0s``), with the busy time / busy-% columns of the former ``Busy time by
+    hour:`` sub-table plus three per-session-classification columns: the
+    sessions whose **first request** started in that hour, by journey
+    (started local and completed local / started local and fell back /
+    started remote-only), rendered in the Session summary's ``n (pct%)``
+    style where pct is of the sessions started in that hour
+    (LP-0MTFO210Q0044TTF). Always rendered — also when the window has no
+    local traffic (busy columns then read ``0s`` / ``0.0%``); with no session
+    data at all the body shows a ``No data`` note. Ends with a Totals row:
+    window busy totals plus the overall classification percentages (matching
+    the Session summary table).
+    """
+    sessions = list(summary.sessions.values())
+    by_hour = _hourly_session_classification(sessions)
+    hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
+    end = summary.window_end
+
+    ap("")
+    ap("## Summary by hour")
+    ap("")
+    ap("| Hour | Busy | % | Started local, completed local | Started local, fell back | Started remote-only |")
+    ap("|---|---|---|---|---|---|")
+    if not sessions:
+        ap("| _No session data in window._ | - | - | - | - | - |")
+    else:
+        # Window-bounded hour buckets (LP-0MSVMLM7G009N74N): one row per hour
+        # from window_start to window_end, with the first/last rows truncated
+        # to the window edges and idle hours listed as 0s. Busy seconds come
+        # from ``BusyStats.hourly_busy`` (hour-of-day -> seconds), which is
+        # already window-correct because intervals are clipped to the window
+        # before attribution; the % is busy / window-bounded bucket duration.
+        # Limitation: buckets are keyed by hour-of-day, so windows longer than
+        # 24h that cover the same hour twice would collide — out of scope for
+        # the daily report (``DEFAULT_HOURS = 24``).
+        cursor = summary.window_start
+        while cursor < end:
+            # The first bucket ends at the next full hour boundary (truncated
+            # to the window end for a partial last hour); subsequent cursors
+            # are already on the hour so +1h is the next bucket boundary.
+            bucket_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            bucket_end = min(bucket_end, end)
+            duration = (bucket_end - cursor).total_seconds()
+            seconds = hourly.get(cursor.hour, 0.0)
+            pct = (seconds / duration * 100.0) if duration else 0.0
+            counts = by_hour.get(cursor.hour, Counter())
+            started = sum(counts.values())
+            cells = [
+                f"{counts.get(key, 0)} ({_pct(counts.get(key, 0), started):.1f}%)"
+                for key in SESSION_CLASSIFICATION_KEYS
+            ]
+            ap(
+                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% | "
+                + " | ".join(cells)
+                + " |"
+            )
+            cursor = bucket_end
+
+    n = len(sessions)
+    local_only = sum(1 for s in sessions if _session_classification(s) == "local_only")
+    fell_back = sum(1 for s in sessions if _session_classification(s) == "fell_back")
+    remote_only = sum(1 for s in sessions if _session_classification(s) == "remote_only")
+    busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
+    busy_pct = summary.busy.busy_pct if summary.busy else 0.0
+    ap(
+        f"| Totals | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
+        f"{local_only} ({_pct(local_only, n):.1f}%) | "
+        f"{fell_back} ({_pct(fell_back, n):.1f}%) | "
+        f"{remote_only} ({_pct(remote_only, n):.1f}%) |"
+    )
+
+
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
     """Append the ``## Local model utilization`` section to the report.
 
     Covers busy/idle time over the window (union of active local streams,
-    clipped to the window), total compute (slot-seconds), concurrency, and
-    the fast/cheap + hourly busy profile. The section is omitted when the
-    window has no local traffic.
+    clipped to the window), total compute (slot-seconds), and concurrency.
+    The section is omitted when the window has no local traffic. (The
+    former hourly busy profile moved to the top of the report as the
+    ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
     """
     if summary.busy is None:
         return
@@ -595,39 +713,6 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
-    if b.hourly_busy:
-        ap("")
-        ap("Busy time by hour:")
-        ap("")
-        ap("| Hour | Busy | % |")
-        ap("|---|---|---|")
-        # Window-bounded hour buckets (LP-0MSVMLM7G009N74N): one row per hour
-        # from window_start to window_end, with the first/last rows truncated
-        # to the window edges and idle hours listed as 0s. Busy seconds come
-        # from ``BusyStats.hourly_busy`` (hour-of-day -> seconds), which is
-        # already window-correct because intervals are clipped to the window
-        # before attribution; the % is busy / window-bounded bucket duration.
-        # Limitation: buckets are keyed by hour-of-day, so windows longer than
-        # 24h that cover the same hour twice would collide — out of scope for
-        # the daily report (``DEFAULT_HOURS = 24``).
-        hourly = dict(b.hourly_busy)
-        cursor = summary.window_start
-        end = summary.window_end
-        while cursor < end:
-            # The first bucket ends at the next full hour boundary (truncated
-            # to the window end for a partial last hour); subsequent cursors
-            # are already on the hour so +1h is the next bucket boundary.
-            bucket_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-            bucket_end = min(bucket_end, end)
-            duration = (bucket_end - cursor).total_seconds()
-            seconds = hourly.get(cursor.hour, 0.0)
-            pct = (seconds / duration * 100.0) if duration else 0.0
-            ap(f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% |")
-            cursor = bucket_end
-        # Totals row: total busy time over the window and the overall busy %,
-        # matching the summary table's "Busy time" values
-        # (``busy_seconds`` / ``window_seconds``).
-        ap(f"| Totals | {_fmt_duration(b.busy_seconds)} | {b.busy_pct:.1f}% |")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
@@ -903,6 +988,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "local_only_sessions": local_only,
         "fallback_sessions": fell_back,
         "remote_only_sessions": remote_only,
+        "hourly_session_classification": _hourly_session_classification_json(sessions),
         "total_requests": total,
         "local_requests": summary.local_requests,
         "remote_requests": summary.remote_requests,
@@ -927,6 +1013,19 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
     }
+
+
+def _hourly_session_classification_json(sessions: list[SessionStats]) -> list[dict]:
+    """JSON-friendly per-hour session-classification counts (start hour)."""
+    return [
+        {
+            "hour": hour,
+            "local_only": counts["local_only"],
+            "fell_back": counts["fell_back"],
+            "remote_only": counts["remote_only"],
+        }
+        for hour, counts in sorted(_hourly_session_classification(sessions).items())
+    ]
 
 
 def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
