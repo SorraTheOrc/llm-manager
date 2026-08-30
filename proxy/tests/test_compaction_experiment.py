@@ -21,16 +21,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from run_compaction_experiment import (
-    ArmConfig,
-    ArmResult,
     CHEAP_CAP,
     CHEAP_STRATEGY,
-    CHEAP_TRIGGER,
     CHEAP_TARGET,
+    CHEAP_TRIGGER,
     FAST_CAP,
     FAST_STRATEGY,
-    FAST_TRIGGER,
     FAST_TARGET,
+    FAST_TRIGGER,
+    ArmConfig,
+    ArmResult,
     Mode,
     RequestRecord,
     Task,
@@ -56,7 +56,6 @@ from run_compaction_experiment import (
     score_response,
     write_results_jsonl,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -316,16 +315,18 @@ class TestCompactionTruncate:
     def test_scale_applied_to_estimate(self, conversation_20):
         msgs = conversation_20
         raw = _estimate_message_tokens_list(msgs)
-        # With scale=4.5, effective tokens should be ~4.5x larger
-        effective = raw * 4.5
-        # Result should trigger compaction if effective > target
+        # With scale=4.5, effective tokens are ~4.5x larger than the
+        # unscaled count (used for compaction/prefill accounting).
         result = _compact_truncate(
             msgs, target=FAST_TARGET, token_scale=4.5
         )
-        # The scaled count determines whether compaction fires
-        # Just verify it doesn't crash and produces valid output
-        if result is not None:
-            assert len(result) > 0
+        # The scaled count determines whether compaction fires:
+        # an unscaled budget under the target should NOT compact, while
+        # the 4.5x-scaled count exceeds it.
+        if raw * 4.5 > FAST_TARGET:
+            assert result is not None and len(result) < len(msgs)
+        else:
+            assert result is None or len(result) > 0
 
 
 class TestCompactionSummarize:

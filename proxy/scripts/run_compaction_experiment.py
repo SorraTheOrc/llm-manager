@@ -43,7 +43,7 @@ Deliverables written on successful run:
   - ``<output-dir>/run-<timestamp>.json``  — full machine-readable report
 
 This script is **eval-only** — no behaviour change, no dispatch.
-"""  # noqa: E501, EXE001
+"""
 
 from __future__ import annotations
 
@@ -51,7 +51,6 @@ import argparse
 import asyncio
 import csv
 import gzip
-import hashlib
 import json
 import math
 import re
@@ -59,11 +58,10 @@ import statistics
 import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 # ---------------------------------------------------------------------------
 # Constants (mirrors design doc §4 / F3/F4 thresholds)
@@ -419,8 +417,6 @@ def extract_tasks_from_logs(
     # single long session isn't reused across many tasks.
     transcript_index: dict[str, tuple[list[dict], str, datetime, int]] = {}
     if recordings_dir is not None:
-        from datetime import timezone as _tz
-
         for rec_dir in discover_recording_dirs(recordings_dir):
             messages, target = read_recording_session(rec_dir)
             if not messages or not target:
@@ -431,9 +427,9 @@ def extract_tasks_from_logs(
                     files[-1].name.split("-request.json")[0]
                 )
                 if latest.tzinfo is None:
-                    latest = latest.replace(tzinfo=_tz.utc)
+                    latest = latest.replace(tzinfo=datetime.UTC)
             except (Exception, IndexError):
-                latest = datetime.now(_tz.utc)
+                latest = datetime.now(datetime.UTC)
             # Recording timestamps are UTC-aware; routing samples are naive
             # local. Normalise both to a naive UTC-ish base for matching.
             raw_n = sum(
@@ -549,7 +545,6 @@ def _synthetic_transcript(estimated_tokens: int) -> tuple[list[dict], str]:
     }
     # Fill the estimated budget with topical detail turns (code/qa mix)
     target = int(estimated_tokens * 0.9)  # leave headroom
-    base_tokens = sum(_estimate_message_tokens(m) for m in (system, first_user, assistant))
     messages = [system, first_user, assistant]
     topics = [
         "refactor the caching layer to use a segmented LRU",
@@ -766,12 +761,9 @@ def _compact_truncate(
             break
 
     # Build compacted list: keep system + first user + recent turns
-    # Estimate token count per message (scaled to proxy/Qwen3 units)
     retained = messages[:first_user_idx + 1]  # system + first user
     recent = []
     for msg in reversed(messages[first_user_idx + 1:]):
-        # Approximate tokens (scaled)
-        msg_tokens = _estimate_message_tokens(msg) * token_scale
         if sum(_estimate_message_tokens(m) for m in retained + [msg] + recent) * token_scale <= target:
             recent.append(msg)
         else:
@@ -1230,7 +1222,6 @@ async def _execute_single_arm(
             # Measure TTFT (time to first token)
             ttft_start = time.monotonic()
             first_token_time = None
-            response_prefix = ""
 
             async with client.stream("POST", arm_cfg.endpoint + "/v1/chat/completions", json=body, headers=headers) as resp:
                 if resp.status_code >= 400:
@@ -1298,7 +1289,7 @@ async def _execute_single_arm(
                     compaction_strategy=strategy if compaction_success else None,
                 )
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return ArmResult(
             task_id=task.task_id,
             arm=arm_id,
@@ -1308,7 +1299,7 @@ async def _execute_single_arm(
             compaction_after=compaction_after,
             compaction_strategy=strategy if compaction_success else None,
         )
-    except Exception as exc:  # noqa: BLE001 - broad catch for arm errors
+    except Exception as exc:  # broad catch for arm errors
         return ArmResult(
             task_id=task.task_id,
             arm=arm_id,
@@ -1527,13 +1518,13 @@ def _extract_distinctive_terms(messages: list[dict]) -> list[str]:
         for m in ident_re.findall(str(content)):
             terms.add(m.lower())
     # Filter common words
-    COMMON = {
+    common = {
         "about", "after", "before", "being", "below", "between", "could",
         "current", "during", "using", "where", "which", "would", "should",
         "there", "these", "those", "their", "topic", "query", "based",
         "often", "given", "think", "thing", "stuff", "might", "maybe",
     }
-    return sorted(t for t in terms if t not in COMMON)[:20]
+    return sorted(t for t in terms if t not in common)[:20]
 
 
 # ---------------------------------------------------------------------------
@@ -1891,7 +1882,6 @@ def render_report_markdown(
     lines.append("")
 
     # Transcript source breakdown (data provenance)
-    from collections import Counter
     src_counts = Counter(t.transcript_src for t in results)
     if src_counts:
         lines.append("## Transcript sources")
@@ -1940,7 +1930,7 @@ def write_results_jsonl(results: list[TaskResult], path: Path) -> None:
 def read_results_jsonl(path: Path) -> list[TaskResult]:
     """Read results previously written by :func:`write_results_jsonl`."""
     results: list[TaskResult] = []
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
