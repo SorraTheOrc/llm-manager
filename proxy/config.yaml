@@ -520,6 +520,23 @@ server:
   # per-slot limit decode far slower than short sessions. 0 disables.
   context_pressure_warn_ratio: 0.8
 
+  # --- Session compaction config (LP-0MTG6RW3L003X122) ---
+  # Proxy-side proactive session compaction at prompt-assembly time.
+  # trigger_ratio: fires when est_tokens > ratio × per-slot threshold
+  #   (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K)
+  #   (cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K)
+  compaction_trigger_ratio: 0.70
+  # Summariser model: local llama.cpp model used for in-proxy summarisation.
+  # Reuses the existing Qwen3 model — no new model download required.
+  summarizer_model:
+    type: local
+    llama_model: Qwen3
+  # Summariser context size (tokens): sufficient for short summarisation prompt
+  # + middle turns; avoids unnecessary KV cache footprint.
+  summarizer_ctx_size: 8192
+  # Max output tokens for the summariser: concise summary budget.
+  summarizer_max_tokens: 512
+
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
   # routing threshold (local_model_ctx_size // slots - 4096 output headroom,

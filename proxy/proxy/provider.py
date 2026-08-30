@@ -613,6 +613,150 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
     return context_pressure_ratio(estimated_tokens, ctx_size, slots) >= ratio
 
 
+# ===================================================================
+# Compaction config — LP-0MTG6RW3L003X122
+# ===================================================================
+
+# Default compaction trigger ratio (0.70 × effective per-slot context).
+# Fires before the 0.8 context_pressure warn ratio, giving proactive
+# compaction rather than reactive warning.
+_DEFAULT_COMPACTION_TRIGGER_RATIO = 0.70
+
+# Default summarizer context size (tokens). 8192 is enough for a short
+# summarisation prompt + middle turns; avoids unnecessary KV cache footprint.
+_DEFAULT_SUMMARIZER_CTX_SIZE = 8192
+
+# Default summariser output budget (tokens). 512 tokens of summary text
+# is enough for a concise middle-turn condensation without wasting GPU.
+_DEFAULT_SUMMARIZER_MAX_TOKENS = 512
+
+# Dedicated system prompt for the proxy-side compaction summariser.
+# Keeps the summariser focused on content condensation, not creative writing.
+_SUMMARIZER_SYSTEM_PROMPT = (
+    "Summarise the middle portion of this conversation for context retention. "
+    "Preserve essential instructions, decisions, and key facts. "
+    "Omit routine back-and-forth, acknowledgments, and redundant context. "
+    "Write in a neutral, concise style suitable for feeding into a subsequent "
+    "LLM prompt. Do NOT include any preamble or closing remarks."
+)
+
+
+def compaction_config(config: dict) -> dict:
+    """Resolve the compaction configuration from the proxy config.
+
+    Reads from the nested ``server.compaction_*`` keys (or flat keys for
+    backward compatibility) and applies defaults where absent.
+
+    Args:
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        A dict with keys:
+            - trigger_ratio (float): Compaction trigger ratio.
+            - summarizer_model_type (str): "local" or "remote".
+            - summarizer_model_name (str): Model identifier (e.g. "Qwen3").
+            - summarizer_ctx_size (int): Context size for the summariser.
+            - summarizer_max_tokens (int): Max output tokens for summary.
+            - summarizer_system_prompt (str): Dedicated system prompt.
+    """
+    server = config.get("server", {})
+
+    # Trigger ratio
+    trigger_ratio = server.get("compaction_trigger_ratio")
+    if trigger_ratio is None:
+        trigger_ratio = config.get("compaction_trigger_ratio")
+    if trigger_ratio is None:
+        trigger_ratio = _DEFAULT_COMPACTION_TRIGGER_RATIO
+    try:
+        trigger_ratio = float(trigger_ratio)
+    except (ValueError, TypeError):
+        trigger_ratio = _DEFAULT_COMPACTION_TRIGGER_RATIO
+
+    # Summariser model
+    model_cfg = server.get("summarizer_model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    summarizer_model_type = model_cfg.get("type", "local")
+    summarizer_model_name = model_cfg.get("llama_model", "Qwen3")
+
+    # Summariser context size
+    ctx_size = server.get("summarizer_ctx_size")
+    if ctx_size is None:
+        ctx_size = _DEFAULT_SUMMARIZER_CTX_SIZE
+    try:
+        ctx_size = int(ctx_size)
+    except (ValueError, TypeError):
+        ctx_size = _DEFAULT_SUMMARIZER_CTX_SIZE
+
+    # Summariser max output tokens
+    max_tokens = server.get("summarizer_max_tokens")
+    if max_tokens is None:
+        max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
+    try:
+        max_tokens = int(max_tokens)
+    except (ValueError, TypeError):
+        max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
+
+    return {
+        "trigger_ratio": trigger_ratio,
+        "summarizer_model_type": summarizer_model_type,
+        "summarizer_model_name": summarizer_model_name,
+        "summarizer_ctx_size": ctx_size,
+        "summarizer_max_tokens": max_tokens,
+        "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
+    }
+
+
+def validate_compaction_config(config: dict) -> list[str]:
+    """Validate the compaction configuration at startup.
+
+    Checks that all required fields are present and within valid ranges.
+    Returns a list of problem strings (empty when config is valid).
+
+    Problem strings are prefixed with ``FATAL: `` when the server must not
+    start, or ``WARNING: `` when the config is questionable but salvageable.
+
+    Args:
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        List of problem strings (empty when config is valid).
+    """
+    problems: list[str] = []
+    cfg = compaction_config(config)
+
+    # trigger_ratio must be in [0, 1]
+    tr = cfg["trigger_ratio"]
+    if tr < 0 or tr > 1:
+        problems.append(
+            f"FATAL: compaction_trigger_ratio={tr!r} is outside "
+            "valid range [0.0, 1.0]"
+        )
+
+    # summarizer_model must have a llama_model name
+    model_name = cfg["summarizer_model_name"]
+    if not model_name or not isinstance(model_name, str):
+        problems.append(
+            "FATAL: summarizer_model.llama_model must be a non-empty string"
+        )
+
+    # summarizer_ctx_size must be positive
+    ctx_size = cfg["summarizer_ctx_size"]
+    if ctx_size <= 0:
+        problems.append(
+            f"FATAL: summarizer_ctx_size={ctx_size} must be positive"
+        )
+
+    # summarizer_max_tokens must be positive
+    max_tokens = cfg["summarizer_max_tokens"]
+    if max_tokens <= 0:
+        problems.append(
+            f"FATAL: summarizer_max_tokens={max_tokens} must be positive"
+        )
+
+    return problems
+
+
 # Output-token headroom reserved below the per-slot context when clamping
 # routing thresholds (LP-0MSAZXXDY005AWA1). Ensures prompts routed local
 # leave room for the model's completion tokens in the KV slot.

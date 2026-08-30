@@ -453,6 +453,8 @@ def load_config(config_path: str | None = None) -> dict:
     _validate_prompt_configs(cfg)
     # Validate chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5)
     _validate_chain_hold_config(cfg)
+    # Validate compaction configuration (LP-0MTG6RW3L003X122)
+    _validate_compaction_config(cfg)
 
     return cfg
 
@@ -469,6 +471,21 @@ def _validate_chain_hold_config(cfg: dict) -> None:
     problems = _vchc(cfg)
     if problems:
         raise ValueError("Chain-hold config validation failed: " + "; ".join(problems))
+
+
+def _validate_compaction_config(cfg: dict) -> None:
+    """Validate the compaction configuration (LP-0MTG6RW3L003X122).
+
+    Raises ValueError on FATAL problems at startup.
+    """
+    from proxy.provider import validate_compaction_config as _vcc
+
+    problems = _vcc(cfg)
+    fatal_problems = [p for p in problems if p.startswith("FATAL: ")]
+    if fatal_problems:
+        raise ValueError(
+            "Compaction config validation failed: " + "; ".join(fatal_problems)
+        )
 
 
 def _validate_prompt_configs(cfg: dict) -> None:

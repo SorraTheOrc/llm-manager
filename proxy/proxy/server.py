@@ -379,6 +379,26 @@ def _startup_validate_local_routing_config(config: dict) -> None:
         )
 
 
+def _startup_validate_compaction_config(config: dict) -> None:
+    """Validate the compaction configuration (LP-0MTG6RW3L003X122).
+
+    Logs a WARNING per problem by default; raises ValueError at startup when
+    a FATAL problem is detected.
+    """
+    from proxy.provider import validate_compaction_config
+
+    problems = validate_compaction_config(config)
+    for problem in problems:
+        if problem.startswith("FATAL: "):
+            logger.error("Compaction config validation FAILED: %s", problem)
+        else:
+            logger.warning("Compaction config validation: %s", problem)
+    if any(p.startswith("FATAL: ") for p in problems):
+        raise ValueError(
+            "Compaction config validation failed: " + "; ".join(problems)
+        )
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -389,6 +409,7 @@ def _startup_config_logging():
     config = load_config()
     logger = setup_logging(config)
     _startup_validate_local_routing_config(config)
+    _startup_validate_compaction_config(config)
 
     # Log resolved hard-routing caps for both modes (LP-0MTBOX45O005LD1S).
     # The caps are derived from per-mode ratios against the active per-slot

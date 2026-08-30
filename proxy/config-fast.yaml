@@ -499,6 +499,14 @@ server:
   # per-slot limit decode far slower than short sessions. 0 disables.
   context_pressure_warn_ratio: 0.8
 
+  # --- Session compaction config (LP-0MTG6RW3L003X122) ---
+  compaction_trigger_ratio: 0.70
+  summarizer_model:
+    type: local
+    llama_model: Qwen3
+  summarizer_ctx_size: 8192
+  summarizer_max_tokens: 512
+
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
   # routing threshold (local_model_ctx_size // slots - 4096 output headroom,

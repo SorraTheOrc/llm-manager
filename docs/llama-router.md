@@ -101,6 +101,32 @@ server:
 The warning names the session and the ratio so operators/agents can compact before
 decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
 
+## Session compaction config (LP-0MTG6RW3L003X122)
+
+Proxy-side proactive session compaction (parent LP-0MTCWE8NG003P0SD) needs a
+summariser and a configurable compaction trigger ratio. Both are read from the
+`server:` section of the config:
+
+```yaml
+server:
+  # Fires when est_tokens > ratio × effective per-slot threshold
+  # (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K;
+  #  cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K).
+  compaction_trigger_ratio: 0.70   # default 0.70; 0 disables
+  # Summariser model — reuses the existing local Qwen3 model, no new download.
+  summarizer_model:
+    type: local
+    llama_model: Qwen3
+  summarizer_ctx_size: 8192        # default 8192; summariser KV footprint
+  summarizer_max_tokens: 512       # default 512; summary output budget
+```
+
+The config is validated at startup (`validate_compaction_config` in
+`proxy/proxy/provider.py`, invoked from `proxy/proxy/utils.py` and
+`proxy/proxy/server.py`): an out-of-range trigger ratio, an explicitly empty
+`llama_model`, or non-positive ctx/max-token values fail startup with a clear
+error. See `proxy/tests/test_compaction_config.py`.
+
 ## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
 
 The smart-routing clamp (`_effective_large_context_thresholds` in
