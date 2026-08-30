@@ -271,6 +271,88 @@ def truncate_backstop(
     return result
 
 
+# Log levels for the canonical compaction event (LP-0MTGBP8DX003R5ZO).
+# Tidy compactions are INFO; anything that signals loss or escalation
+# (backstop drop, budget exhaustion, remote fallback) is WARNING so it is
+# never silent in operational monitoring.
+_WARNING_REASONS = frozenset(
+    {
+        "backstop_dropped",
+        "backstop_exhausted",
+        "compacted_over_budget",
+        "remote_with_guidance",
+    }
+)
+
+
+def log_compaction_event(
+    plan_result: dict[str, Any],
+    *,
+    session_id: str,
+    dry_run: bool = False,
+    logger_obj: logging.Logger | None = None,
+    estimate_tokens: TokenEstimator | None = None,
+) -> dict[str, Any] | None:
+    """Emit ONE structured log entry for a compaction event (AC1/AC2).
+
+    Every compaction event — summary path, backstop, dry-run advisory,
+    remote fallback — is logged with the full field set (no silent drops):
+
+    - session: Session ID (truncated per codebase convention)
+    - mode: "fast" | "cheap"
+    - action / reason: the plan decision
+    - pre_tokens / post_tokens: token estimates around the event
+    - turns_summarized / turns_dropped: turn accounting
+    - summary_tokens: summary length in the caller's token units
+    - dry_run: advisory mode flag (true/false)
+
+    Non-events (``action="noop"``) are NOT compaction events and emit
+    nothing unless ``dry_run`` is set (advisory mode projects them).
+
+    Args:
+        plan_result: A ``plan_session_compaction`` result dict.
+        session_id: The session ID associated with the event.
+        dry_run: Advisory (dry-run) mode flag.
+        logger_obj: Logger to emit on (defaults to this module's logger).
+        estimate_tokens: Estimator used to price the summary (defaults to
+            the module heuristic).
+
+    Returns:
+        The emitted field dict (None when nothing was logged). Callers
+        (e.g. the dry-run child) can collect the same structure for
+        churn statistics without re-parsing the log.
+    """
+    action = plan_result.get("action")
+    est = estimate_tokens or estimate_session_tokens
+    if action in (None, "noop") and not dry_run:
+        return None
+
+    summary_text = plan_result.get("summary_text")
+    summary_tokens = 0
+    if summary_text:
+        summary_tokens = int(est([{"role": _USER_ROLE, "content": summary_text}]) or 0)
+
+    fields: dict[str, Any] = {
+        "session": str(session_id)[:8],
+        "mode": plan_result.get("mode", "fast"),
+        "action": action,
+        "reason": plan_result.get("reason"),
+        "pre_tokens": int(plan_result.get("estimated_before", 0) or 0),
+        "post_tokens": int(plan_result.get("estimated_after", 0) or 0),
+        "turns_summarized": int(plan_result.get("turns_summarized", 0) or 0),
+        "turns_dropped": int(plan_result.get("backstop_dropped_turns", 0) or 0),
+        "summary_tokens": int(summary_tokens),
+        "dry_run": bool(dry_run),
+    }
+    line = "compaction_event " + " ".join(f"{k}={v}" for k, v in fields.items())
+    emit = logger_obj if logger_obj is not None else logger
+    if fields["reason"] in _WARNING_REASONS:
+        emit.warning(line)
+    else:
+        emit.info(line)
+    return fields
+
+
 def plan_session_compaction(
     messages: list[dict[str, Any]],
     config: dict,
