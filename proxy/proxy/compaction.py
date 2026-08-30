@@ -24,10 +24,14 @@ production routing estimator (``_estimate_prompt_tokens_for_routing``);
 unit tests inject deterministic estimators. Output is fully deterministic
 for a given input (AC7 — composes with slot save/restore).
 
-The backstop (drop oldest whole non-first turns when the compacted output
-still exceeds budget) and the structured churn/compaction logging are
-implemented by sibling children; this module reports
-``compacted_over_budget`` so the dispatcher can escalate.
+The backstop (``truncate_backstop``, LP-0MTGBOYJX006KVN8) is the logged
+safety net: when the summary path alone leaves the session over budget it
+drops the oldest whole recent turns; ``plan_session_compaction(backstop=True)``
+chains it automatically. When even the backstop cannot reach the budget it
+reports ``backstop_exhausted`` so the dispatcher can escalate to remote
+with guidance. Structured churn/compaction logging is the sibling logging
+child's scope; this module reports ``compacted_over_budget`` (or
+``backstop_*`` reasons) so the dispatcher can escalate.
 """
 from __future__ import annotations
 
@@ -169,12 +173,111 @@ def _summary_message(summary_text: str) -> dict[str, str]:
     }
 
 
+def truncate_backstop(
+    compacted_messages: list[dict[str, Any]],
+    target_tokens: int,
+    estimate_tokens: TokenEstimator | None = None,
+) -> dict[str, Any]:
+    """Drop the oldest whole recent turns until the estimate fits the target.
+
+    Safety-net backstop (LP-0MTGBOYJX006KVN8) for when summarization alone
+    leaves the session over budget. Operates on the compacted list produced
+    by ``plan_session_compaction``: everything through the summary marker
+    (system prompt + first user prompt + summary) is protected and never
+    dropped (AC2); the recent turns after the marker are dropped in whole
+    turn units, oldest first — never splitting a turn, never touching the
+    system/first-prompt region.
+
+    Only acts when the list is over budget (AC1): at/below the target the
+    input is returned untouched.
+
+    Args:
+        compacted_messages: The compacted message list (summary marker
+            required to define the droppable region).
+        target_tokens: The per-mode budget to restore.
+        estimate_tokens: Estimator over a full message list (defaults to
+            the module heuristic).
+
+    Returns:
+        A dict with:
+        - action: "noop" | "dropped" | "exhausted"
+        - messages: the resulting list (same object when noop)
+        - dropped_turns / dropped_messages: drop accounting
+        - estimated_before / estimated_after: token estimates
+        - remaining_budget: target - estimated_after (< 0 when exhausted)
+    """
+    est = estimate_tokens or estimate_session_tokens
+    estimated_before = est(compacted_messages)
+    result: dict[str, Any] = {
+        "action": "noop",
+        "messages": compacted_messages,
+        "dropped_turns": 0,
+        "dropped_messages": 0,
+        "estimated_before": estimated_before,
+        "estimated_after": estimated_before,
+        "remaining_budget": target_tokens - estimated_before,
+    }
+    if estimated_before <= target_tokens:
+        return result
+
+    summary_idx = next(
+        (
+            i
+            for i, m in enumerate(compacted_messages)
+            if isinstance(m.get("content"), str)
+            and m["content"].startswith(_SUMMARY_MARKER)
+        ),
+        None,
+    )
+    if summary_idx is None:
+        # No compaction marker → no defined droppable region; never touch
+        # the input (defensive; wired only onto plan output).
+        result["action"] = "exhausted"
+        return result
+
+    protected = compacted_messages[: summary_idx + 1]
+    region = list(compacted_messages[summary_idx + 1 :])
+    turns = pair_turns(region)
+    dropped_turns = 0
+    estimated = estimated_before
+    while estimated > target_tokens and turns:
+        turn = turns.pop(0)  # oldest whole turn
+        region = region[len(turn) :]
+        turns = pair_turns(region)
+        dropped_turns += 1
+        estimated = est(protected + region)
+
+    action = "dropped" if dropped_turns and estimated <= target_tokens else "exhausted"
+    result.update(
+        action=action,
+        messages=protected + region,
+        dropped_turns=dropped_turns,
+        dropped_messages=len(compacted_messages) - len(protected + region),
+        estimated_after=estimated,
+        remaining_budget=target_tokens - estimated,
+    )
+    if action != "noop":
+        logger.warning(
+            "compaction_backstop action=%s dropped_turns=%d dropped_messages=%d "
+            "estimated_before=%d estimated_after=%d target=%d remaining_budget=%d",
+            action,
+            dropped_turns,
+            result["dropped_messages"],
+            estimated_before,
+            estimated,
+            target_tokens,
+            result["remaining_budget"],
+        )
+    return result
+
+
 def plan_session_compaction(
     messages: list[dict[str, Any]],
     config: dict,
     mode: str = "fast",
     summarizer: Summarizer | None = None,
     estimate_tokens: TokenEstimator | None = None,
+    backstop: bool = False,
 ) -> dict[str, Any]:
     """Plan and produce the compacted message list for a session.
 
@@ -200,6 +303,10 @@ def plan_session_compaction(
             the summarizer as unavailable (non-compactable).
         estimate_tokens: Estimator over a full message list; defaults to
             the module heuristic (production passes the routing estimator).
+        backstop: When True, chain ``truncate_backstop`` when the summary
+            path alone still leaves the session over budget: the oldest
+            whole recent turns are dropped and the reason becomes
+            ``backstop_dropped`` / ``backstop_exhausted``.
 
     Returns:
         A dict with the compaction decision:
@@ -303,4 +410,15 @@ def plan_session_compaction(
         estimated_after=estimated_after,
         reason="compacted_over_budget" if over_budget else "compacted_within_target",
     )
+    if backstop and result["reason"] == "compacted_over_budget":
+        back = truncate_backstop(result["messages"], target, est)
+        result["messages"] = back["messages"]
+        result["estimated_after"] = back["estimated_after"]
+        result["backstop_dropped_turns"] = back["dropped_turns"]
+        result["backstop_dropped_messages"] = back["dropped_messages"]
+        result["remaining_budget"] = back["remaining_budget"]
+        if back["action"] == "dropped":
+            result["reason"] = "backstop_dropped"
+        else:
+            result["reason"] = "backstop_exhausted"
     return result
