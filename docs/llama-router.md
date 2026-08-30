@@ -119,11 +119,22 @@ server:
     llama_model: Qwen3
   summarizer_ctx_size: 8192        # default 8192; summariser KV footprint
   summarizer_max_tokens: 512       # default 512; summary output budget
-  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI): advisory logging only —
-  # logs what WOULD happen (would-summarize / would-drop) plus churn stats
-  # (compactions/session/hour, target < 1) without changing dispatch.
-  compaction_dry_run: false
+  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
+  # advisory logging only, zero dispatch change. TRUE until the AC8
+  # enforcement gate passes (experiment LP-0MSG9PUHU0059TTZ bar + client-side
+  # compaction review); flip to false to enable live enforcement.
+  compaction_dry_run: true
 ```
+
+The proxy evaluates the session history at prompt-assembly time
+(`_evaluate_session_compaction` in `proxy/proxy/router_helpers.py`, wired
+into `_handle_session`). In dry-run it logs what WOULD happen
+(would-summarize / would-drop) plus churn stats (< 1 compaction/session/hour)
+without touching the request; in live mode (`compaction_dry_run: false`) an
+over-trigger session is summarized (strategy: system + first prompt retained
+verbatim, middle folded, newest whole turns kept ≤ target), the dispatch body
+is replaced with the compacted full history, and `remote_with_guidance`
+enforces non-compactable sessions never reach local near-full-slot.
 
 The config is validated at startup (`validate_compaction_config` in
 `proxy/proxy/provider.py`, invoked from `proxy/proxy/utils.py` and

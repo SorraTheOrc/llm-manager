@@ -536,10 +536,11 @@ server:
   summarizer_ctx_size: 8192
   # Max output tokens for the summariser: concise summary budget.
   summarizer_max_tokens: 512
-  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI): when true, the proxy
-  # logs what WOULD happen (would-summarize / would-drop) and churn stats
-  # WITHOUT changing dispatch. Default false (live compaction).
-  compaction_dry_run: false
+  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
+  # advisory logging only, zero dispatch change. TRUE until the AC8
+  # enforcement gate passes (experiment bar + client-side compaction
+  # review); flip to false to enable live enforcement.
+  compaction_dry_run: true
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context

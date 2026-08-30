@@ -1604,6 +1604,82 @@ def _normalize_outgoing_headers(
 # Session handling helper
 # ===================================================================
 
+
+def _evaluate_session_compaction(
+    srv,
+    session_id: str,
+    session_messages: list,
+    mode: str,
+    summarizer=None,
+    estimate_tokens=None,
+    churn_collector=None,
+    logger_obj=None,
+) -> dict:
+    """Prompt-assembly-time compaction decision for a session (integration).
+
+    Parent LP-0MTCWE8NG003P0SD: proactive session compaction at
+    prompt-assembly / session-persistence time. Wires the pure decision
+    (``decide_session_compaction``) to the router's session machinery:
+
+    - Warn-only dry-run (default, AC8 gate not passed): returns
+      ``applied=False`` and the ORIGINAL list — the persistence layer
+      stores exactly what it would have stored before. Advisory log +
+      churn only.
+    - Live (opt-in ``compaction_dry_run: false``): when the session
+      exceeds the trigger and is compactable, returns ``applied=True``
+      with the COMPACTED history for the caller to persist; the slot/KV
+      is invalidated by the caller so the next request re-prefills
+      cleanly from the compacted history.
+    - ``remote_with_guidance``: returns ``applied=False`` and the reason;
+      the dispatcher must route remote with guidance rather than dispatch
+      local near-full-slot.
+
+    Fail-open: any exception falls back to the untouched plan (original
+    messages, ``applied=False``) and logs a warning — compaction must
+    never break dispatch.
+
+    Args:
+        srv: Server object (config at ``srv.config``).
+        session_id: The session being assembled.
+        session_messages: The full session message list.
+        mode: "fast" or "cheap" (from ``proxy.mode.read_mode``).
+        summarizer: Production summarizer callable (see compaction module).
+        estimate_tokens: Production routing estimator.
+
+    Returns:
+        The ``decide_session_compaction`` result (always includes
+        ``messages``, ``applied``, ``dry_run``).
+    """
+    try:
+        from proxy.compaction import decide_session_compaction
+
+        server_config = getattr(srv, "config", {}).get("server", {})
+        return decide_session_compaction(
+            session_messages,
+            server_config,
+            mode,
+            summarizer=summarizer,
+            estimate_tokens=estimate_tokens,
+            session_id=session_id or "",
+            churn_collector=churn_collector,
+            logger_obj=logger_obj,
+        )
+    except Exception:
+        getattr(getattr(srv, "logger", None), "warning", lambda *a, **k: None)(
+            "Session compaction evaluation failed; dispatching untouched "
+            "(session=%s)",
+            (session_id or "")[:8],
+            exc_info=True,
+        )
+        return {
+            "action": "noop",
+            "applied": False,
+            "dry_run": True,
+            "messages": session_messages,
+            "reason": "evaluation_failed",
+        }
+
+
 async def _handle_session(
     srv,
     body_json: dict,
@@ -1716,6 +1792,60 @@ async def _handle_session(
                     )
             elif session_created:
                 result["session_fallback_reason"] = "no_existing_history"
+
+            # Proactive session compaction at prompt-assembly time
+            # (LP-0MTCWE8NG003P0SD / LP-0MTGBQ01A000ZFT9 wiring). Evaluates
+            # the persistent history this request produces. Warn-only
+            # dry-run (default, AC8 gate pending) logs advisories only —
+            # zero dispatch change. Opt-in live enforcement rewrites the
+            # dispatch body to the compacted full history and marks the
+            # request full-prompt so forward + persistence stay consistent.
+            try:
+                from proxy.mode import read_mode as _read_mode
+
+                _compaction = _evaluate_session_compaction(
+                    srv,
+                    result["session_id"],
+                    list(getattr(session, "messages", None) or body_json.get("messages", [])),
+                    _read_mode(),
+                )
+                if (
+                    _compaction.get("action") == "compact"
+                    and _compaction.get("applied")
+                    and not _compaction.get("dry_run")
+                ):
+                    # Live: dispatch the compacted history as a full prompt
+                    # (its prefix no longer matches the client's history).
+                    body_json["messages"] = list(_compaction["messages"])
+                    body_json["cache_prompt"] = True
+                    body_json["session_id"] = result["session_id"]
+                    result["body_override"] = json.dumps(body_json).encode("utf-8")
+                    result["is_delta_request"] = False
+                    result["delta_messages"] = None
+                    result["compaction_applied"] = True
+                    srv.logger.info(
+                        "session_compaction applied session=%s mode=%s "
+                        "est_before=%d est_after=%d",
+                        result["session_id"][:8],
+                        _compaction.get("mode"),
+                        _compaction.get("estimated_before", 0),
+                        _compaction.get("estimated_after", 0),
+                    )
+                elif (
+                    _compaction.get("action") == "remote_with_guidance"
+                    and not _compaction.get("dry_run")
+                ):
+                    # Never dispatch local near-full-slot when the session
+                    # cannot be compacted; the dispatcher must escalate
+                    # remote WITH guidance.
+                    result["compaction_remote_with_guidance"] = True
+            except Exception:
+                srv.logger.warning(
+                    "Compaction evaluation failed; continuing unchanged "
+                    "(session=%s)",
+                    str(result.get("session_id") or "")[:8],
+                    exc_info=True,
+                )
 
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True

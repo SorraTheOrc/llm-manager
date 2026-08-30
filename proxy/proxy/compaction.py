@@ -349,7 +349,9 @@ def log_compaction_event(
     }
     line = "compaction_event " + " ".join(f"{k}={v}" for k, v in fields.items())
     emit = logger_obj if logger_obj is not None else logger
-    if fields["reason"] in _WARNING_REASONS:
+    if fields["action"] == "remote_with_guidance" or (
+        fields["reason"] in _WARNING_REASONS
+    ):
         emit.warning(line)
     else:
         emit.info(line)
@@ -480,6 +482,89 @@ def run_dry_run_plan(
         logger_obj=logger_obj,
         estimate_tokens=estimate_tokens,
     )
+    return plan
+
+
+def decide_session_compaction(
+    messages: list[dict[str, Any]],
+    config: dict,
+    mode: str = "fast",
+    summarizer: Summarizer | None = None,
+    estimate_tokens: TokenEstimator | None = None,
+    session_id: str = "",
+    dry_run: bool | None = None,
+    churn_collector: CompactionChurnCollector | None = None,
+    logger_obj: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Full prompt-assembly-time dispatch decision (integration child).
+
+    End-to-end flow (parent LP-0MTCWE8NG003P0SD test matrix):
+
+    1. Trigger check via ``plan_session_compaction`` (fires when the
+       session estimate exceeds the per-mode trigger; 0 disables).
+    2. *Dry-run mode* (``compaction_dry_run`` config, default): log the
+       advisory event (would-summarize / would-drop) + record churn,
+       apply NOTHING — ``messages`` stays the exact same list object
+       (AC3/AC8: zero dispatch change in warn-only phase).
+    3. *Live mode* (opt-in): summarize + backstop the session history,
+       emit the structured event + churn, and hand the dispatcher the
+       compacted ``messages``. ``remote_with_guidance`` means the session
+       cannot be compacted — the dispatcher must route remote WITH
+       guidance, never near-full-slot local, never silently.
+
+    Args:
+        messages: The session's message history (to be dispatched).
+        config: Proxy configuration (flat or nested ``server`` dict).
+        mode: "fast" (≤38K target) or "cheap" (≤30K target).
+        summarizer: Callable(middle_messages) -> summary text; None marks
+            the summarizer unavailable (non-compactable).
+        estimate_tokens: Estimator over a full message list (production
+            passes the routing estimator).
+        session_id: Session ID for this decision.
+        dry_run: Override the config flag (None = read config).
+        churn_collector: Optional collector for <1/session/hour telemetry.
+        logger_obj: Logger for the structured event (defaults to module
+            logger).
+
+    Returns:
+        The plan dict plus two dispatch fields:
+
+        - ``dry_run``: whether advisory mode was in effect.
+        - ``applied``: True only when ``messages`` has been compacted and
+          the dispatcher MUST use the compacted history (live mode,
+          action == "compact"). Never True in dry-run or for
+          ``remote_with_guidance``/``noop``.
+    """
+    dry_run = is_compaction_dry_run(config) if dry_run is None else dry_run
+
+    if dry_run:
+        # Warn-only advisory: log what WOULD happen, never apply.
+        plan = run_dry_run_plan(
+            messages, config, mode,
+            summarizer=summarizer, estimate_tokens=estimate_tokens,
+            session_id=session_id, logger_obj=logger_obj,
+        )
+        plan["dry_run"] = True
+        plan["applied"] = False
+        plan["messages"] = messages
+        if churn_collector is not None and plan["action"] != "noop":
+            churn_collector.record(session_id)
+        return plan
+
+    # Live enforcement path (opt-in after the AC8 experiment gate).
+    plan = plan_session_compaction(
+        messages, config, mode,
+        summarizer=summarizer, estimate_tokens=estimate_tokens,
+        backstop=True,
+    )
+    log_compaction_event(
+        plan, session_id=session_id, dry_run=False,
+        logger_obj=logger_obj, estimate_tokens=estimate_tokens,
+    )
+    if churn_collector is not None and plan["action"] != "noop":
+        churn_collector.record(session_id)
+    plan["dry_run"] = False
+    plan["applied"] = plan["action"] == "compact"
     return plan
 
 
