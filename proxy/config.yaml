@@ -56,6 +56,16 @@
 #                         model: deepseek-v4-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
 #
+# Responses-API mode (optional, remote providers only):
+#   api - "openai-completions" (default) or "openai-responses". Some
+#        upstreams (opencode.ai zen/go for the muse model family) expose
+#        only the OpenAI Responses API (/v1/responses) and return HTTP 500
+#        on /v1/chat/completions. Setting api: openai-responses makes the
+#        proxy route the request to /v1/responses and translate between the
+#        chat/completions and Responses wire formats (request bodies,
+#        streaming SSE, non-streaming JSON) transparently for the client
+#        (LP-0MTGK5DQO001Y8H0). omit the field for the default behavior.
+#
 # Example with providers list:
 #   mimo-v2.5:
 #     providers:
@@ -188,6 +198,14 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      - name: opencode-zen-muse-free
+        type: remote
+        provider: opencode-zen
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
+        forward_session_headers: false
       - name: opencode-go-3-deepseek
         type: remote
         provider: opencode-go

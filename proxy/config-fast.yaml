@@ -180,6 +180,14 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      - name: opencode-zen-muse-free
+        type: remote
+        provider: opencode-zen
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
+        forward_session_headers: false
       - name: opencode-go-3-deepseek
         type: remote
         provider: opencode-go

@@ -282,6 +282,279 @@ def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# OpenAI Responses API translation (LP-0MTGK5DQO001Y8H0)
+# ---------------------------------------------------------------------------
+#
+# Some remote providers (opencode.ai zen/go for the muse model family) expose
+# ONLY the Responses API (``/v1/responses``). Chat-completions requests to
+# those models return HTTP 500, so the proxy translates between the two wire
+# formats:
+#
+#   - Request: chat/completions body --messages--> ``input`` items,
+#     ``max_tokens`` --> ``max_output_tokens``, tool-role messages -->
+#     ``function_call_output`` items, assistant ``tool_calls`` -->
+#     ``function_call`` items.
+#   - Streaming response: Responses SSE events (``response.output_text.delta``,
+#     ``response.function_call_arguments.delta``, ``response.completed``) are
+#     converted into chat/completions SSE chunks so the existing proxy
+#     fallback/watchdog/retry machinery keeps working unchanged.
+#   - Non-streaming response: Responses JSON (``output[]``, ``usage``) is
+#     mapped to the chat/completions JSON shape.
+#
+# Enable per-provider with ``api: openai-responses`` on the remote provider
+# config entry. See proxy/docs/routing.md and proxy/config.yaml.
+# ---------------------------------------------------------------------------
+
+
+def _translate_chat_to_responses(body_json: dict) -> dict:
+    """Translate a chat/completions request body to the Responses API format.
+
+    Mapping (best-effort):
+
+      - ``messages`` -> ``input``; system/user/assistant roles pass through;
+        ``tool`` role becomes ``{type: function_call_output}``; assistant
+        ``tool_calls`` become ``{type: function_call}`` items.
+      - ``max_tokens`` / ``max_completion_tokens`` -> ``max_output_tokens``.
+      - ``reasoning_effort`` -> ``reasoning.effort`` (Responses shape).
+      - Streaming/tools/temperature/top_p/stop pass through unchanged.
+
+    Unsupported chat-only keys (store, stream_options, n, ...) are dropped;
+    the upstream sanitizer already strips most of them before this runs.
+    """
+    if not isinstance(body_json, dict):
+        return body_json
+
+    out: dict[str, Any] = {}
+    if body_json.get("model"):
+        out["model"] = body_json["model"]
+
+    messages = body_json.get("messages")
+    if isinstance(messages, list):
+        input_items: list[Any] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                input_items.append(msg)
+                continue
+            role = msg.get("role")
+            if role == "tool":
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id") or "",
+                    "output": msg.get("content") if isinstance(msg.get("content"), str) else json.dumps(msg.get("content")),
+                })
+            elif role == "assistant" and isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls"):
+                # Assistant tool-call turn: keep content (if any) then emit
+                # one function_call item per tool call.
+                content = msg.get("content")
+                if content:
+                    input_items.append({"role": "assistant", "content": content})
+                for tc in msg["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id") or "",
+                        "name": fn.get("name") or "",
+                        "arguments": fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {}),
+                    })
+            else:
+                input_items.append(msg)
+        out["input"] = input_items
+
+    if body_json.get("max_tokens") is not None:
+        out["max_output_tokens"] = body_json["max_tokens"]
+    elif body_json.get("max_completion_tokens") is not None:
+        out["max_output_tokens"] = body_json["max_completion_tokens"]
+
+    for key in ("stream", "temperature", "top_p", "stop", "tools", "tool_choice"):
+        if body_json.get(key) is not None:
+            out[key] = body_json[key]
+
+    if body_json.get("reasoning_effort"):
+        out["reasoning"] = {"effort": body_json["reasoning_effort"]}
+
+    return out
+
+
+def _translate_responses_to_chat(resp_json: dict) -> dict:
+    """Translate a non-streaming Responses API JSON body to chat/completions shape.
+
+    Mapping:
+      - ``output[].message.content[].text`` -> ``choices[0].message.content``
+        (concatenated over the message body).
+      - ``output[].function_call`` -> ``choices[0].message.tool_calls``.
+      - ``usage.{input,output,total}_tokens`` -> ``usage.{prompt,completion,total}_tokens``.
+      - ``status`` -> ``finish_reason`` (completed->stop, incomplete->length,
+        failed->error; tool-call output -> tool_calls).
+
+    Reasoning items (which carry ``encrypted_content`` on zen/go) are dropped;
+    they are not usable as assistant reasoning_content anyway.
+    """
+    if not isinstance(resp_json, dict):
+        return resp_json
+
+    output = resp_json.get("output") or []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "message":
+            content = item.get("content") or []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    t = part.get("text")
+                    if isinstance(t, str):
+                        text_parts.append(t)
+        elif itype == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or "",
+                "type": "function",
+                "function": {
+                    "name": item.get("name") or "",
+                    "arguments": item.get("arguments") if isinstance(item.get("arguments"), str) else json.dumps(item.get("arguments") or {}),
+                },
+            })
+
+    status = resp_json.get("status")
+    if tool_calls:
+        finish_reason = "tool_calls"
+    elif status == "incomplete":
+        finish_reason = "length"
+    elif status == "failed":
+        finish_reason = "error"
+    else:
+        finish_reason = "stop"
+
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    usage = resp_json.get("usage") or {}
+    return {
+        "id": resp_json.get("id") or "resp-unknown",
+        "object": "chat.completion",
+        "created": resp_json.get("created_at"),
+        "model": resp_json.get("model"),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
+
+
+def _sse_chat_completion_chunk(delta: dict, finish_reason: str | None = None) -> bytes:
+    """Serialize one chat/completions SSE ``data:`` chunk as bytes."""
+    choice: dict[str, Any] = {"index": 0, "delta": delta}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    return f"data: {json.dumps({'choices': [choice]})}\n\n".encode()
+
+
+async def _translate_responses_stream(aiter) -> Any:
+    """Wrap a Responses API SSE byte iterator, yielding chat/completions SSE chunks.
+
+    Consumes ``response.output_text.delta`` (-> content delta), function-call
+    item add / ``function_call_arguments.delta`` (-> tool_calls deltas), and
+    ``response.completed`` (-> finish chunk + ``[DONE]``). All other events
+    (created, in_progress, reasoning items, ping, ...) are skipped. The
+    ``response.failed`` event yields a ``finish_reason: error`` chunk so the
+    proxy fallback chain can route to the next provider.
+    """
+    buffer = b""
+    # Track emitted tool-call index by responses output_index so argument
+    # deltas accumulate onto the right tool_call delta chunk.
+    _tool_index_by_output: dict[int, int] = {}
+    _next_tool_index = 0
+    _stream_saw_tool_calls = False
+    _stream_status = "in_progress"
+
+    async def _feed(chunk: bytes):
+        nonlocal buffer
+        buffer += chunk
+
+    async def _process_events():
+        nonlocal buffer, _next_tool_index, _stream_saw_tool_calls, _stream_status
+        while b"\n\n" in buffer:
+            event_block, buffer = buffer.split(b"\n\n", 1)
+            event_block = event_block.strip()
+            if not event_block:
+                continue
+            event_type = None
+            data_str = None
+            for line in event_block.split(b"\n"):
+                line = line.strip()
+                if line.startswith(b"event:"):
+                    event_type = line[6:].strip().decode("utf-8", errors="replace")
+                elif line.startswith(b"data:"):
+                    data_str = line[5:].strip()
+            if event_type is None or data_str is None:
+                continue
+            try:
+                data = json.loads(data_str.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            if event_type == "response.output_text.delta":
+                delta = data.get("delta")
+                if isinstance(delta, str) and delta:
+                    yield _sse_chat_completion_chunk({"content": delta})
+            elif event_type == "response.output_item.added":
+                item = data.get("item") or {}
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    output_index = data.get("output_index")
+                    _tool_index_by_output[output_index] = _next_tool_index
+                    _next_tool_index += 1
+                    _stream_saw_tool_calls = True
+                    fn = {"name": item.get("name") or "", "arguments": ""}
+                    yield _sse_chat_completion_chunk({
+                        "tool_calls": [{
+                            "index": _tool_index_by_output[output_index],
+                            "id": item.get("id") or item.get("call_id") or "",
+                            "type": "function",
+                            "function": fn,
+                        }]
+                    })
+            elif event_type == "response.function_call_arguments.delta":
+                output_index = data.get("output_index")
+                tool_idx = _tool_index_by_output.get(output_index)
+                if tool_idx is not None:
+                    delta_args = data.get("delta")
+                    if isinstance(delta_args, str) and delta_args:
+                        yield _sse_chat_completion_chunk({
+                            "tool_calls": [{"index": tool_idx, "function": {"arguments": delta_args}}]
+                        })
+            elif event_type == "response.completed":
+                resp_obj = data.get("response") or {}
+                _stream_status = resp_obj.get("status") or "completed"
+                if _stream_saw_tool_calls:
+                    yield _sse_chat_completion_chunk({}, finish_reason="tool_calls")
+                elif _stream_status == "incomplete":
+                    yield _sse_chat_completion_chunk({}, finish_reason="length")
+                else:
+                    yield _sse_chat_completion_chunk({}, finish_reason="stop")
+                yield b"data: [DONE]\n\n"
+            elif event_type == "response.failed":
+                yield _sse_chat_completion_chunk({}, finish_reason="error")
+                yield b"data: [DONE]\n\n"
+            # All other events -> skipped
+
+    async for chunk in aiter:
+        await _feed(chunk)
+        async for out in _process_events():
+            yield out
+    # Stream ended without a terminal event: flush any trailing partial block
+    # (unlikely for a well-formed stream) and stop.
+    return
+
+
 async def proxy_to_remote(
     request: Request,
     path: str,
@@ -289,6 +562,15 @@ async def proxy_to_remote(
 ) -> Response:
     """Proxy request to remote API endpoint."""
     endpoint = model_config.get("endpoint", "")
+
+    # Responses-API mode (LP-0MTGK5DQO001Y8H0): providers configured with
+    # ``api: openai-responses`` expose only /v1/responses. Route to the
+    # responses path and translate the body/response between the two wire
+    # formats.
+    responses_mode = model_config.get("api") == "openai-responses"
+    if responses_mode and str(path).endswith("chat/completions"):
+        path = str(path)[: -len("chat/completions")] + "responses"
+
     target_url = f"{endpoint}/{path}"
 
     # Get request body
@@ -352,15 +634,24 @@ async def proxy_to_remote(
     if not isinstance(body_json, dict):
         body_json = {}
 
-    # Sanitize request-shape for remote compatibility before model override.
-    body_json = _sanitize_remote_chat_payload(path, body_json)
+    if responses_mode:
+        # Keep the chat-format tool-call repair (it runs on the inbound chat
+        # messages), then translate the whole body to the Responses API shape.
+        if isinstance(body_json.get("messages"), list):
+            body_json["messages"] = _sanitize_remote_messages(body_json["messages"])
+        body_json = _translate_chat_to_responses(body_json)
+        # The upstream must receive the translated (responses-shaped) body.
+        body = json.dumps(body_json).encode("utf-8")
+    else:
+        # Sanitize request-shape for remote compatibility before model override.
+        body_json = _sanitize_remote_chat_payload(path, body_json)
 
-    # Sanitize accumulated tool-call/tool-result message history before remote
-    # sends (LP-0MSC1BNP90017L9K): remote providers reject malformed tool-call
-    # sequences with HTTP 400 (missing/dangling tool_call_id, missing id/type,
-    # empty tool_calls). Always-on; repairs where unambiguous, prunes otherwise.
-    if isinstance(body_json.get("messages"), list):
-        body_json["messages"] = _sanitize_remote_messages(body_json["messages"])
+        # Sanitize accumulated tool-call/tool-result message history before remote
+        # sends (LP-0MSC1BNP90017L9K): remote providers reject malformed tool-call
+        # sequences with HTTP 400 (missing/dangling tool_call_id, missing id/type,
+        # empty tool_calls). Always-on; repairs where unambiguous, prunes otherwise.
+        if isinstance(body_json.get("messages"), list):
+            body_json["messages"] = _sanitize_remote_messages(body_json["messages"])
 
     # Override model name in body if provider config specifies an upstream model ID.
     # This allows the proxy to present a different model name to the remote API
@@ -473,6 +764,7 @@ async def proxy_to_remote(
                 upstream_idle_timeout_seconds=_upstream_idle_timeout,
                 upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
                 pool_client=_pool_client,
+                responses_mode=responses_mode,
             )
         return await _handle_remote_streaming(
             request, target_url, headers, body, body_json,
@@ -483,6 +775,7 @@ async def proxy_to_remote(
             upstream_idle_timeout_seconds=_upstream_idle_timeout,
             upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
             pool_client=_pool_client,
+            responses_mode=responses_mode,
         )
     else:
         if _remote_session_id:
@@ -491,11 +784,13 @@ async def proxy_to_remote(
                 resolved_model=_resolved_model_header,
                 session_id=_remote_session_id,
                 pool_client=_pool_client,
+                responses_mode=responses_mode,
             )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
             resolved_model=_resolved_model_header,
             pool_client=_pool_client,
+            responses_mode=responses_mode,
         )
 
 
@@ -608,8 +903,16 @@ async def _handle_remote_streaming(
     upstream_max_stream_duration_seconds: float | None = None,
     upstream_activity_timeout_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
+    responses_mode: bool = False,
 ) -> Response:
     """Handle streaming remote proxy request with upstream stall detection and retry.
+
+    When ``responses_mode`` is True (``api: openai-responses`` provider), the
+    upstream emits Responses API SSE events; the byte iterator is wrapped with
+    :func:`_translate_responses_stream` so the events surface as chat/completions
+    SSE (content/tool_calls deltas, finish chunk, [DONE]) and every fallback/
+    watchdog/retry mechanism below keeps working unchanged (LP-0MTGK5DQO001Y8H0).
+
 
     Features:
     - Per-chunk idle timeout: detects upstream silence within
@@ -1087,7 +1390,8 @@ async def _handle_remote_streaming(
             _disconnect_check_count = 0
 
             try:
-                _aiter = _current_response.aiter_bytes().__aiter__()
+                _raw_aiter = _current_response.aiter_bytes().__aiter__()
+                _aiter = _translate_responses_stream(_raw_aiter) if responses_mode else _raw_aiter
                 while True:
                     # Watchdog-bounded read (LP-0MSVP7ZML003XZTJ): the
                     # effective per-read budget is the minimum of the idle
@@ -1581,8 +1885,15 @@ async def _handle_remote_non_streaming(
     resolved_model: str | None = None,
     session_id: str | None = None,
     pool_client: httpx.AsyncClient | None = None,
+    responses_mode: bool = False,
 ) -> Response:
     """Handle non-streaming remote proxy request with empty-response retry.
+
+    When ``responses_mode`` is True (``api: openai-responses`` provider), the
+    upstream body is a Responses API JSON document; it is translated to the
+    chat/completions shape before the empty-response check and before being
+    returned to the client (LP-0MTGK5DQO001Y8H0).
+
 
     Features:
     - Detects semantically empty upstream responses (empty content,
@@ -1630,6 +1941,7 @@ async def _handle_remote_non_streaming(
                 )
 
     last_response = None
+    translated_body = None
     for attempt in range(empty_max_attempts + 1):
         response = await _do_request()
         last_response = response
@@ -1641,6 +1953,15 @@ async def _handle_remote_non_streaming(
         except Exception:
             # Not valid JSON — no retry, use as-is
             break
+
+        if responses_mode and isinstance(resp_json, dict) and response.status_code < 400:
+            # Translate Responses API JSON -> chat/completions JSON so the
+            # empty check and the client-visible body use the same shape.
+            # Non-2xx responses pass through untranslated: upstream error
+            # JSON has no ``output`` items and must reach the client/fallback
+            # chain as-is.
+            resp_json = _translate_responses_to_chat(resp_json)
+            translated_body = json.dumps(resp_json).encode("utf-8")
 
         if _is_empty_remote_response(resp_json):
             if attempt < empty_max_attempts:
@@ -1697,8 +2018,10 @@ async def _handle_remote_non_streaming(
     # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
     if resolved_model:
         _ns_headers["X-Resolved-Model"] = resolved_model
+
+    _out_content = translated_body if translated_body is not None else response.content
     return Response(
-        content=response.content,
+        content=_out_content,
         status_code=response.status_code,
         headers=_ns_headers,
     )
