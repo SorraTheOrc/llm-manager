@@ -99,6 +99,9 @@ class AnalysisResult:
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
+    # Compaction events (LP-0MTHCTLAF00147IT): compaction_event, backstop, and
+    # churn events observed inside the window.
+    compaction_events: list[LogEvent] = field(default_factory=list)
     # llama-server decode/prompt-eval speed stats (set by reporting.run_analysis).
     speed: object | None = None
     # Local-model utilization (busy time etc.); None when no local traffic.
@@ -537,6 +540,129 @@ def compute_busy_stats(
     )
 
 
+def compaction_impact(
+    sessions: dict[str, SessionStats],
+    compaction_events: list[LogEvent],
+    config: dict | None = None,
+) -> dict:
+    """Impact analysis for compacted sessions (LP-0MTHCTLAF00147IT AC3).
+
+    Correlates each compacted session with its subsequent in-window
+    routing/fallback outcome (stayed local vs fell back) and estimates
+    fallback avoidance: sessions where ``pre_tokens`` met the effective
+    large-context threshold but ``post_tokens`` dropped below it would have
+    been a large-context bypass without compaction.
+
+    ``config`` supplies the effective large-context thresholds (clamped to
+    the per-slot context, matching the routing machinery's
+    ``_effective_large_context_thresholds``). When ``config`` is ``None``
+    the avoided-fallback heuristic is skipped.
+
+    The compaction event's own ``dry_run`` flag distinguishes "would-have-
+    avoided" (advisory) from "avoided" (live). The threshold clamp is
+    approximated here from ``local_model_ctx_size / slots`` minus output
+    headroom (4096) and the warm-threshold hard-cap, matching
+    ``_effective_large_context_thresholds``. When the config clamp cannot be
+    computed the raw configured thresholds are compared directly.
+    """
+    from collections import Counter as _Counter
+
+    effective_warm: int | None = None
+    effective_cold: int | None = None
+    if config:
+        try:
+            ctx = int(config.get("local_model_ctx_size") or 0)
+            slots = int(config.get("session_slot_pool_size") or 0)
+            # Prefer the routing machinery's helper when available; fall back to
+            # the same arithmetic so tests (which lack proxy/ on sys.path) still
+            # exercise the clamp.
+            try:
+                from proxy.provider import effective_per_slot_threshold as _cap_fn  # type: ignore[import]
+
+                cap = _cap_fn(ctx, slots)
+            except Exception:
+                per_slot = (ctx // slots) if slots else 0
+                cap = (per_slot - 4096) if per_slot > 4096 else 0
+            cold_cfg = int(config.get("local_large_context_cold_cache_threshold") or 0) or None
+            warm_cfg = int(config.get("local_large_context_warm_cache_threshold") or 0) or None
+            effective_warm = min(warm_cfg, cap) if warm_cfg and cap else (warm_cfg or cap or None)
+            effective_cold = cold_cfg  # cold threshold clamp is NOT applied (it is economic-only).
+        except Exception:
+            effective_warm = None
+            effective_cold = None
+
+    sessions_with_compaction: set[str] = {e.session for e in compaction_events if e.kind == "compaction_event" and e.session}
+    by_action: _Counter = _Counter()
+    by_reason: _Counter = _Counter()
+    dry_live: _Counter = _Counter()
+    bucket_counts: _Counter = _Counter()
+    bucket_dry_live: dict[str, _Counter] = {}
+    stayed_local = 0
+    fell_back = 0
+    would_have_avoided = 0  # dry_run=true, pre above threshold, post below.
+    would_still_fallback = 0  # dry_run=true, pre and post both above.
+    avoided = 0  # live, pre above / post below (sparse until live rollout).
+    backstop_sessions: set[str] = set()
+
+    for ev in compaction_events:
+        if ev.kind == "compaction_event":
+            if ev.action:
+                by_action[ev.action] += 1
+            if ev.reason:
+                by_reason[ev.reason] += 1
+            lab = "dry_run" if ev.dry_run is True else ("live" if ev.dry_run is False else "unknown")
+            dry_live[lab] += 1
+            if ev.mode:
+                bucket_counts[ev.mode] += 1
+                bucket_dry_live.setdefault(ev.mode, _Counter())[lab] += 1
+            if ev.action in ("backstop_dropped", "backstop_exhausted"):
+                if ev.session:
+                    backstop_sessions.add(ev.session)
+            # Fallback-avoidance heuristic: pre above threshold -> would bypass, post below -> fit.
+            if ev.pre_tokens is not None and ev.post_tokens is not None and effective_warm:
+                pre_hit = ev.pre_tokens >= effective_warm
+                post_fit = ev.post_tokens < effective_warm
+                if pre_hit and post_fit:
+                    if ev.dry_run is True:
+                        would_have_avoided += 1
+                    elif ev.dry_run is False:
+                        avoided += 1
+                elif pre_hit and not post_fit and ev.dry_run is True:
+                    would_still_fallback += 1
+        elif ev.kind == "compaction_backstop":
+            # Backstop is a supplementary machine line; also counts as backstop.* action.
+            if ev.action:
+                by_action[ev.action] += 1
+            dry_live["live"] += 1
+
+    # Session-level routing correlation uses the aggregated session stats.
+    for sid in sessions_with_compaction:
+        sess = sessions.get(sid)
+        if sess is None:
+            continue
+        if sess.fell_back:
+            fell_back += 1
+        else:
+            stayed_local += 1
+
+    return {
+        "sessions_with_compaction": len(sessions_with_compaction),
+        "by_action": dict(by_action),
+        "by_reason": dict(by_reason),
+        "dry_run": {"dry_run": dry_live.get("dry_run", 0), "live": dry_live.get("live", 0), "unknown": dry_live.get("unknown", 0)},
+        "bucket_counts": dict(bucket_counts),
+        "bucket_dry_live": {k: dict(v) for k, v in bucket_dry_live.items()},
+        "stayed_local": stayed_local,
+        "fell_back": fell_back,
+        "would_have_avoided": would_have_avoided,
+        "would_still_fallback": would_still_fallback,
+        "avoided": avoided,
+        "effective_warm": effective_warm,
+        "effective_cold": effective_cold,
+        "backstop_sessions": len(backstop_sessions),
+    }
+
+
 def aggregate(
     events: Iterable[LogEvent],
     window_start: datetime,
@@ -565,6 +691,7 @@ def aggregate(
     error_events: list[LogEvent] = []
     contention_dispatch_events: list[LogEvent] = []
     contention_fallback_events: list[LogEvent] = []
+    compaction_events: list[LogEvent] = []
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -619,6 +746,9 @@ def aggregate(
         if ev.kind == "contention_fallback_after_queue":
             contention_fallback_events.append(ev)
             continue
+        if ev.kind in ("compaction_event", "compaction_backstop", "compaction_churn"):
+            compaction_events.append(ev)
+            continue
         if ev.kind in ("stream_started", "stream_finished"):
             if not ev.session:
                 unattributed += 1
@@ -655,5 +785,6 @@ def aggregate(
         error_events=error_events,
         contention_dispatch_events=contention_dispatch_events,
         contention_fallback_events=contention_fallback_events,
+        compaction_events=compaction_events,
         busy=busy,
     )

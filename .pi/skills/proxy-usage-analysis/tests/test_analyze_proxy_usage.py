@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MTHLGVPO004DZ56
+# smell: unused_import
+# severity: critical
+# description: Local variable `schedule` is assigned to but never used
+# -->
 """Unit tests for the proxy-usage-analysis skill.
 
 Covers: log-line parsing, session aggregation, fast/cheap bucketing from the
@@ -2755,3 +2761,387 @@ class TestTimeToCompletion:
         # Section header renders with an empty-window note (like the speed sections).
         assert "## Time to completion" in md
         assert "_No sessions in window._" in md
+
+
+# ---------------------------------------------------------------------------
+# Server-side compaction — LP-0MTHCTLAF00147IT AC1/AC2/AC3/AC4/AC5/AC6/AC7
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionLogParsing:
+    """AC1: compaction_event / backstop / churn lines are parsed tolerantly."""
+
+    def test_compaction_event_fast_parsed(self):
+        ev = log_parser.parse_log_line(fixtures.COMPACTION_EVENT_FAST)
+        assert ev is not None
+        assert ev.kind == "compaction_event"
+        assert ev.session == "019fc2be-eb73-7830-a55e-c8bd5d21c927"
+        assert ev.mode == "fast"
+        assert ev.action == "compact"
+        assert ev.reason == "context_window"
+        assert ev.pre_tokens == 55000
+        assert ev.post_tokens == 42000
+        assert ev.turns_summarized == 3
+        assert ev.turns_dropped == 1
+        assert ev.summary_tokens == 800
+        assert ev.dry_run is False
+
+    def test_compaction_event_cheap_dry_run_parsed(self):
+        ev = log_parser.parse_log_line(fixtures.COMPACTION_EVENT_CHEAP)
+        assert ev is not None
+        assert ev.kind == "compaction_event"
+        assert ev.mode == "cheap"
+        assert ev.action == "remote_with_guidance"
+        assert ev.dry_run is True
+        assert ev.pre_tokens == 60000
+        assert ev.post_tokens == 35000
+
+    def test_compaction_backstop_parsed(self):
+        ev = log_parser.parse_log_line(fixtures.COMPACTION_BACKSTOP)
+        assert ev is not None
+        assert ev.kind == "compaction_backstop"
+        assert ev.action == "dropped"
+        assert ev.turns_dropped == 1
+        assert ev.dropped_messages == 2
+        assert ev.pre_tokens == 65000
+        assert ev.post_tokens == 48000
+
+    def test_compaction_churn_parsed(self):
+        ev = log_parser.parse_log_line(fixtures.COMPACTION_CHURN)
+        assert ev is not None
+        assert ev.kind == "compaction_churn"
+        assert ev.session == "019fc2be-eb73-7830-a55e-c8bd5d21c927"
+        assert ev.churn_count == 5
+        assert ev.churn_rate == pytest.approx(2.3)
+
+    def test_compaction_event_tolerant_missing_fields(self):
+        # Missing numeric fields must default to None, never fatal.
+        line = "2026-08-02 14:12:00,000 - INFO - compaction_event session=abc123 mode=fast action=compact dry_run=true"
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "compaction_event"
+        assert ev.pre_tokens is None
+        assert ev.post_tokens is None
+        assert ev.turns_summarized is None
+        assert ev.dry_run is True
+
+    def test_compaction_backstop_tolerant_partial(self):
+        line = "2026-08-02 14:13:00,000 - INFO - compaction_backstop action=exhausted estimated_before=70000"
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "compaction_backstop"
+        assert ev.pre_tokens == 70000
+        assert ev.post_tokens is None
+
+    def test_compaction_churn_invalid_rate_tolerated(self):
+        # Malformed rate_per_hour must not crash — defaults to None.
+        line = "2026-08-02 14:13:30,000 - INFO - compaction_churn session=abc count=2 rate_per_hour=notanumber exceeds_target=true"
+        # Regex won't match non-numeric rate, so churn_rate stays None gracefully.
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "compaction_churn"
+        assert ev.churn_count == 2
+        assert ev.churn_rate is None
+
+    def test_compaction_event_window_filtering_via_iter_events(self, tmp_path):
+        log_dir = tmp_path / "logs_comp"
+        log_dir.mkdir()
+        # One event inside window, one before.
+        lines = [
+            "2026-08-02 13:00:00,000 - INFO - compaction_event session=s1 mode=fast action=compact pre_tokens=50000 post_tokens=30000 dry_run=false",
+            fixtures.COMPACTION_EVENT_FAST,  # 14:12 inside
+        ]
+        (log_dir / "proxy.log").write_text("\n".join(lines) + "\n")
+        events = list(log_parser.iter_events(log_dir / "proxy.log", WINDOW_START, WINDOW_END))
+        kinds = [e.kind for e in events]
+        assert "compaction_event" in kinds
+        assert len([k for k in kinds if k == "compaction_event"]) == 1
+        assert events[0].pre_tokens == 55000
+
+
+class TestCompactionAggregation:
+    """AC3: compaction impact correlation and threshold heuristic."""
+
+    def test_compaction_events_collected(self):
+        schedule = _schedule()
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s-compact request=[]",
+            "2026-08-02 14:00:02,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s-compact provider=local model=Qwen3 request=[]",
+            fixtures.COMPACTION_EVENT_FAST.replace("019fc2be-eb73-7830-a55e-c8bd5d21c927", "s-compact"),
+            fixtures.COMPACTION_BACKSTOP,
+            fixtures.COMPACTION_CHURN.replace("019fc2be-eb73-7830-a55e-c8bd5d21c927", "s-compact"),
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, schedule)
+        assert len(summary.compaction_events) == 3
+        kinds = {e.kind for e in summary.compaction_events}
+        assert kinds == {"compaction_event", "compaction_backstop", "compaction_churn"}
+
+    def test_compaction_impact_stayed_local_vs_fell_back(self):
+        # Two sessions: one compacted and stayed local, one compacted and fell back.
+        sessions = {
+            "s-local": aggregation.SessionStats(**_session("s-local", bucket="fast", remote_move=False)),
+            "s-remote": aggregation.SessionStats(**_session("s-remote", bucket="fast", remote_move=True, reason="context_too_large")),
+        }
+        events = [
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s-local", mode="fast", action="compact", pre_tokens=50000, post_tokens=30000, dry_run=False),
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s-remote", mode="fast", action="compact", pre_tokens=50000, post_tokens=30000, dry_run=False),
+        ]
+        impact = aggregation.compaction_impact(sessions, events, config=None)
+        assert impact["sessions_with_compaction"] == 2
+        assert impact["stayed_local"] == 1
+        assert impact["fell_back"] == 1
+
+    def test_compaction_impact_would_have_avoided_dry_run(self):
+        # Config: 262144 ctx / 6 slots -> cap 39594, warm 100000 -> effective_warm 39594.
+        config = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 6,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_large_context_cold_cache_threshold": 60000,
+        }
+        sessions = {"s1": aggregation.SessionStats(**_session("s1"))}
+        # pre above threshold, post below -> would-have-avoided (dry_run=true)
+        events = [
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=50000, post_tokens=30000, dry_run=True),
+        ]
+        impact = aggregation.compaction_impact(sessions, events, config=config)
+        assert impact["effective_warm"] == 39594
+        assert impact["would_have_avoided"] == 1
+        assert impact["avoided"] == 0
+
+    def test_compaction_impact_live_avoided(self):
+        config = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 6,
+            "local_large_context_warm_cache_threshold": 100000,
+        }
+        sessions = {"s1": aggregation.SessionStats(**_session("s1"))}
+        events = [
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=50000, post_tokens=30000, dry_run=False),
+        ]
+        impact = aggregation.compaction_impact(sessions, events, config=config)
+        assert impact["avoided"] == 1
+        assert impact["would_have_avoided"] == 0
+
+    def test_compaction_impact_would_still_fallback(self):
+        config = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 6,
+            "local_large_context_warm_cache_threshold": 100000,
+        }
+        sessions = {"s1": aggregation.SessionStats(**_session("s1"))}
+        # Both pre and post above threshold -> would_still_fallback
+        events = [
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=50000, post_tokens=45000, dry_run=True),
+        ]
+        impact = aggregation.compaction_impact(sessions, events, config=config)
+        assert impact["would_still_fallback"] == 1
+        assert impact["would_have_avoided"] == 0
+
+    def test_compaction_impact_without_config_skips_heuristic(self):
+        sessions = {"s1": aggregation.SessionStats(**_session("s1"))}
+        events = [
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=90000, post_tokens=10000, dry_run=True),
+        ]
+        impact = aggregation.compaction_impact(sessions, events, config=None)
+        assert impact["effective_warm"] is None
+        assert impact["would_have_avoided"] == 0
+        assert impact["avoided"] == 0
+
+    def test_compaction_impact_bucket_counts_and_dry_live(self):
+        sessions = {}
+        events = [
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", dry_run=False),
+            log_parser.LogEvent("compaction_event", WINDOW_START, session="s2", mode="cheap", action="remote_with_guidance", dry_run=True),
+            log_parser.LogEvent("compaction_backstop", WINDOW_START, action="dropped", pre_tokens=65000, post_tokens=48000),
+        ]
+        impact = aggregation.compaction_impact(sessions, events, config=None)
+        assert impact["bucket_counts"] == {"fast": 1, "cheap": 1}
+        assert impact["by_action"]["compact"] == 1
+        assert impact["by_action"]["remote_with_guidance"] == 1
+        assert impact["by_action"]["dropped"] == 1  # backstop
+        assert impact["dry_run"]["dry_run"] == 1
+        assert impact["dry_run"]["live"] == 2  # one live event + one backstop
+
+
+class TestCompactionReporting:
+    """AC2/AC5/AC6: report section rendering."""
+
+    def test_zero_compaction_placeholder(self):
+        md = reporting.build_report(aggregation.aggregate([], WINDOW_START, WINDOW_END, _schedule()), None)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        assert "No compactions observed in window" in section
+
+    def test_report_with_compactions_shows_split(self):
+        schedule = _schedule()
+        sessions = {
+            "s1": aggregation.SessionStats(**_session("s1", bucket="fast")),
+            "s2": aggregation.SessionStats(**_session("s2", bucket="cheap")),
+        }
+        # Build a summary manually with compaction events.
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions=sessions,
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[
+                log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", reason="context_window", pre_tokens=55000, post_tokens=42000, turns_summarized=3, dry_run=False),
+                log_parser.LogEvent("compaction_event", WINDOW_START, session="s2", mode="cheap", action="compact", reason="context_window", pre_tokens=60000, post_tokens=35000, turns_summarized=2, dry_run=True),
+                log_parser.LogEvent("compaction_backstop", WINDOW_START, action="dropped", turns_dropped=1, dropped_messages=2, pre_tokens=65000, post_tokens=48000),
+            ],
+        )
+        md = reporting.build_report(summary, None)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        assert "Total compaction events:" in section
+        # Total/Fast/Cheap split appears
+        assert "Fast" in section and "Cheap" in section
+        # Action breakdown
+        assert "action=compact" in section
+        # Dry-run vs live rows
+        assert "dry_run=true" in section
+        assert "dry_run=false" in section
+        # Token economics
+        assert "Avg pre_tokens" in section
+        # Fallback-avoidance impact heading
+        assert "Fallback-avoidance impact" in section
+
+    def test_report_all_dry_run_heading_note(self):
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions={"s1": aggregation.SessionStats(**_session("s1"))},
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[
+                log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=50000, post_tokens=30000, dry_run=True),
+            ],
+        )
+        md = reporting.build_report(summary, None)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        assert "Advisory (dry_run)" in section
+
+    def test_report_backstop_and_churn_visible(self):
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions={},
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[
+                log_parser.LogEvent("compaction_backstop", WINDOW_START, action="dropped", turns_dropped=2, dropped_messages=4, pre_tokens=70000, post_tokens=50000),
+                log_parser.LogEvent("compaction_churn", WINDOW_START, session="s1", churn_count=3, churn_rate=1.5),
+            ],
+        )
+        md = reporting.build_report(summary, None)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        assert "compaction_backstop" in section.lower() or "dropped" in section
+        assert "Churn warnings" in section
+
+    def test_report_impact_effective_threshold(self):
+        config = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 6,
+            "local_large_context_warm_cache_threshold": 100000,
+        }
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions={"s1": aggregation.SessionStats(**_session("s1"))},
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[
+                log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=50000, post_tokens=30000, dry_run=True),
+            ],
+        )
+        md = reporting.build_report(summary, config)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        assert "Effective warm threshold" in section
+        assert "Would-have-avoided" in section
+
+
+class TestCompactionJson:
+    """AC4: machine-readable compaction object via --json."""
+
+    def test_json_compaction_structure(self):
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions={"s1": aggregation.SessionStats(**_session("s1"))},
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[
+                log_parser.LogEvent("compaction_event", WINDOW_START, session="s1", mode="fast", action="compact", pre_tokens=55000, post_tokens=42000, dry_run=False),
+                log_parser.LogEvent("compaction_backstop", WINDOW_START, action="dropped", pre_tokens=65000, post_tokens=48000),
+                log_parser.LogEvent("compaction_churn", WINDOW_START, session="s1", churn_count=2, churn_rate=1.0),
+            ],
+        )
+        data = reporting.summary_to_json(summary)
+        comp = data["compaction"]
+        assert comp["events"] == 3
+        assert comp["compact_events"] == 1
+        assert comp["backstop_events"] == 1
+        assert comp["churn_events"] == 1
+        assert comp["sessions_with_compaction"] == 1
+        assert comp["by_action"]["compact"] == 1
+        assert comp["bucket_counts"]["fast"] == 1
+        assert comp["avg_pre_tokens"] is not None
+        assert comp["avg_post_tokens"] is not None
+        assert comp["avg_tokens_saved"] == comp["avg_pre_tokens"] - comp["avg_post_tokens"]
+        assert "stayed_local" in comp
+        assert "would_have_avoided" in comp
+        assert "backstop_sessions" in comp
+        json.dumps(data)  # serialisable
+
+    def test_json_jq_compaction_without_markdown_parsing(self, tmp_path):
+        # End-to-end JSON path: run_analysis -> summary_to_json -> jq .compaction
+        log_dir = tmp_path / "logs_json"
+        log_dir.mkdir()
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:02,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            fixtures.COMPACTION_EVENT_FAST.replace("019fc2be-eb73-7830-a55e-c8bd5d21c927", "s1"),
+        ]
+        (log_dir / "proxy.log").write_text("\n".join(lines) + "\n")
+        result = reporting.run_analysis(log_dir=log_dir, window_start=WINDOW_START, window_end=WINDOW_END, output_dir=tmp_path / "out_json", config=None)
+        data = reporting.summary_to_json(result.summary)
+        comp = data["compaction"]
+        # jq .compaction equivalent: direct dict access without Markdown
+        assert comp["events"] >= 1
+        assert comp["compact_events"] >= 1
+
+    def test_json_zero_compaction(self):
+        summary = aggregation.aggregate([], WINDOW_START, WINDOW_END, _schedule())
+        data = reporting.summary_to_json(summary)
+        assert data["compaction"]["events"] == 0
+        assert data["compaction"]["sessions_with_compaction"] == 0
+
+
+class TestCompactionEndToEnd:
+    """AC7: synthetic 24h window with compaction events."""
+
+    def test_e2e_run_with_compactions(self, tmp_path):
+        log_dir = tmp_path / "logs_e2e"
+        log_dir.mkdir()
+        # Two sessions: s1 compacted dry-run, s2 compacted live; s2 has a backstop.
+        s1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        s2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        lines = [
+            f"2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session={s1} request=[]",
+            f"2026-08-02 14:00:02,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session={s1} provider=local model=Qwen3 request=[]",
+            f"2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session={s2} request=[]",
+            f"2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session={s2} provider=local model=Qwen3 request=[]",
+            f"2026-08-02 14:12:00,000 - INFO - compaction_event session={s1} mode=fast action=compact reason=context_window pre_tokens=55000 post_tokens=32000 turns_summarized=2 turns_dropped=0 summary_tokens=600 dry_run=true",
+            f"2026-08-02 14:12:30,000 - INFO - compaction_event session={s2} mode=cheap action=compact reason=context_window pre_tokens=60000 post_tokens=35000 turns_summarized=3 turns_dropped=1 summary_tokens=800 dry_run=false",
+            "2026-08-02 14:13:00,000 - INFO - compaction_backstop action=dropped dropped_turns=1 dropped_messages=2 estimated_before=65000 estimated_after=48000",
+            f"2026-08-02 14:13:30,000 - INFO - compaction_churn session={s1} count=2 rate_per_hour=1.5 exceeds_target=true",
+        ]
+        (log_dir / "proxy.log").write_text("\n".join(lines) + "\n")
+        out = tmp_path / "out_e2e"
+        result = reporting.run_analysis(log_dir=log_dir, window_start=WINDOW_START, window_end=WINDOW_END, output_dir=out, config=None)
+        assert len(result.summary.compaction_events) == 4
+        md = (out / "report.md").read_text()
+        assert "## Server-side compaction" in md
+        assert "Total compaction events:" in md
+        # JSON mirrors the report.
+        data = reporting.summary_to_json(result.summary)
+        assert data["compaction"]["events"] == 4
+        assert data["compaction"]["compact_events"] == 2
+        assert data["compaction"]["backstop_events"] == 1
+        assert data["compaction"]["churn_events"] == 1
+

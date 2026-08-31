@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MTHLGTUR00053QP
+# smell: unused_import
+# severity: critical
+# description: Local variable `by_action` is assigned to but never used
+# -->
 """CSV and Markdown report generation, plus the end-to-end analysis runner.
 
 Outputs (per acceptance criteria):
@@ -355,6 +361,7 @@ def build_report(
     ap(f"| Dispatch denied | {summary.dispatch_denied_count} | "
        f"{d['dispatch_denied']} ({_pct(d['dispatch_denied'], summary.dispatch_denied_count):.1f}%) | "
        f"{n['dispatch_denied']} ({_pct(n['dispatch_denied'], summary.dispatch_denied_count):.1f}%) |")
+    _append_compaction_section(ap, summary, config)
     total_avg, total_max = _ctx_stats(
         [s.max_context_size for s in sessions if s.max_context_size is not None]
     )
@@ -460,7 +467,178 @@ def build_report(
         "fast/cheap split and window filtering are approximate: each sample is bucketed by its log "
         "file's last-write time. Files whose Qwen3 port cannot be discovered are skipped."
     )
+    ap(
+        "- Compaction events (LP-0MTHCTLAF00147IT): the proxy emits `compaction_event` lines for "
+        "every compaction decision (compact / remote_with_guidance / backstop_*). `dry_run=true` "
+        "indicates the prompt was rejected without sending to the model; `dry_run=false` means "
+        "compaction actually ran. Churn warnings (`compaction_churn`) signal compaction rate "
+        "exceeding the target; backstops (`compaction_backstop`) are forced truncations when "
+        "compaction cannot keep pace."
+    )
     return "\n".join(lines) + "\n"
+
+
+def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None = None) -> None:
+    """Append the ``## Server-side compaction`` section to the report.
+
+    Reports server-side proactive session compaction telemetry
+    (LP-0MTHCTLAF00147IT): total events, Total/Fast/Cheap split (using the
+    event's ``mode`` field; sessions bucketed the same way stay aligned),
+    action breakdown, dry-run labelling, token/turn economics, and
+    fallback-avoidance impact (compacted sessions that stayed local vs fell
+    back, and the estimate of avoided fallbacks computed from the
+    pre/post token estimates against the effective large-context thresholds).
+    """
+    compactions = [e for e in summary.compaction_events if e.kind == "compaction_event"]
+    backstops = [e for e in summary.compaction_events if e.kind == "compaction_backstop"]
+    churns = [e for e in summary.compaction_events if e.kind == "compaction_churn"]
+    has_events = bool(compactions or backstops or churns)
+
+    ap("")
+    ap("## Server-side compaction")
+    ap("")
+
+    if not has_events:
+        ap("No compactions observed in window.")
+        ap("")
+        ap("_The server emits `compaction_event` lines only when the session "
+          "estimate exceeds the per-mode trigger (≈58.3K fast / ≈43K cheap, "
+          "`compaction_trigger_ratio=0.70` × per-slot clamp); below trigger or "
+          "without a session history the window is expected to be empty._")
+        ap("_Default mode is dry-run advisory (`compaction_dry_run: true`) — "
+          "no dispatch change even when events fire. Flip "
+          "`server.compaction_dry_run: false` for live enforcement._")
+        return
+
+    # --- Aggregate stats via the shared impact helper ---
+    impact = aggregation.compaction_impact(summary.sessions, summary.compaction_events, config)
+    sessions_with_compaction = impact["sessions_with_compaction"]
+    by_action = impact["by_action"]
+    by_reason = impact["by_reason"]
+    by_bucket = impact["bucket_counts"]
+    bucket_dry_live = impact["bucket_dry_live"]
+    dry_live = impact["dry_run"]
+    stayed_local = impact["stayed_local"]
+    fell_back = impact["fell_back"]
+    would_have_avoided = impact["would_have_avoided"]
+    would_still_fallback = impact["would_still_fallback"]
+    avoided = impact["avoided"]
+    effective_warm = impact["effective_warm"]
+    backstop_sessions = impact["backstop_sessions"]
+
+    total_compactions = len(compactions) + len(backstops)
+    all_dry = (dry_live.get("live", 0) == 0) and (dry_live.get("dry_run", 0) > 0)
+    heading_note = "Advisory (dry_run) — no dispatch change" if all_dry else None
+    if heading_note:
+        ap(f"_{heading_note}._")
+        ap("")
+
+    # --- Top-line table: Total / Fast / Cheap split (same column convention
+    # as the Session summary). Counts come from compaction_event.action +
+    # backstop events; live vs dry_run breakdown reflects the event-level
+    # ``dry_run`` flag. ---
+    fast_total = by_bucket.get("fast", 0)
+    cheap_total = by_bucket.get("cheap", 0)
+    unknown_bucket = total_compactions - fast_total - cheap_total
+    # Backstop flag: backstops carry no mode; Cheap/Fast columns are pure
+    # compacted-session counts.
+    if unknown_bucket:
+        ap(f"Total compaction events: **{total_compactions}** (" f"Total {total_compactions} / Fast {fast_total} / Cheap {cheap_total} / unknown-mode {unknown_bucket})")
+    else:
+        ap(f"Total compaction events: **{total_compactions}** (Total {total_compactions} / Fast {fast_total} / Cheap {cheap_total})")
+    ap(f"- Sessions with compaction: {sessions_with_compaction} / {len(summary.sessions)} "
+       f"({(_pct(sessions_with_compaction, len(summary.sessions)) if len(summary.sessions) else 0):.1f}%)")
+
+    # Bucket × action × dry_run breakdown.
+    ap("")
+    ap("| Metric | Total | Fast | Cheap |")
+    ap("|---|---|---|---|")
+    # Combine compaction_event + backstop actions for the action breakdown.
+    # Count per action per bucket from the raw events (includes dry-run flag).
+    def _action_bucket_count(action: str, bucket: str) -> int:
+        return sum(1 for e in summary.compaction_events
+                   if e.action == action and (e.mode == bucket) and e.kind == "compaction_event")
+    def _total_action_count(action: str) -> int:
+        return sum(1 for e in summary.compaction_events if e.action == action)
+    actions = sorted(set(e.action for e in summary.compaction_events if e.action)) or []
+    for action in actions:
+        t = _total_action_count(action)
+        f = _action_bucket_count(action, "fast")
+        c = _action_bucket_count(action, "cheap")
+        ap(f"| action={action} | {t} | {f} | {c} |")
+    # Dry-run vs applied split (matches acceptance criteria AC2).
+    ap(f"| dry_run=true (advisory) | {dry_live.get('dry_run', 0)} | {bucket_dry_live.get('fast', {}).get('dry_run', 0)} | {bucket_dry_live.get('cheap', {}).get('dry_run', 0)} |")
+    ap(f"| dry_run=false (applied) | {dry_live.get('live', 0)} | {bucket_dry_live.get('fast', {}).get('live', 0)} | {bucket_dry_live.get('cheap', {}).get('live', 0)} |")
+    if backstop_sessions:
+        ap(f"| backstop sessions | {backstop_sessions} | - | - |")
+
+    # --- Token / turn economics (per average sample) ---
+    pre_sum = 0
+    post_sum = 0
+    samples = 0
+    turns_summ = 0
+    turns_drop = 0
+    for e in compactions:
+        if e.pre_tokens is not None and e.post_tokens is not None:
+            pre_sum += e.pre_tokens
+            post_sum += e.post_tokens
+            samples += 1
+        if e.turns_summarized is not None:
+            turns_summ += e.turns_summarized
+        if e.turns_dropped is not None:
+            turns_drop += e.turns_dropped
+    for e in backstops:
+        if e.pre_tokens is not None and e.post_tokens is not None:
+            pre_sum += e.pre_tokens
+            post_sum += e.post_tokens
+            samples += 1
+        if e.turns_dropped is not None:
+            turns_drop += e.turns_dropped
+    ap("")
+    if samples:
+        avg_pre = round(pre_sum / samples)
+        avg_post = round(post_sum / samples)
+        saved = avg_pre - avg_post
+        saved_pct = (saved / avg_pre * 100.0) if avg_pre else 0.0
+        ap(f"- Avg pre_tokens: {avg_pre:,} | post_tokens: {avg_post:,} | " f"saved {saved:,} ({saved_pct:.1f}%)")
+        ap(f"- Avg turns summarized: {turns_summ / max(samples, 1):.1f} | turns dropped (backstop): {turns_drop}")
+    else:
+        ap("- Token/turn economics unavailable (no pre/post token estimates in window).")
+
+    # --- Fallback-avoidance impact ---
+    # Use a bold label (not a "##"/"###" heading) so section parsers that
+    # split on "## " (e.g. tests) keep this content inside the
+    # "## Server-side compaction" section.
+    ap("")
+    ap("**Fallback-avoidance impact**")
+    ap("")
+    ap(f"- Compacted sessions that stayed local: {stayed_local} / {sessions_with_compaction}")
+    ap(f"- Compacted sessions that still fell back: {fell_back} / {sessions_with_compaction}")
+    if effective_warm is not None:
+        ap(f"_Effective warm threshold (estimated fallback boundary): {effective_warm:,}_")
+        if all_dry:
+            ap(f"- Would-have-avoided fallbacks (dry-run, advisory): {would_have_avoided} (pre ≥ threshold → post < threshold)")
+            ap(f"- Would-still-fallback (dry-run, stayed over threshold): {would_still_fallback}")
+        else:
+            ap(f"- Avoided fallbacks (live, pre ≥ threshold → post < threshold): {avoided}")
+            if would_have_avoided or would_still_fallback:
+                ap(f"- Would-have-avoided (remaining dry-run, advisory): {would_have_avoided}")
+    else:
+        ap("_Threshold-unaware impact estimate not available (no config thresholds in analysis)._")
+
+    if churns:
+        ap("")
+        ap("Churn warnings")
+        ap("")
+        ap(f"_Compaction churn (> target rate per session/hour): {len(churns)}_")
+        for e in churns:
+            ap(f"- session={e.session or '?'} count={e.churn_count} rate={e.churn_rate}/h")
+
+    # When the entire window was dry-run, clearly state it so the
+    # estimates are not overstated.
+    if all_dry and (would_have_avoided or avoided or would_still_fallback):
+        ap("")
+        ap("_Impact estimates in this window are hypothetical: no live dispatch change; " "the session history was not mutated._")
 
 
 def _append_error_section(ap, summary: AnalysisResult) -> None:
@@ -1008,6 +1186,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "errors": len(summary.error_events),
         "errors_by_type": dict(summary.error_counts.most_common()),
         "errors_by_provider_model": error_provider_model_json(summary),
+        "compaction": compaction_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
@@ -1050,6 +1229,50 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         "fast_window_seconds": busy.fast_window_seconds,
         "cheap_window_seconds": busy.cheap_window_seconds,
         "hourly_busy": busy.hourly_busy,
+    }
+
+
+def compaction_json(summary: AnalysisResult) -> dict:
+    """Machine-readable compaction summary for ``summary_to_json``.
+
+    Built from ``AnalysisResult.compaction_events`` and the session stats;
+    suitable for ``--json | jq .compaction``. Structure mirrors the report
+    section: top-line counts, per-bucket / per-action breakdown, token and
+    turn economics, and fallback-avoidance impact. No mode-timeline
+    approximation is baked in — it is streaming-discovered at report time.
+    """
+    events = summary.compaction_events
+    impact = aggregation.compaction_impact(summary.sessions, events, None)
+    pre_sum = 0
+    post_sum = 0
+    counted = 0
+    for e in events:
+        if e.pre_tokens is not None and e.post_tokens is not None:
+            pre_sum += e.pre_tokens
+            post_sum += e.post_tokens
+            counted += 1
+    avg_pre = round(pre_sum / counted) if counted else None
+    avg_post = round(post_sum / counted) if counted else None
+    return {
+        "events": len(events),
+        "compact_events": sum(1 for e in events if e.kind == "compaction_event"),
+        "backstop_events": sum(1 for e in events if e.kind == "compaction_backstop"),
+        "churn_events": sum(1 for e in events if e.kind == "compaction_churn"),
+        "sessions_with_compaction": impact["sessions_with_compaction"],
+        "by_action": impact["by_action"],
+        "by_reason": impact["by_reason"],
+        "bucket_counts": impact["bucket_counts"],
+        "bucket_dry_live": impact["bucket_dry_live"],
+        "dry_run": impact["dry_run"],
+        "avg_pre_tokens": avg_pre,
+        "avg_post_tokens": avg_post,
+        "avg_tokens_saved": (avg_pre - avg_post) if (avg_pre is not None and avg_post is not None) else None,
+        "stayed_local": impact["stayed_local"],
+        "fell_back": impact["fell_back"],
+        "would_have_avoided": impact["would_have_avoided"],
+        "would_still_fallback": impact["would_still_fallback"],
+        "avoided": impact["avoided"],
+        "backstop_sessions": impact["backstop_sessions"],
     }
 
 

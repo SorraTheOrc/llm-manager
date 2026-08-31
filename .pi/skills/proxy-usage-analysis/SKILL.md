@@ -116,6 +116,15 @@ Outputs written to:
   models not derivable from the log line are keyed `(unknown)`) plus
   **upstream HTTP error breakdown by status** (`{status: count}` and
   `{status: {provider: count}}`) plus the window bounds.
+- `--json` summary field `compaction` — machine-readable compaction summary
+  (same as in the report): `"compaction": {"events": N, "compact_events":
+  N, "backstop_events": N, "churn_events": N, "sessions_with_compaction":
+  N, "by_action": {action: count}, "by_reason": {...}, "bucket_counts":
+  {mode: count}, "bucket_dry_live": {mode: {label: count}}, "dry_run":
+  {dry_run/live}, "avg_pre_tokens": i, "avg_post_tokens": i,
+  "avg_tokens_saved": n, "stayed_local": N, "fell_back": N,
+  "would_have_avoided": N, "would_still_fallback": N, "avoided": N,
+  "backstop_sessions": N} — so `python3 scripts/analyze_proxy_usage.py … --json | jq .compaction` is usable without parsing Markdown.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
@@ -186,12 +195,15 @@ run (`Previous outputs archived to …`).
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`, plus the operating-mode
-   lines (`Mode scheduler: applied scheduled mode fast|cheap`; manual
-   switches, which log `Grandfathering: enabled; other-mode config ...
-   (current=fast|cheap)`, LP-0MT1EE315007AKXG) and the error
-   lines (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote]
-   upstream error`). Unparseable lines are counted and skipped, never fatal.
+   `routing_skip_local`, `local_dispatch_denied`, the server-side
+   compaction events (`compaction_event`, `compaction_backstop`,
+   `compaction_churn` — parsed tamerly with missing fields defaulting to
+   None, LP-0MTHCTLAF00147IT), plus the operating-mode lines (`Mode
+   scheduler: applied scheduled mode fast|cheap`; manual switches, which
+   log `Grandfathering: enabled; other-mode config ...
+   (current=fast|cheap)`, LP-0MT1EE315007AKXG) and the error lines (`Stream
+   error:`, `slot_save failed`, `backend_retry`, `[remote] upstream error`).
+   Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
@@ -270,7 +282,20 @@ run (`Previous outputs archived to …`).
    `upstream_by_status_provider` keys. Remediation recommendations
    (recovery-first, informative-error, ctx-size pressure, per-status upstream
    remediation) are generated from these events and link to the relevant work
-   items.
+   items. The **Server-side compaction** section (LP-0MTHCTLAF00147IT) is
+   rendered immediately after the Session summary whenever the window has
+   compaction telemetry (and otherwise as a "No compactions observed in
+   window" note). It covers Total / Fast / Cheap split (using the
+   compaction event's own `mode` field, aligned with session bucketing),
+   compact vs remote_with_guidance vs backstop action split, dry-run
+   (`dry_run=true`) vs live (`dry_run=false`) labelling, token/turn
+   economics (avg pre_tokens → post_tokens → tokens saved, avg
+   turns_summarized), and fallback-avoidance impact (compacted sessions that
+   stayed local vs still fell back, plus an estimate of avoided
+   `large_context_bypass`/`context_too_large` fallbacks via the effective
+   large-context warm threshold; dry-run estimates are labelled
+   "would-have-avoided" to avoid overstating). The `--json` summary
+   includes a `compaction` object (see [Outputs](#outputs)).
 8. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
@@ -426,6 +451,14 @@ lines (`proxy.log` and `llama-server.log`).
   a conservative lower bound.
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
+- Compaction events are window-filtered by per-line timestamp (`ts`) and
+  by the same streaming, per-line margin as session / fallback / error
+  events; the bucket (fast/cheap) of each `compaction_event` comes from its
+  own `mode` field (the mode active at dispatch), not the analysis-time
+  config. Backstop drops (`compaction_backstop` / `backstop_dropped` /
+  `backstop_exhausted`) log as `compaction_backstop` lines at WARNING level
+  (no `mode` field there) — they surface as the distinct "backstop
+  sessions" row and count toward the action breakdown.
 - llama-server.log eval-timing lines carry no timestamps, so the speed
   section's window filtering and fast/cheap split are approximate: each
   sample is bucketed by its log file's last-write time. Files whose Qwen3

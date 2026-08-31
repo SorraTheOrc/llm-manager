@@ -37,6 +37,29 @@ RE_FALLBACK = re.compile(
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
 
+# Compaction events (LP-0MTHCTLAF00147IT): the proxy emits ``compaction_event``
+# for every compaction decision (compact / remote_with_guidance / backstop_*)
+# with fields session/mode/action/reason/pre_tokens/post_tokens/turns_summarized/
+# turns_dropped/summary_tokens/dry_run. Churn and backstop lines are parsed
+# as supplements but do not affect primary counts (tolerant, never fatal).
+RE_COMPACTION_PRE_TOKENS = re.compile(r"\bpre_tokens=(\d+)")
+RE_COMPACTION_POST_TOKENS = re.compile(r"\bpost_tokens=(\d+)")
+RE_COMPACTION_TURNS_SUMMARIZED = re.compile(r"\bturns_summarized=(\d+)")
+RE_COMPACTION_TURNS_DROPPED = re.compile(r"\bturns_dropped=(\d+)")
+RE_COMPACTION_SUMMARY_TOKENS = re.compile(r"\bsummary_tokens=(\d+)")
+RE_COMPACTION_DRY_RUN = re.compile(r"\bdry_run=(true|false)")
+RE_COMPACTION_ACTION = re.compile(r"\baction=([A-Za-z_]+)")
+RE_COMPACTION_MODE = re.compile(r"\bmode=(\w+)")
+RE_COMPACTION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+# Backstop-specific field names (truncate_backstop structured log).
+RE_BACKSTOP_DROPPED_TURNS = re.compile(r"\bdropped_turns=(\d+)")
+RE_BACKSTOP_DROPPED_MESSAGES = re.compile(r"\bdropped_messages=(\d+)")
+# Churn line: "compaction_churn session=<id> count=<n> rate_per_hour=<f> exceeds_target=<bool>"
+# Backstop line: "compaction_backstop action=dropped|exhausted ... dropped_turns=N dropped_messages=N"
+# Example: "compaction_backstop action=dropped dropped_turns=1 dropped_messages=2 estimated_before=65000"
+RE_CHURN_COUNT = re.compile(r"\bcount=(\d+)")
+RE_CHURN_RATE = re.compile(r"\brate_per_hour=([\d.]+)")
+
 # Contention-queue events (LP-0MSORQVK50012Q4D F4 AC3): the proxy emits
 # ``contention_queue_dispatch`` (a queued request was dispatched local after
 # a slot freed) and ``contention_queue_fallback_after_queue`` (caps exceeded
@@ -79,6 +102,9 @@ ROUTING_SKIP = "routing_skip_local"
 DISPATCH_DENIED = "local_dispatch_denied"
 CONTENTION_DISPATCH = "contention_queue_dispatch"
 CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
+COMPACTION_EVENT = "compaction_event"
+COMPACTION_BACKSTOP = "compaction_backstop"
+COMPACTION_CHURN = "compaction_churn"
 
 # Reason-value normalization (backward compatibility). ``warm_cache_bypass``
 # was the pre-LP-0MSF8XDG7000PERM name for the warm-cache hard-cap skip. The
@@ -184,10 +210,11 @@ class LogEvent:
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
     ``routing_skip``, ``dispatch_denied``, ``contention_dispatch``,
-    ``contention_fallback_after_queue``, or an error kind (``stream_error``,
-    ``stream_finish_error``, ``slot_save_error``, ``backend_retry``,
-    ``upstream_http_error``). Only the fields relevant to each kind are
-    populated.
+    ``contention_fallback_after_queue``, ``compaction_event``,
+    ``compaction_backstop``, ``compaction_churn``, or an error kind
+    (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
+    ``backend_retry``, ``upstream_http_error``). Only the fields relevant to
+    each kind are populated.
     """
 
     kind: str
@@ -224,6 +251,19 @@ class LogEvent:
     raw: str | None = None
     # Operating-mode field (mode_switch kind only): "fast" | "cheap".
     mode: str | None = None
+    # Compaction fields (compaction_event / compaction_backstop / compaction_churn).
+    action: str | None = None
+    pre_tokens: int | None = None
+    post_tokens: int | None = None
+    turns_summarized: int | None = None
+    turns_dropped: int | None = None
+    summary_tokens: int | None = None
+    dry_run: bool | None = None
+    # Backstop-specific.
+    dropped_messages: int | None = None
+    # Churn-specific.
+    churn_count: int | None = None
+    churn_rate: float | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -411,6 +451,67 @@ def parse_log_line(line: str) -> LogEvent | None:
             provider=_provider_from_upstream_url(_first(RE_UPSTREAM_URL, msg)),
             error=body_type.group(1) if body_type else None,
             status=int(status_m.group(1)) if status_m else None,
+            raw=line,
+        )
+    if msg.startswith(COMPACTION_EVENT):
+        # "compaction_event session=<8ch> mode=fast|cheap action=compact|..."
+        # Tolerant: missing numeric fields default to None; never fatal.
+        dry_raw = _first(RE_COMPACTION_DRY_RUN, msg)
+        dry_val: bool | None = None
+        if dry_raw is not None:
+            dry_val = dry_raw == "true"
+        pre_m = RE_COMPACTION_PRE_TOKENS.search(msg)
+        post_m = RE_COMPACTION_POST_TOKENS.search(msg)
+        ts_m = RE_COMPACTION_TURNS_SUMMARIZED.search(msg)
+        td_m = RE_COMPACTION_TURNS_DROPPED.search(msg)
+        st_m = RE_COMPACTION_SUMMARY_TOKENS.search(msg)
+        return LogEvent(
+            "compaction_event",
+            ts,
+            session=_session_from(msg),
+            mode=(_first(RE_COMPACTION_MODE, msg) or "").lower() or None,
+            action=_first(RE_COMPACTION_ACTION, msg),
+            reason=_first(RE_COMPACTION_REASON, msg),
+            pre_tokens=int(pre_m.group(1)) if pre_m else None,
+            post_tokens=int(post_m.group(1)) if post_m else None,
+            turns_summarized=int(ts_m.group(1)) if ts_m else None,
+            turns_dropped=int(td_m.group(1)) if td_m else None,
+            summary_tokens=int(st_m.group(1)) if st_m else None,
+            dry_run=dry_val,
+            raw=line,
+        )
+    if msg.startswith(COMPACTION_BACKSTOP):
+        # "compaction_backstop action=dropped|exhausted dropped_turns=1 dropped_messages=2 ..."
+        dt_m = RE_BACKSTOP_DROPPED_TURNS.search(msg)
+        dm_m = RE_BACKSTOP_DROPPED_MESSAGES.search(msg)
+        eb = re.search(r"estimated_before=(\d+)", msg)
+        ea = re.search(r"estimated_after=(\d+)", msg)
+        return LogEvent(
+            "compaction_backstop",
+            ts,
+            action=_first(RE_COMPACTION_ACTION, msg),
+            turns_dropped=int(dt_m.group(1)) if dt_m else None,
+            dropped_messages=int(dm_m.group(1)) if dm_m else None,
+            pre_tokens=int(eb.group(1)) if eb else None,
+            post_tokens=int(ea.group(1)) if ea else None,
+            raw=line,
+        )
+    if msg.startswith(COMPACTION_CHURN):
+        # "compaction_churn session=<8ch> count=<n> rate_per_hour=<f> exceeds_target=<bool>"
+        cc_m = RE_CHURN_COUNT.search(msg)
+        cr_m = RE_CHURN_RATE.search(msg)
+        churn_rate_val: float | None = None
+        if cr_m:
+            try:
+                churn_rate_val = float(cr_m.group(1))
+            except ValueError:
+                churn_rate_val = None
+        return LogEvent(
+            "compaction_churn",
+            ts,
+            session=_session_from(msg),
+            churn_count=int(cc_m.group(1)) if cc_m else None,
+            churn_rate=churn_rate_val,
             raw=line,
         )
     return None
