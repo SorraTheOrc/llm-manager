@@ -13,6 +13,8 @@ compaction_trigger_ratio, summarizer_ctx_size, summarizer_max_tokens).
 This module verifies the config-reading helpers and startup validation that
 ensure the compaction configuration is sane before the proxy starts.
 """
+import pathlib
+
 import pytest
 from proxy.provider import (
     _DEFAULT_COMPACTION_TRIGGER_RATIO,
@@ -291,9 +293,6 @@ class TestValidateCompactionConfig:
 # ===================================================================
 # Live config validation
 # ===================================================================
-
-
-import pathlib
 
 
 class TestLiveConfigsValidate:
