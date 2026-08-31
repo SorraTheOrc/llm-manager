@@ -2973,7 +2973,6 @@ class TestCompactionReporting:
         assert "No compactions observed in window" in section
 
     def test_report_with_compactions_shows_split(self):
-        schedule = _schedule()
         sessions = {
             "s1": aggregation.SessionStats(**_session("s1", bucket="fast")),
             "s2": aggregation.SessionStats(**_session("s2", bucket="cheap")),

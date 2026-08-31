@@ -513,8 +513,6 @@ def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None 
     # --- Aggregate stats via the shared impact helper ---
     impact = aggregation.compaction_impact(summary.sessions, summary.compaction_events, config)
     sessions_with_compaction = impact["sessions_with_compaction"]
-    by_action = impact["by_action"]
-    by_reason = impact["by_reason"]
     by_bucket = impact["bucket_counts"]
     bucket_dry_live = impact["bucket_dry_live"]
     dry_live = impact["dry_run"]
