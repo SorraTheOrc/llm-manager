@@ -410,9 +410,35 @@ def _translate_chat_to_responses(body_json: dict) -> dict:
     elif body_json.get("max_completion_tokens") is not None:
         out["max_output_tokens"] = body_json["max_completion_tokens"]
 
-    for key in ("stream", "temperature", "top_p", "stop", "tools", "tool_choice"):
+    for key in ("stream", "temperature", "top_p", "stop"):
         if body_json.get(key) is not None:
             out[key] = body_json[key]
+
+    # Tools: chat/completions nests function name/description/parameters under
+    # ``function``; the Responses API requires ``name`` at the tool top level
+    # (``tools[0] missing required field name`` otherwise).
+    tools = body_json.get("tools")
+    if isinstance(tools, list):
+        normalized_tools: list[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                normalized_tools.append(tool)
+                continue
+            fn = tool.get("function")
+            if tool.get("type") == "function" and isinstance(fn, dict):
+                norm_tool: dict[str, Any] = {"type": "function"}
+                for k in ("name", "description", "parameters", "strict"):
+                    if fn.get(k) is not None:
+                        norm_tool[k] = fn[k]
+                normalized_tools.append(norm_tool)
+            else:
+                normalized_tools.append(tool)
+        out["tools"] = normalized_tools
+    elif tools is not None:
+        out["tools"] = tools
+
+    if body_json.get("tool_choice") is not None:
+        out["tool_choice"] = body_json["tool_choice"]
 
     if body_json.get("reasoning_effort"):
         out["reasoning"] = {"effort": body_json["reasoning_effort"]}

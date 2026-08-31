@@ -125,13 +125,42 @@ def test_request_translation_reasoning_effort():
 
 
 def test_request_translation_tools_and_choice_pass_through():
-    """tools / tool_choice are retained verbatim."""
+    """tools are normalized to Responses shape; tool_choice retained."""
     tools = [{"type": "function", "name": "f", "description": "d",
               "parameters": {"type": "object", "properties": {}}}]
     body = {"model": "m", "messages": [], "tools": tools, "tool_choice": "auto"}
     out = _translate_chat_to_responses(body)
     assert out["tools"] == tools
     assert out["tool_choice"] == "auto"
+
+
+def test_request_translation_tools_function_nested_unwrapped():
+    """chat tool (function nested) -> Responses tool (name at top level).
+
+    Regression for upstream 400: ``tools[0] missing required field name`` —
+    the Responses API requires ``name`` at the tool top level, while
+    chat/completions nests it under ``function``.
+    """
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "Adds two numbers",
+            "parameters": {"type": "object", "properties": {"a": {"type": "number"}}},
+            "strict": True,
+        },
+    }]
+    body = {"model": "m", "messages": [], "tools": tools}
+    out = _translate_chat_to_responses(body)
+    assert out["tools"] == [{
+        "type": "function",
+        "name": "calculator",
+        "description": "Adds two numbers",
+        "parameters": {"type": "object", "properties": {"a": {"type": "number"}}},
+        "strict": True,
+    }]
+    # no nested function key remains
+    assert "function" not in out["tools"][0]
 
 
 def test_request_translation_content_parts_normalized():
