@@ -1849,8 +1849,6 @@ async def restart_services(
         server_cfg = srv.config.get("server", {})
         if isinstance(server_cfg, dict):
             server_cfg["session_slot_pool_size"] = int(slot_count)
-            # Also update the legacy key for backward compatibility.
-            server_cfg["local_max_concurrent_queries"] = int(slot_count)
     else:
         server_cfg = srv.config.get("server", {})
         slot_count = int(server_cfg.get("session_slot_pool_size", 1) or 1)

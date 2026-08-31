@@ -52,6 +52,42 @@ For remote models (`proxy_to_remote()`):
 - Adds custom headers from config
 - Forwards the request via `httpx` (streaming for SSE responses)
 
+### Responses-API providers (`api: openai-responses`)
+
+Some upstreams expose **only** the OpenAI Responses API (`/v1/responses`) and
+return HTTP 500 on `/v1/chat/completions` (e.g. the muse model family on
+`https://opencode.ai/zen`). For those providers, set `api: openai-responses`
+on the remote config entry (LP-0MTGK5DQO001Y8H0):
+
+```yaml
+- name: opencode-zen-muse-free
+  type: remote
+  endpoint: https://opencode.ai/zen
+  api_key_env: OPENCODE_API_KEY
+  model: muse-spark-1.2-contributor-free
+  api: openai-responses
+  forward_session_headers: false
+```
+
+Behavior when enabled:
+
+- The request path is rewritten from `v1/chat/completions` to `v1/responses`.
+- The request body is translated: `messages` → `input` (tool-role messages
+  become `function_call_output` items, assistant `tool_calls` become
+  `function_call` items), `max_tokens`/`max_completion_tokens` →
+  `max_output_tokens`, `reasoning_effort` → `reasoning.effort`.
+- Streaming responses are translated Responses SSE → chat/completions SSE
+  (`response.output_text.delta` → content deltas,
+  `response.function_call_arguments.delta` → tool_calls argument deltas,
+  `response.completed` → finish chunk + `[DONE]`), so fallback, watchdog,
+  retry, and empty-detection machinery keeps working unchanged.
+- Non-streaming responses are translated from Responses JSON (`output[]`,
+  `usage.{input,output,total}_tokens`) to the chat/completions JSON shape.
+
+The client always sees chat/completions wire format; `api: openai-responses`
+is purely an upstream-adaptation flag. Omit it (default:
+`openai-completions`) for normal providers.
+
 ## Example Config Structure
 
 ```yaml
@@ -176,7 +212,6 @@ computed reset time passes. Routing decisions during the block log
 `usage_limit_reset_pending` with the reset time and do not contact the
 upstream; once the reset time arrives the domain becomes eligible again
 without operator intervention. `FreeUsageLimitError` responses without a
-reset time get a per-provider cooldown: 24 hours (86400s) for
-`opencode-deepseek-free` and `opencode-big-pickle` (LP-0MSMCM5UG00378G8),
-and the default 3-hour cooldown (10800s) for all other providers. Tracked in
+reset time get the default 3-hour cooldown (10800s; per-provider overrides
+were retired with `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
 **LP-0MSLJPOCC0001ROJ**.

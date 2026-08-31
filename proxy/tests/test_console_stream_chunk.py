@@ -247,3 +247,106 @@ def test_get_request_preview_skips_system():
     }
     preview = _get_request_preview(body_json)
     assert preview == "Hi there!"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LP-0MT6322OT00900OX: enriched stream-error payload in Stream finished lines
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_error_finish_reason_includes_error_payload(tmp_path):
+    """Stream finished: reason=error includes error type/message/action.
+
+    When a synthetic finish_reason: error event carries an enriched error
+    object (LP-0MSETOTWY000SU0Z), the log line must surface the payload
+    so the proxy-usage analysis tool can classify it (LP-0MT6322OT00900OX).
+    """
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = (
+        b'data: {"choices": [{"delta": {}, "finish_reason": "error", "error": '
+        b'{"type": "stall_exhausted", "message": "Retry chain exhausted", '
+        b'"provider": "opencode-go", "model": "deepseek-v4-flash", '
+        b'"entry": "opencode-go-2-deepseek", "suggested_action": '
+        b'"Check provider availability and retry"}}]}\n\n'
+    )
+    server.log_response_chunk(
+        chunk, session_id="sess789", model="deepseek-v4-flash",
+        provider="opencode-go", entry="opencode-go-2-deepseek",
+    )
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=error" in out
+    assert "error_type=stall_exhausted" in out
+    assert "error_message=Retry chain exhausted" in out
+    assert "suggested_action=Check provider availability and retry" in out
+
+
+def test_error_finish_reason_missing_payload_fields(tmp_path):
+    """Error finish_reason without optional payload fields omits them."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    # Minimal enriched error (only type is present)
+    chunk = (
+        b'data: {"choices": [{"delta": {}, "finish_reason": "error", "error": '
+        b'{"type": "stream_exception"}}]}\n\n'
+    )
+    server.log_response_chunk(chunk, session_id="s1")
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=error" in out
+    assert "error_type=stream_exception" in out
+    assert "error_message=" not in out
+    assert "suggested_action=" not in out
+
+
+def test_error_finish_reason_without_error_object_omits_payload(tmp_path):
+    """A finish_reason=error without an error object omits payload fields."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = (
+        b'data: {"choices": [{"delta": {}, "finish_reason": "error"}]}\n\n'
+    )
+    server.log_response_chunk(chunk, session_id="s2")
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=error" in out
+    assert "error_type=" not in out
+    assert "error_message=" not in out
+    assert "suggested_action=" not in out
+
+
+def test_non_error_finish_reason_no_error_payload(tmp_path):
+    """Non-error finish_reasons must not carry error payload fields."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = (
+        b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
+    )
+    server.log_response_chunk(chunk, session_id="s3")
+
+    out = strio.getvalue()
+    assert "Stream finished: reason=stop" in out
+    assert "error_type=" not in out
+    assert "error_message=" not in out
+
+
+def test_error_finish_reason_includes_provider_model_entry(tmp_path):
+    """Error log line also carries session/provider/model/entry params."""
+    logger, ch, strio = _configure_logger_for_test(tmp_path)
+
+    chunk = (
+        b'data: {"choices": [{"delta": {}, "finish_reason": "error", "error": '
+        b'{"type": "empty_response"}}]}\n\n'
+    )
+    server.log_response_chunk(
+        chunk, session_id="sess01", model="deepseek-v4-flash",
+        provider="opencode-go", entry="opencode-go-2-deepseek",
+    )
+
+    out = strio.getvalue()
+    assert "error_type=empty_response" in out
+    assert "session=sess01" in out
+    assert "provider=opencode-go" in out
+    assert "model=deepseek-v4-flash" in out
+    assert "entry=opencode-go-2-deepseek" in out

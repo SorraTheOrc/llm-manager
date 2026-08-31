@@ -158,7 +158,7 @@ def _mock_server_state(monkeypatch):
             "llama_router_mode": False,
             "llama_server_port": 8080,
             "max_concurrent_queries": 4,
-            "local_max_concurrent_queries": 1,
+            "session_slot_pool_size": 1,
             "llama_request_timeout": 30,
             "session_single_flight_mode": "bypass",
             "disconnect_cleanup_timeout": 1,
@@ -275,12 +275,12 @@ async def test_proxy_to_local_non_streaming_adds_resolved_model_header(monkeypat
 
 @pytest.mark.asyncio
 async def test_proxy_to_remote_streaming_adds_resolved_model_header(mock_request):
-    """proxy_to_remote() adds X-Resolved-Model: opencode/deepseek-v4-flash-free to streaming responses."""
+    """proxy_to_remote() adds X-Resolved-Model: opencode/deepseek-v4-flash to streaming responses."""
     provider_cfg = {
         "name": "opencode",
         "type": "remote",
         "endpoint": "https://api.opencode.com/v1",
-        "model": "deepseek-v4-flash-free",
+        "model": "deepseek-v4-flash",
     }
 
     sse_chunk = b'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}\n\ndata: [DONE]\n\n'
@@ -304,8 +304,8 @@ async def test_proxy_to_remote_streaming_adds_resolved_model_header(mock_request
     assert isinstance(result, StreamingResponse), f"Expected StreamingResponse, got {type(result).__name__}"
     headers = dict(result.headers)
     assert "x-resolved-model" in headers, "X-Resolved-Model header missing from remote streaming response"
-    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash-free", \
-        f"Expected opencode/deepseek-v4-flash-free, got {headers['X-Resolved-Model']}"
+    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash", \
+        f"Expected opencode/deepseek-v4-flash, got {headers['X-Resolved-Model']}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -381,7 +381,7 @@ async def test_proxy_with_fallback_sets_resolved_model_header(monkeypatch):
             "provider_cooldown_seconds": 60,
             "local_slot_exhaustion_retry_attempts": 0,
             "local_slot_exhaustion_retry_delay_seconds": 0.2,
-            "local_max_concurrent_queries": 4,
+            "session_slot_pool_size": 4,
         }
     }
 
@@ -493,7 +493,7 @@ async def test_fallback_overrides_resolved_model_header(monkeypatch):
             "provider_cooldown_seconds": 60,
             "local_slot_exhaustion_retry_attempts": 0,
             "local_slot_exhaustion_retry_delay_seconds": 0.2,
-            "local_max_concurrent_queries": 4,
+            "session_slot_pool_size": 4,
         }
     }
 
@@ -590,10 +590,10 @@ async def test_proxy_to_remote_header_reflects_upstream_model_override(mock_requ
         "name": "opencode",
         "type": "remote",
         "endpoint": "https://api.opencode.com/v1",
-        "model": "deepseek-v4-flash-free",  # upstream model override
+        "model": "deepseek-v4-flash",  # upstream model override
     }
 
-    # Body sends "plan" but provider cfg overrides to "deepseek-v4-flash-free"
+    # Body sends "plan" but provider cfg overrides to "deepseek-v4-flash"
     sse_chunk = b'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}\n\ndata: [DONE]\n\n'
     mock_resp = _make_mock_remote_response(status_code=200, body=sse_chunk)
     mock_client_cls = _make_mock_client(mock_resp)
@@ -615,8 +615,8 @@ async def test_proxy_to_remote_header_reflects_upstream_model_override(mock_requ
     assert isinstance(result, StreamingResponse), f"Expected StreamingResponse, got {type(result).__name__}"
     headers = dict(result.headers)
     assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
-    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash-free", \
-        f"Expected opencode/deepseek-v4-flash-free, got {headers['X-Resolved-Model']}"
+    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash", \
+        f"Expected opencode/deepseek-v4-flash, got {headers['X-Resolved-Model']}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -644,11 +644,11 @@ def test_build_resolved_model_value_falls_back_to_name():
         "name": "opencode",
         "type": "remote",
         "endpoint": "https://api.opencode.com/v1",
-        "model": "deepseek-v4-flash-free",
+        "model": "deepseek-v4-flash",
     }
     result = provider._build_resolved_model_value(cfg)
-    assert result == "opencode/deepseek-v4-flash-free", \
-        f"Expected opencode/deepseek-v4-flash-free, got {result}"
+    assert result == "opencode/deepseek-v4-flash", \
+        f"Expected opencode/deepseek-v4-flash, got {result}"
 
 
 def test_build_resolved_model_value_local_provider():
@@ -715,11 +715,11 @@ async def test_proxy_with_fallback_uses_provider_field(monkeypatch):
     model_config = {
         "providers": [
             {
-                "name": "opencode-deepseek-free",
+                "name": "opencode-deepseek",
                 "provider": "opencode",
                 "type": "remote",
                 "endpoint": "https://api.opencode.com/v1",
-                "model": "deepseek-v4-flash-free",
+                "model": "deepseek-v4-flash",
             },
         ]
     }
@@ -729,7 +729,7 @@ async def test_proxy_with_fallback_uses_provider_field(monkeypatch):
             "provider_cooldown_seconds": 60,
             "local_slot_exhaustion_retry_attempts": 0,
             "local_slot_exhaustion_retry_delay_seconds": 0.2,
-            "local_max_concurrent_queries": 4,
+            "session_slot_pool_size": 4,
         }
     }
 
@@ -754,8 +754,8 @@ async def test_proxy_with_fallback_uses_provider_field(monkeypatch):
     assert isinstance(result, Response), f"Expected Response, got {type(result).__name__}"
     headers = dict(result.headers)
     assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
-    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash-free", \
-        f"Expected opencode/deepseek-v4-flash-free, got {headers['X-Resolved-Model']}"
+    assert headers["x-resolved-model"] == "opencode/deepseek-v4-flash", \
+        f"Expected opencode/deepseek-v4-flash, got {headers['X-Resolved-Model']}"
 
 
 # ===================================================================

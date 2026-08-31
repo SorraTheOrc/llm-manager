@@ -109,7 +109,7 @@ BASE_SERVER_CONFIG = {
         "llama_router_mode": False,
         "llama_server_port": 8080,
         "max_concurrent_queries": 4,
-        "local_max_concurrent_queries": 1,
+        "session_slot_pool_size": 1,
         "llama_request_timeout": 30,
         "session_single_flight_mode": "bypass",
         "disconnect_cleanup_timeout": 1,

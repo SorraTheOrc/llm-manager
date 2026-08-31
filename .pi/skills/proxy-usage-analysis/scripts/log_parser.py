@@ -46,6 +46,19 @@ RE_CONTENTION_DURATION = re.compile(r"queued_duration=([\d.]+)s")
 RE_CONTENTION_DEPTH = re.compile(r"\bdepth=(\d+)")
 RE_CONTENTION_POLICY = re.compile(r"\bpolicy=(\S+)")
 
+# Enriched error payload on ``Stream finished: reason=error`` (LP-0MT6322OT00900OX).
+# The proxy now logs ``error_type=<type> error_message=<msg> suggested_action=<act>``
+# before the trailing session/provider/model/entry fields. Messages/actions may
+# contain spaces, so values are captured non-greedily up to the next known key
+# (or end of line); ``error_message`` may be followed by ``suggested_action``.
+RE_ERROR_TYPE = re.compile(r"\berror_type=(\S+)")
+RE_ERROR_MESSAGE = re.compile(
+    r"\berror_message=(.+?)(?=\s+(?:session|provider|model|entry|request|suggested_action)=|$)"
+)
+RE_SUGGESTED_ACTION = re.compile(
+    r"\bsuggested_action=(.+?)(?=\s+(?:session|provider|model|entry|request)=|$)"
+)
+
 # Error-line extractors.
 RE_BACKEND_ATTEMPT = re.compile(r"attempt=(\d+/\d+)")
 RE_BACKEND_SIGNAL = re.compile(r"signal=([\w_]+)")
@@ -97,6 +110,19 @@ UPSTREAM_ERROR = "[remote] upstream error"
 # profiles), not the mode at analysis time (LP-0MSPZUD4G007IYGH).
 MODE_SWITCH_PREFIX = "Mode scheduler: applied scheduled mode"
 RE_MODE_SWITCH = re.compile(r"Mode scheduler: applied scheduled mode (\w+)")
+
+# MANUAL mode switches (POST /admin/set-mode, LP-0MSMF25V9002AY1J) persist the
+# new mode and restart the proxy but do NOT emit an ``applied scheduled mode``
+# line; the grandfathering init that runs on every restart then reports the
+# actually-active mode as ``Grandfathering: enabled; other-mode config <file>
+# (current=<mode>)`` (LP-0MT1EE315007AKXG). The ``Mode scheduler: enabled with
+# N entries`` announcement fires on BOTH scheduled and manual transitions and
+# is therefore not a reliable signal; the ``(current=<mode>)`` field on the
+# grandfathering line is. The ``restart_services: router-mode restart complete
+# (N slots)`` line is corroborating evidence only (slot count -> mode mapping
+# is deployment-specific and never parsed).
+GRANDFATHERING_PREFIX = "Grandfathering: enabled; other-mode config"
+RE_MANUAL_MODE_CURRENT = re.compile(r"\(current=(\w+)\)")
 
 # Best-effort provider attribution for ``[remote] upstream error`` lines: the
 # line carries only the target URL, so the provider is inferred from the
@@ -184,6 +210,12 @@ class LogEvent:
     policy: str | None = None
     # Error-taxonomy fields (populated for error kinds only).
     error: str | None = None
+    # Enriched error payload (LP-0MT6322OT00900OX): carried on
+    # ``stream_finish_error`` when the log line includes the enriched
+    # error fields.
+    error_type: str | None = None
+    error_message: str | None = None
+    suggested_action: str | None = None
     entry: str | None = None
     status: int | None = None
     attempt: str | None = None
@@ -242,7 +274,9 @@ def parse_log_line(line: str) -> LogEvent | None:
             re.compile(r"\breason=(\w+)"), msg
         )
         # ``Stream finished: reason=error`` is the client-visible synthetic
-        # error event (no error payload); keep it distinct from normal finishes.
+        # error event.  Prior to LP-0MT6322OT00900OX the log line carried no
+        # error payload; now it may carry ``error_type``, ``error_message``,
+        # and ``suggested_action`` from the enriched error object.
         if reason == "error":
             return LogEvent(
                 "stream_finish_error",
@@ -252,6 +286,9 @@ def parse_log_line(line: str) -> LogEvent | None:
                 session=_session_from(msg),
                 reason=reason,
                 error="finish_reason:error",
+                error_type=_first(RE_ERROR_TYPE, msg),
+                error_message=_first(RE_ERROR_MESSAGE, msg),
+                suggested_action=_first(RE_SUGGESTED_ACTION, msg),
                 entry=_first(RE_ENTRY, msg),
                 raw=line,
             )
@@ -313,6 +350,19 @@ def parse_log_line(line: str) -> LogEvent | None:
         # "Mode scheduler: applied scheduled mode cheap" — the mode that the
         # scheduler applied at this timestamp (LP-0MSM5K4TX004MICX).
         m = RE_MODE_SWITCH.search(msg)
+        if m is None:
+            return None
+        mode = m.group(1).lower()
+        if mode not in ("fast", "cheap"):
+            return None
+        return LogEvent("mode_switch", ts, mode=mode)
+    if msg.startswith(GRANDFATHERING_PREFIX):
+        # "Grandfathering: enabled; other-mode config config-fast.yaml
+        # (current=cheap)" — the actually-active mode after a restart. Manual
+        # mode switches emit this (and NOT an applied-scheduled-mode line), so
+        # it is what reconstructs manual-switch transitions in the mode
+        # timeline (LP-0MT1EE315007AKXG).
+        m = RE_MANUAL_MODE_CURRENT.search(msg)
         if m is None:
             return None
         mode = m.group(1).lower()

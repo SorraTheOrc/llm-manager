@@ -1,0 +1,485 @@
+{
+  "by_band": {
+    "extreme": {
+      "A": {
+        "cheap": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 60,
+          "prefill_est_avg": 101425.95,
+          "prefill_est_total": 6085557,
+          "response_tokens_avg": 484.95,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.017763755982741714,
+          "total_p95_ms": 0.05023130995687097,
+          "ttft_p50_ms": 349.0,
+          "ttft_p95_ms": 575.0
+        },
+        "fast": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 233,
+          "prefill_est_avg": 124319.15450643777,
+          "prefill_est_total": 28966363,
+          "response_tokens_avg": 438.18025751072963,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.06792911502998322,
+          "total_p95_ms": 0.18586986092850566,
+          "ttft_p50_ms": 347.0,
+          "ttft_p95_ms": 575.0
+        }
+      },
+      "B": {
+        "cheap": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 60,
+          "prefill_est_avg": 69983.18333333333,
+          "prefill_est_total": 4198991,
+          "response_tokens_avg": 455.8833333333333,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.02190329402219504,
+          "total_p95_ms": 0.04768444097135216,
+          "ttft_p50_ms": 349.0,
+          "ttft_p95_ms": 575.0
+        },
+        "fast": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 233,
+          "prefill_est_avg": 43592.18454935622,
+          "prefill_est_total": 10156979,
+          "response_tokens_avg": 438.7381974248927,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.06743848707992584,
+          "total_p95_ms": 0.1877964090090245,
+          "ttft_p50_ms": 347.0,
+          "ttft_p95_ms": 575.0
+        }
+      },
+      "C": {
+        "cheap": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 60,
+          "prefill_est_avg": 101425.95,
+          "prefill_est_total": 6085557,
+          "response_tokens_avg": 461.6666666666667,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.01629639999009669,
+          "total_p95_ms": 0.03712950099725276,
+          "ttft_p50_ms": 349.0,
+          "ttft_p95_ms": 575.0
+        },
+        "fast": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 233,
+          "prefill_est_avg": 124319.15450643777,
+          "prefill_est_total": 28966363,
+          "response_tokens_avg": 443.4334763948498,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.0171518309507519,
+          "total_p95_ms": 0.04634106298908591,
+          "ttft_p50_ms": 347.0,
+          "ttft_p95_ms": 575.0
+        }
+      }
+    },
+    "trigger-cap": {
+      "A": {
+        "cheap": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 55,
+          "prefill_est_avg": 51787.836363636365,
+          "prefill_est_total": 2848331,
+          "response_tokens_avg": 428.3636363636364,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.01767362910322845,
+          "total_p95_ms": 0.06071685196366161,
+          "ttft_p50_ms": 328.0,
+          "ttft_p95_ms": 580.0
+        },
+        "fast": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 68,
+          "prefill_est_avg": 64726.26470588235,
+          "prefill_est_total": 4401386,
+          "response_tokens_avg": 457.4264705882353,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.20879568392410874,
+          "total_p95_ms": 0.27054188901092857,
+          "ttft_p50_ms": 367.0,
+          "ttft_p95_ms": 590.0
+        }
+      },
+      "B": {
+        "cheap": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 55,
+          "prefill_est_avg": 37107.0,
+          "prefill_est_total": 2040885,
+          "response_tokens_avg": 465.3454545454546,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.02179030899424106,
+          "total_p95_ms": 0.057787640020251274,
+          "ttft_p50_ms": 328.0,
+          "ttft_p95_ms": 580.0
+        },
+        "fast": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 68,
+          "prefill_est_avg": 39139.367647058825,
+          "prefill_est_total": 2661477,
+          "response_tokens_avg": 442.72058823529414,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.21353860606905073,
+          "total_p95_ms": 0.2744226179784164,
+          "ttft_p50_ms": 367.0,
+          "ttft_p95_ms": 590.0
+        }
+      },
+      "C": {
+        "cheap": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 55,
+          "prefill_est_avg": 51787.836363636365,
+          "prefill_est_total": 2848331,
+          "response_tokens_avg": 454.8363636363636,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.01642897294368595,
+          "total_p95_ms": 0.038807066972367465,
+          "ttft_p50_ms": 328.0,
+          "ttft_p95_ms": 580.0
+        },
+        "fast": {
+          "completion_rate": 0.0,
+          "failure_rate": 0.0,
+          "gate_rate": 0.0,
+          "n": 68,
+          "prefill_est_avg": 64726.26470588235,
+          "prefill_est_total": 4401386,
+          "response_tokens_avg": 464.7352941176471,
+          "rubric": {
+            "completeness": 1.0,
+            "correctness": 2.0,
+            "detail_recall": 3.0,
+            "formatting": 3.0,
+            "instruction_adherence": 3.0
+          },
+          "rubric_mean": 2.4,
+          "total_p50_ms": 0.016387442010454834,
+          "total_p95_ms": 0.04288568301126361,
+          "ttft_p50_ms": 367.0,
+          "ttft_p95_ms": 590.0
+        }
+      }
+    }
+  },
+  "csv_path": "proxy/experiment-results/metrics.csv",
+  "decision": {
+    "checks": [
+      {
+        "detail": "B/A rubric = 1.000",
+        "mode": "fast",
+        "pass": true,
+        "rule": "rubric"
+      },
+      {
+        "detail": "completion delta B-A = 0.0pp",
+        "mode": "fast",
+        "pass": true,
+        "rule": "completion"
+      },
+      {
+        "detail": "failure delta B-A = 0.0pp",
+        "mode": "fast",
+        "pass": true,
+        "rule": "failures"
+      },
+      {
+        "detail": "B/A rubric = 1.000",
+        "mode": "cheap",
+        "pass": true,
+        "rule": "rubric"
+      },
+      {
+        "detail": "completion delta B-A = 0.0pp",
+        "mode": "cheap",
+        "pass": true,
+        "rule": "completion"
+      },
+      {
+        "detail": "failure delta B-A = 0.0pp",
+        "mode": "cheap",
+        "pass": true,
+        "rule": "failures"
+      },
+      {
+        "detail": "prefill reduction = 61.6%",
+        "mode": "fast",
+        "pass": true,
+        "rule": "prefill_reduction"
+      },
+      {
+        "detail": "prefill reduction = 30.2%",
+        "mode": "cheap",
+        "pass": true,
+        "rule": "prefill_reduction"
+      },
+      {
+        "detail": "TTFT P95 B vs A = +0.0%",
+        "mode": "fast",
+        "pass": true,
+        "rule": "ttft"
+      },
+      {
+        "detail": "TTFT P95 B vs A = +0.0%",
+        "mode": "cheap",
+        "pass": true,
+        "rule": "ttft"
+      }
+    ],
+    "go": true,
+    "go_requires_waiver": false,
+    "rationale": "quality gate met; efficiency gate met"
+  },
+  "dry_run": true,
+  "generated_at": "2026-08-30T16:15:56.388874",
+  "metrics": {
+    "A": {
+      "cheap": {
+        "completion_rate": 0.0,
+        "failure_rate": 0.0,
+        "gate_rate": 0.0,
+        "n": 115,
+        "prefill_est_avg": 77685.98260869565,
+        "prefill_est_total": 8933888,
+        "response_tokens_avg": 457.88695652173914,
+        "rubric": {
+          "completeness": 1.0,
+          "correctness": 2.0,
+          "detail_recall": 3.0,
+          "formatting": 3.0,
+          "instruction_adherence": 3.0
+        },
+        "rubric_mean": 2.4,
+        "total_p50_ms": 0.017730826046317816,
+        "total_p95_ms": 0.05583960493095219,
+        "ttft_p50_ms": 344.0,
+        "ttft_p95_ms": 580.0
+      },
+      "fast": {
+        "completion_rate": 0.0,
+        "failure_rate": 0.0,
+        "gate_rate": 0.0,
+        "n": 301,
+        "prefill_est_avg": 110856.30897009966,
+        "prefill_est_total": 33367749,
+        "response_tokens_avg": 442.5282392026578,
+        "rubric": {
+          "completeness": 1.0,
+          "correctness": 2.0,
+          "detail_recall": 3.0,
+          "formatting": 3.0,
+          "instruction_adherence": 3.0
+        },
+        "rubric_mean": 2.4,
+        "total_p50_ms": 0.08229867392219603,
+        "total_p95_ms": 0.2481135040288791,
+        "ttft_p50_ms": 350.0,
+        "ttft_p95_ms": 579.0
+      }
+    },
+    "B": {
+      "cheap": {
+        "completion_rate": 0.0,
+        "failure_rate": 0.0,
+        "gate_rate": 0.0,
+        "n": 115,
+        "prefill_est_avg": 54259.791304347826,
+        "prefill_est_total": 6239876,
+        "response_tokens_avg": 460.4086956521739,
+        "rubric": {
+          "completeness": 1.0,
+          "correctness": 2.0,
+          "detail_recall": 3.0,
+          "formatting": 3.0,
+          "instruction_adherence": 3.0
+        },
+        "rubric_mean": 2.4,
+        "total_p50_ms": 0.021821147995069623,
+        "total_p95_ms": 0.04978126904461533,
+        "ttft_p50_ms": 344.0,
+        "ttft_p95_ms": 580.0
+      },
+      "fast": {
+        "completion_rate": 0.0,
+        "failure_rate": 0.0,
+        "gate_rate": 0.0,
+        "n": 301,
+        "prefill_est_avg": 42586.232558139534,
+        "prefill_est_total": 12818456,
+        "response_tokens_avg": 439.63787375415285,
+        "rubric": {
+          "completeness": 1.0,
+          "correctness": 2.0,
+          "detail_recall": 3.0,
+          "formatting": 3.0,
+          "instruction_adherence": 3.0
+        },
+        "rubric_mean": 2.4,
+        "total_p50_ms": 0.08485289989039302,
+        "total_p95_ms": 0.25216834305319935,
+        "ttft_p50_ms": 350.0,
+        "ttft_p95_ms": 579.0
+      }
+    },
+    "C": {
+      "cheap": {
+        "completion_rate": 0.0,
+        "failure_rate": 0.0,
+        "gate_rate": 0.0,
+        "n": 115,
+        "prefill_est_avg": 77685.98260869565,
+        "prefill_est_total": 8933888,
+        "response_tokens_avg": 458.4,
+        "rubric": {
+          "completeness": 1.0,
+          "correctness": 2.0,
+          "detail_recall": 3.0,
+          "formatting": 3.0,
+          "instruction_adherence": 3.0
+        },
+        "rubric_mean": 2.4,
+        "total_p50_ms": 0.016320558032020926,
+        "total_p95_ms": 0.03741570794954896,
+        "ttft_p50_ms": 344.0,
+        "ttft_p95_ms": 580.0
+      },
+      "fast": {
+        "completion_rate": 0.0,
+        "failure_rate": 0.0,
+        "gate_rate": 0.0,
+        "n": 301,
+        "prefill_est_avg": 110856.30897009966,
+        "prefill_est_total": 33367749,
+        "response_tokens_avg": 448.24584717607974,
+        "rubric": {
+          "completeness": 1.0,
+          "correctness": 2.0,
+          "detail_recall": 3.0,
+          "formatting": 3.0,
+          "instruction_adherence": 3.0
+        },
+        "rubric_mean": 2.4,
+        "total_p50_ms": 0.017042024992406368,
+        "total_p95_ms": 0.043174174963496625,
+        "ttft_p50_ms": 350.0,
+        "ttft_p95_ms": 579.0
+      }
+    }
+  },
+  "min_extreme": 10,
+  "min_tasks": 30,
+  "mode": [
+    "fast",
+    "cheap"
+  ],
+  "num_tasks": 416,
+  "report_path": "proxy/experiment-results/report.md",
+  "results_path": "proxy/experiment-results/run-20260830-161556.jsonl"
+}

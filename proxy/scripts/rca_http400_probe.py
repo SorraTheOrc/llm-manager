@@ -34,13 +34,6 @@ AUTH_PATH = Path.home() / ".pi" / "agent" / "auth.json"
 # key_lookup mirrors the api_key_env names used in config.
 ENDPOINTS = [
     {
-        "name": "opencode-deepseek-free",
-        "provider": "opencode",
-        "url": "https://opencode.ai/zen/v1/chat/completions",
-        "key_env": "OPENCODE_API_KEY",
-        "model": "deepseek-v4-flash-free",
-    },
-    {
         "name": "opencode-go-deepseek",
         "provider": "opencode-go",
         "url": "https://opencode.ai/zen/go/v1/chat/completions",

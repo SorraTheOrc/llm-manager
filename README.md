@@ -1,7 +1,61 @@
 LLM Manager
 ===========
 
+A local LLM proxy that exposes OpenAI-compatible APIs for both local
+(llama-server) and remote (OpenAI, Anthropic, etc.) models behind a
+single endpoint, with a live dashboard, model routing and switching,
+per-session slot management, session recording, and full server
+administration from the browser.
+
 This repository contains a local copy of the llm proxy with an added model statistics panel and SSE status broadcasts. It was pushed to `SorraTheOrc/llm-manager` for development and review.
+
+Key features
+------------
+
+### API & Routing
+- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings` passthrough endpoints that route automatically to the correct backend.
+- **Local + remote backends** — serves local models via llama-server (in a podman container) and proxies remote models to external APIs (OpenAI, Anthropic, etc.).
+- **Model aliases & wildcards** — configure aliases such as `gpt-*` to match any model starting with a prefix.
+- **Router mode** — multi-model routing with automatic model loading, fallback models, and a router status indicator in the UI.
+- **Automatic model switching** — `/admin/switch-model/{model}` switches the running model; the UI shows live loading progress via SSE.
+
+### Live Dashboard
+- **Status bar** — proxy, current model, router mode, and llama-server status at a glance.
+- **Model statistics panel** — live context size, KV cache tokens, and total tokens sent/received, updated over SSE.
+- **Real-time slot status** — per-slot cards showing idle/processing/waiting states with token progress for the local server.
+- **Model endpoints table** — overview of every configured model with its provider type (local/remote), primary endpoint, and fallbacks.
+- **Server-Sent Events (SSE)** — `/events` pushes live status, model-switch, and slot updates to the UI.
+- **Tabbed interface** — Home (slots & endpoint overview), Models (test console & routing info), and API (endpoint reference).
+
+### Interactive Testing
+- **Quick Test console** — chat directly with the current model from the browser with streaming responses.
+- **API endpoint tester** — one-click "Test" for chat, completions, models, and embeddings, with a model picker and request/response viewer.
+
+### Logging & Observability
+- **Live dual-pane log viewer** (`/logs`) — streaming proxy and llama-server logs with line limits, autoscroll, clear, and download controls.
+- **Per-slot log isolation** — a dedicated Slots tab shows a live log section per llama-server slot, filterable server-side by slot/session.
+- **Request summary** — per-endpoint request counts and token statistics (with per-role breakdowns for chat traffic).
+- **Session recordings** — every prompt/completion/embedding is recorded to disk; browse sessions, replay conversations, and inspect raw JSON via the admin API.
+- **Prometheus metrics** — `/metrics` endpoint for monitoring.
+
+### Session & Slot Management
+- **Job-level slot scheduler** — configurable slot pool with queueing, per-job timeouts, and load-aware skip to avoid ReadTimeouts under concurrency.
+- **Dispatch leases** — per-session reservation of the local backend with adaptive timeouts and prefill-progress polling.
+- **Session tracking** — active session list with preview text, model, and provider; sessions can be deleted via the admin API.
+- **Session recording retention** — automatic pruning of old recordings with configurable retention days and background intervals.
+- **Grandfathering** — legacy session migration for in-flight requests across proxy restarts.
+
+### Administration
+- **Health check** — `/health` reports readiness, self-healing state, GPU wedge detection, and TTS server status.
+- **Mode switching** — toggle between Fast (cloud-backed) and Cheap (2-slot local pool) runtime modes.
+- **Hot config reload** — `/admin/reload-config` re-reads configuration without a restart.
+- **Server control** — stop/restart the llama-server from the UI (with confirmation), plus TTS server lifecycle management.
+- **Self-healing & recovery** — automatic backend recovery, GPU wedge detection, and disconnect-reaper middleware for stalled clients.
+- **OpenAPI docs** — built-in Swagger UI and ReDoc for API exploration.
+
+### Text-to-Speech
+- **TTS server integration** — managed local TTS server with health monitoring in the `/health` endpoint.
+- **Voice and speech APIs** — `/v1/voices` lists available voices and `/v1/audio/speech` synthesizes speech.
 
 Key files
 - `proxy/server.py` — server, SSE, and the model stats query helper
@@ -167,10 +221,25 @@ Session recording is configured under the ``session_recording`` key in
 
 ```yaml
 session_recording:
-  path: proxy/session-recordings/   # Directory for recording files
+  path: ~/.llm-proxy/session-recordings/   # Directory for recording files
+  retention_days: 3                 # Prune recordings older than this (<= 0 disables)
+  prune_interval_seconds: 3600      # How often the retention prune re-runs
 ```
 
-The ``path`` defaults to ``proxy/session-recordings/`` if not specified.
+The ``path`` defaults to ``~/.llm-proxy/session-recordings/`` if not
+specified — an absolute location outside the proxy source tree so runtime
+artifacts never pollute the repository (LP-0MT2TC7FG008BXIU).
+
+### Retention pruning
+
+Recordings older than ``session_recording.retention_days`` (default 3 days)
+are deleted automatically — once at startup and then every
+``session_recording.prune_interval_seconds`` (default 3600s) while the proxy
+runs (LP-0MT2TC3PB005H1RD). Pruning runs as a background task, never blocks
+startup or request handling, never follows symlinks out of the recording
+root, and only touches files matching the recorder naming convention
+(``*-request.json`` / ``*-response.json``). Set ``retention_days: 0`` to
+disable pruning.
 
 ### Directory Structure
 

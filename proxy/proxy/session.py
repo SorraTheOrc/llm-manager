@@ -953,16 +953,31 @@ def _build_slot_context(
     # SAME source as the routing clamp (local_model_ctx_size // active_slots
     # - output headroom) — so it auto-adapts to slot-count/ctx-size changes
     # instead of freezing at a static value.
+    # LP-0MTBOX45O005LD1S: when a hard-routing cap is configured, use that
+    # as the single source for both persistence and routing so cache-restore
+    # is never attempted above the routing cap (consistent AC4).
     if max_prompt_tokens <= 0:
-        from proxy.provider import (
-            _get_active_local_ctx_size,
-            _get_active_local_slots,
-            effective_per_slot_threshold,
-        )
-        max_prompt_tokens = effective_per_slot_threshold(
-            _get_active_local_ctx_size(server_config),
-            _get_active_local_slots(server_config),
-        )
+        # Try the hard cap first (mode-aware); fall through to the
+        # per-slot threshold when no hard cap is configured.
+        try:
+            from proxy.mode import read_mode as _read_mode
+            from proxy.provider import compute_hard_routing_cap
+            _mode = _read_mode()
+            _hard_cap = compute_hard_routing_cap(_mode, server_config)
+            if _hard_cap > 0:
+                max_prompt_tokens = _hard_cap
+        except Exception:
+            pass
+        if max_prompt_tokens <= 0:
+            from proxy.provider import (
+                _get_active_local_ctx_size,
+                _get_active_local_slots,
+                effective_per_slot_threshold,
+            )
+            max_prompt_tokens = effective_per_slot_threshold(
+                _get_active_local_ctx_size(server_config),
+                _get_active_local_slots(server_config),
+            )
     per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)
     need_estimate = max_prompt_tokens > 0 or per_token > 0
     # Resolve the request's model config so the persistence estimate uses the
@@ -1056,7 +1071,7 @@ async def _invalidate_session_and_slot(
                     try:
                         _srv().logger.info(
                             "lease_released session=%s reason=%s",
-                            session_id[:8] if session_id else "unknown",
+                            session_id if session_id else "unknown",
                             reason or "invalidation",
                         )
                     except Exception:

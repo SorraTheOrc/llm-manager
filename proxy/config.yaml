@@ -16,10 +16,8 @@
 # FreeUsageLimitError cooldown (LP-0MSMCM5UG00378G8):
 #   When a provider returns HTTP 429 with error.type = "FreeUsageLimitError"
 #   (no explicit reset duration), the proxy marks it unavailable for a
-#   per-provider cooldown: 24 hours (86400s) for `opencode-deepseek-free` and
-#   `opencode-big-pickle`, and 3 hours (10800s, LP-0MRGU0I91006ODFD) for all
-#   other providers. The override map lives in proxy/provider.py
-#   (`_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES`).
+#   per-provider cooldown: 3 hours (10800s, LP-0MRGU0I91006ODFD) applied to all
+#   providers.
 #
 # Failure-domain grouping (LP-0MSG45I8Q0020N1F):
 #   Provider entries that share the same normalized endpoint form a SINGLE
@@ -46,8 +44,8 @@
 #                     provider unrestricted. Malformed entries are logged and
 #                     ignored (fail-open). The deepseek-v4-flash provider
 #                     (direct api.deepseek.com entry and all opencode-hosted
-#                     deepseek entries: opencode-deepseek-free, opencode-go-3-
-#                     deepseek, opencode-go-2-deepseek, opencode-go-deepseek)
+#                     deepseek entries: opencode-go-3-deepseek, opencode-go-2-
+#                     deepseek, opencode-go-deepseek)
 #                     are currently timed to off-peak UTC windows
 #                     (see their entries).
 #                     Example:
@@ -57,6 +55,16 @@
 #                         api_key_env: DEEPSEEK_API_KEY
 #                         model: deepseek-v4-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
+#
+# Responses-API mode (optional, remote providers only):
+#   api - "openai-completions" (default) or "openai-responses". Some
+#        upstreams (opencode.ai zen/go for the muse model family) expose
+#        only the OpenAI Responses API (/v1/responses) and return HTTP 500
+#        on /v1/chat/completions. Setting api: openai-responses makes the
+#        proxy route the request to /v1/responses and translate between the
+#        chat/completions and Responses wire formats (request bodies,
+#        streaming SSE, non-streaming JSON) transparently for the client
+#        (LP-0MTGK5DQO001Y8H0). omit the field for the default behavior.
 #
 # Example with providers list:
 #   mimo-v2.5:
@@ -129,9 +137,9 @@ logging:
 #
 # Fields:
 #   path: Directory where recordings are stored.
-#         Default: proxy/session-recordings/
+#         Default: ~/.llm-proxy/session-recordings/ (outside the proxy tree)
 session_recording:
-  path: proxy/session-recordings/
+  path: ~/.llm-proxy/session-recordings/
   # Maximum number of entries kept in the in-memory session metadata index
   # (LP-0MSNKMZCP003T8OG). Least-recently-active sessions are evicted when
   # the index exceeds this size.
@@ -140,24 +148,32 @@ session_recording:
   # at most this many most-recent session directories (by dir mtime), never
   # the full recordings tree.
   cold_scan_dir_limit: 50
+  # Retention window in days (LP-0MT2TC3PB005H1RD). Recordings older than
+  # this are pruned at startup and periodically while the proxy runs.
+  # Values <= 0 disable pruning entirely.
+  retention_days: 3
+  # How often the retention prune re-runs, in seconds.
+  prune_interval_seconds: 3600
 
 # ---------------------------------------------------------------------------
 # Audit model configuration
 # ---------------------------------------------------------------------------
 # The audit skill (skill/audit/) uses these settings to determine which
 # model to call for audit operations. The resolver maps short names to
-# provider-prefixed model IDs (e.g., ``deepseek-v4-flash-free`` →
-# ``opencode/deepseek-v4-flash-free``).
+# provider-prefixed model IDs (e.g., ``deepseek-v4-flash`` →
+# ``opencode/deepseek-v4-flash``).
 #
 # Canonical model IDs (discovered via ``pi --list-models``):
-#   opencode/deepseek-v4-flash-free
+#   opencode/deepseek-v4-flash
 #   opencode-go/deepseek-v4-flash
-#   openrouter/openrouter/free
+#   openrouter/deepseek/deepseek-v4-flash
 #
 # See proxy/provider_resolver.py for the full mapping table.
-audit_model: "deepseek-v4-flash-free"
+audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  - "openrouter/free"
+  # Mirrors plan's provider chain: muse tier first, then the paid
+  # deepseek tier (plan: local -> zen muse -> go muse -> deepseek).
+  - "muse-spark-1.2-contributor-free"
   - "deepseek-v4-flash"
 
 models:
@@ -177,7 +193,7 @@ models:
         endpoint: https://models.inference.ai.azure.com
     aliases:
     - github-*
-  # Cascading fallback: local Qwen3 first, then OpenCode free, OpenCode Go, OpenCode Go #2, then DeepSeek direct.
+  # Cascading fallback: local Qwen3 first, then OpenCode Go, OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
   plan:
@@ -185,45 +201,62 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
+      - name: opencode-zen-muse-free
         type: remote
-        provider: opencode
+        provider: opencode-zen
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
-      - name: opencode-go-3-deepseek
+      - name: opencode-go-3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-2-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go-2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -244,37 +277,62 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-mimo-v2.5-free
+      - name: opencode-zen-muse-free
         type: remote
-        provider: opencode
+        provider: opencode-zen
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
-        model: mimo-v2.5-free
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
         forward_session_headers: false
-      - name: opencode-go-3-deepseek
+      - name: opencode-go-3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-2-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go-2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -290,48 +348,65 @@ models:
 
   code:
     providers:
-      - name: local-qwen3-next
+      - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-deepseek-free
+      - name: opencode-zen-muse-free
         type: remote
-        provider: opencode
+        provider: opencode-zen
         endpoint: https://opencode.ai/zen
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
-      - name: opencode-go-3-deepseek
+      - name: opencode-go-3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-2-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go-2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -341,64 +416,6 @@ models:
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
-    force_full_prompt: true
-    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
-    tokenizer: qwen3
-
-  local-qwen3-mtp:
-    # MTP evaluation model (LP-0MSNI1B68001VE6C): Qwen3.6-35B-A3B served
-    # from the MTP-converted GGUF with llama-server --spec-type draft-mtp
-    # --spec-draft-n-max 2. Coexists with production Qwen3 serving; the
-    # plan/author/code chains above are UNCHANGED until rollout is approved
-    # post-benchmark. Requires an MTP-capable llama-server build (the local
-    # build b8782/e97492369 predates llama.cpp PR #22673 and lacks draft-mtp)
-    # and single-slot serving (--parallel 1), mirroring the proxy's
-    # LLAMA_PARALLEL when slugged to this model.
-    providers:
-      - name: local-qwen3-mtp
-        type: local
-        llama_model: Qwen3-MTP
-      - name: opencode-deepseek-free
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash-free
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-big-pickle
-        type: remote
-        provider: opencode
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: big-pickle
-        forward_session_headers: false
-      - name: opencode-go-2-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: deepseek-v4-flash
-        type: remote
-        provider: deepseek
-        endpoint: https://api.deepseek.com
-        api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-    aliases:
-    - local-qwen3-mtp
-    - qwen3-mtp
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
@@ -516,7 +533,8 @@ server:
   # tokenizer).
   #
   # MODE-AWARE value (LP-0MSOMVOPH004ATAK): this default profile mirrors the
-  # fast-mode profile (3 slots x 131072); keep it aligned with config-fast.yaml
+  # fast-mode profile (3 slots x 262144; superseded per LP-0MSY0SDAS0031Y7F);
+  # keep it aligned with config-fast.yaml
   # (38000). See the mode-aware note there.
   local_large_context_cold_cache_threshold: 38000
 
@@ -533,6 +551,17 @@ server:
   # never routed local. Unlike the cold threshold it is NOT an economic
   # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
   local_large_context_warm_cache_threshold: 100000
+
+  # Hard local-routing cap ratio (LP-0MTBOX45O005LD1S, operator-approved
+  # 2026-08-27): fast mode hard-skips local with context_too_large above the
+  # resolved cap; cheap mode returns a 429 compaction-gate response. The
+  # ratio is expressed against the effective warm/routing clamp
+  # min(warm_cache_threshold, per_slot - 4096) (decision #4):
+  #   70000 / 83285 ≈ 0.84049 (3 slots x 262144 ctx → per-slot clamp 83285)
+  #   → resolved cap = round(0.84049 x 83285) = 70000 EXACT
+  # 0 (or absent) disables the cap. The cap rescales automatically when
+  # slot_schedule changes (``compute_hard_routing_cap`` is schedule-aware).
+  local_hard_routing_cap_ratio_fast: 0.84049
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
@@ -557,6 +586,28 @@ server:
   # per-slot limit decode far slower than short sessions. 0 disables.
   context_pressure_warn_ratio: 0.8
 
+  # --- Session compaction config (LP-0MTG6RW3L003X122) ---
+  # Proxy-side proactive session compaction at prompt-assembly time.
+  # trigger_ratio: fires when est_tokens > ratio × per-slot threshold
+  #   (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K)
+  #   (cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K)
+  compaction_trigger_ratio: 0.70
+  # Summariser model: local llama.cpp model used for in-proxy summarisation.
+  # Reuses the existing Qwen3 model — no new model download required.
+  summarizer_model:
+    type: local
+    llama_model: Qwen3
+  # Summariser context size (tokens): sufficient for short summarisation prompt
+  # + middle turns; avoids unnecessary KV cache footprint.
+  summarizer_ctx_size: 8192
+  # Max output tokens for the summariser: concise summary budget.
+  summarizer_max_tokens: 512
+  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
+  # advisory logging only, zero dispatch change. TRUE until the AC8
+  # enforcement gate passes (experiment bar + client-side compaction
+  # review); flip to false to enable live enforcement.
+  compaction_dry_run: true
+
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
   # routing threshold (local_model_ctx_size // slots - 4096 output headroom,
@@ -574,16 +625,6 @@ server:
   min_local_routing_threshold_fatal: false
   llama_router_mode: true
   max_concurrent_queries: 16
-  # Local-model concurrency limit (LP-0MR5MAJNM005R905).
-  # Limits concurrent requests to local providers. Remote providers
-  # continue to use max_concurrent_queries. When this limit is reached,
-  # requests with fallback providers skip to the next provider immediately.
-  #
-  # NOTE: This value is now derived from `session_slot_pool_size` by default.
-  # The `local_max_concurrent_queries` key is preserved for explicit override
-  # only. In normal operation, change `session_slot_pool_size` to control the
-  # number of parallel dispatch leases.
-  local_max_concurrent_queries: 1
   # Local dispatch lease timeout in seconds.
   # An idle session holds an inactive lease for this duration after its
   # last request completes, preventing other sessions from acquiring the
@@ -760,6 +801,30 @@ server:
     enabled: true
     # fallback_grace_seconds: 10800
 
+  # -----------------------------------------------------------------------
+  # Bounded drain before a mode-switch restart (LP-0MT631JKW008WAKE)
+  # -----------------------------------------------------------------------
+  # A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode)
+  # restarts the proxy process. Historically the restart killed in-flight
+  # local streams mid-generation, surfacing a synthetic `finish_reason:
+  # error` to clients; the bounded drain fixes that:
+  #   - NEW chat requests are deferred with a short 503 + Retry-After while
+  #     the drain is active (no new stream starts that would be killed),
+  #   - the process kill is delayed until in-flight local streams finish,
+  #     bounded by max_seconds,
+  #   - enabled: false (or max_seconds: 0) restores the old "just restart"
+  #     behavior.
+  # The window is SHORT and bounded, preserving the "no long rejection
+  # window" property of slot-schedule transitions (LP-0MSF9RUSQ007M346).
+  mode_switch_drain:
+    enabled: true
+    # Maximum seconds to wait for in-flight local streams before the restart
+    # kills the process.
+    max_seconds: 30
+    # Extra seconds added to the "Retry-After" header past the drain deadline
+    # so clients retry after the restart has had time to complete.
+    retry_after_margin_seconds: 15
+
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
   # The effective timeout is base + session_slot_timeout_per_token_seconds x
@@ -772,15 +837,12 @@ server:
   # estimated tokens. llama-server serializes the whole KV cache on save,
   # so large contexts ReadTimeout and can wedge the GPU.
   #
-  # DYNAMIC DERIVATION (LP-0MSEGPO77005CYCQ F3, amended AC2): when this key
-  # is absent or 0, the cap is derived from the effective per-slot clamp
-  # (local_model_ctx_size // active_slots - 4096 output headroom) — the SAME
-  # source as the routing clamp (effective_per_slot_threshold in provider.py)
-  # — so it auto-adapts to slot-count/ctx-size changes (e.g. the live
-  # 3-slot schedule (fast 23:59→3, cheap 10:00→3) → 39594) instead of
-  # freezing at a static value. Set to a non-zero value to use an explicit
-  # static override.
-  # 0 = dynamic derivation (current live config).
+  # DERIVED (LP-0MTBOX45O005LD1S AC4): 0 = derive from the hard-routing cap
+  # (provider.py ``compute_hard_routing_cap``) as the single source, so
+  # persistence is never attempted above the routing cap (83285 static >
+  # 70000 cap would persist contexts the router refuses to dispatch). The
+  # derivation falls back to the per-slot routing clamp when no hard cap is
+  # configured (LP-0MSEGPO77005CYCQ F3).
   session_slot_max_prompt_tokens: 0
   # Adaptive save/restore timeout: base (session_slot_timeout_seconds) +
   # per_token * estimated tokens, capped at session_slot_max_timeout_seconds.
@@ -797,6 +859,14 @@ server:
   # contexts; keeps the circuit breaker within a bounded window so a wedged
   # GPU still trips and recovers instead of holding indefinitely.
   session_slot_max_timeout_seconds: 60
+  # Availability-check timeout (seconds) for the pre-dispatch /slots?model=
+  # query (LP-0MTDH2U6V0062TUF). The check uses a dedicated per-call client
+  # with this short timeout so a slow router/child response fails fast and can
+  # never exhaust the shared _http_client pool (which previously caused
+  # slot_save PoolTimeouts and client-visible "Request timed out" under
+  # multi-session load — LP-0MTDGBRPU003Z7KU). 2.0s is short enough to fail
+  # fast under a busy child; the check is best-effort (failure -> skip).
+  session_slot_availability_timeout_seconds: 2.0
   # Load-aware save/restore gating (LP-0MSI1RWLM007N367 F3): skip slot
   # save/restore when ANOTHER local session is actively streaming. llama-server
   # serializes each KV-cache copy behind its slot work, so saves issued under

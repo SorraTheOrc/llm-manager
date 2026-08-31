@@ -575,7 +575,7 @@ async def test_after_content_stall_records_circuit_breaker(mock_request):
                                     model_name="test-model",
                                     remote_timeout=httpx.Timeout(30.0),
                                     upstream_idle_timeout_seconds=0.05,
-                                    provider="opencode-deepseek-free",
+                                    provider="opencode-deepseek",
                                 )
                                 collected = [
                                     chunk async for chunk in result.body_iterator
@@ -588,6 +588,6 @@ async def test_after_content_stall_records_circuit_breaker(mock_request):
         f"got {mock_cb.call_count}"
     )
     provider_arg = mock_cb.call_args[0][0]
-    assert provider_arg == "opencode-deepseek-free", (
-        f"Expected provider 'opencode-deepseek-free', got '{provider_arg}'"
+    assert provider_arg == "opencode-deepseek", (
+        f"Expected provider 'opencode-deepseek', got '{provider_arg}'"
     )

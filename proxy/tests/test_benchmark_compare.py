@@ -37,6 +37,9 @@ BASELINE = {
         "avg_total_duration_seconds": 2.25,
         "avg_tokens_per_second": 10.0,
         "avg_time_to_first_token_seconds": 0.225,
+        "p95_total_duration_seconds": 2.4,
+        "p95_tokens_per_second": 9.8,
+        "p95_time_to_first_token_seconds": 0.24,
         "total_prompt_tokens": 22, "total_completion_tokens": 45,
         "memory_snapshot_bytes": 8_000_000_000,
     },
@@ -64,6 +67,9 @@ CANDIDATE_IMPROVED = {
         "avg_total_duration_seconds": 1.75,
         "avg_tokens_per_second": 14.33,
         "avg_time_to_first_token_seconds": 0.175,
+        "p95_total_duration_seconds": 1.85,
+        "p95_tokens_per_second": 14.4,
+        "p95_time_to_first_token_seconds": 0.19,
         "total_prompt_tokens": 22, "total_completion_tokens": 50,
         "memory_snapshot_bytes": 6_000_000_000,
     },
@@ -91,6 +97,9 @@ CANDIDATE_REGRESSION = {
         "avg_total_duration_seconds": 3.25,
         "avg_tokens_per_second": 6.14,
         "avg_time_to_first_token_seconds": 0.425,
+        "p95_total_duration_seconds": 3.4,
+        "p95_tokens_per_second": 6.0,
+        "p95_time_to_first_token_seconds": 0.44,
         "total_prompt_tokens": 22, "total_completion_tokens": 40,
         "memory_snapshot_bytes": 6_000_000_000,
     },
@@ -185,6 +194,65 @@ class TestDeltaComputation:
         candidate_lat = CANDIDATE_REGRESSION["summary"]["avg_total_duration_seconds"]
         delta_pct = (candidate_lat - baseline_lat) / baseline_lat * 100
         assert delta_pct > 10.0  # Clearly exceeds 10% regression threshold
+
+    def test_p95_tps_delta(self):
+        """P95 TPS delta should be computed and positive for improvement."""
+        cr = _import_compare_results()
+        if cr is None:
+            pytest.skip("compare_results module not importable from current sys.path")
+        baseline = BASELINE["summary"]["p95_tokens_per_second"]
+        candidate = CANDIDATE_IMPROVED["summary"]["p95_tokens_per_second"]
+        expected = (candidate - baseline) / baseline * 100
+        deltas = cr.compute_deltas(BASELINE, CANDIDATE_IMPROVED)
+        assert deltas["p95_tps_delta_pct"] == pytest.approx(expected)
+
+    def test_p95_ttft_delta(self):
+        """P95 TTFT delta should be computed (negative = faster)."""
+        cr = _import_compare_results()
+        if cr is None:
+            pytest.skip("compare_results module not importable from current sys.path")
+        baseline = BASELINE["summary"]["p95_time_to_first_token_seconds"]
+        candidate = CANDIDATE_IMPROVED["summary"]["p95_time_to_first_token_seconds"]
+        expected = (candidate - baseline) / baseline * 100
+        deltas = cr.compute_deltas(BASELINE, CANDIDATE_IMPROVED)
+        assert deltas["p95_ttft_delta_pct"] == pytest.approx(expected)
+        assert deltas["p95_ttft_delta_pct"] < 0
+
+    def test_p95_duration_delta(self):
+        """P95 duration delta should be computed (negative = faster)."""
+        cr = _import_compare_results()
+        if cr is None:
+            pytest.skip("compare_results module not importable from current sys.path")
+        baseline = BASELINE["summary"]["p95_total_duration_seconds"]
+        candidate = CANDIDATE_IMPROVED["summary"]["p95_total_duration_seconds"]
+        expected = (candidate - baseline) / baseline * 100
+        deltas = cr.compute_deltas(BASELINE, CANDIDATE_IMPROVED)
+        assert deltas["p95_duration_delta_pct"] == pytest.approx(expected)
+
+    def test_p95_delta_handles_missing_values(self):
+        """P95 deltas should be None when summaries lack p95 keys."""
+        cr = _import_compare_results()
+        if cr is None:
+            pytest.skip("compare_results module not importable from current sys.path")
+        base_no_p95 = dict(BASELINE)
+        cand_no_p95 = dict(CANDIDATE_IMPROVED)
+        base_no_p95["summary"] = {k: v for k, v in BASELINE["summary"].items() if "p95" not in k}
+        cand_no_p95["summary"] = {k: v for k, v in CANDIDATE_IMPROVED["summary"].items() if "p95" not in k}
+        deltas = cr.compute_deltas(base_no_p95, cand_no_p95)
+        assert deltas["p95_tps_delta_pct"] is None
+        assert deltas["p95_ttft_delta_pct"] is None
+        assert deltas["p95_duration_delta_pct"] is None
+
+    def test_p95_delta_handles_zero_baseline(self):
+        """P95 deltas should be None when baseline value is zero."""
+        cr = _import_compare_results()
+        if cr is None:
+            pytest.skip("compare_results module not importable from current sys.path")
+        base_zero = dict(BASELINE)
+        base_zero["summary"] = dict(BASELINE["summary"])
+        base_zero["summary"]["p95_tokens_per_second"] = 0
+        deltas = cr.compute_deltas(base_zero, CANDIDATE_IMPROVED)
+        assert deltas["p95_tps_delta_pct"] is None
 
 
 # ---------------------------------------------------------------------------

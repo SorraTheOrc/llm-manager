@@ -764,12 +764,13 @@ async def test_remote_fallback_free_usage_limit_in_proxy_with_fallback(sample_mo
 
 
 @pytest.mark.asyncio
-async def test_free_usage_limit_opencode_deepseek_free_24h_cooldown():
-    """opencode-deepseek-free should get a 24-hour (86400s) cooldown on FreeUsageLimitError."""
+async def test_free_usage_limit_opencode_deepseek_free_default_3h_cooldown():
+    """opencode-deepseek (removed from all fallback plans) should NOT get
+    a 24-hour override anymore; it falls back to the default 3h cooldown."""
     model_config = {
         "providers": [
             {
-                "name": "opencode-deepseek-free",
+                "name": "opencode-deepseek",
                 "type": "remote",
                 "endpoint": "https://opencode.ai/zen",
                 "api_key_env": "OPENCODE_API_KEY",
@@ -817,93 +818,27 @@ async def test_free_usage_limit_opencode_deepseek_free_24h_cooldown():
     assert result.status_code == 200
     assert call_count == 2
 
-    # opencode-deepseek-free should have a 24-hour cooldown
+    # Default 3-hour cooldown (no 24h override entry for this provider).
     now = time.time()
-    expiry = provider._provider_unavailable_until.get("opencode-deepseek-free")
-    assert expiry is not None, "opencode-deepseek-free should have a cooldown expiry"
+    expiry = provider._provider_unavailable_until.get("opencode-deepseek")
+    assert expiry is not None, "opencode-deepseek should have a cooldown expiry"
     cooldown_seconds = expiry - now
-    assert cooldown_seconds >= 86300, (
-        f"Expected ~86400s cooldown for opencode-deepseek-free, got {cooldown_seconds:.1f}s"
+    assert cooldown_seconds >= 10700, (
+        f"Expected ~10800s default cooldown, got {cooldown_seconds:.1f}s"
     )
-    assert cooldown_seconds <= 86500, (
-        f"Cooldown too large: {cooldown_seconds:.1f}s"
-    )
-
-
-@pytest.mark.asyncio
-async def test_free_usage_limit_opencode_big_pickle_24h_cooldown():
-    """opencode-big-pickle should get a 24-hour (86400s) cooldown on FreeUsageLimitError."""
-    model_config = {
-        "providers": [
-            {
-                "name": "opencode-big-pickle",
-                "type": "remote",
-                "endpoint": "https://opencode.ai/zen",
-                "api_key_env": "OPENCODE_API_KEY",
-            },
-            {
-                "name": "opencode-go-deepseek",
-                "type": "remote",
-                "endpoint": "https://opencode.ai/zen/go",
-                "api_key_env": "OPENCODE_API_KEY",
-            },
-        ],
-        "aliases": ["*"],
-    }
-    request = _DummyRequest()
-    cfg = {"provider_cooldown_seconds": 60}
-    call_count = 0
-
-    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return Response(
-                status_code=429,
-                content=json.dumps({
-                    "type": "error",
-                    "error": {
-                        "type": "FreeUsageLimitError",
-                        "message": "Rate limit exceeded.",
-                    },
-                    "metadata": {},
-                }).encode("utf-8"),
-                media_type="application/json",
-            )
-        return Response(
-            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
-            status_code=200,
-            media_type="application/json",
-        )
-
-    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
-        result = await provider.proxy_with_remote_fallback(
-            request, "v1/chat/completions", model_config, cfg
-        )
-
-    assert result.status_code == 200
-    assert call_count == 2
-
-    # opencode-big-pickle should have a 24-hour cooldown
-    now = time.time()
-    expiry = provider._provider_unavailable_until.get("opencode-big-pickle")
-    assert expiry is not None, "opencode-big-pickle should have a cooldown expiry"
-    cooldown_seconds = expiry - now
-    assert cooldown_seconds >= 86300, (
-        f"Expected ~86400s cooldown for opencode-big-pickle, got {cooldown_seconds:.1f}s"
-    )
-    assert cooldown_seconds <= 86500, (
+    assert cooldown_seconds <= 10900, (
         f"Cooldown too large: {cooldown_seconds:.1f}s"
     )
 
 
 @pytest.mark.asyncio
 async def test_free_usage_limit_non_overridden_provider_3h_cooldown():
-    """A provider NOT in the override map should still get the default 3-hour cooldown."""
+    """A provider not carrying a per-provider override still gets the default
+    3-hour cooldown (no overrides are active since LP-0MT652JRM004ZLSI)."""
     model_config = {
         "providers": [
             {
-                "name": "opencode-mimo-v2.5-free",
+                "name": "opencode-mimo-v2.5",
                 "type": "remote",
                 "endpoint": "https://opencode.ai/zen",
                 "api_key_env": "OPENCODE_API_KEY",
@@ -951,9 +886,9 @@ async def test_free_usage_limit_non_overridden_provider_3h_cooldown():
     assert result.status_code == 200
     assert call_count == 2
 
-    # Should get the default 3-hour cooldown, not 24h
+    # Should get the default 3-hour cooldown
     now = time.time()
-    expiry = provider._provider_unavailable_until.get("opencode-mimo-v2.5-free")
+    expiry = provider._provider_unavailable_until.get("opencode-mimo-v2.5")
     assert expiry is not None
     cooldown_seconds = expiry - now
     assert cooldown_seconds >= 10700, (
@@ -1623,7 +1558,7 @@ async def test_local_concurrency_limit_fallback(mixed_model_config):
     request = _DummyRequest()
     cfg = {
         "provider_cooldown_seconds": 60,
-        "server": {"local_max_concurrent_queries": 1},
+        "server": {"session_slot_pool_size": 1},
     }
     call_log = []
 
@@ -1659,7 +1594,7 @@ async def test_local_concurrency_below_limit_calls_local(mixed_model_config):
     request = _DummyRequest()
     cfg = {
         "provider_cooldown_seconds": 60,
-        "server": {"local_max_concurrent_queries": 1},
+        "server": {"session_slot_pool_size": 1},
     }
     call_log = []
 
@@ -1934,11 +1869,11 @@ async def test_proxy_to_remote_strips_hop_by_hop_headers_before_forwarding():
     }
 
     provider_cfg = {
-        "name": "opencode-deepseek-free",
+        "name": "opencode-deepseek",
         "type": "remote",
         "endpoint": "https://opencode.ai/zen",
         "api_key_env": "OPENCODE_API_KEY",
-        "model": "deepseek-v4-flash-free",
+        "model": "deepseek-v4-flash",
     }
 
     observed_headers = None
@@ -1983,11 +1918,11 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
     request.headers = {}
 
     provider_cfg = {
-        "name": "opencode-deepseek-free",
+        "name": "opencode-deepseek",
         "type": "remote",
         "endpoint": "https://opencode.ai/zen",
         "api_key_env": "OPENCODE_API_KEY",
-        "model": "deepseek-v4-flash-free",
+        "model": "deepseek-v4-flash",
     }
 
     captured_body = None
@@ -2007,8 +1942,8 @@ async def test_proxy_to_remote_overrides_model_name_with_model_field():
     assert result.status_code == 200
     assert captured_body is not None, "_handle_remote_non_streaming should have been called"
     captured_json = json.loads(captured_body.decode("utf-8"))
-    assert captured_json["model"] == "deepseek-v4-flash-free", \
-        f"Expected model override to 'deepseek-v4-flash-free', got '{captured_json.get('model')}'"
+    assert captured_json["model"] == "deepseek-v4-flash", \
+        f"Expected model override to 'deepseek-v4-flash', got '{captured_json.get('model')}'"
 
 
 @pytest.mark.asyncio
@@ -2858,11 +2793,11 @@ async def test_plan_fallback_reaches_go_tier_when_free_tier_rate_limited():
                 "llama_model": "Qwen3",
             },
             {
-                "name": "opencode-deepseek-free",
+                "name": "opencode-deepseek",
                 "type": "remote",
                 "endpoint": "https://opencode.ai/zen",
                 "api_key_env": "OPENCODE_API_KEY",
-                "model": "deepseek-v4-flash-free",
+                "model": "deepseek-v4-flash",
             },
             {
                 "name": "opencode-go-deepseek",
@@ -2899,7 +2834,7 @@ async def test_plan_fallback_reaches_go_tier_when_free_tier_rate_limited():
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         name = provider_cfg.get("name")
         call_log.append(name)
-        if name == "opencode-deepseek-free":
+        if name == "opencode-deepseek":
             # Free tier rate-limited
             return Response(status_code=429, content=b"Rate limited")
         # Go tier succeeds
@@ -2924,7 +2859,7 @@ async def test_plan_fallback_reaches_go_tier_when_free_tier_rate_limited():
     )
     assert call_log == [
         "local-qwen3",
-        "opencode-deepseek-free",
+        "opencode-deepseek",
         "opencode-go-deepseek",
     ], f"Expected fallback chain through all providers, got: {call_log}"
     assert result.headers.get("X-Provider") == "opencode-go-deepseek", (
@@ -2946,11 +2881,11 @@ async def test_plan_fallback_all_exhausted_with_go_tier_error():
                 "llama_model": "Qwen3",
             },
             {
-                "name": "opencode-deepseek-free",
+                "name": "opencode-deepseek",
                 "type": "remote",
                 "endpoint": "https://opencode.ai/zen",
                 "api_key_env": "OPENCODE_API_KEY",
-                "model": "deepseek-v4-flash-free",
+                "model": "deepseek-v4-flash",
             },
             {
                 "name": "opencode-go-deepseek",
@@ -2998,7 +2933,7 @@ async def test_plan_fallback_all_exhausted_with_go_tier_error():
     )
     assert call_log == [
         "local-qwen3",
-        "opencode-deepseek-free",
+        "opencode-deepseek",
         "opencode-go-deepseek",
     ], f"Expected all providers tried, got: {call_log}"
 
@@ -3968,7 +3903,12 @@ async def test_cross_session_cooldown_does_not_affect_available_providers(mixed_
 
 @pytest.mark.asyncio
 async def test_get_local_concurrency_info_reads_session_slot_pool_size():
-    """_get_local_concurrency_info reads from session_slot_pool_size primarily."""
+    """_get_local_concurrency_info reads ONLY session_slot_pool_size.
+
+    The legacy ``local_max_concurrent_queries`` fallback was removed
+    (LP-0MTCZ35X7009IZKE). session_slot_pool_size is always present; a
+    missing value is caught at launch by validate_local_routing_config.
+    """
     from proxy.provider import _get_local_concurrency_info
 
     # session_slot_pool_size should take precedence
@@ -3978,11 +3918,11 @@ async def test_get_local_concurrency_info_reads_session_slot_pool_size():
     })
     assert result == (0, 3), f"Expected (0, 3), got {result}"
 
-    # without session_slot_pool_size, fall back to local_max_concurrent_queries
+    # without session_slot_pool_size, default to 1 (legacy key is ignored)
     result = _get_local_concurrency_info({
         "local_max_concurrent_queries": 2,
     })
-    assert result == (0, 2), f"Expected (0, 2), got {result}"
+    assert result == (0, 1), f"Expected (0, 1) (no legacy fallback), got {result}"
 
     # with neither, default to 1
     result = _get_local_concurrency_info({})

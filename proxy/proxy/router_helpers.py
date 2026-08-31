@@ -16,8 +16,10 @@ Includes:
 import asyncio
 import json
 import os
+import re
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -229,6 +231,12 @@ def log_response_chunk(
     entry name (e.g. ``opencode-go-2-deepseek``) so per-account traffic is
     attributable (LP-0MSC7F7BG0043TE1); it is omitted when absent.
 
+    For ``finish_reason: error`` events carrying an enriched ``error``
+    object (LP-0MSETOTWY000SU0Z), the line additionally carries
+    ``error_type``, ``error_message``, and ``suggested_action`` so the
+    proxy-usage analysis tool can classify the informative-error fallback
+    (LP-0MT60S55M000TK1H).
+
     When *body_json* is provided, a request preview (first 80 characters of
     the first non-system user message) is included in the finished line.
     """
@@ -277,6 +285,25 @@ def log_response_chunk(
                     tt = usage.get("total_tokens")
                     if pt is not None or ct is not None or tt is not None:
                         parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
+                # LP-0MT60S55M000TK1H: when the error is a synthetic stream-error
+                # event (LP-0MSETOTWY000SU0Z) carry the enriched error payload so
+                # the proxy-usage analysis tool can classify it (previously the
+                # log line reported "no error payload").
+                if finish_reason == "error":
+                    for choice in j.get("choices", []):
+                        if isinstance(choice, dict):
+                            err = choice.get("error")
+                            if isinstance(err, dict):
+                                err_type = err.get("type")
+                                err_msg = err.get("message")
+                                err_action = err.get("suggested_action")
+                                if err_type:
+                                    parts.append(f"error_type={err_type}")
+                                if err_msg:
+                                    parts.append(f"error_message={err_msg}")
+                                if err_action:
+                                    parts.append(f"suggested_action={err_action}")
+                                break  # only use the first choice's error
                 # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
                 if session_id:
                     parts.append(f"session={session_id}")
@@ -860,14 +887,14 @@ async def _extend_lease_during_prefill(
                         if advancing:
                             srv.logger.info(
                                 "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                                session_key[:8] if session_key else "unknown",
+                                session_key if session_key else "unknown",
                                 progress,
                                 buffer_seconds,
                             )
                         else:
                             srv.logger.info(
                                 "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
-                                session_key[:8] if session_key else "unknown",
+                                session_key if session_key else "unknown",
                                 buffer_seconds,
                             )
                     except Exception:
@@ -893,7 +920,7 @@ async def _decrement_local_active_queries(
         async with srv.local_active_queries_lock:
             srv.local_active_queries = max(0, srv.local_active_queries - 1)
     except Exception as exc:
-        session_hint = f" session={session_key[:8]}" if session_key else ""
+        session_hint = f" session={session_key}" if session_key else ""
         try:
             srv.logger.warning(
                 "Failed to decrement local_active_queries: %s: %s%s",
@@ -918,14 +945,14 @@ async def _decrement_local_active_queries(
                         try:
                             srv.logger.info(
                                 "lease_renewed session=%s timeout=%.0fs",
-                                session_key[:8] if session_key else "unknown",
+                                session_key if session_key else "unknown",
                                 lease_timeout,
                             )
                         except Exception as exc:
                             try:
                                 srv.logger.warning(
                                     "Failed to log lease_renewed for session=%s: %s: %s",
-                                    session_key[:8] if session_key else "unknown",
+                                    session_key if session_key else "unknown",
                                     type(exc).__name__,
                                     exc,
                                 )
@@ -935,7 +962,7 @@ async def _decrement_local_active_queries(
             try:
                 srv.logger.warning(
                     "Failed to mark dispatch record inactive for session=%s: %s: %s",
-                    session_key[:8] if session_key else "unknown",
+                    session_key if session_key else "unknown",
                     type(exc).__name__,
                     exc,
                 )
@@ -1170,7 +1197,7 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                 try:
                     srv.logger.info(
                         "lease_released session=%s reason=explicit_release",
-                        session_id[:8] if session_id else "unknown",
+                        session_id if session_id else "unknown",
                         extra=_client_identity_extra(request),
                     )
                 except Exception:
@@ -1293,7 +1320,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout",
-                            sid[:8] if sid else "unknown",
+                            sid if sid else "unknown",
                         )
                     except Exception:
                         pass
@@ -1339,7 +1366,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             srv.logger.info(
                                 "lease_verified_active session=%s "
                                 "reason=active_slot stream_abandoned=False",
-                                sid[:8] if sid else "unknown",
+                                sid if sid else "unknown",
                             )
                         except Exception:
                             pass
@@ -1367,11 +1394,11 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         srv.logger.warning(
                             "lease_released session=%s reason=orphan_cleanup "
                             "stream_abandoned=True",
-                            sid[:8] if sid else "unknown",
+                            sid if sid else "unknown",
                         )
                         srv.logger.info(
                             "lease_released session=%s reason=orphan_cleanup",
-                            sid[:8] if sid else "unknown",
+                            sid if sid else "unknown",
                         )
                     except Exception:
                         pass
@@ -1577,6 +1604,82 @@ def _normalize_outgoing_headers(
 # Session handling helper
 # ===================================================================
 
+
+def _evaluate_session_compaction(
+    srv,
+    session_id: str,
+    session_messages: list,
+    mode: str,
+    summarizer=None,
+    estimate_tokens=None,
+    churn_collector=None,
+    logger_obj=None,
+) -> dict:
+    """Prompt-assembly-time compaction decision for a session (integration).
+
+    Parent LP-0MTCWE8NG003P0SD: proactive session compaction at
+    prompt-assembly / session-persistence time. Wires the pure decision
+    (``decide_session_compaction``) to the router's session machinery:
+
+    - Warn-only dry-run (default, AC8 gate not passed): returns
+      ``applied=False`` and the ORIGINAL list — the persistence layer
+      stores exactly what it would have stored before. Advisory log +
+      churn only.
+    - Live (opt-in ``compaction_dry_run: false``): when the session
+      exceeds the trigger and is compactable, returns ``applied=True``
+      with the COMPACTED history for the caller to persist; the slot/KV
+      is invalidated by the caller so the next request re-prefills
+      cleanly from the compacted history.
+    - ``remote_with_guidance``: returns ``applied=False`` and the reason;
+      the dispatcher must route remote with guidance rather than dispatch
+      local near-full-slot.
+
+    Fail-open: any exception falls back to the untouched plan (original
+    messages, ``applied=False``) and logs a warning — compaction must
+    never break dispatch.
+
+    Args:
+        srv: Server object (config at ``srv.config``).
+        session_id: The session being assembled.
+        session_messages: The full session message list.
+        mode: "fast" or "cheap" (from ``proxy.mode.read_mode``).
+        summarizer: Production summarizer callable (see compaction module).
+        estimate_tokens: Production routing estimator.
+
+    Returns:
+        The ``decide_session_compaction`` result (always includes
+        ``messages``, ``applied``, ``dry_run``).
+    """
+    try:
+        from proxy.compaction import decide_session_compaction
+
+        server_config = getattr(srv, "config", {}).get("server", {})
+        return decide_session_compaction(
+            session_messages,
+            server_config,
+            mode,
+            summarizer=summarizer,
+            estimate_tokens=estimate_tokens,
+            session_id=session_id or "",
+            churn_collector=churn_collector,
+            logger_obj=logger_obj,
+        )
+    except Exception:
+        getattr(getattr(srv, "logger", None), "warning", lambda *a, **k: None)(
+            "Session compaction evaluation failed; dispatching untouched "
+            "(session=%s)",
+            (session_id or "")[:8],
+            exc_info=True,
+        )
+        return {
+            "action": "noop",
+            "applied": False,
+            "dry_run": True,
+            "messages": session_messages,
+            "reason": "evaluation_failed",
+        }
+
+
 async def _handle_session(
     srv,
     body_json: dict,
@@ -1689,6 +1792,60 @@ async def _handle_session(
                     )
             elif session_created:
                 result["session_fallback_reason"] = "no_existing_history"
+
+            # Proactive session compaction at prompt-assembly time
+            # (LP-0MTCWE8NG003P0SD / LP-0MTGBQ01A000ZFT9 wiring). Evaluates
+            # the persistent history this request produces. Warn-only
+            # dry-run (default, AC8 gate pending) logs advisories only —
+            # zero dispatch change. Opt-in live enforcement rewrites the
+            # dispatch body to the compacted full history and marks the
+            # request full-prompt so forward + persistence stay consistent.
+            try:
+                from proxy.mode import read_mode as _read_mode
+
+                _compaction = _evaluate_session_compaction(
+                    srv,
+                    result["session_id"],
+                    list(getattr(session, "messages", None) or body_json.get("messages", [])),
+                    _read_mode(),
+                )
+                if (
+                    _compaction.get("action") == "compact"
+                    and _compaction.get("applied")
+                    and not _compaction.get("dry_run")
+                ):
+                    # Live: dispatch the compacted history as a full prompt
+                    # (its prefix no longer matches the client's history).
+                    body_json["messages"] = list(_compaction["messages"])
+                    body_json["cache_prompt"] = True
+                    body_json["session_id"] = result["session_id"]
+                    result["body_override"] = json.dumps(body_json).encode("utf-8")
+                    result["is_delta_request"] = False
+                    result["delta_messages"] = None
+                    result["compaction_applied"] = True
+                    srv.logger.info(
+                        "session_compaction applied session=%s mode=%s "
+                        "est_before=%d est_after=%d",
+                        result["session_id"][:8],
+                        _compaction.get("mode"),
+                        _compaction.get("estimated_before", 0),
+                        _compaction.get("estimated_after", 0),
+                    )
+                elif (
+                    _compaction.get("action") == "remote_with_guidance"
+                    and not _compaction.get("dry_run")
+                ):
+                    # Never dispatch local near-full-slot when the session
+                    # cannot be compacted; the dispatcher must escalate
+                    # remote WITH guidance.
+                    result["compaction_remote_with_guidance"] = True
+            except Exception:
+                srv.logger.warning(
+                    "Compaction evaluation failed; continuing unchanged "
+                    "(session=%s)",
+                    str(result.get("session_id") or "")[:8],
+                    exc_info=True,
+                )
 
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True
@@ -1891,6 +2048,76 @@ async def _schedule_recv_token_increment(
 
 
 # ===================================================================
+# Local child-port discovery
+# ===================================================================
+
+_QWEN3_SPAWN_RE = re.compile(r"name=(\S+) on port (\d+)")
+
+_child_port_cache: dict[int, int | None] = {}
+"""Cached child port per llama-server pid.
+
+The router llama-server (port 8080) spawns child instances on dynamic ports
+(``--port 0``). The child port is discoverable from the spawn line in the
+llama-server log (``spawning server instance with name=Qwen3 on port 58113``).
+
+The router serializes ``GET /slots?model=...`` behind the busy child's
+generation loop (LP-0MTDGBRPU003Z7KU: measured 5-7s via the router vs 0.17s
+direct), so availability/status checks should target the child port directly.
+"""
+
+
+def _llama_log_path(srv) -> Path:
+    """Resolve the llama-server log path for a given server context."""
+    log_dir = getattr(srv, "log_dir", None)
+    if log_dir:
+        return Path(log_dir) / "llama-server.log"
+    return Path(__file__).parent / "logs" / "llama-server.log"
+
+
+def _discover_local_child_port(srv) -> int | None:
+    """Discover the local model child port from the llama-server log.
+
+    The router (``llama_server_port``) spawns model children on dynamic ports
+    (``--port 0``); the spawn line ``spawning server instance with
+    name=<model> on port <port>`` is written near the top of the fresh
+    llama-server log on startup. Returns the port for the first matching
+    spawn line, or ``None`` when the log is missing/unreadable or contains
+    no spawn line.
+
+    The result is cached per llama-server process pid so repeated calls
+    (every request) do not re-read the log; a new pid (restart) re-parses.
+    """
+    try:
+        proc = getattr(srv, "llama_process", None)
+        pid = getattr(proc, "pid", None) if proc is not None else None
+        if pid is None:
+            return None
+        if pid in _child_port_cache:
+            return _child_port_cache[pid]
+        log_path = _llama_log_path(srv)
+        if not log_path.exists():
+            _child_port_cache[pid] = None
+            return None
+        # Read the top of the log (spawn lines are written at startup).
+        read_size = min(65536, log_path.stat().st_size)
+        with open(log_path, "rb") as f:
+            head = f.read(read_size).decode("utf-8", errors="replace")
+        port = None
+        for line in head.splitlines():
+            m = _QWEN3_SPAWN_RE.search(line)
+            if m:
+                try:
+                    port = int(m.group(2))
+                except (TypeError, ValueError):
+                    port = None
+                break
+        _child_port_cache[pid] = port
+        return port
+    except Exception:
+        return None
+
+
+# ===================================================================
 # Slot availability check
 # ===================================================================
 
@@ -1901,11 +2128,29 @@ async def _check_slot_availability(
     slot_model_name: str | None,
     model_name: str | None,
     path: str,
+    lease_held: bool = False,
 ) -> JSONResponse | None:
     """Check llama-server slot availability.
 
     Returns a 503 JSONResponse if no slots are available, None otherwise.
+
+    When *lease_held* is True the check is skipped entirely: the caller has
+    already acquired a dispatch lease (``_try_acquire_local_dispatch``),
+    which gates concurrency to ``session_slot_pool_size`` — the /slots query
+    would be redundant and, via the router, can take 5-7s under load
+    (LP-0MTDGBRPU003Z7KU).
+
+    The query targets the discovered local child port (``_discover_local_child_port``)
+    instead of the router port when available — the router serializes
+    ``GET /slots?model=...`` behind the busy child's generation loop.
+
+    The query uses a dedicated per-call ``httpx.AsyncClient`` with a short
+    timeout (``session_slot_availability_timeout_seconds``, default 2.0) so a
+    slow router/child response fails fast and can never exhaust the shared
+    ``_http_client`` pool (LP-0MTDH2U6V0062TUF).
     """
+    if lease_held:
+        return None
     if not (path == "v1/chat/completions" or path.endswith("chat/completions")):
         return None
 
@@ -1913,28 +2158,38 @@ async def _check_slot_availability(
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
         )
-        slots_url = f"http://localhost:{llama_port}/slots?model={slot_model}"
-        client = (
-            srv._http_client
-            if srv._http_client
-            else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+        child_port = _discover_local_child_port(srv)
+        slots_port = child_port if child_port is not None else llama_port
+        slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
+        availability_timeout = float(
+            server_config.get(
+                "session_slot_availability_timeout_seconds", 2.0
+            )
+            or 2.0
         )
-        slots_resp = await client.get(slots_url, timeout=5.0)
-        if slots_resp.status_code == 200:
-            slots_data = slots_resp.json()
-            available_slots = 0
-            total_slots = 0
-            if isinstance(slots_data, list):
-                total_slots = len(slots_data)
-                available_slots = sum(
-                    1
-                    for s in slots_data
-                    if not s.get("is_processing", True)
-                )
-            if available_slots == 0 and total_slots > 0:
-                return _build_slot_exhaustion_response(
-                    server_config, srv, total_slots
-                )
+        # Dedicated per-call client with a short timeout — never borrow the
+        # shared _http_client, so a slow /slots response cannot hold shared
+        # pool connections and starve slot_save/status under multi-session
+        # load (LP-0MTDH2U6V0062TUF).
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(availability_timeout)
+        ) as client:
+            slots_resp = await client.get(slots_url, timeout=availability_timeout)
+            if slots_resp.status_code == 200:
+                slots_data = slots_resp.json()
+                available_slots = 0
+                total_slots = 0
+                if isinstance(slots_data, list):
+                    total_slots = len(slots_data)
+                    available_slots = sum(
+                        1
+                        for s in slots_data
+                        if not s.get("is_processing", True)
+                    )
+                if available_slots == 0 and total_slots > 0:
+                    return _build_slot_exhaustion_response(
+                        server_config, srv, total_slots
+                    )
     except HTTPException:
         raise
     except Exception:

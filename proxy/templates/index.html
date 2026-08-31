@@ -1237,6 +1237,22 @@ API Endpoints
                     ? '<div class="slot-token-count">Session: ' + slot.session_id.substring(0, 16) + '...</div>'
                     : '';
                 
+                // Lease label (LP-0MTCZ35X7009IZKE): shows whether the work
+                // item owns a dispatch lease on this slot, which session owns
+                // it, and how long it has left.
+                let leaseDisplay = '';
+                if (slot.lease_session_id) {
+                    const ownsLease = hasSession && slot.session_id === slot.lease_session_id;
+                    const remaining = slot.lease_remaining_seconds !== undefined && slot.lease_remaining_seconds !== null
+                        ? Math.round(slot.lease_remaining_seconds) + 's' : '';
+                    const stateLabel = slot.lease_active === true ? 'active' : 'cooldown';
+                    const ownerLabel = ownsLease
+                        ? 'this work item'
+                        : slot.lease_session_id.substring(0, 16) + '...';
+                    leaseDisplay = '<div class="slot-token-count">Lease: ' + ownerLabel +
+                        ' · ' + stateLabel + ' · ' + remaining + ' left</div>';
+                }
+                
                 html += '<div class="slot-card">' +
                     '<div class="slot-card-header">' +
                         '<span class="slot-id">Slot ' + slot.slot_id + '</span>' +
@@ -1246,6 +1262,7 @@ API Endpoints
                         '</span>' +
                     '</div>' +
                     sessionDisplay +
+                    leaseDisplay +
                 '</div>';
             }
             

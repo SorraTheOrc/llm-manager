@@ -938,6 +938,51 @@ async def _do_proxy_openai_api(
     Extracted so that request coalescing can wrap just the outer call
     without interfering with the processing logic.
     """
+    # Bounded mode-switch drain (LP-0MT631JKW008WAKE / AC2): while a
+    # mode-switch restart is draining in-flight local streams, defer NEW
+    # chat requests with a short 503 + Retry-After so no new stream starts
+    # that the imminent restart would kill (the old behavior surfaced a
+    # synthetic ``finish_reason: error`` to the client).
+    if path == "chat/completions":
+        try:
+            from proxy import mode as _mode_mod
+
+            # Defer only while a mode-switch restart is pending AND the
+            # bounded drain is active (restart_pending stays True from the
+            # moment set_mode arms it, so the drain window alone bounds the
+            # deferral). This keeps the gate inert outside a real mode switch.
+            if _mode_mod.restart_pending() and _mode_mod.draining():
+                retry_after = _mode_mod.drain_retry_after()
+                srv.logger.info(
+                    "Deferring chat request during mode-switch drain "
+                    "(retry_after=%ss)",
+                    retry_after,
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "type": "mode_switch_drain",
+                            "code": "mode_switch_drain",
+                            "message": (
+                                "Mode switch in progress; retry shortly."
+                            ),
+                        },
+                        "status": 503,
+                        "retry_after": retry_after,
+                    },
+                    headers={
+                        "Retry-After": str(retry_after),
+                        "Cache-Control": "no-store",
+                    },
+                )
+        except Exception:
+            # Never let the drain gate break request handling.
+            srv.logger.debug(
+                "Mode-switch drain gate failed; serving request normally",
+                exc_info=True,
+            )
+
     # Get the request body to determine the model
     body_json = {}
     model_name = None

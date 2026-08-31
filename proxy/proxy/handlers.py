@@ -496,6 +496,15 @@ async def get_llama_local_status(request: Request):
         if cm:
             try:
                 llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                # Prefer the discovered local child port: the router serializes
+                # /slots?model=... behind the busy child (LP-0MTDGBRPU003Z7KU,
+                # measured 5-7s vs 0.17s direct), which starved the shared
+                # client pool and made status polls report llama_server_running
+                # = false on ~76% of polls.
+                from proxy.router_helpers import _discover_local_child_port
+                child_port = _discover_local_child_port(srv)
+                if child_port is not None:
+                    llama_port = child_port
                 client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
                 from proxy.observability import _query_slots, _query_slots_detail, last_known_slot_counts
                 available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
@@ -1055,7 +1064,7 @@ async def release_lease(request: Request):
     except Exception as e:
         logger.exception(
             "Failed to release dispatch lease for session %s",
-            session_id[:8] if session_id else "unknown",
+            session_id if session_id else "unknown",
         )
         raise HTTPException(
             status_code=500,

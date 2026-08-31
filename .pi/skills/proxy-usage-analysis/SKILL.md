@@ -26,10 +26,11 @@ data-backed recommendations — including an **error taxonomy** and quantified
   thresholds: the report's fallback-reason breakdown and context pressure
   stats show whether configuration changes are warranted.
 - An error spike occurred (e.g. `Stream finished: reason=error`, `slot_save`
-  ReadTimeouts, `backend_retry` timeouts, upstream 429s): the report's
+  ReadTimeouts, `backend_retry` timeouts, upstream HTTP errors): the report's
   **Error analysis** section categorizes every error event and recommends
   remediation (recovery-first silent continue, informative-error fallback,
-  ctx-size pressure, upstream 429 cooldown), quantified from the window.
+  ctx-size pressure, per-status upstream remediation), quantified from the
+  window.
 
 ## Inputs
 
@@ -112,27 +113,47 @@ Outputs written to:
   file, and the raw evidence line.
 - `errors.json` — aggregated error counts by type plus a **provider/model
   breakdown** (nested `{error_type: {provider: {model: count}}}`; providers or
-  models not derivable from the log line are keyed `(unknown)`) plus the window
-  bounds.
+  models not derivable from the log line are keyed `(unknown)`) plus
+  **upstream HTTP error breakdown by status** (`{status: count}` and
+  `{status: {provider: count}}`) plus the window bounds.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), fallback-reason and routing-skip breakdowns, per-model
   breakdown, **Error analysis** (when the window has error events) with a
-  taxonomy table plus a **Provider/model breakdown** table (error type ×
-  provider × model × count),
-  **Local model utilization** (busy time %, idle time, streams served, avg
-  stream duration, total compute, avg/peak concurrency, hourly busy profile,
-  fast/cheap split — when the window has local traffic). The **hourly busy
-  profile** sub-table lists one row per hour of the report window (partial
-  first/last hours truncated to the window edges, idle hours included as
-  `0s`), each with a busy-% column — busy seconds ÷ window-bounded bucket
-  duration — plus a totals row with the overall busy % of the window, **Decode speed** and
+  taxonomy table that includes a **Status** column (upstream HTTP errors are
+  split into one row per status code), a **Provider/model breakdown** table
+  (error type × provider × model × count), and an
+  **Upstream HTTP error breakdown by status** table (status × count ×
+  provider breakdown),
+  **Summary by hour** (rendered at the top of the report, before the
+  Session summary and always — regardless of local traffic): one row per
+  hour of the report window (partial first/last hours truncated to the
+  window edges, idle hours included as `0s`) with busy time / busy-%
+  columns — busy seconds ÷ window-bounded bucket duration — plus three
+  per-session classification columns (Started local, completed local /
+  Started local, fell back / Started remote-only) counting the sessions
+  whose **first request** started in that hour, each cell as `n (pct%)` of
+  that hour's starts; a **Totals** row gives the window busy totals plus
+  the overall classification percentages (matching the Session summary
+  table), **Local model
+  utilization** (busy time %, idle time, streams served, avg
+  stream duration, total compute, avg/peak concurrency,
+  fast/cheap split — when the window has local traffic), **Decode speed** and
   **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
   eval-timing lines, split Total / Fast / Cheap), and highlighted
-  recommendations. Every fast/cheap count carries its share of the metric's
-  total (e.g. `285 (74.4%)`), and each recommendation's evidence cites the
-  total plus the fast/cheap split.
+  recommendations. Percentages in the Total/Fast/Cheap columns are
+  **category-relative**: the Total cell is the share of the overall metric,
+  the Fast cell the share of the fast-only total for that metric, and the
+  Cheap cell the share of the cheap-only total (e.g. a Fallback-reasons Fast
+  cell `3173 (60.3%)` means 60.3% of *fast* fallbacks; a Cheap cell
+  `353 (32.8%)` means 32.8% of *cheap* fallbacks), so fast and cheap are
+  directly comparable within each column. Rows that predate the category
+  split (Session summary Sessions/Requests/Dispatch denied, the `% of
+  fallbacks` / `% of skips` columns, and recommendation evidence's
+  within-group fast/cheap split) intentionally stay share-of-total or
+  share-of-group. Each recommendation's evidence cites the total plus the
+  fast/cheap split.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment
@@ -166,7 +187,9 @@ run (`Previous outputs archived to …`).
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
    `routing_skip_local`, `local_dispatch_denied`, plus the operating-mode
-   lines (`Mode scheduler: applied scheduled mode fast|cheap`) and the error
+   lines (`Mode scheduler: applied scheduled mode fast|cheap`; manual
+   switches, which log `Grandfathering: enabled; other-mode config ...
+   (current=fast|cheap)`, LP-0MT1EE315007AKXG) and the error
    lines (`Stream error:`, `slot_save failed`, `backend_retry`, `[remote]
    upstream error`). Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
@@ -182,12 +205,20 @@ run (`Previous outputs archived to …`).
    durations (slot-seconds), and peak concurrency comes from a sweep over
    interval endpoints. Busy seconds are attributed to hours and to
    fast/cheap periods (slot schedule) by splitting at hour and period
-   boundaries. The hourly sub-table ("Busy time by hour:") then renders one
-   row per hour of the report window — the first/last rows truncated to the
-   window edges and every hour listed even when idle — each with a busy-%
-   column (busy seconds ÷ window-bounded bucket duration) and a final totals
-   row matching the summary's `busy_seconds` / `window_seconds` busy %. The
-   bucket keys are hour-of-day, so windows longer than 24 hours that cover
+   boundaries. The top-of-report **Summary by hour** table
+   (LP-0MTFO210Q0044TTF) then renders one row per hour of the report window
+   — the first/last rows truncated to the window edges and every hour listed
+   even when idle — with a busy-% column (busy seconds ÷ window-bounded
+   bucket duration) plus the per-session classification columns: sessions
+   are counted once by the hour in which their **first request** started and
+   bucketed by journey (started local and completed local / started local
+   and fell back / started remote-only), each cell showing `n (pct%)` of
+   that hour's starts; a final totals row gives the window busy totals plus
+   the overall classification percentages (matching the Session summary
+   table). It renders regardless of local traffic (busy columns read `0s` /
+   `0.0%` when the window has no local streams; with no sessions a "No
+   data" note is shown). The bucket
+   keys are hour-of-day, so windows longer than 24 hours that cover
    the same hour twice would collide; the daily report (24h) never hits this
    (documented limitation). Streams whose start has no paired finish are counted in
    `unfinished_streams` **only when they started inside the window or within
@@ -198,8 +229,12 @@ run (`Previous outputs archived to …`).
 5. **Fast/cheap bucketing** — each session is bucketed by the **operating
    mode** active at its first in-window stream, reconstructed from the
    `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
-   (LP-0MSPZUD4G007IYGH) — so a window crossing the 01:00/10:00 mode
-   transitions splits fast vs cheap correctly even when the analysis itself
+   plus the manual-switch marker `Grandfathering: enabled; other-mode
+   config ... (current=<mode>)` (a `POST /admin/set-mode` manual switch
+   restarts the proxy and logs the actually-active mode this way, without
+   an applied-scheduled-mode line; LP-0MT1EE315007AKXG) — so a window
+   crossing the 01:00/10:00 mode transitions, or containing a manual
+   switch, splits fast vs cheap correctly even when the analysis itself
    runs in fast mode. The mode timeline is built with a 48h margin beyond
    the window (a single streaming pass also serves the busy-time pairing),
    so the nearest prior transition is always available. The bucket label is
@@ -215,8 +250,10 @@ run (`Previous outputs archived to …`).
 7. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
-   rendered into the report's **Error analysis** section (taxonomy table plus
-   a **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
+   rendered into the report's **Error analysis** section (taxonomy table
+   **with a Status column** for upstream HTTP errors, plus an
+   **Upstream HTTP error breakdown by status** table, and a
+   **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
    Provider/model attribution is best effort: `Stream finished: reason=error`
    and `Stream error:` lines carry `provider=`/`model=` directly; `slot_save
    failed` is always the local llama-server (provider `local`, model not in
@@ -226,9 +263,14 @@ run (`Previous outputs archived to …`).
    `deepseek`, `models.inference.ai.azure.com` → `github`; unknown endpoints
    fall back to the bare hostname) and the model is unknown; `backend_retry`
    carries neither. Undetermined values render as `-` in the report and
-   `(unknown)` in JSON. Remediation recommendations (recovery-first,
-   informative-error, ctx-size pressure, 429 cooldown) are generated from
-   these events and link to the relevant work items.
+   `(unknown)` in JSON. Upstream HTTP errors are **broken out by HTTP status
+   code** (one taxonomy row per status, one recommendation per status) so
+   429 rate-limit events and 402 balance events are never conflated. The
+   `errors.json` artifact includes `upstream_by_status` and
+   `upstream_by_status_provider` keys. Remediation recommendations
+   (recovery-first, informative-error, ctx-size pressure, per-status upstream
+   remediation) are generated from these events and link to the relevant work
+   items.
 8. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
@@ -267,10 +309,13 @@ run (`Previous outputs archived to …`).
 - **Local model utilization**: busy time is the share of the window with at
   least one local slot generating. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
-  fallback reasons), not that local is underprovisioned. The "Busy time by
-  hour:" sub-table shows per-hour busy % across exactly the report window
-  (idle hours included), so a glance at the hourly pattern shows when local
-  was saturated vs idle; the totals row gives the window-wide busy %. `context_too_large`
+  fallback reasons), not that local is underprovisioned. The **Summary by
+  hour** table at the top of the report shows per-hour busy % across exactly
+  the report window (idle hours included) alongside the per-session
+  classification of that hour's request starts (local-only / fell back /
+  remote-only), so a glance at the hourly pattern correlates demand with
+  provider usage and shows when local was saturated vs idle; the totals row
+  gives the window-wide busy % and the overall classification percentages. `context_too_large`
   is the largest lever: despite the legacy name (`warm_cache_bypass`) it
   fires when the *estimated context* exceeds the effective warm-cache
   threshold (the per-slot clamp,
@@ -307,9 +352,37 @@ run (`Previous outputs archived to …`).
     (LP-0MSAOQTJS000FFVM).
   - `backend_retry` — upstream connect/read timeouts during retry backoff;
     transient unless clustered.
-  - `upstream error status=429` (`FreeUsageLimitError`) — the 3-hour
-    per-model cooldown (LP-0MRGU0I91006ODFD) should suppress repeat
-    fallbacks; persistent 429s indicate an upstream quota issue.
+  - `upstream error` (HTTP 429) — the 3-hour per-model cooldown
+    (LP-0MRGU0I91006ODFD) should suppress repeat fallbacks; persistent 429s
+    indicate an upstream quota/rate-limit issue.
+  - `upstream error` (HTTP 402) — account balance or subscription issue;
+    the proxy cannot recover — top up the account or switch provider.
+  - `upstream error` (HTTP 5xx) — server-side upstream error; monitor for
+    clustering (provider outage). Other 4xx codes carry the specific error
+    message in the `errors.csv` evidence column.
+
+  **Root-cause classification of observed `reason=error` events (LP-0MT60S55M000TK1H):**
+
+  A 2026-08-23 investigation of 13 `Stream finished: reason=error` events plus
+  7 `Stream error` exceptions across `opencode-go/deepseek-v4-flash` and
+  `local/Qwen3` providers classified the root causes into three categories:
+
+  1. **Mode-switch restart kills (4 events, local/Qwen3)** — `RemoteProtocolError`
+     when the mode-switch restart spawned during an in-flight stream. Per
+     LP-0MSF9RUSQ007M346 the drain window was deliberately removed ("just
+     restart, the client will deal with it"); in-flight streams die mid-generation.
+     Observed at 00:08:22, 01:00:24×2, and 10:00:03 transition windows.
+  2. **Genuine ReadTimeout (1 event, local/Qwen3)** — llama-server stalled under
+     high contention (available_slots=0, queue depth ~54) at 03:48:41.
+  3. **Remote chain exhaustion (8 events, opencode-go/deepseek-v4-flash)** —
+     empty response / stall retries exhausted (2 attempts) while all sibling
+     providers were in cooldown or usage-limit-reset-pending. Correct handling
+     (enriched error, no re-route after content/tool_calls); not a proxy defect.
+
+  The remaining 7 `Stream error` exceptions were proxy-side exceptions (not
+  `finish_reason: error` events) and are handled by the informative-error
+  fallback (LP-0MSDP2PH20079WQ7). All 13 events are now classified per this
+  taxonomy.
 
 ## Testing
 
@@ -335,11 +408,13 @@ lines (`proxy.log` and `llama-server.log`).
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
 - A session is included when it has at least one `Stream started` inside the
   window; the fast/cheap bucket is keyed by its first in-window stream.
-- The mode timeline is reconstructed from `Mode scheduler` lines within a
-  48h margin of the window; sessions starting before the earliest observed
-  transition in the available logs fall back to the analysis-time mode
-  (documented in LP-0MSPZUD4G007IYGH). A window entirely inside one mode
-  (no transition observed) keeps the legacy slot-schedule bucketing.
+- The mode timeline is reconstructed from `Mode scheduler` lines
+  (scheduled) plus the `Grandfathering: enabled; ... (current=<mode>)`
+  marker (manual switches, LP-0MT1EE315007AKXG) within a 48h margin of the
+  window; sessions starting before the earliest observed transition in the
+  available logs fall back to the analysis-time mode (documented in
+  LP-0MSPZUD4G007IYGH). A window entirely inside one mode (no transition
+  observed) keeps the legacy slot-schedule bucketing.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
   across the analysis's effective margin (48h, see `MODE_TIMELINE_MARGIN`)
   and clips streams to the window; a stream that started more than

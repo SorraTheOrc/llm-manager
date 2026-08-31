@@ -183,6 +183,16 @@ ERROR_TYPE_LABELS = {
 
 
 def _error_row(e: log_parser.LogEvent) -> dict:
+    # Enriched stream-error payload (LP-0MT6322OT00900OX): fold the
+    # error_type / message / suggested_action into the detail cell so the
+    # CSV/JSON artifacts surface the informative-error coverage.
+    detail = e.error or ""
+    if e.kind == "stream_finish_error" and e.error_type:
+        detail = e.error_type
+        if e.error_message:
+            detail += f": {e.error_message}"
+        if e.suggested_action:
+            detail += f" ({e.suggested_action})"
     return {
         "error_type": e.kind,
         "timestamp": _fmt_ts(e.ts),
@@ -190,7 +200,7 @@ def _error_row(e: log_parser.LogEvent) -> dict:
         "model": e.model or "",
         "session": e.session or "",
         "entry": e.entry or "",
-        "error_detail": e.error or "",
+        "error_detail": detail,
         "status": str(e.status) if e.status is not None else "",
         "attempt": e.attempt or "",
         "signal": e.signal or "",
@@ -232,10 +242,23 @@ def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path,
 
     json_path = out_dir / "errors.json"
     by_type = dict(summary.error_counts.most_common())
+    by_status = {
+        str(status): count
+        for status, count in sorted(summary.upstream_error_by_status.items())
+    }
+    by_status_provider = {
+        str(status): {
+            provider: count
+            for provider, count in sorted(providers.items(), key=lambda kv: -kv[1])
+        }
+        for status, providers in sorted(summary.upstream_error_by_status_provider.items())
+    }
     payload = {
         "total": len(events),
         "by_type": by_type,
         "by_provider_model": error_provider_model_json(summary),
+        "upstream_by_status": by_status,
+        "upstream_by_status_provider": by_status_provider,
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
     }
@@ -293,6 +316,8 @@ def build_report(
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
 
+    _append_summary_by_hour(ap, summary)
+
     ap("")
     ap("## Session summary")
     ap("")
@@ -321,8 +346,8 @@ def build_report(
     fast_fb = sum(d["fallback_reasons"].values())
     cheap_fb = sum(n["fallback_reasons"].values())
     ap(f"| Fallback events | {len(summary.fallback_events)} ({fallback_rate * 100:.1f}%) | "
-       f"{fast_fb} ({_pct(fast_fb, len(summary.fallback_events)):.1f}%) | "
-       f"{cheap_fb} ({_pct(cheap_fb, len(summary.fallback_events)):.1f}%) |")
+       f"{fast_fb} ({_pct(fast_fb, d['requests']):.1f}%) | "
+       f"{cheap_fb} ({_pct(cheap_fb, n['requests']):.1f}%) |")
     ap(f"| Queued → dispatched local | {len(summary.contention_dispatch_events)} | "
        f"- | {len(summary.contention_dispatch_events)} |")
     ap(f"| Fallback after queue | {len(summary.contention_fallback_events)} | "
@@ -348,11 +373,13 @@ def build_report(
             d = profile["fast"]["fallback_reasons"].get(reason, 0)
             n = profile["cheap"]["fallback_reasons"].get(reason, 0)
             ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% | "
-               f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
+               f"{d} ({_pct(d, fast_fb):.1f}%) | {n} ({_pct(n, cheap_fb):.1f}%) |")
 
     _append_error_section(ap, summary)
 
     if summary.routing_skip_reason_counts:
+        fast_skips = sum(profile["fast"]["routing_skip_reasons"].values())
+        cheap_skips = sum(profile["cheap"]["routing_skip_reasons"].values())
         ap("")
         ap("## routing_skip_local reasons")
         ap("")
@@ -362,7 +389,7 @@ def build_report(
             d = profile["fast"]["routing_skip_reasons"].get(reason, 0)
             n = profile["cheap"]["routing_skip_reasons"].get(reason, 0)
             ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
-               f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
+               f"{d} ({_pct(d, fast_skips):.1f}%) | {n} ({_pct(n, cheap_skips):.1f}%) |")
 
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
@@ -370,14 +397,16 @@ def build_report(
     ap("")
     ap("| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |")
     ap("|---|---|---|---|---|---|---|")
+    total_fast_sessions = profile["fast"]["sessions"]
+    total_cheap_sessions = profile["cheap"]["sessions"]
     for (provider, model), count in initial.most_common():
         s_list = [s for s in sessions if s.initial_provider == provider and s.initial_model == model]
         fast = sum(1 for s in s_list if _bucket_key(s.bucket) == "fast")
         cheap = len(s_list) - fast
         reqs = sum(s.messages for s in s_list)
         fb = sum(1 for s in s_list if s.fell_back)
-        ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, count):.1f}%) | "
-           f"{cheap} ({_pct(cheap, count):.1f}%) | {reqs} | {fb} |")
+        ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, total_fast_sessions):.1f}%) | "
+           f"{cheap} ({_pct(cheap, total_cheap_sessions):.1f}%) | {reqs} | {fb} |")
 
     _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
@@ -408,7 +437,9 @@ def build_report(
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
         "fast/cheap bucketing uses the session start time and the operating-mode profile active at "
-        "that time (reconstructed from `Mode scheduler` lines; windows without mode transitions use "
+        "that time (reconstructed from `Mode scheduler` lines for scheduled "
+        "transitions plus the `Grandfathering: enabled; ... (current=<mode>)` marker for "
+        "manual switches, LP-0MT1EE315007AKXG; windows without mode transitions use "
         "the analysis-time config profile, LP-0MSPZUD4G007IYGH)."
     )
     ap(
@@ -446,8 +477,8 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
     ap("")
     ap("## Error analysis")
     ap("")
-    ap("| Error type | Count | Evidence excerpt |")
-    ap("|---|---|---|")
+    ap("| Error type | Status | Count | Evidence excerpt |")
+    ap("|---|---|---|---|")
     counts = summary.error_counts
     for kind, count in counts.most_common():
         first = next((e for e in summary.error_events if e.kind == kind), None)
@@ -456,7 +487,19 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
             excerpt = first.raw.strip()
             if len(excerpt) > 100:
                 excerpt = excerpt[:100] + "…"
-        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {count} | `{excerpt}` |")
+        # Split upstream HTTP errors into one row per status code.
+        if kind == "upstream_http_error":
+            by_status = {}
+            for e in summary.error_events:
+                if e.kind == "upstream_http_error" and e.status is not None:
+                    by_status[e.status] = by_status.get(e.status, 0) + 1
+            for status, scount in sorted(by_status.items()):
+                ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | {status} | {scount} | `{excerpt}` |")
+            unlabeled = count - sum(by_status.values())
+            if unlabeled > 0:
+                ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | - | {unlabeled} | `{excerpt}` |")
+            continue
+        ap(f"| {ERROR_TYPE_LABELS.get(kind, kind)} | - | {count} | `{excerpt}` |")
     ap("")
     ap("### Provider/model breakdown")
     ap("")
@@ -470,10 +513,40 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
         label = ERROR_TYPE_LABELS.get(kind, kind)
         ap(f"| {label} | {provider or '-'} | {model or '-'} | {count} |")
     ap("")
+    # Upstream errors broken out by HTTP status code.
+    if summary.upstream_error_by_status:
+        ap("### Upstream HTTP error breakdown by status")
+        ap("")
+        ap("| Status | Count | Provider breakdown |")
+        ap("|---|---|---|")
+        for status, count in sorted(summary.upstream_error_by_status.items()):
+            providers = ", ".join(
+                f"{p} ({c})"
+                for p, c in sorted(
+                    summary.upstream_error_by_status_provider.get(status, {}).items(),
+                    key=lambda kv: -kv[1],
+                )
+            )
+            ap(f"| {status} | {count} | {providers} |")
+        ap("")
+    # Enriched stream-error coverage (LP-0MT6322OT00900OX): when stream
+    # finish errors carry the informative error payload, report it so the
+    # operator can verify informative-error coverage without grepping logs.
+    enriched = [
+        e for e in summary.error_events
+        if e.kind == "stream_finish_error" and e.error_type
+    ]
+    if enriched:
+        types = sorted({e.error_type for e in enriched if e.error_type})
+        ap(
+            f"- {len(enriched)} of the `stream_finish_error` events carry the enriched error "
+            f"payload (types: {', '.join(types) or 'n/a'}) — informative-error fallback is "
+            "reaching the log line."
+        )
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
-        "fallback, ctx-size pressure, upstream 429 cooldown)."
+        "fallback, ctx-size pressure, upstream HTTP status-specific remediation)."
     )
 
 
@@ -493,13 +566,129 @@ def _busy_cell(busy: float, window: float) -> str:
     return f"{_fmt_duration(busy)} ({busy / window * 100:.1f}%)" if window else f"{_fmt_duration(busy)}"
 
 
+SESSION_CLASSIFICATION_KEYS = ("local_only", "fell_back", "remote_only")
+
+
+def _session_classification(s: SessionStats) -> str:
+    """Journey classification of one session (``local_only`` / ``fell_back``
+    / ``remote_only``), matching the Session summary table's definitions:
+
+    - ``local_only`` — never used a remote provider (``remote_requests == 0``);
+    - ``fell_back`` — started local and moved to remote
+      (``remote_move_time`` set, LP-0MTFO210Q0044TTF: the session's journey
+      applies to the whole session regardless of when the fallback occurred);
+    - ``remote_only`` — never used local (``local_requests == 0`` and remote
+      traffic).
+
+    The three buckets are mutually exclusive and partition all sessions
+    (every session has at least one in-window ``Stream started``).
+    """
+    if s.remote_requests == 0:
+        return "local_only"
+    if s.fell_back:
+        return "fell_back"
+    return "remote_only"
+
+
+def _hourly_session_classification(sessions: list[SessionStats]) -> dict[int, Counter]:
+    """Session-classification counts keyed by the session's start hour.
+
+    Each session is counted once, in the hour of day in which its **first
+    request** (first in-window ``Stream started``) began; the count feeds the
+    Summary by hour table's three classification columns. Same hour-of-day
+    keying as ``BusyStats.hourly_busy``: windows longer than 24h that cover
+    the same hour twice would collide (daily reports never hit this).
+    """
+    by_hour: dict[int, Counter] = {}
+    for s in sessions:
+        by_hour.setdefault(s.start.hour, Counter())[_session_classification(s)] += 1
+    return by_hour
+
+
+def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
+    """Append the top-of-report ``## Summary by hour`` table.
+
+    One row per hour of the report window (window-bounded buckets, partial
+    first/last hours truncated to the window edges, idle hours listed as
+    ``0s``), with the busy time / busy-% columns of the former ``Busy time by
+    hour:`` sub-table plus three per-session-classification columns: the
+    sessions whose **first request** started in that hour, by journey
+    (started local and completed local / started local and fell back /
+    started remote-only), rendered in the Session summary's ``n (pct%)``
+    style where pct is of the sessions started in that hour
+    (LP-0MTFO210Q0044TTF). Always rendered — also when the window has no
+    local traffic (busy columns then read ``0s`` / ``0.0%``); with no session
+    data at all the body shows a ``No data`` note. Ends with a Totals row:
+    window busy totals plus the overall classification percentages (matching
+    the Session summary table).
+    """
+    sessions = list(summary.sessions.values())
+    by_hour = _hourly_session_classification(sessions)
+    hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
+    end = summary.window_end
+
+    ap("")
+    ap("## Summary by hour")
+    ap("")
+    ap("| Hour | Busy | % | Started local, completed local | Started local, fell back | Started remote-only |")
+    ap("|---|---|---|---|---|---|")
+    if not sessions:
+        ap("| _No session data in window._ | - | - | - | - | - |")
+    else:
+        # Window-bounded hour buckets (LP-0MSVMLM7G009N74N): one row per hour
+        # from window_start to window_end, with the first/last rows truncated
+        # to the window edges and idle hours listed as 0s. Busy seconds come
+        # from ``BusyStats.hourly_busy`` (hour-of-day -> seconds), which is
+        # already window-correct because intervals are clipped to the window
+        # before attribution; the % is busy / window-bounded bucket duration.
+        # Limitation: buckets are keyed by hour-of-day, so windows longer than
+        # 24h that cover the same hour twice would collide — out of scope for
+        # the daily report (``DEFAULT_HOURS = 24``).
+        cursor = summary.window_start
+        while cursor < end:
+            # The first bucket ends at the next full hour boundary (truncated
+            # to the window end for a partial last hour); subsequent cursors
+            # are already on the hour so +1h is the next bucket boundary.
+            bucket_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            bucket_end = min(bucket_end, end)
+            duration = (bucket_end - cursor).total_seconds()
+            seconds = hourly.get(cursor.hour, 0.0)
+            pct = (seconds / duration * 100.0) if duration else 0.0
+            counts = by_hour.get(cursor.hour, Counter())
+            started = sum(counts.values())
+            cells = [
+                f"{counts.get(key, 0)} ({_pct(counts.get(key, 0), started):.1f}%)"
+                for key in SESSION_CLASSIFICATION_KEYS
+            ]
+            ap(
+                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% | "
+                + " | ".join(cells)
+                + " |"
+            )
+            cursor = bucket_end
+
+    n = len(sessions)
+    local_only = sum(1 for s in sessions if _session_classification(s) == "local_only")
+    fell_back = sum(1 for s in sessions if _session_classification(s) == "fell_back")
+    remote_only = sum(1 for s in sessions if _session_classification(s) == "remote_only")
+    busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
+    busy_pct = summary.busy.busy_pct if summary.busy else 0.0
+    ap(
+        f"| Totals | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
+        f"{local_only} ({_pct(local_only, n):.1f}%) | "
+        f"{fell_back} ({_pct(fell_back, n):.1f}%) | "
+        f"{remote_only} ({_pct(remote_only, n):.1f}%) |"
+    )
+
+
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
     """Append the ``## Local model utilization`` section to the report.
 
     Covers busy/idle time over the window (union of active local streams,
-    clipped to the window), total compute (slot-seconds), concurrency, and
-    the fast/cheap + hourly busy profile. The section is omitted when the
-    window has no local traffic.
+    clipped to the window), total compute (slot-seconds), and concurrency.
+    The section is omitted when the window has no local traffic. (The
+    former hourly busy profile moved to the top of the report as the
+    ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
     """
     if summary.busy is None:
         return
@@ -524,39 +713,6 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
-    if b.hourly_busy:
-        ap("")
-        ap("Busy time by hour:")
-        ap("")
-        ap("| Hour | Busy | % |")
-        ap("|---|---|---|")
-        # Window-bounded hour buckets (LP-0MSVMLM7G009N74N): one row per hour
-        # from window_start to window_end, with the first/last rows truncated
-        # to the window edges and idle hours listed as 0s. Busy seconds come
-        # from ``BusyStats.hourly_busy`` (hour-of-day -> seconds), which is
-        # already window-correct because intervals are clipped to the window
-        # before attribution; the % is busy / window-bounded bucket duration.
-        # Limitation: buckets are keyed by hour-of-day, so windows longer than
-        # 24h that cover the same hour twice would collide — out of scope for
-        # the daily report (``DEFAULT_HOURS = 24``).
-        hourly = dict(b.hourly_busy)
-        cursor = summary.window_start
-        end = summary.window_end
-        while cursor < end:
-            # The first bucket ends at the next full hour boundary (truncated
-            # to the window end for a partial last hour); subsequent cursors
-            # are already on the hour so +1h is the next bucket boundary.
-            bucket_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-            bucket_end = min(bucket_end, end)
-            duration = (bucket_end - cursor).total_seconds()
-            seconds = hourly.get(cursor.hour, 0.0)
-            pct = (seconds / duration * 100.0) if duration else 0.0
-            ap(f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% |")
-            cursor = bucket_end
-        # Totals row: total busy time over the window and the overall busy %,
-        # matching the summary table's "Busy time" values
-        # (``busy_seconds`` / ``window_seconds``).
-        ap(f"| Totals | {_fmt_duration(b.busy_seconds)} | {b.busy_pct:.1f}% |")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
@@ -766,8 +922,11 @@ def run_analysis(
     llama-server files are skipped, never fatal.
 
     Fast/cheap bucketing is mode-aware (LP-0MSPZUD4G007IYGH): the mode
-    timeline is reconstructed from ``Mode scheduler`` lines in the logs, and
-    each session is bucketed by the profile active at its start. ``mode_map``
+    timeline is reconstructed from ``Mode scheduler`` lines in the logs
+    (scheduled transitions) plus the ``Grandfathering: enabled; other-mode
+    config ... (current=<mode>)`` marker (manual ``POST /admin/set-mode``
+    switches, LP-0MT1EE315007AKXG), and each session is bucketed by the
+    profile active at its start. ``mode_map``
     may be passed explicitly (tests); otherwise it is built from the
     discovered config profiles (``config-fast.yaml`` / ``config-cheap.yaml``)
     and the persisted ``proxy/.mode``.
@@ -829,6 +988,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "local_only_sessions": local_only,
         "fallback_sessions": fell_back,
         "remote_only_sessions": remote_only,
+        "hourly_session_classification": _hourly_session_classification_json(sessions),
         "total_requests": total,
         "local_requests": summary.local_requests,
         "remote_requests": summary.remote_requests,
@@ -853,6 +1013,19 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
     }
+
+
+def _hourly_session_classification_json(sessions: list[SessionStats]) -> list[dict]:
+    """JSON-friendly per-hour session-classification counts (start hour)."""
+    return [
+        {
+            "hour": hour,
+            "local_only": counts["local_only"],
+            "fell_back": counts["fell_back"],
+            "remote_only": counts["remote_only"],
+        }
+        for hour, counts in sorted(_hourly_session_classification(sessions).items())
+    ]
 
 
 def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:

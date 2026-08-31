@@ -166,3 +166,82 @@ def test_lease_released_renders_message_and_identity_additively():
     assert "client_ip=192.168.0.191" in text
     assert "client_ip_source=direct" in text
     assert "client_port=51842" in text
+
+
+# ---------------------------------------------------------------------------
+# Full session ID in lease events (LP-0MT1TGQC1002X5RH)
+# ---------------------------------------------------------------------------
+
+
+def _full_uuid():
+    """Return a realistic 36-character UUID-style session ID."""
+    return "019fc27d-0000-0000-0000-000000000000"
+
+
+@pytest.mark.asyncio
+async def test_lease_released_logs_full_session_id(caplog):
+    """lease_released events carry the full session ID, not a truncated prefix."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    logger = logging.getLogger("llama-proxy")
+
+    sid = _full_uuid()
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            sid: {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": False,
+                "expires_at": 0.0,
+            },
+        },
+        local_dispatch_records_lock=asyncio.Lock(),
+        logger=logger,
+    )
+
+    await _cleanup_stale_local_dispatch(srv)
+
+    records = _lease_records(caplog)
+    assert records, "Expected lease_released record"
+    msg = records[-1].getMessage()
+    assert f"session={sid} " in msg or msg.endswith(f"session={sid}"), (
+        f"Expected full session ID ({sid}) in lease event log; got: {msg}"
+    )
+    assert msg.count("session=") == 1, (
+        "Lease event should contain exactly one session= field"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_renewed_logs_full_session_id(caplog):
+    """lease_renewed events carry the full session ID."""
+    from proxy.router_helpers import _decrement_local_active_queries
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    logger = logging.getLogger("llama-proxy")
+
+    sid = _full_uuid()
+    lock = asyncio.Lock()
+    records = {sid: {"active": True, "expires_at": time.monotonic() + 60}}
+
+    srv = SimpleNamespace(
+        local_dispatch_records=records,
+        local_dispatch_records_lock=lock,
+        local_active_queries=1,
+        local_active_queries_lock=asyncio.Lock(),
+        logger=logger,
+        config={"server": {"local_dispatch_lease_timeout_seconds": 60}},
+    )
+
+    await _decrement_local_active_queries(srv, session_key=sid)
+
+    renewed_records = [r for r in caplog.records if "lease_renewed" in r.getMessage()]
+    assert renewed_records, "Expected lease_renewed record"
+    msg = renewed_records[-1].getMessage()
+    assert f"session={sid} " in msg, (
+        f"Expected full session ID ({sid}) in lease_renewed log; got: {msg}"
+    )

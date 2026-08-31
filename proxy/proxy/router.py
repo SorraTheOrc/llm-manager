@@ -134,20 +134,17 @@ def _get_local_max_concurrent_queries(server_config: dict) -> int:
     Returns the configured parallel session count, which determines how
     many concurrent sessions can hold local dispatch leases simultaneously.
 
-    The primary config key is ``session_slot_pool_size`` (same value that
-    controls ``--parallel`` in llama-server). If not set, falls back to
-    the legacy ``local_max_concurrent_queries`` key.  Defaults to 1.
+    Reads ``session_slot_pool_size`` (same value that controls
+    ``--parallel`` in llama-server). The legacy
+    ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
+    and a missing value is caught at launch by
+    ``validate_local_routing_config``.  Defaults to 1.
 
     This limit is separate from the global ``max_concurrent_queries``
     which applies to remote providers.
     """
     try:
-        # Primary: session_slot_pool_size (configurable parallel session count)
-        val = server_config.get("session_slot_pool_size", None)
-        if val is None:
-            # Fallback: local_max_concurrent_queries for backward compatibility
-            val = server_config.get("local_max_concurrent_queries", 1)
-        return max(1, int(val or 1))
+        return max(1, int(server_config.get("session_slot_pool_size", 1) or 1))
     except (ValueError, TypeError):
         return 1
 
@@ -561,7 +558,7 @@ async def _cleanup_after_request(
                             try:
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
-                                    session_id[:8] if session_id else "unknown",
+                                    session_id if session_id else "unknown",
                                     extra=_client_identity_extra(request),
                                 )
                             except Exception:
@@ -581,7 +578,7 @@ async def _cleanup_after_request(
                         try:
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
-                                session_id[:8] if session_id else "unknown",
+                                session_id if session_id else "unknown",
                                 extra=_client_identity_extra(request),
                             )
                         except Exception:
@@ -727,6 +724,83 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         server_config.get("session_single_flight_queue_timeout_seconds", 120) or 120
     )
 
+    # ── Hard local-routing cap (LP-0MTBOX45O005LD1S) ──
+    # Check BEFORE concurrency/lease/slot gating so requests above the cap
+    # never acquire a dispatch lease or consume slot resources.
+    # Fast mode: skip local with context_too_large when above cap.
+    # Cheap mode: return a 429 compaction-gate response (no silent remote).
+    #
+    # The estimate MUST use the provider's authoritative pipeline
+    # (``_get_tokenizer_for_model`` + ``_estimate_effective_prompt_tokens_for_routing``)
+    # — native tokenizer + session history + multiplier — IDENTICAL to the
+    # provider smart-routing block (provider.py ``_should_skip_local`` path),
+    # so the gate fires whenever the provider would skip local.  The body-
+    # only tiktoken estimate (``_estimate_tokens_sent``, which returns a DICT
+    # and would crash the cap comparison) undercounts session-heavy /
+    # native-tokenized requests (~1.69x vs Qwen3).  With a lower gate
+    # estimate an over-cap cheap request passes the gate, then the provider
+    # block fires ``context_too_large`` → routes to the next REMOTE provider
+    # = silent remote fallback in cheap mode (AC2 violation).
+    try:
+        from proxy.provider import (
+            _estimate_effective_prompt_tokens_for_routing,
+            _get_tokenizer_for_model,
+        )
+        _model_cfg = srv.get_model_config(model_name) if model_name else None
+        _tokenizer, _multiplier = _get_tokenizer_for_model(_model_cfg, server_config)
+        _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
+            request, body_json, tokenizer=_tokenizer,
+        )
+        if _multiplier != 1.0:
+            _estimated_tokens = int(_estimated_tokens * _multiplier)
+    except Exception:
+        # Fail-open: an estimate error must never break local routing.  The
+        # provider smart-routing block re-estimates per attempt anyway.
+        _estimated_tokens = 0
+    try:
+        from proxy.mode import read_mode as _read_mode
+        _mode = _read_mode()
+    except Exception:
+        _mode = "fast"
+    from proxy.provider import (
+        check_hard_routing_cap,
+        compute_hard_routing_cap,
+    )
+    if check_hard_routing_cap(_estimated_tokens, _mode, server_config):
+        _cap = compute_hard_routing_cap(_mode, server_config)
+        if _mode == "cheap":
+            # Cheap mode: return a 429 compaction-gate response.
+            srv.logger.info(
+                "compaction_gate session=%s tokens=%d cap=%d mode=%s",
+                session_id or "anonymous",
+                _estimated_tokens,
+                _cap,
+                _mode,
+            )
+            from proxy.provider import _build_compaction_gate_response
+            return _build_compaction_gate_response(
+                _estimated_tokens, _cap, _mode, session_id, model_name,
+            )
+        else:
+            # Fast mode: skip local with context_too_large.
+            srv.logger.info(
+                "context_too_large session=%s tokens=%d cap=%d mode=%s",
+                session_id or "anonymous",
+                _estimated_tokens,
+                _cap,
+                _mode,
+            )
+            _record_backend_signal("context_too_large")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Context ({_estimated_tokens} tokens) exceeds the "
+                    f"{model_name or 'model'} local routing cap ({_cap} tokens) "
+                    "in fast mode. Compact the session and retry."
+                ),
+                headers={"X-Context-Too-Large": "true"},
+            )
+
     # Check concurrency limit
     max_queries = server_config.get("max_concurrent_queries", 4)
     try:
@@ -778,6 +852,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     # Anonymous/auto-generated sessions are ephemeral and should not
     # acquire a persistent lease.
     # -------------------------------------------------------------------
+    acquired = False
     if session_id and session_explicit:
         local_max = _get_local_max_concurrent_queries(server_config)
         acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
@@ -791,8 +866,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         if not acquired:
             srv.logger.info(
                 "local_dispatch_denied session=%s owner=%s active=%s",
-                session_id[:8] if session_id else "unknown",
-                owner[:8] if owner else "none",
+                session_id if session_id else "unknown",
+                owner if owner else "none",
                 active_count,
             )
             _record_backend_signal("local_dispatch_denied")
@@ -814,9 +889,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
             }
             return JSONResponse(status_code=503, content=payload)
 
-    # Check slot availability
+    # Check slot availability — skipped when the dispatch lease was acquired
+    # (the lease already gates concurrency to session_slot_pool_size; the
+    # router /slots?model= check is redundant and can take 5-7s under load,
+    # LP-0MTDGBRPU003Z7KU).
+    _lease_held = bool(session_id and session_explicit) and acquired
     slot_response = await _check_slot_availability(
-        srv, server_config, llama_port, slot_model_name, model_name, path
+        srv, server_config, llama_port, slot_model_name, model_name, path,
+        lease_held=_lease_held,
     )
     if slot_response is not None:
         return slot_response

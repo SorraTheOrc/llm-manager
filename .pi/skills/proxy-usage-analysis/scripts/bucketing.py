@@ -169,7 +169,9 @@ class ModeScheduleMap:
     own config profile: ``config-fast.yaml`` / ``config-cheap.yaml``), each
     with its own ``slot_schedule`` (LP-0MSM5K4TX004MICX). The mode active at
     any timestamp is reconstructed from ``Mode scheduler: applied scheduled
-    mode <mode>`` transitions parsed out of the logs
+    mode <mode>`` transitions (scheduled) plus the ``Grandfathering:
+    enabled; ... (current=<mode>)`` marker (manual ``POST /admin/set-mode``
+    switches, LP-0MT1EE315007AKXG) parsed out of the logs
     (LP-0MSPZUD4G007IYGH) — so sessions that ran during cheap hours are
     bucketed with the cheap profile even when the analysis itself runs in
     fast mode (the old behaviour bucketed every session by the

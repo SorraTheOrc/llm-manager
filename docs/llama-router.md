@@ -101,6 +101,47 @@ server:
 The warning names the session and the ratio so operators/agents can compact before
 decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
 
+## Session compaction config (LP-0MTG6RW3L003X122)
+
+Proxy-side proactive session compaction (parent LP-0MTCWE8NG003P0SD) needs a
+summariser and a configurable compaction trigger ratio. Both are read from the
+`server:` section of the config:
+
+```yaml
+server:
+  # Fires when est_tokens > ratio × effective per-slot threshold
+  # (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K;
+  #  cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K).
+  compaction_trigger_ratio: 0.70   # default 0.70; 0 disables
+  # Summariser model — reuses the existing local Qwen3 model, no new download.
+  summarizer_model:
+    type: local
+    llama_model: Qwen3
+  summarizer_ctx_size: 8192        # default 8192; summariser KV footprint
+  summarizer_max_tokens: 512       # default 512; summary output budget
+  # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
+  # advisory logging only, zero dispatch change. TRUE until the AC8
+  # enforcement gate passes (experiment LP-0MSG9PUHU0059TTZ bar + client-side
+  # compaction review); flip to false to enable live enforcement.
+  compaction_dry_run: true
+```
+
+The proxy evaluates the session history at prompt-assembly time
+(`_evaluate_session_compaction` in `proxy/proxy/router_helpers.py`, wired
+into `_handle_session`). In dry-run it logs what WOULD happen
+(would-summarize / would-drop) plus churn stats (< 1 compaction/session/hour)
+without touching the request; in live mode (`compaction_dry_run: false`) an
+over-trigger session is summarized (strategy: system + first prompt retained
+verbatim, middle folded, newest whole turns kept ≤ target), the dispatch body
+is replaced with the compacted full history, and `remote_with_guidance`
+enforces non-compactable sessions never reach local near-full-slot.
+
+The config is validated at startup (`validate_compaction_config` in
+`proxy/proxy/provider.py`, invoked from `proxy/proxy/utils.py` and
+`proxy/proxy/server.py`): an out-of-range trigger ratio, an explicitly empty
+`llama_model`, or non-positive ctx/max-token values fail startup with a clear
+error. See `proxy/tests/test_compaction_config.py`.
+
 ## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
 
 The smart-routing clamp (`_effective_large_context_thresholds` in
@@ -171,11 +212,15 @@ server:
 > (cold, warm] band must never collapse — dead-code guard
 > LP-0MSI2M5BT004BCDP):
 >
-> - `proxy/config-fast.yaml` — `38000` (warm clamps to `131072//3 − 4096 =
->   39594`; recaptures the old (30000, 38000] cold-cache bypass band).
-> - `proxy/config-cheap.yaml` — `60000` (warm resolves to `100000` via the
+> - `proxy/config-fast.yaml` — `38000` (fast mode runs 3 slots × 262144 total
+>   ctx since the operator supersede LP-0MSY0SDAS0031Y7F, so the warm clamp is
+>   `262144//3 − 4096 =
+>   83285`; recaptures the old (30000, 38000] cold-cache bypass band).
+> - `proxy/config-cheap.yaml` — `38000` (warm resolves to `100000` via the
 >   2×262144 schedule entries; also below the boot-transient clamp 61440,
->   LP-0MSMZOAJW002UR2A; recaptures ~50 cold-cache requests/night).
+>   LP-0MSMZOAJW002UR2A; symmetric with fast after the 60000 raise failed
+>   guardrails and was reverted — see LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K
+>   / LP-0MSY0V4ZO002ANPL).
 > - `proxy/config.yaml` (default/fallback) — `38000`, mirroring fast mode.
 >
 > Prompts above the per-slot warm clamp are **never** routed local
@@ -203,7 +248,9 @@ At a transition the proxy restarts llama-server with the new `--parallel`
 AND context size, and the routing clamp (`_effective_large_context_thresholds`)
 plus the `session_slot_max_prompt_tokens` dynamic derivation use the ACTIVE
 period's `(ctx_size, slots)` — so overnight the per-slot cap becomes
-`262144 // 2 - 4096 = 126976` while daytime stays `131072 // 3 - 4096 = 39594`.
+`262144 // 2 - 4096 = 126976` while daytime stays `262144 // 3 - 4096 = 83285`
+(the shared `local_model_ctx_size: 262144` supersede LP-0MSY0SDAS0031Y7F
+applies when the daytime entry omits ctx_size).
 
 **Router-mode mechanism:** a global `--ctx-size` on the router command line
 would override per-model INI `ctx-size` for EVERY model (CLI args take highest
