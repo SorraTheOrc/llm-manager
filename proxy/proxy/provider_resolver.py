@@ -13,15 +13,12 @@ Provides:
 - Lightweight structured logging and a counter metric for unresolved names.
 
 Configuration (see ``config.yaml``):
-  audit_model: "deepseek-v4-flash-free"
+  audit_model: "deepseek-v4-flash"
   audit_model_fallbacks:
-    - "openrouter/free"
     - "deepseek-v4-flash"
 
 Canonical model IDs (discovered via ``pi --list-models``):
-  opencode/deepseek-v4-flash-free
   opencode-go/deepseek-v4-flash
-  openrouter/openrouter/free
   openrouter/deepseek/deepseek-v4-flash
   opencode/deepseek-v4-flash
 """

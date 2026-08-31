@@ -67,7 +67,7 @@ def test_concurrent_embeddings_and_chat():
     """Issue concurrent embedding and chat requests and verify graceful handling.
 
     Sends 1 embedding and 1 chat request at a time (matching
-    local_max_concurrent_queries=1) rather than 10 concurrent requests,
+    session_slot_pool_size=1) rather than 10 concurrent requests,
     reducing the likelihood of overwhelming the server while still
     exercising both endpoints under concurrency.
 
@@ -127,7 +127,7 @@ def test_concurrent_embeddings_and_chat():
         assert len(results) == 6, f"expected 6 responses, got {len(results)}"
 
         # Validate responses under concurrency guard:
-        # with local_max_concurrent_queries=1, overload 503s are expected
+        # with session_slot_pool_size=1, overload 503s are expected
         # when firing 2 concurrent requests.
         ok_count = 0
         overload_count = 0

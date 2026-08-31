@@ -167,56 +167,6 @@ def test_models_ini_reasoning_format_set_for_qwen3_presets():
 # ---------------------------------------------------------------------------
 
 
-def test_configs_have_local_qwen3_mtp_entry():
-    """Every proxy config should define the local-qwen3-mtp model entry."""
-    for path in CONFIG_PATHS:
-        cfg = _load_config(path)
-        assert "local-qwen3-mtp" in cfg.get("models", {}), (
-            f"{os.path.basename(path)} should define local-qwen3-mtp"
-        )
-
-
-def test_config_local_qwen3_mtp_first_provider_is_local_mtp():
-    """The local-qwen3-mtp entry's first provider must be local llama_model Qwen3-MTP."""
-    for path in CONFIG_PATHS:
-        cfg = _load_config(path)
-        entry = cfg["models"]["local-qwen3-mtp"]
-        providers = entry.get("providers", [])
-        assert providers, f"{os.path.basename(path)} local-qwen3-mtp needs providers"
-        assert providers[0].get("type") == "local", (
-            f"{os.path.basename(path)} local-qwen3-mtp first provider must be local"
-        )
-        assert providers[0].get("llama_model") == "Qwen3-MTP", (
-            f"{os.path.basename(path)} local-qwen3-mtp should use llama_model: Qwen3-MTP, "
-            f"got {providers[0].get('llama_model')!r}"
-        )
-
-
-def test_config_local_qwen3_mtp_keeps_remote_fallback_chain():
-    """The local-qwen3-mtp entry should keep the same remote fallback chain."""
-    for path in CONFIG_PATHS:
-        cfg = _load_config(path)
-        entry = cfg["models"]["local-qwen3-mtp"]
-        providers = entry.get("providers", [])
-        assert len(providers) >= 2, (
-            f"{os.path.basename(path)} local-qwen3-mtp should have local + remote fallbacks"
-        )
-        for p in providers[1:]:
-            assert p.get("type") == "remote", (
-                f"{os.path.basename(path)} local-qwen3-mtp fallback provider should be remote"
-            )
-
-
-def test_config_local_qwen3_mtp_aliases():
-    """The local-qwen3-mtp entry should expose qwen3-mtp / local-qwen3-mtp aliases."""
-    for path in CONFIG_PATHS:
-        cfg = _load_config(path)
-        aliases = cfg["models"]["local-qwen3-mtp"].get("aliases", [])
-        assert "qwen3-mtp" in aliases, (
-            f"{os.path.basename(path)} local-qwen3-mtp should alias 'qwen3-mtp'"
-        )
-
-
 def test_config_production_chains_unaffected():
     """The plan/author/code chains must STILL route local-first to Qwen3 (coexist)."""
     for path in CONFIG_PATHS:

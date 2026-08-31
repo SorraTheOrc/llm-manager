@@ -1,0 +1,192 @@
+{
+  "caps": {
+    "cheap": 61440,
+    "fast": 83285
+  },
+  "days": {
+    "2026-08-24": {
+      "breaches": {
+        "cheap": {
+          "breach": 6,
+          "breach_pct": 9.1,
+          "cap": 61440,
+          "sessions": 66
+        },
+        "fast": {
+          "breach": 24,
+          "breach_pct": 12.8,
+          "cap": 83285,
+          "sessions": 187
+        }
+      },
+      "context_pressure_sessions": 39,
+      "context_pressure_warnings": 1234,
+      "distributions": {
+        "cheap": {
+          "requests": {
+            "count": 1042,
+            "max": 136976.0,
+            "mean": 27641.2,
+            "median": 20926.0,
+            "p90": 63766.0,
+            "p95": 82675.0
+          },
+          "sessions": {
+            "count": 66,
+            "max": 136976.0,
+            "mean": 27992.2,
+            "median": 19313.0,
+            "p90": 57875.0,
+            "p95": 95537.0
+          }
+        },
+        "fast": {
+          "requests": {
+            "count": 3803,
+            "max": 248905.0,
+            "mean": 60866.5,
+            "median": 38806.0,
+            "p90": 154353.0,
+            "p95": 187070.0
+          },
+          "sessions": {
+            "count": 187,
+            "max": 248905.0,
+            "mean": 44050.8,
+            "median": 32769.0,
+            "p90": 89881.0,
+            "p95": 125804.0
+          }
+        }
+      },
+      "routing_skips": {
+        "context_too_large": 1054,
+        "large_context_bypass": 383
+      },
+      "sessions": 253
+    },
+    "2026-08-25": {
+      "breaches": {
+        "cheap": {
+          "breach": 11,
+          "breach_pct": 15.3,
+          "cap": 61440,
+          "sessions": 72
+        },
+        "fast": {
+          "breach": 18,
+          "breach_pct": 15.1,
+          "cap": 83285,
+          "sessions": 119
+        }
+      },
+      "context_pressure_sessions": 34,
+      "context_pressure_warnings": 1362,
+      "distributions": {
+        "cheap": {
+          "requests": {
+            "count": 979,
+            "max": 109098.0,
+            "mean": 30734.9,
+            "median": 26582.0,
+            "p90": 63768.0,
+            "p95": 77181.0
+          },
+          "sessions": {
+            "count": 72,
+            "max": 109098.0,
+            "mean": 34491.4,
+            "median": 32361.5,
+            "p90": 64616.0,
+            "p95": 76416.0
+          }
+        },
+        "fast": {
+          "requests": {
+            "count": 3617,
+            "max": 424128.0,
+            "mean": 78845.6,
+            "median": 49071.0,
+            "p90": 209752.0,
+            "p95": 255364.0
+          },
+          "sessions": {
+            "count": 119,
+            "max": 424128.0,
+            "mean": 53869.4,
+            "median": 37346.0,
+            "p90": 115435.0,
+            "p95": 140059.0
+          }
+        }
+      },
+      "routing_skips": {
+        "context_too_large": 1191,
+        "large_context_bypass": 526
+      },
+      "sessions": 191
+    },
+    "2026-08-26": {
+      "breaches": {
+        "cheap": {
+          "breach": 5,
+          "breach_pct": 11.1,
+          "cap": 61440,
+          "sessions": 45
+        },
+        "fast": {
+          "breach": 14,
+          "breach_pct": 10.4,
+          "cap": 83285,
+          "sessions": 135
+        }
+      },
+      "context_pressure_sessions": 25,
+      "context_pressure_warnings": 1731,
+      "distributions": {
+        "cheap": {
+          "requests": {
+            "count": 1209,
+            "max": 162389.0,
+            "mean": 48362.8,
+            "median": 33703.0,
+            "p90": 119571.0,
+            "p95": 133467.0
+          },
+          "sessions": {
+            "count": 45,
+            "max": 162389.0,
+            "mean": 36776.9,
+            "median": 30009.0,
+            "p90": 64606.0,
+            "p95": 109169.0
+          }
+        },
+        "fast": {
+          "requests": {
+            "count": 3387,
+            "max": 651408.0,
+            "mean": 91305.4,
+            "median": 54396.0,
+            "p90": 186309.0,
+            "p95": 245348.0
+          },
+          "sessions": {
+            "count": 135,
+            "max": 651408.0,
+            "mean": 46234.4,
+            "median": 27385.0,
+            "p90": 92101.0,
+            "p95": 167364.0
+          }
+        }
+      },
+      "routing_skips": {
+        "context_too_large": 1553,
+        "large_context_bypass": 365
+      },
+      "sessions": 180
+    }
+  },
+  "window": "2026-08-24..2026-08-26"
+}

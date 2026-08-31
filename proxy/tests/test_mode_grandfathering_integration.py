@@ -47,7 +47,7 @@ FAST_MODELS = {
         "providers": [
             {"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"},
             {
-                "name": "opencode-deepseek-free",
+                "name": "opencode-deepseek",
                 "type": "remote",
                 "provider": "opencode",
                 "endpoint": "https://opencode.ai/zen",

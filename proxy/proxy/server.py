@@ -136,6 +136,10 @@ other_mode_config: dict | None = None
 # Periodic prune task for the grandfathering registry.
 _grandfathering_prune_task: asyncio.Task | None = None
 
+# Periodic prune task for session recordings (retention, LP-0MT2TC3PB005H1RD).
+# The recorder prunes on startup (immediately) and then on an interval.
+_recording_prune_task: asyncio.Task | None = None
+
 
 # Lazy self-import helper returns this module (avoids circular imports)
 def _srv():
@@ -156,12 +160,12 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         await _release_local_dispatch(_srv, session_id)
         logger.info(
             "lease_released session=%s reason=session_evicted",
-            session_id[:8] if session_id else "unknown",
+            session_id if session_id else "unknown",
         )
     except Exception:
         logger.exception(
             "Failed to release dispatch lease on session eviction for %s",
-            session_id[:8] if session_id else "unknown",
+            session_id if session_id else "unknown",
         )
 
 
@@ -375,6 +379,26 @@ def _startup_validate_local_routing_config(config: dict) -> None:
         )
 
 
+def _startup_validate_compaction_config(config: dict) -> None:
+    """Validate the compaction configuration (LP-0MTG6RW3L003X122).
+
+    Logs a WARNING per problem by default; raises ValueError at startup when
+    a FATAL problem is detected.
+    """
+    from proxy.provider import validate_compaction_config
+
+    problems = validate_compaction_config(config)
+    for problem in problems:
+        if problem.startswith("FATAL: "):
+            logger.error("Compaction config validation FAILED: %s", problem)
+        else:
+            logger.warning("Compaction config validation: %s", problem)
+    if any(p.startswith("FATAL: ") for p in problems):
+        raise ValueError(
+            "Compaction config validation failed: " + "; ".join(problems)
+        )
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -385,6 +409,26 @@ def _startup_config_logging():
     config = load_config()
     logger = setup_logging(config)
     _startup_validate_local_routing_config(config)
+    _startup_validate_compaction_config(config)
+
+    # Log resolved hard-routing caps for both modes (LP-0MTBOX45O005LD1S).
+    # The caps are derived from per-mode ratios against the active per-slot
+    # threshold, so they rescale automatically when slot_schedule changes.
+    try:
+        from proxy.mode import read_mode as _read_mode
+        from proxy.provider import compute_hard_routing_cap
+        _mode = _read_mode()
+        _fast_cap = compute_hard_routing_cap("fast", config)
+        _cheap_cap = compute_hard_routing_cap("cheap", config)
+        logger.info(
+            "Hard-routing caps: fast=%s cheap=%s (mode=%s)",
+            _fast_cap if _fast_cap > 0 else "disabled",
+            _cheap_cap if _cheap_cap > 0 else "disabled",
+            _mode,
+        )
+    except Exception:
+        pass  # Logging is best-effort; don't block startup
+
     logger.info("Starting LLama Proxy Server")
     return config, logger
 
@@ -776,6 +820,101 @@ def _shutdown_grandfathering():
         logger.exception("Failed to save grandfathering registry on shutdown")
 
 
+def _startup_launch_recording_prune():
+    """Start the session-recording retention prune task (non-blocking).
+
+    The prune loop runs once immediately on startup and then on a periodic
+    interval. Skips creation when already running, and never blocks startup:
+    failures are logged and the task is left unset so startup continues
+    (LP-0MT2TC3PB005H1RD).
+    """
+    global _recording_prune_task
+    if _recording_prune_task is not None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _recording_prune_task = loop.create_task(_recording_prune_loop())
+        logger.info("Session recording prune task started")
+    except Exception as e:
+        logger.warning(
+            "Failed to start session recording prune task: %s", e
+        )
+        _recording_prune_task = None
+
+
+async def _recording_prune_loop(
+    interval_seconds: float | None = None,
+) -> None:
+    """Periodically prune recordings older than the retention window.
+
+    Runs once immediately so startup cleans up any files that aged out
+    while the proxy was stopped, then re-runs on an interval derived from
+    the ``session_recording.prune_interval_seconds`` config (default
+    DEFAULT_PRUNE_INTERVAL_SECONDS). When retention is disabled
+    (``retention_days <= 0``) the loop exits without pruning
+    (LP-0MT2TC3PB005H1RD).
+    """
+    try:
+        from proxy.session_recorder import (
+            DEFAULT_PRUNE_INTERVAL_SECONDS,
+            SessionRecorder,
+        )
+
+        recorder = SessionRecorder.from_config(config)
+        if recorder.retention_days <= 0:
+            logger.info(
+                "Session recording pruning disabled "
+                "(session_recording.retention_days=%s)",
+                recorder.retention_days,
+            )
+            return
+        if interval_seconds is None:
+            interval_seconds = recorder.prune_interval_seconds or DEFAULT_PRUNE_INTERVAL_SECONDS
+
+        # Immediate start: prune anything that aged out while stopped.
+        try:
+            stats = await recorder.prune_older_than(recorder.retention_days)
+            logger.info(
+                "Session recording startup prune: %d file(s) deleted, "
+                "%d dir(s) removed",
+                stats.get("files_deleted", 0),
+                stats.get("dirs_removed", 0),
+            )
+        except Exception as exc:
+            logger.warning("Session recording startup prune failed: %s", exc)
+
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                stats = await recorder.prune_older_than(recorder.retention_days)
+                if stats.get("files_deleted") or stats.get("dirs_removed"):
+                    logger.info(
+                        "Session recording prune: %d file(s) deleted, "
+                        "%d dir(s) removed",
+                        stats.get("files_deleted", 0),
+                        stats.get("dirs_removed", 0),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Session recording prune failed: %s", exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Session recording prune loop error: %s", exc)
+
+
+def _shutdown_stop_recording_prune():
+    """Cancel the session-recording retention prune task."""
+    global _recording_prune_task
+    if _recording_prune_task is not None:
+        try:
+            _recording_prune_task.cancel()
+        except Exception:
+            pass
+        _recording_prune_task = None
+
+
 def _startup_launch_slot_scheduler():
     """Start the slot scheduler background task.
 
@@ -987,6 +1126,7 @@ async def lifespan(app: FastAPI):
     _startup_launch_mode_scheduler()
     _startup_initialize_grandfathering()
     _startup_launch_disconnect_reaper()
+    _startup_launch_recording_prune()
 
     yield
 
@@ -995,6 +1135,7 @@ async def lifespan(app: FastAPI):
     # ------------------------------------------------------------------ #
     logger.info("Shutting down LLama Proxy Server")
     _shutdown_stop_session_cleanup()
+    _shutdown_stop_recording_prune()
     _shutdown_grandfathering()
     await _shutdown_cleanup_tasks()
     _shutdown_tts_server()

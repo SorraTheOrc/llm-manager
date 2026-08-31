@@ -104,12 +104,12 @@ def opencode_distinct_endpoints_chain():
     return {
         "providers": [
             {
-                "name": "opencode-deepseek-free",
+                "name": "opencode-deepseek",
                 "type": "remote",
                 "provider": "opencode",
                 "endpoint": "https://opencode.ai/zen",
                 "api_key_env": "OPENCODE_API_KEY",
-                "model": "deepseek-v4-flash-free",
+                "model": "deepseek-v4-flash",
             },
             {
                 "name": "opencode-go-2-deepseek",
@@ -296,7 +296,7 @@ def test_resolve_with_exclusions_does_not_skip_different_endpoint(opencode_disti
 
     result = provider._resolve_provider_with_exclusions(
         opencode_distinct_endpoints_chain,
-        excluded_provider_names={"opencode-deepseek-free"},
+        excluded_provider_names={"opencode-deepseek"},
         excluded_domains={domain},
     )
     assert result is not None
@@ -332,11 +332,11 @@ def test_resolve_provider_skips_same_domain_after_failure(opencode_same_gateway_
 
 def test_resolve_provider_keeps_different_endpoint_after_failure(opencode_distinct_endpoints_chain):
     """``resolve_provider`` must NOT over-group: failing
-    ``opencode-deepseek-free`` (zen) leaves ``opencode-go-2-deepseek``
+    ``opencode-deepseek`` (zen) leaves ``opencode-go-2-deepseek``
     (zen/go) eligible."""
     result = provider.resolve_provider(
         opencode_distinct_endpoints_chain,
-        failed_provider="opencode-deepseek-free",
+        failed_provider="opencode-deepseek",
     )
     assert result is not None
     assert result["name"] == "opencode-go-2-deepseek"
@@ -419,7 +419,7 @@ async def test_midstream_stall_reroutes_past_same_gateway_in_proxy_with_fallback
 
 @pytest.mark.asyncio
 async def test_midstream_stall_keeps_different_endpoint_in_chain(opencode_distinct_endpoints_chain):
-    """No over-grouping end-to-end: a stall on ``opencode-deepseek-free``
+    """No over-grouping end-to-end: a stall on ``opencode-deepseek``
     (zen) still tries ``opencode-go-2-deepseek`` (zen/go) before reaching
     ``deepseek-v4-flash``."""
     call_order: list[str] = []
@@ -427,7 +427,7 @@ async def test_midstream_stall_keeps_different_endpoint_in_chain(opencode_distin
     async def _mock_proxy_to_remote(_req, _path, provider_cfg):
         name = provider_cfg["name"]
         call_order.append(name)
-        if name == "opencode-deepseek-free":
+        if name == "opencode-deepseek":
             return _make_streaming_response(_reasoning_only_stall_stream())
         if name == "opencode-go-2-deepseek":
             return _make_streaming_response(_reasoning_only_stall_stream())
@@ -439,7 +439,7 @@ async def test_midstream_stall_keeps_different_endpoint_in_chain(opencode_distin
             {"provider_cooldown_seconds": 60},
         )
 
-    assert call_order == ["opencode-deepseek-free", "opencode-go-2-deepseek", "deepseek-v4-flash"], (
+    assert call_order == ["opencode-deepseek", "opencode-go-2-deepseek", "deepseek-v4-flash"], (
         f"Distinct endpoints must NOT be grouped, got {call_order}"
     )
     assert result.status_code == 200

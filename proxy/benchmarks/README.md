@@ -211,6 +211,62 @@ python -m proxy.benchmarks.slot_benchmark --slots 6 --phase cold --clean-cache
 4. **KV memory is total-ctx-bound, not slot-bound** (q8_0, 10 layers): 131072
    total ctx → 1362.7 MiB KV; 262144 → ~2720 MiB, regardless of slot split.
 
+#### Per-config per-slot KV headroom table (F4, LP-0MSC95W3T000CCYC)
+
+Reproducible via `python3 proxy/benchmarks/kv_memory_table.py` (or `--json`).
+Method: q8_0 KV per-token cost measured from llama-server logs
+(1362.7 MiB / 131072 total ctx cells); model Qwen3 35B Q5_K_M = 24.7 GiB;
+~87 GiB available (124 GiB total, measured across F2/F3 run snapshots):
+
+```
+| Config | Slots | per-slot ctx | per-slot KV (MiB) | total KV (MiB) | Model+KV (GiB) | headroom (GiB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8x32.8K | 8 | 32768 | 340.7 | 2725.4 | 27.36 | 59.64 |
+| 6x43.7K | 6 | 43690 | 454.2 | 2725.4 | 27.36 | 59.64 |
+| 4x65.5K | 4 | 65536 | 681.4 | 2725.4 | 27.36 | 59.64 |
+| 3x87.4K | 3 | 87381 | 908.5 | 2725.4 | 27.36 | 59.64 |
+| 2x131K | 2 | 131072 | 1362.7 | 2725.4 | 27.36 | 59.64 |
+| 3x43.7K live baseline | 3 | 43690 | 454.2 | 1362.7 | 26.03 | 60.97 |
+```
+
+Memory is NOT a constraint for any candidate (≥59 GiB headroom at all
+configs); the intake's "~71GB available" claim is confirmed upward.
+
+#### Metric semantics (F1/F2/F3 variances, noted in the 2026-08-24 audit)
+
+The ACs reference "prefill throughput (t/s)". In the recorded F2/F3 JSONs:
+
+- `tokens_per_second` is **generation** throughput (`completion_tokens / elapsed`),
+  not prefill throughput. Prefill t/s is derivable as `prompt_tokens /
+  time_to_first_token_seconds` (e.g. ~125 tok/s documented in F3 comments).
+- `time_to_first_token_seconds` is a **heuristic estimate** for non-streaming
+  requests (`elapsed / (completion + 1) * 1.5`) rather than a server-reported
+  TTFT (`run_benchmark.py` RequestResult).
+- P95 fields are **aggregate** per run; each prompt size has 1 sample per run,
+  so per-size P95 is not first-class in the JSON (derivable from `requests`).
+
+These semantics are consistent across all F2/F3 JSONs and `compare_results.py`
+consumes the same summary keys, so delta comparisons remain valid.
+
+#### Run-window error taxonomy (F3 AC3, LP-0MSC95W0H0003JOL)
+
+Candidate benchmark JSONs record errors whose root cause is external to the
+original 503-protocol concern (`backend_unavailable` during llama-server
+restarts). Triage of every recorded error in `benchmark-results/F3_candidates/`:
+
+- **2× HTTP 500 `Router.Unavailable`** (`candidate_2x131K_q8_cold.json`,
+  90K/120K fixtures): the remote provider (deepseek-v4-flash-free) was down
+  during the run window — a remote-outage, not a local restart-window 503.
+  The proxy correctly fell through local→remote per the routing clamp.
+- **1× 1200s client timeout** (`candidate_3x87.4K_q8_warm.json`, 60K fixture):
+  the ~77K-token local prefill exceeded the proxy's dispatch-lease
+  `orphan_cleanup` and was restarted, never completing — a known large-prefill
+  lease hazard tracked as follow-up LP-0MSEHMMBK0062ZPI.
+
+The 503 `backend_unavailable` path itself is code-verified
+(`proxy/proxy/backend_health.py`, `proxy/proxy/router_helpers.py`) and
+test-covered (`proxy/tests/test_backend_resilience.py`).
+
 ## Gating Policy
 
 The following thresholds define minimum acceptable criteria for candidate

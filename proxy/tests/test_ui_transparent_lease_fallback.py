@@ -31,7 +31,7 @@ def _setup_server_state(monkeypatch):
         "server": {
             "llama_router_mode": False,
             "llama_server_port": 8080,
-            "local_max_concurrent_queries": 1,
+            "session_slot_pool_size": 1,
         }
     }
     monkeypatch.setattr(srv_module, "config", config)
@@ -245,7 +245,7 @@ async def test_proxy_with_fallback_lease_active_no_remote_503(monkeypatch):
     )
     body_data = json.loads(resp.body.decode("utf-8"))
     diagnostics = body_data.get("diagnostics", [])
-    # With local_max_concurrent_queries=1 and one other session holding
+    # With session_slot_pool_size=1 and one other session holding
     # a lease, the concurrency limit is hit before the lease check in
     # proxy_to_local is even called.  Verify the diagnostics contain the
     # concurrency-limit reason.

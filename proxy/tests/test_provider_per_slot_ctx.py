@@ -221,35 +221,38 @@ class TestColdWarmBandReachable:
 
 
 class TestCheapModeColdThreshold:
-    """Cold-cache threshold for the CHEAP profile (LP-0MSOMVOPH004ATAK, reverted).
+    """Cold-cache threshold for the CHEAP profile (LP-0MSOMVOPH004ATAK,
+    reverted, then re-raised).
 
     Cheap mode runs 2 slots x 262144 (per-period ctx override), so the
     effective warm threshold resolves to min(100000, 262144//2 - 4096 =
     126976) = 100000. Post-deploy validation (LP-0MSRM54YO007YG0K AC6/AC7)
     showed the raised cheap cold 60000 breached the cheap queue guardrails on
-    two consecutive nights, so it is reverted to the pre-change 30000. 30000
-    stays below both the warm 100000 and the boot-transient clamp 61440
-    (2x65536 before the catch-up restart, LP-0MSMZOAJW002UR2A) — the
-    (30000, 100000] band never collapses (dead-code guard
-    LP-0MSI2M5BT004BCDP).
+    two consecutive nights, so it was reverted to 30000, then re-raised to
+    38000 (LP-0MSY0V4ZO002ANPL). The safe-level investigation
+    (LP-0MT50SMU1005ZAD6) pins cheap cold at 42000 (LP-0MT50WCCP000DU00):
+    42K < warm 100000, < boot-transient clamp 61440, and < the do-not-raise
+    boundary 46000 — the (42000, 100000] band never collapses (dead-code
+    guard LP-0MSI2M5BT004BCDP). Fast/default stay at 38000 (cheap-only
+    change).
     """
 
     def _cheap_config(self):
         """Mirror the live proxy/config-cheap.yaml routing settings (cold
-        reverted 60000→30000 per validation)."""
+        raised to 42000 per LP-0MT50WCCP000DU00)."""
         return {"server": {
-            "local_large_context_cold_cache_threshold": 30000,
+            "local_large_context_cold_cache_threshold": 42000,
             "local_large_context_warm_cache_threshold": 100000,
             "local_model_ctx_size": 131072,
             "session_slot_pool_size": 2,
         }}
 
     def test_cheap_cold_below_effective_warm(self):
-        """AC1 (cheap mode): cold 30000 < effective warm.
+        """AC1 (cheap mode): cold 42000 < effective warm.
 
         The cheap schedule entries carry ctx_size 262144, so the warm
         clamp resolves to min(100000, 262144//2 - 4096) = 100000. Cold
-        30000 stays below it; the (30000, 100000] band is non-empty.
+        42000 stays below it; the (42000, 100000] band is non-empty.
         """
         from proxy.provider import _effective_large_context_thresholds
 
@@ -257,13 +260,13 @@ class TestCheapModeColdThreshold:
         cold, warm = _effective_large_context_thresholds(config)
         # Static pool 2 @ 131072 → per-slot cap 61440; warm clamps to it.
         assert warm == 61440
-        assert cold == 30000
+        assert cold == 42000
         assert cold < warm
 
     def test_cheap_cold_below_scheduled_effective_warm(self, monkeypatch):
         """AC1 (cheap mode, scheduled): with the live schedule active
         (2 slots @ 262144), the effective warm resolves to 100000 and cold
-        30000 stays below it — the (30000, 100000] band is non-empty."""
+        42000 stays below it — the (42000, 100000] band is non-empty."""
         import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
 
@@ -278,24 +281,24 @@ class TestCheapModeColdThreshold:
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._cheap_config())
         assert warm == 100000  # min(100000, 262144//2 - 4096)
-        assert cold == 30000
+        assert cold == 42000
         assert cold < warm
 
     def test_cheap_cold_below_boot_transient_clamp(self):
-        """AC1 (cheap mode): cold 30000 stays below the boot-transient
+        """AC1 (cheap mode): cold 42000 stays below the boot-transient
         clamp 61440 (2x65536 before the catch-up restart,
         LP-0MSMZOAJW002UR2A) so the band never collapses even then."""
         from proxy.provider import effective_per_slot_threshold
 
         boot_transient_clamp = effective_per_slot_threshold(65536 * 2, 2)
         assert boot_transient_clamp == 61440
-        assert 30000 < boot_transient_clamp
+        assert 42000 < boot_transient_clamp
 
-    def test_cheap_35k_cold_cache_bypasses_again_after_revert(self):
-        """AC3 (cheap mode): a cold-cache prompt at ~35K tokens bypasses
-        again — at the reverted cold 30000, 35K new tokens exceed the
-        threshold (restores the pre-change behavior; the (30000, 60000]
-        band is bypassed again after the 60000→30000 revert)."""
+    def test_cheap_35k_cold_cache_now_routes_local(self):
+        """AC3 (cheap mode): a cold-cache prompt at ~35K tokens routes
+        local — below the raised cold 42000, 35K new tokens are under the
+        threshold (recaptured band (42K, 100K]; 35K < 42K so it routes
+        local, LP-0MT50WCCP000DU00)."""
         from proxy.provider import _effective_large_context_thresholds, _should_skip_local
 
         config = self._cheap_config()
@@ -303,12 +306,13 @@ class TestCheapModeColdThreshold:
         body = {"messages": [{"role": "user", "content": "x " * 35000}]}  # ~35K est
         assert _should_skip_local(
             "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is True
+        ) is False
 
-    def test_cheap_45k_cold_cache_bypasses_again_after_revert(self):
-        """AC3 (cheap mode): a cold-cache prompt at ~45K tokens bypasses
-        again — above the reverted cold 30000 (was routed local at 60000
-        during the bump; the (30000, 60000] band is bypassed again)."""
+    def test_cheap_45k_cold_cache_still_bypasses(self):
+        """AC3 (cheap mode): a cold-cache prompt at ~45K tokens still
+        bypasses — above the recaptured cold 42000, so all ~45K tokens are
+        new and exceed the threshold (recaptured band (42K, 100K];
+        LP-0MT50WCCP000DU00)."""
         from proxy.provider import _effective_large_context_thresholds, _should_skip_local
 
         config = self._cheap_config()
@@ -327,6 +331,20 @@ class TestCheapModeColdThreshold:
         config = self._cheap_config()
         cold, warm = _effective_large_context_thresholds(config)
         body = {"messages": [{"role": "user", "content": "x " * 110000}]}  # ~110K est
+        assert _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
+        ) is True
+
+    def test_cheap_cold_cache_bypasses_only_above_cold_in_band(self):
+        """AC3 (cheap mode): inside the (42000, 100000] band with a cold
+        cache, a prompt whose new tokens exceed cold 42000 still bypasses —
+        cold-cache recapture only applies up to the cold threshold."""
+        from proxy.provider import _effective_large_context_thresholds, _should_skip_local
+
+        config = self._cheap_config()
+        cold, warm = _effective_large_context_thresholds(config)
+        # 43K is in (42000, 100000]; cold cache -> 43K new tokens > cold 42000
+        body = {"messages": [{"role": "user", "content": "x " * 43000}]}  # ~43K est
         assert _should_skip_local(
             "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
         ) is True

@@ -35,6 +35,7 @@ the schedule reasserts control (LP-0MSMF25V9002AY1J).
 """
 
 import logging
+import math
 import os
 import subprocess
 import threading
@@ -62,6 +63,183 @@ MODE_CONFIG_FILES = {
 # Delay (seconds) before the background restart spawns, so the API response
 # flushes before the process is killed (LP-0MSLMYEEU002IBH6).
 RESTART_DELAY_SECONDS = 1.5
+
+# ---------------------------------------------------------------------------
+# Bounded mode-switch drain (LP-0MT631JKW008WAKE / LP-0MT60S55M000TK1H AC2)
+# ---------------------------------------------------------------------------
+# A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode) restarts
+# the proxy process. Previously the restart killed in-flight local streams
+# mid-generation, surfacing a synthetic ``finish_reason: error`` to the client
+# (4 events in the LP-0MT60S55M000TK1H analysis). This drain fixes that with a
+# SHORT, BOUNDED window:
+#
+#   1. ``set_mode`` arms the drain synchronously when it triggers a restart.
+#   2. While draining, NEW chat requests are deferred (short 503 + Retry-After)
+#      in the OpenAI API path so no new stream starts that the imminent
+#      restart would kill.
+#   3. ``_spawn_restart`` delays the actual process kill until in-flight local
+#      streams (``proxy.server.local_active_queries``) finish, bounded by
+#      ``server.mode_switch_drain.max_seconds`` (default 30s).
+#
+# The window is short and bounded so LP-0MSF9RUSQ007M346's "no long rejection
+# window" property is preserved: new requests are refused only during the
+# drain (with a Retry-After), and ``enabled: false`` / ``max_seconds: 0``
+# restores the old "just restart" behavior.
+MODE_SWITCH_DRAIN_MAX_SECONDS = 30.0
+MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
+
+# Serializes the drain state (separate from _mode_lock to avoid blocking the
+# set-mode lock while polling in-flight queries).
+_drain_lock = threading.Lock()
+_draining = False
+_drain_deadline: float | None = None
+
+
+def _mode_switch_drain_config(server_config: dict | None) -> dict:
+    """Resolve the ``server.mode_switch_drain`` config with defaults.
+
+    Args:
+        server_config: The ``server`` section of the server config dict, or
+            None to read it from the live server module lazily.
+
+    Returns:
+        A dict with ``enabled`` (bool), ``max_seconds`` (float), and
+        ``retry_after_margin_seconds`` (float) keys.
+    """
+    if server_config is None:
+        server_config = {}
+    section = server_config.get("mode_switch_drain") or {}
+    enabled = bool(section.get("enabled", True))
+    try:
+        max_seconds = float(section.get("max_seconds", MODE_SWITCH_DRAIN_MAX_SECONDS) or 0)
+    except (TypeError, ValueError):
+        max_seconds = MODE_SWITCH_DRAIN_MAX_SECONDS
+    try:
+        margin = float(
+            section.get("retry_after_margin_seconds", MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS)
+            or 0
+        )
+    except (TypeError, ValueError):
+        margin = MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS
+    return {
+        "enabled": enabled,
+        "max_seconds": max(0.0, max_seconds),
+        "retry_after_margin_seconds": max(0.0, margin),
+    }
+
+
+def _live_server_config() -> dict | None:
+    """Best-effort read of the current ``server`` config section.
+
+    Uses a lazy import so mode.py never creates a circular import with
+    server.py (same pattern as lifecycle._srv). Returns None when the
+    server module (or its config) is unavailable (e.g. in unit tests).
+    """
+    try:
+        import proxy.server as _srv_module
+
+        config = getattr(_srv_module, "config", None)
+        if isinstance(config, dict):
+            server_section = config.get("server")
+            return server_section if isinstance(server_section, dict) else {}
+    except Exception:
+        pass
+    return None
+
+
+def _begin_drain() -> None:
+    """Arm the bounded drain window (called synchronously on restart trigger).
+
+    Starts the drain deadline; subsequent calls refresh the deadline. A
+    disabled or zero-length window leaves ``draining()`` False (opt-out).
+    """
+    global _draining, _drain_deadline
+    cfg = _mode_switch_drain_config(_live_server_config())
+    if not cfg["enabled"] or cfg["max_seconds"] <= 0:
+        with _drain_lock:
+            _draining = False
+            _drain_deadline = None
+        return
+    with _drain_lock:
+        _draining = True
+        _drain_deadline = time.monotonic() + cfg["max_seconds"]
+
+
+def draining() -> bool:
+    """Whether the bounded drain window is currently active (thread-safe).
+
+    Self-expiring: once the armed deadline passes (e.g. the restart spawn
+    never ran, or a test armed the drain without a real restart), the drain
+    is treated as inactive so request handling is never blocked indefinitely.
+    """
+    with _drain_lock:
+        if not _draining or _drain_deadline is None:
+            return False
+        return time.monotonic() < _drain_deadline
+
+
+def drain_retry_after() -> int:
+    """Seconds for the "Retry-After" header while a drain is active (0 when idle).
+
+    Points *past* the drain deadline by the configured margin so clients
+    retry after the restart has had time to complete, rather than into the
+    middle of the drain window.
+    """
+    with _drain_lock:
+        if not _draining or _drain_deadline is None:
+            return 0
+        remaining = max(0.0, _drain_deadline - time.monotonic())
+        cfg = _mode_switch_drain_config(_live_server_config())
+    return max(1, int(math.ceil(remaining + cfg["retry_after_margin_seconds"])))
+
+
+def _end_drain() -> None:
+    """Clear the drain state (called after the restart spawn or on abort)."""
+    global _draining, _drain_deadline
+    with _drain_lock:
+        _draining = False
+        _drain_deadline = None
+
+
+def _wait_for_in_flight_local_streams(
+    deadline: float | None = None,
+) -> None:
+    """Wait (bounded) for in-flight local streams to finish before restart spawn.
+
+    Polls ``srv.local_active_queries`` until it reaches 0 or the drain
+    deadline elapses. The wait is deliberately SHORT and bounded — new
+    requests are deferred during the same window, and a stuck counter
+    cannot hold the restart hostage.
+
+    Args:
+        deadline: Monotonic deadline by which the wait must return. When
+            None, the already-armed ``_drain_deadline`` is used (a drain
+            is armed by ``set_mode`` before ``_spawn_restart`` runs).
+    """
+    if deadline is None:
+        with _drain_lock:
+            deadline = _drain_deadline
+    if deadline is None or time.monotonic() >= deadline:
+        # No drain armed (disabled/zero window) or already expired: nothing
+        # to wait for — proceed to the restart directly.
+        _end_drain()
+        return
+    try:
+        import proxy.server as srv
+    except Exception:
+        srv = None
+    while True:
+        active = 0
+        if srv is not None:
+            try:
+                active = int(getattr(srv, "local_active_queries", 0) or 0)
+            except Exception:
+                active = 0
+        if active <= 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    _end_drain()
+
 
 # Built-in automatic mode schedule: cheap from 01:00 until 10:00, fast from
 # 10:00 until 01:00 (LP-0MSM5K4TX004MICX). Used when the config has no
@@ -479,6 +657,9 @@ def set_mode(
         else:
             write_override_until(None)
         _restart_pending = True
+        # AC2 bounded drain: arm it synchronously so new chat requests are
+        # deferred from the moment the restart is triggered (LP-0MT631JKW008WAKE).
+        _begin_drain()
     _spawn_restart()
     return mode, True
 
@@ -507,11 +688,23 @@ def _spawn_restart() -> None:
     response flushes before the process is killed. The persisted mode is
     already written, so a failed restart still applies on the next manual
     start.
+
+    Before the kill, waits (bounded) for in-flight local streams to finish
+    (LP-0MT631JKW008WAKE AC2): new chat requests are deferred during the
+    same drain window, so the restart no longer terminates active streams
+    with a client-visible ``finish_reason: error``.
     """
 
     def _run() -> None:
         try:
             time.sleep(RESTART_DELAY_SECONDS)
+            # Bounded drain: allow in-flight local streams to finish before
+            # the process is killed (max server.mode_switch_drain.max_seconds).
+            try:
+                _wait_for_in_flight_local_streams()
+            except Exception:
+                logger.exception("Mode-switch drain wait failed; restarting anyway")
+                _end_drain()
             script = proxy_dir() / "scripts" / "start-proxy.sh"
             subprocess.Popen(
                 ["bash", str(script), "--restart"],

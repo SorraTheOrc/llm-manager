@@ -430,8 +430,6 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
     stream_err = counts.get("stream_error", 0)
     slot_save = counts.get("slot_save_error", 0)
     backend_retry = counts.get("backend_retry", 0)
-    upstream_429 = counts.get("upstream_http_error", 0)
-
     if stream_finish > 0:
         provider_detail = ""
         pm = Counter(
@@ -442,13 +440,26 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
         if pm:
             top = ", ".join(f"{p}/{m}" if p and m else (p or m) for (p, m), _ in pm.most_common(3))
             provider_detail = f" Affected: {top}."
+        # Informative-error coverage (LP-0MT6322OT00900OX): when the stream
+        # finish errors carry the enriched payload, note the coverage.
+        enriched = [
+            e for e in result.error_events
+            if e.kind == "stream_finish_error" and e.error_type
+        ]
+        if enriched:
+            payload_note = (
+                f"{len(enriched)} of {stream_finish} carry the enriched error payload "
+                "(type/message/suggested-action) in the log and client-visible SSE event."
+            )
+        else:
+            payload_note = "Log lines carry no error payload; enriched coverage cannot be verified."
         recs.append(
             Recommendation(
                 severity="high",
                 title="Stream finish errors: adopt recovery-first + informative-error strategy",
                 detail=(
-                    f"{stream_finish} stream(s) ended with the synthetic `finish_reason: error` event "
-                    "(no error payload), which the client surfaces as an unspecified error. Recommended "
+                    f"{stream_finish} stream(s) ended with the synthetic `finish_reason: error` event. "
+                    f"{payload_note} Recommended "
                     "proxy-side remediation: (1) recovery-first silent continue — re-route to the next "
                     "healthy provider before content is delivered (see LP-0MSDP2PDB004GV86); (2) when "
                     "recovery is impossible, emit an informative error (type/message/provider/suggested "
@@ -480,19 +491,79 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
             )
         )
 
-    if upstream_429 > 0:
-        recs.append(
-            Recommendation(
-                severity="medium",
-                title="Upstream HTTP 429 (FreeUsageLimitError): cooldown active",
-                detail=(
-                    f"{upstream_429} upstream 429 `FreeUsageLimitError` event(s) observed. The proxy's "
-                    "3-hour per-model cooldown (LP-0MRGU0I91006ODFD) should suppress repeat fallbacks to "
-                    "the affected model; if 429s persist, check the upstream provider quota."
-                ),
-                evidence=f"{upstream_429} of {total} error events ({_pct(upstream_429, total):.1f}%) were `upstream_http_error` status=429.",
+    # Break out upstream errors by status code and error type.
+    upstream_by_status: dict[int, dict] = {}
+    for e in result.error_events:
+        if e.kind == "upstream_http_error" and e.status is not None:
+            upstream_by_status.setdefault(e.status, {"count": 0, "error_types": Counter(), "providers": set()})
+            upstream_by_status[e.status]["count"] += 1
+            if e.error:
+                upstream_by_status[e.status]["error_types"][e.error] += 1
+            if e.provider:
+                upstream_by_status[e.status]["providers"].add(e.provider)
+
+    if upstream_by_status:
+        # Build one recommendation per status code bucket.
+        for status, info in sorted(upstream_by_status.items()):
+            count = info["count"]
+            error_types = info["error_types"]
+            providers = info["providers"]
+            et_str = ", ".join(
+                f"{et} ({c})" for et, c in error_types.most_common(5)
+            ) if error_types else "none extracted"
+            prov_str = ", ".join(sorted(providers)) if providers else "unknown"
+
+            # Status-specific remediation.
+            if status == 429:
+                severity = "medium"
+                title = "Upstream HTTP 429: rate limiting active"
+                detail = (
+                    f"{count} upstream HTTP 429 event(s) from {prov_str} "
+                    f"(error types: {et_str}). The proxy's 3-hour per-model cooldown "
+                    f"(LP-0MRGU0I91006ODFD) should suppress repeat fallbacks to the affected model; "
+                    f"if 429s persist, check the upstream provider quota or usage limits."
+                )
+            elif status == 402:
+                severity = "high"
+                title = "Upstream HTTP 402: payment/balance required"
+                detail = (
+                    f"{count} upstream HTTP 402 event(s) from {prov_str} "
+                    f"(error types: {et_str}). This indicates an account balance or subscription issue "
+                    f"with the upstream provider — not a transient error. Top up the account, switch "
+                    f"to a different provider tier, or adjust routing to avoid this provider."
+                )
+            elif status == 400:
+                severity = "medium"
+                title = "Upstream HTTP 400: bad request"
+                detail = (
+                    f"{count} upstream HTTP 400 event(s) from {prov_str} "
+                    f"(error types: {et_str}). These are client-side errors — check the request "
+                    f"payload, credentials, or model identifier being sent."
+                )
+            elif status in (500, 502, 503, 504):
+                severity = "medium"
+                title = f"Upstream HTTP {status}: server error"
+                detail = (
+                    f"{count} upstream HTTP {status} event(s) from {prov_str} "
+                    f"(error types: {et_str}). These are server-side errors from the upstream provider. "
+                    f"Monitor for clustering; persistent errors suggest a provider outage."
+                )
+            else:
+                severity = "medium"
+                title = f"Upstream HTTP {status}: unexpected status"
+                detail = (
+                    f"{count} upstream HTTP {status} event(s) from {prov_str} "
+                    f"(error types: {et_str}). Check upstream provider docs for this status code."
+                )
+
+            recs.append(
+                Recommendation(
+                    severity=severity,
+                    title=title,
+                    detail=detail,
+                    evidence=f"{count} of {total} error events ({_pct(count, total):.1f}%) were `upstream_http_error` status={status} ({et_str}). Providers: {prov_str}.",
+                )
             )
-        )
 
     if backend_retry > 0:
         recs.append(

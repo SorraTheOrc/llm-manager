@@ -280,15 +280,14 @@ default_model: "gemma4"
 logging:
   directory: "/var/log/llama-proxy"
   rotation_hours: 6
-  retention_days: 90
+  retention_days: 7
   level: "INFO"
 
 # Audit model configuration
 # The audit skill uses these settings to determine which model to call
 # for audit operations. See proxy/provider_resolver.py for details.
-audit_model: "deepseek-v4-flash-free"
+audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  - "openrouter/free"
   - "deepseek-v4-flash"
 
 # Model routing
@@ -306,7 +305,7 @@ default_model: "gemma4"
 logging:
   directory: "/var/log/llama-proxy"
   rotation_hours: 6
-  retention_days: 90
+  retention_days: 7
   level: "INFO"
 
 # Model routing
@@ -429,9 +428,8 @@ maps short model names to provider-prefixed model identifiers.
 #### Configuration
 
 ```yaml
-audit_model: "deepseek-v4-flash-free"
+audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  - "openrouter/free"
   - "deepseek-v4-flash"
 ```
 
@@ -442,15 +440,10 @@ maps well-known short names to provider-prefixed model IDs:
 
 | Short name | Resolved IDs |
 |------------|-------------|
-| `deepseek-v4-flash-free` | `opencode/deepseek-v4-flash-free`, `openrouter/openrouter/free`, `opencode-go/deepseek-v4-flash` |
 | `deepseek-v4-flash` | `opencode/deepseek-v4-flash`, `opencode-go/deepseek-v4-flash`, `openrouter/deepseek/deepseek-v4-flash` |
-| `openrouter/free` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
-| `free-model` | `openrouter/openrouter/free`, `opencode/deepseek-v4-flash-free`, `opencode-go/deepseek-v4-flash` |
 
 Canonical model IDs were discovered via `pi --list-models`:
-- `opencode/deepseek-v4-flash-free`
 - `opencode-go/deepseek-v4-flash`
-- `openrouter/openrouter/free`
 - `openrouter/deepseek/deepseek-v4-flash`
 - `opencode/deepseek-v4-flash`
 
@@ -488,8 +481,8 @@ CLI:
 
 ```bash
 cd proxy && source .venv/bin/activate
-python -m proxy.provider_resolver deepseek-v4-flash-free openrouter/free
-# Output: Resolved to: opencode/deepseek-v4-flash-free, openrouter/openrouter/free, opencode-go/deepseek-v4-flash
+python -m proxy.provider_resolver deepseek-v4-flash
+# Output: Resolved to: opencode/deepseek-v4-flash, opencode-go/deepseek-v4-flash, openrouter/deepseek/deepseek-v4-flash
 ```
 
 ### Provider Fallback
@@ -605,7 +598,7 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Default cooldown**: 60 seconds
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
-- **FreeUsageLimitError (HTTP 429, LP-0MSMCM5UG00378G8)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s) by default. Two frequently-exhausted free-tier entries, `opencode-deepseek-free` and `opencode-big-pickle`, use a 24-hour (86400s) cooldown instead (override map `_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES` in `proxy/proxy/provider.py`) so the fallback chain routes to paid alternatives for a full day. 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
+- **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
 - **State**: Cooldown state is in-memory only and resets when the proxy restarts
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as
@@ -854,10 +847,16 @@ curl -X POST http://localhost:8000/admin/set-mode \
 Requesting the mode that is already active is a noop (no restart).
 Switching to a different mode persists the new mode and triggers a **full
 proxy restart** in the background — the endpoint responds before the
-restart kills the process. In-flight requests are terminated and clients
-retry (same semantics as slot-schedule transitions). A second switch while
-a restart is pending is a noop if the mode matches, otherwise rejected with
-`409` (avoids restart loops).
+restart kills the process. A **bounded drain** protects in-flight local
+streams (LP-0MT631JKW008WAKE): while the drain is active (default 30s,
+`server.mode_switch_drain.max_seconds`), NEW chat requests are deferred
+with a short `503` + `Retry-After`, and the process kill is delayed until
+in-flight local streams finish (or the bound elapses). The window is short
+and bounded so the "no long rejection window" property of slot-schedule
+transitions is preserved (LP-0MSF9RUSQ007M346); `enabled: false` restores
+the old "just restart" behavior. A second switch while a restart is pending
+is a noop if the mode matches, otherwise rejected with `409` (avoids
+restart loops).
 
 #### Session grandfathering across mode switches
 
@@ -1818,8 +1817,11 @@ local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 
 local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
 ```
 
-The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`
-and the default `config.yaml` use `38000`, `config-cheap.yaml` uses `60000`.
+The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`,
+the default `config.yaml`, and `config-cheap.yaml` all use `38000` (cheap is
+symmetric with fast after the initial 60000 raise breached the cheap queue
+guardrails and was reverted — LP-0MSRM54YO007YG0K AC7 — then re-raised to
+38000, LP-0MSY0V4ZO002ANPL).
 Each value stays below its mode's effective warm clamp (fast `131072//3 − 4096
 = 39594`; cheap resolves to `100000` via its 2×262144 schedule entries, and is
 also below the boot-transient clamp 61440) so the (cold, warm] band never
@@ -2176,14 +2178,14 @@ Logs are written with time-based rotation:
 
 | File | Description | Rotation |
 |------|-------------|----------|
-| `proxy.log` | Proxy server logs (requests, responses, lifecycle) | Every 6 hours, 90 days retention |
+| `proxy.log` | Proxy server logs (requests, responses, lifecycle) | Every 6 hours, 7 days retention |
 | `llama-server.log` | llama-server stdout/stderr | On each restart, last 15 kept |
 | `request_counts.json` | Persisted request counters (endpoint keys) | Updated periodically and on reset |
 | `token_counts.json` | Persisted token counters (endpoint keys + totals) | Updated periodically and on reset |
 
 ### Proxy Log Settings
 - **Rotation**: Every 6 hours
-- **Retention**: 90 days
+- **Retention**: 7 days
 - **Format**: `TIMESTAMP - LEVEL - MESSAGE`
 
 Log entries include:

@@ -896,15 +896,16 @@ def test_contention_queue_config_logs_invalid_values(caplog):
 
 
 def test_cheap_config_declares_queue_policy():
-    """config-cheap.yaml declares queue policy + caps (F2 AC1)."""
+    """config-cheap.yaml declares queue policy + tuned caps (F2 AC1, caps
+    tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN)."""
     import yaml
     from proxy.mode import proxy_dir
 
     with open(proxy_dir() / "config-cheap.yaml") as fh:
         server = yaml.safe_load(fh)["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 60
-    assert server["contention_queue_max_depth"] == 4
+    assert server["contention_queue_max_wait_seconds"] == 120
+    assert server["contention_queue_max_depth"] == 8
 
 
 def test_fast_config_declares_fallback_policy():

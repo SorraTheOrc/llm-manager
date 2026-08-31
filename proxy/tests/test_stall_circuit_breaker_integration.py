@@ -220,7 +220,7 @@ async def test_circuit_breaker_called_with_provider_name(mock_request):
                                     model_name="test-model",
                                     remote_timeout=httpx.Timeout(30.0),
                                     upstream_idle_timeout_seconds=0.05,
-                                    provider="opencode-deepseek-free",
+                                    provider="opencode-deepseek",
                                 )
 
                                 _collected = [
@@ -233,8 +233,8 @@ async def test_circuit_breaker_called_with_provider_name(mock_request):
     call_args = mock_cb.call_args
     assert call_args is not None, "check_stall_circuit_breaker was not called"
     provider_arg = call_args[0][0]
-    assert provider_arg == "opencode-deepseek-free", (
-        f"Expected provider='opencode-deepseek-free', got '{provider_arg}'"
+    assert provider_arg == "opencode-deepseek", (
+        f"Expected provider='opencode-deepseek', got '{provider_arg}'"
     )
 
     # Verify config dict was passed as second arg
@@ -297,7 +297,7 @@ async def test_normal_streaming_does_not_trigger_cb(mock_request):
                                     model_name="test-model",
                                     remote_timeout=httpx.Timeout(30.0),
                                     upstream_idle_timeout_seconds=0.5,
-                                    provider="opencode-deepseek-free",
+                                    provider="opencode-deepseek",
                                 )
 
                                 collected = [
@@ -368,7 +368,7 @@ async def test_client_disconnect_does_not_trigger_cb(mock_request):
                                     model_name="test-model",
                                     remote_timeout=httpx.Timeout(30.0),
                                     upstream_idle_timeout_seconds=0.5,
-                                    provider="opencode-deepseek-free",
+                                    provider="opencode-deepseek",
                                 )
 
                                 # Collect only the first chunk to trigger generator
@@ -434,7 +434,7 @@ async def test_non_timeout_error_does_not_trigger_cb(mock_request):
                                     model_name="test-model",
                                     remote_timeout=httpx.Timeout(30.0),
                                     upstream_idle_timeout_seconds=0.5,
-                                    provider="opencode-deepseek-free",
+                                    provider="opencode-deepseek",
                                 )
 
                                 _collected = [

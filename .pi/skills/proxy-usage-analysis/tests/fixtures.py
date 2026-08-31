@@ -195,6 +195,27 @@ MODE_SCHEDULER_ENABLED_IGNORED = (
     "[('01:00', 'cheap'), ('10:00', 'fast')]"
 )
 
+# Manual mode switch (LP-0MT1EE315007AKXG): ``POST /admin/set-mode`` persists
+# the new mode and restarts the proxy; grandfathering init then reports the
+# ACTUALLY active mode as ``Grandfathering: enabled; other-mode config
+# <file> (current=<mode>)`` (real lines from /var/log/llama-proxy at a
+# 18:20 manual switch to cheap). The ``enabled with 2 entries`` announcement
+# fires on BOTH scheduled and manual transitions, so it is NOT the signal;
+# the ``(current=<mode>)`` field on the grandfathering line is. The
+# ``restart_services: router-mode restart complete (N slots)`` line is
+# corroborating evidence (never parsed on its own).
+MANUAL_MODE_SWITCH_CHEAP = (
+    "2026-08-19 18:20:16,661 - INFO - Mode scheduler: enabled with 2 entries: "
+    "[('01:00', 'cheap'), ('10:00', 'fast')]"
+)
+MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP = (
+    "2026-08-19 18:20:16,684 - INFO - Grandfathering: enabled; other-mode config "
+    "config-fast.yaml (current=cheap)"
+)
+MANUAL_MODE_SWITCH_RESTART = (
+    "2026-08-19 18:20:23,374 - INFO - restart_services: router-mode restart complete (2 slots)"
+)
+
 # status_request lines expose the running mode's total_slots and contention
 # policy (real lines from /var/log/llama-proxy): used as corroborating
 # evidence in the mode-bucketing regression fixture (never parsed).

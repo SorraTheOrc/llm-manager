@@ -29,7 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy.utils import _is_empty_response
 
@@ -52,21 +52,10 @@ _BACKOFF_MAX_SECONDS = 45.0
 
 # FreeUsageLimitError cooldown: 3 hours (10800 seconds) by default.
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
-# See LP-0MRGU0I91006ODFD for details.
-# Per-provider overrides for providers whose free-tier quota requires a
-# longer quarantine to avoid repeated futile fallback attempts (LP-0MSMCM5UG00378G8).
+# See LP-0MRGU0I91006ODFD for details. The per-provider overrides
+# (LP-0MSMCM5UG00378G8) were retired when the last free-tier provider
+# was removed from all chains (LP-0MT652JRM004ZLSI).
 _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
-_FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES: dict[str, int] = {
-    "opencode-deepseek-free": 86400,   # 24 hours
-    "opencode-big-pickle": 86400,      # 24 hours
-}
-
-
-def _free_usage_limit_cooldown_for_provider(provider_name: str) -> int:
-    """Return the cooldown seconds for a FreeUsageLimitError on the given provider."""
-    return _FREE_USAGE_LIMIT_COOLDOWN_OVERRIDES.get(
-        provider_name, _FREE_USAGE_LIMIT_COOLDOWN_SECONDS
-    )
 
 # Usage-limit reset tracking (LP-0MSLJPOCC0001ROJ): failure-domain key ->
 # absolute epoch timestamp when the usage limit resets (including the
@@ -624,6 +613,150 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
     return context_pressure_ratio(estimated_tokens, ctx_size, slots) >= ratio
 
 
+# ===================================================================
+# Compaction config — LP-0MTG6RW3L003X122
+# ===================================================================
+
+# Default compaction trigger ratio (0.70 × effective per-slot context).
+# Fires before the 0.8 context_pressure warn ratio, giving proactive
+# compaction rather than reactive warning.
+_DEFAULT_COMPACTION_TRIGGER_RATIO = 0.70
+
+# Default summarizer context size (tokens). 8192 is enough for a short
+# summarisation prompt + middle turns; avoids unnecessary KV cache footprint.
+_DEFAULT_SUMMARIZER_CTX_SIZE = 8192
+
+# Default summariser output budget (tokens). 512 tokens of summary text
+# is enough for a concise middle-turn condensation without wasting GPU.
+_DEFAULT_SUMMARIZER_MAX_TOKENS = 512
+
+# Dedicated system prompt for the proxy-side compaction summariser.
+# Keeps the summariser focused on content condensation, not creative writing.
+_SUMMARIZER_SYSTEM_PROMPT = (
+    "Summarise the middle portion of this conversation for context retention. "
+    "Preserve essential instructions, decisions, and key facts. "
+    "Omit routine back-and-forth, acknowledgments, and redundant context. "
+    "Write in a neutral, concise style suitable for feeding into a subsequent "
+    "LLM prompt. Do NOT include any preamble or closing remarks."
+)
+
+
+def compaction_config(config: dict) -> dict:
+    """Resolve the compaction configuration from the proxy config.
+
+    Reads from the nested ``server.compaction_*`` keys (or flat keys for
+    backward compatibility) and applies defaults where absent.
+
+    Args:
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        A dict with keys:
+            - trigger_ratio (float): Compaction trigger ratio.
+            - summarizer_model_type (str): "local" or "remote".
+            - summarizer_model_name (str): Model identifier (e.g. "Qwen3").
+            - summarizer_ctx_size (int): Context size for the summariser.
+            - summarizer_max_tokens (int): Max output tokens for summary.
+            - summarizer_system_prompt (str): Dedicated system prompt.
+    """
+    server = config.get("server", {})
+
+    # Trigger ratio
+    trigger_ratio = server.get("compaction_trigger_ratio")
+    if trigger_ratio is None:
+        trigger_ratio = config.get("compaction_trigger_ratio")
+    if trigger_ratio is None:
+        trigger_ratio = _DEFAULT_COMPACTION_TRIGGER_RATIO
+    try:
+        trigger_ratio = float(trigger_ratio)
+    except (ValueError, TypeError):
+        trigger_ratio = _DEFAULT_COMPACTION_TRIGGER_RATIO
+
+    # Summariser model
+    model_cfg = server.get("summarizer_model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    summarizer_model_type = model_cfg.get("type", "local")
+    summarizer_model_name = model_cfg.get("llama_model", "Qwen3")
+
+    # Summariser context size
+    ctx_size = server.get("summarizer_ctx_size")
+    if ctx_size is None:
+        ctx_size = _DEFAULT_SUMMARIZER_CTX_SIZE
+    try:
+        ctx_size = int(ctx_size)
+    except (ValueError, TypeError):
+        ctx_size = _DEFAULT_SUMMARIZER_CTX_SIZE
+
+    # Summariser max output tokens
+    max_tokens = server.get("summarizer_max_tokens")
+    if max_tokens is None:
+        max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
+    try:
+        max_tokens = int(max_tokens)
+    except (ValueError, TypeError):
+        max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
+
+    return {
+        "trigger_ratio": trigger_ratio,
+        "summarizer_model_type": summarizer_model_type,
+        "summarizer_model_name": summarizer_model_name,
+        "summarizer_ctx_size": ctx_size,
+        "summarizer_max_tokens": max_tokens,
+        "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
+    }
+
+
+def validate_compaction_config(config: dict) -> list[str]:
+    """Validate the compaction configuration at startup.
+
+    Checks that all required fields are present and within valid ranges.
+    Returns a list of problem strings (empty when config is valid).
+
+    Problem strings are prefixed with ``FATAL: `` when the server must not
+    start, or ``WARNING: `` when the config is questionable but salvageable.
+
+    Args:
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        List of problem strings (empty when config is valid).
+    """
+    problems: list[str] = []
+    cfg = compaction_config(config)
+
+    # trigger_ratio must be in [0, 1]
+    tr = cfg["trigger_ratio"]
+    if tr < 0 or tr > 1:
+        problems.append(
+            f"FATAL: compaction_trigger_ratio={tr!r} is outside "
+            "valid range [0.0, 1.0]"
+        )
+
+    # summarizer_model must have a llama_model name
+    model_name = cfg["summarizer_model_name"]
+    if not model_name or not isinstance(model_name, str):
+        problems.append(
+            "FATAL: summarizer_model.llama_model must be a non-empty string"
+        )
+
+    # summarizer_ctx_size must be positive
+    ctx_size = cfg["summarizer_ctx_size"]
+    if ctx_size <= 0:
+        problems.append(
+            f"FATAL: summarizer_ctx_size={ctx_size} must be positive"
+        )
+
+    # summarizer_max_tokens must be positive
+    max_tokens = cfg["summarizer_max_tokens"]
+    if max_tokens <= 0:
+        problems.append(
+            f"FATAL: summarizer_max_tokens={max_tokens} must be positive"
+        )
+
+    return problems
+
+
 # Output-token headroom reserved below the per-slot context when clamping
 # routing thresholds (LP-0MSAZXXDY005AWA1). Ensures prompts routed local
 # leave room for the model's completion tokens in the KV slot.
@@ -693,6 +826,20 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     # remains non-empty for Check 2 (cached_ratio routing) to operate in.
     if warm > 0:
         warm = min(warm, cap)
+        # LP-0MTBOX45O005LD1S AC4: also clamp warm to the hard-routing cap
+        # (mode-aware; the cap is expressed as a per-mode ratio) so
+        # ``context_too_large`` fires exactly at the hard cap — the SAME
+        # single source as ``session_slot_max_prompt_tokens`` persistence.
+        # No circularity: ``compute_hard_routing_cap`` derives its denominator
+        # from the RAW warm config + per-slot threshold, not this clamped warm.
+        try:
+            from proxy.mode import read_mode as _read_mode
+            _mode = _read_mode()
+        except Exception:
+            _mode = "fast"  # default mode, matching read_mode()
+        _hard_cap = compute_hard_routing_cap(_mode, config)
+        if _hard_cap > 0:
+            warm = min(warm, _hard_cap)
     return cold, warm
 
 
@@ -747,6 +894,203 @@ def _get_min_local_routing_threshold(config: dict) -> int:
         return _DEFAULT_MIN_LOCAL_ROUTING_THRESHOLD
 
 
+# ---------------------------------------------------------------------------
+# Hard local-routing caps (LP-0MTBOX45O005LD1S)
+# ---------------------------------------------------------------------------
+# Per-mode ratio of the effective per-slot context below which local routing
+# is allowed.  Ratios are applied against the *effective per-slot threshold*
+# (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``) so they
+# automatically rescale when ``slot_schedule`` changes.
+#
+# Resolved caps (operator-approved 2026-08-27):
+#   fast:  70 000 tokens  → ratio 70000/83285 ≈ 0.84049
+#   cheap: 61 440 tokens  → ratio 61440/100000 = 0.6144
+#
+# Denominators are the effective warm/routing clamp (decision #4):
+# ``min(warm_config, effective_per_slot_threshold)`` — the SAME value the
+# warm-context routing check is clamped to (see
+# ``_effective_large_context_thresholds``):
+#   fast  schedule (3 slots x 262144 ctx):
+#       per_slot = 262144//3 - 4096 = 83285; min(100000, 83285) = 83285
+#       → 0.84049 x 83285 = 70000 EXACT
+#   cheap schedule (2 slots x 262144 ctx):
+#       per_slot = 262144//2 - 4096 = 126976; min(100000, 126976) = 100000
+#       → 0.6144 x 100000 = 61440 EXACT
+#
+# A ratio of 0 (or absent) disables the hard cap.
+_DEFAULT_HARD_ROUTING_CAP_RATIO_FAST = 0.0
+_DEFAULT_HARD_ROUTING_CAP_RATIO_CHEAP = 0.0
+
+
+def _get_hard_routing_cap_ratio(config: dict, mode: str) -> float:
+    """Read the per-mode hard-routing-cap ratio from config.
+
+    Supports both nested (``server.local_hard_routing_cap_ratio_<mode>``) and
+    flat keys.  Mode must be ``"fast"`` or ``"cheap"``.
+    A ratio of 0 (or absent) disables the hard cap.
+
+    Args:
+        config: Proxy configuration dict.
+        mode: Operating mode ("fast" or "cheap").
+
+    Returns:
+        The ratio to apply (0.0 = disabled).
+    """
+    key = f"local_hard_routing_cap_ratio_{mode}"
+    val = config.get(key)
+    if val is None:
+        val = config.get("server", {}).get(key, 0)
+    try:
+        ratio = float(val or 0)
+    except (ValueError, TypeError):
+        ratio = 0.0
+    return max(0.0, ratio)
+
+
+def compute_hard_routing_cap(mode: str, config: dict) -> int:
+    """Resolve the hard-routing cap for *mode* against the active per-slot context.
+
+    Returns the absolute token count at which local is hard-skipped (fast) or
+    gated with a compaction response (cheap).  Computed as:
+        ``ratio × effective_warm_clamp``
+    rounded to the nearest integer, where ``effective_warm_clamp`` is
+    ``min(warm_cache_threshold, effective_per_slot_threshold(ctx_size, slots))``
+    — the SAME clamp the warm-context routing threshold resolves to
+    (LP-0MTBOX45O005LD1S decision #4): the approved ratios are expressed
+    against this clamp so the caps reproduce the approved absolutes (~70000 /
+    61440) under the current fast/cheap schedules.  Falls back to the raw
+    per-slot threshold when no warm threshold is configured (warm=0 disables
+    the clamp).
+
+    Rounding uses ``round()`` (not floor) to absorb float representation error
+    (0.6144 × 100000 = 61439.999… in IEEE-754; floor would yield 61439).
+
+    When the slot scheduler is available, the function uses the schedule-aware
+    slot count and ctx_size so the cap rescales automatically on schedule
+    transitions.  NOTE (cheap boot-static): when the slot scheduler is NOT
+    available, the cheap profile falls back to its static pair
+    (local_model_ctx_size=131072, 2 slots) → per-slot clamp
+    min(100000, 61440)=61440 → 0.6144 × 61440 ≈ 37749, NOT the approved
+    61440.  Production always runs the live scheduler (both schedule entries
+    override ctx to 262144), so the approved absolute holds; the transient
+    boot-static value is strictly more conservative (never routes local what
+    the scheduled view would allow) and is accepted per the item's "caps
+    rescale automatically when slot_schedule changes" caveat.
+
+    Args:
+        mode: Operating mode ("fast" or "cheap").
+        config: Proxy configuration dict.
+
+    Returns:
+        Absolute token cap (0 = disabled).
+    """
+    ratio = _get_hard_routing_cap_ratio(config, mode)
+    if ratio <= 0:
+        return 0
+    ctx_size = _get_active_local_ctx_size(config)
+    slots = _get_active_local_slots(config)
+    per_slot = effective_per_slot_threshold(ctx_size, slots)
+    if per_slot <= 0:
+        return 0
+    warm = _get_warm_cache_threshold(config)
+    if warm > 0:
+        per_slot = min(per_slot, warm)
+    if per_slot <= 0:
+        return 0
+    return round(ratio * per_slot)
+
+
+def check_hard_routing_cap(
+    estimated_tokens: int, mode: str, config: dict
+) -> bool:
+    """Whether ``estimated_tokens`` exceeds the hard-routing cap for *mode*.
+
+    Args:
+        estimated_tokens: Estimated prompt/context tokens for the request.
+        mode: Operating mode ("fast" or "cheap").
+        config: Proxy configuration dict.
+
+    Returns:
+        ``True`` when the estimate is above the cap (local must be skipped).
+    """
+    cap = compute_hard_routing_cap(mode, config)
+    if cap <= 0:
+        return False  # cap disabled
+    return estimated_tokens > cap
+
+
+def _build_compaction_gate_response(
+    estimated_tokens: int, cap: int, mode: str, session_id: str | None,
+    model_name: str | None,
+) -> Response:
+    """Build a 429 response that gates the request for client-side compaction.
+
+    Used only in cheap mode when the hard-routing cap is exceeded.  The
+    response includes:
+    - HTTP 429 status code
+    - ``X-Compaction-Gate: true`` header
+    - ``X-Compaction-Estimated-Tokens`` header
+    - ``X-Compaction-Cap`` header
+    - JSON body with ``error`` and compaction guidance
+
+    This is NOT a remote fallback — it tells the client to compact its
+    session before retrying.
+
+    Args:
+        estimated_tokens: The estimated token count that triggered the gate.
+        cap: The hard-routing cap that was exceeded.
+        mode: Operating mode ("cheap").
+        session_id: Session ID for the request (may be None).
+        model_name: Model name for the request.
+
+    Returns:
+        A FastAPI ``Response`` to return to the client.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "X-Compaction-Gate": "true",
+        "X-Compaction-Estimated-Tokens": str(estimated_tokens),
+        "X-Compaction-Cap": str(cap),
+        "X-Compaction-Mode": mode,
+    }
+    if session_id:
+        headers["X-Session-Id"] = session_id
+    headers["X-Resolved-Model"] = f"local/{model_name}" if model_name else "local/unknown"
+    payload = {
+        "error": {
+            "type": "compaction_gate",
+            "code": "context_too_large_for_local",
+            "message": (
+                f"Context ({estimated_tokens} tokens) exceeds the "
+                f"{mode}-mode local routing cap ({cap} tokens). "
+                "Compact the session before retrying (see the "
+                "context_pressure guidance signal)."
+            ),
+        },
+        "status": 429,
+        "estimated_tokens": estimated_tokens,
+        "cap": cap,
+        "mode": mode,
+    }
+    return JSONResponse(status_code=429, content=payload, headers=headers)
+
+
+def _is_compaction_gate_response(response) -> bool:
+    """Whether *response* is the cheap-mode compaction gate (429).
+
+    The gate is a TERMINAL response (LP-0MTBOX45O005LD1S AC2): it must
+    reach the client as-is and must never trigger the fallback cycle's
+    local-4xx branch, which would silently re-route to the next remote
+    provider.  Detected via the ``X-Compaction-Gate`` header emitted by
+    :func:`_build_compaction_gate_response`.
+    """
+    try:
+        headers = getattr(response, "headers", {}) or {}
+        return str(headers.get("X-Compaction-Gate", "")).lower() == "true"
+    except Exception:
+        return False
+
+
 def validate_local_routing_config(config: dict) -> list[str]:
     """Validate the ctx-size / slot-count routing clamp configuration.
 
@@ -770,15 +1114,37 @@ def validate_local_routing_config(config: dict) -> list[str]:
     startup; otherwise callers log a WARNING.
     """
     min_threshold = _get_min_local_routing_threshold(config)
-    if min_threshold <= 0:
-        return []  # minimum check disabled (min_local_routing_threshold: 0)
-
     fatal = bool(
         config.get("server", {}).get("min_local_routing_threshold_fatal", False)
         or config.get("min_local_routing_threshold_fatal", False)
     )
 
     problems: list[str] = []
+
+    # --- session_slot_pool_size is REQUIRED (LP-0MTCZ35X7009IZKE) ---------
+    # The legacy ``local_max_concurrent_queries`` fallback was removed; the
+    # slot pool is the single source of truth for both llama-server's
+    # --parallel and the local dispatch lease pool. Refuse to start when it
+    # is missing or invalid so a stale config cannot silently drop to a
+    # 1-slot pool (the original single-slot regression). Unconditional FATAL
+    # — independent of min_local_routing_threshold_fatal.
+    server_cfg = config.get("server", config)
+    raw_pool = server_cfg.get("session_slot_pool_size", None)
+    try:
+        pool_val = int(raw_pool or 0)
+    except (ValueError, TypeError):
+        pool_val = 0
+    if pool_val <= 0:
+        problems.append(
+            "FATAL: session_slot_pool_size is required in the server config "
+            "(controls llama-server --parallel and the local dispatch lease "
+            f"pool); found {raw_pool!r}. Add session_slot_pool_size to the "
+            "server section (LP-0MTCZ35X7009IZKE)."
+        )
+
+    if min_threshold <= 0:
+        return problems  # minimum check disabled (min_local_routing_threshold: 0)
+
     for ctx, slots in _collect_local_ctx_pairs(config):
         if ctx <= 0:
             continue  # clamp disabled for this pair
@@ -1793,10 +2159,11 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     """Lazily import and return (current_local_active, max_local) from config.
 
     Returns the current local active query count and the configured
-    local concurrency limit.  Uses ``session_slot_pool_size`` as the
-    primary config key (same value that controls ``--parallel`` in
-    llama-server). Falls back to the legacy ``local_max_concurrent_queries``
-    key for backward compatibility.  Defaults to (0, 1) on error.
+    local concurrency limit.  Reads ``session_slot_pool_size`` (same value
+    that controls ``--parallel`` in llama-server); the legacy
+    ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
+    and a missing value is caught at launch by
+    ``validate_local_routing_config``.  Defaults to (0, 1) on error.
     """
     cur_active = 0
     max_local = 1
@@ -1807,12 +2174,7 @@ def _get_local_concurrency_info(config: dict) -> tuple:
         pass
     try:
         server_cfg = config.get("server", config)
-        # Primary: session_slot_pool_size (same as router._get_local_max_concurrent_queries)
-        val = server_cfg.get("session_slot_pool_size", None)
-        if val is None:
-            # Fallback: local_max_concurrent_queries for backward compatibility
-            val = server_cfg.get("local_max_concurrent_queries", 1)
-        max_local = max(1, int(val or 1))
+        max_local = max(1, int(server_cfg.get("session_slot_pool_size", 1) or 1))
     except (ValueError, TypeError):
         pass
     return (cur_active, max_local)
@@ -3529,13 +3891,11 @@ async def _proxy_with_remote_fallback_cycle(
 
                 # FreeUsageLimitError: apply cooldown on affected provider
                 # so the fallback chain routes to paid alternatives instead of
-                # repeatedly retrying the exhausted free tier.  Some providers
-                # (opencode-deepseek-free, opencode-big-pickle) use a 24-hour
-                # cooldown to avoid futile repeated fallback attempts (LP-0MSMCM5UG00378G8).
+                # repeatedly retrying the exhausted free tier (LP-0MRGU0I91006ODFD).
                 if _is_free_usage_limit_error(response, body_text):
                     fallback_reason = "free_usage_limit"
                     prev_provider = provider_name
-                    cooldown_seconds = _free_usage_limit_cooldown_for_provider(provider_name)
+                    cooldown_seconds = _FREE_USAGE_LIMIT_COOLDOWN_SECONDS
                     mark_provider_unavailable(provider_name, cooldown_seconds)
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
@@ -4055,6 +4415,20 @@ async def _proxy_with_fallback_cycle(
                     continue
 
                 response = await ptr_local(request, path)
+
+                # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
+                # (429) is TERMINAL.  Without this, the local-4xx branch
+                # below would ``continue`` to the next provider → a silent
+                # remote fallback for a request the gate exists to reject.
+                if _is_compaction_gate_response(response):
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="compaction_gate",
+                        status_code=int(getattr(response, "status_code", 0) or 0),
+                    )
+                    return response
             else:
                 # Proactive rate-limit check for remote providers
                 # (LP-0MQNRDUP4008KT6T: rate limiter for remote models)
@@ -4379,13 +4753,11 @@ async def _proxy_with_fallback_cycle(
 
                     # FreeUsageLimitError: apply cooldown on affected provider
                     # so the fallback chain routes to paid alternatives instead of
-                    # repeatedly retrying the exhausted free tier.  Some providers
-                    # (opencode-deepseek-free, opencode-big-pickle) use a 24-hour
-                    # cooldown to avoid futile repeated fallback attempts (LP-0MSMCM5UG00378G8).
+                    # repeatedly retrying the exhausted free tier (LP-0MRGU0I91006ODFD).
                     if _is_free_usage_limit_error(response, body_text):
                         fallback_reason = "free_usage_limit"
                         prev_provider = provider_name
-                        cooldown_seconds = _free_usage_limit_cooldown_for_provider(provider_name)
+                        cooldown_seconds = _FREE_USAGE_LIMIT_COOLDOWN_SECONDS
                         mark_provider_unavailable(provider_name, cooldown_seconds)
                         attempted_domains.add(_failure_domain_key(provider_cfg))
                         _record_attempt(

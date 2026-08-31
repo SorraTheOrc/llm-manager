@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -224,8 +225,36 @@ class TestLogLineParsing:
 
     def test_mode_scheduler_enabled_line_ignored(self):
         """The ``enabled with N entries`` announcement carries no applied
-        mode and is not a timeline event."""
+        mode and is not a timeline event (fires on both scheduled and manual
+        transitions, so it is not a reliable mode signal)."""
         assert log_parser.parse_log_line(fixtures.MODE_SCHEDULER_ENABLED_IGNORED) is None
+
+    def test_manual_mode_switch_grandfathering_parsed(self):
+        """A manual ``POST /admin/set-mode`` switch reports the actually-
+        active mode as ``Grandfathering: enabled; other-mode config ...
+        (current=<mode>)`` — a mode_switch event (LP-0MT1EE315007AKXG)."""
+        ev = log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.ts == datetime(2026, 8, 19, 18, 20, 16, 684000)
+
+    def test_manual_mode_switch_enabled_and_restart_lines_ignored(self):
+        """The manual-switch 'enabled with N entries' announcement (it fired
+        for the scheduled 10:00 transition too) and the 'router-mode restart
+        complete' corroboration line carry no reliable mode and stay outside
+        the timeline."""
+        assert log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_CHEAP) is None
+        assert log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_RESTART) is None
+
+    def test_manual_mode_switch_slot_scheduler_current_ignored(self):
+        """slot_scheduler logs ``(current=%d`` with a slot COUNT, not a mode;
+        the parser must not mistake it for a mode_switch."""
+        line = (
+            "2026-08-19 18:20:20,000 - INFO - Slot scheduler: arming transition "
+            "to 2 slots at 10:00 (current=3)"
+        )
+        assert log_parser.parse_log_line(line) is None
 
     def test_status_request_lines_ignored(self):
         """status_request lines expose total_slots but are not parsed (they
@@ -248,6 +277,45 @@ class TestErrorLineParsing:
         assert ev.model == "deepseek-v4-flash-free"
         assert ev.entry == "opencode-deepseek-free"
         assert ev.raw and "Stream finished: reason=error" in ev.raw
+
+    def test_stream_finished_reason_error_with_enriched_payload(self):
+        # LP-0MT6322OT00900OX: the proxy now appends the enriched error
+        # payload (type/message/suggested-action) to the stream-finish-error
+        # log line; the parser must surface it so the analysis can classify.
+        line = (
+            "2026-08-03 10:13:15,000 - INFO - Stream finished: reason=error "
+            "error_type=stall_exhausted error_message=Upstream stalled repeatedly "
+            "(2 retries exhausted; idle timeout 30s) "
+            "suggested_action=Provider placed in cooldown; the next provider in "
+            "the chain will be used "
+            "session=019fc52e-05a0-78d5-b59d-bcb91055b787 provider=opencode-go "
+            "model=deepseek-v4-flash entry=opencode-go-2-deepseek"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "stream_finish_error"
+        assert ev.error_type == "stall_exhausted"
+        assert ev.error_message == "Upstream stalled repeatedly (2 retries exhausted; idle timeout 30s)"
+        assert ev.suggested_action == (
+            "Provider placed in cooldown; the next provider in the chain will be used"
+        )
+        assert ev.provider == "opencode-go"
+        assert ev.model == "deepseek-v4-flash"
+        assert ev.entry == "opencode-go-2-deepseek"
+
+    def test_stream_finished_reason_error_partial_payload(self):
+        # Enriched event with only type (no message/action) — fields absent.
+        line = (
+            "2026-08-03 10:13:16,000 - INFO - Stream finished: reason=error "
+            "error_type=stream_exception "
+            "session=019fc52e-05a0-78d5-b59d-bcb91055b787 provider=local model=Qwen3"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "stream_finish_error"
+        assert ev.error_type == "stream_exception"
+        assert ev.error_message is None
+        assert ev.suggested_action is None
 
     def test_stream_error_line(self):
         ev = log_parser.parse_log_line(fixtures.STREAM_ERROR_LINE)
@@ -700,6 +768,35 @@ class TestErrorAggregation:
         )
         assert res.lines_skipped == 0
 
+    def test_upstream_error_by_status(self):
+        lines = [
+            fixtures.UPSTREAM_429,
+            # A 402 (Insufficient Balance) real line from api.deepseek.com:
+            "2026-08-03 11:00:00,000 - WARNING - [remote] upstream error status=402 "
+            "url=https://api.deepseek.com/v1/chat/completions "
+            "body={\"error\":{\"message\":\"Insufficient Balance\",\"type\":\"unknown_error\","
+            "\"param\":null,\"code\":\"invalid_request_error\"}}",
+            fixtures.UPSTREAM_429,
+        ]
+        res = aggregation.aggregate(
+            _events(lines), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        assert res.upstream_error_by_status == {429: 2, 402: 1}
+        by_sp = res.upstream_error_by_status_provider
+        assert by_sp[429] == {"opencode": 2}
+        assert by_sp[402] == {"deepseek": 1}
+
+    def test_upstream_error_by_status_ignores_missing_status(self):
+        lines = [
+            "2026-08-03 13:58:04,053 - WARNING - [remote] upstream error "
+            "url=https://api.deepseek.com/v1/chat/completions body={}",
+        ]
+        res = aggregation.aggregate(
+            _events(lines), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        assert res.upstream_error_by_status == {}
+        assert res.upstream_error_by_status_provider == {}
+
 
 # ---------------------------------------------------------------------------
 # Fast/cheap bucketing from the slot schedule
@@ -860,6 +957,64 @@ class TestModeTimelineBucketing:
         assert res.sessions["fast-late"].bucket == "fast"
         assert res.sessions["fast-late"].slots == 3
         assert res.sessions["fast-late"].ctx_size == 131072
+
+    def test_manual_mode_switch_buckets_sessions_cheap(self):
+        """Regression (LP-0MT1EE315007AKXG): a MANUAL switch to cheap mid-
+        window (logged only as ``Grandfathering: enabled ... (current=cheap)``,
+        no 'applied scheduled mode' line) must bucket subsequent sessions as
+        cheap — previously the whole window collapsed into fast (0 cheap)."""
+        mm = fixtures.mode_map_fixture()
+        lines = [
+            # Manual switch to cheap at 18:20 (inside the window).
+            fixtures.MANUAL_MODE_SWITCH_CHEAP,
+            fixtures.MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP,
+            fixtures.MANUAL_MODE_SWITCH_RESTART,
+            # Cheap-hour session after the manual switch.
+            "2026-08-19 18:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=manual-cheap request=[]",
+            "2026-08-19 18:30:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=manual-cheap provider=local model=Qwen3 request=[]",
+            # Fast-hour session before the manual switch.
+            "2026-08-19 12:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=manual-fast request=[]",
+            "2026-08-19 12:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=manual-fast provider=local model=Qwen3 request=[]",
+        ]
+        window_start = datetime(2026, 8, 19, 10, 0, 0)
+        window_end = datetime(2026, 8, 19, 20, 0, 0)
+        res = aggregation.aggregate(
+            _events(lines),
+            window_start,
+            window_end,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # Manual switch reconstructed as a cheap transition.
+        assert (datetime(2026, 8, 19, 18, 20, 16, 684000), "cheap") in mm.transitions
+        assert res.sessions["manual-fast"].bucket == "fast"
+        assert res.sessions["manual-fast"].slots == 3
+        assert res.sessions["manual-cheap"].bucket == "cheap"
+        assert res.sessions["manual-cheap"].slots == 2
+        assert res.sessions["manual-cheap"].ctx_size == 262144
+
+    def test_manual_switch_same_timestamp_as_scheduled_dedupes(self):
+        """When a manual switch and a scheduled 'applied scheduled mode' line
+        report the same mode at the same instant, the timeline keeps a single
+        transition (no spurious flip)."""
+        mm = fixtures.mode_map_fixture()
+        lines = [
+            "2026-08-19 10:00:18,000 - INFO - Mode scheduler: applied scheduled mode fast",
+            "2026-08-19 10:00:18,400 - INFO - Grandfathering: enabled; other-mode config config-cheap.yaml (current=fast)",
+            "2026-08-19 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-19 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 19, 9, 0, 0),
+            datetime(2026, 8, 19, 12, 0, 0),
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        # Both lines say 'fast'; the session stays fast and no double-transition
+        # introduces a spurious cheap period.
+        assert res.sessions["s1"].bucket == "fast"
+        assert res.sessions["s1"].slots == 3
 
     def test_window_without_transitions_keeps_legacy_bucketing(self):
         """A single-mode window (no transitions observed) keeps the legacy
@@ -1061,6 +1216,35 @@ class TestErrorRecommendations:
         titles = " | ".join(r.title.lower() for r in recs)
         assert "429" in titles, f"expected 429/cooldown recommendation, got: {titles}"
         assert "LP-0MRGU0I91006ODFD" in " | ".join(r.detail for r in recs)
+
+    def test_upstream_402_triggers_balance_recommendation(self):
+        # Status 402 (Insufficient Balance) must NOT be reported as a
+        # rate-limit / cooldown issue: it is an account-funding problem.
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="unknown_error", status=402)
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title.lower() for r in recs)
+        assert "402" in titles, f"expected 402 recommendation, got: {titles}"
+        assert "429" not in titles
+        assert "balance" in titles, f"expected balance-related title, got: {titles}"
+
+    def test_upstream_errors_broken_out_by_status(self):
+        # Mixed statuses produce one recommendation per status, not a single
+        # lumped 'upstream HTTP error' recommendation.
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="FreeUsageLimitError", status=429),
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="unknown_error", status=402),
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, status=500),
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        status_titles = [r.title for r in recs if "429" in r.title or "402" in r.title or "500" in r.title]
+        joined = " ".join(status_titles)
+        assert "429" in joined and "402" in joined and "500" in joined, \
+            f"expected one recommendation per upstream status, got: {status_titles}"
 
     def test_backend_retry_errors_are_informational(self):
         errors = [
@@ -1518,12 +1702,15 @@ class TestBusyStats:
         assert hourly[9] == 30.0
         assert hourly[10] == 15.0
 
-    def test_report_hourly_busy_table_window_bounded_with_pct_and_totals(self):
-        # Regression (LP-0MSVMLM7G009N74N): the hourly busy table spans exactly
-        # the report window (partial first/last rows truncated to the window
-        # edges), lists every hour including idle ones, carries a % column
-        # (busy / window-bounded bucket duration), and ends with a totals row
-        # matching the summary's overall busy %.
+    def test_report_summary_by_hour_table_window_bounded_with_pct_and_totals(self):
+        # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF:
+        # the hourly profile is now the top-of-report ``## Summary by hour``
+        # table — it spans exactly the report window (partial first/last
+        # rows truncated to the window edges), lists every hour including
+        # idle ones, carries a % column (busy / window-bounded bucket
+        # duration), adds the three per-session classification columns
+        # (counted per start hour), and ends with a totals row matching the
+        # summary's overall busy % and classification percentages.
         start = datetime(2026, 8, 2, 9, 30, 0)
         end = datetime(2026, 8, 2, 11, 45, 0)
         lines = [
@@ -1537,17 +1724,22 @@ class TestBusyStats:
         summary = aggregation.aggregate(_events(lines), start, end, _schedule())
         assert summary.busy is not None
         md = reporting.build_report(summary, None)
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        # AC1: renamed, moved to the top of the report (before Session summary).
+        assert "Busy time by hour:" not in md
+        assert md.index("## Summary by hour") < md.index("## Session summary")
+        # AC2: window-bounded rows with a % column; idle middle hour listed;
+        # classification cells added (both sessions are local-only).
+        assert "| Hour | Busy | % | Started local, completed local | Started local, fell back | Started remote-only |" in section
+        assert "| 09:30-10:00 | 30s | 1.7% | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        assert "| 10:00-11:00 | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        assert "| 11:00-11:45 | 15s | 0.6% | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        # AC3: totals row = total busy over the window and overall busy % plus
+        # the overall classification percentages (Session summary style).
+        assert "| Totals | 45s | 0.6% | 2 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        # The Local model utilization section no longer hosts the hourly table.
         util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
-        # AC1: retitled.
-        assert "Busy time by hour:" in util
-        assert "Busy seconds by hour:" not in util
-        # AC2/AC3: window-bounded rows with a % column; idle middle hour listed.
-        assert "| Hour | Busy | % |" in util
-        assert "| 09:30-10:00 | 30s | 1.7% |" in util
-        assert "| 10:00-11:00 | 0s | 0.0% |" in util
-        assert "| 11:00-11:45 | 15s | 0.6% |" in util
-        # AC4: totals row = total busy over the window and overall busy %.
-        assert "| Totals | 45s | 0.6% |" in util
+        assert "| Hour | Busy |" not in util
 
     def test_aggregate_populates_busy(self):
         lines = [
@@ -1561,6 +1753,123 @@ class TestBusyStats:
         assert res.busy.streams == 2
         assert res.busy.busy_seconds == 20.0
         assert res.busy.peak_concurrency == 2
+
+
+class TestSummaryByHourClassification:
+    """Per-hour session-journey classification in the top-of-report
+    ``## Summary by hour`` table (LP-0MTFO210Q0044TTF).
+
+    Each session is counted once, in the hour its **first request** started,
+    classified by its journey (local-only / fell back / remote-only); cells
+    render ``n (pct%)`` where pct is of the sessions started in that hour,
+    matching the Session summary table's style.
+    """
+
+    WINDOW_START = datetime(2026, 8, 2, 9, 0, 0)
+    WINDOW_END = datetime(2026, 8, 2, 12, 0, 0)
+
+    def _lines(self) -> list[str]:
+        # s1: local-only, first request 09:40 (hour 9).
+        # s2: starts local 10:30 then falls back (hour 10).
+        # s3: remote-only, first request 11:30 (hour 11).
+        return [
+            "2026-08-02 09:40:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 09:40:30,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s2 request=[]",
+            "2026-08-02 10:30:05,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:30:06,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+            "estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 new_tokens=50 cached_ratio=0.50 "
+            "reason=local_concurrency_limit → skipping local, routing to next remote provider session=s2",
+            "2026-08-02 10:30:07,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s2 request=[]",
+            "2026-08-02 10:30:09,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s2 provider=opencode-go model=deepseek-v4-flash request=[]",
+            "2026-08-02 11:30:00,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s3 request=[]",
+            "2026-08-02 11:30:10,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s3 provider=opencode-go model=deepseek-v4-flash request=[]",
+        ]
+
+    def _summary(self):
+        return aggregation.aggregate(
+            _events(self._lines()), self.WINDOW_START, self.WINDOW_END, _schedule()
+        )
+
+    def test_hourly_classification_counts(self):
+        # Unit-level: the counting helper buckets each session once by its
+        # first-request hour with the Session summary's classification
+        # definitions (local_only / fell_back / remote_only).
+        summary = self._summary()
+        by_hour = reporting._hourly_session_classification(list(summary.sessions.values()))
+        assert by_hour[9].get("local_only") == 1
+        assert by_hour[9].get("fell_back", 0) == 0
+        assert by_hour[9].get("remote_only", 0) == 0
+        assert by_hour[10].get("local_only", 0) == 0
+        assert by_hour[10].get("fell_back") == 1
+        assert by_hour[10].get("remote_only", 0) == 0
+        assert by_hour[11].get("local_only", 0) == 0
+        assert by_hour[11].get("fell_back", 0) == 0
+        assert by_hour[11].get("remote_only") == 1
+
+    def test_table_renders_classification_per_start_hour(self):
+        # Each session lands in its START hour's row, in its journey column,
+        # with n (pct%) of the sessions started in that hour; busy % columns
+        # are unchanged (busy / window-bounded bucket duration).
+        md = reporting.build_report(self._summary(), None)
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        assert "| 09:00-10:00 | 30s | 0.8% | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        assert "| 10:00-11:00 | 5s | 0.1% | 0 (0.0%) | 1 (100.0%) | 0 (0.0%) |" in section
+        assert "| 11:00-12:00 | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) |" in section
+        # Totals row: overall busy + classification % matching Session summary.
+        assert "| Totals | 35s | 0.3% | 1 (33.3%) | 1 (33.3%) | 1 (33.3%) |" in section
+
+    def test_multiple_sessions_same_hour_share_pct(self):
+        # Two sessions start in the same hour: each cell shows its n and its
+        # % of that hour's starts (per-session count, not per-request).
+        lines = self._lines() + [
+            "2026-08-02 10:45:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s4 request=[]",
+            "2026-08-02 10:45:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s4 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
+        md = reporting.build_report(summary, None)
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        # Hour 10: s2 (fell back) + s4 (local-only) → 2 sessions, 50/50.
+        assert "| 10:00-11:00 | 15s | 0.4% | 1 (50.0%) | 1 (50.0%) | 0 (0.0%) |" in section
+        assert "| Totals | 45s | 0.4% | 2 (50.0%) | 1 (25.0%) | 1 (25.0%) |" in section
+
+    def test_renders_without_local_traffic(self):
+        # No local streams (busy is None): the table still renders at the top
+        # of the report with 0s busy / 0.0% and the classification columns
+        # populated (LP-0MTFO210Q0044TTF AC1 — renders regardless of local
+        # traffic); the Local model utilization section is omitted.
+        lines = [
+            "2026-08-02 10:00:00,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=r1 request=[]",
+            "2026-08-02 10:00:10,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=r1 provider=opencode-go model=deepseek-v4-flash request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
+        assert summary.busy is None
+        md = reporting.build_report(summary, None)
+        assert md.index("## Summary by hour") < md.index("## Session summary")
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        assert "| 10:00-11:00 | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) |" in section
+        assert "| Totals | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) |" in section
+        assert "## Local model utilization" not in md
+
+    def test_no_sessions_renders_no_data_note(self):
+        # Empty window: the table still renders with a "No data" note and a
+        # zeroed totals row.
+        summary = aggregation.aggregate([], self.WINDOW_START, self.WINDOW_END, _schedule())
+        md = reporting.build_report(summary, None)
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        assert "| _No session data in window._ | - | - | - | - | - |" in section
+        assert "| Totals | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+
+    def test_json_summary_exposes_hourly_classification(self):
+        # The machine-readable summary exposes the same per-hour
+        # classification so agents can query it without scraping the report.
+        data = reporting.summary_to_json(self._summary())
+        assert data["hourly_session_classification"] == [
+            {"hour": 9, "local_only": 1, "fell_back": 0, "remote_only": 0},
+            {"hour": 10, "local_only": 0, "fell_back": 1, "remote_only": 0},
+            {"hour": 11, "local_only": 0, "fell_back": 0, "remote_only": 1},
+        ]
+        json.dumps(data)  # round-trips
 
 
 class TestIterEventsMargin:
@@ -1842,6 +2151,10 @@ class TestEndToEnd:
         assert "slot_save_error" in report_md
         assert "upstream_http_error" in report_md
         assert "FreeUsageLimitError" in report_md
+        # Upstream errors are broken out by status code (LP-402 vs 429).
+        assert "| upstream HTTP error | 429 | 1 |" in report_md
+        assert "Upstream HTTP error breakdown by status" in report_md
+        assert "| 429 | 1 | opencode (1) |" in report_md
 
         errors_csv = out_dir / "errors.csv"
         assert errors_csv.exists()
@@ -2124,6 +2437,127 @@ class TestReportRestructure:
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
+
+
+class TestCategoryRelativePercentages:
+    """Breakdown percentages in the Total/Fast/Cheap columns are
+    category-relative (LP-0MSVMS95E001Z78V): each fast % is the value's share
+    of the fast-only total for that metric, each cheap % its share of the
+    cheap-only total — so fast + cheap no longer sum to 100% per row. Uses a
+    mixed fast/cheap fixture where the new values differ from the old
+    per-row-split values.
+
+    Fixture (schedule: 6-slot fast period 10:00-23:59, 8-slot cheap otherwise):
+    - 5 sessions: f1..f4 fast (3 local/Qwen3 + 1 opencode-go deepseek),
+      c1 cheap (local/Qwen3); 2 messages each → 8 fast / 2 cheap requests.
+    - 6 fallback events: 3 fast + 1 cheap context_too_large, 1 fast + 1
+      cheap local_concurrency_limit → fast_fb=4, cheap_fb=2.
+    - 4 routing skips: 2 fast + 1 cheap context_too_large, 1 cheap
+      large_context_bypass → fast_skips=2, cheap_skips=2.
+    """
+
+    CONFIG = {
+        "session_slot_pool_size": 8,
+        "slot_schedule": {
+            "enabled": True,
+            "entries": [("23:59", 8), ("10:00", 6)],
+        },
+    }
+    FAST_TS = datetime(2026, 8, 2, 14, 0, 0)
+    CHEAP_TS = datetime(2026, 8, 2, 3, 0, 0)
+
+    def _session(self, sid, bucket, model="Qwen3", provider="local"):
+        d = _session(sid, messages=2, bucket=bucket, local_req=2, remote_req=0)
+        d["initial_provider"] = provider
+        d["initial_model"] = model
+        return d
+
+    def _build(self) -> aggregation.AnalysisResult:
+        res = aggregation.AnalysisResult(
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            sessions={},
+            fallback_events=[
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.CHEAP_TS, reason="context_too_large"),
+                log_parser.LogEvent("fallback", self.FAST_TS, reason="local_concurrency_limit"),
+                log_parser.LogEvent("fallback", self.CHEAP_TS, reason="local_concurrency_limit"),
+            ],
+            routing_skip_events=[
+                log_parser.LogEvent("routing_skip", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("routing_skip", self.FAST_TS, reason="context_too_large"),
+                log_parser.LogEvent("routing_skip", self.CHEAP_TS, reason="context_too_large"),
+                log_parser.LogEvent("routing_skip", self.CHEAP_TS, reason="large_context_bypass"),
+            ],
+            dispatch_denied_count=0,
+            dispatch_denied_events=[],
+            unattributed_events=0,
+            lines_skipped=0,
+            total_lines=0,
+        )
+        for d in [
+            self._session("f1", "fast"),
+            self._session("f2", "fast"),
+            self._session("f3", "fast"),
+            self._session("f4", "fast", model="deepseek-v4-flash", provider="opencode-go"),
+            self._session("c1", "cheap"),
+        ]:
+            s = aggregation.SessionStats(**d)
+            res.sessions[s.session_id] = s
+        return res
+
+    def _md(self) -> str:
+        return reporting.build_report(self._build(), self.CONFIG, speed=None, mode_map=None)
+
+    def test_fallback_events_row_percentages_are_category_rates(self):
+        # Fast = fast fallbacks ÷ fast requests (4/8 = 50.0%); Cheap = cheap
+        # fallbacks ÷ cheap requests (2/2 = 100.0%); Total stays 6/10 = 60.0%.
+        # Old behavior showed the fast/cheap split of total fallbacks
+        # (4/6 = 66.7% / 2/6 = 33.3%).
+        section = self._md().split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Fallback events | 6 (60.0%) | 4 (50.0%) | 2 (100.0%) |" in section
+
+    def test_fallback_reasons_percentages_are_category_relative(self):
+        # Fast = reason fast-count ÷ fast_fb (4); Cheap = reason cheap-count ÷
+        # cheap_fb (2). Old showed the per-row split (e.g. context_too_large
+        # cheap 1/4 = 25.0%); new shows the share within each category.
+        section = self._md().split("## Fallback reasons", 1)[1].split("## ", 1)[0]
+        assert "| context_too_large | 4 | 66.7% | 3 (75.0%) | 1 (50.0%) |" in section
+        assert "| local_concurrency_limit | 2 | 33.3% | 1 (25.0%) | 1 (50.0%) |" in section
+
+    def test_fallback_reasons_fast_and_cheap_no_longer_sum_to_row(self):
+        # Consistency property: per-category reason percentages sum to ~100%
+        # within each category (each column's own total), so operators can
+        # compare reasons across fast vs cheap columns directly.
+        # Fast column: 75.0% + 25.0% = 100.0% of fast_fb; Cheap: 50.0% + 50.0%
+        # = 100.0% of cheap_fb — but no single row sums to 100% (fast + cheap
+        # no longer sum to the row total).
+        section = self._md().split("## Fallback reasons", 1)[1].split("## ", 1)[0]
+        # Fast/Cheap cells are ``count (pct%)``; the ``% of fallbacks`` column
+        # and Total are bare percentages outside parens.
+        pcts = [float(p) for p in re.findall(r"\((\d+\.\d)%\)", section)]
+        assert pcts == [75.0, 50.0, 25.0, 50.0]
+        assert sum(pcts[0::2]) == pytest.approx(100.0)  # fast column
+        assert sum(pcts[1::2]) == pytest.approx(100.0)  # cheap column
+
+    def test_routing_skip_reasons_percentages_are_category_relative(self):
+        # Fast = reason fast-count ÷ fast_skips (2); Cheap = reason cheap-count
+        # ÷ cheap_skips (2). context_too_large: fast 2/2 = 100.0% (old was
+        # 2/3 = 66.7%), cheap 1/2 = 50.0% (old 1/3 = 33.3%).
+        section = self._md().split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
+        assert "| context_too_large | 3 | 75.0% | 2 (100.0%) | 1 (50.0%) |" in section
+        assert "| large_context_bypass | 1 | 25.0% | 0 (0.0%) | 1 (50.0%) |" in section
+
+    def test_per_model_breakdown_percentages_are_category_relative(self):
+        # Fast = model fast sessions ÷ total fast sessions (4); Cheap = model
+        # cheap sessions ÷ total cheap sessions (1). Old showed the per-model
+        # split (Qwen3 fast 3/4 = 75.0%; new 3/4 = 75.0%, cheap 1/4 = 25.0% →
+        # new 1/1 = 100.0%).
+        section = self._md().split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
+        assert "| local | Qwen3 | 4 | 3 (75.0%) | 1 (100.0%) | 8 | 0 |" in section
+        assert "| opencode-go | deepseek-v4-flash | 1 | 1 (25.0%) | 0 (0.0%) | 2 | 0 |" in section
 
 
 class TestArchiveOutputs:
