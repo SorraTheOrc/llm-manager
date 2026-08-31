@@ -171,6 +171,9 @@ session_recording:
 # See proxy/provider_resolver.py for the full mapping table.
 audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
+  # Mirrors plan's provider chain: muse tier first, then the paid
+  # deepseek tier (plan: local -> zen muse -> go muse -> deepseek).
+  - "muse-spark-1.2-contributor-free"
   - "deepseek-v4-flash"
 
 models:
@@ -206,30 +209,54 @@ models:
         model: muse-spark-1.2-contributor-free
         api: openai-responses
         forward_session_headers: false
-      - name: opencode-go-3-deepseek
+      - name: opencode-go-3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-2-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go-2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -250,30 +277,62 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-go-3-deepseek
+      - name: opencode-zen-muse-free
+        type: remote
+        provider: opencode-zen
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
+        forward_session_headers: false
+      - name: opencode-go-3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-2-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go-2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -289,33 +348,65 @@ models:
 
   code:
     providers:
-      - name: local-qwen3-next
+      - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-go-3-deepseek
+      - name: opencode-zen-muse-free
+        type: remote
+        provider: opencode-zen
+        endpoint: https://opencode.ai/zen
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.2-contributor-free
+        api: openai-responses
+        forward_session_headers: false
+      - name: opencode-go-3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-2-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go-2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
+      - name: opencode-go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
         forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Deepseek
+        #
+        # model: deepseek-v4-flash
+        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        model: muse-spark-1.2-contributor
+        api: openai-responses
       - name: deepseek-v4-flash
         type: remote
         provider: deepseek
@@ -325,49 +416,6 @@ models:
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
-    force_full_prompt: true
-    # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
-    tokenizer: qwen3
-
-  local-qwen3-mtp:
-    # MTP evaluation model (LP-0MSNI1B68001VE6C): Qwen3.6-35B-A3B served
-    # from the MTP-converted GGUF with llama-server --spec-type draft-mtp
-    # --spec-draft-n-max 2. Coexists with production Qwen3 serving; the
-    # plan/author/code chains above are UNCHANGED until rollout is approved
-    # post-benchmark. Requires an MTP-capable llama-server build (the local
-    # build b8782/e97492369 predates llama.cpp PR #22673 and lacks draft-mtp)
-    # and single-slot serving (--parallel 1), mirroring the proxy's
-    # LLAMA_PARALLEL when slugged to this model.
-    providers:
-      - name: local-qwen3-mtp
-        type: local
-        llama_model: Qwen3-MTP
-      - name: opencode-go-2-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_2_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: opencode-go-deepseek
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_API_KEY
-        model: deepseek-v4-flash
-        forward_session_headers: false
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-      - name: deepseek-v4-flash
-        type: remote
-        provider: deepseek
-        endpoint: https://api.deepseek.com
-        api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-    aliases:
-    - local-qwen3-mtp
-    - qwen3-mtp
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
