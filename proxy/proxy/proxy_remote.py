@@ -307,6 +307,45 @@ def _sanitize_remote_messages(messages: list[Any]) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_responses_content(content: Any) -> Any:
+    """Normalize chat-format message content to Responses-API input content.
+
+    The Responses API ``input`` items accept content as a plain string or an
+    array of typed parts (``input_text`` / ``input_image`` / ``input_file``).
+    Chat/completions messages use ``text`` / ``image_url`` part types, which
+    the Responses API rejects with ``input[N].content did not match any
+    supported type``. Mapping:
+
+      - ``{"type": "text", "text": ...}``  -> ``{"type": "input_text", "text": ...}``
+      - ``{"type": "image_url", "image_url": {"url": ...}}`` -> ``{"type": "input_image", "image_url": <url>}``
+      - strings and already-valid parts pass through unchanged.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+    parts: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            parts.append(part)
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            parts.append({"type": "input_text", "text": part.get("text", "")})
+        elif ptype == "image_url":
+            iu = part.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            new_part: dict[str, Any] = {"type": "input_image", "image_url": url or ""}
+            if isinstance(iu, dict) and iu.get("detail"):
+                new_part["detail"] = iu["detail"]
+            parts.append(new_part)
+        else:
+            # Already-valid Responses part type (input_text/input_image/...) or
+            # unknown: pass through unchanged.
+            parts.append(part)
+    return parts
+
+
 def _translate_chat_to_responses(body_json: dict) -> dict:
     """Translate a chat/completions request body to the Responses API format.
 
@@ -348,7 +387,7 @@ def _translate_chat_to_responses(body_json: dict) -> dict:
                 # one function_call item per tool call.
                 content = msg.get("content")
                 if content:
-                    input_items.append({"role": "assistant", "content": content})
+                    input_items.append({"role": "assistant", "content": _normalize_responses_content(content)})
                 for tc in msg["tool_calls"]:
                     if not isinstance(tc, dict):
                         continue
@@ -360,7 +399,10 @@ def _translate_chat_to_responses(body_json: dict) -> dict:
                         "arguments": fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {}),
                     })
             else:
-                input_items.append(msg)
+                norm = dict(msg)
+                if "content" in norm:
+                    norm["content"] = _normalize_responses_content(norm["content"])
+                input_items.append(norm)
         out["input"] = input_items
 
     if body_json.get("max_tokens") is not None:

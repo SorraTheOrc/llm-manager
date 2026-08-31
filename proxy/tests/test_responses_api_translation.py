@@ -134,6 +134,40 @@ def test_request_translation_tools_and_choice_pass_through():
     assert out["tool_choice"] == "auto"
 
 
+def test_request_translation_content_parts_normalized():
+    """chat content parts (text/image_url) -> Responses input parts (input_text/input_image).
+
+    Regression for upstream 400: ``input[N].content did not match any supported
+    type`` — the Responses API rejects chat-format part types.
+    """
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": "plain string ok"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        ],
+    }
+    out = _translate_chat_to_responses(body)
+    # string content passes through
+    assert out["input"][0]["content"] == "plain string ok"
+    # text part -> input_text
+    assert out["input"][1]["content"][0] == {"type": "input_text", "text": "hello"}
+    # image_url part -> input_image with url + detail
+    img = out["input"][1]["content"][1]
+    assert img["type"] == "input_image"
+    assert img["image_url"] == "data:image/png;base64,AAAA"
+    assert img["detail"] == "high"
+    # assistant content parts normalized too
+    assert out["input"][2]["content"][0] == {"type": "input_text", "text": "hi"}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. Non-streaming response translation: responses JSON → chat/completions JSON
 # ═══════════════════════════════════════════════════════════════════════════════
