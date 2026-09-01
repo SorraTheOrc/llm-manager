@@ -1233,6 +1233,19 @@ async def _periodic_broadcast_loop():
                     try:
                         server_cfg = srv.config.get("server", {})
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                        # Prefer the discovered local child port: the router
+                        # serializes /slots?model=... behind the busy child
+                        # (LP-0MTDGBRPU003Z7KU, 5-7s vs 0.17s direct), so the
+                        # broadcast SSE loop must query the model instance
+                        # directly to avoid the 6,865/day router 500 storm
+                        # (LP-0MTIHZ8M5005ZAU8 / F3 triage rank 1).
+                        try:
+                            from proxy.router_helpers import _discover_local_child_port
+                            _child = _discover_local_child_port(srv)
+                            if _child is not None:
+                                llama_port = _child
+                        except Exception:
+                            pass
                         # Use current_model as the model param for /slots
                         model_name = srv.current_model or None
                         # 5s timeout: llama-server may be slow to respond
