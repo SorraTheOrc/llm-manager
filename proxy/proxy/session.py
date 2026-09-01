@@ -968,16 +968,22 @@ def _build_slot_context(
                 max_prompt_tokens = _hard_cap
         except Exception:
             pass
-        if max_prompt_tokens <= 0:
-            from proxy.provider import (
-                _get_active_local_ctx_size,
-                _get_active_local_slots,
-                effective_per_slot_threshold,
-            )
-            max_prompt_tokens = effective_per_slot_threshold(
-                _get_active_local_ctx_size(server_config),
-                _get_active_local_slots(server_config),
-            )
+        # LP-0MTE9HAF8008909G F3: pin the dynamic persistence cap to the
+        # per-slot routing clamp (83285 / 126976 for the live 262K schedule)
+        # so the router and the persistence gate use the same threshold.
+        # The previous hard-cap derivation (70000 / 61440) left a gap where
+        # the router accepted a request but persistence gated it out, which
+        # disabled KV reuse for the largest sessions that benefit most.
+        from proxy.provider import (
+            _get_active_local_ctx_size as _persist_ctx_size,
+            _get_active_local_slots as _persist_slots,
+            effective_per_slot_threshold as _persist_clamp,
+        )
+        _persist_ctx = _persist_ctx_size(server_config)
+        _persist_n = _persist_slots(server_config)
+        _persist_threshold = _persist_clamp(_persist_ctx, _persist_n)
+        if _persist_threshold > max_prompt_tokens:
+            max_prompt_tokens = _persist_threshold
     per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)
     need_estimate = max_prompt_tokens > 0 or per_token > 0
     # Resolve the request's model config so the persistence estimate uses the
