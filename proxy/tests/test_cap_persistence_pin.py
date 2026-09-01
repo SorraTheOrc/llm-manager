@@ -17,9 +17,8 @@ The GPU-wedge plan must stay unchanged:
 """
 
 import pytest
-
-from proxy.session import _build_slot_context, _slot_owners
 from proxy.provider import effective_per_slot_threshold
+from proxy.session import _build_slot_context, _slot_owners
 
 
 def _body_for_tokens(n: int) -> dict:

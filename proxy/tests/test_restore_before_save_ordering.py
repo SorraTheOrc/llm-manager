@@ -153,9 +153,10 @@ class TestHotRestoreBeforeSaveOrdering:
         assert cfg["session_slot_skip_when_busy"] is True
 
         # Verify _build_slot_context still scales with same coefficients
-        from proxy.session import _build_slot_context
-        from unittest.mock import patch, MagicMock
         import logging
+        from unittest.mock import MagicMock
+
+        from proxy.session import _build_slot_context
         srv = MagicMock()
         srv.logger = logging.getLogger("test")
         srv._http_client = None
@@ -171,9 +172,10 @@ class TestHotRestoreBeforeSaveOrdering:
 class TestZeroGpuFootprint:
     def test_session_slot_module_has_no_new_config_keys(self):
         """No new dependencies or config keys beyond hot tracking."""
-        from proxy import session as sess
         # Existing timeout keys must still be the only ones read by _build_slot_context
         import inspect
+
+        from proxy import session as sess
         src = inspect.getsource(sess._build_slot_context)
         assert "session_slot_timeout_seconds" in src
         assert "session_slot_max_timeout_seconds" in src

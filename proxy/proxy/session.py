@@ -1025,7 +1025,11 @@ def _build_slot_context(
         # disabled KV reuse for the largest sessions that benefit most.
         from proxy.provider import (
             _get_active_local_ctx_size as _persist_ctx_size,
+        )
+        from proxy.provider import (
             _get_active_local_slots as _persist_slots,
+        )
+        from proxy.provider import (
             effective_per_slot_threshold as _persist_clamp,
         )
         _persist_ctx = _persist_ctx_size(server_config)

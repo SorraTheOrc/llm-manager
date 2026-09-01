@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
 class _FakeResponse:
     def __init__(self, status_code=200, json_data=None):
         self.status_code = status_code
@@ -38,7 +39,9 @@ class _FakeResponse:
 class TestDirectPollingPrefersChildPort:
     def test_broadcast_loop_uses_child_port_when_available(self):
         """_periodic_broadcast_loop must query the child port (not 8080) when _discover_local_child_port returns one."""
-        import inspect, proxy.observability as obs
+        import inspect
+
+        import proxy.observability as obs
         src = inspect.getsource(obs._periodic_broadcast_loop)
         # After the fix the broadcast loop resolves llama_port via
         # _discover_local_child_port, exactly like get_llama_local_status
@@ -57,7 +60,9 @@ class TestDirectPollingPrefersChildPort:
 
     def test_query_slots_helpers_use_supplied_port(self):
         """_query_slots / _query_slots_detail / _query_slots_progress honour the caller-supplied llama_port."""
-        import inspect, proxy.observability as obs
+        import inspect
+
+        import proxy.observability as obs
         for name in ("_query_slots", "_query_slots_detail", "_query_slots_progress"):
             src = inspect.getsource(getattr(obs, name))
             assert "llama_port" in src
@@ -72,7 +77,6 @@ class TestDirectPollingPrefersChildPort:
         import proxy.observability as obs
         # Patch _query_slots_detail to capture the llama_port it was called with
         seen = {}
-        real = obs._query_slots_detail
         async def spy(llama_port, timeout=2.0, model=None, _client=None):
             seen["port"] = llama_port
             return []
@@ -89,7 +93,6 @@ class TestDirectPollingPrefersChildPort:
                     srv.config = {"server": {"llama_server_port": 8080}}
                     srv.current_model = "Qwen3"
                     srv.llama_process = MagicMock(pid=9999)
-                    log_dir = None
                     # Simulate what the loop does:
                     llama_port = srv.config["server"]["llama_server_port"]
                     cp = disc(srv)
@@ -127,9 +130,9 @@ class TestLastKnownFallbackBehaviour:
     @pytest.mark.asyncio
     async def test_status_uses_last_known_when_direct_fails(self):
         """get_llama_local_status serves the cached counts with slots_stale=true when direct _query_slots fails."""
-        from proxy.handlers import get_llama_local_status
         import proxy.observability as obs
         import proxy.server as server
+        from proxy.handlers import get_llama_local_status
         # Establish a fresh last-known cache entry (available=2, total=3)
         obs._record_last_slot_counts(2, 3)
         assert obs.last_known_slot_counts() == (2, 3)
@@ -163,8 +166,8 @@ class TestLastKnownFallbackBehaviour:
     @pytest.mark.asyncio
     async def test_status_not_stale_on_direct_success(self):
         """Direct success → real counts, slots_stale=false (no fallback needed)."""
-        from proxy.handlers import get_llama_local_status
         import proxy.server as server
+        from proxy.handlers import get_llama_local_status
         # No prior cache needed — direct succeeds
         with patch("proxy.router_helpers._discover_local_child_port", return_value=58113):
             with patch("proxy.server.query_llama_status", new=AsyncMock(return_value={"llama_server_running": True})):
@@ -193,8 +196,9 @@ class TestNoRegressionInSlotAccuracy:
 
     def test_helpers_still_parse_is_processing_and_n_decoded(self):
         """_query_slots* helpers still return is_processing / n_decoded with the expected schema."""
-        import proxy.observability as obs
         import inspect
+
+        import proxy.observability as obs
         for name in ("_query_slots_detail", "_query_slots_progress"):
             src = inspect.getsource(getattr(obs, name))
             # Schema guard: these keys are the contract with the routing /

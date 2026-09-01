@@ -688,10 +688,13 @@ class TestEffectivePerSlotThreshold:
 class TestSessionSlotMaxPromptDerivation:
     """AC4: session_slot_max_prompt_tokens derives from same cap."""
 
-    def test_derives_from_hard_cap_when_configured(self, provider_mod, monkeypatch, patch_scheduler):
-        """
-        When a hard cap is configured, session.py should use it as the
-        max_prompt_tokens instead of the per-slot threshold.
+    def test_derives_from_per_slot_clamp_not_hard_cap(self, provider_mod, monkeypatch, patch_scheduler):
+        """LP-0MTE9HAF8008909G F3: persistence pins to the per-slot clamp (83285)
+        — not the hard-routing cap (70000) — so the largest beneficial
+        sessions (e.g. 75000 tokens) persist. Previous LP-0MTBOX45O005LD1S
+        wording claimed persistence used the hard cap; F3 corrected that gap
+        (F2: 38/48 sessions, ~22.8M tokens/day). Hard caps remain the ROUTING
+        gate only (see _effective_large_context_thresholds / check_hard_routing_cap).
         """
         import proxy.mode as mode_mod
         from proxy.session import _build_slot_context
@@ -707,18 +710,20 @@ class TestSessionSlotMaxPromptDerivation:
             "session_slot_max_prompt_tokens": 0,  # derived
             "session_slot_timeout_seconds": 3.0,
         }
-        # Estimate a context ABOVE the routing cap (70000) but BELOW the old
-        # static 83285: persistence must be skipped (derived from hard cap).
+        # 75000 > routing hard cap (70000) but <= per-slot clamp (83285).
+        # Routing would skip local, but PERSISTENCE must still save the slot
+        # so the KV is available for a later same-slot restore (gap fix).
         body = {"messages": [{"role": "user", "content": "x" * (75000 * 8)}]}
         slot_id, _, _ = _build_slot_context(server_cfg, "session-a", body)
-        assert slot_id is None
+        assert slot_id is not None
 
         # Hard cap math: round(0.84049 × min(100000, 262144//3 - 4096)) = 70000
         hard_cap = provider_mod.compute_hard_routing_cap("fast", server_cfg)
         assert hard_cap == 70000
         per_slot_thresh = provider_mod.effective_per_slot_threshold(262144, 3)
         assert per_slot_thresh == 83285
-        # Hard cap should be less than per-slot threshold when ratio < 1
+        # The hard cap exists but is strictly below the per-slot clamp (gap).
+        # Effective persistence uses max(hard_cap, clamp) = clamp = 83285.
         assert hard_cap < per_slot_thresh
 
     def test_falls_through_to_per_slot_without_hard_cap(self, provider_mod, monkeypatch, patch_scheduler):
