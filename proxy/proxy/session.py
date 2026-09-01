@@ -909,6 +909,55 @@ def _assigned_slot_for_session(session_id: str) -> int | None:
     return None
 
 
+# ===================================================================
+# Hot same-slot reuse detection (LP-0MTIHXPP9005182I)
+#
+# Tracks the last saving session per slot so a hot same-slot turn can
+# be recognised without extra I/O.  Zero GPU footprint: only in-memory
+# timestamps and string comparisons; no new config, timeouts, or
+# llama-server calls.  The proxy already serializes same-slot restores
+# via SlotLockCoordinator — the "restore-before-save" guarantee is that
+# a streaming save re-acquires that lock, so a hot restore cannot be
+# clobbered.  This helper is the detector the router/correlation
+# harness uses to measure that ordering (AC1/AC3).
+# ===================================================================
+
+HOT_SLOT_REUSE_WINDOW_SECONDS: float = 120.0
+_slot_hot_last_owner: dict[int, tuple[str, float]] = {}
+"""{slot_id: (session_id, last_save_monotonic)} for hot-reuse detection."""
+
+
+def _is_hot_same_slot_session(
+    slot_id: int | None, session_id: str | None
+) -> bool:
+    """True when *session_id* last saved *slot_id* within the hot window.
+
+    Hot = same session reusing the same slot across turns without an
+    intervening different owner.  Used to measure AC1/AC3 ordering:
+    when hot, the restore-before-save serialization is the behaviour that
+    recovers reuse; a miss here is a save-clobbered candidate.
+    """
+    if slot_id is None or not session_id:
+        return False
+    entry = _slot_hot_last_owner.get(slot_id)
+    if entry is None:
+        return False
+    last_owner, last_at = entry
+    if last_owner != session_id:
+        return False
+    return (time.monotonic() - last_at) <= HOT_SLOT_REUSE_WINDOW_SECONDS
+
+
+def _record_hot_slot_owner(slot_id: int | None, session_id: str | None) -> None:
+    """Record *session_id* as the last saver of *slot_id* for hot detection."""
+    if slot_id is None or not session_id:
+        return
+    _slot_hot_last_owner[slot_id] = (session_id, time.monotonic())
+
+# Back-compat alias used by some harnesses
+is_hot_same_slot_session = _is_hot_same_slot_session
+
+
 def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
     safe_id = _sanitize_session_id(session_id)
     return str(Path(base_dir) / f"slot_{safe_id}.bin")

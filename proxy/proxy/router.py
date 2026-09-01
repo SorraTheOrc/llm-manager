@@ -1608,21 +1608,52 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     provider="local",
                                 )
 
-                            # Update session history and save slot (shared helper)
-                            await _update_session_and_slot(
-                                srv, session_id, body_json,
-                                is_delta_request, delta_messages,
-                                original_message_count,
-                                response,
-                                llama_port, slot_id, slot_filename,
-                                slot_timeout, slot_model_payload,
-                                slot_enabled,
-                                upstream_status=upstream_status,
-                                slot_save_allowed=slot_save_allowed,
-                                collected_content=collected_content,
-                                llama_log_path=llama_log_path,
-                                llama_log_offset=llama_log_offset,
-                            )
+                            # Restore-before-save ordering (LP-0MTIHXPP9005182I):
+                            # streaming saves previously ran outside slot_guard,
+                            # so a hot same-slot restore could race behind the
+                            # save and overwrite the candidate (~438K tokens/day).
+                            # Re-acquire the slot lock around the save so
+                            # same-slot restores (which also hold the lock at
+                            # request start) are serialized before the save.
+                            # Zero GPU footprint: same save/restore calls and
+                            # timeouts (AC4), just ordered behind the existing
+                            # SlotLockCoordinator (AC2 unchanged).
+                            if slot_save_allowed and slot_enabled and slot_id is not None:
+                                async with slot_lock_coordinator.acquire(slot_id):
+                                    await _update_session_and_slot(
+                                        srv, session_id, body_json,
+                                        is_delta_request, delta_messages,
+                                        original_message_count,
+                                        response,
+                                        llama_port, slot_id, slot_filename,
+                                        slot_timeout, slot_model_payload,
+                                        slot_enabled,
+                                        upstream_status=upstream_status,
+                                        slot_save_allowed=slot_save_allowed,
+                                        collected_content=collected_content,
+                                        llama_log_path=llama_log_path,
+                                        llama_log_offset=llama_log_offset,
+                                    )
+                                    try:
+                                        from proxy.session import _record_hot_slot_owner
+                                        _record_hot_slot_owner(slot_id, session_id)
+                                    except Exception:
+                                        pass
+                            else:
+                                await _update_session_and_slot(
+                                    srv, session_id, body_json,
+                                    is_delta_request, delta_messages,
+                                    original_message_count,
+                                    response,
+                                    llama_port, slot_id, slot_filename,
+                                    slot_timeout, slot_model_payload,
+                                    slot_enabled,
+                                    upstream_status=upstream_status,
+                                    slot_save_allowed=slot_save_allowed,
+                                    collected_content=collected_content,
+                                    llama_log_path=llama_log_path,
+                                    llama_log_offset=llama_log_offset,
+                                )
 
                             # Wrap both cm.__aexit__ and client.aclose() with a
                             # configurable timeout so that an unresponsive upstream
