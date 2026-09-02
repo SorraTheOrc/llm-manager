@@ -405,10 +405,24 @@ def _translate_chat_to_responses(body_json: dict) -> dict:
                 input_items.append(norm)
         out["input"] = input_items
 
-    if body_json.get("max_tokens") is not None:
-        out["max_output_tokens"] = body_json["max_tokens"]
-    elif body_json.get("max_completion_tokens") is not None:
-        out["max_output_tokens"] = body_json["max_completion_tokens"]
+    # OpenAI Responses API requires max_output_tokens >= 16 (Console Go /
+    # opencode-zen upstream). Clamp small values to this floor to prevent
+    # ``invalid_request_error``; omit when no source value is present.
+    min_max_output_tokens = 16
+
+    def _clamped_max_output_tokens(raw: Any) -> int | None:
+        try:
+            return max(min_max_output_tokens, int(raw))
+        except (TypeError, ValueError):
+            return None
+
+    _raw_max = body_json.get("max_tokens")
+    if _raw_max is None:
+        _raw_max = body_json.get("max_completion_tokens")
+    if _raw_max is not None:
+        _clamped = _clamped_max_output_tokens(_raw_max)
+        if _clamped is not None:
+            out["max_output_tokens"] = _clamped
 
     for key in ("stream", "temperature", "top_p", "stop"):
         if body_json.get(key) is not None:
