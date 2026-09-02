@@ -1191,6 +1191,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             #     max_runtime_seconds (long — large prompt ingestion).
                             #   Phase 2 (between chunks): budget =
                             #     stream_idle_timeout_seconds (short).
+                            _generating_slot_counted = False
                             _stream_aiter = response.aiter_bytes().__aiter__()
                             _stream_iter = asyncio.ensure_future(
                                 _stream_aiter.__anext__()
@@ -1384,6 +1385,19 @@ async def proxy_to_local(request: Request, path: str) -> Response:
 
                                 if _has_actual_data:
                                     remaining_budget = float(stream_idle_timeout)
+                                    # First actual data chunk marks the
+                                    # generating phase for the pool gate
+                                    # (LP-0MTH7JX82000YS5N).
+                                    if not _generating_slot_counted and _has_actual_data:
+                                        try:
+                                            from proxy.router_helpers import _increment_generating_only_slot
+
+                                            await _increment_generating_only_slot(
+                                                srv, session_key=session_id
+                                            )
+                                            _generating_slot_counted = True
+                                        except Exception:
+                                            pass
                                     # Prefill phase is over: the first actual data
                                     # chunk has arrived, so stop progress-based
                                     # lease extension — the chunk-refresh path
@@ -1705,6 +1719,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 # _stream_iter may not exist in all code paths
                                 pass
 
+                            if _generating_slot_counted:
+                                try:
+                                    from proxy.router_helpers import _decrement_generating_only_slot
+
+                                    await _decrement_generating_only_slot(
+                                        srv, session_key=session_id
+                                    )
+                                except Exception:
+                                    pass
                             # Decrement local active queries now that the stream
                             # has finished (LP-0MR96QL8400022BW: streaming path was
                             # not decrementing local_active_queries, causing subsequent

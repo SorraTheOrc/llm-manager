@@ -46,6 +46,9 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv, "local_active_queries", 1)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_queries", 1)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", {"owner-session"})
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -110,7 +113,18 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(monkeypatch):
-    """No-preemption policy should reject non-owner even when no active request exists."""
+    """No-preemption policy: generating-owner blocks non-owner read.
+
+    With generating-only occupancy (LP-0MTH7JX82000YS5N), a non-owner is
+    blocked only while the owner is *generating*. An inactive post-stream
+    lease alone (no generating slot) does not block others when max_local
+    == 1 — that was the 290 false-full case this parent work item fixes.
+
+    Legacy note: old tests set local_active_queries==0 + inactive lease
+    and expected 503; those fixtures now represent the fixed case (no
+    generating slot = not full) and should get 400 (model validation)
+    rather than a dispatch-gate 503.
+    """
     from proxy.router import proxy_to_local
 
     from proxy import server as srv
@@ -136,6 +150,16 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv, "local_active_queries", 0)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    # Generating-only occupancy (LP-0MTH7JX82000YS5N): pool occupancy is
+    # driven by local_generating_queries, not the inactive-lease map.
+    # With local_generating_queries==0 and max_local==1 the pool is NOT
+    # full, so proxy_to_local must NOT dispatch-gate 503 here. The 503
+    # assertions below are for the generating-owner variant (see the
+    # helper block). When NOT generating, the request passes the gate and
+    # hits model-validation (400 for "plan"), not a dispatch denial.
+    monkeypatch.setattr(srv, "local_generating_queries", 0)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", set())
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -189,9 +213,8 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
     )
 
     resp = await proxy_to_local(req, "v1/chat/completions")
-    assert resp.status_code == 503
-    payload = json.loads(resp.body)
-    assert payload["local_owner_session_id"] == "owner-session"
+    # Must NOT be a dispatch-gate denial when no generating slot is held.
+    assert resp.status_code != 503, "Inactive-lease-only must not dispatch-gate 503; generating-only pool not full"
 
 
 @pytest.mark.asyncio
@@ -248,7 +271,7 @@ async def test_try_acquire_denies_non_owner_during_unexpired_lease():
 
     assert acquired is False
     assert owner == "sess-owner"
-    assert active == 0
+    assert active == 1
     assert retry_after >= 1
 
 
@@ -1053,9 +1076,12 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
     monkeypatch.setattr(srv, "current_model", "Qwen3")
     monkeypatch.setattr(srv, "active_queries", 0)
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
-    # Simulate 2 active local queries (sess-a and sess-b)
+    # Simulate 2 active local queries (sess-a and sess-b) — generating-only path
     monkeypatch.setattr(srv, "local_active_queries", 2)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_queries", 2)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", {"sess-a", "sess-b"})
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -1261,6 +1287,9 @@ async def test_n1_backward_compat_integration(monkeypatch):
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv, "local_active_queries", 1)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_queries", 1)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", {"sess-a"})
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",

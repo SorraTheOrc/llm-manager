@@ -2156,9 +2156,13 @@ def _get_proxy_to_local():
 
 
 def _get_local_concurrency_info(config: dict) -> tuple:
-    """Lazily import and return (current_local_active, max_local) from config.
+    """Lazily import and return (current_generating_active, max_local) from config.
 
-    Returns the current local active query count and the configured
+    Generating-only pool (LP-0MTH7JX82000YS5N): occupancy is measured as the
+    number of sessions currently in the generating phase (first-byte onward).
+    Prefill time does not count against session_slot_pool_size.
+
+    Returns the current generating-only count and the configured
     local concurrency limit.  Reads ``session_slot_pool_size`` (same value
     that controls ``--parallel`` in llama-server); the legacy
     ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
@@ -2169,7 +2173,10 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     max_local = 1
     try:
         import proxy.server as _srv
-        cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+        try:
+            cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+        except Exception:
+            cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
     except Exception:
         pass
     try:

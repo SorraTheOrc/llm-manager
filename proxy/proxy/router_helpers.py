@@ -1025,6 +1025,83 @@ async def _increment_local_active_queries(
             pass
 
 
+def _get_generating_only_count(srv) -> int:
+    """Return the current generating-only pool occupancy."""
+    try:
+        return max(0, int(getattr(srv, "local_generating_queries", 0) or 0))
+    except Exception:
+        return 0
+
+
+async def _increment_generating_only_slot(srv, session_key: str | None = None) -> None:
+    """Increment generating-only slot once per session (idempotent)."""
+    if not hasattr(srv, "local_generating_queries"):
+        return
+    # Ensure the per-session set exists so duplicate increments are idempotent
+    # even for test SimpleNamespace fixtures that lack the attribute.
+    if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
+        try:
+            srv.local_generating_sessions = set()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        lock = getattr(srv, "local_generating_queries_lock", None)
+        sessions: set | None = getattr(srv, "local_generating_sessions", None)
+        if lock is not None:
+            async with lock:
+                if session_key and sessions is not None and session_key in sessions:
+                    return
+                srv.local_generating_queries = int(getattr(srv, "local_generating_queries", 0) or 0) + 1
+                if session_key and sessions is not None:
+                    sessions.add(session_key)
+        else:
+            if session_key and sessions is not None and session_key in sessions:
+                return
+            srv.local_generating_queries = int(getattr(srv, "local_generating_queries", 0) or 0) + 1
+            if session_key and sessions is not None:
+                sessions.add(session_key)
+    except Exception:
+        pass
+
+
+async def _decrement_generating_only_slot(srv, session_key: str | None = None) -> None:
+    """Decrement generating-only slot for *session_key* (safe / not negative)."""
+    if not hasattr(srv, "local_generating_queries"):
+        return
+    if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
+        try:
+            srv.local_generating_sessions = set()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        lock = getattr(srv, "local_generating_queries_lock", None)
+        sessions: set | None = getattr(srv, "local_generating_sessions", None)
+        if lock is not None and sessions is not None:
+            async with lock:
+                if session_key and session_key not in sessions:
+                    return
+                srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
+                if session_key:
+                    sessions.discard(session_key)
+        elif lock is not None:
+            async with lock:
+                srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
+        else:
+            if sessions is not None and session_key and session_key not in sessions:
+                return
+            srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
+            if session_key and sessions is not None:
+                sessions.discard(session_key)
+    except Exception:
+        pass
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(1)
+    except Exception:
+        pass
+
+
 async def _try_acquire_local_dispatch(
     srv,
     max_local: int,
@@ -1110,34 +1187,42 @@ async def _try_acquire_local_dispatch(
                     )
                 )
 
+                occupied_by_others = 0
+                first_occupied_owner = None
+                for existing_key, record in srv.local_dispatch_records.items():
+                    if existing_key == session_key:
+                        continue
+                    if record.get("active") or record.get("expires_at", 0) > now:
+                        occupied_by_others += 1
+                        if first_occupied_owner is None:
+                            first_occupied_owner = existing_key
+                _generating_count = _get_generating_only_count(srv)
+                has_generating_state = (
+                    hasattr(srv, "local_generating_queries")
+                    or hasattr(srv, "local_generating_sessions")
+                    or hasattr(srv, "local_generating_queries_lock")
+                )
                 if not own_has_lease:
-                    occupied_by_others = 0
-                    first_occupied_owner = None
-                    for existing_key, record in srv.local_dispatch_records.items():
-                        if existing_key == session_key:
-                            continue
-                        if record.get("active") or record.get("expires_at", 0) > now:
-                            occupied_by_others += 1
-                            if first_occupied_owner is None:
-                                first_occupied_owner = existing_key
-
-                    if occupied_by_others >= max_local:
-                        active_count = getattr(srv, "local_active_queries", 0)
-                        retry_after = max(1.0, lease_timeout)
-                        return (False, first_occupied_owner, active_count, retry_after)
-
-                if srv.local_active_queries >= max_local and not own_has_lease:
-                    active_owner = None
-                    for ek, er in srv.local_dispatch_records.items():
-                        if er.get("active"):
-                            active_owner = ek
-                            break
-                    return (
-                        False,
-                        active_owner,
-                        srv.local_active_queries,
-                        max(1.0, lease_timeout),
-                    )
+                    if has_generating_state:
+                        # Generating-only pool (LP-0MTH7JX82000YS5N): prefill
+                        # dispatches do not count against the cap — only
+                        # generating sessions do. Inactive leases (cooldown)
+                        # are not counted here; they are covered by the
+                        # streaming-phase counter.
+                        if _generating_count >= max_local:
+                            active_owner = None
+                            for ek, er in srv.local_dispatch_records.items():
+                                if ek != session_key and er.get("active"):
+                                    active_owner = ek
+                                    break
+                            if active_owner is None:
+                                active_owner = first_occupied_owner
+                            return (False, active_owner, _generating_count, max(1.0, lease_timeout))
+                        # Also enforce the traditional slot-cap when no
+                        # generating backing state is present (legacy).
+                    else:
+                        if occupied_by_others >= max_local:
+                            return (False, first_occupied_owner, occupied_by_others, max(1.0, lease_timeout))
 
                 srv.local_active_queries += 1
 

@@ -106,6 +106,14 @@ per_model_queries_lock = asyncio.Lock()
 local_active_queries: int = 0
 local_active_queries_lock = asyncio.Lock()
 
+# Generating-only pool occupancy (LP-0MTH7JX82000YS5N)
+# Slots are counted only during the generating phase (first-byte onward)
+# and released immediately on stream end — prefill time does NOT count
+# against session_slot_pool_size.
+local_generating_queries: int = 0
+local_generating_queries_lock = asyncio.Lock()
+local_generating_sessions: set = set()
+
 # Dispatch lease tracking — per-session records that persist as inactive
 # leases after a request completes, preventing other sessions from
 # acquiring the local backend for a configured timeout.

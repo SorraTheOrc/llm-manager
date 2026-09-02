@@ -170,8 +170,13 @@ async def test_counter_based_deny_still_applies_when_slots_full():
 
     srv = SimpleNamespace(
         config={"server": {"local_dispatch_lease_timeout_seconds": 180}},
-        local_active_queries=2,  # capacity reached
+        local_active_queries=2,  # capacity reached (legacy)
         local_active_queries_lock=asyncio.Lock(),
+        # Generating-only pool (LP-0MTH7JX82000YS5N): counter gate is
+        # local_generating_queries, not local_active_queries.
+        local_generating_queries=2,
+        local_generating_queries_lock=asyncio.Lock(),
+        local_generating_sessions={"sess-a", "sess-b"},
         local_dispatch_records={},
         local_dispatch_records_lock=asyncio.Lock(),
     )
