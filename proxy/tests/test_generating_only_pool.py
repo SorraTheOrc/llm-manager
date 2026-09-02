@@ -554,6 +554,8 @@ async def test_proxy_to_local_allows_dispatch_when_generating_below_cap(monkeypa
         },
     )
     monkeypatch.setattr(srv, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_prefill_in_flight", {})
+    monkeypatch.setattr(srv, "local_prefill_in_flight_lock", asyncio.Lock())
 
     import proxy.router as router_mod
 
@@ -660,6 +662,8 @@ async def test_proxy_to_local_denies_when_generating_at_pool_cap(monkeypatch):
         },
     )
     monkeypatch.setattr(srv, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_prefill_in_flight", {})
+    monkeypatch.setattr(srv, "local_prefill_in_flight_lock", asyncio.Lock())
 
     import proxy.router as router_mod
 

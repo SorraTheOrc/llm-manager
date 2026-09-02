@@ -114,6 +114,12 @@ local_generating_queries: int = 0
 local_generating_queries_lock = asyncio.Lock()
 local_generating_sessions: set = set()
 
+# Prefill-aware guard (LP-0MTJET4I5009EHNX): caps concurrent prefills to
+# ``parallel`` / ``session_slot_pool_size``. Initialised as empty so a
+# fresh start has 0 in-flight prefills without leaking cross-restart state.
+local_prefill_in_flight: dict = {}
+local_prefill_in_flight_lock = asyncio.Lock()
+
 # Dispatch lease tracking — per-session records that persist as inactive
 # leases after a request completes, preventing other sessions from
 # acquiring the local backend for a configured timeout.

@@ -1033,8 +1033,45 @@ def _get_generating_only_count(srv) -> int:
         return 0
 
 
+def _get_prefill_in_flight_count(srv) -> int:
+    """Return the number of sessions currently in prefill (dispatch→first-byte).
+
+    Prefill-aware guard (LP-0MTJET4I5009EHNX): caps concurrent prefills to
+    ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the llama-
+    server internal queue does not saturate under generating-only occupancy.
+    """
+    try:
+        d = getattr(srv, "local_prefill_in_flight", None)
+        if d is None:
+            return 0
+        return max(0, int(len(d)))
+    except Exception:
+        return 0
+
+
 async def _increment_generating_only_slot(srv, session_key: str | None = None) -> None:
-    """Increment generating-only slot once per session (idempotent)."""
+    """Increment generating-only slot once per session (idempotent).
+
+    Prefill-aware guard: the session's prefill hold is released on first-byte
+    so the prefill cap slot is freed for waiters.
+    """
+    # Prefill-aware guard: clear the prefill hold on first-byte.
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_key and session_key in _p:
+            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
+            if _plock is not None:
+                async with _plock:
+                    _p.pop(session_key, None)
+            else:
+                _p.pop(session_key, None)
+            try:
+                from proxy.contention_queue import wake
+                await wake(1)
+            except Exception:
+                pass
+    except Exception:
+        pass
     if not hasattr(srv, "local_generating_queries"):
         return
     # Ensure the per-session set exists so duplicate increments are idempotent
@@ -1065,7 +1102,27 @@ async def _increment_generating_only_slot(srv, session_key: str | None = None) -
 
 
 async def _decrement_generating_only_slot(srv, session_key: str | None = None) -> None:
-    """Decrement generating-only slot for *session_key* (safe / not negative)."""
+    """Decrement generating-only slot for *session_key* (safe / not negative).
+
+    Also clears any remaining prefill hold (prefill-only aborts).
+    """
+    # Clear prefill hold for prefill-only sessions (no generating).
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_key and session_key in _p:
+            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
+            if _plock is not None:
+                async with _plock:
+                    _p.pop(session_key, None)
+            else:
+                _p.pop(session_key, None)
+            try:
+                from proxy.contention_queue import wake
+                await wake(1)
+            except Exception:
+                pass
+    except Exception:
+        pass
     if not hasattr(srv, "local_generating_queries"):
         return
     if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
@@ -1197,6 +1254,7 @@ async def _try_acquire_local_dispatch(
                         if first_occupied_owner is None:
                             first_occupied_owner = existing_key
                 _generating_count = _get_generating_only_count(srv)
+                _prefill_count = _get_prefill_in_flight_count(srv)
                 has_generating_state = (
                     hasattr(srv, "local_generating_queries")
                     or hasattr(srv, "local_generating_sessions")
@@ -1218,6 +1276,18 @@ async def _try_acquire_local_dispatch(
                             if active_owner is None:
                                 active_owner = first_occupied_owner
                             return (False, active_owner, _generating_count, max(1.0, lease_timeout))
+                        # Prefill-aware guard (LP-0MTJET4I5009EHNX): cap
+                        # concurrent prefills to ``parallel`` (max_local) so
+                        # the llama-server internal queue does not saturate.
+                        if _prefill_count >= max_local:
+                            active_owner = None
+                            for ek, er in srv.local_dispatch_records.items():
+                                if ek != session_key and er.get("active"):
+                                    active_owner = ek
+                                    break
+                            if active_owner is None:
+                                active_owner = first_occupied_owner
+                            return (False, active_owner, _prefill_count, max(1.0, lease_timeout))
                         # Also enforce the traditional slot-cap when no
                         # generating backing state is present (legacy).
                     else:
@@ -1233,6 +1303,13 @@ async def _try_acquire_local_dispatch(
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
                 }
+                # Register prefill hold for the prefill-aware guard.
+                try:
+                    _p = getattr(srv, "local_prefill_in_flight", None)
+                    if _p is not None:
+                        _p[session_key] = True
+                except Exception:
+                    pass
 
             return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
     except Exception:
@@ -1290,6 +1367,12 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     except Exception:
         raise
     # Free the slot registry entry
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_id and session_id in _p:
+            _p.pop(session_id, None)
+    except Exception:
+        pass
     if session_id:
         try:
             from proxy.session import _free_slot_assignment
@@ -1403,6 +1486,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                     try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and sid in _p:
+                            _p.pop(sid, None)
+                    except Exception:
+                        pass
+                    try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout",
                             sid if sid else "unknown",
@@ -1458,6 +1547,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         continue
                     # Genuinely orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
+                    try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and sid in _p:
+                            _p.pop(sid, None)
+                    except Exception:
+                        pass
                     removed += 1
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
