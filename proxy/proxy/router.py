@@ -929,6 +929,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
     await _schedule_token_increment(key, tokens_sent)
 
+    # Dispatch→first-byte capture (LP-0MTJET616005S7PN: prefill/audit latency).
+    _dispatch_start = None
+    try:
+        _dispatch_start = time.monotonic()
+    except Exception:
+        pass
+
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
 
@@ -1192,6 +1199,8 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             #   Phase 2 (between chunks): budget =
                             #     stream_idle_timeout_seconds (short).
                             _generating_slot_counted = False
+                            # Dispatch→first-byte capture uses this stable per-stream scope
+                            _first_byte_emitted = False
                             _stream_aiter = response.aiter_bytes().__aiter__()
                             _stream_iter = asyncio.ensure_future(
                                 _stream_aiter.__anext__()
@@ -1384,6 +1393,27 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     pass
 
                                 if _has_actual_data:
+                                    # Dispatch→first-byte capture: first actual data chunk marks the
+                                    # generating phase and gives the distribution-relevant latency
+                                    # without request-ID correlation (LP-0MTJET616005S7PN).
+                                    if not _first_byte_emitted:
+                                        try:
+                                            _now = time.monotonic()
+                                            _delta = (_now - _dispatch_start) if isinstance(_dispatch_start, float) else None
+                                            if _delta is not None and _delta >= 0:
+                                                srv.logger.info(
+                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f session=%s model=%s",
+                                                    _delta * 1000.0,
+                                                    _delta * 1000.0,
+                                                    session_id or "unknown",
+                                                    model_name or "unknown",
+                                                )
+                                            _first_byte_emitted = True
+                                        except Exception:
+                                            try:
+                                                _first_byte_emitted = True
+                                            except Exception:
+                                                pass
                                     remaining_budget = float(stream_idle_timeout)
                                     # First actual data chunk marks the
                                     # generating phase for the pool gate
