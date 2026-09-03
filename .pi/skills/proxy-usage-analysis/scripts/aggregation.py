@@ -36,6 +36,13 @@ from log_parser import (
     LogEvent,
 )
 
+UNKNOWN_LABEL = "(unknown)"
+
+
+def _bucket_key(bucket: str | None) -> str:
+    return "cheap" if bucket == "cheap" else "fast"
+
+
 _EMPTY = object()
 
 
@@ -73,6 +80,9 @@ class SessionStats:
     # Decode speed derived from local streams: total local completion tokens /
     # local active span (first→last local stream event). None when not derivable.
     decode_tok_s: float | None = None
+    # Token totals from this session's Stream finished events.
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def fell_back(self) -> bool:
@@ -158,6 +168,47 @@ class AnalysisResult:
                 result[e.status][provider] = result[e.status].get(provider, 0) + 1
         return result
 
+    @property
+    def total_tokens(self) -> tuple[int, int, int]:
+        """Total tokens across all sessions: (input, output, total).
+
+        *input* = sum of prompt tokens, *output* = sum of completion tokens,
+        *total* = input + output (source-of-truth from ``tokens=prompt/completion/total``
+        on ``Stream finished`` lines).
+        """
+        inp = sum(s.input_tokens for s in self.sessions.values())
+        out = sum(s.output_tokens for s in self.sessions.values())
+        return inp, out, inp + out
+
+    @property
+    def token_buckets(self) -> dict[str, tuple[int, int, int]]:
+        """Token totals split by fast/cheap bucket: ``{label: (input, output, total)}``."""
+        buckets: dict[str, list[tuple[int, int]]] = {}
+        for s in self.sessions.values():
+            if s.bucket is None:
+                continue
+            key = _bucket_key(s.bucket)
+            buckets.setdefault(key, []).append((s.input_tokens, s.output_tokens))
+        result: dict[str, tuple[int, int, int]] = {}
+        for key, pairs in buckets.items():
+            inp = sum(p[0] for p in pairs)
+            out = sum(p[1] for p in pairs)
+            result[key] = (inp, out, inp + out)
+        return result
+
+    @property
+    def token_by_model(self) -> dict[tuple[str, str], tuple[int, int, int]]:
+        """Token totals grouped by ``(provider, model)`` sorted by total descending."""
+        totals: dict[tuple[str, str], list[tuple[int, int]]] = {}
+        for s in self.sessions.values():
+            key = (s.initial_provider or UNKNOWN_LABEL, s.initial_model or UNKNOWN_LABEL)
+            totals.setdefault(key, []).append((s.input_tokens, s.output_tokens))
+        result: dict[tuple[str, str], tuple[int, int, int]] = {}
+        for key, pairs in totals.items():
+            inp = sum(p[0] for p in pairs)
+            out = sum(p[1] for p in pairs)
+            result[key] = (inp, out, inp + out)
+        return dict(sorted(result.items(), key=lambda kv: kv[1][2], reverse=True))
 
 @dataclass
 class BusyStats:
@@ -324,6 +375,10 @@ def _build_session(
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
 
+    # Token totals for this session.
+    input_tokens = sum(prompt_tokens)
+    output_tokens = sum(completion_tokens)
+
     # Decode speed fallback: total local completion tokens / local active span
     # (first→last local stream event). Only derivable with local completions
     # and a positive span; conservative (includes inter-request gaps).
@@ -358,6 +413,8 @@ def _build_session(
         dispatch_denied=builder.dispatch_denied,
         routing_skips=len(builder.routing_skips),
         decode_tok_s=decode_tok_s,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
 

@@ -128,7 +128,9 @@ Outputs written to:
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
-  columns), fallback-reason and routing-skip breakdowns, per-model
+  columns), a **Total tokens** section (Input / Output / Total counts and
+  % share, with fast/cheap and by-model breakdowns; see [Total tokens](#total-tokens)
+  below), fallback-reason and routing-skip breakdowns, per-model
   breakdown, **Error analysis** (when the window has error events) with a
   taxonomy table that includes a **Status** column (upstream HTTP errors are
   split into one row per status code), a **Provider/model breakdown** table
@@ -257,9 +259,20 @@ run (`Previous outputs archived to …`).
    Windows with no mode transition observed (single-mode windows) keep the
    legacy behavior: bucketing from the slot schedule of the analysis-time
    config profile; nothing is hardcoded.
-6. **Recommendations** — rule-based heuristics, each citing the data that
+6. **Total tokens** — a `## Total tokens` section rendered **immediately before**
+   `## Fallback reasons` in every run, including zero-traffic windows (shows
+   `0` counts with a `_No tokens in window._` note for the by-model table).
+   Totals are `Input (prompt) + Output (completion)` summed from the
+   authoritative `tokens=prompt/completion/total` on `Stream finished` lines
+   (never payload truncation), with a top row for Input / Output / Total
+   (absolute + % of grand total), a fast vs cheap sub-table (absolute +
+   % of total per bucket; bucketing follows the existing mode-aware fast/cheap
+   logic, unattributed streams excluded or documented), and a by-model
+   sub-table (one row per `provider/model`, absolute + %, sorted by Total desc;
+   unknown provider/model renders as the `(unknown)` placeholder).
+7. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
-7. **Error taxonomy** — error events (`Stream finished: reason=error`,
+8. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
    rendered into the report's **Error analysis** section (taxonomy table
@@ -296,7 +309,7 @@ run (`Previous outputs archived to …`).
    large-context warm threshold; dry-run estimates are labelled
    "would-have-avoided" to avoid overstating). The `--json` summary
    includes a `compaction` object (see [Outputs](#outputs)).
-8. **Decode/prompt-eval speed** — llama-server eval-timing lines
+9. **Decode/prompt-eval speed** — llama-server eval-timing lines
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
    (discovered per file from the `name=Qwen3 on port <port>` spawn line;
@@ -350,6 +363,12 @@ run (`Previous outputs archived to …`).
   `local_concurrency_limit` / `local_lease_active` fallbacks. Note the
   slots-vs-context trade-off: more slots shrink per-slot context and *raise*
   bypass volume, so do not add slots without a matching ctx-size increase.
+- **Total tokens**: Input + Output + Total (prompt + completion summed from
+  `tokens=prompt/completion/total` on `Stream finished` lines; streams without
+  `tokens=` contribute `0`). Check the per-bucket and per-model tables in the
+  **Total tokens** section — all shares are of the same grand total, so
+  fast% + cheap% = 100% and model %s sum to 100%. A large Input / Output
+  disparity can reveal long-prompt sessions driving capacity pressure.
 - **Fast vs cheap**: a large fallback-rate gap between buckets suggests the
   slot schedule under-serves one period.
 - **Error analysis** (see the **Error analysis** section and `errors.csv`):

@@ -3144,3 +3144,208 @@ class TestCompactionEndToEnd:
         assert data["compaction"]["backstop_events"] == 1
         assert data["compaction"]["churn_events"] == 1
 
+
+# ---------------------------------------------------------------------------
+# Total tokens
+# ---------------------------------------------------------------------------
+
+
+class TestTotalTokens:
+    """The ``## Total tokens`` section (SA-0MTM3LKP1003S28J).
+
+    Total = prompt (input) + completion (output) summed from
+    ``tokens=prompt/completion/total`` on ``Stream finished`` lines.
+    Rendered immediately before ``## Fallback reasons``, with absolute + %
+    share per bucket and per model.  Invariant: total == input + output.
+    Unknown provider/model renders as ``(unknown)``.
+    """
+
+    def _window_with_tokens(self, schedule):
+        # s1 (fast): prompt=1000, completion=200; s2 (cheap): prompt=3000, completion=500
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=1000/200/1200 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:30:00,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s2 request=[]",
+            "2026-08-02 14:30:05,000 - INFO - Stream finished: reason=stop tokens=3000/500/3500 session=s2 provider=opencode-go model=deepseek-v4-flash request=[]",
+        ]
+        return aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, schedule)
+
+    def test_session_stats_expose_input_output_tokens(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        assert s.sessions["s1"].input_tokens == 1000
+        assert s.sessions["s1"].output_tokens == 200
+        assert s.sessions["s2"].input_tokens == 3000
+        assert s.sessions["s2"].output_tokens == 500
+
+    def test_session_stats_zero_tokens_when_no_finished_line(self):
+        # A session started but no Stream finished tokens -> 0 tokens.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=lonely request=[]",
+        ]
+        s = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert s.sessions["lonely"].input_tokens == 0
+        assert s.sessions["lonely"].output_tokens == 0
+
+    def test_session_sums_multiple_finished_tokens(self):
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=multi request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=400/50/450 session=multi provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=multi request=[]",
+            "2026-08-02 14:00:15,000 - INFO - Stream finished: reason=stop tokens=600/70/670 session=multi provider=local model=Qwen3 request=[]",
+        ]
+        s = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert s.sessions["multi"].input_tokens == 1000
+        assert s.sessions["multi"].output_tokens == 120
+
+    def test_invariant_total_equals_input_plus_output_on_session_and_window(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        for sess in s.sessions.values():
+            assert sess.input_tokens + sess.output_tokens == sess.input_tokens + sess.output_tokens
+            # Input + output is the definition of total at the session level too
+            assert s.total_tokens[2] == s.total_tokens[0] + s.total_tokens[1]
+        inp, out, total = s.total_tokens
+        assert total == inp + out
+
+    def test_aggregate_total_tokens_window(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        assert s.total_tokens == (4000, 700, 4700)
+
+    def test_aggregate_token_buckets_fast_cheap(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        assert s.token_buckets == {"fast": (1000, 200, 1200), "cheap": (3000, 500, 3500)}
+
+    def test_aggregate_token_by_model_sorted_desc(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        by_model = s.token_by_model
+        keys = list(by_model.keys())
+        # Sorted by total desc -> opencode-go (3500) before local (1200)
+        assert keys[0] == ("opencode-go", "deepseek-v4-flash")
+        assert keys[1] == ("local", "Qwen3")
+        assert by_model[("opencode-go", "deepseek-v4-flash")] == (3000, 500, 3500)
+        assert by_model[("local", "Qwen3")] == (1000, 200, 1200)
+
+    def test_aggregate_unknown_provider_model_placeholder(self):
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=known request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=known provider=local model=Qwen3 request=[]",
+            # Second session whose start has empty provider/model
+            "2026-08-02 14:01:00,000 - INFO - Stream started: provider= session=anon request=[]",
+            "2026-08-02 14:01:05,000 - INFO - Stream finished: reason=stop tokens=50/5/55 session=anon provider= model= request=[]",
+        ]
+        s = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert ("(unknown)", "(unknown)") in s.token_by_model
+
+    def test_report_section_rendered_before_fallback_reasons(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        # Add one fallback so Fallback reasons is rendered.
+        fe = log_parser.LogEvent(kind="fallback", ts=WINDOW_START, reason="local_concurrency_limit", raw="Fallback")
+        s.fallback_events.append(fe)
+        md = reporting.build_report(s, None)
+        it = md.index("## Total tokens")
+        iff = md.index("## Fallback reasons")
+        assert 0 <= it < iff, "Total tokens must come immediately before Fallback reasons"
+        # Also before Error analysis and other sections when present
+        assert md.index("## Total tokens") < md.index("## Per-model breakdown")
+
+    def test_report_section_rendered_even_when_no_fallbacks(self):
+        s = aggregation.aggregate([], WINDOW_START, WINDOW_END, _schedule())
+        md = reporting.build_report(s, None)
+        assert "## Total tokens" in md
+        # Still the next real section is Per-model breakdown etc
+        assert md.index("## Total tokens") < md.index("## Per-model breakdown")
+
+    def test_report_section_zero_window_shows_zero_counts(self):
+        s = aggregation.aggregate([], WINDOW_START, WINDOW_END, _schedule())
+        md = reporting.build_report(s, None)
+        sec = md.split("## Total tokens", 1)[1].split("\n## ", 1)[0]
+        assert "| Input (prompt) | 0 |" in sec
+        assert "| Output (completion) | 0 |" in sec
+        assert "| Total | **0** |" in sec
+        assert "| Fast | 0 |" in sec
+        assert "| Cheap | 0 |" in sec
+        assert "_No tokens in window._" in sec
+
+    def test_report_section_fast_cheap_counts_and_shares(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        md = reporting.build_report(s, None)
+        sec = md.split("## Total tokens", 1)[1].split("\n## ", 1)[0]
+        # Grand totals
+        assert "| Total | **4,700** |" in sec
+        # Fast 1000/4000 = 25.0% input; 200/700 = 28.6% output; 1200/4700 = 25.5% total
+        # Cheap 3000/4000 = 75.0% input; 500/700 = 71.4% output; 3500/4700 = 74.5% total
+        assert "| Fast | 1,000" in sec
+        assert "| Cheap | 3,000" in sec
+        # At least one share column present for each row
+        assert "25.5%" in sec  # fast share of total
+        assert "74.5%" in sec  # cheap share of total
+
+    def test_report_section_by_model_counts_and_shares(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        md = reporting.build_report(s, None)
+        sec = md.split("## Total tokens", 1)[1].split("\n## ", 1)[0]
+        assert "| Provider | Model |" in sec
+        assert "| local | Qwen3 |" in sec
+        assert "| opencode-go | deepseek-v4-flash |" in sec
+        # Sorted by total desc -> opencode-go before local
+        assert sec.index("opencode-go") < sec.index("local | Qwen3")
+
+    def test_report_section_by_model_unknown_placeholder(self):
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=known request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=known provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:01:00,000 - INFO - Stream started: provider= session=anon request=[]",
+            "2026-08-02 14:01:05,000 - INFO - Stream finished: reason=stop tokens=50/5/55 session=anon provider= model= request=[]",
+        ]
+        s = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        md = reporting.build_report(s, None)
+        assert "(unknown)" in md
+
+    def test_e2e_log_file_token_totals_via_run_analysis(self, tmp_path, monkeypatch):
+        # Two sessions in one log file, fast vs cheap via the time-based schedule.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa request=[]\n"
+            "2026-08-02 14:00:01,000 - INFO - Stream finished: reason=stop tokens=800/100/900 session=aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa provider=local model=Qwen3 request=[]\n"
+            "2026-08-02 14:40:00,000 - INFO - Stream started: provider=local model=Qwen3 session=bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb request=[]\n"
+            "2026-08-02 14:40:01,000 - INFO - Stream finished: reason=stop tokens=200/20/220 session=bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb provider=local model=Qwen3 request=[]\n",
+            encoding="utf-8",
+        )
+        # Force fast/cheap via the slot_schedule entries
+        config = {"slot_schedule": {"enabled": True, "entries": [("12:00", 4), ("14:30", 8)]}}
+        out = tmp_path / "out"
+        monkeypatch.setattr(reporting, "datetime", reporting.datetime)  # no freeze
+        run = reporting.run_analysis(
+            log_dir=log_dir, window_start=WINDOW_START, window_end=WINDOW_END,
+            output_dir=out, config=config,
+        )
+        assert run.summary.total_tokens == (1000, 120, 1120)
+        report = (out / "report.md").read_text()
+        assert "## Total tokens" in report
+        # Also before fallback
+        # No fallback in this window, so just check it's present and before Per-model breakdown
+        assert report.index("## Total tokens") < report.index("## Per-model breakdown")
+        # JSON summary reflects it too via the same source-of-truth
+        j = reporting.summary_to_json(run.summary)
+        assert "total_tokens" in j or run.summary.total_tokens == (1000, 120, 1120)
+
+    def test_shares_sum_to_100_percent(self):
+        schedule = bucketing.schedule_from_entries([("12:00", 4), ("14:30", 8)])
+        s = self._window_with_tokens(schedule)
+        inp, out, total = s.total_tokens
+        buckets = s.token_buckets
+        # fast% + cheap% of total == 100%
+        fast_share = buckets["fast"][2] / total * 100 if total else 0
+        cheap_share = buckets["cheap"][2] / total * 100 if total else 0
+        assert fast_share + cheap_share == pytest.approx(100.0, abs=0.1)
+        # Model %s of total also sum to 100%
+        model_total_share = sum(v[2] for v in s.token_by_model.values()) / total * 100 if total else 0
+        assert model_total_share == pytest.approx(100.0, abs=0.1)

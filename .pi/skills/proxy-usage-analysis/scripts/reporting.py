@@ -370,6 +370,8 @@ def build_report(
     ap(f"| Avg max context | {total_avg} | {fast_avg} | {cheap_avg} |")
     ap(f"| Highest context | {total_max} | {fast_max} | {cheap_max} |")
 
+    _append_total_tokens_section(ap, summary)
+
     if summary.fallback_reason_counts:
         ap("")
         ap("## Fallback reasons")
@@ -907,6 +909,78 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
        "follows the slot schedule.")
+
+
+def _fmt_tokens(n: int) -> str:
+    """Format a token count with comma separators."""
+    return f"{n:,}"
+
+
+def _append_total_tokens_section(ap, summary) -> None:
+    """Render the ``## Total tokens`` section immediately before fallback reasons.
+
+    Shows Total (Input + Output = Total) with fast/cheap and by-model
+    breakdowns, each with absolute + % share.  Shares are of the grand total
+    (``input + output``) so fast% + cheap% = 100% and model %s sum to 100%.
+    Rendered every run including zero-traffic windows (``0`` / ``100.0%``
+    are well-defined for an empty window and ``_pct`` guards zero division).
+    Token totals are summed from authoritative ``tokens=prompt/completion/total``
+    on ``Stream finished`` lines (never payload truncation).  Model unknown
+    renders as the ``(unknown)`` placeholder from ``aggregation.UNKNOWN_LABEL``.
+    """
+    grand_input, grand_output, grand_total = summary.total_tokens
+    buckets = summary.token_buckets
+    fast = buckets.get("fast")
+    cheap = buckets.get("cheap")
+    # Missing buckets (empty window, single-bucket window) are treated as 0.
+    fast_in, fast_out, fast_total = fast if fast is not None else (0, 0, 0)
+    cheap_in, cheap_out, cheap_total = cheap if cheap is not None else (0, 0, 0)
+    ap("")
+    ap("## Total tokens")
+    ap("")
+    ap("Total = prompt (input) + completion (output) summed from authoritative "
+       "``tokens=prompt/completion/total`` on ``Stream finished`` lines.  "
+       "Input = sum(prompt), Output = sum(completion), Total = Input + Output.  "
+       "Shares are of the grand Total Tokens, so fast% + cheap% = 100% and model "
+       "%s sum to 100%.  Streams without ``tokens=`` contribute ``0``; sessions "
+       "without a bucket (unattributed) are excluded from the bucket share.")
+    ap("")
+    ap("| Kind | Count | % of total |")
+    ap("|---|---|---|")
+    ap(f"| Input (prompt) | {_fmt_tokens(grand_input)} | {_pct(grand_input, grand_total):.1f}% |")
+    ap(f"| Output (completion) | {_fmt_tokens(grand_output)} | {_pct(grand_output, grand_total):.1f}% |")
+    ap(f"| Total | **{_fmt_tokens(grand_total)}** | 100.0% |")
+    ap("")
+    ap("### Tokens — fast vs cheap")
+    ap("")
+    ap("Bucketing follows the existing mode-aware fast/cheap logic (mode timeline / "
+       "slot schedule keyed by session start; unattributed streams are excluded from "
+       "the share).")
+    ap("")
+    ap("| Bucket | Input | % input | Output | % output | Total | % total |")
+    ap("|---|---|---|---|---|---|---|")
+    ap(f"| Fast | {_fmt_tokens(fast_in)} | {_pct(fast_in, grand_input):.1f}% | "
+       f"{_fmt_tokens(fast_out)} | {_pct(fast_out, grand_output):.1f}% | "
+       f"{_fmt_tokens(fast_total)} | {_pct(fast_total, grand_total):.1f}% |")
+    ap(f"| Cheap | {_fmt_tokens(cheap_in)} | {_pct(cheap_in, grand_input):.1f}% | "
+       f"{_fmt_tokens(cheap_out)} | {_pct(cheap_out, grand_output):.1f}% | "
+       f"{_fmt_tokens(cheap_total)} | {_pct(cheap_total, grand_total):.1f}% |")
+    ap("")
+    ap("### Tokens — by model")
+    ap("")
+    ap("Grouped by the session's initial ``(provider, model)`` (same grouping as "
+       "the Per-model breakdown), sorted by Total desc; unknown provider/model "
+       "render as the placeholder ``(unknown)``.")
+    ap("")
+    if grand_total == 0:
+        ap("_No tokens in window._")
+    else:
+        ap("| Provider | Model | Input | % input | Output | % output | Total | % total |")
+        ap("|---|---|---|---|---|---|---|---|")
+        for (provider, model), (inp, out, total) in summary.token_by_model.items():
+            ap(f"| {provider} | {model} | {_fmt_tokens(inp)} | {_pct(inp, grand_input):.1f}% | "
+               f"{_fmt_tokens(out)} | {_pct(out, grand_output):.1f}% | "
+               f"{_fmt_tokens(total)} | {_pct(total, grand_total):.1f}% |")
 
 
 def _pct(part: int, total: int) -> float:
