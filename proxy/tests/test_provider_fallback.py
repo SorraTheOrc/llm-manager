@@ -1129,7 +1129,7 @@ async def test_local_slot_exhaustion_retry_prefers_local_before_remote(mixed_mod
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -1193,7 +1193,7 @@ async def test_local_503_retry_prefers_local_before_remote(mixed_model_config):
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -1246,7 +1246,7 @@ async def test_local_http_exception_503_retry_prefers_local_before_remote(mixed_
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -1295,7 +1295,7 @@ async def test_local_empty_200_retry_prefers_local_before_remote(mixed_model_con
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -4359,3 +4359,138 @@ async def test_proxy_with_fallback_all_time_window_skipped_distinguishable_503()
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
     )
+
+# ===================================================================
+# Additional 2-retry tests (LP-0MSORQKKM005MJ31)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_local_slot_exhaustion_retry_two_retries_succeeds_on_third(
+    mixed_model_config,
+):
+    """With local_slot_exhaustion_retry_attempts=2, first two calls fail
+    with slot exhaustion but the third succeeds locally (no remote fallback).
+
+    This exercises the full retry budget: initial attempt + 2 grace retries.
+    """
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 2,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        from fastapi.responses import JSONResponse
+        if local_calls <= 2:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "server_busy",
+                        "code": "no_slots_available",
+                        "message": "Model server busy: 0/3 slots available.",
+                    },
+                    "status": 503,
+                    "retry_after": 5,
+                    "total_slots": 3,
+                    "available_slots": 0,
+                },
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_calls == 3, "Expected initial + 2 retries = 3 local calls"
+    assert not remote_called, "Should NOT fall back to remote when third attempt succeeds"
+
+
+@pytest.mark.asyncio
+async def test_local_slot_exhaustion_persistent_falls_back_after_two_retries(
+    mixed_model_config,
+):
+    """With local_slot_exhaustion_retry_attempts=2, when all 3 attempts
+    (initial + 2 retries) report slot exhaustion, the request falls back
+    to the remote provider.
+    """
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 2,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        from fastapi.responses import JSONResponse
+        # All 3 calls report slot exhaustion
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": "Model server busy: 0/3 slots available.",
+                },
+                "status": 503,
+                "retry_after": 5,
+                "total_slots": 3,
+                "available_slots": 0,
+            },
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert local_calls == 3, "Expected initial + 2 retries = 3 local calls before fallback"
+    assert remote_called, "Should fall back to remote after all retries exhausted"
