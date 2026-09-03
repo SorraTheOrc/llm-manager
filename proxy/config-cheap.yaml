@@ -571,17 +571,13 @@ server:
   # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
   local_large_context_warm_cache_threshold: 100000
 
-  # Hard local-routing cap ratio (LP-0MTBOX45O005LD1S, operator-approved
-  # 2026-08-27): cheap mode returns a 429 compaction-gate response above the
-  # resolved cap (never a silent remote). The ratio is expressed against the
-  # effective warm/routing clamp min(warm_cache_threshold, per_slot - 4096)
-  # (decision #4):
-  #   61440 / 100000 = 0.6144 (2 slots x 262144 ctx → per-slot clamp
-  #   min(100000, 262144//2 - 4096 = 126976) = 100000)
-  #   → resolved cap = round(0.6144 x 100000) = 61440 EXACT
-  # 0 (or absent) disables the cap. The cap rescales automatically when
-  # slot_schedule changes (``compute_hard_routing_cap`` is schedule-aware).
-  local_hard_routing_cap_ratio_cheap: 0.6144
+  # Hard local-routing cap ratio — DISABLED (LP-0MTLB1LK80098R43 revert of
+  # LP-0MTBOX45O005LD1S; 2026-09-03: follows LP-0MTBTCK2I005MOTE verdict
+  # NOT EFFECTIVE — caps too restrictive). 0 = dynamic per-slot clamp
+  # (provider.py effective_per_slot_threshold: 262144//slots - 4096
+  # → 83285 fast / 126976 cheap, warm 100000 caps). Rollback: restore
+  # 0.6144 for 61440 cheap cap (61440/100000) and 0.84049 for 70000 fast.
+  local_hard_routing_cap_ratio_cheap: 0
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]

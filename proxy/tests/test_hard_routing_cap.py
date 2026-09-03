@@ -271,45 +271,45 @@ class TestHardCapRatioResolution:
 
 
 class TestRealConfigRatioResolution:
-    """AC5: the shipped config files carry the ratios and resolve correctly."""
+    """AC5: shipped configs DISABLE the hard cap (LP-0MTLB1LK80098R43 revert of
+    LP-0MTBOX45O005LD1S per LP-0MTBTCK2I005MOTE NOT EFFECTIVE): ratio 0 = dynamic
+    per-slot clamp (83285 fast / min(100000,126976)=100000 cheap)."""
 
     def test_fast_yaml_ratio_and_resolution(self, provider_mod, real_config, patch_scheduler):
         fast = real_config["fast"]
         server = fast.get("server", fast)
-        assert server.get("local_hard_routing_cap_ratio_fast") == 0.84049
-        # Derived persistence (AC4): static 83285 replaced by the derived 0.
+        # Hard-routing cap DISABLED (LP-0MTLB1LK80098R43): 0 = per-slot clamp.
+        assert server.get("local_hard_routing_cap_ratio_fast") == 0
         assert server.get("session_slot_max_prompt_tokens") == 0
         patch_scheduler(262144, 3)
         cap = provider_mod.compute_hard_routing_cap("fast", server)
-        assert cap == 70000
+        assert cap == 0
 
     def test_cheap_yaml_ratio_and_resolution(self, provider_mod, real_config, patch_scheduler):
         cheap = real_config["cheap"]
         server = cheap.get("server", cheap)
-        assert server.get("local_hard_routing_cap_ratio_cheap") == 0.6144
+        assert server.get("local_hard_routing_cap_ratio_cheap") == 0
         assert server.get("session_slot_max_prompt_tokens") == 0
-        # Live cheap schedule pairs: 2 × 262144.
+        # Live cheap schedule pairs: 2 × 262144 — but cap disabled so 0.
         patch_scheduler(262144, 2)
         cap = provider_mod.compute_hard_routing_cap("cheap", server)
-        assert cap == 61440
+        assert cap == 0
 
     def test_base_yaml_uses_fast_ratio(self, provider_mod, real_config, patch_scheduler):
         base = real_config["base"]
         server = base.get("server", base)
-        assert server.get("local_hard_routing_cap_ratio_fast") == 0.84049
+        assert server.get("local_hard_routing_cap_ratio_fast") == 0
         assert server.get("local_hard_routing_cap_ratio_cheap") in (None, 0)
         patch_scheduler(262144, 3)
         cap = provider_mod.compute_hard_routing_cap("fast", server)
-        assert cap == 70000
+        assert cap == 0
 
     def test_cheap_boot_static_is_conservative(self, provider_mod, real_config):
-        """Boot-static cheap fallback (131072 ctx, no scheduler) is < approved
-        cap and > 0 — the accepted transient state (docstring note)."""
+        """Boot-static cheap cap is also DISABLED (0) in the revert."""
         cheap = real_config["cheap"]
         server = cheap.get("server", cheap)
         cap = provider_mod.compute_hard_routing_cap("cheap", server)
-        assert cap > 0
-        assert cap < 61440
+        assert cap == 0
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +641,9 @@ class TestWarmClampToHardCap:
     ``context_too_large`` fires at the SAME cap as persistence."""
 
     def test_warm_clamps_to_hard_cap(self, provider_mod, patch_scheduler, monkeypatch):
+        # Hard-routing cap still enforces a clamp when configured via test fixture
+        # (0.84049 → 70000) — the live configs disable it, so warm falls back
+        # to the per-slot clamp (83285). This test verifies the mechanism.
         import proxy.mode as mode_mod
 
         monkeypatch.setattr(mode_mod, "read_mode", lambda: "fast")

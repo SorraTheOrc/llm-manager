@@ -404,9 +404,9 @@ class TestLiveConfigsValidate:
         assert problems == [], f"{config_file}: {problems}"
 
     def test_fast_mode_cold_below_warm(self, monkeypatch):
-        """Fast mode: cold 38000 < effective warm hard-cap clamp 70000
-        (3x262144 → per-slot 83285; AC4 clamps warm to the hard-routing
-        cap round(0.84049 × 83285) = 70000, LP-0MTBOX45O005LD1S)."""
+        """Fast mode: cold 38000 < effective warm per-slot clamp 83285
+        (3x262144 → per-slot 83285; hard-routing cap DISABLED per
+        LP-0MTLB1LK80098R43, warm = min(100000, 83285) = 83285)."""
         import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
 
@@ -421,11 +421,11 @@ class TestLiveConfigsValidate:
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config-fast.yaml"))
         assert cold == 38000
-        assert warm == 70000
+        assert warm == 83285
         assert cold < warm
 
     def test_default_mode_cold_below_warm(self, monkeypatch):
-        """Default profile (config.yaml) mirrors fast: cold 38000 < 70000."""
+        """Default profile (config.yaml) mirrors fast: cold 38000 < 83285."""
         import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
 
@@ -440,13 +440,13 @@ class TestLiveConfigsValidate:
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 70000
+        assert warm == 83285
         assert cold < warm
 
     def test_cheap_mode_cold_below_warm(self, monkeypatch):
-        """Cheap mode: cold 42000 < effective warm (scheduled 2×262144 →
-        per-slot clamp 126976; AC4 clamps warm to the hard-routing cap
-        round(0.6144 × min(100000, 126976)) = 61440)."""
+        """Cheap mode: cold 42000 < effective warm per-slot clamp 100000
+        (scheduled 2×262144 → per-slot 126976; hard-routing cap
+        DISABLED per LP-0MTLB1LK80098R43, warm = min(100000, 126976) = 100000)."""
         import proxy.mode as mode_mod
         import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
@@ -463,15 +463,14 @@ class TestLiveConfigsValidate:
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
         assert cold == 42000
-        assert warm == 61440
+        assert warm == 100000
         assert cold < warm
 
     def test_cheap_mode_scheduled_warm_resolves_100000(self, monkeypatch):
         """Cheap mode with the live schedule active (2 slots × 262144):
-        warm resolves to 61440 — the AC4 hard-cap clamp
-        (LP-0MTBOX45O005LD1S), superseding the pre-cap 100000 value
-        (LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00 band was (42000, 100000]
-        before the hard cap; now (42000, 61440])."""
+        warm resolves to 100000 — the per-slot clamp
+        (hard-routing cap DISABLED per LP-0MTLB1LK80098R43;
+        min(100000, 126976) = 100000; band (42000, 100000])."""
         import proxy.mode as mode_mod
         import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
@@ -488,21 +487,18 @@ class TestLiveConfigsValidate:
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
         assert cold == 42000
-        assert warm == 61440
+        assert warm == 100000
         assert cold < warm
 
 
 class TestLiveConfigPersistenceCap:
-    """The persistence cap (``session_slot_max_prompt_tokens``) derives from
-    the hard-routing cap in every live profile (LP-0MTBOX45O005LD1S AC4)
-    as the single source.
-
-    Static value 0 = derive; session.py ``_build_slot_context`` resolves the
-    mode-aware hard cap (``compute_hard_routing_cap``) when configured,
-    otherwise falls back to the per-slot routing clamp
-    (LP-0MSEGPO77005CYCQ F3). Cap == routing cap means every context admitted
-    for slot save/restore also fits the routing clamp — no dead-band where
-    persistence is attempted for contexts the router would never send local.
+    """The persistence cap (``session_slot_max_prompt_tokens``) is derived
+    from the hard-routing cap when enabled (LP-0MTBOX45O005LD1S AC4) and
+    DISABLED otherwise (LP-0MTLB1LK80098R43 revert of LP-0MTBOX45O005LD1S
+    per LP-0MTBTCK2I005MOTE NOT EFFECTIVE verdict: 0 = dynamic per-slot
+    clamp). With the cap disabled, session.py ``_build_slot_context``
+    falls back to the per-slot routing clamp (LP-0MSEGPO77005CYCQ F3) so
+    persistence is only attempted for contexts the router can dispatch.
     """
 
     def _load(self, name: str) -> dict:
@@ -513,27 +509,19 @@ class TestLiveConfigPersistenceCap:
             return yaml.safe_load(fh)
 
     @pytest.mark.parametrize(
-        "config_file,active_ctx,active_slots,mode,ratio_key,expected_cap",
+        "config_file,mode,ratio_key",
         [
-            # Fast/default: 3-slot schedule @ ctx 262144 → clamp 83285;
-            # hard cap = round(0.84049 × 83285) = 70000.
-            ("config.yaml", 262144, 3, "fast",
-             "local_hard_routing_cap_ratio_fast", 70000),
-            ("config-fast.yaml", 262144, 3, "fast",
-             "local_hard_routing_cap_ratio_fast", 70000),
-            # Cheap: 2-slot schedule, per-period ctx_size 262144 override
-            # → clamp 126976; hard cap = round(0.6144 × 100000) = 61440.
-            ("config-cheap.yaml", 262144, 2, "cheap",
-             "local_hard_routing_cap_ratio_cheap", 61440),
+            ("config.yaml", "fast", "local_hard_routing_cap_ratio_fast"),
+            ("config-fast.yaml", "fast", "local_hard_routing_cap_ratio_fast"),
+            ("config-cheap.yaml", "cheap", "local_hard_routing_cap_ratio_cheap"),
         ],
     )
     def test_persistence_cap_derives_from_hard_cap(
-        self, config_file, active_ctx, active_slots, mode, ratio_key, expected_cap,
-        monkeypatch,
+        self, config_file, mode, ratio_key, monkeypatch,
     ):
-        """Static value 0 (derive); the resolved cap equals the hard-routing
-        cap for the profile's active (ctx, slots) shape — no dead-band, no
-        drift, single source (AC4)."""
+        """Hard-routing cap DISABLED (LP-0MTLB1LK80098R43 revert): ratio is 0
+        so ``compute_hard_routing_cap`` returns 0 and persistence falls back
+        to the per-slot routing clamp (no dead-band via session.py F3)."""
         import proxy.mode as mode_mod
         import proxy.server as srv_mod
         from proxy.provider import compute_hard_routing_cap
@@ -543,8 +531,8 @@ class TestLiveConfigPersistenceCap:
             "S",
             (),
             {
-                "get_active_ctx_size": lambda self, now=None: active_ctx,
-                "get_active_slot": lambda self, now=None: active_slots,
+                "get_active_ctx_size": lambda self, now=None: 262144,
+                "get_active_slot": lambda self, now=None: 3 if mode == "fast" else 2,
             },
         )()
         monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
@@ -554,12 +542,10 @@ class TestLiveConfigPersistenceCap:
         static = server_cfg.get("session_slot_max_prompt_tokens", 0)
         assert static == 0, f"{config_file}: expected derived (0), got {static}"
         ratio = server_cfg.get(ratio_key, 0)
-        assert ratio > 0, f"{config_file}: {ratio_key} must be configured"
+        assert ratio == 0, f"{config_file}: {ratio_key} must be disabled (0), got {ratio}"
         derived = compute_hard_routing_cap(mode, server_cfg)
-        assert derived == expected_cap, (
-            f"{config_file}: derived cap {derived} != {expected_cap} "
-            f"(ratio {ratio} × clamp {active_ctx}//{active_slots} - 4096 "
-            f"capped by warm)"
+        assert derived == 0, (
+            f"{config_file}: derived cap must be 0 when disabled, got {derived}"
         )
 
     @pytest.mark.parametrize(

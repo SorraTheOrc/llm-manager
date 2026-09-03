@@ -306,8 +306,9 @@ class TestCheapConfigProfile:
         # (derive) in both.
         cheap_srv.pop("session_slot_max_prompt_tokens", None)
         fast_srv.pop("session_slot_max_prompt_tokens", None)
-        # Hard-routing-cap ratios (LP-0MTBOX45O005LD1S AC5): each mode
-        # declares its own ratio key (cheap 0.6144, fast 0.84049).
+        # Hard-routing-cap ratios DISABLED at 0 (LP-0MTLB1LK80098R43
+        # revert of LP-0MTBOX45O005LD1S — each mode declares its own ratio
+        # key now set to 0, so they match after pop for equality check).
         cheap_srv.pop("local_hard_routing_cap_ratio_cheap", None)
         fast_srv.pop("local_hard_routing_cap_ratio_fast", None)
         assert cheap_srv == fast_srv
@@ -330,13 +331,15 @@ class TestCheapConfigProfile:
         assert fast["server"]["contention_queue_policy"] == "fallback"
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
         # Per-mode persistence caps derive from each profile's hard-routing
-        # cap (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4): static 0 =
-        # derive from mode-aware cap at runtime.
+        # cap when enabled (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4)
+        # but the cap is DISABLED in the revert (LP-0MTLB1LK80098R43 per
+        # LP-0MTBTCK2I005MOTE NOT EFFECTIVE verdict): static 0 and hard cap 0.
         assert cheap["server"]["session_slot_max_prompt_tokens"] == 0
         assert fast["server"]["session_slot_max_prompt_tokens"] == 0
-        # Per-mode hard-routing-cap ratios (LP-0MTBOX45O005LD1S AC5).
-        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0.6144
-        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0.84049
+        # Per-mode hard-routing-cap ratios DISABLED (LP-0MTLB1LK80098R43
+        # revert of LP-0MTBOX45O005LD1S): 0 = dynamic per-slot clamp.
+        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0
+        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0
         assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 

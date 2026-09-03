@@ -26,13 +26,16 @@ def _body_for_tokens(n: int) -> dict:
 
 
 def _make_config(**overrides):
+    # Hard-routing caps DISABLED (LP-0MTLB1LK80098R43 revert of
+    # LP-0MTBOX45O005LD1S per LP-0MTBTCK2I005MOTE NOT EFFECTIVE): 0 = dynamic
+    # per-slot clamp, so persistence pins to 83285 / 126976.
     cfg = {
         "session_slot_save_path": "/tmp/slot-cache",
         "session_slot_pool_size": 3,
         "local_model_ctx_size": 262144,
         "session_slot_max_prompt_tokens": 0,
-        "local_hard_routing_cap_ratio_fast": 0.84049,
-        "local_hard_routing_cap_ratio_cheap": 0.6144,
+        "local_hard_routing_cap_ratio_fast": 0,
+        "local_hard_routing_cap_ratio_cheap": 0,
         "warm_cache_threshold": 100000,
     }
     cfg.update(overrides)
