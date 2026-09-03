@@ -237,3 +237,76 @@ def test_index_handler_injects_model_endpoint_data():
     assert test_data[2]["name"] == "model-c"
     assert test_data[2]["type"] == "local"
     assert test_data[2]["providers"][0]["endpoint"] == "gemma4"
+
+
+def test_build_home_model_rows_exposes_active_times_and_status_cells():
+    """Home tab Model Endpoints rows include Active Times / Status cells."""
+    from unittest.mock import MagicMock
+
+    from proxy.ui import _build_home_model_rows
+
+    srv = MagicMock()
+    srv.config = {
+        "models": {
+            "my-model": {
+                "providers": [
+                    {"name": "p", "type": "local", "llama_model": "qwen3"},
+                ],
+            },
+        },
+    }
+    html = _build_home_model_rows(srv)
+    assert "Always" in html
+    assert "badge-active" in html or "badge-inactive" in html
+
+
+def test_build_home_model_rows_restricted_displays_windows():
+    """Restricted providers show their available_times window string with (UTC)."""
+    from unittest.mock import MagicMock
+
+    from proxy.ui import _build_home_model_rows
+
+    srv = MagicMock()
+    srv.config = {
+        "models": {
+            "my-model": {
+                "providers": [
+                    {
+                        "name": "p",
+                        "type": "remote",
+                        "endpoint": "https://x.example",
+                        "available_times": ["00:00-01:00", "04:00-06:00", "10:00-00:00"],
+                    },
+                ],
+            },
+        },
+    }
+    html = _build_home_model_rows(srv)
+    assert "00:00-01:00, 04:00-06:00, 10:00-00:00 (UTC)" in html
+
+
+def test_build_home_model_rows_uses_shared_window_helpers():
+    """Rows delegate to the shared provider display helpers (single source of truth)."""
+    from unittest.mock import MagicMock, patch
+
+    from proxy.ui import _build_home_model_rows
+
+    srv = MagicMock()
+    srv.config = {
+        "models": {
+            "my-model": {
+                "providers": [
+                    {"name": "p", "type": "local", "llama_model": "qwen3"},
+                ],
+            },
+        },
+    }
+    with (
+        patch("proxy.ui.format_available_times", return_value="Always") as mock_times,
+        patch("proxy.ui.format_active_status", return_value="Active") as mock_status,
+    ):
+        html = _build_home_model_rows(srv)
+        assert mock_times.called
+        assert mock_status.called
+        assert "Always" in html
+        assert "badge-active" in html

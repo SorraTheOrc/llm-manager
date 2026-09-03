@@ -1665,6 +1665,36 @@ def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     return result
 
 
+def format_available_times(provider_cfg: dict) -> str:
+    """Format a provider's ``available_times`` for display.
+
+    Returns a human-readable string of ``"HH:MM-HH:MM"`` windows in config
+    order with a ``(UTC)`` suffix, or ``"Always"`` when the provider is
+    unrestricted (no ``available_times`` or all entries malformed).
+    """
+    windows = _parse_available_times(provider_cfg)
+    if windows is None:
+        return "Always"
+    parts = []
+    for start_min, end_min in windows:
+        sh, sm = divmod(start_min, 60)
+        eh, em = divmod(end_min, 60)
+        parts.append(f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}")
+    return ", ".join(parts) + " (UTC)"
+
+
+def format_active_status(provider_cfg: dict, now_utc: datetime | None = None) -> str:
+    """Format a provider's active status for display.
+
+    Returns ``"Active"`` when the provider is within its allowed window (or
+    unrestricted), ``"Inactive"`` otherwise. Uses the same UTC window
+    semantics as routing (start-inclusive, end-exclusive, overnight wrap).
+    """
+    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+        return "Active"
+    return "Inactive"
+
+
 def _parse_retry_after(response: Response) -> float | None:
     """Parse Retry-After header from a response.
 
