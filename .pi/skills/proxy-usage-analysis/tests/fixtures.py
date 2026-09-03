@@ -343,7 +343,6 @@ server:
   local_large_context_cold_cache_threshold: 60000
   local_large_context_warm_cache_threshold: 100000
   local_model_ctx_size: 262144
-  local_max_concurrent_queries: 1
   local_dispatch_lease_timeout_seconds: 60
   session_single_flight_mode: queue
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
