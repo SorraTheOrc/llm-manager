@@ -18,8 +18,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import proxy.session as sess
+import pytest
 from proxy.router_helpers import _cleanup_stale_local_dispatch
 
 pytestmark = pytest.mark.asyncio
@@ -76,7 +76,7 @@ class TestSessionSlotAffinityContinuity:
         async def fake_query(*args, **kwargs):
             return False
 
-        monkey = pytest.importorskip("pytest")
+        pytest.importorskip("pytest")
         from unittest.mock import patch
 
         with patch("proxy.router_helpers._query_slot_processing", side_effect=fake_query):

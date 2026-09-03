@@ -9,17 +9,15 @@ The render tests assert the new Active Times / Status cells appear per
 provider row (including fallback chains with ``rowspan``).
 """
 
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import pytest
-
 from proxy.provider import format_active_status, format_available_times
-
 
 # ---------------------------------------------------------------------------
 # format_available_times

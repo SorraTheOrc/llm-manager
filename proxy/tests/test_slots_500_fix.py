@@ -26,14 +26,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import proxy.metrics as metrics
 import pytest
-
 from proxy.observability import (
     _query_slots,
     _query_slots_detail,
     _query_slots_progress,
     last_known_slot_counts,
 )
-
 
 # ======================================================================
 # Helpers — fake httpx responses
@@ -129,7 +127,6 @@ class TestDirectModelInstancePolling:
         """Direct polling works without a model parameter (port 8080)."""
         slots_data = [{"id": 0, "is_processing": False}]
         mock_client = _FakeClient([(200, slots_data)])
-        url_used = ""
 
         async def capture_url():
             result = await _query_slots(mock_client, llama_port=8080)
@@ -181,7 +178,7 @@ class TestRouterFallbackBehavior:
     def test_router_timeout_records_timeout_failure(self):
         """A timeout on /slots queries increments the timeout failure counter."""
         async def fake_get_timeout(*args, **kwargs):
-            raise asyncio.TimeoutError("request timed out")
+            raise TimeoutError("request timed out")
 
         mock_client = MagicMock()
         mock_client.get = fake_get_timeout
@@ -291,7 +288,6 @@ class TestLastKnownFallback:
         # second call (stale check) returns past stale period.
         stale_seconds = 3600  # default stale period
         call_count = [0]
-        original_monotonic = time.monotonic
 
         def fake_monotonic():
             call_count[0] += 1
@@ -347,7 +343,7 @@ class TestSlotsStaleMeasurement:
         mock_client = _FakeClient([(200, slots_data)])
 
         async def check_stale():
-            result = await _query_slots(mock_client, llama_port=8080, model="Qwen3")
+            await _query_slots(mock_client, llama_port=8080, model="Qwen3")
             # Direct success — no staleness
             return True  # will verify by checking cache is fresh
 
