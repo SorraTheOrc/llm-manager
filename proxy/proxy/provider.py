@@ -1646,6 +1646,83 @@ def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = Non
     return False
 
 
+def _seconds_until_next_window(provider_cfg: dict, now_utc: datetime | None = None) -> float | None:
+    """Return seconds until the provider's next available_times window opens.
+
+    Returns ``None`` when the provider is currently inside its window or has
+    no ``available_times`` restriction. Otherwise returns the positive number
+    of seconds until the next window start (UTC).
+    """
+    windows = _parse_available_times(provider_cfg)
+    if windows is None:
+        return None
+    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+        return None
+    if now_utc is None:
+        now_utc = datetime.now(UTC)
+    current_min = now_utc.hour * 60 + now_utc.minute
+    current_sec = now_utc.second
+    # Find the soonest upcoming window start
+    best: int | None = None
+    for start_min, _end_min in windows:
+        if start_min > current_min:
+            delta_min = start_min - current_min
+        elif start_min == current_min and current_sec == 0:
+            delta_min = 0
+        else:
+            # Window is tomorrow
+            delta_min = (24 * 60 - current_min) + start_min
+        if best is None or delta_min < best:
+            best = delta_min
+    if best is None:
+        return None
+    # Subtract elapsed seconds within the current minute for sub-minute precision
+    return float(best * 60 - current_sec)
+
+
+def _compute_retry_after(
+    unavailable_providers: dict | None = None,
+    model_config: dict | None = None,
+    now_utc: datetime | None = None,
+) -> int:
+    """Compute an honest ``retry_after`` (seconds) from real availability data.
+
+    Takes the maximum of:
+    - cooldown durations (``unavailable_providers`` values)
+    - available_times window edges (seconds until next window for providers
+      currently outside their window)
+    - usage-limit reset times (``_usage_reset_at`` remaining seconds)
+
+    Returns 0 when every provider is actually available (edge case).
+    """
+    candidates: list[float] = []
+
+    if unavailable_providers:
+        for v in unavailable_providers.values():
+            try:
+                candidates.append(float(v))
+            except Exception:
+                pass
+
+    if model_config is not None:
+        for p in (model_config.get("providers") or []):
+            if not isinstance(p, dict):
+                continue
+            secs = _seconds_until_next_window(p, now_utc=now_utc)
+            if secs is not None and secs > 0:
+                candidates.append(secs)
+
+    # Usage-limit resets: consider every account with a pending reset
+    for _key, expiry in _usage_reset_at.items():
+        remaining = expiry - time.time()
+        if remaining > 0:
+            candidates.append(remaining)
+
+    if not candidates:
+        return 0
+    return int(max(candidates))
+
+
 def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     """Return ``{name, type}`` pairs for providers whose ``available_times``
     window excludes the current UTC time.
@@ -2026,7 +2103,7 @@ def _build_reasoning_content_roundtrip_error() -> Response:
     )
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
@@ -2047,7 +2124,8 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             media_type="text/plain",
         )
 
-    payload = {"error": "All providers exhausted", "retry_after": 60}
+    retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
+    payload: dict[str, Any] = {"error": "All providers exhausted", "retry_after": retry_after}
     if unavailable_providers:
         # Attach diagnostic info about which providers are in cooldown
         try:
@@ -2066,6 +2144,7 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -2073,6 +2152,7 @@ def _build_time_window_exhausted_response(
     attempts: list[dict[str, Any]],
     unavailable: dict[str, int],
     any_provider_tried: bool,
+    model_config: dict | None = None,
 ) -> Response | None:
     """Return a distinguishable 503 when every provider was skipped solely due
     to its configured ``available_times`` window.
@@ -2089,9 +2169,10 @@ def _build_time_window_exhausted_response(
     if not any(a.get("status") == "outside_time_window" for a in attempts):
         return None
 
-    payload = {
+    retry_after = _compute_retry_after(unavailable, model_config=model_config)
+    payload: dict[str, Any] = {
         "error": "All providers unavailable: no provider is available during the current scheduled time window",
-        "retry_after": 60,
+        "retry_after": retry_after,
     }
     if attempts:
         try:
@@ -2102,6 +2183,7 @@ def _build_time_window_exhausted_response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -4039,14 +4121,14 @@ async def _proxy_with_remote_fallback_cycle(
     # provider could be used, surface a specific message instead of the generic
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
-        attempts, unavailable, any_provider_tried,
+        attempts, unavailable, any_provider_tried, model_config=model_config,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
         )
 
     if first_model_loading_response is not None:
@@ -4068,7 +4150,7 @@ async def _proxy_with_remote_fallback_cycle(
         raise ChainExhaustedError(_build_reasoning_content_roundtrip_error())
 
     raise ChainExhaustedError(
-        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
+        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
     )
 
 
@@ -5040,20 +5122,20 @@ async def _proxy_with_fallback_cycle(
     # provider could be used, surface a specific message instead of the generic
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
-        attempts, unavailable, any_provider_tried,
+        attempts, unavailable, any_provider_tried, model_config=model_config,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
         )
 
     # If all failures were slot exhaustion, include total slots in message
     if all_slot_exhaustion:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts)
+            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
         )
 
     # When all providers are exhausted, return the first provider's actual
@@ -5095,7 +5177,7 @@ async def _proxy_with_fallback_cycle(
             raise ChainExhaustedError(_first_error_response)
 
     raise ChainExhaustedError(
-        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
     )
 
 
