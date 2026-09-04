@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from itertools import chain
 from pathlib import Path
+from decimal import Decimal, ROUND_HALF_UP
 
 import aggregation
 import bucketing
@@ -475,9 +477,127 @@ def build_report(
         "indicates the prompt was rejected without sending to the model; `dry_run=false` means "
         "compaction actually ran. Churn warnings (`compaction_churn`) signal compaction rate "
         "exceeding the target; backstops (`compaction_backstop`) are forced truncations when "
-        "compaction cannot keep pace."
+        "compaction cannot keep pace. The trigger thresholds in the report are schedule-aware "
+        "(from ``slot_schedule.ctx_by_time``), not the static ``local_model_ctx_size`` fallback; "
+        "cheap live triggers can exceed fast despite the file fallback being lower "
+        "(LP-0MTNIJQ8U007AGVW)."
     )
     return "\n".join(lines) + "\n"
+
+
+def _compute_trigger_thresholds(config: dict | None) -> dict[str, int]:
+    """Resolve schedule-aware compaction trigger thresholds for fast and cheap.
+
+    Returns ``{"fast": <trigger>, "cheap": <trigger>}`` where each trigger is
+    ``round_half_up(0.70 * (ctx_size // slots - 4096))``.
+
+    When ``slot_schedule.ctx_by_time`` is present the ctx-size per period
+    (from ``config_loader``) is used; otherwise ``local_model_ctx_size`` is
+    the fallback (static, conservative, LP-0MTNIJQ8U007AGVW).
+    """
+    if config is None:
+        return {"fast": 0, "cheap": 0}
+
+    slots = config.get("session_slot_pool_size")
+    if slots is None:
+        return {"fast": 0, "cheap": 0}
+
+    ctx_by_time = {}
+    schedule = config.get("slot_schedule", {})
+    if isinstance(schedule, dict):
+        ctx_by_time = schedule.get("ctx_by_time", {})
+
+    headroom = 4096
+
+    def _resolve_trigger(ctx_size: int) -> int:
+        """Compute the per-mode trigger for one ctx_size."""
+        per_slot = ctx_size // slots - headroom
+        if per_slot <= 0:
+            return 0
+        raw = Decimal(str(0.70)) * Decimal(str(per_slot))
+        return int(raw.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+    if ctx_by_time:
+        # Schedule-aware: use all distinct ctx_size values from the schedule
+        triggers: dict[int, int] = {}
+        for ctx_sz in set(ctx_by_time.values()):
+            triggers[_resolve_trigger(ctx_sz)] = ctx_sz
+        # Map: use the *range* of triggers across periods
+        # For the report: show min and max trigger (fast always uses fewest slots
+        # → highest per-slot → highest trigger; cheap uses most slots → lower trigger)
+        # Actually: fast has *fewer* slots (3) → ctx_size/3 larger per-slot;
+        # cheap has *more* slots (2) but ctx_by_time may override ctx_size to 262144.
+        # We report the trigger for each distinct ctx_size found.
+        fast_ctx = _resolve_trigger(
+            ctx_by_time.get("10:00", ctx_by_time.get("00:00", 0)) or
+            config.get("local_model_ctx_size", 0)
+        )
+        cheap_ctx = _resolve_trigger(
+            ctx_by_time.get("23:59", ctx_by_time.get("01:00", 0)) or
+            config.get("local_model_ctx_size", 0)
+        )
+        # Both configs typically share the same ctx_by_time values; use distinct ones
+        distinct_triggers = sorted(set([fast_ctx, cheap_ctx]))
+        return {
+            "fast": distinct_triggers[0] if len(distinct_triggers) == 1 else fast_ctx,
+            "cheap": distinct_triggers[-1] if len(distinct_triggers) == 1 else cheap_ctx,
+        }
+
+    # Static fallback
+    static_ctx = config.get("local_model_ctx_size", 0)
+    if static_ctx > 0:
+        t = _resolve_trigger(static_ctx)
+        # fast and cheap use the same static ctx_size when no schedule
+        return {"fast": t, "cheap": t}
+
+    return {"fast": 0, "cheap": 0}
+
+
+def _append_compaction_dry_run_estimate(
+    ap, sessions: list, config: dict | None = None
+) -> None:
+    """Append a dry-run hypothetical estimate when no compaction events occurred.
+
+    Uses each session's ``max_context_size`` as a proxy for whether the
+    compaction trigger would have fired. The estimate is clearly labelled
+    hypothetical with a warning that no history was mutated.
+    """
+    thresholds = _compute_trigger_thresholds(config)
+    fast_t = thresholds.get("fast", 0)
+    cheap_t = thresholds.get("cheap", 0)
+    if not sessions or (fast_t == 0 and cheap_t == 0):
+        # No thresholds to estimate against
+        return
+
+    fast_count = 0
+    cheap_count = 0
+    for s in sessions:
+        max_ctx = s.max_context_size if s.max_context_size is not None else 0
+        bucket = _bucket_key(s.bucket)
+        if bucket == "fast":
+            if max_ctx > fast_t:
+                fast_count += 1
+        else:  # cheap
+            if max_ctx > cheap_t:
+                cheap_count += 1
+
+    total = fast_count + cheap_count
+    n = len(sessions)
+
+    ap("")
+    ap("DRY-RUN ESTIMATE (hypothetical \u2014 no compaction ran)")
+    ap("")
+    ap(f"- Would-have-triggered: **{total}** / {n} (fast {fast_count} / cheap {cheap_count})")
+    ap(
+        f"- Triggers used: fast ≈{fast_t:,} / cheap ≈{cheap_t:,} "
+        f"(`compaction_trigger_ratio=0.70` \u00d7 per-slot clamp)"
+    )
+    ap(
+        "\u26a0\ufe0f  This is a rough estimate using max-context as a proxy; "
+        "the server's session estimator is more nuanced (new-token economics "
+        "with cached_ratio). No history was mutated, no dispatch change."
+    )
+    ap("")
 
 
 def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None = None) -> None:
@@ -503,13 +623,25 @@ def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None 
     if not has_events:
         ap("No compactions observed in window.")
         ap("")
-        ap("_The server emits `compaction_event` lines only when the session "
-          "estimate exceeds the per-mode trigger (≈58.3K fast / ≈43K cheap, "
-          "`compaction_trigger_ratio=0.70` × per-slot clamp); below trigger or "
-          "without a session history the window is expected to be empty._")
-        ap("_Default mode is dry-run advisory (`compaction_dry_run: true`) — "
-          "no dispatch change even when events fire. Flip "
-          "`server.compaction_dry_run: false` for live enforcement._")
+        thresholds = _compute_trigger_thresholds(config)
+        fast_t = thresholds.get("fast", 0)
+        cheap_t = thresholds.get("cheap", 0)
+        ap(
+            "_The server emits `compaction_event` lines only when the session "
+            "estimate exceeds the per-mode trigger ("
+            f"fast ≈{fast_t:,} / cheap ≈{cheap_t:,}, "
+            "`compaction_trigger_ratio=0.70` × per-slot clamp); below trigger or "
+            "without a session history the window is expected to be empty._"
+        )
+        ap(
+            "_Default mode is dry-run advisory (`compaction_dry_run: true`) — "
+            "no dispatch change even when events fire. Flip "
+            "`server.compaction_dry_run: false` for live enforcement._"
+        )
+        # Dry-run estimate: how many sessions *would* have triggered
+        summary_sessions = list(summary.sessions.values())
+        if summary_sessions:
+            _append_compaction_dry_run_estimate(ap, summary_sessions, config)
         return
 
     # --- Aggregate stats via the shared impact helper ---

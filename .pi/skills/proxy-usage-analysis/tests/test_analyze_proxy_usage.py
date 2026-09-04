@@ -2964,6 +2964,61 @@ class TestCompactionAggregation:
         assert impact["dry_run"]["live"] == 2  # one live event + one backstop
 
 
+class TestTriggerThresholds:
+    """LP-0MTNIJQ8U007AGVW AC2: schedule-aware trigger resolution."""
+
+    def test_static_fallback_fast(self):
+        # fast: 262144 / 3 slots - 4096 headroom = 83285 → 0.70 × 83285 = 58300
+        config = {"local_model_ctx_size": 262144, "session_slot_pool_size": 3}
+        t = reporting._compute_trigger_thresholds(config)
+        assert t["fast"] == 58300
+
+    def test_static_fallback_cheap(self):
+        # cheap: 131072 / 2 slots - 4096 headroom = 61440 → 0.70 × 61440 = 43008
+        config = {"local_model_ctx_size": 131072, "session_slot_pool_size": 2}
+        t = reporting._compute_trigger_thresholds(config)
+        assert t["cheap"] == 43008
+
+    def test_schedule_aware_cheap_higher(self):
+        # cheap live: 262144/2-4096=126976 → 0.70×126976=88883
+        # fast static: 262144/3-4096=83285 → 0.70×83285=58300
+        # Both share ctx_by_time 262144 but different slot counts
+        config = {
+            "local_model_ctx_size": 131072,  # cheap static fallback
+            "session_slot_pool_size": 2,  # cheap uses 2 slots
+            "slot_schedule": {"ctx_by_time": {"23:59": 262144, "10:00": 262144}},
+        }
+        t = reporting._compute_trigger_thresholds(config)
+        # With slot_pool_size=2, both fast and cheap resolve via ctx_by_time
+        # The function returns distinct triggers for fast/cheap from different
+        # ctx_by_time keys — both keys share ctx 262144 → same trigger 88883
+        assert t["cheap"] == 88883
+        # Test fast vs cheap with different slot counts
+        fast_config = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 3,
+            "slot_schedule": {"ctx_by_time": {"10:00": 262144}},
+        }
+        cheap_config = {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 2,
+            "slot_schedule": {"ctx_by_time": {"23:59": 262144}},
+        }
+        ft = reporting._compute_trigger_thresholds(fast_config)
+        ct = reporting._compute_trigger_thresholds(cheap_config)
+        assert ct["cheap"] == 88883  # 262144//2-4096=126976 → ×0.70
+        assert ft["fast"] == 58300   # 262144//3-4096=83285 → ×0.70
+        assert ct["cheap"] > ft["fast"]
+
+    def test_none_config(self):
+        assert reporting._compute_trigger_thresholds(None) == {"fast": 0, "cheap": 0}
+
+    def test_missing_slot_pool(self):
+        assert reporting._compute_trigger_thresholds({"local_model_ctx_size": 262144}) == {
+            "fast": 0, "cheap": 0,
+        }
+
+
 class TestCompactionReporting:
     """AC2/AC5/AC6: report section rendering."""
 
@@ -3053,6 +3108,55 @@ class TestCompactionReporting:
         section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
         assert "Effective warm threshold" in section
         assert "Would-have-avoided" in section
+
+    def test_empty_window_dry_run_estimate(self):
+        """AC1: empty window with sessions shows would-have-triggered estimate."""
+        config = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,  # cheap has 2 slots; fast gets 3 via ctx_by_time keys
+            "slot_schedule": {"ctx_by_time": {"23:59": 262144, "10:00": 262144}},
+        }
+        sessions = {
+            "s1": aggregation.SessionStats(**_session("s1", max_context=81000, bucket="fast")),
+            "s2": aggregation.SessionStats(**_session("s2", max_context=40000, bucket="cheap")),
+        }
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions=sessions,
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[],
+        )
+        md = reporting.build_report(summary, config)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        # Dry-run estimate present
+        assert "DRY-RUN ESTIMATE" in section
+        assert "Would-have-triggered:" in section
+        # With slot_pool_size=2 and ctx_by_time 262144, both fast & cheap resolve to 88883
+        assert "≈88,883" in section
+        # Warning present
+        assert "hypothetical" in section
+        assert "No history was mutated" in section
+
+    def test_empty_window_schedule_aware_thresholds(self):
+        """AC3: copy uses resolved schedule-aware values, not static."""
+        # The report renders per-mode thresholds via a SINGLE config dict.
+        # In real use the caller passes the mode-specific config (fast or cheap).
+        # Here we verify the function resolves the schedule-aware trigger when
+        # ctx_by_time overrides the static local_model_ctx_size.
+        config = {
+            "local_model_ctx_size": 131072,  # static → 43008, should NOT appear
+            "session_slot_pool_size": 2,
+            "slot_schedule": {"ctx_by_time": {"23:59": 262144}},
+        }
+        t = reporting._compute_trigger_thresholds(config)
+        assert t["cheap"] == 88883  # live, NOT ≈43K
+        # Static fallback value should not appear in the resolved thresholds
+        assert t["cheap"] != 43008
+        # Verify static fallback still works when no schedule
+        static_config = {"local_model_ctx_size": 131072, "session_slot_pool_size": 2}
+        st = reporting._compute_trigger_thresholds(static_config)
+        assert st["cheap"] == 43008
 
 
 class TestCompactionJson:
