@@ -96,6 +96,19 @@ Testing
   ```
   Prefer `/skill:test` above; the direct command bypasses the cache.
 
+#### Persistence-cap integration tests
+
+The following test modules exercise the persistence-cap pin fix (LP-0MTIFR5W3006UAX8 / LP-0MTE9HAF8008909G):
+
+| Module | Purpose |
+|--------|---------|
+| `proxy/tests/test_cap_persistence_pin.py` | Fast (83285) and cheap (126976) clamp derivation and persistence gating |
+| `proxy/tests/test_clamp_derived_persistence.py` | Clamp derived from `effective_per_slot_threshold` (dynamic schedule-aware path) |
+| `proxy/tests/test_slot_persistence_guards.py` | GPU-wedge safeguards: adaptive timeout, circuit breaker, skip-when-busy |
+| `proxy/tests/test_persistence_cap_modes.py` | **New** — save→restore cycles for oversized (>50K) contexts in fast/cheap modes; restore-rate baselines (>80% for >50K); wedge parameter pinning |
+
+Run all four: `. .venv/bin/activate && python -m pytest proxy/tests/test_cap_persistence_pin.py proxy/tests/test_clamp_derived_persistence.py proxy/tests/test_slot_persistence_guards.py proxy/tests/test_persistence_cap_modes.py -q`
+
 > **Safety:** the default test run never spawns or kills real OS processes and
 > never touches the live proxy/llama-server/TTS server. Live tests are opt-in
 > (`RUN_LIVE_PROXY_E2E=1`, `RUN_LIVE_TTS=1`, `RUN_LIVE_HOST_FLOW=1`,
