@@ -124,11 +124,15 @@ majority keeps re-prefilling remote.
    proxy's slot-state view and session↔slot affinity, compounding (1) when
    the proxy does attempt restore.
 
-## Fix direction (feed F4/F5 — no code change here)
+## Fix direction (feed F4/F5)
 
-- Raise/remove the persistence cap **with** a timeout/cooldown plan for the
-  GPU-wedge constraint (LP-0MS91DHPZ001VWQO) — evaluate separately per
-  mode (fast 83,285 → ?; cheap 126,976 → ?).
+- **Cap derived and validated** (LP-0MTIFR5W3006UAX8 / LP-0MTE9HAF8008909G): the
+  persistence cap is now derived from the per-slot routing clamp via
+  `effective_per_slot_threshold` (83285 fast, 126976 cheap). Integration tests
+  (`test_persistence_cap_modes.py`) verify save→restore cycles at both caps,
+  restore-rate baselines (>80% proxy slot restores for >50K contexts), and GPU-
+  wedge safeguards (adaptive timeout, circuit breaker, skip-when-busy). The
+  `session_slot_max_prompt_tokens: 0` config triggers the dynamic derivation.
 - Fix the residual /slots 500s + slots_stale so the proxy's slot-state view
   is trustworthy for affinity decisions.
 - Consider lease continuity (fewer orphan releases) so sessions keep their
