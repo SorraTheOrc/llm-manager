@@ -15,12 +15,12 @@
 #     exhausted. Keep this file's models section in sync with
 #     config-fast.yaml (test_cheap_config_matches_fast_models guards it).
 #
-# CTX NOTE (LP-0MSMZOAJW002UR2A + LP-0MSY0SDAS0031Y7F): the shared
-# models.ini [Qwen3] base is now 262144 and the schedule entries carry
-# ctx_size: 262144, so cheap boots 2x262144 natively (no catch-up needed)
-# and local_model_ctx_size below runs the static clamp 61440 (131072//2 - 4096)
-# which is CONSERVATIVE vs the real per-slot 131072 — the safe direction. The
-# scheduled clamp resolves higher (min(100000, 262144//2 - 4096) = 100000).
+# CTX NOTE (LP-0MSMZOAJW002UR2A + LP-0MSY0SDAS0031Y7F + LP-0MTO8SZ8K0080RHT):
+# the shared models.ini [Qwen3] base is now 262144 and the schedule entries
+# carry ctx_size: 262144, so cheap boots 2x262144 natively (no catch-up
+# needed) and local_model_ctx_size below also runs 262144, giving a static
+# clamp of 126976 (262144//2 - 4096) — identical to the scheduled clamp.
+# Warm threshold: min(100000, 126976) = 100000; trigger: 0.70 * 126976 ≈ 88883.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -589,7 +589,7 @@ server:
   # LP-0MSEGPO77005CYCQ F4: the ctx-size evaluation (LP-0MSAOQTJS000FFVM)
   # concluded NO-GO on 4x65.5K / 3x87.4K / 2x131K; the live config had
   # drifted to the rejected 4x65.5K (262144/4) via commit ccca402.
-  local_model_ctx_size: 131072
+  local_model_ctx_size: 262144
   # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
   # When a session's estimated context reaches this fraction of the
   # effective per-slot context (ctx_size / slots - 4096 headroom), the

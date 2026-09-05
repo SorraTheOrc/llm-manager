@@ -42,9 +42,9 @@ def raw_config(ctx_size: int, slots: int, **extra) -> dict:
 
 
 FAST = raw_config(262144, 3)          # per-slot 83,285 → trigger 58,300
-CHEAP = raw_config(131072, 2)         # per-slot 61,440 → trigger 43,008
+CHEAP = raw_config(262144, 2)         # per-slot 126,976 → trigger 88,883
 FAST_DRY = raw_config(262144, 3, compaction_dry_run=True)
-CHEAP_DRY = raw_config(131072, 2, compaction_dry_run=True)
+CHEAP_DRY = raw_config(262144, 2, compaction_dry_run=True)
 
 
 def fixed_summarizer(middle_messages) -> str:
@@ -123,7 +123,7 @@ class TestFastFlow:
 
 class TestCheapFlow:
     def test_trigger_fires_and_dispatch_gets_compacted_history(self):
-        messages = make_session(60)  # est ~124K > 43,008 trigger
+        messages = make_session(60)  # est ~124K > 88,883 trigger
         decision = decide_session_compaction(
             messages, CHEAP, "cheap",
             summarizer=fixed_summarizer,
