@@ -38,7 +38,6 @@ def _reset_server_global_state(monkeypatch):
     Hardened to catch every known leased-state fixture without requiring
     each test file to individually reset it.
     """
-    import asyncio
     import proxy.server as server
 
     # Only reset; never touch mocks established by per-file fixtures.
