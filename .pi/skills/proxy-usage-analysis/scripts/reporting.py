@@ -22,13 +22,12 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from itertools import chain
 from pathlib import Path
-from decimal import Decimal, ROUND_HALF_UP
 
 import aggregation
 import bucketing
