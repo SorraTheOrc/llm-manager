@@ -46,6 +46,25 @@ _provider_unavailable_until: dict[str, float] = {}
 # Incremented on each failure, reset to 0 on success.
 _provider_failure_count: dict[str, int] = {}
 
+# ---------------------------------------------------------------------------
+# Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
+#
+# Tracks consecutive empty_response/stall failures per provider across
+# retry cycles. When the count exceeds the configured threshold within
+# the sliding window, the provider is marked unavailable for an extended
+# cooldown so the retry cycle permanently skips it and tries siblings.
+#
+# State is in-memory (no persistence), consistent with the existing
+# cooldown mechanism.
+# ---------------------------------------------------------------------------
+
+# Consecutive empty/stall failure count: provider_name -> count
+_sibling_failure_count: dict[str, int] = {}
+
+# Timestamp (monotonic) when the current consecutive-failure streak began
+# for a provider. Reset when the streak clears.
+_sibling_failure_streak_start: dict[str, float] = {}
+
 # Exponential backoff constants (remote providers only)
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
@@ -75,6 +94,25 @@ _PERIOD_DEFAULT_SECONDS = {
     "weekly": 7 * 24 * 3600,
     "monthly": 30 * 24 * 3600,
 }
+
+# ---------------------------------------------------------------------------
+# Default sibling-fallback constants
+# ---------------------------------------------------------------------------
+
+# Default number of consecutive empty/stall failures before triggering
+# an extended cooldown that forces the retry cycle to skip this provider.
+_DEFAULT_SIBLING_FALLBACK_THRESHOLD = 2
+
+# Default extended cooldown duration (seconds) applied when the sibling-
+# fallback threshold is exceeded. This is much longer than the standard
+# provider cooldown so the retry cycle permanently skips the failing
+# provider and tries siblings instead of repeatedly hitting the same one.
+_DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS = 600  # 10 minutes
+
+# Sliding window (seconds) for the consecutive-failure streak. If a
+# provider has no failures for longer than this window, the streak
+# is considered stale and resets.
+_DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS = 600  # 10 minutes
 
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
@@ -1817,6 +1855,160 @@ def _get_cooldown_seconds(config: dict) -> float:
     return float(val)
 
 
+def _get_sibling_fallback_threshold(config: dict) -> int:
+    """Read the sibling-fallback failure threshold from config.
+
+    After this many consecutive ``empty_response`` or ``stall_after_content``
+    failures on the same provider, the provider is marked unavailable for an
+    extended cooldown (``sibling_fallback_cooldown_seconds``) so the retry
+    cycle permanently skips it and tries siblings.
+
+    Supports both nested (``server.sibling_fallback_*``) and flat keys.
+    Defaults: threshold=2.
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    val = server_cfg.get("sibling_fallback_threshold")
+    if val is None:
+        val = config.get("sibling_fallback_threshold", _DEFAULT_SIBLING_FALLBACK_THRESHOLD)
+    try:
+        return max(1, int(val or _DEFAULT_SIBLING_FALLBACK_THRESHOLD))
+    except (ValueError, TypeError):
+        return _DEFAULT_SIBLING_FALLBACK_THRESHOLD
+
+
+def _get_sibling_fallback_cooldown_seconds(config: dict) -> float:
+    """Read the sibling-fallback extended cooldown from config.
+
+    Applied when the consecutive-failure threshold is exceeded.
+    Supports both nested (``server.sibling_fallback_cooldown_seconds``)
+    and flat keys. Defaults to 600 (10 minutes).
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    val = server_cfg.get("sibling_fallback_cooldown_seconds")
+    if val is None:
+        val = config.get(
+            "sibling_fallback_cooldown_seconds",
+            _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS,
+        )
+    try:
+        return max(60.0, float(val or _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS))
+    except (ValueError, TypeError):
+        return _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS
+
+
+def _get_sibling_fallback_window_seconds(config: dict) -> int:
+    """Read the sibling-fallback streak window from config.
+
+    If a provider has no failures for longer than this window, the
+    consecutive-failure streak resets.
+    Supports both nested (``server.sibling_fallback_window_seconds``)
+    and flat keys. Defaults to 600 (10 minutes).
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    val = server_cfg.get("sibling_fallback_window_seconds")
+    if val is None:
+        val = config.get(
+            "sibling_fallback_window_seconds",
+            _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS,
+        )
+    try:
+        return max(60, int(val or _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS))
+    except (ValueError, TypeError):
+        return _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS
+
+
+def _record_sibling_failure(
+    provider_name: str,
+    config: dict,
+    brand: str | None = None,
+) -> bool:
+    """Record a consecutive empty_response/stall failure for *provider_name*.
+
+    Increments the streak counter. If the streak exceeds the configured
+    threshold within the sliding window, marks the provider unavailable
+    for an extended cooldown and returns ``True``.  On any other case
+    returns ``False``.
+
+    The streak resets when a successful response occurs (via
+    ``_reset_sibling_failure_count()``) or when the window expires
+    without failures.
+
+    When *brand* is provided (the entry's ``provider`` field, e.g.
+    ``"opencode-go"``), the extended cooldown is applied to BOTH the entry
+    name and the brand.  ``_entry_cooldown_key`` checks the brand of every
+    entry, so quarantining the brand blocks all same-gateway sibling
+    entries (``opencode-go-2``/``opencode-go-3``) from being retried
+    through other API keys on the same failing endpoint
+    (LP-0MTPMF03P0046MFG) — mirroring how the Tier-3 stall circuit breaker
+    marks the provider brand.
+
+    Args:
+        provider_name: Provider entry name (e.g. ``"opencode-go"``).
+        config: Server configuration (to read threshold/window).
+        brand: Optional provider brand (``provider_cfg.get("provider")``)
+            shared by same-gateway sibling entries.
+
+    Returns:
+        ``True`` if the extended cooldown threshold was exceeded.
+    """
+    now = time.monotonic()
+    window = _get_sibling_fallback_window_seconds(config)
+
+    # Get or initialize the streak count
+    count = _sibling_failure_count.get(provider_name, 0)
+
+    # Initialize streak start if this is the first failure
+    if provider_name not in _sibling_failure_streak_start:
+        _sibling_failure_streak_start[provider_name] = now
+
+    # Check if the previous streak has expired (no failures for > window)
+    streak_start = _sibling_failure_streak_start.get(provider_name, 0)
+    if now - streak_start > window:
+        # Streak expired — start fresh
+        count = 0
+        _sibling_failure_streak_start[provider_name] = now
+
+    # Increment the count
+    count += 1
+    _sibling_failure_count[provider_name] = count
+
+    # Check against threshold
+    threshold = _get_sibling_fallback_threshold(config)
+    if count >= threshold:
+        cooldown = _get_sibling_fallback_cooldown_seconds(config)
+        mark_provider_unavailable(provider_name, cooldown)
+        # Also quarantine the shared brand so same-gateway sibling entries
+        # are not retried via other API keys (LP-0MTPMF03P0046MFG).
+        if brand and str(brand) != provider_name:
+            mark_provider_unavailable(str(brand), cooldown)
+        logger.warning(
+            "Sibling-fallback circuit breaker triggered: "
+            "provider=%s brand=%s consecutive_failures=%d "
+            "threshold=%d extended_cooldown=%ds",
+            provider_name,
+            brand or provider_name,
+            count,
+            threshold,
+            cooldown,
+        )
+        return True
+
+    return False
+
+
+def _reset_sibling_failure_count(provider_name: str) -> None:
+    """Reset the consecutive sibling-failure count for a provider on success.
+
+    Removes both the count and streak start from their dicts so that
+    the next failure starts a fresh streak.
+
+    Args:
+        provider_name: Provider entry name.
+    """
+    _sibling_failure_count.pop(provider_name, None)
+    _sibling_failure_streak_start.pop(provider_name, None)
+
+
 def _chain_hold_enabled(config: dict) -> bool:
     """Return True when the chain-hold feature is explicitly configured.
 
@@ -3158,6 +3350,8 @@ def _handle_streaming_success(
         )
         # Reset exponential-backoff failure count on success
         _reset_provider_failure_count(provider_name)
+        # Reset sibling-failure count on success (LP-0MTPMF03P0046MFG)
+        _reset_sibling_failure_count(provider_name)
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
@@ -3221,6 +3415,8 @@ def _build_fallback_success_response(
     )
     # Reset exponential-backoff failure count on success
     _reset_provider_failure_count(provider_name)
+    # Reset sibling-failure count on success (LP-0MTPMF03P0046MFG)
+    _reset_sibling_failure_count(provider_name)
     result = _add_provider_header(response, provider_name)
     if prev_provider:
         logger.info(
@@ -3907,6 +4103,14 @@ async def _proxy_with_remote_fallback_cycle(
                     )
                 except StreamingPreContentError as exc:
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # a pre-content stream error (empty_response / finish_reason:
+                    # error with zero content) counts toward the consecutive-
+                    # failure streak so the provider gets an extended cooldown
+                    # after the threshold and the retry cycle skips to a sibling.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
@@ -3926,6 +4130,14 @@ async def _proxy_with_remote_fallback_cycle(
                     # request to the next provider; the buffered intermediate
                     # output is discarded (never reaches the client).
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # reasoning was delivered but the provider stalled before
+                    # usable final content; repeated stalls on the same provider
+                    # count toward the streak so it is skipped for a sibling
+                    # after the threshold.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
                     # request so the re-route hops straight to a different
@@ -4072,6 +4284,12 @@ async def _proxy_with_remote_fallback_cycle(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text,
                     )
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # track consecutive empty/stall failures across cycles.
+                    # If the threshold is exceeded, the provider gets an
+                    # extended cooldown so the retry cycle permanently skips
+                    # it and tries siblings.
+                    _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
@@ -4589,6 +4807,14 @@ async def _proxy_with_fallback_cycle(
                     )
                 except StreamingPreContentError as exc:
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # a pre-content stream error (empty_response / finish_reason:
+                    # error with zero content) counts toward the consecutive-
+                    # failure streak so the provider gets an extended cooldown
+                    # after the threshold and the retry cycle skips to a sibling.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
@@ -4608,6 +4834,14 @@ async def _proxy_with_fallback_cycle(
                     # request to the next provider; the buffered intermediate
                     # output is discarded (never reaches the client).
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # reasoning was delivered but the provider stalled before
+                    # usable final content; repeated stalls on the same provider
+                    # count toward the streak so it is skipped for a sibling
+                    # after the threshold.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
                     # request so the re-route hops straight to a different
@@ -4971,6 +5205,7 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text,
                             )
+                            _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                             attempted_domains.add(_failure_domain_key(provider_cfg))
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
@@ -4982,6 +5217,7 @@ async def _proxy_with_fallback_cycle(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text,
                         )
+                        _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                         attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "empty_response"
                         prev_provider = provider_name

@@ -482,6 +482,28 @@ server:
   llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
+  # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
+  # provider repeatedly returns an EMPTY response / stalls (no usable content)
+  # across retry cycles, the provider is quarantined for an EXTENDED cooldown
+  # so the fallback chain permanently skips it and routes to the next healthy
+  # sibling instead of retrying the same dead provider ~80x (the 2026-09-06
+  # RCA storm: opencode-go returned empty_response 80 times in 32 minutes).
+  #   - sibling_fallback_threshold: consecutive empty/stall failures on the
+  #     SAME provider entry (e.g. `opencode-go`) within the sliding window that
+  #     trigger the extended cooldown. 2 = quarantine after 2 failures.
+  #   - sibling_fallback_cooldown_seconds: extended cooldown applied to the
+  #     provider (entry AND its shared brand, so same-gateway API-key siblings
+  #     opencode-go-2/-3 are skipped too). Longer than the 60s Tier-2 provider
+  #     cooldown so cross-request retry cycles stop hammering the dead gateway.
+  #   - sibling_fallback_window_seconds: sliding window for the consecutive-
+  #     failure streak; a streak with no failures for longer than this resets.
+  # 429/402 responses are NOT counted here (they use the existing per-model
+  # cooldown); this breaker only covers empty_response / stall_* / zero-content
+  # stream errors. State is in-memory (no persistence), like the other
+  # cooldown mechanisms.
+  sibling_fallback_threshold: 2
+  sibling_fallback_cooldown_seconds: 600
+  sibling_fallback_window_seconds: 600
   # Chain-hold retry (LP-0MSH94Z7K007VKC9): when EVERY provider in a model's
   # fallback chain is exhausted, hold the request for chain_hold_seconds
   # (default 300) instead of erroring immediately, then start a NEW cycle from
