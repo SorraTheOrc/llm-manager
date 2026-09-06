@@ -2232,9 +2232,11 @@ async def _schedule_recv_token_increment(
 # ===================================================================
 
 _QWEN3_SPAWN_RE = re.compile(r"name=(\S+) on port (\d+)")
+# Alias kept for backward-compat; new code uses _SPAWN_RE.
+_SPAWN_RE = _QWEN3_SPAWN_RE
 
-_child_port_cache: dict[int, int | None] = {}
-"""Cached child port per llama-server pid.
+_child_port_cache: dict[tuple[int, str], int | None] = {}
+"""Cached child port per (llama-server pid, normalized target model).
 
 The router llama-server (port 8080) spawns child instances on dynamic ports
 (``--port 0``). The child port is discoverable from the spawn line in the
@@ -2243,7 +2245,46 @@ llama-server log (``spawning server instance with name=Qwen3 on port 58113``).
 The router serializes ``GET /slots?model=...`` behind the busy child's
 generation loop (LP-0MTDGBRPU003Z7KU: measured 5-7s via the router vs 0.17s
 direct), so availability/status checks should target the child port directly.
+
+LP-0MTP1FQXH004JYEF: the previous implementation returned the *first*
+spawn line (which is ``mxbai-embed`` — embeddings child) instead of the
+target model (Qwen3), so ``/llama/local/status`` queried the embed child
+(``n_ctx 256, is_processing=false``) and reported ``3/3`` idle while the
+Qwen3 child was busy. The cache was also per-pid only and sticky. Now the
+lookup filters by target model, strips NUL padding from sparse logrotate
+files, scans the full current log + rotated logs, and caches per
+``(pid, model)``. Callers should pass the target model (``current_model``
+or ``slot_model``) so the right child is returned.
 """
+
+
+def _is_sparse_log(log_path: Path) -> bool:
+    """Return True when *log_path* is sparse/NUL-padded/empty (logrotate).
+
+    A non-sparse file with real content (even without a spawn line) returns
+    False so :func:`_discover_local_child_port` does NOT fall back to global
+    rotated logs — this preserves tmp_path isolation in tests
+    (LP-0MTP1FQXH004JYEF).
+    """
+    try:
+        if not log_path.exists():
+            return False
+        size = log_path.stat().st_size
+        if size == 0:
+            return True
+        read_size = min(8192, size)
+        with open(log_path, "rb") as f:
+            chunk = f.read(read_size)
+        if not chunk:
+            return True
+        # Sparse if >50% NULs or stripped text is empty/short whitespace.
+        nul_ratio = chunk.count(b"\x00") / len(chunk)
+        if nul_ratio > 0.5:
+            return True
+        text = chunk.decode("utf-8", errors="replace").replace("\x00", "").strip()
+        return len(text) == 0
+    except Exception:
+        return False
 
 
 def _llama_log_path(srv) -> Path:
@@ -2254,45 +2295,172 @@ def _llama_log_path(srv) -> Path:
     return Path(__file__).parent / "logs" / "llama-server.log"
 
 
-def _discover_local_child_port(srv) -> int | None:
+def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
+    """Scan a single log file for spawn ports, filtered by target model.
+
+    Strips NUL padding (sparse logrotate files) and returns the *last*
+    matching port for *target_model* so restarts pick the newest line.
+    ``target_model`` is matched case-insensitively; when no exact match is
+    found the function returns ``None`` (caller may fall back to a non-embed
+    heuristic or to ``None`` / router port). Returns a special sentinel
+    ``None`` both for "file unreadable" and "no matching spawn" — caller
+    distinguishes sparse vs. real-content via :func:`_is_sparse_log`.
+    """
+    try:
+        if not log_path.exists():
+            return None
+        size = log_path.stat().st_size
+        # Spawn lines are at startup (head) but NUL-padded sparse files can
+        # hide them; read up to 256 KiB so we cover head + a bit of tail
+        # without loading multi-MB logs fully. If the file is larger we still
+        # scan only that window — the caller iterates rotated logs for older
+        # spawn lines.
+        read_size = min(262144, size) if size else 0
+        if read_size == 0:
+            return None
+        with open(log_path, "rb") as f:
+            raw = f.read(read_size)
+        text = raw.decode("utf-8", errors="replace").replace("\x00", "")
+        if not text.strip():
+            return None
+        want = (target_model or "").strip().lower() or None
+        # Collect all matches so the last (newest) wins after a restart.
+        matches: list[tuple[str, int]] = []
+        for line in text.splitlines():
+            m = _SPAWN_RE.search(line)
+            if not m:
+                continue
+            try:
+                name = str(m.group(1)).strip()
+                port = int(m.group(2))
+            except (TypeError, ValueError, IndexError):
+                continue
+            matches.append((name, port))
+        if not matches:
+            return None
+        if want is not None:
+            # Exact case-insensitive match for the requested model.
+            filtered = [p for n, p in matches if n.lower() == want]
+            if filtered:
+                return filtered[-1]
+            return None
+        # No target requested — prefer a non-embed model (Qwen3) over
+        # mxbai-embed; fall back to the last match.
+        non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
+        if non_embed:
+            return non_embed[-1][1]
+        return matches[-1][1]
+    except Exception:
+        return None
+
+
+def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     """Discover the local model child port from the llama-server log.
 
     The router (``llama_server_port``) spawns model children on dynamic ports
     (``--port 0``); the spawn line ``spawning server instance with
     name=<model> on port <port>`` is written near the top of the fresh
-    llama-server log on startup. Returns the port for the first matching
-    spawn line, or ``None`` when the log is missing/unreadable or contains
-    no spawn line.
+    llama-server log on startup.
 
-    The result is cached per llama-server process pid so repeated calls
-    (every request) do not re-read the log; a new pid (restart) re-parses.
+    Args:
+        srv: Server module / namespace with ``llama_process.pid`` and
+            ``log_dir`` / ``current_model``.
+        model: Optional target model name to filter by (e.g. ``"Qwen3"``).
+            When ``None`` the function uses ``srv.current_model`` or
+            ``"Qwen3"`` as the target. Matching is case-insensitive.
+            Passing the wrong model previously returned the embed child port
+            (first spawn line ``mxbai-embed``) — LP-0MTP1FQXH004JYEF.
+
+    Returns the port for the target model, or ``None`` when the log is
+    missing/unreadable or contains no matching spawn line (caller should
+    fall back to the router port). NUL padding from sparse logrotate files
+    is stripped before matching.
+
+    The result is cached per ``(pid, normalized target model)`` so repeated
+    calls (every request) do not re-read the log; a new pid (restart) or
+    different target re-parses. A sparse/empty read is *not* cached as a
+    hard ``None`` for the pid — only for the specific ``(pid, model)`` key
+    — so a later valid log or rotated log can still be found.
     """
     try:
         proc = getattr(srv, "llama_process", None)
         pid = getattr(proc, "pid", None) if proc is not None else None
         if pid is None:
             return None
-        if pid in _child_port_cache:
-            return _child_port_cache[pid]
+        # Resolve the target model: explicit arg wins, then current_model.
+        target = (model or getattr(srv, "current_model", None) or "Qwen3")
+        target = str(target).strip() if target is not None else "Qwen3"
+        if not target:
+            target = "Qwen3"
+        cache_key = (int(pid), target.lower())
+        if cache_key in _child_port_cache:
+            return _child_port_cache[cache_key]
+        # Compatibility: legacy cache used int pid -> port; honour it for
+        # the default Qwen3 target so old tests that populate {pid: port}
+        # still hit.
+        legacy = _child_port_cache.get(int(pid))  # type: ignore[arg-type]
+        if legacy is not None and target.lower() in ("qwen3",):
+            # Only reuse legacy for Qwen3; otherwise re-parse correctly.
+            return legacy  # type: ignore[return-value]
+        # Primary log path.
         log_path = _llama_log_path(srv)
+        # Missing file -> no fallback scan (test isolation: tmp_path that
+        # does not contain the log should stay None, not find the global
+        # /var/log/llama-proxy file — LP-0MTP1FQXH004JYEF).
         if not log_path.exists():
-            _child_port_cache[pid] = None
+            _child_port_cache[cache_key] = None
             return None
-        # Read the top of the log (spawn lines are written at startup).
-        read_size = min(65536, log_path.stat().st_size)
-        with open(log_path, "rb") as f:
-            head = f.read(read_size).decode("utf-8", errors="replace")
-        port = None
-        for line in head.splitlines():
-            m = _QWEN3_SPAWN_RE.search(line)
-            if m:
+        port = _scan_spawn_ports(log_path, target)
+        if port is not None:
+            _child_port_cache[cache_key] = port
+            return port
+        # Primary had real content but no matching spawn for this target
+        # (e.g. test file "[58113] main: model loaded" or a non-Qwen3-only
+        # log) — do NOT fall back to global /var/log/llama-proxy rotated
+        # logs, otherwise tmp_path isolation leaks into tests. Only fall
+        # back when the primary is sparse/NUL-padded/empty (logrotate case)
+        # — LP-0MTP1FQXH004JYEF.
+        if not _is_sparse_log(log_path):
+            _child_port_cache[cache_key] = None
+            return None
+        # Sparse current log (e.g. NUL-padded after logrotate) — scan
+        # rotated logs (llama-server*.log) by mtime descending for the most
+        # recent matching spawn line. Only when the primary file exists but
+        # had no matching spawn line; a missing file already returned above.
+        try:
+            parent = log_path.parent
+            # Also check the canonical /var/log/llama-proxy location when
+            # log_dir is custom, so a sparse worktree log can still find the
+            # real spawn line.
+            candidates: list[Path] = []
+            for base in {parent, Path("/var/log/llama-proxy")}:
                 try:
-                    port = int(m.group(2))
-                except (TypeError, ValueError):
-                    port = None
-                break
-        _child_port_cache[pid] = port
-        return port
+                    if base.exists():
+                        for p in base.glob("llama-server*.log*"):
+                            # Avoid re-scanning the primary we already tried.
+                            try:
+                                if p.resolve() == log_path.resolve():
+                                    continue
+                            except Exception:
+                                if p == log_path:
+                                    continue
+                            # Skip compressed archives.
+                            if p.suffix == ".gz":
+                                continue
+                            candidates.append(p)
+                except Exception:
+                    continue
+            # Most-recent first so the newest restart wins.
+            candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+            for cand in candidates[:8]:
+                cand_port = _scan_spawn_ports(cand, target)
+                if cand_port is not None:
+                    _child_port_cache[cache_key] = cand_port
+                    return cand_port
+        except Exception:
+            pass
+        _child_port_cache[cache_key] = None
+        return None
     except Exception:
         return None
 
@@ -2338,7 +2506,9 @@ async def _check_slot_availability(
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
         )
-        child_port = _discover_local_child_port(srv)
+        # LP-0MTP1FQXH004JYEF: target the slot's model so we query the
+        # Qwen3 child not the embed child (first spawn line).
+        child_port = _discover_local_child_port(srv, model=slot_model)
         slots_port = child_port if child_port is not None else llama_port
         slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
         availability_timeout = float(

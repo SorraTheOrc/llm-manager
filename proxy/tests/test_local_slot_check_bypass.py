@@ -111,6 +111,73 @@ class TestDiscoverLocalChildPort:
             else:
                 marker.write_bytes(original)
 
+    # --- LP-0MTP1FQXH004JYEF regression: embed line must not win ---
+
+    def test_embed_first_returns_qwen3_port(self, tmp_path):
+        """With mxbai-embed spawn first, Qwen3 target still returns Qwen3's port.
+
+        Regression for LP-0MTP1FQXH004JYEF: the old implementation returned
+        the first spawn line (mxbai-embed's port) and /llama/local/status
+        queried the embed child (n_ctx 256, always idle) while Qwen3 was
+        busy, reporting 3/3 free vs real 1/3.
+        """
+        log = tmp_path / "llama-server.log"
+        log.write_text(
+            "srv          load: spawning server instance with name=mxbai-embed on port 58489\n"
+            "srv          load: spawning server instance with name=Qwen3 on port 46085\n"
+        )
+        srv = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=901), current_model="Qwen3")
+        assert _discover_local_child_port(srv) == 46085
+        # Explicit embed target should still find embed.
+        srv2 = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=902), current_model="Qwen3")
+        assert _discover_local_child_port(srv2, model="mxbai-embed") == 58489
+
+    def test_nul_padded_sparse_log_is_handled(self, tmp_path):
+        """NUL-padded sparse file (logrotate) still yields the spawn line."""
+        log = tmp_path / "llama-server.log"
+        log.write_bytes(("\x00" * 5000 + "srv          load: spawning server instance with name=Qwen3 on port 46085\n").encode())
+        srv = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=9021), current_model="Qwen3")
+        assert _discover_local_child_port(srv) == 46085
+
+    def test_sparse_primary_falls_back_to_rotated_log(self, tmp_path):
+        """When primary is NUL-sparse, rotated log is scanned for the spawn."""
+        cur = tmp_path / "llama-server.log"
+        cur.write_bytes(b"\x00" * 1000)
+        rotated = tmp_path / "llama-server.1.log"
+        rotated.write_text("srv          load: spawning server instance with name=Qwen3 on port 47779\n")
+        srv = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=9022), current_model="Qwen3")
+        assert _discover_local_child_port(srv) == 47779
+
+    def test_non_sparse_miss_does_not_fallback_globally(self, tmp_path):
+        """A file with real content but no matching spawn returns None (no global fallback)."""
+        log = tmp_path / "llama-server.log"
+        log.write_text("[58113] main: model loaded\n")
+        srv = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=9023), current_model="Qwen3")
+        assert _discover_local_child_port(srv) is None
+
+    def test_case_insensitive_target(self, tmp_path):
+        """Model matching is case-insensitive."""
+        log = tmp_path / "llama-server.log"
+        log.write_text("srv          load: spawning server instance with name=Qwen3 on port 46085\n")
+        srv = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=9024), current_model="Qwen3")
+        assert _discover_local_child_port(srv, model="qwen3") == 46085
+        srv2 = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=9025), current_model="Qwen3")
+        assert _discover_local_child_port(srv2, model="QWEN3") == 46085
+
+    def test_cache_is_per_model(self, tmp_path):
+        """Same pid, different model targets cache separately."""
+        log = tmp_path / "llama-server.log"
+        log.write_text(
+            "srv          load: spawning server instance with name=mxbai-embed on port 58489\n"
+            "srv          load: spawning server instance with name=Qwen3 on port 46085\n"
+        )
+        srv = SimpleNamespace(log_dir=tmp_path, llama_process=SimpleNamespace(pid=9030), current_model="Qwen3")
+        assert _discover_local_child_port(srv) == 46085
+        # Same pid, embed model -> different cache key -> embed port.
+        assert _discover_local_child_port(srv, model="mxbai-embed") == 58489
+        # Qwen3 still cached.
+        assert _discover_local_child_port(srv) == 46085
+
 
 # ======================================================================
 # _check_slot_availability targets the child port and honours lease-hold
@@ -162,7 +229,7 @@ class TestCheckSlotAvailability:
             rh, "httpx",
             SimpleNamespace(AsyncClient=lambda timeout: client, Timeout=lambda t: t),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: 58113)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: 58113)
 
         result = await _check_slot_availability(
             srv, {"llama_server_port": 8080}, 8080, "Qwen3", "Qwen3",
@@ -202,7 +269,7 @@ class TestCheckSlotAvailability:
             rh, "httpx",
             SimpleNamespace(AsyncClient=lambda timeout: client, Timeout=lambda t: t),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: 58113)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: 58113)
 
         result = await _check_slot_availability(
             srv, {"llama_server_port": 8080}, 8080, "Qwen3", "Qwen3",
@@ -239,7 +306,7 @@ class TestCheckSlotAvailability:
             rh, "httpx",
             SimpleNamespace(AsyncClient=lambda timeout: client, Timeout=lambda t: t),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: None)
 
         result = await _check_slot_availability(
             srv, {"llama_server_port": 8080}, 8080, "Qwen3", "Qwen3",

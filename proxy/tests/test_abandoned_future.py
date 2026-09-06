@@ -96,6 +96,13 @@ def _reset_server_state(monkeypatch):
     monkeypatch.setattr(server, "config", dict(BASE_SERVER_CONFIG))
     monkeypatch.setattr(server, "active_queries", 0)
     monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_generating_queries", 0)
+    monkeypatch.setattr(server, "local_generating_queries_lock", __import__("asyncio").Lock())
+    monkeypatch.setattr(server, "local_generating_sessions", set())
+    monkeypatch.setattr(server, "local_prefill_in_flight", {})
+    monkeypatch.setattr(server, "local_prefill_in_flight_lock", __import__("asyncio").Lock())
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", __import__("asyncio").Lock())
     monkeypatch.setattr(server, "backend_ready", True)
     monkeypatch.setattr(server, "llama_process", MagicMock(poll=lambda: None, pid=1))
     monkeypatch.setattr(server, "current_model", "test-model")
@@ -139,6 +146,10 @@ def _reset_server_state(monkeypatch):
 
     # Mock slot availability
     monkeypatch.setattr("proxy.router._check_slot_availability", AsyncMock(return_value=None))
+
+    # Reset dispatch lease tracking (LP-0MRDKV44T003FRBP + LP-0MRDUQ9QC003LDDP)
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
 
 
 async def _collect_streamed_chunks(resp):

@@ -77,7 +77,7 @@ class TestCheckSlotAvailabilityDedicatedClient:
                 Timeout=lambda t: t,
             ),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: None)
 
         result = await rh._check_slot_availability(
             srv, {"llama_server_port": 8080}, 8080, "Qwen3", "Qwen3",
@@ -118,7 +118,7 @@ class TestCheckSlotAvailabilityDedicatedClient:
                 Timeout=lambda t: t,
             ),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: None)
 
         result = await rh._check_slot_availability(
             srv,
@@ -158,7 +158,7 @@ class TestCheckSlotAvailabilityDedicatedClient:
                 Timeout=lambda t: t,
             ),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: None)
 
         result = await rh._check_slot_availability(
             srv, {"llama_server_port": 8080}, 8080, "Qwen3", "Qwen3",
@@ -192,7 +192,7 @@ class TestCheckSlotAvailabilityDedicatedClient:
 
         client = _Slow(timeout=None)
         monkeypatch.setattr(rh, "httpx", SimpleNamespace(AsyncClient=lambda timeout: client))
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: None)
 
         start = asyncio.get_event_loop().time()
         result = await rh._check_slot_availability(
@@ -239,7 +239,7 @@ class TestCheckSlotAvailabilityDedicatedClient:
                 Timeout=lambda t: t,
             ),
         )
-        monkeypatch.setattr(rh, "_discover_local_child_port", lambda s: None)
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **kw: None)
 
         result = await rh._check_slot_availability(
             srv, {"llama_server_port": 8080}, 8080, "Qwen3", "Qwen3",
