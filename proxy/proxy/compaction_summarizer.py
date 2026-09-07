@@ -1,9 +1,3 @@
-
-# <!-- REFACTOR-LP-0MTPNMF3Q001VKA6
-# smell: naming
-# severity: medium
-# description: Variable `_PROMPT` in function should be lowercase
-# -->
 """
 Proxy-side local summarizer for session compaction (LP-0MTPMJG1P0038D32).
 
@@ -76,9 +70,9 @@ def build_local_summarizer(
     model_name = cfg.get("summarizer_model_name") or "Qwen3"
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
     try:
-        from proxy.provider import _SUMMARIZER_SYSTEM_PROMPT as _PROMPT
+        from proxy.provider import _SUMMARIZER_SYSTEM_PROMPT as _prompt  # noqa: N811
     except Exception:
-        _PROMPT = (  # noqa: N806
+        _prompt = (
             "Summarise the middle portion of this conversation for context retention. "
             "Preserve essential instructions, decisions, and key facts."
         )
@@ -93,7 +87,7 @@ def build_local_summarizer(
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": _PROMPT},
+                {"role": "system", "content": _prompt},
                 {"role": "user", "content": transcript},
             ],
             "max_tokens": max_tokens,
@@ -122,9 +116,7 @@ def build_local_summarizer(
             if not isinstance(content, str):
                 # Some servers return content as list parts
                 if isinstance(content, list):
-                    content = "\n".join(
-                        str(p.get("text", "")) for p in content if isinstance(p, dict)
-                    )
+                    content = "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
                 else:
                     content = str(content or "")
             return content.strip()
