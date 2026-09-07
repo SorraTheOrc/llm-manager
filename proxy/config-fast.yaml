@@ -153,9 +153,8 @@ session_recording:
 # See proxy/provider_resolver.py for the full mapping table.
 audit_model: "deepseek-v4-flash"
 audit_model_fallbacks:
-  # Mirrors plan's provider chain: muse tier first, then the paid
-  # deepseek tier (plan: local -> zen muse -> go muse -> deepseek).
-  - "muse-spark-1.2-contributor-free"
+  # Mirrors plan's paid-tier fallbacks (the opencode free zen-muse tier
+  # was removed: OpenCode's free tier errors outside the OpenCode app).
   - "deepseek-v4-flash"
 
 models:
@@ -183,14 +182,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-zen-muse-free
-        type: remote
-        provider: opencode-zen
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: muse-spark-1.2-contributor-free
-        api: openai-responses
-        forward_session_headers: false
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -259,14 +250,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-zen-muse-free
-        type: remote
-        provider: opencode-zen
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: muse-spark-1.2-contributor-free
-        api: openai-responses
-        forward_session_headers: false
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -333,14 +316,6 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      - name: opencode-zen-muse-free
-        type: remote
-        provider: opencode-zen
-        endpoint: https://opencode.ai/zen
-        api_key_env: OPENCODE_API_KEY
-        model: muse-spark-1.2-contributor-free
-        api: openai-responses
-        forward_session_headers: false
       - name: opencode-go-3
         type: remote
         provider: opencode-go
