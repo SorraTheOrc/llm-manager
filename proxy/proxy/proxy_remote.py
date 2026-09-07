@@ -637,6 +637,75 @@ async def _translate_responses_stream(aiter) -> Any:
     return
 
 
+# ===================================================================
+# Console / Console Go session-header synthesis (LP-0MTR3CHEP007S699)
+# ===================================================================
+# opencode.ai Console (https://opencode.ai/zen) and Console Go
+# (https://opencode.ai/zen/go) upstreams reject requests without an
+# ``x-opencode-session`` header (HTTP 400 MissingSessionID). When pi /
+# opencode clients talk DIRECTLY to opencode.ai they add the header
+# client-side (pi dist/core/provider-attribution.js getSessionHeaders,
+# matched on provider opencode/opencode-go or base-URL host opencode.ai);
+# when the request arrives via this proxy the client's base URL is the
+# proxy, so the client never adds it and the proxy must synthesize it on
+# the upstream hop from the inbound session id.
+
+_OPENCODE_HOST = "opencode.ai"
+"""Host of the opencode.ai Console / Console Go gateways.
+
+Matched as an exact hostname against the configured upstream endpoint URL
+(mirrors the client-side host check in pi's provider-attribution.js).
+"""
+
+# Proxy-local session headers whose value identifies the client session
+# (same priority order as proxy/session.py _resolve_session_id_header).
+_SESSION_ID_HEADER_KEYS = (
+    "x-session-id",
+    "session_id",
+    "x-client-request-id",
+    "x-session-affinity",
+)
+
+
+def _is_opencode_upstream(endpoint: str) -> bool:
+    """Return True when *endpoint* targets an opencode.ai gateway host.
+
+    Mirrors the client-side host check pi uses for its own opencode session
+    headers (provider-attribution.js matchesHost against opencode.ai). Covers
+    both Console (opencode.ai/zen) and Console Go (opencode.ai/zen/go).
+    Uses an exact hostname match so lookalike hosts (e.g.
+    ``opencode.ai.evil.example``) are never treated as opencode upstreams.
+    """
+    if not endpoint:
+        return False
+    try:
+        host = httpx.URL(str(endpoint)).host
+    except Exception:
+        host = ""
+    return host == _OPENCODE_HOST
+
+
+def _resolve_client_session_id(headers: dict) -> str | None:
+    """Resolve the client session id from request headers.
+
+    Priority order matches the proxy's session-header convention
+    (proxy/session.py ``_resolve_session_id_header``): ``x-session-id``,
+    ``session_id``, ``x-client-request-id``, ``x-session-affinity``.
+    Returns ``None`` when none are present.
+    """
+    lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
+    for key in _SESSION_ID_HEADER_KEYS:
+        value = lowered.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _sanitize_header_value(value: str) -> str:
+    """Strip CR/LF from a header value to prevent header injection."""
+    return str(value).replace("\r", "").replace("\n", "").strip()
+
+
 async def proxy_to_remote(
     request: Request,
     path: str,
@@ -711,6 +780,19 @@ async def proxy_to_remote(
     attribution_headers = model_config.get("attribution_headers", {})
     if attribution_headers and isinstance(attribution_headers, dict):
         headers.update(attribution_headers)
+
+    # Synthesize x-opencode-session for Console / Console Go upstreams
+    # (LP-0MTR3CHEP007S699). opencode.ai gateways require this header and
+    # reject requests without it (HTTP 400 MissingSessionID). When the
+    # client talks to the proxy instead of opencode.ai directly it cannot
+    # add the header itself, so derive it from the inbound session id.
+    # A client-/config-supplied x-opencode-session is never overridden.
+    if _is_opencode_upstream(endpoint) and not any(
+        str(k).lower() == "x-opencode-session" for k in headers
+    ):
+        _opencode_session = _resolve_client_session_id(request.headers)
+        if _opencode_session:
+            headers["x-opencode-session"] = _sanitize_header_value(_opencode_session)
 
     body_json = json.loads(body) if body else {}
     if not isinstance(body_json, dict):
