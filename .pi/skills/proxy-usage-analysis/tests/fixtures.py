@@ -343,7 +343,6 @@ server:
   local_large_context_cold_cache_threshold: 60000
   local_large_context_warm_cache_threshold: 100000
   local_model_ctx_size: 262144
-  local_max_concurrent_queries: 1
   local_dispatch_lease_timeout_seconds: 60
   session_single_flight_mode: queue
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
@@ -414,6 +413,34 @@ def mode_map_fixture() -> object:
 S1 = "11111111-1111-1111-1111-111111111111"
 # Session S2: local -> remote fallback, fully inside the window.
 S2 = "22222222-2222-2222-2222-222222222222"
+
+# --- Compaction events (LP-0MTHCTLAF00147IT) ------------------------------
+
+COMPACTION_EVENT_FAST = (
+    "2026-08-02 14:12:00,000 - INFO - compaction_event "
+    "session=019fc2be-eb73-7830-a55e-c8bd5d21c927 "
+    "mode=fast action=compact reason=context_window "
+    "pre_tokens=55000 post_tokens=42000 turns_summarized=3 turns_dropped=1 "
+    "summary_tokens=800 dry_run=false"
+)
+
+COMPACTION_EVENT_CHEAP = (
+    "2026-08-02 14:12:30,000 - INFO - compaction_event "
+    "session=019fc2be-eb73-7830-a55e-c8bd5d21c928 "
+    "mode=cheap action=remote_with_guidance reason=context_window "
+    "pre_tokens=60000 post_tokens=35000 turns_summarized=2 turns_dropped=0 "
+    "summary_tokens=1200 dry_run=true"
+)
+
+COMPACTION_BACKSTOP = (
+    "2026-08-02 14:13:00,000 - INFO - compaction_backstop "
+    "action=dropped dropped_turns=1 dropped_messages=2 estimated_before=65000 estimated_after=48000"
+)
+
+COMPACTION_CHURN = (
+    "2026-08-02 14:13:30,000 - INFO - compaction_churn "
+    "session=019fc2be-eb73-7830-a55e-c8bd5d21c927 count=5 rate_per_hour=2.3 exceeds_target=true"
+)
 
 E2E_LINES = [
     # Rotated file content (13:29:00 - 14:00:00): S1 starts before the window.

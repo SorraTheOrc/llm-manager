@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.1.17 (2026-09-07)
+### Features
+- proxy-usage-analysis: report server-side compactions and fallback avoidance impact (LP-0MTHCTLAF00147IT)
+- Server-side compaction report: dry-run estimate + schedule-aware trigger thresholds (LP-0MTNIJQ8U007AGVW)
+- Proxy: switch to sibling provider after repeated upstream failures on same provider (LP-0MTPMF03P0046MFG)
+- Implement generating-only pool with prefill-aware guard to reduce false-full fallbacks (LP-0MTH7JX82000YS5N)
+- Web UI models list: show per-model active times and Active/Inactive flag (LP-0MT2WMACO003SE7M)
+### Bug Fixes
+- Fix proxy /llama/local/status querying wrong child (embed vs Qwen3) — slots divergence 3/3 vs 0/3 (LP-0MTP1FQXH004JYEF)
+- Fix max_output_tokens validation error for muse via Console Go provider (Responses API translation) (LP-0MTJSORO10035LKR)
+- Implement KV slot persistence fixes from reuse-gap evaluation (fast cap 83285 / cheap cap 126976) (LP-0MTE9HAF8008909G)
+- Synthesize x-opencode-session header for Console/Console Go upstream requests (LP-0MTR3CHEP007S699)
+### Other
+- Honest Retry-After: emit real provider availability windows (LP-0MT654ISW002QVH4)
+- Implement proactive session compaction (two-tier: proxy-side + hard-cap gate) (LP-0MTCW79RR000LFMJ)
+- Post-rollout proxy monitoring: warm/cold prefill ratio, fallback rate, remote spend, TTFT (LP-0MTBTCK2I005MOTE)
+- Integration tests: persistence cap & restore-rate validation (fast/cheap modes) (LP-0MTIFR5W3006UAX8)
+- ruff N806 in /home/rgardler/projects/llm/proxy/proxy/compaction_summarizer.py — candidate false positive — producer decision required (LP-0MTR5GATN008US2U)
+- Evaluate increasing local context size (ctx-size) to serve >65K-token prompts locally (LP-0MSAOQTJS000FFVM)
+- Quality Improvement - Refactoring (LP-0MTLGH6II003J4C4)
+- Fix ruff lint findings in tests/test_rebuild_llama.py and tests/test_rebuild_and_restart_mtp.py (LP-0MSXZ5QY0009WG9E)
+- Align cheap static ctx to 262144 (LP-0MTO8SZ8K0080RHT)
+- Quality Improvement - Refactoring (LP-0MTHMCWLX008WNXH)
+- Refactor: Unused Import in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MTHCTLAF00147IT-proxy-usage-analysis-report-server-side/.pi/skills/proxy-usage-analysis/tests/test_analyze_proxy_usage.py (LP-0MTHLGVPO004DZ56)
+- Refactor: Unused Import in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MTHCTLAF00147IT-proxy-usage-analysis-report-server-side/.pi/skills/proxy-usage-analysis/scripts/reporting.py (LP-0MTHLGTUR00053QP)
+- AGENTS.md: instruct agents to NEVER kill the LLM proxy (LP-0MTQAXB5Q005MJE5)
+- Bump local_slot_exhaustion_retry_attempts 1 -> 2 (grace retry on slot exhaustion) (LP-0MSORQKKM005MJ31)
+- Remove local_max_concurrent_queries from proxy-usage-analysis skill test fixture (LP-0MTD4C1HN005I48W)
+
 ## v0.1.16 (2026-08-31)
 ### Features
 - Rollout: raise local persistence cap (session_slot_max_prompt_tokens) to routing clamp (LP-0MTBTCB8D000OQ0C)

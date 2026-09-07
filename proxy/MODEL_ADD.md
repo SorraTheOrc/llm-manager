@@ -273,5 +273,55 @@ comments and follow best practices.
 - Add alias mapping code in `get_model_config()`.
 - Add the integration test `proxy/tests/test_embeddings_integration.py`.
 
+## Timed access to providers (optional, LP-0MS4ETBNO0022QAC)
+
+A provider may carry an `available_times` list restricting when it may be used.
+Entries are `"HH:MM-HH:MM"` UTC windows; window start is inclusive, end is
+_exclusive_, and overnight ranges (e.g. `"22:00-02:00"`) wrap past midnight.
+Routing skips providers outside their window at selection time. Unrestricted
+providers (no `available_times` or only malformed entries) are always
+eligible — malformed entries are logged and ignored (fail-open).
+
+```yaml
+models:
+  example:
+    providers:
+      - name: deepseek-v4-flash
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+```
+
+### Validating timed access
+
+| Helper | Location | Purpose |
+|--------|----------|---------|
+| `_parse_window` | `proxy/proxy/provider.py` | Parse a single window string |
+| `_parse_available_times` | `proxy/proxy/provider.py` | Parse + cache a provider's list |
+| `_is_within_allowed_window` | `proxy/proxy/provider.py` | Check if now-UTC is inside any window |
+| `format_available_times` | `proxy/proxy/provider.py` | Render windows for the UI (e.g. `00:00-01:00, ... (UTC)`) |
+| `format_active_status` | `proxy/proxy/provider.py` | Render `Active`/`Inactive` for the UI |
+
+### Home tab display (LP-0MT2WMACO003SE7M)
+
+The **Home tab** `Model Endpoints` table shows, per provider entry within each
+model's fallback chain:
+
+| Column | Content |
+|--------|---------|
+| `Active Times` | The provider's `available_times` in config order, e.g. `00:00–01:00, 04:00–06:00 (UTC)`. Unrestricted providers show `Always`. |
+| `Status` | `Active` (green badge) when the provider is usable right now — i.e. inside any of its windows or unrestricted; `Inactive` (red badge) otherwise. |
+
+Both values are computed **once at page-serve time** (current UTC) via the
+shared `proxy.provider` helpers, so the display can never disagree with
+routing. The flag is static until the page is refreshed (no client-side
+clock/polling — operator decision per LP-0MT2WMACO003SE7M). Windows are shown in
+UTC with an explicit `(UTC)` label — no local-time conversion.
+
 ## References
 - Parent work item: LP-0MN557XBD0H8B8PC - Add an embeddings specific model
+- LP-0MS4ETBNO0022QAC — Timed access (backend)
+- LP-0MT2WMACO003SE7M — Home tab Active Times / Status columns

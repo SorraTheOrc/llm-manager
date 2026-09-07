@@ -14,10 +14,19 @@ Key features
 
 ### API & Routing
 - **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings` passthrough endpoints that route automatically to the correct backend.
-- **Local + remote backends** — serves local models via llama-server (in a podman container) and proxies remote models to external APIs (OpenAI, Anthropic, etc.).
+- **Local + remote backends** — serves local models via llama-server and proxies remote models to external APIs (OpenAI, Anthropic, etc.).
+- **Fallback model routing** — single model name can route to a list of models with the each falling back to the next based on availability/time/budget.
 - **Model aliases & wildcards** — configure aliases such as `gpt-*` to match any model starting with a prefix.
 - **Router mode** — multi-model routing with automatic model loading, fallback models, and a router status indicator in the UI.
 - **Automatic model switching** — `/admin/switch-model/{model}` switches the running model; the UI shows live loading progress via SSE.
+
+### Session & Slot Management
+- **Job-level slot scheduler** — configurable slot pool with queueing, per-job timeouts, and load-aware skip to avoid ReadTimeouts under concurrency.
+- **Dispatch leases** — per-session reservation of the local backend with adaptive timeouts and prefill-progress polling.
+- **Automatic Config Switching** — switch local model modes to keep more traffic local (slower) or push remote (faster) based on time.
+- **Session tracking** — active session list with preview text, model, and provider; sessions can be deleted via the admin API.
+- **Session recording retention** — automatic pruning of old recordings with configurable retention days and background intervals.
+- **Grandfathering** — legacy session migration for in-flight requests across proxy restarts.
 
 ### Live Dashboard
 - **Status bar** — proxy, current model, router mode, and llama-server status at a glance.
@@ -25,7 +34,6 @@ Key features
 - **Real-time slot status** — per-slot cards showing idle/processing/waiting states with token progress for the local server.
 - **Model endpoints table** — overview of every configured model with its provider type (local/remote), primary endpoint, and fallbacks.
 - **Server-Sent Events (SSE)** — `/events` pushes live status, model-switch, and slot updates to the UI.
-- **Tabbed interface** — Home (slots & endpoint overview), Models (test console & routing info), and API (endpoint reference).
 
 ### Interactive Testing
 - **Quick Test console** — chat directly with the current model from the browser with streaming responses.
@@ -35,19 +43,12 @@ Key features
 - **Live dual-pane log viewer** (`/logs`) — streaming proxy and llama-server logs with line limits, autoscroll, clear, and download controls.
 - **Per-slot log isolation** — a dedicated Slots tab shows a live log section per llama-server slot, filterable server-side by slot/session.
 - **Request summary** — per-endpoint request counts and token statistics (with per-role breakdowns for chat traffic).
-- **Session recordings** — every prompt/completion/embedding is recorded to disk; browse sessions, replay conversations, and inspect raw JSON via the admin API.
+- **Session recordings** — PRIVACY WARNING: every prompt/completion/embedding is optionally recorded to disk; browse sessions, replay conversations, and inspect raw JSON via the admin API.
 - **Prometheus metrics** — `/metrics` endpoint for monitoring.
-
-### Session & Slot Management
-- **Job-level slot scheduler** — configurable slot pool with queueing, per-job timeouts, and load-aware skip to avoid ReadTimeouts under concurrency.
-- **Dispatch leases** — per-session reservation of the local backend with adaptive timeouts and prefill-progress polling.
-- **Session tracking** — active session list with preview text, model, and provider; sessions can be deleted via the admin API.
-- **Session recording retention** — automatic pruning of old recordings with configurable retention days and background intervals.
-- **Grandfathering** — legacy session migration for in-flight requests across proxy restarts.
 
 ### Administration
 - **Health check** — `/health` reports readiness, self-healing state, GPU wedge detection, and TTS server status.
-- **Mode switching** — toggle between Fast (cloud-backed) and Cheap (2-slot local pool) runtime modes.
+- **Mode switching** — toggle between Fast (cloud-backed) and Cheap (local pool) runtime modes.
 - **Hot config reload** — `/admin/reload-config` re-reads configuration without a restart.
 - **Server control** — stop/restart the llama-server from the UI (with confirmation), plus TTS server lifecycle management.
 - **Self-healing & recovery** — automatic backend recovery, GPU wedge detection, and disconnect-reaper middleware for stalled clients.
@@ -56,10 +57,6 @@ Key features
 ### Text-to-Speech
 - **TTS server integration** — managed local TTS server with health monitoring in the `/health` endpoint.
 - **Voice and speech APIs** — `/v1/voices` lists available voices and `/v1/audio/speech` synthesizes speech.
-
-Key files
-- `proxy/server.py` — server, SSE, and the model stats query helper
-- `proxy/tests/` — unit tests and Playwright tests (e.g. `test_query_llama_status.py`, `status-stats.spec.js`)
 
 Quick start (development)
 1. Create and activate a virtualenv:
@@ -95,6 +92,19 @@ Testing
   . .venv/bin/activate && python -m pytest -q
   ```
   Prefer `/skill:test` above; the direct command bypasses the cache.
+
+#### Persistence-cap integration tests
+
+The following test modules exercise the persistence-cap pin fix (LP-0MTIFR5W3006UAX8 / LP-0MTE9HAF8008909G):
+
+| Module | Purpose |
+|--------|---------|
+| `proxy/tests/test_cap_persistence_pin.py` | Fast (83285) and cheap (126976) clamp derivation and persistence gating |
+| `proxy/tests/test_clamp_derived_persistence.py` | Clamp derived from `effective_per_slot_threshold` (dynamic schedule-aware path) |
+| `proxy/tests/test_slot_persistence_guards.py` | GPU-wedge safeguards: adaptive timeout, circuit breaker, skip-when-busy |
+| `proxy/tests/test_persistence_cap_modes.py` | **New** — save→restore cycles for oversized (>50K) contexts in fast/cheap modes; restore-rate baselines (>80% for >50K); wedge parameter pinning |
+
+Run all four: `. .venv/bin/activate && python -m pytest proxy/tests/test_cap_persistence_pin.py proxy/tests/test_clamp_derived_persistence.py proxy/tests/test_slot_persistence_guards.py proxy/tests/test_persistence_cap_modes.py -q`
 
 > **Safety:** the default test run never spawns or kills real OS processes and
 > never touches the live proxy/llama-server/TTS server. Live tests are opt-in

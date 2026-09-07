@@ -16,7 +16,13 @@ from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from proxy.lifecycle import _extract_router_model_ids
 from proxy.observability import _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
-from proxy.provider import get_local_model_name_from_providers, get_model_type, get_remote_endpoint
+from proxy.provider import (
+    format_active_status,
+    format_available_times,
+    get_local_model_name_from_providers,
+    get_model_type,
+    get_remote_endpoint,
+)
 from proxy.router_helpers import _get_per_model_queries
 from proxy.session_recorder import MAX_SESSION_DROPDOWN_COUNT
 
@@ -114,6 +120,15 @@ def _build_home_model_rows(srv) -> str:
                     f'</span>'
                 )
 
+            # Active times + status (via shared provider helpers — single source of truth)
+            active_times = format_available_times(p)
+            active_status = format_active_status(p)
+            if active_status == "Active":
+                status_cell = '<span class="badge-active">Active</span>'
+            else:
+                status_cell = '<span class="badge-inactive">Inactive</span>'
+            active_times_cell = f'<span class="active-times">{active_times}</span>'
+
             if is_first:
                 rows += f"""
         <tr>
@@ -121,12 +136,16 @@ def _build_home_model_rows(srv) -> str:
             <td{rowspan_attr}><span class="badge-type {type_badge_class}">{type_label}</span></td>
             <td>{endpoint_display}</td>
             <td>{model_display}</td>
+            <td>{active_times_cell}</td>
+            <td>{status_cell}</td>
         </tr>"""
             else:
                 rows += f"""
         <tr>
             <td>{endpoint_display}</td>
             <td>{model_display}</td>
+            <td>{active_times_cell}</td>
+            <td>{status_cell}</td>
         </tr>"""
     return rows
 

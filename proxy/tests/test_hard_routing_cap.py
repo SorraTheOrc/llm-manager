@@ -271,45 +271,45 @@ class TestHardCapRatioResolution:
 
 
 class TestRealConfigRatioResolution:
-    """AC5: the shipped config files carry the ratios and resolve correctly."""
+    """AC5: shipped configs DISABLE the hard cap (LP-0MTLB1LK80098R43 revert of
+    LP-0MTBOX45O005LD1S per LP-0MTBTCK2I005MOTE NOT EFFECTIVE): ratio 0 = dynamic
+    per-slot clamp (83285 fast / min(100000,126976)=100000 cheap)."""
 
     def test_fast_yaml_ratio_and_resolution(self, provider_mod, real_config, patch_scheduler):
         fast = real_config["fast"]
         server = fast.get("server", fast)
-        assert server.get("local_hard_routing_cap_ratio_fast") == 0.84049
-        # Derived persistence (AC4): static 83285 replaced by the derived 0.
+        # Hard-routing cap DISABLED (LP-0MTLB1LK80098R43): 0 = per-slot clamp.
+        assert server.get("local_hard_routing_cap_ratio_fast") == 0
         assert server.get("session_slot_max_prompt_tokens") == 0
         patch_scheduler(262144, 3)
         cap = provider_mod.compute_hard_routing_cap("fast", server)
-        assert cap == 70000
+        assert cap == 0
 
     def test_cheap_yaml_ratio_and_resolution(self, provider_mod, real_config, patch_scheduler):
         cheap = real_config["cheap"]
         server = cheap.get("server", cheap)
-        assert server.get("local_hard_routing_cap_ratio_cheap") == 0.6144
+        assert server.get("local_hard_routing_cap_ratio_cheap") == 0
         assert server.get("session_slot_max_prompt_tokens") == 0
-        # Live cheap schedule pairs: 2 × 262144.
+        # Live cheap schedule pairs: 2 × 262144 — but cap disabled so 0.
         patch_scheduler(262144, 2)
         cap = provider_mod.compute_hard_routing_cap("cheap", server)
-        assert cap == 61440
+        assert cap == 0
 
     def test_base_yaml_uses_fast_ratio(self, provider_mod, real_config, patch_scheduler):
         base = real_config["base"]
         server = base.get("server", base)
-        assert server.get("local_hard_routing_cap_ratio_fast") == 0.84049
+        assert server.get("local_hard_routing_cap_ratio_fast") == 0
         assert server.get("local_hard_routing_cap_ratio_cheap") in (None, 0)
         patch_scheduler(262144, 3)
         cap = provider_mod.compute_hard_routing_cap("fast", server)
-        assert cap == 70000
+        assert cap == 0
 
     def test_cheap_boot_static_is_conservative(self, provider_mod, real_config):
-        """Boot-static cheap fallback (131072 ctx, no scheduler) is < approved
-        cap and > 0 — the accepted transient state (docstring note)."""
+        """Boot-static cheap cap is also DISABLED (0) in the revert."""
         cheap = real_config["cheap"]
         server = cheap.get("server", cheap)
         cap = provider_mod.compute_hard_routing_cap("cheap", server)
-        assert cap > 0
-        assert cap < 61440
+        assert cap == 0
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +641,9 @@ class TestWarmClampToHardCap:
     ``context_too_large`` fires at the SAME cap as persistence."""
 
     def test_warm_clamps_to_hard_cap(self, provider_mod, patch_scheduler, monkeypatch):
+        # Hard-routing cap still enforces a clamp when configured via test fixture
+        # (0.84049 → 70000) — the live configs disable it, so warm falls back
+        # to the per-slot clamp (83285). This test verifies the mechanism.
         import proxy.mode as mode_mod
 
         monkeypatch.setattr(mode_mod, "read_mode", lambda: "fast")
@@ -688,10 +691,13 @@ class TestEffectivePerSlotThreshold:
 class TestSessionSlotMaxPromptDerivation:
     """AC4: session_slot_max_prompt_tokens derives from same cap."""
 
-    def test_derives_from_hard_cap_when_configured(self, provider_mod, monkeypatch, patch_scheduler):
-        """
-        When a hard cap is configured, session.py should use it as the
-        max_prompt_tokens instead of the per-slot threshold.
+    def test_derives_from_per_slot_clamp_not_hard_cap(self, provider_mod, monkeypatch, patch_scheduler):
+        """LP-0MTE9HAF8008909G F3: persistence pins to the per-slot clamp (83285)
+        — not the hard-routing cap (70000) — so the largest beneficial
+        sessions (e.g. 75000 tokens) persist. Previous LP-0MTBOX45O005LD1S
+        wording claimed persistence used the hard cap; F3 corrected that gap
+        (F2: 38/48 sessions, ~22.8M tokens/day). Hard caps remain the ROUTING
+        gate only (see _effective_large_context_thresholds / check_hard_routing_cap).
         """
         import proxy.mode as mode_mod
         from proxy.session import _build_slot_context
@@ -707,18 +713,20 @@ class TestSessionSlotMaxPromptDerivation:
             "session_slot_max_prompt_tokens": 0,  # derived
             "session_slot_timeout_seconds": 3.0,
         }
-        # Estimate a context ABOVE the routing cap (70000) but BELOW the old
-        # static 83285: persistence must be skipped (derived from hard cap).
+        # 75000 > routing hard cap (70000) but <= per-slot clamp (83285).
+        # Routing would skip local, but PERSISTENCE must still save the slot
+        # so the KV is available for a later same-slot restore (gap fix).
         body = {"messages": [{"role": "user", "content": "x" * (75000 * 8)}]}
         slot_id, _, _ = _build_slot_context(server_cfg, "session-a", body)
-        assert slot_id is None
+        assert slot_id is not None
 
         # Hard cap math: round(0.84049 × min(100000, 262144//3 - 4096)) = 70000
         hard_cap = provider_mod.compute_hard_routing_cap("fast", server_cfg)
         assert hard_cap == 70000
         per_slot_thresh = provider_mod.effective_per_slot_threshold(262144, 3)
         assert per_slot_thresh == 83285
-        # Hard cap should be less than per-slot threshold when ratio < 1
+        # The hard cap exists but is strictly below the per-slot clamp (gap).
+        # Effective persistence uses max(hard_cap, clamp) = clamp = 83285.
         assert hard_cap < per_slot_thresh
 
     def test_falls_through_to_per_slot_without_hard_cap(self, provider_mod, monkeypatch, patch_scheduler):

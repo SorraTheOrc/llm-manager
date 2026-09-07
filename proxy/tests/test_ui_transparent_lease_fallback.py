@@ -42,11 +42,14 @@ def _setup_server_state(monkeypatch):
     # Reset dispatch tracking to a known state
     monkeypatch.setattr(srv_module, "active_queries", 0)
     monkeypatch.setattr(srv_module, "local_active_queries", 0)
+    monkeypatch.setattr(srv_module, "local_generating_queries", 0)
+    monkeypatch.setattr(srv_module, "local_generating_sessions", set())
     monkeypatch.setattr(srv_module, "local_dispatch_records", {})
     # Re-create locks to avoid sharing state with other test fixtures
     import asyncio
     monkeypatch.setattr(srv_module, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv_module, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv_module, "local_generating_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv_module, "local_dispatch_records_lock", asyncio.Lock())
     # Mock the session manager
     _mock_session_manager(monkeypatch, srv_module)
@@ -99,6 +102,10 @@ def _seed_other_session_lease(srv_module):
         "expires_at": time.monotonic() + 300,
     }
     srv_module.local_active_queries = 1
+    # Generating-only pool (LP-0MTH7JX82000YS5N): pool gate reads
+    # local_generating_queries, not local_active_queries.
+    srv_module.local_generating_queries = 1
+    srv_module.local_generating_sessions = {other}
 
 
 # ===================================================================

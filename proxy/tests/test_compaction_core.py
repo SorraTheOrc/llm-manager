@@ -36,9 +36,9 @@ from proxy.compaction import (
 # fast  : local_model_ctx_size 262144, session_slot_pool_size 3
 #         per_slot = 262144//3 - 4096 = 83285
 #         trigger = round-half-up(0.70 × 83285) = 58300
-# cheap : local_model_ctx_size 131072, session_slot_pool_size 2
-#         per_slot = 131072//2 - 4096 = 61440
-#         trigger = round-half-up(0.70 × 61440) = 43008 (spec: ≈43K)
+# cheap : local_model_ctx_size 262144, session_slot_pool_size 2
+#         per_slot = 262144//2 - 4096 = 126976
+#         trigger = round-half-up(0.70 × 126976) = 88883
 
 
 def fast_config(**overrides) -> dict:
@@ -63,7 +63,7 @@ def fast_config(**overrides) -> dict:
 
 
 def cheap_config(**overrides) -> dict:
-    return fast_config(local_model_ctx_size=131072, session_slot_pool_size=2, **overrides)
+    return fast_config(local_model_ctx_size=262144, session_slot_pool_size=2, **overrides)
 
 
 # -------------------------------------------------------------------
@@ -113,10 +113,9 @@ class TestTriggerComputation:
         # rounded half-up → 58300.
         assert compaction_trigger_tokens("fast", fast_config()) == 58300
 
-    def test_cheap_trigger_resolves_43008(self):
-        # AC3: cheap trigger = 0.70 × (131072//2 - 4096 = 61440) = 43008
-        # (the spec writes ≈43K).
-        assert compaction_trigger_tokens("cheap", cheap_config()) == 43008
+    def test_cheap_trigger_resolves_88883(self):
+        # AC3: cheap trigger = 0.70 × (262144//2 - 4096 = 126976) = 88883.
+        assert compaction_trigger_tokens("cheap", cheap_config()) == 88883
 
     def test_trigger_scales_with_ratio(self):
         cfg = fast_config(compaction_trigger_ratio=0.9)
@@ -146,9 +145,9 @@ class TestTriggerComputation:
         assert should_compact_session(58300, "fast", fast_config()) is False
         assert should_compact_session(58301, "fast", fast_config()) is True
 
-    def test_should_compact_cheap_fires_above_43008(self):
-        assert should_compact_session(43008, "cheap", cheap_config()) is False
-        assert should_compact_session(43009, "cheap", cheap_config()) is True
+    def test_should_compact_cheap_fires_above_88883(self):
+        assert should_compact_session(88883, "cheap", cheap_config()) is False
+        assert should_compact_session(88884, "cheap", cheap_config()) is True
 
     def test_should_compact_false_when_disabled(self):
         cfg = fast_config(compaction_trigger_ratio=0)

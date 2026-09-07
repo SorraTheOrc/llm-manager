@@ -929,6 +929,13 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
     await _schedule_token_increment(key, tokens_sent)
 
+    # Dispatch→first-byte capture (LP-0MTJET616005S7PN: prefill/audit latency).
+    _dispatch_start = None
+    try:
+        _dispatch_start = time.monotonic()
+    except Exception:
+        pass
+
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
 
@@ -1191,6 +1198,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             #     max_runtime_seconds (long — large prompt ingestion).
                             #   Phase 2 (between chunks): budget =
                             #     stream_idle_timeout_seconds (short).
+                            _generating_slot_counted = False
+                            # Dispatch→first-byte capture uses this stable per-stream scope
+                            _first_byte_emitted = False
                             _stream_aiter = response.aiter_bytes().__aiter__()
                             _stream_iter = asyncio.ensure_future(
                                 _stream_aiter.__anext__()
@@ -1383,7 +1393,41 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     pass
 
                                 if _has_actual_data:
+                                    # Dispatch→first-byte capture: first actual data chunk marks the
+                                    # generating phase and gives the distribution-relevant latency
+                                    # without request-ID correlation (LP-0MTJET616005S7PN).
+                                    if not _first_byte_emitted:
+                                        try:
+                                            _now = time.monotonic()
+                                            _delta = (_now - _dispatch_start) if isinstance(_dispatch_start, float) else None
+                                            if _delta is not None and _delta >= 0:
+                                                srv.logger.info(
+                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f session=%s model=%s",
+                                                    _delta * 1000.0,
+                                                    _delta * 1000.0,
+                                                    session_id or "unknown",
+                                                    model_name or "unknown",
+                                                )
+                                            _first_byte_emitted = True
+                                        except Exception:
+                                            try:
+                                                _first_byte_emitted = True
+                                            except Exception:
+                                                pass
                                     remaining_budget = float(stream_idle_timeout)
+                                    # First actual data chunk marks the
+                                    # generating phase for the pool gate
+                                    # (LP-0MTH7JX82000YS5N).
+                                    if not _generating_slot_counted and _has_actual_data:
+                                        try:
+                                            from proxy.router_helpers import _increment_generating_only_slot
+
+                                            await _increment_generating_only_slot(
+                                                srv, session_key=session_id
+                                            )
+                                            _generating_slot_counted = True
+                                        except Exception:
+                                            pass
                                     # Prefill phase is over: the first actual data
                                     # chunk has arrived, so stop progress-based
                                     # lease extension — the chunk-refresh path
@@ -1608,21 +1652,52 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     provider="local",
                                 )
 
-                            # Update session history and save slot (shared helper)
-                            await _update_session_and_slot(
-                                srv, session_id, body_json,
-                                is_delta_request, delta_messages,
-                                original_message_count,
-                                response,
-                                llama_port, slot_id, slot_filename,
-                                slot_timeout, slot_model_payload,
-                                slot_enabled,
-                                upstream_status=upstream_status,
-                                slot_save_allowed=slot_save_allowed,
-                                collected_content=collected_content,
-                                llama_log_path=llama_log_path,
-                                llama_log_offset=llama_log_offset,
-                            )
+                            # Restore-before-save ordering (LP-0MTIHXPP9005182I):
+                            # streaming saves previously ran outside slot_guard,
+                            # so a hot same-slot restore could race behind the
+                            # save and overwrite the candidate (~438K tokens/day).
+                            # Re-acquire the slot lock around the save so
+                            # same-slot restores (which also hold the lock at
+                            # request start) are serialized before the save.
+                            # Zero GPU footprint: same save/restore calls and
+                            # timeouts (AC4), just ordered behind the existing
+                            # SlotLockCoordinator (AC2 unchanged).
+                            if slot_save_allowed and slot_enabled and slot_id is not None:
+                                async with slot_lock_coordinator.acquire(slot_id):
+                                    await _update_session_and_slot(
+                                        srv, session_id, body_json,
+                                        is_delta_request, delta_messages,
+                                        original_message_count,
+                                        response,
+                                        llama_port, slot_id, slot_filename,
+                                        slot_timeout, slot_model_payload,
+                                        slot_enabled,
+                                        upstream_status=upstream_status,
+                                        slot_save_allowed=slot_save_allowed,
+                                        collected_content=collected_content,
+                                        llama_log_path=llama_log_path,
+                                        llama_log_offset=llama_log_offset,
+                                    )
+                                    try:
+                                        from proxy.session import _record_hot_slot_owner
+                                        _record_hot_slot_owner(slot_id, session_id)
+                                    except Exception:
+                                        pass
+                            else:
+                                await _update_session_and_slot(
+                                    srv, session_id, body_json,
+                                    is_delta_request, delta_messages,
+                                    original_message_count,
+                                    response,
+                                    llama_port, slot_id, slot_filename,
+                                    slot_timeout, slot_model_payload,
+                                    slot_enabled,
+                                    upstream_status=upstream_status,
+                                    slot_save_allowed=slot_save_allowed,
+                                    collected_content=collected_content,
+                                    llama_log_path=llama_log_path,
+                                    llama_log_offset=llama_log_offset,
+                                )
 
                             # Wrap both cm.__aexit__ and client.aclose() with a
                             # configurable timeout so that an unresponsive upstream
@@ -1674,6 +1749,15 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 # _stream_iter may not exist in all code paths
                                 pass
 
+                            if _generating_slot_counted:
+                                try:
+                                    from proxy.router_helpers import _decrement_generating_only_slot
+
+                                    await _decrement_generating_only_slot(
+                                        srv, session_key=session_id
+                                    )
+                                except Exception:
+                                    pass
                             # Decrement local active queries now that the stream
                             # has finished (LP-0MR96QL8400022BW: streaming path was
                             # not decrementing local_active_queries, causing subsequent

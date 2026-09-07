@@ -46,6 +46,25 @@ _provider_unavailable_until: dict[str, float] = {}
 # Incremented on each failure, reset to 0 on success.
 _provider_failure_count: dict[str, int] = {}
 
+# ---------------------------------------------------------------------------
+# Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
+#
+# Tracks consecutive empty_response/stall failures per provider across
+# retry cycles. When the count exceeds the configured threshold within
+# the sliding window, the provider is marked unavailable for an extended
+# cooldown so the retry cycle permanently skips it and tries siblings.
+#
+# State is in-memory (no persistence), consistent with the existing
+# cooldown mechanism.
+# ---------------------------------------------------------------------------
+
+# Consecutive empty/stall failure count: provider_name -> count
+_sibling_failure_count: dict[str, int] = {}
+
+# Timestamp (monotonic) when the current consecutive-failure streak began
+# for a provider. Reset when the streak clears.
+_sibling_failure_streak_start: dict[str, float] = {}
+
 # Exponential backoff constants (remote providers only)
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
@@ -75,6 +94,25 @@ _PERIOD_DEFAULT_SECONDS = {
     "weekly": 7 * 24 * 3600,
     "monthly": 30 * 24 * 3600,
 }
+
+# ---------------------------------------------------------------------------
+# Default sibling-fallback constants
+# ---------------------------------------------------------------------------
+
+# Default number of consecutive empty/stall failures before triggering
+# an extended cooldown that forces the retry cycle to skip this provider.
+_DEFAULT_SIBLING_FALLBACK_THRESHOLD = 2
+
+# Default extended cooldown duration (seconds) applied when the sibling-
+# fallback threshold is exceeded. This is much longer than the standard
+# provider cooldown so the retry cycle permanently skips the failing
+# provider and tries siblings instead of repeatedly hitting the same one.
+_DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS = 600  # 10 minutes
+
+# Sliding window (seconds) for the consecutive-failure streak. If a
+# provider has no failures for longer than this window, the streak
+# is considered stale and resets.
+_DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS = 600  # 10 minutes
 
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
@@ -1646,6 +1684,83 @@ def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = Non
     return False
 
 
+def _seconds_until_next_window(provider_cfg: dict, now_utc: datetime | None = None) -> float | None:
+    """Return seconds until the provider's next available_times window opens.
+
+    Returns ``None`` when the provider is currently inside its window or has
+    no ``available_times`` restriction. Otherwise returns the positive number
+    of seconds until the next window start (UTC).
+    """
+    windows = _parse_available_times(provider_cfg)
+    if windows is None:
+        return None
+    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+        return None
+    if now_utc is None:
+        now_utc = datetime.now(UTC)
+    current_min = now_utc.hour * 60 + now_utc.minute
+    current_sec = now_utc.second
+    # Find the soonest upcoming window start
+    best: int | None = None
+    for start_min, _end_min in windows:
+        if start_min > current_min:
+            delta_min = start_min - current_min
+        elif start_min == current_min and current_sec == 0:
+            delta_min = 0
+        else:
+            # Window is tomorrow
+            delta_min = (24 * 60 - current_min) + start_min
+        if best is None or delta_min < best:
+            best = delta_min
+    if best is None:
+        return None
+    # Subtract elapsed seconds within the current minute for sub-minute precision
+    return float(best * 60 - current_sec)
+
+
+def _compute_retry_after(
+    unavailable_providers: dict | None = None,
+    model_config: dict | None = None,
+    now_utc: datetime | None = None,
+) -> int:
+    """Compute an honest ``retry_after`` (seconds) from real availability data.
+
+    Takes the maximum of:
+    - cooldown durations (``unavailable_providers`` values)
+    - available_times window edges (seconds until next window for providers
+      currently outside their window)
+    - usage-limit reset times (``_usage_reset_at`` remaining seconds)
+
+    Returns 0 when every provider is actually available (edge case).
+    """
+    candidates: list[float] = []
+
+    if unavailable_providers:
+        for v in unavailable_providers.values():
+            try:
+                candidates.append(float(v))
+            except Exception:
+                pass
+
+    if model_config is not None:
+        for p in (model_config.get("providers") or []):
+            if not isinstance(p, dict):
+                continue
+            secs = _seconds_until_next_window(p, now_utc=now_utc)
+            if secs is not None and secs > 0:
+                candidates.append(secs)
+
+    # Usage-limit resets: consider every account with a pending reset
+    for _key, expiry in _usage_reset_at.items():
+        remaining = expiry - time.time()
+        if remaining > 0:
+            candidates.append(remaining)
+
+    if not candidates:
+        return 0
+    return int(max(candidates))
+
+
 def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     """Return ``{name, type}`` pairs for providers whose ``available_times``
     window excludes the current UTC time.
@@ -1663,6 +1778,36 @@ def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
                 "type": p.get("type", "remote"),
             })
     return result
+
+
+def format_available_times(provider_cfg: dict) -> str:
+    """Format a provider's ``available_times`` for display.
+
+    Returns a human-readable string of ``"HH:MM-HH:MM"`` windows in config
+    order with a ``(UTC)`` suffix, or ``"Always"`` when the provider is
+    unrestricted (no ``available_times`` or all entries malformed).
+    """
+    windows = _parse_available_times(provider_cfg)
+    if windows is None:
+        return "Always"
+    parts = []
+    for start_min, end_min in windows:
+        sh, sm = divmod(start_min, 60)
+        eh, em = divmod(end_min, 60)
+        parts.append(f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}")
+    return ", ".join(parts) + " (UTC)"
+
+
+def format_active_status(provider_cfg: dict, now_utc: datetime | None = None) -> str:
+    """Format a provider's active status for display.
+
+    Returns ``"Active"`` when the provider is within its allowed window (or
+    unrestricted), ``"Inactive"`` otherwise. Uses the same UTC window
+    semantics as routing (start-inclusive, end-exclusive, overnight wrap).
+    """
+    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+        return "Active"
+    return "Inactive"
 
 
 def _parse_retry_after(response: Response) -> float | None:
@@ -1708,6 +1853,160 @@ def _get_cooldown_seconds(config: dict) -> float:
     if val is None:
         val = config.get("server", {}).get("provider_cooldown_seconds", 60)
     return float(val)
+
+
+def _get_sibling_fallback_threshold(config: dict) -> int:
+    """Read the sibling-fallback failure threshold from config.
+
+    After this many consecutive ``empty_response`` or ``stall_after_content``
+    failures on the same provider, the provider is marked unavailable for an
+    extended cooldown (``sibling_fallback_cooldown_seconds``) so the retry
+    cycle permanently skips it and tries siblings.
+
+    Supports both nested (``server.sibling_fallback_*``) and flat keys.
+    Defaults: threshold=2.
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    val = server_cfg.get("sibling_fallback_threshold")
+    if val is None:
+        val = config.get("sibling_fallback_threshold", _DEFAULT_SIBLING_FALLBACK_THRESHOLD)
+    try:
+        return max(1, int(val or _DEFAULT_SIBLING_FALLBACK_THRESHOLD))
+    except (ValueError, TypeError):
+        return _DEFAULT_SIBLING_FALLBACK_THRESHOLD
+
+
+def _get_sibling_fallback_cooldown_seconds(config: dict) -> float:
+    """Read the sibling-fallback extended cooldown from config.
+
+    Applied when the consecutive-failure threshold is exceeded.
+    Supports both nested (``server.sibling_fallback_cooldown_seconds``)
+    and flat keys. Defaults to 600 (10 minutes).
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    val = server_cfg.get("sibling_fallback_cooldown_seconds")
+    if val is None:
+        val = config.get(
+            "sibling_fallback_cooldown_seconds",
+            _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS,
+        )
+    try:
+        return max(60.0, float(val or _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS))
+    except (ValueError, TypeError):
+        return _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS
+
+
+def _get_sibling_fallback_window_seconds(config: dict) -> int:
+    """Read the sibling-fallback streak window from config.
+
+    If a provider has no failures for longer than this window, the
+    consecutive-failure streak resets.
+    Supports both nested (``server.sibling_fallback_window_seconds``)
+    and flat keys. Defaults to 600 (10 minutes).
+    """
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    val = server_cfg.get("sibling_fallback_window_seconds")
+    if val is None:
+        val = config.get(
+            "sibling_fallback_window_seconds",
+            _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS,
+        )
+    try:
+        return max(60, int(val or _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS))
+    except (ValueError, TypeError):
+        return _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS
+
+
+def _record_sibling_failure(
+    provider_name: str,
+    config: dict,
+    brand: str | None = None,
+) -> bool:
+    """Record a consecutive empty_response/stall failure for *provider_name*.
+
+    Increments the streak counter. If the streak exceeds the configured
+    threshold within the sliding window, marks the provider unavailable
+    for an extended cooldown and returns ``True``.  On any other case
+    returns ``False``.
+
+    The streak resets when a successful response occurs (via
+    ``_reset_sibling_failure_count()``) or when the window expires
+    without failures.
+
+    When *brand* is provided (the entry's ``provider`` field, e.g.
+    ``"opencode-go"``), the extended cooldown is applied to BOTH the entry
+    name and the brand.  ``_entry_cooldown_key`` checks the brand of every
+    entry, so quarantining the brand blocks all same-gateway sibling
+    entries (``opencode-go-2``/``opencode-go-3``) from being retried
+    through other API keys on the same failing endpoint
+    (LP-0MTPMF03P0046MFG) — mirroring how the Tier-3 stall circuit breaker
+    marks the provider brand.
+
+    Args:
+        provider_name: Provider entry name (e.g. ``"opencode-go"``).
+        config: Server configuration (to read threshold/window).
+        brand: Optional provider brand (``provider_cfg.get("provider")``)
+            shared by same-gateway sibling entries.
+
+    Returns:
+        ``True`` if the extended cooldown threshold was exceeded.
+    """
+    now = time.monotonic()
+    window = _get_sibling_fallback_window_seconds(config)
+
+    # Get or initialize the streak count
+    count = _sibling_failure_count.get(provider_name, 0)
+
+    # Initialize streak start if this is the first failure
+    if provider_name not in _sibling_failure_streak_start:
+        _sibling_failure_streak_start[provider_name] = now
+
+    # Check if the previous streak has expired (no failures for > window)
+    streak_start = _sibling_failure_streak_start.get(provider_name, 0)
+    if now - streak_start > window:
+        # Streak expired — start fresh
+        count = 0
+        _sibling_failure_streak_start[provider_name] = now
+
+    # Increment the count
+    count += 1
+    _sibling_failure_count[provider_name] = count
+
+    # Check against threshold
+    threshold = _get_sibling_fallback_threshold(config)
+    if count >= threshold:
+        cooldown = _get_sibling_fallback_cooldown_seconds(config)
+        mark_provider_unavailable(provider_name, cooldown)
+        # Also quarantine the shared brand so same-gateway sibling entries
+        # are not retried via other API keys (LP-0MTPMF03P0046MFG).
+        if brand and str(brand) != provider_name:
+            mark_provider_unavailable(str(brand), cooldown)
+        logger.warning(
+            "Sibling-fallback circuit breaker triggered: "
+            "provider=%s brand=%s consecutive_failures=%d "
+            "threshold=%d extended_cooldown=%ds",
+            provider_name,
+            brand or provider_name,
+            count,
+            threshold,
+            cooldown,
+        )
+        return True
+
+    return False
+
+
+def _reset_sibling_failure_count(provider_name: str) -> None:
+    """Reset the consecutive sibling-failure count for a provider on success.
+
+    Removes both the count and streak start from their dicts so that
+    the next failure starts a fresh streak.
+
+    Args:
+        provider_name: Provider entry name.
+    """
+    _sibling_failure_count.pop(provider_name, None)
+    _sibling_failure_streak_start.pop(provider_name, None)
 
 
 def _chain_hold_enabled(config: dict) -> bool:
@@ -1996,7 +2295,7 @@ def _build_reasoning_content_roundtrip_error() -> Response:
     )
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
@@ -2017,7 +2316,8 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             media_type="text/plain",
         )
 
-    payload = {"error": "All providers exhausted", "retry_after": 60}
+    retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
+    payload: dict[str, Any] = {"error": "All providers exhausted", "retry_after": retry_after}
     if unavailable_providers:
         # Attach diagnostic info about which providers are in cooldown
         try:
@@ -2036,6 +2336,7 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -2043,6 +2344,7 @@ def _build_time_window_exhausted_response(
     attempts: list[dict[str, Any]],
     unavailable: dict[str, int],
     any_provider_tried: bool,
+    model_config: dict | None = None,
 ) -> Response | None:
     """Return a distinguishable 503 when every provider was skipped solely due
     to its configured ``available_times`` window.
@@ -2059,9 +2361,10 @@ def _build_time_window_exhausted_response(
     if not any(a.get("status") == "outside_time_window" for a in attempts):
         return None
 
-    payload = {
+    retry_after = _compute_retry_after(unavailable, model_config=model_config)
+    payload: dict[str, Any] = {
         "error": "All providers unavailable: no provider is available during the current scheduled time window",
-        "retry_after": 60,
+        "retry_after": retry_after,
     }
     if attempts:
         try:
@@ -2072,6 +2375,7 @@ def _build_time_window_exhausted_response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -2156,9 +2460,13 @@ def _get_proxy_to_local():
 
 
 def _get_local_concurrency_info(config: dict) -> tuple:
-    """Lazily import and return (current_local_active, max_local) from config.
+    """Lazily import and return (current_generating_active, max_local) from config.
 
-    Returns the current local active query count and the configured
+    Generating-only pool (LP-0MTH7JX82000YS5N): occupancy is measured as the
+    number of sessions currently in the generating phase (first-byte onward).
+    Prefill time does not count against session_slot_pool_size.
+
+    Returns the current generating-only count and the configured
     local concurrency limit.  Reads ``session_slot_pool_size`` (same value
     that controls ``--parallel`` in llama-server); the legacy
     ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
@@ -2169,7 +2477,10 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     max_local = 1
     try:
         import proxy.server as _srv
-        cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+        try:
+            cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+        except Exception:
+            cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
     except Exception:
         pass
     try:
@@ -3039,6 +3350,8 @@ def _handle_streaming_success(
         )
         # Reset exponential-backoff failure count on success
         _reset_provider_failure_count(provider_name)
+        # Reset sibling-failure count on success (LP-0MTPMF03P0046MFG)
+        _reset_sibling_failure_count(provider_name)
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
@@ -3102,6 +3415,8 @@ def _build_fallback_success_response(
     )
     # Reset exponential-backoff failure count on success
     _reset_provider_failure_count(provider_name)
+    # Reset sibling-failure count on success (LP-0MTPMF03P0046MFG)
+    _reset_sibling_failure_count(provider_name)
     result = _add_provider_header(response, provider_name)
     if prev_provider:
         logger.info(
@@ -3788,6 +4103,14 @@ async def _proxy_with_remote_fallback_cycle(
                     )
                 except StreamingPreContentError as exc:
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # a pre-content stream error (empty_response / finish_reason:
+                    # error with zero content) counts toward the consecutive-
+                    # failure streak so the provider gets an extended cooldown
+                    # after the threshold and the retry cycle skips to a sibling.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
@@ -3807,6 +4130,14 @@ async def _proxy_with_remote_fallback_cycle(
                     # request to the next provider; the buffered intermediate
                     # output is discarded (never reaches the client).
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # reasoning was delivered but the provider stalled before
+                    # usable final content; repeated stalls on the same provider
+                    # count toward the streak so it is skipped for a sibling
+                    # after the threshold.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
                     # request so the re-route hops straight to a different
@@ -3953,6 +4284,12 @@ async def _proxy_with_remote_fallback_cycle(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text,
                     )
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # track consecutive empty/stall failures across cycles.
+                    # If the threshold is exceeded, the provider gets an
+                    # extended cooldown so the retry cycle permanently skips
+                    # it and tries siblings.
+                    _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
@@ -4002,14 +4339,14 @@ async def _proxy_with_remote_fallback_cycle(
     # provider could be used, surface a specific message instead of the generic
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
-        attempts, unavailable, any_provider_tried,
+        attempts, unavailable, any_provider_tried, model_config=model_config,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
         )
 
     if first_model_loading_response is not None:
@@ -4031,7 +4368,7 @@ async def _proxy_with_remote_fallback_cycle(
         raise ChainExhaustedError(_build_reasoning_content_roundtrip_error())
 
     raise ChainExhaustedError(
-        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts)
+        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
     )
 
 
@@ -4470,6 +4807,14 @@ async def _proxy_with_fallback_cycle(
                     )
                 except StreamingPreContentError as exc:
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # a pre-content stream error (empty_response / finish_reason:
+                    # error with zero content) counts toward the consecutive-
+                    # failure streak so the provider gets an extended cooldown
+                    # after the threshold and the retry cycle skips to a sibling.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
                         attempts,
@@ -4489,6 +4834,14 @@ async def _proxy_with_fallback_cycle(
                     # request to the next provider; the buffered intermediate
                     # output is discarded (never reaches the client).
                     mark_provider_unavailable(provider_name, cooldown_seconds)
+                    # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
+                    # reasoning was delivered but the provider stalled before
+                    # usable final content; repeated stalls on the same provider
+                    # count toward the streak so it is skipped for a sibling
+                    # after the threshold.
+                    _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
                     # request so the re-route hops straight to a different
@@ -4852,6 +5205,7 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text,
                             )
+                            _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                             attempted_domains.add(_failure_domain_key(provider_cfg))
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
@@ -4863,6 +5217,7 @@ async def _proxy_with_fallback_cycle(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text,
                         )
+                        _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                         attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "empty_response"
                         prev_provider = provider_name
@@ -5003,20 +5358,20 @@ async def _proxy_with_fallback_cycle(
     # provider could be used, surface a specific message instead of the generic
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
-        attempts, unavailable, any_provider_tried,
+        attempts, unavailable, any_provider_tried, model_config=model_config,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
         )
 
     # If all failures were slot exhaustion, include total slots in message
     if all_slot_exhaustion:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts)
+            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
         )
 
     # When all providers are exhausted, return the first provider's actual
@@ -5058,7 +5413,7 @@ async def _proxy_with_fallback_cycle(
             raise ChainExhaustedError(_first_error_response)
 
     raise ChainExhaustedError(
-        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts)
+        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
     )
 
 
