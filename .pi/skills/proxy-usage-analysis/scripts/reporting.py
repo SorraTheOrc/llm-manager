@@ -1,9 +1,3 @@
-
-# <!-- REFACTOR-LP-0MTHLGTUR00053QP
-# smell: unused_import
-# severity: critical
-# description: Local variable `by_action` is assigned to but never used
-# -->
 """CSV and Markdown report generation, plus the end-to-end analysis runner.
 
 Outputs (per acceptance criteria):
