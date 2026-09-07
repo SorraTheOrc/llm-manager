@@ -26,6 +26,38 @@ def _reset_slot_counts_cache():
     obs._last_slot_counts_cache = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_server_global_state(monkeypatch):
+    """Reset global server counters that leak across tests.
+
+    Module-level ``proxy.server`` state (generating/prefill/dispatch) is
+    mutated by router_helpers during real proxy_to_local calls. Tests that
+    touch those paths without resetting would pollute subsequent tests —
+    e.g. a test leaving ``local_generating_queries==1`` causes the next
+    test's ``_try_acquire_local_dispatch`` to 503 via the generating cap.
+    Hardened to catch every known leased-state fixture without requiring
+    each test file to individually reset it.
+    """
+    import proxy.server as server
+
+    # Only reset; never touch mocks established by per-file fixtures.
+    server.active_queries = 0
+    server.local_active_queries = 0
+    server.local_generating_queries = 0
+    server.local_dispatch_records = {}
+    server.local_generating_sessions = set()
+    server.local_prefill_in_flight = {}
+    # Don't rebind locks mid-test — they may be acquired by in-flight tasks.
+    # Just ensure the containers pointed at by existing locks are empty.
+    yield
+    server.local_dispatch_records = {}
+    server.local_generating_sessions = set()
+    server.local_prefill_in_flight = {}
+    server.active_queries = 0
+    server.local_active_queries = 0
+    server.local_generating_queries = 0
+
+
 def _find_live_e2e_summary_data() -> tuple[dict[str, Any] | None, str | None]:
     """Locate live E2E summary payload and best available text rendering."""
     module_names = (

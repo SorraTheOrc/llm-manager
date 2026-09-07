@@ -204,16 +204,15 @@ class TestCheapConfigProfile:
         assert [e["slots"] for e in entries] == [2, 2]
         assert all(e.get("ctx_size") == 262144 for e in entries)
 
-    def test_cheap_config_keeps_static_ctx_for_boot_catchup(self):
-        """The cheap profile's static local_model_ctx_size stays at the
-        models.ini base (131072) — deliberately NOT aligned with the schedule
-        entries' 262144 — so the slot-scheduler boot catch-up fires and
-        applies the per-period 256K override (LP-0MSMZOAJW002UR2A)."""
+    def test_cheap_config_static_ctx_aligned_with_schedule(self):
+        """The cheap profile's static local_model_ctx_size is aligned with
+        the schedule entries' 262144 (LP-0MTO8SZ8K0080RHT) — static clamp
+        equals scheduled clamp (126976), no catch-up needed."""
         cfg = _load("config-cheap.yaml")
         srv = cfg["server"]
-        assert srv["local_model_ctx_size"] == 131072
+        assert srv["local_model_ctx_size"] == 262144
         assert all(
-            e.get("ctx_size", 0) != srv["local_model_ctx_size"]
+            e.get("ctx_size") == srv["local_model_ctx_size"]
             for e in srv["slot_schedule"]["entries"]
         )
 
@@ -286,9 +285,7 @@ class TestCheapConfigProfile:
         fast_srv = dict(fast["server"])
         cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
         cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
-        # local_model_ctx_size differs intentionally per profile (fast
-        # 262144 inline; cheap 131072 base with 262144 schedule override),
-        # LP-0MSY0SDAS0031Y7F.
+        # local_model_ctx_size now identical (262144) per LP-0MTO8SZ8K0080RHT.
         cheap_srv["local_model_ctx_size"] = fast_srv["local_model_ctx_size"]
         # Cheap declares queue + caps; fast declares fallback (no caps).
         cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
@@ -306,8 +303,9 @@ class TestCheapConfigProfile:
         # (derive) in both.
         cheap_srv.pop("session_slot_max_prompt_tokens", None)
         fast_srv.pop("session_slot_max_prompt_tokens", None)
-        # Hard-routing-cap ratios (LP-0MTBOX45O005LD1S AC5): each mode
-        # declares its own ratio key (cheap 0.6144, fast 0.84049).
+        # Hard-routing-cap ratios DISABLED at 0 (LP-0MTLB1LK80098R43
+        # revert of LP-0MTBOX45O005LD1S — each mode declares its own ratio
+        # key now set to 0, so they match after pop for equality check).
         cheap_srv.pop("local_hard_routing_cap_ratio_cheap", None)
         fast_srv.pop("local_hard_routing_cap_ratio_fast", None)
         assert cheap_srv == fast_srv
@@ -330,27 +328,27 @@ class TestCheapConfigProfile:
         assert fast["server"]["contention_queue_policy"] == "fallback"
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
         # Per-mode persistence caps derive from each profile's hard-routing
-        # cap (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4): static 0 =
-        # derive from mode-aware cap at runtime.
+        # cap when enabled (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4)
+        # but the cap is DISABLED in the revert (LP-0MTLB1LK80098R43 per
+        # LP-0MTBTCK2I005MOTE NOT EFFECTIVE verdict): static 0 and hard cap 0.
         assert cheap["server"]["session_slot_max_prompt_tokens"] == 0
         assert fast["server"]["session_slot_max_prompt_tokens"] == 0
-        # Per-mode hard-routing-cap ratios (LP-0MTBOX45O005LD1S AC5).
-        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0.6144
-        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0.84049
+        # Per-mode hard-routing-cap ratios DISABLED (LP-0MTLB1LK80098R43
+        # revert of LP-0MTBOX45O005LD1S): 0 = dynamic per-slot clamp.
+        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0
+        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0
         assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
-        """The local model context size: fast inlines 262144 (operator
-        supersede LP-0MSY0SDAS0031Y7F) while cheap keeps the 131072 base and
-        applies the 262144 override only via its schedule entries.
+        """The local model context size: both fast and cheap now inline
+        262144 (LP-0MSY0SDAS0031Y7F + LP-0MTO8SZ8K0080RHT).
         """
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         assert fast["server"]["local_model_ctx_size"] == 262144
-        assert cheap["server"]["local_model_ctx_size"] == 131072
+        assert cheap["server"]["local_model_ctx_size"] == 262144
         assert all(
             e.get("ctx_size") == 262144
             for e in cheap["server"]["slot_schedule"]["entries"]
         )
-        assert fast["server"]["local_model_ctx_size"] >= cheap["server"]["local_model_ctx_size"]

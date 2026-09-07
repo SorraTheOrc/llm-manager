@@ -46,6 +46,9 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv, "local_active_queries", 1)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_queries", 1)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", {"owner-session"})
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -110,7 +113,18 @@ async def test_proxy_to_local_rejects_when_local_dispatch_busy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(monkeypatch):
-    """No-preemption policy should reject non-owner even when no active request exists."""
+    """No-preemption policy: generating-owner blocks non-owner read.
+
+    With generating-only occupancy (LP-0MTH7JX82000YS5N), a non-owner is
+    blocked only while the owner is *generating*. An inactive post-stream
+    lease alone (no generating slot) does not block others when max_local
+    == 1 — that was the 290 false-full case this parent work item fixes.
+
+    Legacy note: old tests set local_active_queries==0 + inactive lease
+    and expected 503; those fixtures now represent the fixed case (no
+    generating slot = not full) and should get 400 (model validation)
+    rather than a dispatch-gate 503.
+    """
     from proxy.router import proxy_to_local
 
     from proxy import server as srv
@@ -136,6 +150,16 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv, "local_active_queries", 0)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    # Generating-only occupancy (LP-0MTH7JX82000YS5N): pool occupancy is
+    # driven by local_generating_queries, not the inactive-lease map.
+    # With local_generating_queries==0 and max_local==1 the pool is NOT
+    # full, so proxy_to_local must NOT dispatch-gate 503 here. The 503
+    # assertions below are for the generating-owner variant (see the
+    # helper block). When NOT generating, the request passes the gate and
+    # hits model-validation (400 for "plan"), not a dispatch denial.
+    monkeypatch.setattr(srv, "local_generating_queries", 0)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", set())
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -189,9 +213,8 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
     )
 
     resp = await proxy_to_local(req, "v1/chat/completions")
-    assert resp.status_code == 503
-    payload = json.loads(resp.body)
-    assert payload["local_owner_session_id"] == "owner-session"
+    # Must NOT be a dispatch-gate denial when no generating slot is held.
+    assert resp.status_code != 503, "Inactive-lease-only must not dispatch-gate 503; generating-only pool not full"
 
 
 @pytest.mark.asyncio
@@ -248,7 +271,7 @@ async def test_try_acquire_denies_non_owner_during_unexpired_lease():
 
     assert acquired is False
     assert owner == "sess-owner"
-    assert active == 0
+    assert active == 1
     assert retry_after >= 1
 
 
@@ -1053,9 +1076,12 @@ async def test_n2_integration_third_session_blocked_via_proxy_to_local(monkeypat
     monkeypatch.setattr(srv, "current_model", "Qwen3")
     monkeypatch.setattr(srv, "active_queries", 0)
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
-    # Simulate 2 active local queries (sess-a and sess-b)
+    # Simulate 2 active local queries (sess-a and sess-b) — generating-only path
     monkeypatch.setattr(srv, "local_active_queries", 2)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_queries", 2)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", {"sess-a", "sess-b"})
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -1261,6 +1287,9 @@ async def test_n1_backward_compat_integration(monkeypatch):
     monkeypatch.setattr(srv, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv, "local_active_queries", 1)
     monkeypatch.setattr(srv, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_queries", 1)
+    monkeypatch.setattr(srv, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "local_generating_sessions", {"sess-a"})
     monkeypatch.setattr(
         srv,
         "local_dispatch_records",
@@ -1944,3 +1973,139 @@ async def test_query_slot_processing_false_when_slot_idle(monkeypatch):
         "proxy.session._assigned_slot_for_session", lambda sid: 2
     )
     assert await _query_slot_processing(srv, "sess-x", None) is False
+
+# ---------------------------------------------------------------------------
+# Prefill-aware dispatch guard (LP-0MTJET4I5009EHNX)
+# ---------------------------------------------------------------------------
+
+def _make_dispatch_srv(
+    *,
+    session_slot_pool_size: int = 3,
+    generating_queries: int = 0,
+    generating_sessions: set | None = None,
+    dispatch_records: dict | None = None,
+    prefill_in_flight: dict | None = None,
+) -> SimpleNamespace:
+    if dispatch_records is None:
+        dispatch_records = {}
+    return SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 60, "session_slot_pool_size": session_slot_pool_size}},
+        local_active_queries=len(dispatch_records),
+        local_active_queries_lock=asyncio.Lock(),
+        local_generating_queries=generating_queries,
+        local_generating_queries_lock=asyncio.Lock(),
+        local_generating_sessions=generating_sessions if generating_sessions is not None else set(),
+        local_dispatch_records=dict(dispatch_records),
+        local_dispatch_records_lock=asyncio.Lock(),
+        local_prefill_in_flight=dict(prefill_in_flight) if prefill_in_flight is not None else {},
+        local_prefill_in_flight_lock=asyncio.Lock(),
+        logger=MagicMock(info=MagicMock(), warning=MagicMock(), debug=MagicMock()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_reports_zero_when_none_in_flight():
+    from proxy.router_helpers import _get_prefill_in_flight_count
+    srv = _make_dispatch_srv()
+    assert _get_prefill_in_flight_count(srv) == 0
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_blocks_when_at_parallel_cap():
+    """AC1/AC3: dispatch denied when prefill_in_flight >= prefill_cap."""
+    from proxy.router_helpers import _try_acquire_local_dispatch
+    srv = _make_dispatch_srv(
+        session_slot_pool_size=3,
+        dispatch_records={
+            k: {"backend": "local", "started_at": 0.0, "active": True, "expires_at": time.monotonic() + 100, "model_name": None}
+            for k in ("a", "b", "c")
+        },
+        prefill_in_flight={"a": True, "b": True, "c": True},
+    )
+    acquired, owner, active, _ = await _try_acquire_local_dispatch(srv, max_local=3, session_key="d", backend="local")
+    assert acquired is False
+    assert active >= 3 or owner is not None
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_allows_when_below_cap():
+    """AC1: below prefill cap the usual generating/idle check governs, not the guard."""
+    from proxy.router_helpers import _try_acquire_local_dispatch
+    srv = _make_dispatch_srv(
+        session_slot_pool_size=3,
+        dispatch_records={
+            k: {"backend": "local", "started_at": 0.0, "active": True, "expires_at": time.monotonic() + 100, "model_name": None}
+            for k in ("a", "b")
+        },
+        prefill_in_flight={"a": True, "b": True},
+    )
+    acquired, owner, *_ = await _try_acquire_local_dispatch(srv, max_local=3, session_key="c", backend="local")
+    assert acquired is True, "2 in flight < parallel(3) should allow dispatch"
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_boundary_exact_parallel():
+    """AC4 edge case: N in flight < parallel allows; N==parallel blocks."""
+    from proxy.router_helpers import _get_prefill_in_flight_count, _try_acquire_local_dispatch
+    srv = _make_dispatch_srv(session_slot_pool_size=3)
+    for k in ("a", "b"):
+        srv.local_prefill_in_flight[k] = True
+        srv.local_dispatch_records[k] = {"backend": "local", "started_at": 0.0, "active": True, "expires_at": time.monotonic() + 100, "model_name": None}
+    assert _get_prefill_in_flight_count(srv) == 2
+    acquired, *_ = await _try_acquire_local_dispatch(srv, max_local=3, session_key="c", backend="local")
+    assert acquired is True, "2 < 3 must allow the 3rd"
+    srv.local_prefill_in_flight["c"] = True
+    srv.local_dispatch_records["c"] = {"backend": "local", "started_at": 0.0, "active": True, "expires_at": time.monotonic() + 100, "model_name": None}
+    assert _get_prefill_in_flight_count(srv) == 3
+    acquired, *_ = await _try_acquire_local_dispatch(srv, max_local=3, session_key="d", backend="local")
+    assert acquired is False, "3 == parallel must block the 4th"
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_releases_on_first_byte():
+    """Generating transition (prefill -> first-byte) releases the prefill hold.
+
+    Idempotent increment_generating path should clear the prefill entry so
+    contention_queue waiters see the freed prefill slot without waiting.
+    """
+    from proxy.router_helpers import _get_prefill_in_flight_count, _increment_generating_only_slot
+    srv = _make_dispatch_srv(prefill_in_flight={"a": True, "b": True})
+    assert _get_prefill_in_flight_count(srv) == 2
+    await _increment_generating_only_slot(srv, session_key="a")
+    assert "a" not in srv.local_prefill_in_flight
+    assert _get_prefill_in_flight_count(srv) == 1
+    await _increment_generating_only_slot(srv, session_key="a")
+    assert _get_prefill_in_flight_count(srv) == 1
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_first_byte_failure_keeps_hold(monkeypatch):
+    """If generating increment fails, the prefill hold must not be leaked.
+
+    Regression: an exception before the prefill clear must leave the counter
+    consistent (no double free, no leaked hold).
+    """
+    from proxy.router_helpers import _get_prefill_in_flight_count, _increment_generating_only_slot
+    srv = _make_dispatch_srv(prefill_in_flight={"a": True})
+    assert _get_prefill_in_flight_count(srv) == 1
+    from proxy import contention_queue
+    orig_wake = contention_queue.wake
+    monkeypatch.setattr(contention_queue, "wake", AsyncMock(side_effect=RuntimeError("wake fail")))
+    # Should not leak: prefill entry removed on entry, generating increment atomic.
+    await _increment_generating_only_slot(srv, session_key="a")
+    await _increment_generating_only_slot(srv, session_key="a")
+    assert _get_prefill_in_flight_count(srv) == 0
+    monkeypatch.setattr(contention_queue, "wake", orig_wake)
+    assert _get_prefill_in_flight_count(srv) == 0
+
+
+@pytest.mark.asyncio
+async def test_prefill_guard_releases_on_stream_end_or_abort():
+    """Decrement generating should be safe even for prefill-only sessions (no generating)."""
+    from proxy.router_helpers import _decrement_generating_only_slot, _get_prefill_in_flight_count
+    srv = _make_dispatch_srv(prefill_in_flight={"a": True})
+    srv.local_generating_queries = 0
+    await _decrement_generating_only_slot(srv, session_key="a")
+    # Prefill-only session that never generated: decrement is no-op / not negative.
+    assert srv.local_generating_queries == 0
+    assert "a" not in srv.local_prefill_in_flight

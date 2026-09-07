@@ -502,7 +502,10 @@ async def get_llama_local_status(request: Request):
                 # client pool and made status polls report llama_server_running
                 # = false on ~76% of polls.
                 from proxy.router_helpers import _discover_local_child_port
-                child_port = _discover_local_child_port(srv)
+                # LP-0MTP1FQXH004JYEF: pass current_model so the lookup
+                # filters to the Qwen3 child, not the first spawn line
+                # (mxbai-embed) which yields idle n_ctx 256 slots.
+                child_port = _discover_local_child_port(srv, model=cm)
                 if child_port is not None:
                     llama_port = child_port
                 client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)

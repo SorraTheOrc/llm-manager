@@ -62,6 +62,87 @@ def test_request_translation_max_tokens_mapping():
     assert "max_completion_tokens" not in out2
 
 
+def test_request_translation_max_output_tokens_floor_16():
+    """Small max_tokens/max_completion_tokens values are clamped to 16.
+
+    Console Go / OpenAI Responses API requires max_output_tokens >= 16.
+    The proxy clamps inbound small values to this floor to prevent 400 errors.
+    """
+    # max_tokens < 16 → clamped to 16
+    body = {"model": "m", "messages": [], "max_tokens": 1}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+    assert "max_tokens" not in out
+
+    body = {"model": "m", "messages": [], "max_tokens": 5}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+
+    body = {"model": "m", "messages": [], "max_tokens": 15}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+
+    # max_completion_tokens < 16 → clamped to 16
+    body = {"model": "m", "messages": [], "max_completion_tokens": 0}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+
+    body = {"model": "m", "messages": [], "max_completion_tokens": 10}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+
+
+def test_request_translation_max_output_tokens_preserved_at_boundary():
+    """max_output_tokens >= 16 pass through unchanged."""
+    # Exactly 16 → unchanged
+    body = {"model": "m", "messages": [], "max_tokens": 16}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+
+    # 17 → unchanged
+    body = {"model": "m", "messages": [], "max_tokens": 17}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 17
+
+    # Large values → unchanged
+    body = {"model": "m", "messages": [], "max_tokens": 2048}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 2048
+
+
+def test_request_translation_max_output_tokens_absent_when_no_source():
+    """When max_tokens and max_completion_tokens are absent, max_output_tokens is not set."""
+    body = {"model": "m", "messages": []}
+    out = _translate_chat_to_responses(body)
+    assert "max_output_tokens" not in out
+
+
+def test_request_translation_max_tokens_takes_precedence_over_max_completion_tokens():
+    """When both are present, max_tokens wins."""
+    body = {"model": "m", "messages": [], "max_tokens": 5, "max_completion_tokens": 2048}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16  # clamped from max_tokens=5
+    assert "max_completion_tokens" not in out
+
+
+def test_request_translation_non_numeric_max_tokens_omits_field():
+    """Non-numeric max_tokens values should be omitted rather than cause a crash."""
+    body = {"model": "m", "messages": [], "max_tokens": "not-a-number"}
+    out = _translate_chat_to_responses(body)
+    assert "max_output_tokens" not in out
+
+
+def test_request_translation_string_coercible_max_tokens_clamped():
+    """String-coercible values should be clamped to the floor."""
+    body = {"model": "m", "messages": [], "max_tokens": "5"}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 16
+
+    body = {"model": "m", "messages": [], "max_tokens": "4096"}
+    out = _translate_chat_to_responses(body)
+    assert out["max_output_tokens"] == 4096
+
+
 def test_request_translation_tool_messages():
     """tool-role messages → function_call_output items; assistant tool_calls → function_call items."""
     body = {

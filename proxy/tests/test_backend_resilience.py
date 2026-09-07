@@ -26,6 +26,14 @@ def reset_backend_state(monkeypatch):
     monkeypatch.setattr(server, "backend_ready", False)
     monkeypatch.setattr(server, "active_queries", 0)
     monkeypatch.setattr(server, "local_active_queries", 0)
+    monkeypatch.setattr(server, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_generating_queries", 0)
+    monkeypatch.setattr(server, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_generating_sessions", set())
+    monkeypatch.setattr(server, "local_prefill_in_flight", {})
+    monkeypatch.setattr(server, "local_prefill_in_flight_lock", asyncio.Lock())
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
     monkeypatch.setattr(
         server,
         "backend_recovery_state",

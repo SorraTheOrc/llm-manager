@@ -119,11 +119,16 @@ def _setup_server_state(monkeypatch):
     # test-interaction pollution from other tests modifying server state).
     monkeypatch.setattr(srv_module, "active_queries", 0)
     monkeypatch.setattr(srv_module, "local_active_queries", 0)
+    monkeypatch.setattr(srv_module, "local_generating_queries", 0)
+    monkeypatch.setattr(srv_module, "local_prefill_in_flight", {})
     monkeypatch.setattr(srv_module, "local_dispatch_records", {})
     import asyncio
     monkeypatch.setattr(srv_module, "active_queries_lock", asyncio.Lock())
     monkeypatch.setattr(srv_module, "local_active_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv_module, "local_generating_queries_lock", asyncio.Lock())
+    monkeypatch.setattr(srv_module, "local_prefill_in_flight_lock", asyncio.Lock())
     monkeypatch.setattr(srv_module, "local_dispatch_records_lock", asyncio.Lock())
+    monkeypatch.setattr(srv_module, "local_generating_sessions", set())
     # Mock session manager — support async get and get_or_create
     mock_sm = MagicMock()
     # Create a proper session-like object

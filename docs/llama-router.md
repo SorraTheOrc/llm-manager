@@ -265,3 +265,41 @@ prompts larger than the real per-slot context after llama.cpp rounds
 `131072/3 → 43776/slot`). The clamp `(ctx_size // slots - 4096)` is always ≤
 the rounded per-slot context — enforced by
 `proxy/tests/test_ctx_slot_validation.py::TestCtxSlotConsistency`.
+
+## Pool semantics: generating-only occupancy (LP-0MTH7JX82000YS5N)
+
+Since LP-0MTH7JX82000YS5N the proxy's local pool counts only
+**generating** requests (first data chunk onward) against
+`session_slot_pool_size` / `--parallel`. Prefill time and post-stream
+cooldown do NOT hold a pool slot — this eliminates the false-full
+fallbacks captured in the 2026-08-28 window where 76% of
+`local_concurrency_limit` fallbacks were during idle llama-server periods.
+
+### Prefill-aware guard
+
+A bounded concurrent-prefill guard caps in-flight prefills at the
+remaining parallel capacity (the `max_local` / `--parallel` value). This
+prevents the proxy's internal queue from growing without bound while the
+pool gate is open during prefill. In the default 3-parallel setup the
+guard holds at 3 concurrent prefills; additional sessions fall back to
+the next provider with `reason=local_concurrency_limit`.
+
+### Observability
+
+On the first stream data chunk the proxy logs a
+`dispatch_to_first_byte_ms` line (in seconds, per-stream, correlation via
+the session id) from `proxy/proxy/router.py`'s stream generator so
+follow-up audits can derive TTFT distributions without request-ID
+join. The leased-but-not-yet-generating wait is observable as the
+`local_active_queries` (lifecycle/dispatch lease) vs.
+`local_generating_queries` delta.
+
+### Legacy semantics replaced
+
+- The former *post-stream inactive hold* (30s lease keep-alive after stream
+  end) no longer counts against the pool — the generating counter decrements
+  immediately.
+- `_get_local_concurrency_info` now returns the generating-only count; the
+  legacy fallback to `local_max_concurrent_queries` has been removed in
+  favour of `session_slot_pool_size` as the single-source limit
+  (LP-0MTCZ35X7009IZKE).

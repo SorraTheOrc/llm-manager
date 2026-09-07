@@ -215,3 +215,63 @@ without operator intervention. `FreeUsageLimitError` responses without a
 reset time get the default 3-hour cooldown (10800s; per-provider overrides
 were retired with `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
 **LP-0MSLJPOCC0001ROJ**.
+
+## Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
+
+A remote provider that repeatedly returns an **empty response** or **stalls**
+(zero usable content) across retry cycles is quarantined for an **extended
+cooldown** so the fallback chain permanently skips it and routes to the next
+healthy sibling — instead of re-attempting the same dead provider dozens of
+times per request/client retry.
+
+**Motivating incident (2026-09-06 RCA):** session
+`herdr-1788651245-1996040-22961` retried `opencode-go/muse-spark-1.2-contributor`
+~80 times in 32 minutes, each failing with `empty_response` (upstream closed
+without delivering content). The short 60s Tier-2 provider cooldown expired
+between client retries, so every new request POSTed the dead gateway again.
+`empty_response` events were never counted by the Tier-3 stall circuit breaker
+(which only tracks idle-timeout stalls), so nothing ever escalated to a long
+quarantine.
+
+**Behaviour:**
+
+1. Every `empty_response` / `stall_*` / zero-content stream error on a
+   provider entry increments a per-entry consecutive-failure streak
+   (`_sibling_failure_count` in `proxy/proxy/provider.py`), shared across
+   requests (module-level state, like the other cooldown mechanisms).
+2. Once the streak reaches `sibling_fallback_threshold` (default 2) within
+   `sibling_fallback_window_seconds` (default 600s), the provider is marked
+   unavailable for `sibling_fallback_cooldown_seconds` (default 600s) — via
+   the existing `mark_provider_unavailable()` — and a
+   `Sibling-fallback circuit breaker triggered: ...` warning is logged.
+   Both the provider ENTRY and its shared BRAND are quarantined, so
+   same-gateway API-key siblings (`opencode-go-2` / `opencode-go-3`) are also
+   skipped (mirrors the Tier-3 stall breaker's brand-level quarantine and the
+   `_entry_cooldown_key` brand check).
+3. On success the streak resets (`_reset_sibling_failure_count`); stale
+   streaks age out of the sliding window.
+4. 429/402 rate-limit responses are **not** counted (they use the existing
+   per-model / usage-limit cooldowns).
+
+**Recording points** (`proxy/proxy/provider.py`): the three non-streaming
+empty-body sites and the four pre-content streaming re-route catches
+(`StreamingPreContentError` / `StreamingRecoverableAfterReasoningError` in
+both `_proxy_with_remote_fallback_cycle` and `_proxy_with_fallback_cycle`) —
+the same places the short Tier-2 cooldown is applied. Streaming failures are
+counted when a sibling is available to re-route to (the pre-flight consumed
+the stream and raised); once a sibling becomes eligible again the streak
+accumulates and the dead provider is skipped.
+
+Config reference (server section):
+
+```yaml
+server:
+  sibling_fallback_threshold: 2        # consecutive failures before quarantine
+  sibling_fallback_cooldown_seconds: 600  # extended cooldown applied on trip
+  sibling_fallback_window_seconds: 600    # sliding window for the streak
+```
+
+See `proxy/tests/test_provider_fallback.py` (`TestSiblingFallbackCore` and the
+`sibling_*` async tests) for coverage of thresholding, extended cooldown,
+window expiry, brand quarantine, 429 non-counting, and direct sibling routing
+after the threshold trips.

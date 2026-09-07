@@ -1025,6 +1025,140 @@ async def _increment_local_active_queries(
             pass
 
 
+def _get_generating_only_count(srv) -> int:
+    """Return the current generating-only pool occupancy."""
+    try:
+        return max(0, int(getattr(srv, "local_generating_queries", 0) or 0))
+    except Exception:
+        return 0
+
+
+def _get_prefill_in_flight_count(srv) -> int:
+    """Return the number of sessions currently in prefill (dispatch→first-byte).
+
+    Prefill-aware guard (LP-0MTJET4I5009EHNX): caps concurrent prefills to
+    ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the llama-
+    server internal queue does not saturate under generating-only occupancy.
+    """
+    try:
+        d = getattr(srv, "local_prefill_in_flight", None)
+        if d is None:
+            return 0
+        return max(0, int(len(d)))
+    except Exception:
+        return 0
+
+
+async def _increment_generating_only_slot(srv, session_key: str | None = None) -> None:
+    """Increment generating-only slot once per session (idempotent).
+
+    Prefill-aware guard: the session's prefill hold is released on first-byte
+    so the prefill cap slot is freed for waiters.
+    """
+    # Prefill-aware guard: clear the prefill hold on first-byte.
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_key and session_key in _p:
+            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
+            if _plock is not None:
+                async with _plock:
+                    _p.pop(session_key, None)
+            else:
+                _p.pop(session_key, None)
+            try:
+                from proxy.contention_queue import wake
+                await wake(1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not hasattr(srv, "local_generating_queries"):
+        return
+    # Ensure the per-session set exists so duplicate increments are idempotent
+    # even for test SimpleNamespace fixtures that lack the attribute.
+    if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
+        try:
+            srv.local_generating_sessions = set()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        lock = getattr(srv, "local_generating_queries_lock", None)
+        sessions: set | None = getattr(srv, "local_generating_sessions", None)
+        if lock is not None:
+            async with lock:
+                if session_key and sessions is not None and session_key in sessions:
+                    return
+                srv.local_generating_queries = int(getattr(srv, "local_generating_queries", 0) or 0) + 1
+                if session_key and sessions is not None:
+                    sessions.add(session_key)
+        else:
+            if session_key and sessions is not None and session_key in sessions:
+                return
+            srv.local_generating_queries = int(getattr(srv, "local_generating_queries", 0) or 0) + 1
+            if session_key and sessions is not None:
+                sessions.add(session_key)
+    except Exception:
+        pass
+
+
+async def _decrement_generating_only_slot(srv, session_key: str | None = None) -> None:
+    """Decrement generating-only slot for *session_key* (safe / not negative).
+
+    Also clears any remaining prefill hold (prefill-only aborts).
+    """
+    # Clear prefill hold for prefill-only sessions (no generating).
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_key and session_key in _p:
+            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
+            if _plock is not None:
+                async with _plock:
+                    _p.pop(session_key, None)
+            else:
+                _p.pop(session_key, None)
+            try:
+                from proxy.contention_queue import wake
+                await wake(1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not hasattr(srv, "local_generating_queries"):
+        return
+    if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
+        try:
+            srv.local_generating_sessions = set()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        lock = getattr(srv, "local_generating_queries_lock", None)
+        sessions: set | None = getattr(srv, "local_generating_sessions", None)
+        if lock is not None and sessions is not None:
+            async with lock:
+                if session_key and session_key not in sessions:
+                    return
+                srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
+                if session_key:
+                    sessions.discard(session_key)
+        elif lock is not None:
+            async with lock:
+                srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
+        else:
+            if sessions is not None and session_key and session_key not in sessions:
+                return
+            srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
+            if session_key and sessions is not None:
+                sessions.discard(session_key)
+    except Exception:
+        pass
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(1)
+    except Exception:
+        pass
+
+
 async def _try_acquire_local_dispatch(
     srv,
     max_local: int,
@@ -1110,34 +1244,55 @@ async def _try_acquire_local_dispatch(
                     )
                 )
 
+                occupied_by_others = 0
+                first_occupied_owner = None
+                for existing_key, record in srv.local_dispatch_records.items():
+                    if existing_key == session_key:
+                        continue
+                    if record.get("active") or record.get("expires_at", 0) > now:
+                        occupied_by_others += 1
+                        if first_occupied_owner is None:
+                            first_occupied_owner = existing_key
+                _generating_count = _get_generating_only_count(srv)
+                _prefill_count = _get_prefill_in_flight_count(srv)
+                has_generating_state = (
+                    hasattr(srv, "local_generating_queries")
+                    or hasattr(srv, "local_generating_sessions")
+                    or hasattr(srv, "local_generating_queries_lock")
+                )
                 if not own_has_lease:
-                    occupied_by_others = 0
-                    first_occupied_owner = None
-                    for existing_key, record in srv.local_dispatch_records.items():
-                        if existing_key == session_key:
-                            continue
-                        if record.get("active") or record.get("expires_at", 0) > now:
-                            occupied_by_others += 1
-                            if first_occupied_owner is None:
-                                first_occupied_owner = existing_key
-
-                    if occupied_by_others >= max_local:
-                        active_count = getattr(srv, "local_active_queries", 0)
-                        retry_after = max(1.0, lease_timeout)
-                        return (False, first_occupied_owner, active_count, retry_after)
-
-                if srv.local_active_queries >= max_local and not own_has_lease:
-                    active_owner = None
-                    for ek, er in srv.local_dispatch_records.items():
-                        if er.get("active"):
-                            active_owner = ek
-                            break
-                    return (
-                        False,
-                        active_owner,
-                        srv.local_active_queries,
-                        max(1.0, lease_timeout),
-                    )
+                    if has_generating_state:
+                        # Generating-only pool (LP-0MTH7JX82000YS5N): prefill
+                        # dispatches do not count against the cap — only
+                        # generating sessions do. Inactive leases (cooldown)
+                        # are not counted here; they are covered by the
+                        # streaming-phase counter.
+                        if _generating_count >= max_local:
+                            active_owner = None
+                            for ek, er in srv.local_dispatch_records.items():
+                                if ek != session_key and er.get("active"):
+                                    active_owner = ek
+                                    break
+                            if active_owner is None:
+                                active_owner = first_occupied_owner
+                            return (False, active_owner, _generating_count, max(1.0, lease_timeout))
+                        # Prefill-aware guard (LP-0MTJET4I5009EHNX): cap
+                        # concurrent prefills to ``parallel`` (max_local) so
+                        # the llama-server internal queue does not saturate.
+                        if _prefill_count >= max_local:
+                            active_owner = None
+                            for ek, er in srv.local_dispatch_records.items():
+                                if ek != session_key and er.get("active"):
+                                    active_owner = ek
+                                    break
+                            if active_owner is None:
+                                active_owner = first_occupied_owner
+                            return (False, active_owner, _prefill_count, max(1.0, lease_timeout))
+                        # Also enforce the traditional slot-cap when no
+                        # generating backing state is present (legacy).
+                    else:
+                        if occupied_by_others >= max_local:
+                            return (False, first_occupied_owner, occupied_by_others, max(1.0, lease_timeout))
 
                 srv.local_active_queries += 1
 
@@ -1148,6 +1303,13 @@ async def _try_acquire_local_dispatch(
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
                 }
+                # Register prefill hold for the prefill-aware guard.
+                try:
+                    _p = getattr(srv, "local_prefill_in_flight", None)
+                    if _p is not None:
+                        _p[session_key] = True
+                except Exception:
+                    pass
 
             return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
     except Exception:
@@ -1205,6 +1367,12 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     except Exception:
         raise
     # Free the slot registry entry
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_id and session_id in _p:
+            _p.pop(session_id, None)
+    except Exception:
+        pass
     if session_id:
         try:
             from proxy.session import _free_slot_assignment
@@ -1318,6 +1486,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                     try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and sid in _p:
+                            _p.pop(sid, None)
+                    except Exception:
+                        pass
+                    try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout",
                             sid if sid else "unknown",
@@ -1373,6 +1547,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         continue
                     # Genuinely orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
+                    try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and sid in _p:
+                            _p.pop(sid, None)
+                    except Exception:
+                        pass
                     removed += 1
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
@@ -2052,9 +2232,11 @@ async def _schedule_recv_token_increment(
 # ===================================================================
 
 _QWEN3_SPAWN_RE = re.compile(r"name=(\S+) on port (\d+)")
+# Alias kept for backward-compat; new code uses _SPAWN_RE.
+_SPAWN_RE = _QWEN3_SPAWN_RE
 
-_child_port_cache: dict[int, int | None] = {}
-"""Cached child port per llama-server pid.
+_child_port_cache: dict[tuple[int, str], int | None] = {}
+"""Cached child port per (llama-server pid, normalized target model).
 
 The router llama-server (port 8080) spawns child instances on dynamic ports
 (``--port 0``). The child port is discoverable from the spawn line in the
@@ -2063,7 +2245,46 @@ llama-server log (``spawning server instance with name=Qwen3 on port 58113``).
 The router serializes ``GET /slots?model=...`` behind the busy child's
 generation loop (LP-0MTDGBRPU003Z7KU: measured 5-7s via the router vs 0.17s
 direct), so availability/status checks should target the child port directly.
+
+LP-0MTP1FQXH004JYEF: the previous implementation returned the *first*
+spawn line (which is ``mxbai-embed`` — embeddings child) instead of the
+target model (Qwen3), so ``/llama/local/status`` queried the embed child
+(``n_ctx 256, is_processing=false``) and reported ``3/3`` idle while the
+Qwen3 child was busy. The cache was also per-pid only and sticky. Now the
+lookup filters by target model, strips NUL padding from sparse logrotate
+files, scans the full current log + rotated logs, and caches per
+``(pid, model)``. Callers should pass the target model (``current_model``
+or ``slot_model``) so the right child is returned.
 """
+
+
+def _is_sparse_log(log_path: Path) -> bool:
+    """Return True when *log_path* is sparse/NUL-padded/empty (logrotate).
+
+    A non-sparse file with real content (even without a spawn line) returns
+    False so :func:`_discover_local_child_port` does NOT fall back to global
+    rotated logs — this preserves tmp_path isolation in tests
+    (LP-0MTP1FQXH004JYEF).
+    """
+    try:
+        if not log_path.exists():
+            return False
+        size = log_path.stat().st_size
+        if size == 0:
+            return True
+        read_size = min(8192, size)
+        with open(log_path, "rb") as f:
+            chunk = f.read(read_size)
+        if not chunk:
+            return True
+        # Sparse if >50% NULs or stripped text is empty/short whitespace.
+        nul_ratio = chunk.count(b"\x00") / len(chunk)
+        if nul_ratio > 0.5:
+            return True
+        text = chunk.decode("utf-8", errors="replace").replace("\x00", "").strip()
+        return len(text) == 0
+    except Exception:
+        return False
 
 
 def _llama_log_path(srv) -> Path:
@@ -2074,45 +2295,172 @@ def _llama_log_path(srv) -> Path:
     return Path(__file__).parent / "logs" / "llama-server.log"
 
 
-def _discover_local_child_port(srv) -> int | None:
+def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
+    """Scan a single log file for spawn ports, filtered by target model.
+
+    Strips NUL padding (sparse logrotate files) and returns the *last*
+    matching port for *target_model* so restarts pick the newest line.
+    ``target_model`` is matched case-insensitively; when no exact match is
+    found the function returns ``None`` (caller may fall back to a non-embed
+    heuristic or to ``None`` / router port). Returns a special sentinel
+    ``None`` both for "file unreadable" and "no matching spawn" — caller
+    distinguishes sparse vs. real-content via :func:`_is_sparse_log`.
+    """
+    try:
+        if not log_path.exists():
+            return None
+        size = log_path.stat().st_size
+        # Spawn lines are at startup (head) but NUL-padded sparse files can
+        # hide them; read up to 256 KiB so we cover head + a bit of tail
+        # without loading multi-MB logs fully. If the file is larger we still
+        # scan only that window — the caller iterates rotated logs for older
+        # spawn lines.
+        read_size = min(262144, size) if size else 0
+        if read_size == 0:
+            return None
+        with open(log_path, "rb") as f:
+            raw = f.read(read_size)
+        text = raw.decode("utf-8", errors="replace").replace("\x00", "")
+        if not text.strip():
+            return None
+        want = (target_model or "").strip().lower() or None
+        # Collect all matches so the last (newest) wins after a restart.
+        matches: list[tuple[str, int]] = []
+        for line in text.splitlines():
+            m = _SPAWN_RE.search(line)
+            if not m:
+                continue
+            try:
+                name = str(m.group(1)).strip()
+                port = int(m.group(2))
+            except (TypeError, ValueError, IndexError):
+                continue
+            matches.append((name, port))
+        if not matches:
+            return None
+        if want is not None:
+            # Exact case-insensitive match for the requested model.
+            filtered = [p for n, p in matches if n.lower() == want]
+            if filtered:
+                return filtered[-1]
+            return None
+        # No target requested — prefer a non-embed model (Qwen3) over
+        # mxbai-embed; fall back to the last match.
+        non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
+        if non_embed:
+            return non_embed[-1][1]
+        return matches[-1][1]
+    except Exception:
+        return None
+
+
+def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     """Discover the local model child port from the llama-server log.
 
     The router (``llama_server_port``) spawns model children on dynamic ports
     (``--port 0``); the spawn line ``spawning server instance with
     name=<model> on port <port>`` is written near the top of the fresh
-    llama-server log on startup. Returns the port for the first matching
-    spawn line, or ``None`` when the log is missing/unreadable or contains
-    no spawn line.
+    llama-server log on startup.
 
-    The result is cached per llama-server process pid so repeated calls
-    (every request) do not re-read the log; a new pid (restart) re-parses.
+    Args:
+        srv: Server module / namespace with ``llama_process.pid`` and
+            ``log_dir`` / ``current_model``.
+        model: Optional target model name to filter by (e.g. ``"Qwen3"``).
+            When ``None`` the function uses ``srv.current_model`` or
+            ``"Qwen3"`` as the target. Matching is case-insensitive.
+            Passing the wrong model previously returned the embed child port
+            (first spawn line ``mxbai-embed``) — LP-0MTP1FQXH004JYEF.
+
+    Returns the port for the target model, or ``None`` when the log is
+    missing/unreadable or contains no matching spawn line (caller should
+    fall back to the router port). NUL padding from sparse logrotate files
+    is stripped before matching.
+
+    The result is cached per ``(pid, normalized target model)`` so repeated
+    calls (every request) do not re-read the log; a new pid (restart) or
+    different target re-parses. A sparse/empty read is *not* cached as a
+    hard ``None`` for the pid — only for the specific ``(pid, model)`` key
+    — so a later valid log or rotated log can still be found.
     """
     try:
         proc = getattr(srv, "llama_process", None)
         pid = getattr(proc, "pid", None) if proc is not None else None
         if pid is None:
             return None
-        if pid in _child_port_cache:
-            return _child_port_cache[pid]
+        # Resolve the target model: explicit arg wins, then current_model.
+        target = (model or getattr(srv, "current_model", None) or "Qwen3")
+        target = str(target).strip() if target is not None else "Qwen3"
+        if not target:
+            target = "Qwen3"
+        cache_key = (int(pid), target.lower())
+        if cache_key in _child_port_cache:
+            return _child_port_cache[cache_key]
+        # Compatibility: legacy cache used int pid -> port; honour it for
+        # the default Qwen3 target so old tests that populate {pid: port}
+        # still hit.
+        legacy = _child_port_cache.get(int(pid))  # type: ignore[arg-type]
+        if legacy is not None and target.lower() in ("qwen3",):
+            # Only reuse legacy for Qwen3; otherwise re-parse correctly.
+            return legacy  # type: ignore[return-value]
+        # Primary log path.
         log_path = _llama_log_path(srv)
+        # Missing file -> no fallback scan (test isolation: tmp_path that
+        # does not contain the log should stay None, not find the global
+        # /var/log/llama-proxy file — LP-0MTP1FQXH004JYEF).
         if not log_path.exists():
-            _child_port_cache[pid] = None
+            _child_port_cache[cache_key] = None
             return None
-        # Read the top of the log (spawn lines are written at startup).
-        read_size = min(65536, log_path.stat().st_size)
-        with open(log_path, "rb") as f:
-            head = f.read(read_size).decode("utf-8", errors="replace")
-        port = None
-        for line in head.splitlines():
-            m = _QWEN3_SPAWN_RE.search(line)
-            if m:
+        port = _scan_spawn_ports(log_path, target)
+        if port is not None:
+            _child_port_cache[cache_key] = port
+            return port
+        # Primary had real content but no matching spawn for this target
+        # (e.g. test file "[58113] main: model loaded" or a non-Qwen3-only
+        # log) — do NOT fall back to global /var/log/llama-proxy rotated
+        # logs, otherwise tmp_path isolation leaks into tests. Only fall
+        # back when the primary is sparse/NUL-padded/empty (logrotate case)
+        # — LP-0MTP1FQXH004JYEF.
+        if not _is_sparse_log(log_path):
+            _child_port_cache[cache_key] = None
+            return None
+        # Sparse current log (e.g. NUL-padded after logrotate) — scan
+        # rotated logs (llama-server*.log) by mtime descending for the most
+        # recent matching spawn line. Only when the primary file exists but
+        # had no matching spawn line; a missing file already returned above.
+        try:
+            parent = log_path.parent
+            # Also check the canonical /var/log/llama-proxy location when
+            # log_dir is custom, so a sparse worktree log can still find the
+            # real spawn line.
+            candidates: list[Path] = []
+            for base in {parent, Path("/var/log/llama-proxy")}:
                 try:
-                    port = int(m.group(2))
-                except (TypeError, ValueError):
-                    port = None
-                break
-        _child_port_cache[pid] = port
-        return port
+                    if base.exists():
+                        for p in base.glob("llama-server*.log*"):
+                            # Avoid re-scanning the primary we already tried.
+                            try:
+                                if p.resolve() == log_path.resolve():
+                                    continue
+                            except Exception:
+                                if p == log_path:
+                                    continue
+                            # Skip compressed archives.
+                            if p.suffix == ".gz":
+                                continue
+                            candidates.append(p)
+                except Exception:
+                    continue
+            # Most-recent first so the newest restart wins.
+            candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+            for cand in candidates[:8]:
+                cand_port = _scan_spawn_ports(cand, target)
+                if cand_port is not None:
+                    _child_port_cache[cache_key] = cand_port
+                    return cand_port
+        except Exception:
+            pass
+        _child_port_cache[cache_key] = None
+        return None
     except Exception:
         return None
 
@@ -2158,7 +2506,9 @@ async def _check_slot_availability(
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
         )
-        child_port = _discover_local_child_port(srv)
+        # LP-0MTP1FQXH004JYEF: target the slot's model so we query the
+        # Qwen3 child not the embed child (first spawn line).
+        child_port = _discover_local_child_port(srv, model=slot_model)
         slots_port = child_port if child_port is not None else llama_port
         slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
         availability_timeout = float(

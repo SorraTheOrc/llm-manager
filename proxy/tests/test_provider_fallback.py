@@ -42,6 +42,9 @@ def reset_cooldown_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    # Sibling-fallback breaker state (LP-0MTPMF03P0046MFG)
+    provider._sibling_failure_count.clear()
+    provider._sibling_failure_streak_start.clear()
     yield
 
 
@@ -900,6 +903,332 @@ async def test_free_usage_limit_non_overridden_provider_3h_cooldown():
 
 
 # ===================================================================
+# Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
+#
+# After N consecutive empty/stall failures on the same provider, the
+# provider is marked unavailable for an extended cooldown so the retry
+# cycle skips it and routes to a healthy sibling.
+# ===================================================================
+
+
+class TestSiblingFallbackCore:
+    """Unit tests for the sibling-failure streak counter (AC5 a/b)."""
+
+    def test_record_sibling_failure_increments_below_threshold(self):
+        """A single failure is counted but does not (yet) trigger cooldown."""
+        with patch('time.monotonic', return_value=1000.0):
+            assert provider._record_sibling_failure("opencode-go", {}) is False
+        assert provider._sibling_failure_count["opencode-go"] == 1
+        assert not provider._is_provider_unavailable("opencode-go")
+
+    def test_threshold_triggers_extended_cooldown(self):
+        """After the default threshold (2), the provider gets the extended
+        (~600s) cooldown, NOT the short 60s provider cooldown."""
+        with patch('time.monotonic', return_value=1000.0), patch('time.time', return_value=1000.0):
+            provider._record_sibling_failure("opencode-go", {})
+            assert provider._record_sibling_failure("opencode-go", {}) is True
+            remaining = provider._provider_cooldown_remaining("opencode-go")
+            assert remaining >= 590, f"expected ~600s extended cooldown, got {remaining}s"
+            assert remaining <= 610, f"cooldown too long: {remaining}s"
+
+    def test_custom_threshold_respected(self):
+        """threshold=3 requires three consecutive failures (AC5 a/b)."""
+        cfg = {"sibling_fallback_threshold": 3}
+        with patch('time.monotonic', return_value=1000.0), patch('time.time', return_value=1000.0):
+            assert provider._record_sibling_failure("opencode-go", cfg) is False
+            assert provider._record_sibling_failure("opencode-go", cfg) is False
+            assert not provider._is_provider_unavailable("opencode-go")
+            assert provider._record_sibling_failure("opencode-go", cfg) is True
+            assert provider._is_provider_unavailable("opencode-go")
+
+    def test_success_resets_count(self):
+        """A success clears the streak so a later single failure does not
+        trigger the extended cooldown (streak must be consecutive)."""
+        with patch('time.monotonic', return_value=1000.0):
+            provider._record_sibling_failure("opencode-go", {})
+        provider._reset_sibling_failure_count("opencode-go")
+        assert "opencode-go" not in provider._sibling_failure_count
+        with patch('time.monotonic', return_value=1010.0), patch('time.time', return_value=1010.0):
+            assert provider._record_sibling_failure("opencode-go", {}) is False
+        assert not provider._is_provider_unavailable("opencode-go")
+
+    def test_stale_window_resets_count(self):
+        """Failures older than the sliding window do not accumulate."""
+        with patch('time.monotonic', return_value=1000.0):
+            provider._record_sibling_failure("opencode-go", {})
+        # 700s later (> 600s window): the streak is stale, restart at 1.
+        with patch('time.monotonic', return_value=1700.0), patch('time.time', return_value=1700.0):
+            assert provider._record_sibling_failure("opencode-go", {}) is False
+            assert provider._sibling_failure_count["opencode-go"] == 1
+            assert not provider._is_provider_unavailable("opencode-go")
+
+    def test_brand_quarantined_alongside_entry(self):
+        """When the threshold trips, the shared brand is also quarantined so
+        same-gateway sibling entries (opencode-go-2/-3) are skipped too
+        (mirrors the Tier-3 stall breaker which marks the brand)."""
+        with patch('time.monotonic', return_value=1000.0), patch('time.time', return_value=1000.0):
+            provider._record_sibling_failure("opencode-go-2", {}, brand="opencode-go")
+            assert provider._record_sibling_failure("opencode-go-2", {}, brand="opencode-go") is True
+            assert provider._is_provider_unavailable("opencode-go-2")
+            assert provider._is_provider_unavailable("opencode-go")
+
+    def test_config_readers(self):
+        """Sibling-fallback knobs read from flat config, server.* nesting,
+        and fall back to defaults (AC6)."""
+        assert provider._get_sibling_fallback_threshold({}) == 2
+        assert provider._get_sibling_fallback_threshold({"sibling_fallback_threshold": 5}) == 5
+        assert provider._get_sibling_fallback_threshold(
+            {"server": {"sibling_fallback_threshold": 4}}
+        ) == 4
+        assert provider._get_sibling_fallback_cooldown_seconds({}) == 600
+        assert provider._get_sibling_fallback_cooldown_seconds(
+            {"server": {"sibling_fallback_cooldown_seconds": 120}}
+        ) == 120
+        assert provider._get_sibling_fallback_window_seconds({}) == 600
+        assert provider._get_sibling_fallback_window_seconds(
+            {"server": {"sibling_fallback_window_seconds": 60}}
+        ) == 60
+
+
+@pytest.mark.asyncio
+async def test_sibling_switch_after_n_empty_responses_across_requests():
+    """AC1: after N consecutive empty responses on the same provider, the
+    next request skips it and routes to the healthy sibling.
+
+    Two sequential proxy_with_remote_fallback calls; the failing provider
+    returns an empty JSON body both times (2 consecutive failures across
+    requests) and the sibling answers with content.
+    """
+    request = _DummyRequest()
+    cfg = {
+        # Short cooldown (0s) so the sibling streak accumulates across the
+        # two back-to-back requests rather than being masked by the short
+        # Tier-2 provider cooldown.
+        "provider_cooldown_seconds": 0,
+        "sibling_fallback_threshold": 2,
+    }
+    model_config = {
+        "providers": [
+            {
+                "name": "sick",
+                "type": "remote",
+                "provider": "sick-brand",
+                "endpoint": "https://sick.example.com",
+                "api_key_env": "SICK_KEY",
+            },
+            {
+                "name": "healthy",
+                "type": "remote",
+                "provider": "healthy-brand",
+                "endpoint": "https://healthy.example.com",
+                "api_key_env": "HEALTHY_KEY",
+            },
+        ],
+        "aliases": ["sib*"],
+    }
+    calls = []
+
+    async def _mock_ptr(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        calls.append(name)
+        if name == "sick":
+            # Empty JSON body: an upstream 200 with no usable content.
+            return Response(
+                content=json.dumps({"choices": []}),
+                status_code=200,
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_ptr):
+        # Request 1: sick empty (failure 1) -> healthy answers.
+        result1 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+        assert result1.status_code == 200
+        # Request 2: sick empty again (failure 2 -> threshold) -> healthy answers.
+        result2 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+        assert result2.status_code == 200
+
+    # Sick was tried on both requests (2 consecutive empty failures) but
+    # never answered; healthy answered both times.
+    assert calls.count("sick") == 2, f"calls={calls}"
+    assert calls.count("healthy") == 2, f"calls={calls}"
+    # After the 2nd failure, sick is on the extended (~600s) sibling cooldown.
+    assert provider._is_provider_unavailable("sick")
+    remaining = provider._provider_cooldown_remaining("sick")
+    assert remaining >= 590, f"expected ~600s extended cooldown, got {remaining}s"
+
+    # Request 3: sick is quarantined, so the router goes straight to healthy.
+    calls.clear()
+    with patch("proxy.server.proxy_to_remote", _mock_ptr):
+        result3 = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+    assert result3.status_code == 200
+    assert calls == ["healthy"], f"expected direct sibling routing, got {calls}"
+
+
+@pytest.mark.asyncio
+async def test_sibling_switch_respects_sibling_availability():
+    """AC1 (c): the next sibling is the next eligible provider in the chain
+    that is not in cooldown; a cooled sibling is skipped in favour of the
+    next one."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 0, "sibling_fallback_threshold": 1}
+    model_config = {
+        "providers": [
+            {"name": "a", "type": "remote", "endpoint": "https://a.example.com", "api_key_env": "A"},
+            {"name": "b", "type": "remote", "endpoint": "https://b.example.com", "api_key_env": "B"},
+            {"name": "c", "type": "remote", "endpoint": "https://c.example.com", "api_key_env": "C"},
+        ],
+        "aliases": ["avail*"],
+    }
+    calls = []
+
+    async def _mock_ptr(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        calls.append(name)
+        if name == "a":
+            return Response(
+                content=json.dumps({"choices": []}),
+                status_code=200,
+                media_type="application/json",
+            )
+        if name == "b":
+            return Response(status_code=503, content=b"busy")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_ptr):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+    assert result.status_code == 200
+    # a failed (empty) -> b failed (503) -> c answered.
+    assert calls == ["a", "b", "c"], f"unexpected order: {calls}"
+
+
+@pytest.mark.asyncio
+async def test_all_siblings_failing_emits_single_error():
+    """AC3: when every provider fails/cooldowns, the chain returns a single
+    exhaustion error rather than looping forever."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60, "sibling_fallback_threshold": 2}
+    model_config = {
+        "providers": [
+            {"name": "a", "type": "remote", "endpoint": "https://a.example.com", "api_key_env": "A"},
+            {"name": "b", "type": "remote", "endpoint": "https://b.example.com", "api_key_env": "B"},
+        ],
+        "aliases": ["allfail*"],
+    }
+
+    async def _mock_ptr(_req, _path, _provider_cfg):
+        return Response(
+            content=json.dumps({"choices": []}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_ptr):
+        # No chain-hold configured -> single-pass cycle raises ChainExhaustedError.
+        with pytest.raises(provider.ChainExhaustedError):
+            await provider._proxy_with_remote_fallback_cycle(
+                request, "v1/chat/completions", model_config, cfg
+            )
+
+
+@pytest.mark.asyncio
+async def test_429_does_not_trigger_sibling_fallback():
+    """AC5 (e): 429 rate-limit responses use the existing cooldown and must
+    NOT increment the sibling-failure counter."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    model_config = {
+        "providers": [
+            {"name": "p1", "type": "remote", "endpoint": "https://p1.example.com", "api_key_env": "K1"},
+            {"name": "p2", "type": "remote", "endpoint": "https://p2.example.com", "api_key_env": "K2"},
+        ],
+        "aliases": ["ratelimit*"],
+    }
+    call_count = 0
+
+    async def _mock_ptr(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if provider_cfg["name"] == "p1":
+            return Response(status_code=429, content=b"rate limited")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_ptr):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+    assert result.status_code == 200
+    # 429 must not count toward the sibling streak.
+    assert provider._sibling_failure_count == {}
+    assert provider._sibling_failure_streak_start == {}
+
+
+@pytest.mark.asyncio
+async def test_streaming_empty_reroute_counts_toward_sibling_streak():
+    """A pre-content streaming error (empty_response style: zero content,
+    finish_reason:error) re-routes to the sibling AND counts toward the
+    sibling-failure streak (LP-0MTPMF03P0046MFG)."""
+    from fastapi.responses import StreamingResponse
+
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60, "sibling_fallback_threshold": 2}
+    model_config = {
+        "providers": [
+            {"name": "stream-sick", "type": "remote", "endpoint": "https://sick.example.com", "api_key_env": "S"},
+            {"name": "stream-ok", "type": "remote", "endpoint": "https://ok.example.com", "api_key_env": "O"},
+        ],
+        "aliases": ["stream-sib*"],
+    }
+    call_count = 0
+
+    async def _error_body():
+        yield b'data: {"choices": [{"delta": {}, "finish_reason": "error", "index": 0}]}\n\n'
+
+    async def _mock_ptr(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if provider_cfg["name"] == "stream-sick":
+            return StreamingResponse(_error_body(), status_code=200, media_type="text/event-stream")
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _mock_ptr):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+    assert result.status_code == 200
+    assert call_count == 2  # re-routed to the sibling
+    # One pre-content stream failure was recorded (below the threshold of 2),
+    # so only the short Tier-2 cooldown is active, not the extended one.
+    assert provider._sibling_failure_count.get("stream-sick") == 1
+    remaining = provider._provider_cooldown_remaining("stream-sick")
+    assert 0 < remaining <= 61, f"expected short cooldown, got {remaining}s"
+
+
+# ===================================================================
 # Local-to-remote fallback tests
 # ===================================================================
 
@@ -1129,7 +1458,7 @@ async def test_local_slot_exhaustion_retry_prefers_local_before_remote(mixed_mod
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -1193,7 +1522,7 @@ async def test_local_503_retry_prefers_local_before_remote(mixed_model_config):
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -1246,7 +1575,7 @@ async def test_local_http_exception_503_retry_prefers_local_before_remote(mixed_
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -1295,7 +1624,7 @@ async def test_local_empty_200_retry_prefers_local_before_remote(mixed_model_con
     cfg = {
         "provider_cooldown_seconds": 60,
         "server": {
-            "local_slot_exhaustion_retry_attempts": 1,
+            "local_slot_exhaustion_retry_attempts": 2,
             "local_slot_exhaustion_retry_delay_seconds": 0,
         },
     }
@@ -4359,3 +4688,138 @@ async def test_proxy_with_fallback_all_time_window_skipped_distinguishable_503()
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
     )
+
+# ===================================================================
+# Additional 2-retry tests (LP-0MSORQKKM005MJ31)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_local_slot_exhaustion_retry_two_retries_succeeds_on_third(
+    mixed_model_config,
+):
+    """With local_slot_exhaustion_retry_attempts=2, first two calls fail
+    with slot exhaustion but the third succeeds locally (no remote fallback).
+
+    This exercises the full retry budget: initial attempt + 2 grace retries.
+    """
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 2,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        from fastapi.responses import JSONResponse
+        if local_calls <= 2:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "server_busy",
+                        "code": "no_slots_available",
+                        "message": "Model server busy: 0/3 slots available.",
+                    },
+                    "status": 503,
+                    "retry_after": 5,
+                    "total_slots": 3,
+                    "available_slots": 0,
+                },
+            )
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "local-llama"
+    assert local_calls == 3, "Expected initial + 2 retries = 3 local calls"
+    assert not remote_called, "Should NOT fall back to remote when third attempt succeeds"
+
+
+@pytest.mark.asyncio
+async def test_local_slot_exhaustion_persistent_falls_back_after_two_retries(
+    mixed_model_config,
+):
+    """With local_slot_exhaustion_retry_attempts=2, when all 3 attempts
+    (initial + 2 retries) report slot exhaustion, the request falls back
+    to the remote provider.
+    """
+    request = _DummyRequest()
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "local_slot_exhaustion_retry_attempts": 2,
+            "local_slot_exhaustion_retry_delay_seconds": 0,
+        },
+    }
+
+    local_calls = 0
+    remote_called = False
+
+    async def _mock_proxy_to_local(_req, _path):
+        nonlocal local_calls
+        local_calls += 1
+        from fastapi.responses import JSONResponse
+        # All 3 calls report slot exhaustion
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": "Model server busy: 0/3 slots available.",
+                },
+                "status": 503,
+                "retry_after": 5,
+                "total_slots": 3,
+                "available_slots": 0,
+            },
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, _provider_cfg):
+        nonlocal remote_called
+        remote_called = True
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok-remote"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    with (
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert local_calls == 3, "Expected initial + 2 retries = 3 local calls before fallback"
+    assert remote_called, "Should fall back to remote after all retries exhausted"
