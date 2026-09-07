@@ -48,7 +48,7 @@ CTX_262K = 262144
 HEADROOM = 4096
 FAST_SLOTS = 3
 CHEAP_SLOTS = 2
-FAST_CLAMP = 83285   # 262144 // 3 - 4096
+FAST_CLAMP = 83285  # 262144 // 3 - 4096
 CHEAP_CLAMP = 126976  # 262144 // 2 - 4096
 
 # Baselines from F2 (docs/dev/save-restore-reuse-gap-root-cause.md)
@@ -66,6 +66,7 @@ WEDGE_COOLDOWN_SECONDS = 300.0
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _body_for_tokens(n: int) -> dict:
     return {"messages": [{"role": "user", "content": "x" * (n * 8)}]}
@@ -126,6 +127,7 @@ def _clear_state():
 # AC-preamble: derivation check — caps come from effective_per_slot_threshold
 # ---------------------------------------------------------------------------
 
+
 class TestCapDerivationSource:
     """Tests must derive from the same source as production (hard cap 0 →
     effective_per_slot_threshold) not a separately hard-coded number."""
@@ -162,6 +164,7 @@ class TestCapDerivationSource:
 # ---------------------------------------------------------------------------
 # AC1: fast mode (cap 83285) — oversized save→restore cycle
 # ---------------------------------------------------------------------------
+
 
 class TestFastModeOversizedSaveRestore:
     """Fast mode (3 slots, 262144 ctx → 83285 cap): oversized session
@@ -278,12 +281,14 @@ class TestFastModeOversizedSaveRestore:
                 assert ok_restore is True
 
         import asyncio
+
         asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
 # AC2: cheap mode (cap 126976) — oversized save→restore via 2-slot schedule
 # ---------------------------------------------------------------------------
+
 
 class TestCheapModeOversizedSaveRestore:
     """Cheap mode (2 slots, 262144 ctx → 126976 cap): same save→restore
@@ -421,6 +426,7 @@ class TestCheapModeOversizedSaveRestore:
 # AC3: restore-rate measurement for >50K contexts
 # ---------------------------------------------------------------------------
 
+
 class TestRestoreRateForOversizedContexts:
     """Verify a restore-rate measurement for >50K contexts (computed as
     restores/saves from harness output or from _build_slot_context + slot
@@ -485,12 +491,10 @@ class TestRestoreRateForOversizedContexts:
         assert saves > 0
         rate = (restores / saves * 100.0) if saves else 0.0
         assert rate > NATIVE_RESTORE_BASELINE_PCT, (
-            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) must exceed "
-            f"native {NATIVE_RESTORE_BASELINE_PCT}%"
+            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) must exceed native {NATIVE_RESTORE_BASELINE_PCT}%"
         )
         assert rate > PROXY_EXPECTED_RESTORE_PCT, (
-            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) below "
-            f"expected >{PROXY_EXPECTED_RESTORE_PCT}%"
+            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) below expected >{PROXY_EXPECTED_RESTORE_PCT}%"
         )
 
     def test_restore_rate_regression_would_fail(self, tmp_path):
@@ -531,6 +535,7 @@ class TestRestoreRateForOversizedContexts:
 # ---------------------------------------------------------------------------
 # AC4: GPU-wedge parameters unchanged
 # ---------------------------------------------------------------------------
+
 
 class TestGpuWedgeParametersUnchanged:
     """Tests verify GPU-wedge parameters are unchanged: adaptive timeout
@@ -665,6 +670,7 @@ class TestGpuWedgeParametersUnchanged:
 # Cross-mode sanity: fast vs cheap caps differ exactly as expected
 # ---------------------------------------------------------------------------
 
+
 class TestCrossModeSanity:
     def test_fast_and_cheap_caps_differ_by_expected_amount(self):
         assert CHEAP_CLAMP - FAST_CLAMP == 43691  # 126976 - 83285
@@ -682,4 +688,3 @@ class TestCrossModeSanity:
         with patch("proxy.session._estimate_slot_prompt_tokens", return_value=CHEAP_CLAMP):
             slot2, _, _ = _build_slot_context(cheap_cfg, "cross-cheap", {})
             assert slot2 is not None, "126976 must persist under cheap cap"
-
