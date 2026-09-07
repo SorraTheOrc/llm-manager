@@ -31,7 +31,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from proxy.provider import effective_per_slot_threshold
 from proxy.session import (
     _build_slot_context,
