@@ -78,7 +78,7 @@ def build_local_summarizer(
     try:
         from proxy.provider import _SUMMARIZER_SYSTEM_PROMPT as _PROMPT
     except Exception:
-        _PROMPT = (
+        _PROMPT = (  # noqa: N806
             "Summarise the middle portion of this conversation for context retention. "
             "Preserve essential instructions, decisions, and key facts."
         )
