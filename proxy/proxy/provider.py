@@ -18,6 +18,7 @@ Provides:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -1484,6 +1485,53 @@ def get_remote_endpoint(model_config: dict) -> str | None:
     return None
 
 
+def _get_local_provider_endpoint(provider_cfg: dict, config: dict) -> str:
+    """Resolve the endpoint URL for a ``type: local`` provider entry.
+
+    When the provider config declares an explicit ``endpoint`` field, that
+    URL is returned unchanged (LP-0MRPILSMW004T4H8). Otherwise the legacy
+    single-server default ``http://localhost:{llama_server_port}`` (default
+    port 8080) is used for backward compatibility.
+
+    Args:
+        provider_cfg: The provider config dict (must be ``type: local``).
+        config: Server configuration dict (for ``server.llama_server_port``).
+
+    Returns:
+        The resolved endpoint URL string (no trailing slash).
+    """
+    endpoint = provider_cfg.get("endpoint")
+    if endpoint:
+        return str(endpoint).rstrip("/")
+    try:
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+    except (TypeError, ValueError):
+        port = 8080
+    return f"http://localhost:{port}"
+
+
+def _check_local_backend_gpu_oom(endpoint: str, body_text: str) -> bool:
+    """Detect GPU OOM / allocation-failure patterns in a local backend response.
+
+    Scope of this helper is the 5GB/8GB-class single-GPU case: llama-server
+    surfaces memory exhaustion as 500 responses whose body contains patterns
+    like ``out of memory`` (LP-0MRPILSMW004T4H8 AC5b). When detected, the
+    requesting code should mark the provider unhealthy so the fallback chain
+    skips the wedged server instead of hammering it.
+
+    Detection is best-effort: llama-server may return generic 500s without a
+    distinguishable body. Slot-capacity probes (HTTP health + available-slot
+    count) supplement this in ``probe_local_backend``.
+    """
+    try:
+        from proxy.backend_health import _detect_gpu_oom_in_text
+
+        return _detect_gpu_oom_in_text(body_text or "")
+    except Exception:
+        return False
+
+
 def mark_provider_unavailable(
     provider_name: str,
     cooldown_seconds: float,
@@ -2459,12 +2507,60 @@ def _get_proxy_to_local():
     raise ImportError('No proxy_to_local implementation available')
 
 
-def _get_local_concurrency_info(config: dict) -> tuple:
+def _local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
+    """Per-endpoint-aware wrapper around ``_get_local_concurrency_info``.
+
+    Tests monkeypatch ``_get_local_concurrency_info`` with callables that only
+    accept ``(config)``; passing the endpoint kwarg would break them. This
+    helper inspects the callable signature and only forwards the endpoint when
+    it is accepted (LP-0MRPILSMW004T4H8).
+    """
+    fn = _get_local_concurrency_info
+    try:
+        sig = inspect.signature(fn)
+        accepts_endpoint = (
+            "endpoint" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except Exception:
+        accepts_endpoint = False
+    if accepts_endpoint and endpoint is not None:
+        return fn(config, endpoint=endpoint)
+    return fn(config)
+
+
+def _dispatch_local(ptr_local, request, path, endpoint: str | None):
+    """Dispatch to a local backend, passing the endpoint when supported.
+
+    The endpoint argument was added for multi-backend support
+    (LP-0MRPILSMW004T4H8). Legacy implementations / test mocks that accept
+    only ``(request, path)`` keep working by falling back to the default
+    endpoint resolution inside ``proxy_to_local``.
+    """
+    try:
+        sig = inspect.signature(ptr_local)
+        accepts_endpoint = "endpoint" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except Exception:
+        accepts_endpoint = False
+    if accepts_endpoint:
+        return ptr_local(request, path, endpoint=endpoint)
+    return ptr_local(request, path)
+
+
+def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
     """Lazily import and return (current_generating_active, max_local) from config.
 
     Generating-only pool (LP-0MTH7JX82000YS5N): occupancy is measured as the
     number of sessions currently in the generating phase (first-byte onward).
     Prefill time does not count against session_slot_pool_size.
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the active
+    count is scoped to that specific llama-server instance via its
+    per-endpoint dispatch records, so each server's slot pool is evaluated
+    independently (LP-0MRPILSMW004T4H8). When it is None (legacy
+    single-server mode), the global ``local_generating_queries`` counter is
+    used.
 
     Returns the current generating-only count and the configured
     local concurrency limit.  Reads ``session_slot_pool_size`` (same value
@@ -2477,10 +2573,53 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     max_local = 1
     try:
         import proxy.server as _srv
-        try:
-            cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
-        except Exception:
-            cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+        if endpoint:
+            # Per-endpoint active count: count active/unexpired per-endpoint
+            # dispatch records for this endpoint.
+            records = getattr(_srv, "local_dispatch_records", None)
+            # The legacy single-server default URL (used when a ``type:
+            # local`` provider declares no explicit endpoint). Plain-key
+            # records (created by the pre-multi-backend code paths) occupy
+            # this default server (LP-0MRPILSMW004T4H8 backward compat).
+            try:
+                _server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+                default_ep = "http://localhost:{}".format(
+                    int(_server_cfg.get("llama_server_port", 8080) or 8080)
+                )
+            except (TypeError, ValueError):
+                default_ep = "http://localhost:8080"
+            if isinstance(records, dict):
+                if endpoint == default_ep and not any(
+                    isinstance(k, tuple) for k in records
+                ):
+                    # Pure legacy state (records keyed by plain session ids):
+                    # the global generating counter is authoritative and must
+                    # gate exactly as it did before multi-backend support.
+                    try:
+                        cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+                    except Exception:
+                        cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+                else:
+                    now = time.monotonic()
+                    for key, record in records.items():
+                        if isinstance(key, tuple) and len(key) == 2 and key[0] == endpoint:
+                            if record.get("active") or record.get("expires_at", 0) > now:
+                                cur_active += 1
+                        elif not isinstance(key, tuple) and endpoint == default_ep:
+                            # Legacy plain-key record occupies the default
+                            # server's pool alongside tuple-keyed records.
+                            if record.get("active") or record.get("expires_at", 0) > now:
+                                cur_active += 1
+            else:
+                try:
+                    cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+                except Exception:
+                    cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+        else:
+            try:
+                cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+            except Exception:
+                cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
     except Exception:
         pass
     try:
@@ -4526,10 +4665,19 @@ async def _proxy_with_fallback_cycle(
             # Mark attempt
             any_provider_tried = True
             if provider_type == "local":
+                # Resolve the per-endpoint target for this local provider
+                # (LP-0MRPILSMW004T4H8). When the provider config has no
+                # explicit ``endpoint`` the legacy default is used, keeping
+                # single-server deployments working without changes.
+                local_endpoint = _get_local_provider_endpoint(provider_cfg, config)
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
                 # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
-                # provider without marking local as unavailable.
-                cur_local, max_local = _get_local_concurrency_info(config)
+                # provider without marking local as unavailable. The check is
+                # scoped per-endpoint so each llama-server's own slot pool is
+                # evaluated independently (LP-0MRPILSMW004T4H8).
+                cur_local, max_local = _local_concurrency_info(
+                    config, endpoint=local_endpoint
+                )
                 if cur_local >= max_local:
                     # Per-mode contention queue (LP-0MSORQVK50012Q4D): in cheap
                     # mode with policy=queue, a request that finds local slots
@@ -4751,7 +4899,7 @@ async def _proxy_with_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
-                response = await ptr_local(request, path)
+                response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
                 # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
                 # (429) is TERMINAL.  Without this, the local-4xx branch
@@ -4924,7 +5072,7 @@ async def _proxy_with_fallback_cycle(
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)
 
-                        retry_response = await ptr_local(request, path)
+                        retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                         retry_body_text = _response_body_text(retry_response)
                         retry_slot_info = _parse_slot_exhaustion(retry_response)
 
@@ -5008,6 +5156,33 @@ async def _proxy_with_fallback_cycle(
 
             # Check for HTTP error status
             if _is_http_error_status(response.status_code):
+                # GPU OOM detection for local backends (LP-0MRPILSMW004T4H8
+                # AC5b): a wedged server surfaces memory-exhaustion patterns in
+                # its error body. When detected, put the provider in cooldown
+                # so the fallback chain skips it instead of retrying a server
+                # that is OOM-thrashing.
+                if provider_type == "local" and _check_local_backend_gpu_oom(
+                    local_endpoint, body_text
+                ):
+                    logger.warning(
+                        "local_gpu_oom provider=%s endpoint=%s status=%s",
+                        provider_name, local_endpoint, response.status_code,
+                    )
+                    mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="gpu_oom",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                    )
+                    fallback_reason = "gpu_oom"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+
                 if _is_model_loading_response(response, body_text):
                     fallback_reason = "model_loading"
                     prev_provider = provider_name
@@ -5029,7 +5204,7 @@ async def _proxy_with_fallback_cycle(
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)
 
-                        retry_response = await ptr_local(request, path)
+                        retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                         retry_body_text = _response_body_text(retry_response)
                         _record_attempt(
                             attempts,
@@ -5166,7 +5341,7 @@ async def _proxy_with_fallback_cycle(
                         for retry_idx in range(1, local_slot_retry_attempts + 1):
                             if local_slot_retry_delay_seconds > 0:
                                 await asyncio.sleep(local_slot_retry_delay_seconds)
-                            retry_response = await ptr_local(request, path)
+                            retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                             retry_body_text = _response_body_text(retry_response)
                             _record_attempt(
                                 attempts,
@@ -5263,7 +5438,7 @@ async def _proxy_with_fallback_cycle(
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)
                         try:
-                            retry_response = await ptr_local(request, path)
+                            retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                         except Exception as inner_exc:
                             retry_exc = inner_exc
                             _record_attempt(

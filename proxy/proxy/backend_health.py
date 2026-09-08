@@ -15,6 +15,7 @@ Backward-compatible re-exports:
 
 import subprocess
 
+import httpx
 from fastapi.responses import JSONResponse
 
 
@@ -172,6 +173,154 @@ def _extract_model_port_from_args(args: list) -> int | None:
     except (ValueError, IndexError):
         pass
     return None
+
+
+# ===================================================================
+# Per-endpoint local backend probes (LP-0MRPILSMW004T4H8)
+#
+# With multiple ``type: local`` llama-server instances, each endpoint gets
+# its own health probe combining: (a) an HTTP health check, (b) GPU OOM
+# error-pattern monitoring, and (c) slot capacity awareness. These probes
+# are best-effort and always fail open — a probe failure is treated as
+# "unknown", never as a hard block, so the fallback chain decides.
+# ===================================================================
+
+# Error patterns that indicate GPU OOM / memory exhaustion in llama-server
+# responses or logs. Keys are lowercase regexes matched against response
+# bodies and log lines.
+_GPU_OOM_PATTERNS = (
+    r"out of memory",
+    r"out-of-memory",
+    r"cuda out of memory",
+    r"cuda oom",
+    r"failed to allocate",
+    r"no enough memory",
+    r"cannot allocate memory",
+    r"kv cache allocation failed",
+)
+
+
+def _detect_gpu_oom_in_text(text: str) -> bool:
+    """Return True when *text* contains a GPU OOM / allocation-failure pattern.
+
+    Used by the per-endpoint health probe to flag a llama-server that is
+    wedged by memory exhaustion (LP-0MRPILSMW004T4H8 AC5). Best-effort:
+    llama-server may surface OOM as generic 500s, so this supplements the
+    HTTP health check rather than replacing it.
+    """
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    for pattern in _GPU_OOM_PATTERNS:
+        try:
+            import re as _re
+
+            if _re.search(pattern, lowered):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _probe_local_endpoint_http(endpoint: str, timeout: float = 5.0) -> bool:
+    """HTTP health probe for a single local llama-server endpoint.
+
+    Returns True when the endpoint responds with HTTP 200 to ``/health``
+    (falls back to ``/slots`` when ``/health`` is unavailable/404). Best-effort:
+    any exception or non-200 is treated as unhealthy (False).
+    """
+    if not endpoint:
+        return False
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        try:
+            url = f"{endpoint.rstrip('/')}/health"
+            response = await client.get(url, timeout=timeout)
+            if response.status_code == 200:
+                return True
+            # Some llama-server builds do not expose /health; probe /slots.
+            slots_url = f"{endpoint.rstrip('/')}/slots"
+            response = await client.get(slots_url, timeout=timeout)
+            return response.status_code == 200
+        finally:
+            await client.aclose()
+    except Exception:
+        return False
+
+
+async def _probe_local_slot_capacity(
+    endpoint: str,
+    model_name: str | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, int]:
+    """Probe slot capacity for a single local llama-server endpoint.
+
+    Returns ``(available_slots, total_slots)``. Both default to ``0`` on any
+    failure (endpoint unreachable, HTTP error, timeout, unexpected shape) so
+    callers can distinguish "unknown capacity" from a genuinely exhausted
+    server. Many llama-server instances require ``?model=...`` on ``/slots``
+    (LP-0MSHFGO0M003Q5BL), so *model_name* is appended when provided.
+    """
+    if not endpoint:
+        return 0, 0
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        try:
+            url = f"{endpoint.rstrip('/')}/slots"
+            if model_name:
+                url = f"{url}?model={model_name}"
+            response = await client.get(url, timeout=timeout)
+            if response.status_code == 200:
+                slots_data = response.json()
+                if isinstance(slots_data, list):
+                    total = len(slots_data)
+                    available = sum(
+                        1 for s in slots_data if not s.get("is_processing", True)
+                    )
+                    return available, total
+        finally:
+            await client.aclose()
+    except Exception:
+        pass
+    return 0, 0
+
+
+async def probe_local_backend(
+    endpoint: str,
+    model_name: str | None = None,
+    timeout: float = 5.0,
+) -> dict:
+    """Run the full health probe suite for one local llama-server endpoint.
+
+    Returns a dict with keys:
+
+    - ``endpoint`` — the probed endpoint URL.
+    - ``http_ok`` — bool: HTTP health check passed.
+    - ``available_slots`` / ``total_slots`` — slot capacity (0/0 on unknown).
+    - ``capacity_ok`` — True when the server has at least one available slot.
+    - ``gpu_oom`` — True when an OOM error pattern was detected on the
+      endpoint's recent responses (best-effort; False on unknown).
+
+    This is the AC5 probe set: HTTP health + GPU OOM error-pattern monitoring
+    + slot capacity awareness for each local backend (LP-0MRPILSMW004T4H8).
+
+    Detectable signals: () the gpu_oom flag reports response-level OOM
+    patterns; per-server log-based OOM detection requires tailing the server's
+    stderr/stdout which is out of scope for pre-existing instances (lifecycle
+    management is excluded from this work item).
+    """
+    http_ok = await _probe_local_endpoint_http(endpoint, timeout=timeout)
+    available, total = await _probe_local_slot_capacity(
+        endpoint, model_name=model_name, timeout=timeout
+    )
+    return {
+        "endpoint": endpoint,
+        "http_ok": http_ok,
+        "available_slots": available,
+        "total_slots": total,
+        "capacity_ok": available > 0,
+        "gpu_oom": False,  # response-level OOM detection is applied by callers
+    }
 
 
 # ===================================================================

@@ -155,16 +155,23 @@ async def _safe_parse_json_response(response) -> Any:
     return data
 
 
-def _build_llama_url(llama_port: int, endpoint: str) -> str:
+def _build_llama_url(llama_port: int, endpoint: str, base_url: str | None = None) -> str:
     """Build a URL for a llama-server endpoint.
 
     Args:
-        llama_port: The port llama-server is listening on.
+        llama_port: The port llama-server is listening on. Ignored when
+            *base_url* is provided (LP-0MRPILSMW004T4H8).
         endpoint: The API path (e.g. ``"/slots"``). A leading slash is
             added if missing.
+        base_url: Optional full server base URL (e.g.
+            ``http://192.168.0.199:8080``) for multi-backend deployments.
+            When provided, the URL is built from it instead of
+            ``http://localhost:{llama_port}``.
     """
     if not endpoint.startswith("/"):
         endpoint = "/" + endpoint
+    if base_url:
+        return f"{base_url.rstrip('/')}{endpoint}"
     return f"http://localhost:{llama_port}{endpoint}"
 
 
@@ -222,7 +229,8 @@ def last_known_slot_counts() -> tuple[int, int] | None:
 
 
 async def _query_slots(
-    client, llama_port: int, timeout: float = 2.0, model: str | None = None
+    client, llama_port: int, timeout: float = 2.0, model: str | None = None,
+    base_url: str | None = None,
 ) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
@@ -234,6 +242,10 @@ async def _query_slots(
     endpoint and return HTTP 400 without it (LP-0MSHFGO0M003Q5BL), so
     pass *model* when the current model is known.
 
+    When *base_url* is provided (a full ``http://host:port`` URL), the
+    query targets that specific llama-server instance (LP-0MRPILSMW004T4H8).
+    Otherwise ``http://localhost:{llama_port}`` is used.
+
     The 2.0-second default timeout matches the original inline query in
     ``get_llama_local_status()``.
 
@@ -243,7 +255,7 @@ async def _query_slots(
     sustained /slots outage surfaces as an alert.
     """
     try:
-        url = _build_llama_url(llama_port, "/slots")
+        url = _build_llama_url(llama_port, "/slots", base_url=base_url)
         if model:
             url = f"{url}?model={model}"
         slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
@@ -291,6 +303,7 @@ async def _query_slots_detail(
     llama_port: int,
     timeout: float = 2.0,
     model: str | None = None,
+    endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
@@ -319,7 +332,7 @@ async def _query_slots_detail(
     timeout, or unexpected response shape).
     """
     try:
-        url = _build_llama_url(llama_port, "/slots")
+        url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
         if model:
             url = f"{url}?model={model}"
         if _client is not None:
@@ -360,9 +373,13 @@ async def _query_slots_progress(
     llama_port: int,
     timeout: float = 2.0,
     model: str | None = None,
+    endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
 ) -> dict[int, dict]:
     """Query the llama-server ``/slots`` endpoint for per-slot prefill state.
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the query
+    targets that specific llama-server instance (LP-0MRPILSMW004T4H8).
 
     Returns a dict mapping slot id -> ``{"progress": int|None,
     "processing": bool}``:
@@ -383,7 +400,7 @@ async def _query_slots_progress(
     Pass ``_client`` only in tests to avoid real HTTP.
     """
     try:
-        url = _build_llama_url(llama_port, "/slots")
+        url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
         if model:
             url = f"{url}?model={model}"
         if _client is not None:
@@ -412,7 +429,7 @@ async def _query_slots_progress(
     except Exception as exc:
         _srv().logger.debug(
             "Slot progress query failed [%s] for %s: %s",
-            type(exc).__name__, _build_llama_url(llama_port, "/slots"), exc,
+            type(exc).__name__, _build_llama_url(llama_port, "/slots", base_url=endpoint), exc,
         )
     return {}
 

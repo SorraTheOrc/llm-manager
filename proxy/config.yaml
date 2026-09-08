@@ -176,6 +176,13 @@ audit_model_fallbacks:
   - "deepseek-v4-flash"
 
 models:
+  # Multi-backend local providers (LP-0MRPILSMW004T4H8): a ``type: local``
+  # provider may declare an optional ``endpoint`` (full ``http://host:port``
+  # URL of a specific llama-server instance) to run several local servers
+  # behind one model with per-endpoint fallback, slot persistence
+  # (``{host}-{port}/`` subdirs) and dispatch leases. Omitted ``endpoint``
+  # keeps the legacy single-server default
+  # ``http://localhost:{llama_server_port}``. See proxy/MODEL_ADD.md.
   embed:
     providers:
       - name: local-embed

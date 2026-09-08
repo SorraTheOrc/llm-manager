@@ -98,10 +98,52 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 |-------|------|----------|-------------|
 | `name` | string | yes | Unique identifier for this provider entry |
 | `type` | string | yes | `"local"` or `"remote"` |
-| `endpoint` | string | remote | Base URL of the remote API |
+| `endpoint` | string | remote; local (optional) | Base URL of the remote API; for `type: local` providers, the URL of a specific llama-server instance (see below) |
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
+
+### Multi-backend: multiple local llama-server instances (LP-0MRPILSMW004T4H8)
+
+A model may list **several `type: local` providers**, each pointing at its own
+llama-server instance. Every `type: local` provider can declare an optional
+`endpoint` field containing the full base URL of that instance
+(`http://host:port`). When `endpoint` is omitted the legacy default is used:
+`http://localhost:{llama_server_port}` (default port `8080`), which keeps
+single-server deployments working unchanged.
+
+```yaml
+models:
+  multi-local:
+    providers:
+      - name: local-qwen3-srv1
+        type: local
+        llama_model: qwen3
+        endpoint: http://192.168.0.199:8080
+      - name: local-qwen3-srv2
+        type: local
+        llama_model: qwen3
+        endpoint: http://192.168.0.200:8080
+      - name: primary_remote
+        type: remote
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+    aliases:
+      - multi-local
+```
+
+Per-endpoint behaviour:
+
+- **Dispatch leases** are keyed per endpoint `(endpoint, session_id)`, so the
+  same session can hold an independent slot on each server and slot pools are
+  evaluated independently (AC2).
+- **Slot persistence** is stored per endpoint under
+  `{session_slot_save_path}/{host}-{port}/` so servers never share slot files
+  (AC3).
+- **Fallback** iterates the local providers in order; when a server is
+  unavailable/busy the chain routes to the next one (AC4).
+- **Health probing** (`/slots`, GPU OOM error patterns, slot capacity) is
+  performed per endpoint (AC5).
 
 ### Example: Local model with remote fallback
 

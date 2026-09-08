@@ -106,6 +106,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_active_queries,
     _decrement_local_active_queries,
     _decrement_per_model_query,
+    _dispatch_lease_key,
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
     _get_chunk_refresh_buffer_seconds,
@@ -314,10 +315,13 @@ async def _update_session_and_slot(
     collected_content: list | None = None,
     llama_log_path=None,
     llama_log_offset: int = 0,
+    endpoint: str | None = None,
 ) -> None:
     """Update session history and save slot snapshot after a response.
 
-    Shared by both streaming and buffered paths.
+    Shared by both streaming and buffered paths. When *endpoint* is
+    provided, the slot snapshot is saved to that specific llama-server
+    instance (LP-0MRPILSMW004T4H8).
     """
     if not session_id:
         return
@@ -478,6 +482,7 @@ async def _update_session_and_slot(
                 slot_filename,
                 slot_timeout,
                 model=slot_model_payload,
+                endpoint=endpoint,
             )
             if saved:
                 srv.logger.info(
@@ -513,6 +518,7 @@ async def _cleanup_after_request(
     session_explicit: bool = False,
     model_name: str | None = None,
     request: Request | None = None,
+    backend: str | None = None,
 ) -> None:
     """Decrement active query counters and clean up dispatch records.
 
@@ -532,6 +538,10 @@ async def _cleanup_after_request(
     When *model_name* is provided, the per-model active query counter
     is also decremented.
 
+    When *backend* is provided (endpoint URL), the per-endpoint dispatch
+    record for that llama-server instance is targeted — required with
+    multiple local backends (LP-0MRPILSMW004T4H8).
+
     When *request* is provided, ``lease_released`` log events carry the
     caller's client identity (``client_ip`` / ``client_port``) for poller
     attribution (LP-0MSKV3IEQ004ZV88).
@@ -542,6 +552,7 @@ async def _cleanup_after_request(
         await _decrement_local_active_queries(
             srv,
             session_key=session_id,
+            backend=backend,
         )
         # For non-explicit sessions (no session affinity), immediately
         # remove the dispatch record instead of letting it linger with
@@ -553,8 +564,9 @@ async def _cleanup_after_request(
                 if lock is not None:
                     async with lock:
                         records = getattr(srv, "local_dispatch_records", {})
-                        if session_id in records:
-                            del records[session_id]
+                        record_key = _dispatch_lease_key(backend, session_id)
+                        if record_key in records:
+                            del records[record_key]
                             try:
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
@@ -573,8 +585,9 @@ async def _cleanup_after_request(
             if lock is not None:
                 async with lock:
                     records = getattr(srv, "local_dispatch_records", {})
-                    if session_id in records:
-                        del records[session_id]
+                    record_key = _dispatch_lease_key(backend, session_id)
+                    if record_key in records:
+                        del records[record_key]
                         try:
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
@@ -591,17 +604,24 @@ async def _cleanup_after_request(
 # Core proxy routing: Local llama-server dispatch
 # ===================================================================
 
-async def proxy_to_local(request: Request, path: str) -> Response:
+async def proxy_to_local(request: Request, path: str, endpoint: str | None = None) -> Response:
     """Proxy request to local llama-server with session-based incremental ingestion.
 
     Uses session headers (X-Session-Id, session_id, X-Client-Request-Id,
     X-Session-Affinity) to track per-session message history and forward
     only new messages (delta) on subsequent requests.
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the
+    request is routed to that specific llama-server instance instead of the
+    default ``http://localhost:{llama_port}`` (LP-0MRPILSMW004T4H8).
     """
     srv = _srv()
     server_config = srv.config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
-    target_url = f"http://localhost:{llama_port}/{path}"
+    if endpoint:
+        target_url = f"{endpoint.rstrip('/')}/{path}"
+    else:
+        target_url = f"http://localhost:{llama_port}/{path}"
 
     # Self-healing is active — record 5xx with reason "self_healing"
     if _is_self_healing_active():
@@ -609,7 +629,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         return _self_healing_response(path)
 
     # LP-0MQ4GQ2LO005PZPY: Return 503 immediately when backend is unavailable.
-    if not srv.backend_ready or srv.llama_process is None:
+    # An explicit *endpoint* implies a pre-existing (externally managed)
+    # llama-server instance, so the single-server process/ready gate does not
+    # apply — the per-endpoint health probe and fallback chain cover it
+    # (LP-0MRPILSMW004T4H8).
+    if not endpoint and (not srv.backend_ready or srv.llama_process is None):
         return _build_backend_unavailable_response(srv, path)
 
     # Get request body (keep original for logging before any modifications)
@@ -662,8 +686,10 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     slot_enabled = False
 
     # Use hash-based slot context (dispatch lease system handles concurrency gating)
+    # Endpoint passed positionally so legacy mocks/lambdas that accept 3 args
+    # keep working (LP-0MRPILSMW004T4H8).
     slot_id, slot_filename, slot_timeout = _build_slot_context(
-        server_config, session_id, body_json
+        server_config, session_id, body_json, endpoint
     )
     slot_enabled = slot_id is not None and slot_filename is not None
 
@@ -855,11 +881,12 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     acquired = False
     if session_id and session_explicit:
         local_max = _get_local_max_concurrent_queries(server_config)
+        backend_label = endpoint or "local"
         acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
             srv,
             max_local=local_max,
             session_key=session_id,
-            backend="local",
+            backend=backend_label,
             body_json=body_json if isinstance(body_json, dict) else None,
             model_name=model_name,
         )
@@ -896,7 +923,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
     _lease_held = bool(session_id and session_explicit) and acquired
     slot_response = await _check_slot_availability(
         srv, server_config, llama_port, slot_model_name, model_name, path,
-        lease_held=_lease_held,
+        lease_held=_lease_held, endpoint=endpoint,
     )
     if slot_response is not None:
         return slot_response
@@ -920,7 +947,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
         await _increment_local_active_queries(
             srv,
             session_key=session_id,
-            backend="local",
+            backend=endpoint or "local",
             body_json=body_json if isinstance(body_json, dict) else None,
             model_name=model_name,
         )
@@ -981,6 +1008,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             slot_filename,
                             slot_timeout,
                             model=slot_model_payload,
+                            endpoint=endpoint,
                         )
                         if restored:
                             srv.logger.info(
@@ -1026,6 +1054,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             decrement_local=True,
                             session_explicit=session_explicit,
                             request=request,
+                            backend=endpoint,
                         )
                         try:
                             await client.aclose()
@@ -1085,6 +1114,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             decrement_local=True,
                             session_explicit=session_explicit,
                             request=request,
+                            backend=endpoint,
                         )
                         return Response(
                             content=body_bytes,
@@ -1273,6 +1303,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                                 await _extend_lease_during_prefill(
                                                     srv,
                                                     session_id,
+                                                    endpoint=endpoint,
                                                     llama_port=llama_port,
                                                     model_name=model_name,
                                                     slot_id=slot_id,
@@ -1458,8 +1489,11 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                             else:
                                                 _lease_timeout = _get_chunk_refresh_buffer_seconds(srv)
                                             async with _lease_lock:
-                                                if session_id in srv.local_dispatch_records:
-                                                    srv.local_dispatch_records[session_id]['expires_at'] = (
+                                                _record_key = _dispatch_lease_key(
+                                                    endpoint, session_id
+                                                )
+                                                if _record_key in srv.local_dispatch_records:
+                                                    srv.local_dispatch_records[_record_key]['expires_at'] = (
                                                         time.monotonic() + _lease_timeout
                                                     )
                                     except Exception:
@@ -1677,6 +1711,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                         collected_content=collected_content,
                                         llama_log_path=llama_log_path,
                                         llama_log_offset=llama_log_offset,
+                                        endpoint=endpoint,
                                     )
                                     try:
                                         from proxy.session import _record_hot_slot_owner
@@ -1697,6 +1732,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                     collected_content=collected_content,
                                     llama_log_path=llama_log_path,
                                     llama_log_offset=llama_log_offset,
+                                    endpoint=endpoint,
                                 )
 
                             # Wrap both cm.__aexit__ and client.aclose() with a
@@ -1769,6 +1805,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 session_explicit=session_explicit,
                                 model_name=model_name,
                                 request=request,
+                                backend=endpoint,
                             )
 
                     return StreamingResponse(
@@ -1783,6 +1820,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                 decrement_local=False,
                 model_name=model_name,
                 request=request,
+                backend=endpoint,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:
@@ -1790,8 +1828,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     lock = getattr(srv, "local_dispatch_records_lock", None)
                     if lock is not None:
                         async with lock:
-                            if session_id in getattr(srv, "local_dispatch_records", {}):
-                                del srv.local_dispatch_records[session_id]
+                            record_key = _dispatch_lease_key(endpoint, session_id)
+                            if record_key in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[record_key]
                 except Exception:
                     pass
             payload = {
@@ -1824,6 +1863,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             slot_filename,
                             slot_timeout,
                             model=slot_model_payload,
+                            endpoint=endpoint,
                         )
                         if restored:
                             srv.logger.info(
@@ -1919,6 +1959,7 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                                 upstream_status=response.status_code,
                                 llama_log_path=llama_log_path,
                                 llama_log_offset=llama_log_offset,
+                                endpoint=endpoint,
                             )
 
                             log_response(
@@ -1949,12 +1990,14 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                             decrement_local=True,
                             session_explicit=session_explicit,
                             request=request,
+                            backend=endpoint,
                         )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
                 decrement_local=True,
                 request=request,
+                backend=endpoint,
             )
             # Clean up any dispatch record that was created before the rejection
             if session_explicit and session_id:
@@ -1962,8 +2005,9 @@ async def proxy_to_local(request: Request, path: str) -> Response:
                     lock = getattr(srv, "local_dispatch_records_lock", None)
                     if lock is not None:
                         async with lock:
-                            if session_id in getattr(srv, "local_dispatch_records", {}):
-                                del srv.local_dispatch_records[session_id]
+                            record_key = _dispatch_lease_key(endpoint, session_id)
+                            if record_key in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[record_key]
                 except Exception:
                     pass
             payload = {
