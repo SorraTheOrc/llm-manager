@@ -98,10 +98,46 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 |-------|------|----------|-------------|
 | `name` | string | yes | Unique identifier for this provider entry |
 | `type` | string | yes | `"local"` or `"remote"` |
-| `endpoint` | string | remote | Base URL of the remote API |
+| `endpoint` | string | remote / local (optional) | Base URL of the provider API. For `remote`, required. For `local`, optional: points at a pre-existing llama-server instance (LP-0MRPILSMW004T4H8). |
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
+
+### Multiple local backends (LP-0MRPILSMW004T4H8)
+
+Each `type: local` provider may declare its own `endpoint` URL (host:port)
+pointing at a pre-existing llama-server instance. Listing several local
+providers with different endpoints pools their GPU slot capacity: the proxy
+routes to the first local provider and falls through to the next when it is
+busy or unhealthy (sequential fallback, no load balancing).
+
+- Omitting `endpoint` keeps the legacy behaviour — the provider routes to
+  `http://localhost:{server.llama_server_port}`.
+- Each server tracks its own dispatch leases (keyed per-endpoint) and
+  persists its slot snapshots in its own `{session_slot_save_path}/{host}-{port}/`
+  subdirectory.
+- The proxy assumes the servers are already running; lifecycle management
+  is out of scope for multi-backend setups.
+
+```yaml
+models:
+  qwen3:
+    providers:
+      - name: local-qwen3-server-1
+        type: local
+        llama_model: Qwen3
+        endpoint: http://192.168.0.199:8080
+      - name: local-qwen3-server-2
+        type: local
+        llama_model: Qwen3
+        endpoint: http://192.168.0.200:8080
+      - name: remote-fallback
+        type: remote
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+    aliases:
+      - qwen3*
+```
 
 ### Example: Local model with remote fallback
 
@@ -211,7 +247,7 @@ comments and follow best practices.
 
 ## Routing to local backends
 
- - Ensure the model's `type` value is consulted when routing. For `type: local` entries, use the existing `proxy_to_local(request, path)` helper and pass the configured `llama_model`. For `type: remote` entries, use `proxy_to_remote` and the configured `endpoint`/`api_key_env`.
+ - Ensure the model's `type` value is consulted when routing. For `type: local` entries, use the existing `proxy_to_local(request, path)` helper and pass the configured `llama_model`. When the local provider declares an `endpoint`, pass it as the third argument so the request routes to that specific llama-server (`proxy_to_local(request, path, endpoint)`; `None`/omitted falls back to `localhost:{llama_server_port}` — see LP-0MRPILSMW004T4H8). For `type: remote` entries, use `proxy_to_remote` and the configured `endpoint`/`api_key_env`.
 
 ## Native tokenizer (optional, LP-0MSEQ71IF0003FRT)
 

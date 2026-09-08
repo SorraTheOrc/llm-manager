@@ -11,7 +11,32 @@
 #   For remote: endpoint, api_key_env, headers (optional),
 #               provider (optional, actual provider brand name used in
 #                        X-Resolved-Model header; falls back to name)
-#   For local:  llama_model
+#   For local:  llama_model, endpoint (optional)
+#
+# Local provider endpoints (LP-0MRPILSMW004T4H8):
+#   Each ``type: local`` provider may declare its own ``endpoint`` URL
+#   (host:port) pointing at a pre-existing llama-server instance. Multiple
+#   local entries with different endpoints pool their GPU slots: the proxy
+#   routes to the first local provider and falls through to the next when
+#   it is busy or unhealthy (sequential fallback). Omitting ``endpoint``
+#   keeps the legacy behaviour of routing to
+#   ``http://localhost:{server.llama_server_port}``. Each server tracks its
+#   own dispatch leases (keyed per-endpoint) and persists slot snapshots in
+#   its own ``{session_slot_save_path}/{host}-{port}/`` subdirectory.
+#   The proxy assumes the servers are already running (no lifecycle
+#   management). Example:
+#
+#     models:
+#       qwen3:
+#         providers:
+#           - name: local-qwen3-server-1
+#             type: local
+#             llama_model: Qwen3
+#             endpoint: http://192.168.0.199:8080
+#           - name: local-qwen3-server-2
+#             type: local
+#             llama_model: Qwen3
+#             endpoint: http://192.168.0.200:8080
 #
 # Failure-domain grouping (LP-0MSG45I8Q0020N1F):
 #   Provider entries that share the same normalized endpoint form a SINGLE
@@ -537,6 +562,12 @@ server:
   # Directory for KV-cache slot snapshots written by slot save/restore
   # (llama-server prompt_save/prompt_load). Must be writable by the proxy
   # user; retention is handled by scripts/cleanup-slot-cache.sh.
+  #
+  # With multiple local backends (LP-0MRPILSMW004T4H8) each server stores
+  # its slot snapshots in its own subdirectory derived from its endpoint:
+  #   {session_slot_save_path}/{host}-{port}/slot_<session_id>.bin
+  # so slot state from one server never collides with another. Single-server
+  # setups (no per-provider ``endpoint``) keep using the directory directly.
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   # Number of parallel sessions (GPU contexts) for local dispatch.
   # Controls how many concurrent Pi agent sessions can hold dispatch leases
