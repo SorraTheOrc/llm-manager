@@ -3018,6 +3018,77 @@ class TestTriggerThresholds:
             "fast": 0, "cheap": 0,
         }
 
+    def test_per_profile_thresholds_split(self):
+        """Production shape: each mode has its own profile (discover_configs).
+
+        Analysis running in fast mode passes the fast analysis_config plus the
+        discovered profiles; the cheap trigger must come from the cheap
+        profile's 2-slot pool (88,883), not the fast profile's 3 slots (58,300).
+        """
+        fast_cfg = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 3,
+            "slot_schedule": {"ctx_by_time": {"10:00": 262144, "23:59": 262144}},
+        }
+        cheap_cfg = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,
+            "slot_schedule": {"ctx_by_time": {"10:00": 262144, "23:59": 262144}},
+        }
+        profiles = {"default": fast_cfg, "fast": fast_cfg, "cheap": cheap_cfg}
+        # Analysis-time config = fast profile; profiles carry both modes.
+        t = reporting._compute_trigger_thresholds(fast_cfg, profiles)
+        assert t == {"fast": 58300, "cheap": 88883}
+        assert t["cheap"] > t["fast"]
+
+    def test_per_profile_missing_cheap_falls_back(self):
+        """A profile file absent from discover_configs falls back to the shared
+        config rather than crashing or fabricating a trigger."""
+        fast_cfg = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 3,
+            "slot_schedule": {"ctx_by_time": {"10:00": 262144}},
+        }
+        profiles = {"default": fast_cfg, "fast": fast_cfg, "cheap": None}
+        t = reporting._compute_trigger_thresholds(fast_cfg, profiles)
+        assert t["fast"] == 58300
+        assert t["cheap"] == 58300
+
+    def test_report_threshold_line_per_profile(self):
+        """AC1: the empty-window note shows per-mode triggers from each mode's
+        own profile (fast ≈58,300 / cheap ≈88,883), not a single collapsed
+        value derived from the analysis-time config alone."""
+        fast_cfg = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 3,
+            "slot_schedule": {"ctx_by_time": {"10:00": 262144, "23:59": 262144}},
+        }
+        cheap_cfg = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,
+            "slot_schedule": {"ctx_by_time": {"10:00": 262144, "23:59": 262144}},
+        }
+        profiles = {"default": fast_cfg, "fast": fast_cfg, "cheap": cheap_cfg}
+        sessions = {
+            "s1": aggregation.SessionStats(**_session("s1", max_context=81000, bucket="fast")),
+            "s2": aggregation.SessionStats(**_session("s2", max_context=70000, bucket="cheap")),
+        }
+        summary = aggregation.AnalysisResult(
+            window_start=WINDOW_START, window_end=WINDOW_END,
+            sessions=sessions,
+            fallback_events=[], routing_skip_events=[],
+            dispatch_denied_count=0, unattributed_events=0, lines_skipped=0, total_lines=0,
+            compaction_events=[],
+        )
+        md = reporting.build_report(summary, fast_cfg, profiles=profiles)
+        section = md.split("## Server-side compaction", 1)[1].split("## ", 1)[0]
+        # Distinct per-mode thresholds in the note line.
+        assert "fast ≈58,300 / cheap ≈88,883" in section
+        # AC2: dry-run estimate compares each bucket against its own trigger:
+        # fast 81k > 58.3k triggers; cheap 70k < 88.9k does NOT.
+        assert "Would-have-triggered: **1** / 2 (fast 1 / cheap 0)" in section
+        assert "Triggers used: fast ≈58,300 / cheap ≈88,883" in section
+
 
 class TestCompactionReporting:
     """AC2/AC5/AC6: report section rendering."""

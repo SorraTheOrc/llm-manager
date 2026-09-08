@@ -281,6 +281,7 @@ def build_report(
     config: dict | None,
     speed: llama_log_parser.SpeedStats | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    profiles: dict | None = None,
 ) -> str:
     recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
@@ -356,7 +357,7 @@ def build_report(
     ap(f"| Dispatch denied | {summary.dispatch_denied_count} | "
        f"{d['dispatch_denied']} ({_pct(d['dispatch_denied'], summary.dispatch_denied_count):.1f}%) | "
        f"{n['dispatch_denied']} ({_pct(n['dispatch_denied'], summary.dispatch_denied_count):.1f}%) |")
-    _append_compaction_section(ap, summary, config)
+    _append_compaction_section(ap, summary, config, profiles)
     total_avg, total_max = _ctx_stats(
         [s.max_context_size for s in sessions if s.max_context_size is not None]
     )
@@ -478,84 +479,102 @@ def build_report(
     return "\n".join(lines) + "\n"
 
 
-def _compute_trigger_thresholds(config: dict | None) -> dict[str, int]:
-    """Resolve schedule-aware compaction trigger thresholds for fast and cheap.
+def _resolve_trigger_for(ctx_size: int, slots: int) -> int:
+    """Compute the compaction trigger for one (ctx_size, slots) pair.
 
-    Returns ``{"fast": <trigger>, "cheap": <trigger>}`` where each trigger is
-    ``round_half_up(0.70 * (ctx_size // slots - 4096))``.
-
-    When ``slot_schedule.ctx_by_time`` is present the ctx-size per period
-    (from ``config_loader``) is used; otherwise ``local_model_ctx_size`` is
-    the fallback (static, conservative, LP-0MTNIJQ8U007AGVW).
+    Mirrors the proxy: ``round_half_up(0.70 * (ctx_size // slots - 4096))``
+    (``compaction_trigger_ratio`` \u00d7 the per-slot clamp in
+    ``proxy/proxy/compaction.py``).
     """
-    if config is None:
-        return {"fast": 0, "cheap": 0}
+    per_slot = ctx_size // slots - 4096
+    if per_slot <= 0:
+        return 0
+    raw = Decimal(str(0.70)) * Decimal(str(per_slot))
+    return int(raw.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
-    slots = config.get("session_slot_pool_size")
+
+def _mode_trigger(cfg: dict | None, shared: dict | None) -> int:
+    """Resolve the compaction trigger for ONE operating mode's profile config.
+
+    Uses the mode's own slot pool (``session_slot_pool_size``) against its
+    effective context sizes: the static ``local_model_ctx_size`` plus any
+    per-period ``slot_schedule.ctx_by_time`` overrides (the schedule may
+    raise the window above the file fallback, LP-0MTNIJQ8U007AGVW). The
+    highest trigger across those contexts is returned (a mode whose schedule
+    pins a larger ctx can fire later than its static fallback implies).
+    Missing values fall back to the shared config (``shared``) so a profile
+    that omits a key still resolves deterministically.
+    """
+    if cfg is None:
+        cfg = {}
+    slots = cfg.get("session_slot_pool_size")
     if slots is None:
-        return {"fast": 0, "cheap": 0}
-
-    ctx_by_time = {}
-    schedule = config.get("slot_schedule", {})
+        slots = (shared or {}).get("session_slot_pool_size")
+    if not slots:
+        return 0
+    ctx = cfg.get("local_model_ctx_size")
+    if ctx is None:
+        ctx = (shared or {}).get("local_model_ctx_size")
+    candidates = [ctx] if ctx else []
+    schedule = cfg.get("slot_schedule") if isinstance(cfg, dict) else None
     if isinstance(schedule, dict):
-        ctx_by_time = schedule.get("ctx_by_time", {})
-
-    headroom = 4096
-
-    def _resolve_trigger(ctx_size: int) -> int:
-        """Compute the per-mode trigger for one ctx_size."""
-        per_slot = ctx_size // slots - headroom
-        if per_slot <= 0:
-            return 0
-        raw = Decimal(str(0.70)) * Decimal(str(per_slot))
-        return int(raw.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-    if ctx_by_time:
-        # Schedule-aware: use all distinct ctx_size values from the schedule
-        triggers: dict[int, int] = {}
-        for ctx_sz in set(ctx_by_time.values()):
-            triggers[_resolve_trigger(ctx_sz)] = ctx_sz
-        # Map: use the *range* of triggers across periods
-        # For the report: show min and max trigger (fast always uses fewest slots
-        # → highest per-slot → highest trigger; cheap uses most slots → lower trigger)
-        # Actually: fast has *fewer* slots (3) → ctx_size/3 larger per-slot;
-        # cheap has *more* slots (2) but ctx_by_time may override ctx_size to 262144.
-        # We report the trigger for each distinct ctx_size found.
-        fast_ctx = _resolve_trigger(
-            ctx_by_time.get("10:00", ctx_by_time.get("00:00", 0)) or
-            config.get("local_model_ctx_size", 0)
+        candidates.extend(
+            int(v) for v in (schedule.get("ctx_by_time") or {}).values() if v
         )
-        cheap_ctx = _resolve_trigger(
-            ctx_by_time.get("23:59", ctx_by_time.get("01:00", 0)) or
-            config.get("local_model_ctx_size", 0)
-        )
-        # Both configs typically share the same ctx_by_time values; use distinct ones
-        distinct_triggers = sorted(set([fast_ctx, cheap_ctx]))
+    triggers = [
+        _resolve_trigger_for(int(ctx_size), int(slots))
+        for ctx_size in candidates
+        if int(ctx_size) > 0
+    ]
+    return max(triggers) if triggers else 0
+
+
+def _compute_trigger_thresholds(
+    config: dict | None, profiles: dict | None = None
+) -> dict[str, int]:
+    """Resolve the compaction trigger thresholds for fast and cheap modes.
+
+    Returns ``{"fast": <trigger>, "cheap": <trigger>}`` where each trigger
+    is ``round_half_up(0.70 * (ctx_size // slots - 4096))``.
+
+    Fast and cheap are separate operating-mode profiles (``config-fast.yaml``
+    / ``config-cheap.yaml``), each with its own slot pool and ctx schedule; the
+    report therefore resolves each mode's trigger from ITS OWN profile
+    (``profiles`` = ``config_loader.discover_configs()["profiles"]``). When
+    ``profiles`` is absent (tests, single-config callers) the one config
+    applies to both modes.
+    """
+    if profiles:
+        # Production: per-mode profiles from discover_configs().
+        fast_cfg = profiles.get("fast") or config or profiles.get("default")
+        cheap_cfg = profiles.get("cheap") or config or profiles.get("default")
+        if fast_cfg is None and cheap_cfg is None:
+            return {"fast": 0, "cheap": 0}
         return {
-            "fast": distinct_triggers[0] if len(distinct_triggers) == 1 else fast_ctx,
-            "cheap": distinct_triggers[-1] if len(distinct_triggers) == 1 else cheap_ctx,
+            "fast": _mode_trigger(fast_cfg, config),
+            "cheap": _mode_trigger(cheap_cfg, config),
         }
 
-    # Static fallback
-    static_ctx = config.get("local_model_ctx_size", 0)
-    if static_ctx > 0:
-        t = _resolve_trigger(static_ctx)
-        # fast and cheap use the same static ctx_size when no schedule
-        return {"fast": t, "cheap": t}
-
-    return {"fast": 0, "cheap": 0}
+    # Legacy single-config path (tests / no mode split): one config covers both.
+    if config is None or config.get("session_slot_pool_size") is None:
+        return {"fast": 0, "cheap": 0}
+    t = _mode_trigger(config, {})
+    return {"fast": t, "cheap": t}
 
 
 def _append_compaction_dry_run_estimate(
-    ap, sessions: list, config: dict | None = None
+    ap, sessions: list, config: dict | None = None, profiles: dict | None = None
 ) -> None:
     """Append a dry-run hypothetical estimate when no compaction events occurred.
 
     Uses each session's ``max_context_size`` as a proxy for whether the
-    compaction trigger would have fired. The estimate is clearly labelled
-    hypothetical with a warning that no history was mutated.
+    compaction trigger would have fired. Sessions are compared against their
+    own mode's trigger (``profiles`` = ``discover_configs()["profiles"]``)
+    so a fast bucket is judged against the fast profile's threshold and a
+    cheap bucket against the cheap profile's. The estimate is clearly
+    labelled hypothetical with a warning that no history was mutated.
     """
-    thresholds = _compute_trigger_thresholds(config)
+    thresholds = _compute_trigger_thresholds(config, profiles)
     fast_t = thresholds.get("fast", 0)
     cheap_t = thresholds.get("cheap", 0)
     if not sessions or (fast_t == 0 and cheap_t == 0):
@@ -593,7 +612,9 @@ def _append_compaction_dry_run_estimate(
     ap("")
 
 
-def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None = None) -> None:
+def _append_compaction_section(
+    ap, summary: AnalysisResult, config: dict | None = None, profiles: dict | None = None
+) -> None:
     """Append the ``## Server-side compaction`` section to the report.
 
     Reports server-side proactive session compaction telemetry
@@ -603,6 +624,8 @@ def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None 
     fallback-avoidance impact (compacted sessions that stayed local vs fell
     back, and the estimate of avoided fallbacks computed from the
     pre/post token estimates against the effective large-context thresholds).
+    ``profiles`` (``discover_configs()["profiles"]``) supplies each mode's
+    own config so the reported triggers are per-mode (LP-0MTSU19N9007TYZC).
     """
     compactions = [e for e in summary.compaction_events if e.kind == "compaction_event"]
     backstops = [e for e in summary.compaction_events if e.kind == "compaction_backstop"]
@@ -616,7 +639,7 @@ def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None 
     if not has_events:
         ap("No compactions observed in window.")
         ap("")
-        thresholds = _compute_trigger_thresholds(config)
+        thresholds = _compute_trigger_thresholds(config, profiles)
         fast_t = thresholds.get("fast", 0)
         cheap_t = thresholds.get("cheap", 0)
         ap(
@@ -634,7 +657,7 @@ def _append_compaction_section(ap, summary: AnalysisResult, config: dict | None 
         # Dry-run estimate: how many sessions *would* have triggered
         summary_sessions = list(summary.sessions.values())
         if summary_sessions:
-            _append_compaction_dry_run_estimate(ap, summary_sessions, config)
+            _append_compaction_dry_run_estimate(ap, summary_sessions, config, profiles)
         return
 
     # --- Aggregate stats via the shared impact helper ---
@@ -1310,8 +1333,10 @@ def run_analysis(
     output_dir = Path(output_dir)
     if llama_log_dir is None:
         llama_log_dir = log_dir
+    profiles: dict | None = None
     if mode_map is None:
         configs = config_loader.discover_configs()
+        profiles = configs["profiles"]
         if config is None:
             config = configs["analysis_config"]
         mode_map = bucketing.ModeScheduleMap.from_profiles(
@@ -1344,7 +1369,8 @@ def run_analysis(
     write_error_artifacts(summary, output_dir)
     report_path = output_dir / "report.md"
     report_path.write_text(
-        build_report(summary, config, summary.speed, mode_map), encoding="utf-8"
+        build_report(summary, config, summary.speed, mode_map, profiles=profiles),
+        encoding="utf-8",
     )
     return AnalysisRun(summary=summary, files=files, archived_to=archived_to, mode_map=mode_map)
 
