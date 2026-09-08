@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MTRWI65I005VXOC
+# smell: formatting
+# severity: high
+# description: Do not assign a `lambda` expression, use a `def`
+# -->
 """
 Router Helpers Module
 
@@ -1981,13 +1987,38 @@ async def _handle_session(
             # dispatch body to the compacted full history and marks the
             # request full-prompt so forward + persistence stay consistent.
             try:
+                from proxy.compaction_summarizer import build_local_summarizer
                 from proxy.mode import read_mode as _read_mode
+                from proxy.provider import _estimate_prompt_tokens_for_routing
+
+                # Build the production summarizer + token estimator once
+                # per request so decide_session_compaction has real
+                # capabilities rather than the always-None defaults
+                # that caused the compaction hang (LP-0MTPK77WG009A4VH).
+                _llama_port = server_config.get("llama_server_port", 8080)
+                _top_cfg = getattr(srv, "config", None)
+                if not isinstance(_top_cfg, dict):
+                    _top_cfg = {"server": dict(server_config)}
+                _summarizer = build_local_summarizer(
+                    _top_cfg,
+                    llama_port=_llama_port,
+                    timeout_seconds=float(
+                        server_config.get("compaction_summarizer_timeout", 30.0)
+                    ),
+                )
+                _estimate_fn = (
+                    lambda msgs: _estimate_prompt_tokens_for_routing(
+                        {"messages": msgs}
+                    )
+                )
 
                 _compaction = _evaluate_session_compaction(
                     srv,
                     result["session_id"],
                     list(getattr(session, "messages", None) or body_json.get("messages", [])),
                     _read_mode(),
+                    summarizer=_summarizer,
+                    estimate_tokens=_estimate_fn,
                 )
                 if (
                     _compaction.get("action") == "compact"
