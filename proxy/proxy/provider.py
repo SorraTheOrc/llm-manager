@@ -669,6 +669,16 @@ _DEFAULT_SUMMARIZER_CTX_SIZE = 8192
 # is enough for a concise middle-turn condensation without wasting GPU.
 _DEFAULT_SUMMARIZER_MAX_TOKENS = 512
 
+# Retry policy for transient summarizer failures (R3, LP-0MTTPXIAB0031AC4).
+# The summarizer retries connection errors / read timeouts / 5xx / 429 up to
+# ``summarizer_retries`` times (default 2) with a fixed inter-attempt delay
+# before failing open (returns ""). Other 4xx responses (auth, model-not-
+# found, …) are permanent and never retried. Configurable via
+# ``server.compaction_summarizer_retries`` and
+# ``server.compaction_summarizer_retry_delay_seconds``; 0 disables retries.
+_DEFAULT_SUMMARIZER_RETRIES = 2
+_DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS = 0.5
+
 # Dedicated system prompt for the proxy-side compaction summariser.
 #
 # Rationale (LP-0MTTSL2AW000A5OG — R1 companion): Pi delivers summarization
@@ -763,6 +773,9 @@ def compaction_config(config: dict) -> dict:
             - summarizer_ctx_size (int): Context size for the summariser.
             - summarizer_max_tokens (int): Max output tokens for summary.
             - summarizer_system_prompt (str): Dedicated system prompt.
+            - summarizer_retries (int): Retries on transient failures
+              (0 disables).
+            - summarizer_retry_delay_seconds (float): Inter-attempt delay.
     """
     server = config.get("server", {})
 
@@ -802,6 +815,26 @@ def compaction_config(config: dict) -> dict:
     except (ValueError, TypeError):
         max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
 
+    # Summarizer retries (transient failures only; 0 disables)
+    retries = server.get("compaction_summarizer_retries")
+    if retries is None:
+        retries = config.get("compaction_summarizer_retries")
+    try:
+        retries = int(retries)
+        retries = max(0, retries)
+    except (ValueError, TypeError):
+        retries = _DEFAULT_SUMMARIZER_RETRIES
+
+    # Summarizer retry inter-attempt delay (seconds; 0 = no wait)
+    retry_delay = server.get("compaction_summarizer_retry_delay_seconds")
+    if retry_delay is None:
+        retry_delay = config.get("compaction_summarizer_retry_delay_seconds")
+    try:
+        retry_delay = float(retry_delay)
+        retry_delay = max(0.0, retry_delay)
+    except (ValueError, TypeError):
+        retry_delay = _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
+
     return {
         "trigger_ratio": trigger_ratio,
         "summarizer_model_type": summarizer_model_type,
@@ -809,6 +842,8 @@ def compaction_config(config: dict) -> dict:
         "summarizer_ctx_size": ctx_size,
         "summarizer_max_tokens": max_tokens,
         "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
+        "summarizer_retries": retries,
+        "summarizer_retry_delay_seconds": retry_delay,
     }
 
 

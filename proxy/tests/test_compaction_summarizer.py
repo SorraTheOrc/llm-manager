@@ -111,20 +111,26 @@ class TestBuildLocalSummarizer:
         import httpx
         from proxy.compaction_summarizer import build_local_summarizer
 
-        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
             mock_client = MagicMock()
             mock_cls.return_value.__enter__.return_value = mock_client
             mock_client.post.side_effect = httpx.ConnectError("refused")
 
             s = build_local_summarizer({}, llama_port=8080, timeout_seconds=2)
-            # Must not raise, must return empty string
+            # Must not raise, must return empty string after retries exhausted
             assert s([{"role": "user", "content": "hi"}]) == ""
 
     def test_fail_open_on_timeout(self):
         import httpx
         from proxy.compaction_summarizer import build_local_summarizer
 
-        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
             mock_client = MagicMock()
             mock_cls.return_value.__enter__.return_value = mock_client
             mock_client.post.side_effect = httpx.ReadTimeout("timeout")
@@ -135,7 +141,10 @@ class TestBuildLocalSummarizer:
     def test_fail_open_on_non_200(self):
         from proxy.compaction_summarizer import build_local_summarizer
 
-        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
             mock_client = MagicMock()
             mock_cls.return_value.__enter__.return_value = mock_client
             resp = MagicMock()
@@ -144,6 +153,7 @@ class TestBuildLocalSummarizer:
             mock_client.post.return_value = resp
 
             s = build_local_summarizer({}, llama_port=8080)
+            # 500 is transient — retried (default 2) then fail-open
             assert s([{"role": "user", "content": "hi"}]) == ""
 
     def test_fail_open_on_malformed_response(self):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -271,6 +272,8 @@ def build_local_summarizer(
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
     _system_default, _format_template = _load_prompt_constants()
     _system_prompt = _resolve_system_prompt_override() or _system_default
+    retries = int(cfg.get("summarizer_retries") or 0)
+    retry_delay = float(cfg.get("summarizer_retry_delay_seconds") or 0.0)
 
     def _summarizer(middle_messages: list[dict[str, Any]]) -> str:
         if not middle_messages:
@@ -297,11 +300,51 @@ def build_local_summarizer(
             "temperature": 0.2,
         }
         url = f"http://localhost:{int(llama_port)}/v1/chat/completions"
+        timeout = httpx.Timeout(float(timeout_seconds))
+        attempts = retries + 1  # initial attempt + configured retries
         try:
-            timeout = httpx.Timeout(float(timeout_seconds))
-            with httpx.Client(timeout=timeout) as client:
-                resp = client.post(url, json=body)
-            if resp.status_code != 200:
+            # R3 (LP-0MTTPXIAB0031AC4): retry TRANSIENT failures only —
+            # connection errors / read timeouts (httpx.TransportError) and
+            # HTTP 5xx / 429. Other 4xx (auth, model-not-found) are permanent
+            # and fail open immediately. Each retry is logged at WARNING;
+            # after exhaustion the summarizer returns "" (fail-open).
+            for attempt in range(attempts):
+                try:
+                    with httpx.Client(timeout=timeout) as client:
+                        resp = client.post(url, json=body)
+                except httpx.TransportError as exc:
+                    if attempt < retries:
+                        logger.warning(
+                            "local summarizer transport error (attempt %d/%d): %s; retrying in %.2fs",
+                            attempt + 1,
+                            attempts,
+                            exc,
+                            retry_delay,
+                        )
+                        if retry_delay > 0:
+                            time.sleep(retry_delay)
+                        continue
+                    logger.warning(
+                        "local summarizer call failed after %d attempts: %s",
+                        attempts,
+                        exc,
+                        exc_info=True,
+                    )
+                    return ""
+                if resp.status_code == 200:
+                    break
+                transient = resp.status_code >= 500 or resp.status_code == 429
+                if transient and attempt < retries:
+                    logger.warning(
+                        "local summarizer non-200 status=%s (attempt %d/%d); retrying in %.2fs",
+                        resp.status_code,
+                        attempt + 1,
+                        attempts,
+                        retry_delay,
+                    )
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
+                    continue
                 logger.warning(
                     "local summarizer non-200 status=%s body=%.500s",
                     resp.status_code,

@@ -20,6 +20,8 @@ from proxy.provider import (
     _DEFAULT_COMPACTION_TRIGGER_RATIO,
     _DEFAULT_SUMMARIZER_CTX_SIZE,
     _DEFAULT_SUMMARIZER_MAX_TOKENS,
+    _DEFAULT_SUMMARIZER_RETRIES,
+    _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS,
     _SUMMARIZATION_PROMPT,
     _SUMMARIZER_SYSTEM_PROMPT,
     compaction_config,
@@ -198,6 +200,64 @@ class TestSummarizationPromptTemplate:
         assert (
             "Keep each section concise. Preserve exact file paths, function "
             "names, and error messages." in _SUMMARIZATION_PROMPT
+        )
+
+
+class TestCompactionRetryConfig:
+    """Retry policy for transient summarizer failures (R3)."""
+
+    def test_defaults(self):
+        c = compaction_config({})
+        assert c["summarizer_retries"] == _DEFAULT_SUMMARIZER_RETRIES
+        assert (
+            c["summarizer_retry_delay_seconds"]
+            == _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
+        )
+
+    def test_server_overrides(self):
+        cfg = {
+            "server": {
+                "compaction_summarizer_retries": 5,
+                "compaction_summarizer_retry_delay_seconds": 1.5,
+            }
+        }
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == 5
+        assert c["summarizer_retry_delay_seconds"] == 1.5
+
+    def test_flat_overrides(self):
+        cfg = {"compaction_summarizer_retries": 0}
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == 0  # 0 disables retries
+
+    def test_explicit_zero_delay(self):
+        cfg = {"server": {"compaction_summarizer_retry_delay_seconds": 0}}
+        c = compaction_config(cfg)
+        assert c["summarizer_retry_delay_seconds"] == 0.0
+
+    def test_negative_values_clamped_to_zero(self):
+        cfg = {
+            "server": {
+                "compaction_summarizer_retries": -3,
+                "compaction_summarizer_retry_delay_seconds": -1,
+            }
+        }
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == 0
+        assert c["summarizer_retry_delay_seconds"] == 0.0
+
+    def test_bad_types_fall_back_to_defaults(self):
+        cfg = {
+            "server": {
+                "compaction_summarizer_retries": "lots",
+                "compaction_summarizer_retry_delay_seconds": "soon",
+            }
+        }
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == _DEFAULT_SUMMARIZER_RETRIES
+        assert (
+            c["summarizer_retry_delay_seconds"]
+            == _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
         )
 
 
