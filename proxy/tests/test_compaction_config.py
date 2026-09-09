@@ -20,6 +20,7 @@ from proxy.provider import (
     _DEFAULT_COMPACTION_TRIGGER_RATIO,
     _DEFAULT_SUMMARIZER_CTX_SIZE,
     _DEFAULT_SUMMARIZER_MAX_TOKENS,
+    _SUMMARIZATION_PROMPT,
     _SUMMARIZER_SYSTEM_PROMPT,
     compaction_config,
     validate_compaction_config,
@@ -128,6 +129,76 @@ class TestSummarizerSystemPrompt:
         """compaction_config returns the same prompt via summarizer_system_prompt."""
         c = compaction_config({})
         assert c["summarizer_system_prompt"] is _SUMMARIZER_SYSTEM_PROMPT
+
+    def test_system_prompt_matches_pi_role_and_guard_rails(self):
+        """Pi verbatim: role + Do NOT continue/respond/ONLY-output guard rails."""
+        assert _SUMMARIZER_SYSTEM_PROMPT.startswith(
+            "You are a context summarization assistant."
+        )
+        assert "Do NOT continue the conversation." in _SUMMARIZER_SYSTEM_PROMPT
+        assert "Do NOT respond to any questions" in _SUMMARIZER_SYSTEM_PROMPT
+        assert "ONLY output the structured summary." in _SUMMARIZER_SYSTEM_PROMPT
+
+    def test_system_prompt_has_no_format_template(self):
+        """Structured sections live in the USER template, mirroring Pi's split.
+
+        R1 (LP-0MTTPXHTI0081WIR) merged the format template into the system
+        prompt; the R1-companion (LP-0MTTSL2AW000A5OG) restores Pi's exact
+        system/user split, so no "## Goal"-style sections belong here.
+        """
+        assert "Use this EXACT format" not in _SUMMARIZER_SYSTEM_PROMPT
+        assert "## Goal" not in _SUMMARIZER_SYSTEM_PROMPT
+        assert "## Next Steps" not in _SUMMARIZER_SYSTEM_PROMPT
+
+    def test_system_prompt_is_pi_verbatim(self):
+        """Exact Pi SUMMARIZATION_SYSTEM_PROMPT text (guard against drift)."""
+        expected = (
+            "You are a context summarization assistant. Your task is to read a "
+            "conversation between a user and an AI coding assistant, then produce "
+            "a structured summary following the exact format specified.\n"
+            "\n"
+            "Do NOT continue the conversation. Do NOT respond to any questions "
+            "in the conversation. ONLY output the structured summary."
+        )
+        assert _SUMMARIZER_SYSTEM_PROMPT == expected
+
+
+class TestSummarizationPromptTemplate:
+    """Pi's SUMMARIZATION_PROMPT — the structured format template delivered in
+    the summarizer's USER message after the <conversation> serialization."""
+
+    def test_template_is_non_empty(self):
+        """_SUMMARIZATION_PROMPT must be a non-empty string."""
+        assert isinstance(_SUMMARIZATION_PROMPT, str)
+        assert len(_SUMMARIZATION_PROMPT) > 0
+
+    def test_template_starts_with_conversation_reference(self):
+        """Pi verbatim opening: the conversation is serialised above the template."""
+        assert _SUMMARIZATION_PROMPT.startswith(
+            "The messages above are a conversation to summarize."
+        )
+
+    def test_template_has_structured_sections(self):
+        """All Pi structured sections are present."""
+        for section in (
+            "## Goal",
+            "## Constraints & Preferences",
+            "## Progress",
+            "### Done",
+            "### In Progress",
+            "### Blocked",
+            "## Key Decisions",
+            "## Next Steps",
+            "## Critical Context",
+        ):
+            assert section in _SUMMARIZATION_PROMPT
+
+    def test_template_preserves_exact_references_instruction(self):
+        """Verbatim Pi tail: keep paths/function names/errors exact."""
+        assert (
+            "Keep each section concise. Preserve exact file paths, function "
+            "names, and error messages." in _SUMMARIZATION_PROMPT
+        )
 
 
 # ===================================================================

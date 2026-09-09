@@ -671,32 +671,54 @@ _DEFAULT_SUMMARIZER_MAX_TOKENS = 512
 
 # Dedicated system prompt for the proxy-side compaction summariser.
 #
-# Rationale (LP-0MTTPXHTI0081WIR / R1): Adopts Pi's structured summarization
-# format to close the single largest quality gap identified in the compaction
-# comparison (proxy 5/10 vs Pi 9/10 on summarization). Mirrors Pi's
-# SUMMARIZATION_PROMPT (dist/core/compaction/compaction.js) and
-# SUMMARIZATION_SYSTEM_PROMPT (dist/core/compaction/utils.js) — see
-# docs/session-compaction-pi-comparison.md §5.1 R1. The structured sections
-# (Goal, Constraints, Progress, Decisions, Next Steps, Critical Context,
-# File Operations) preserve decisions and next steps for correct session
-# resumption; guard rails prevent the model from continuing the conversation.
-# Prompt-only change — summarizer logic, retry, and file-ops extraction are
-# R2/R3/R5 and out of scope for this item.
+# Rationale (LP-0MTTSL2AW000A5OG — R1 companion): Pi delivers summarization
+# instructions through TWO separate messages — SUMMARIZATION_SYSTEM_PROMPT
+# (role + guard rails, dist/core/compaction/utils.js) and SUMMARIZATION_PROMPT
+# (the structured format template, dist/core/compaction/compaction.js).
+# R1 (LP-0MTTPXHTI0081WIR) merged both into a single system-prompt constant;
+# this companion restores Pi's exact split so the model treats the transcript
+# as material to summarise, not a conversation to continue:
+#   - _SUMMARIZER_SYSTEM_PROMPT — role + "Do NOT continue / Do NOT respond /
+#     ONLY output" guard rails (verbatim Pi SUMMARIZATION_SYSTEM_PROMPT).
+#   - _SUMMARIZATION_PROMPT — the structured format template (Goal,
+#     Constraints, Progress, Decisions, Next Steps, Critical Context),
+#     appended AFTER the serialised <conversation> in the summarizer's USER
+#     message (see proxy/compaction_summarizer.py:build_local_summarizer).
+# Keeping Pi's wording verbatim closes the prompt-quality gap from the
+# compaction comparison (docs/session-compaction-pi-comparison.md §5.1) and
+# avoids format drift across the local Qwen3 and future remote `compact`
+# (Muse → DeepSeek, LP-0MTT0O74N009E7N2) paths. Operators may override this
+# system prompt per-installation by dropping a file at
+# .sorraAgents/prompts/compaction-summarizer.txt (see
+# proxy/compaction_summarizer.py:_resolve_system_prompt_override).
 _SUMMARIZER_SYSTEM_PROMPT = (
-    "You are a context summarization assistant. Your task is to read the middle "
-    "portion of a conversation between a user and an AI assistant, then produce "
-    "a structured summary that another LLM will use to continue the work.\n"
+    "You are a context summarization assistant. Your task is to read a "
+    "conversation between a user and an AI coding assistant, then produce "
+    "a structured summary following the exact format specified.\n"
     "\n"
     "Do NOT continue the conversation. Do NOT respond to any questions in the "
-    "conversation. ONLY output the structured summary.\n"
+    "conversation. ONLY output the structured summary."
+)
+
+# Structured summarization format template — verbatim Pi SUMMARIZATION_PROMPT
+# (dist/core/compaction/compaction.js). Delivered in the summarizer's USER
+# message directly after the serialised <conversation> so the model follows
+# the exact checkpoint format below for the condensed middle turns. File
+# operations (<read-files>/<modified-files>) are appended to the OUTPUT by
+# the file-ops tracker (R2, LP-0MTTPXI1Y003YFOU), matching Pi's
+# utils.js:formatFileOperations — they are not part of the template.
+_SUMMARIZATION_PROMPT = (
+    "The messages above are a conversation to summarize. Create a structured "
+    "context checkpoint summary that another LLM will use to continue the work.\n"
     "\n"
     "Use this EXACT format:\n"
     "\n"
     "## Goal\n"
-    "[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n"
+    "[What is the user trying to accomplish? Can be multiple items if the "
+    "session covers different tasks.]\n"
     "\n"
     "## Constraints & Preferences\n"
-    "- [Any constraints, preferences, or requirements mentioned by the user]\n"
+    "- [Any constraints, preferences, or requirements mentioned by user]\n"
     "- [Or \"(none)\" if none were mentioned]\n"
     "\n"
     "## Progress\n"
@@ -707,7 +729,7 @@ _SUMMARIZER_SYSTEM_PROMPT = (
     "- [ ] [Current work]\n"
     "\n"
     "### Blocked\n"
-    "- [Issues preventing progress, if any — or \"(none)\"]\n"
+    "- [Issues preventing progress, if any]\n"
     "\n"
     "## Key Decisions\n"
     "- **[Decision]**: [Brief rationale]\n"
@@ -719,16 +741,8 @@ _SUMMARIZER_SYSTEM_PROMPT = (
     "- [Any data, examples, or references needed to continue]\n"
     "- [Or \"(none)\" if not applicable]\n"
     "\n"
-    "## File Operations\n"
-    "<read-files>\n"
-    "[Paths of files that were read (one per line)]\n"
-    "</read-files>\n"
-    "<modified-files>\n"
-    "[Paths of files that were created or modified (one per line)]\n"
-    "</modified-files>\n"
-    "\n"
-    "Keep each section concise. Preserve exact file paths, function names, and error messages. "
-    "Omit routine back-and-forth, acknowledgments, and redundant context."
+    "Keep each section concise. Preserve exact file paths, function names, "
+    "and error messages."
 )
 
 

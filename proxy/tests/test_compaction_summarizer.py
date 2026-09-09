@@ -8,7 +8,7 @@ fail-open on errors, and timeout handling.
 from unittest.mock import MagicMock, patch
 
 import pytest
-from proxy.provider import _SUMMARIZER_SYSTEM_PROMPT
+from proxy.provider import _SUMMARIZATION_PROMPT, _SUMMARIZER_SYSTEM_PROMPT
 
 
 def _mock_success_response(content: str = "SUMMARY TEXT", status: int = 200):
@@ -72,14 +72,19 @@ class TestBuildLocalSummarizer:
             assert body["model"] == "Qwen3"
             assert body["max_tokens"] == 512
             assert body["stream"] is False
-            # System prompt present
+            # System prompt present (Pi role + guard rails only)
             msgs = body["messages"]
             assert msgs[0]["role"] == "system"
             assert msgs[0]["content"] == _SUMMARIZER_SYSTEM_PROMPT
-            # Transcript contains middle content
-            user_contents = " ".join(m.get("content", "") for m in msgs if m.get("role") == "user")
-            assert "hello" in user_contents
-            assert "world" in user_contents
+            # User message: transcript serialised inside <conversation> tags,
+            # then the structured format template appended (Pi's split)
+            user_msg = next(m for m in msgs if m.get("role") == "user")
+            user_content = user_msg["content"]
+            assert user_content.startswith("<conversation>\n")
+            assert "user: hello" in user_content
+            assert "assistant: world" in user_content
+            assert "\n</conversation>\n\n" in user_content
+            assert _SUMMARIZATION_PROMPT in user_content
 
     def test_uses_config_values_for_model_and_max_tokens(self):
         from proxy.compaction_summarizer import build_local_summarizer
