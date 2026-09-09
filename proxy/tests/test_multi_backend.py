@@ -289,10 +289,10 @@ async def test_local_fallback_chain_tries_next_server(monkeypatch):
 
     class _Req:
         headers = {}
-        body = b"{'messages': [{'role': 'user', 'content': 'hi'}]}"
+        _payload = b"{'messages': [{'role': 'user', 'content': 'hi'}]}"
 
         async def body(self):
-            return self.body
+            return self._payload
 
     result = await provider._proxy_with_fallback_cycle(
         _Req(), "v1/chat/completions", model_config, config
@@ -323,10 +323,10 @@ async def test_local_provider_endpoint_passed_to_proxy_to_local(monkeypatch):
 
     class _Req:
         headers = {}
-        body = b'{"messages": [{"role": "user", "content": "hi"}]}'
+        _payload = b'{"messages": [{"role": "user", "content": "hi"}]}'
 
         async def body(self):
-            return self.body
+            return self._payload
 
     result = await provider._proxy_with_fallback_cycle(
         _Req(), "v1/chat/completions", model_config, config

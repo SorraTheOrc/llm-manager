@@ -2140,11 +2140,8 @@ async def _handle_session(
                         server_config.get("compaction_summarizer_timeout", 30.0)
                     ),
                 )
-                _estimate_fn = (
-                    lambda msgs: _estimate_prompt_tokens_for_routing(
-                        {"messages": msgs}
-                    )
-                )
+                def _estimate_fn(msgs):
+                    return _estimate_prompt_tokens_for_routing({"messages": msgs})
 
                 _compaction = _evaluate_session_compaction(
                     srv,
