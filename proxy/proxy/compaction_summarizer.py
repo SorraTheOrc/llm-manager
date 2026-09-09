@@ -8,6 +8,7 @@ middle turns; fail-open so compaction never blocks dispatch.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,111 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# File-operation tracking (R2, LP-0MTTPXI1Y003YFOU)
+#
+# Mirrors Pi's utils.js extractFileOpsFromMessage / computeFileLists /
+# formatFileOperations: read / write / edit tool calls in the summarised
+# assistant messages are collected programmatically (never left to the
+# model) and appended to the summary as sorted ``<read-files>`` /
+# ``<modified-files>`` XML sections. A file that was both read and modified
+# is reported under ``<modified-files>`` only. Sections are omitted entirely
+# when no file operations exist.
+# ---------------------------------------------------------------------------
+_FILE_TOOL_NAMES = frozenset({"read", "write", "edit"})
+
+
+def _iter_tool_calls(messages: list[dict[str, Any]]):
+    """Yield ``(name, arguments)`` for every file-ish tool call in messages.
+
+    Recognises OpenAI-style ``assistant.tool_calls[].function`` entries and
+    tolerates a flat ``{name, arguments}`` shape. Non-assistant messages and
+    messages without tool_calls contribute nothing.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                yield function.get("name"), function.get("arguments")
+            else:
+                yield tool_call.get("name"), tool_call.get("arguments")
+
+
+def _parse_tool_path(arguments: Any) -> str | None:
+    """Extract the ``path`` argument from JSON-string or dict tool arguments.
+
+    Returns ``None`` (never raises) for malformed JSON, non-dict payloads,
+    or a missing/empty path.
+    """
+    if isinstance(arguments, str):
+        try:
+            data = json.loads(arguments)
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(arguments, dict):
+        data = arguments
+    else:
+        return None
+    if not isinstance(data, dict):
+        return None
+    path = data.get("path")
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def extract_file_operations(
+    messages: list[dict[str, Any]],
+) -> dict[str, set[str]]:
+    """Extract deduplicated file operations from the summarised messages.
+
+    Args:
+        messages: OpenAI-style message list (the summarizer's middle turns).
+
+    Returns:
+        ``{"read": set[str], "modified": set[str]}`` where ``modified`` is
+        the union of write/edit paths and ``read`` excludes any path that was
+        also modified (Pi's computeFileLists semantics). Sets are unordered;
+        callers sort when rendering (see ``format_file_operations``).
+    """
+    read: set[str] = set()
+    modified: set[str] = set()
+    for name, arguments in _iter_tool_calls(messages):
+        if not isinstance(name, str) or name not in _FILE_TOOL_NAMES:
+            continue
+        path = _parse_tool_path(arguments)
+        if not path:
+            continue
+        if name == "read":
+            read.add(path)
+        else:  # write / edit
+            modified.add(path)
+    return {"read": read - modified, "modified": modified}
+
+
+def format_file_operations(read_files, modified_files) -> str:
+    """Render sorted ``<read-files>`` / ``<modified-files>`` XML sections.
+
+    Sections are sorted for deterministic output; empty sections are omitted
+    and a result with no sections returns ``""`` (callers append nothing).
+    The leading blank line separates the sections from the summary body,
+    matching Pi's formatFileOperations.
+    """
+    sections: list[str] = []
+    if read_files:
+        sections.append("<read-files>\n" + "\n".join(sorted(read_files)) + "\n</read-files>")
+    if modified_files:
+        sections.append("<modified-files>\n" + "\n".join(sorted(modified_files)) + "\n</modified-files>")
+    if not sections:
+        return ""
+    return "\n\n" + "\n\n".join(sections)
+
 
 # ---------------------------------------------------------------------------
 # Operator-overridable system prompt (LP-0MTTSL2AW000A5OG)
@@ -215,7 +321,13 @@ def build_local_summarizer(
                     content = "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
                 else:
                     content = str(content or "")
-            return content.strip()
+            content = content.strip()
+            if not content:
+                return ""
+            # R2: append file-operation XML (read/modified tool calls in the
+            # summarised turns) to the model's summary, Pi-style.
+            ops = extract_file_operations(middle_messages)
+            return content + format_file_operations(ops["read"], ops["modified"])
         except Exception as exc:
             logger.warning("local summarizer call failed: %s", exc, exc_info=True)
             return ""
