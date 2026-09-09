@@ -755,6 +755,57 @@ _SUMMARIZATION_PROMPT = (
     "and error messages."
 )
 
+# Incremental summarization template — verbatim Pi UPDATE_SUMMARIZATION_PROMPT
+# (dist/core/compaction/compaction.js). Used (R5, LP-0MTTPXIIX005Y0Z9) when the
+# session already carries a compaction summary: the summarizer merges the NEW
+# middle turns into the existing summary rather than regenerating from scratch,
+# preserving all prior sections and updating only what changed. The existing
+# summary is passed in the ``<previous-summary>`` block that precedes this
+# template in the USER message (see proxy/compaction_summarizer.py).
+_UPDATE_SUMMARIZATION_PROMPT = (
+    "The messages above are NEW conversation messages to incorporate into the "
+    "existing summary provided in <previous-summary> tags.\n"
+    "\n"
+    "Update the existing structured summary with new information. RULES:\n"
+    "- PRESERVE all existing information from the previous summary\n"
+    "- ADD new progress, decisions, and context from the new messages\n"
+    "- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" "
+    "when completed\n"
+    "- UPDATE \"Next Steps\" based on what was accomplished\n"
+    "- PRESERVE exact file paths, function names, and error messages\n"
+    "- If something is no longer relevant, you may remove it\n"
+    "\n"
+    "Use this EXACT format:\n"
+    "\n"
+    "## Goal\n"
+    "[Preserve existing goals, add new ones if the task expanded]\n"
+    "\n"
+    "## Constraints & Preferences\n"
+    "- [Preserve existing, add new ones discovered]\n"
+    "\n"
+    "## Progress\n"
+    "### Done\n"
+    "- [x] [Include previously done items AND newly completed items]\n"
+    "\n"
+    "### In Progress\n"
+    "- [ ] [Current work - update based on progress]\n"
+    "\n"
+    "### Blocked\n"
+    "- [Current blockers - remove if resolved]\n"
+    "\n"
+    "## Key Decisions\n"
+    "- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n"
+    "\n"
+    "## Next Steps\n"
+    "1. [Update based on current state]\n"
+    "\n"
+    "## Critical Context\n"
+    "- [Preserve important context, add new if needed]\n"
+    "\n"
+    "Keep each section concise. Preserve exact file paths, function names, "
+    "and error messages."
+)
+
 
 def compaction_config(config: dict) -> dict:
     """Resolve the compaction configuration from the proxy config.

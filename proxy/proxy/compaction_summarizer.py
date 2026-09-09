@@ -200,6 +200,13 @@ _FALLBACK_SUMMARIZATION_PROMPT = (
     "to continue the work. Keep each section concise. Preserve exact "
     "file paths, function names, and error messages."
 )
+_FALLBACK_UPDATE_SUMMARIZATION_PROMPT = (
+    "The messages above are NEW conversation messages to incorporate into "
+    "the existing summary provided in <previous-summary> tags. Update the "
+    "existing structured summary, PRESERVING all existing information and "
+    "adding new progress, decisions, and context. Preserve exact file paths, "
+    "function names, and error messages."
+)
 
 
 def _message_content_text(msg: dict[str, Any]) -> str:
@@ -228,19 +235,28 @@ def _transcript_for_summarizer(middle_messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
-def _load_prompt_constants() -> tuple[str, str]:
-    """Return ``(system_prompt, format_template)`` defaults from provider.
+def _load_prompt_constants() -> tuple[str, str, str]:
+    """Return ``(system_prompt, format_template, update_template)`` defaults.
 
-    Imports Pi's verbatim ``_SUMMARIZER_SYSTEM_PROMPT`` / ``_SUMMARIZATION_PROMPT``
-    from ``proxy.provider``. Falls back to the built-in copies above on any
-    import error (same-package import virtually never fails) so the
-    summarizer keeps working in degraded conditions.
+    Imports Pi's verbatim ``_SUMMARIZER_SYSTEM_PROMPT`` /
+    ``_SUMMARIZATION_PROMPT`` / ``_UPDATE_SUMMARIZATION_PROMPT`` from
+    ``proxy.provider``. Falls back to the built-in copies above on any import
+    error (same-package import virtually never fails) so the summarizer
+    keeps working in degraded conditions.
     """
     try:
-        from proxy.provider import _SUMMARIZATION_PROMPT, _SUMMARIZER_SYSTEM_PROMPT
+        from proxy.provider import (
+            _SUMMARIZATION_PROMPT,
+            _SUMMARIZER_SYSTEM_PROMPT,
+            _UPDATE_SUMMARIZATION_PROMPT,
+        )
     except Exception:
-        return _FALLBACK_SUMMARIZER_SYSTEM_PROMPT, _FALLBACK_SUMMARIZATION_PROMPT
-    return _SUMMARIZER_SYSTEM_PROMPT, _SUMMARIZATION_PROMPT
+        return (
+            _FALLBACK_SUMMARIZER_SYSTEM_PROMPT,
+            _FALLBACK_SUMMARIZATION_PROMPT,
+            _FALLBACK_UPDATE_SUMMARIZATION_PROMPT,
+        )
+    return _SUMMARIZER_SYSTEM_PROMPT, _SUMMARIZATION_PROMPT, _UPDATE_SUMMARIZATION_PROMPT
 
 
 def build_local_summarizer(
@@ -270,30 +286,39 @@ def build_local_summarizer(
     cfg = compaction_config(config or {})
     model_name = cfg.get("summarizer_model_name") or "Qwen3"
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
-    _system_default, _format_template = _load_prompt_constants()
+    _system_default, _format_template, _update_template = _load_prompt_constants()
     _system_prompt = _resolve_system_prompt_override() or _system_default
     retries = int(cfg.get("summarizer_retries") or 0)
     retry_delay = float(cfg.get("summarizer_retry_delay_seconds") or 0.0)
 
-    def _summarizer(middle_messages: list[dict[str, Any]]) -> str:
+    def _summarizer(
+        middle_messages: list[dict[str, Any]],
+        previous_summary: str | None = None,
+    ) -> str:
         if not middle_messages:
             return ""
         transcript = _transcript_for_summarizer(middle_messages)
         if not transcript.strip():
             return ""
 
+        # R5 (LP-0MTTPXIIX005Y0Z9) — Pi's message split: the transcript is
+        # serialised inside <conversation> tags so the model summarises
+        # rather than continues the conversation; a previous compaction
+        # summary is passed in a <previous-summary> block and switches the
+        # template to the incremental UPDATE prompt.
+        user_content = f"<conversation>\n{transcript}\n</conversation>"
+        if previous_summary:
+            user_content += f"\n\n<previous-summary>\n{previous_summary}\n</previous-summary>"
+            template = _update_template
+        else:
+            template = _format_template
+        user_content += f"\n\n{template}"
+
         body = {
             "model": model_name,
             "messages": [
                 {"role": "system", "content": _system_prompt},
-                # Pi's split: the transcript is serialised inside
-                # <conversation> tags and the structured format template is
-                # appended after them (both in the USER message) so the model
-                # summarises rather than continues the conversation.
-                {
-                    "role": "user",
-                    "content": (f"<conversation>\n{transcript}\n</conversation>\n\n{_format_template}"),
-                },
+                {"role": "user", "content": user_content},
             ],
             "max_tokens": max_tokens,
             "stream": False,

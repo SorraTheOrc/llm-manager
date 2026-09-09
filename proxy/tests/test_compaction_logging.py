@@ -56,7 +56,7 @@ def cheap_config() -> dict:
     }
 
 
-def fixed_summarizer(middle_messages) -> str:
+def fixed_summarizer(middle_messages, previous_summary=None) -> str:
     return f"MIDDLE_SUMMARY: folded {len(middle_messages)} messages."
 
 
@@ -121,7 +121,7 @@ class TestFieldCompleteness:
         assert fields["dry_run"] is False
 
     def test_backstop_dropped_has_turns_dropped(self, caplog):
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         result = plan_session_compaction(
@@ -178,7 +178,7 @@ class TestNoSilentDrops:
             )
         )
         # Backstop path.
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         paths.append(
@@ -264,7 +264,7 @@ class TestDryRunAndSummaryTokens:
 
 class TestLevelSelection:
     def test_dropped_and_exhausted_logged_at_warning(self, caplog):
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         result = plan_session_compaction(

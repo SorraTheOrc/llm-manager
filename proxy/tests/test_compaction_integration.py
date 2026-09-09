@@ -47,7 +47,7 @@ FAST_DRY = raw_config(262144, 3, compaction_dry_run=True)
 CHEAP_DRY = raw_config(262144, 2, compaction_dry_run=True)
 
 
-def fixed_summarizer(middle_messages) -> str:
+def fixed_summarizer(middle_messages, previous_summary=None) -> str:
     return f"MIDDLE_SUMMARY: folded {len(middle_messages)} messages."
 
 
@@ -252,7 +252,7 @@ class TestRetentionInvariant:
         messages = make_session(60)
         system, first_user = messages[0], messages[1]
 
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         decision = decide_session_compaction(
@@ -287,7 +287,7 @@ class TestBackstopFlow:
     def test_backstop_drops_whole_turns_only(self):
         decision = decide_session_compaction(
             make_session(60), FAST, "fast",
-            summarizer=lambda m: "B" * 20000,
+            summarizer=lambda m, _p=None: "B" * 20000,
             estimate_tokens=counting_estimator,
             session_id="sess-backstop",
         )

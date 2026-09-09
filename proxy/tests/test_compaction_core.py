@@ -97,7 +97,7 @@ def make_session(
     return msgs
 
 
-def fixed_summarizer(middle_messages) -> str:
+def fixed_summarizer(middle_messages, previous_summary=None) -> str:
     """Deterministic summarizer spy: returns a fixed concise summary."""
     return f"MIDDLE_SUMMARY: folded {len(middle_messages)} messages."
 
@@ -331,7 +331,7 @@ class TestFastMode:
     def test_fast_summarizer_receives_middle_messages(self):
         captured = {}
 
-        def spy_summarizer(middle_messages):
+        def spy_summarizer(middle_messages, previous_summary=None):
             captured["middle"] = list(middle_messages)
             return "SPY_SUMMARY"
 

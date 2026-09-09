@@ -188,7 +188,7 @@ class TestHandleSessionCompactionWiring:
         assert decision["action"] == "remote_with_guidance"
         assert decision["reason"] == "summarizer_unavailable"
 
-        def small_summary(m):
+        def small_summary(m, previous_summary=None):
             return "S" * 100
 
         decision = decide_session_compaction(

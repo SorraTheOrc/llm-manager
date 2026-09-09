@@ -48,7 +48,7 @@ def fast_config(**overrides) -> dict:
     return cfg
 
 
-def fixed_summarizer(middle_messages) -> str:
+def fixed_summarizer(middle_messages, previous_summary=None) -> str:
     return f"MIDDLE_SUMMARY: folded {len(middle_messages)} messages."
 
 
@@ -210,7 +210,7 @@ class TestDryRunAdvisory:
     def test_dry_run_surfaces_would_drop(self, caplog):
         # Backstop chain: dry-run shows would-drop even though nothing is
         # applied to the session.
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         messages = make_session(60)

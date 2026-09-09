@@ -32,7 +32,22 @@ reports ``backstop_exhausted`` so the dispatcher can escalate to remote
 with guidance. Structured churn/compaction logging is the sibling logging
 child's scope; this module reports ``compacted_over_budget`` (or
 ``backstop_*`` reasons) so the dispatcher can escalate.
+
+Summary lifecycle (R5, LP-0MTTPXIIX005Y0Z9):
+  1. CREATION — a session with no prior summary (``extract_previous_summary``
+     returns None) is summarised with the full SUMMARIZATION_PROMPT; the
+     result is injected as a ``_summary_message`` marker in the compacted
+     history, which the session stores.
+  2. INCREMENTAL UPDATE — a later compaction detects that marker via
+     ``extract_previous_summary(messages)`` and passes its text to the
+     summarizer (Pi UPDATE_SUMMARIZATION_PROMPT + ``<previous-summary>``):
+     new middle turns are merged into the existing summary, all prior
+     sections preserved. The marker message itself is excluded from the
+     summarizer input (it is the previous summary, not new material).
+  3. RESET — a brand-new session starts with no marker, so compaction
+     returns to CREATION automatically.
 """
+
 from __future__ import annotations
 
 import logging
@@ -59,14 +74,59 @@ _ASSISTANT_ROLE = "assistant"
 # Marker wrapping the injected summary. Kept stable with the experiment
 # harness format (proxy/scripts/run_compaction_experiment.py) so operators
 # and downstream tooling recognise compaction artifacts.
-_SUMMARY_MARKER = (
-    "The conversation history before this point was compacted into "
-    "the following summary:\n\n<summary>\n"
-)
+_SUMMARY_MARKER = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
 _SUMMARY_MARKER_END = "\n</summary>"
 
-# Callable that turns the middle messages into a concise summary string.
-Summarizer = Callable[[list[dict[str, Any]]], str]
+
+def _is_compaction_summary_message(message: dict[str, Any]) -> bool:
+    """True when *message* is a compaction summary marker message.
+
+    Compaction injects the summary as a user-role message wrapped in
+    ``_SUMMARY_MARKER`` / ``_SUMMARY_MARKER_END`` (see ``_summary_message``).
+    """
+    content = message.get("content") if isinstance(message, dict) else None
+    return isinstance(content, str) and content.startswith(_SUMMARY_MARKER)
+
+
+def _compaction_summary_text(message: dict[str, Any]) -> str | None:
+    """Extract the summary text between the markers of a marker message.
+
+    Returns ``None`` for non-marker messages or empty summaries.
+    """
+    content = message.get("content") if isinstance(message, dict) else None
+    if (
+        not isinstance(content, str)
+        or not content.startswith(_SUMMARY_MARKER)
+        or not content.endswith(_SUMMARY_MARKER_END)
+    ):
+        return None
+    inner = content[len(_SUMMARY_MARKER) : -len(_SUMMARY_MARKER_END)].strip()
+    return inner or None
+
+
+def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
+    """Return the most recent compaction summary found in *messages* (R5).
+
+    The summary marker message the planner injects on compaction persists in
+    the session history, so a later compaction can detect the previous
+    summary directly from the message list (no separate storage). Returns
+    the text of the LAST marker message, or ``None`` when the session has
+    never been compacted (fresh session / lifecycle reset).
+    """
+    found: str | None = None
+    for message in messages:
+        text = _compaction_summary_text(message)
+        if text is not None:
+            found = text
+    return found
+
+
+# Callable that folds the middle messages into a summary string. The second,
+# optional argument carries a previous compaction summary (R5,
+# LP-0MTTPXIIX005Y0Z9): when present the summarizer merges new middle turns
+# into it (Pi UPDATE_SUMMARIZATION_PROMPT); when None it produces a fresh
+# full summary (Pi SUMMARIZATION_PROMPT).
+Summarizer = Callable[[list[dict[str, Any]], str | None], str]
 # Callable that estimates the token count of a full message list.
 TokenEstimator = Callable[[list[dict[str, Any]]], int]
 
@@ -114,11 +174,7 @@ def compaction_trigger_tokens(mode: str, config: dict) -> int:
         return 0
     # Decimal arithmetic keeps the operator-approved constants exact
     # (float 0.7 noise would truncate 58299.5 → 58299).
-    return int(
-        (Decimal(str(per_slot)) * Decimal(str(ratio))).to_integral_value(
-            rounding=ROUND_HALF_UP
-        )
-    )
+    return int((Decimal(str(per_slot)) * Decimal(str(ratio))).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def should_compact_session(estimated_tokens: int, mode: str, config: dict) -> bool:
@@ -226,8 +282,7 @@ def truncate_backstop(
         (
             i
             for i, m in enumerate(compacted_messages)
-            if isinstance(m.get("content"), str)
-            and m["content"].startswith(_SUMMARY_MARKER)
+            if isinstance(m.get("content"), str) and m["content"].startswith(_SUMMARY_MARKER)
         ),
         None,
     )
@@ -349,9 +404,7 @@ def log_compaction_event(
     }
     line = "compaction_event " + " ".join(f"{k}={v}" for k, v in fields.items())
     emit = logger_obj if logger_obj is not None else logger
-    if fields["action"] == "remote_with_guidance" or (
-        fields["reason"] in _WARNING_REASONS
-    ):
+    if fields["action"] == "remote_with_guidance" or (fields["reason"] in _WARNING_REASONS):
         emit.warning(line)
     else:
         emit.info(line)
@@ -388,9 +441,7 @@ class CompactionChurnCollector:
     clock so tests are deterministic; production uses ``time.time``.
     """
 
-    def __init__(
-        self, now_fn: Callable[[], float] | None = None
-    ) -> None:
+    def __init__(self, now_fn: Callable[[], float] | None = None) -> None:
         self._lock = threading.Lock()
         self._now = now_fn or time.time
         self._events: dict[str, list[float]] = {}
@@ -405,14 +456,9 @@ class CompactionChurnCollector:
         """Per-session event counts within the rolling window."""
         cutoff = self._now() - window_seconds
         with self._lock:
-            return {
-                sid: sum(1 for ts in stamps if ts > cutoff)
-                for sid, stamps in self._events.items()
-            }
+            return {sid: sum(1 for ts in stamps if ts > cutoff) for sid, stamps in self._events.items()}
 
-    def churn_report(
-        self, window_seconds: float = 3600.0, target_rate: float = 1.0
-    ) -> dict[str, dict[str, Any]]:
+    def churn_report(self, window_seconds: float = 3600.0, target_rate: float = 1.0) -> dict[str, dict[str, Any]]:
         """Per-session churn stats: count, rate/hour, target breach."""
         counts = self.churn_counts(window_seconds)
         hours = max(window_seconds / 3600.0, 1e-9)
@@ -438,8 +484,7 @@ class CompactionChurnCollector:
         emit = logger_obj if logger_obj is not None else logger
         for sid, stats in report.items():
             emit.warning(
-                "compaction_churn session=%s count=%d rate_per_hour=%.3f "
-                "exceeds_target=%s",
+                "compaction_churn session=%s count=%d rate_per_hour=%.3f exceeds_target=%s",
                 str(sid)[:8],
                 stats["count"],
                 stats["rate_per_hour"],
@@ -540,9 +585,13 @@ def decide_session_compaction(
     if dry_run:
         # Warn-only advisory: log what WOULD happen, never apply.
         plan = run_dry_run_plan(
-            messages, config, mode,
-            summarizer=summarizer, estimate_tokens=estimate_tokens,
-            session_id=session_id, logger_obj=logger_obj,
+            messages,
+            config,
+            mode,
+            summarizer=summarizer,
+            estimate_tokens=estimate_tokens,
+            session_id=session_id,
+            logger_obj=logger_obj,
         )
         plan["dry_run"] = True
         plan["applied"] = False
@@ -553,13 +602,19 @@ def decide_session_compaction(
 
     # Live enforcement path (opt-in after the AC8 experiment gate).
     plan = plan_session_compaction(
-        messages, config, mode,
-        summarizer=summarizer, estimate_tokens=estimate_tokens,
+        messages,
+        config,
+        mode,
+        summarizer=summarizer,
+        estimate_tokens=estimate_tokens,
         backstop=True,
     )
     log_compaction_event(
-        plan, session_id=session_id, dry_run=False,
-        logger_obj=logger_obj, estimate_tokens=estimate_tokens,
+        plan,
+        session_id=session_id,
+        dry_run=False,
+        logger_obj=logger_obj,
+        estimate_tokens=estimate_tokens,
     )
     if churn_collector is not None and plan["action"] != "noop":
         churn_collector.record(session_id)
@@ -646,9 +701,7 @@ def plan_session_compaction(
     # Retention set: all system prompts + the very first user prompt,
     # verbatim (AC1).
     system_msgs = [m for m in messages if m.get("role") == _SYSTEM_ROLE]
-    first_user_idx = next(
-        (i for i, m in enumerate(messages) if m.get("role") == _USER_ROLE), None
-    )
+    first_user_idx = next((i for i, m in enumerate(messages) if m.get("role") == _USER_ROLE), None)
     if first_user_idx is None:
         result["reason"] = "no_user_message"
         return result
@@ -687,14 +740,11 @@ def plan_session_compaction(
     recent = accepted[::-1]
 
     middle_turns = turns[: len(turns) - len(recent)]
-    middle_messages = [m for turn in middle_turns for m in turn]
-    summary_text = summarizer(middle_messages)
+    middle_messages = [m for turn in middle_turns for m in turn if not _is_compaction_summary_message(m)]
+    previous_summary = extract_previous_summary(messages)
+    summary_text = summarizer(middle_messages, previous_summary)
 
-    compacted = (
-        list(retained)
-        + [_summary_message(summary_text)]
-        + [m for turn in recent for m in turn]
-    )
+    compacted = list(retained) + [_summary_message(summary_text)] + [m for turn in recent for m in turn]
     estimated_after = est(compacted)
     over_budget = estimated_after > target
 
@@ -705,6 +755,7 @@ def plan_session_compaction(
         turns_summarized=len(middle_turns),
         recent_turns_kept=len(recent),
         estimated_after=estimated_after,
+        previous_summary=previous_summary,
         reason="compacted_over_budget" if over_budget else "compacted_within_target",
     )
     if backstop and result["reason"] == "compacted_over_budget":
