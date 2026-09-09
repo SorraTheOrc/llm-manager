@@ -670,13 +670,65 @@ _DEFAULT_SUMMARIZER_CTX_SIZE = 8192
 _DEFAULT_SUMMARIZER_MAX_TOKENS = 512
 
 # Dedicated system prompt for the proxy-side compaction summariser.
-# Keeps the summariser focused on content condensation, not creative writing.
+#
+# Rationale (LP-0MTTPXHTI0081WIR / R1): Adopts Pi's structured summarization
+# format to close the single largest quality gap identified in the compaction
+# comparison (proxy 5/10 vs Pi 9/10 on summarization). Mirrors Pi's
+# SUMMARIZATION_PROMPT (dist/core/compaction/compaction.js) and
+# SUMMARIZATION_SYSTEM_PROMPT (dist/core/compaction/utils.js) — see
+# docs/session-compaction-pi-comparison.md §5.1 R1. The structured sections
+# (Goal, Constraints, Progress, Decisions, Next Steps, Critical Context,
+# File Operations) preserve decisions and next steps for correct session
+# resumption; guard rails prevent the model from continuing the conversation.
+# Prompt-only change — summarizer logic, retry, and file-ops extraction are
+# R2/R3/R5 and out of scope for this item.
 _SUMMARIZER_SYSTEM_PROMPT = (
-    "Summarise the middle portion of this conversation for context retention. "
-    "Preserve essential instructions, decisions, and key facts. "
-    "Omit routine back-and-forth, acknowledgments, and redundant context. "
-    "Write in a neutral, concise style suitable for feeding into a subsequent "
-    "LLM prompt. Do NOT include any preamble or closing remarks."
+    "You are a context summarization assistant. Your task is to read the middle "
+    "portion of a conversation between a user and an AI assistant, then produce "
+    "a structured summary that another LLM will use to continue the work.\n"
+    "\n"
+    "Do NOT continue the conversation. Do NOT respond to any questions in the "
+    "conversation. ONLY output the structured summary.\n"
+    "\n"
+    "Use this EXACT format:\n"
+    "\n"
+    "## Goal\n"
+    "[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n"
+    "\n"
+    "## Constraints & Preferences\n"
+    "- [Any constraints, preferences, or requirements mentioned by the user]\n"
+    "- [Or \"(none)\" if none were mentioned]\n"
+    "\n"
+    "## Progress\n"
+    "### Done\n"
+    "- [x] [Completed tasks/changes]\n"
+    "\n"
+    "### In Progress\n"
+    "- [ ] [Current work]\n"
+    "\n"
+    "### Blocked\n"
+    "- [Issues preventing progress, if any — or \"(none)\"]\n"
+    "\n"
+    "## Key Decisions\n"
+    "- **[Decision]**: [Brief rationale]\n"
+    "\n"
+    "## Next Steps\n"
+    "1. [Ordered list of what should happen next]\n"
+    "\n"
+    "## Critical Context\n"
+    "- [Any data, examples, or references needed to continue]\n"
+    "- [Or \"(none)\" if not applicable]\n"
+    "\n"
+    "## File Operations\n"
+    "<read-files>\n"
+    "[Paths of files that were read (one per line)]\n"
+    "</read-files>\n"
+    "<modified-files>\n"
+    "[Paths of files that were created or modified (one per line)]\n"
+    "</modified-files>\n"
+    "\n"
+    "Keep each section concise. Preserve exact file paths, function names, and error messages. "
+    "Omit routine back-and-forth, acknowledgments, and redundant context."
 )
 
 
