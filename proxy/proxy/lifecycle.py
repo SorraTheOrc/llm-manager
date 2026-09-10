@@ -8,6 +8,8 @@ Uses a lazy server import (_srv()) to access module-level state without
 circular import issues.
 """
 
+from __future__ import annotations
+
 import asyncio
 import errno
 import logging
@@ -18,6 +20,7 @@ import socket
 import subprocess
 import threading
 import time
+from typing import Any
 import traceback
 from datetime import datetime, timedelta
 from fnmatch import fnmatch
@@ -221,31 +224,60 @@ def _compute_retry_delay(attempt: int, base_delay: float, max_delay: float, jitt
 
 
 
+def _count_item_chars(item: Any) -> int:
+    """Count text characters in a single content item.
+
+    Handles:
+      - Plain string content
+      - Array content with text parts ("text" or "input_text" types)
+      - function_call items (count arguments)
+      - function_call_output items (count output)
+    """
+    if not isinstance(item, dict):
+       return 0
+    # Check for Responses API item types (function_call / function_call_output)
+    item_type = item.get("type", "")
+    if item_type == "function_call":
+       args = item.get("arguments", "")
+       return len(str(args)) if args else 0
+    if item_type == "function_call_output":
+       output = item.get("output", "")
+       return len(str(output)) if output else 0
+    # Regular message: check content field
+    content = item.get("content", "")
+    if isinstance(content, str):
+       return len(content)
+    if isinstance(content, list):
+       # Array content: extract text from input_text / text parts
+       total = 0
+       for part in content:
+           if isinstance(part, dict):
+               if "text" in part:
+                   total += len(str(part["text"]))
+               # Other part types (input_image, input_file, etc.) contribute 0
+       return total
+    return 0
+
+
 def _estimate_prompt_tokens(body_json: dict) -> int:
     """Estimate prompt token count from request body.
 
-    Returns estimated token count based on message content length.
+    Handles both chat-completions (messages) and Responses API (input) formats.
     Uses a heuristic of ~4 bytes per token for UTF-8 text.
     """
     if not isinstance(body_json, dict):
        return 0
-    messages = body_json.get("messages", [])
-    if not messages:
-       return 0
-    # Concatenate all message content
     total_chars = 0
-    for msg in messages:
-       if isinstance(msg, dict):
-           content = msg.get("content", "")
-           if isinstance(content, str):
-               total_chars += len(content)
-           elif isinstance(content, list):
-               # Handle array content (e.g., multimodal)
-               for item in content:
-                   if isinstance(item, dict) and "text" in item:
-                       total_chars += len(str(item["text"]))
-    # Heuristic: ~4 bytes per token
-    return max(1, total_chars // 4)
+    has_items = False
+    # Chat-completions format: messages array
+    for msg in body_json.get("messages", []):
+       has_items = True
+       total_chars += _count_item_chars(msg)
+    # Responses API format: input array
+    for item in body_json.get("input", []):
+       has_items = True
+       total_chars += _count_item_chars(item)
+    return max(1, total_chars // 4) if has_items else 0
 
 
 

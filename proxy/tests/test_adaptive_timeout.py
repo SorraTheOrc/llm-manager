@@ -128,6 +128,137 @@ class TestEstimatePromptTokens:
         # Returns 1 because max(1, 0) = 1 when no content found
         assert tokens == 1
 
+    # Responses API input body tests (LP-0MTVVCHC1000I7ON)
+
+    def test_responses_input_string_content(self):
+        """Responses input with plain text content should be estimated."""
+        content = "x" * 4000  # ~1000 tokens
+        body = {"input": [{"role": "user", "content": content}]}
+        tokens = server._estimate_prompt_tokens(body)
+        assert tokens >= 800, f"Expected ~1000 tokens for 4000 chars, got {tokens}"
+        assert tokens <= 1200
+
+    def test_responses_input_array_content_text_parts(self):
+        """Responses input with array content (input_text parts) should extract text."""
+        body = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Hello, world!"},
+                        {"type": "input_image", "image_url": "http://example.com/img.jpg"},
+                    ],
+                }
+            ]
+        }
+        tokens = server._estimate_prompt_tokens(body)
+        # Only "Hello, world!" text should be counted
+        assert tokens >= 1
+        assert tokens <= 5
+
+    def test_responses_input_array_content_mixed_parts(self):
+        """Responses input with mixed content parts extracts all text."""
+        body = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Part one."},
+                        {"type": "text", "text": "Part two."},  # legacy format
+                    ],
+                }
+            ]
+        }
+        tokens = server._estimate_prompt_tokens(body)
+        # Both text parts should be counted
+        assert tokens >= 3
+        assert tokens <= 10
+
+    def test_responses_input_function_call_arguments(self):
+        """function_call items should count arguments as tokens."""
+        body = {
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "get_weather",
+                    "arguments": '{"location": "London", "unit": "celsius"}',
+                }
+            ]
+        }
+        tokens = server._estimate_prompt_tokens(body)
+        # arguments JSON is ~48 chars
+        assert tokens >= 1
+        assert tokens <= 15
+
+    def test_responses_input_function_call_output(self):
+        """function_call_output items should count output as tokens."""
+        body = {
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "{\"temperature\": 22, \"humidity\": 65}",
+                }
+            ]
+        }
+        tokens = server._estimate_prompt_tokens(body)
+        # output JSON is ~42 chars
+        assert tokens >= 1
+        assert tokens <= 15
+
+    def test_responses_input_empty(self):
+        """Empty input array should return 0."""
+        body = {"input": []}
+        tokens = server._estimate_prompt_tokens(body)
+        assert tokens == 0
+
+    def test_responses_body_yields_adaptive_timeout_above_60s(self):
+        """AC 1: Responses-shaped body with ~400KB input yields timeout > 60s (capped)."""
+        large_content = "x" * 400_000  # ~100k tokens
+        body = {"input": [{"role": "user", "content": large_content}]}
+        timeout = server._compute_adaptive_timeout(
+            body,
+            base_timeout=60.0,
+            per_token_timeout=0.015,
+            max_timeout=120.0,  # cap at 120s (upstream_request_timeout_seconds)
+        )
+        # ~100k * 0.015 = 1500s, capped to 120s
+        assert timeout > 60.0, f"Expected >60s, got {timeout}s"
+        assert timeout == 120.0, f"Expected capped at 120s, got {timeout}s"
+
+    def test_responses_and_chat_parity_same_content(self):
+        """AC 2: Chat body and translated Responses equivalent yield same timeout."""
+        large_content = "x" * 360_000  # ~90k tokens
+        chat_body = {"messages": [{"role": "user", "content": large_content}]}
+        responses_body = {"input": [{"role": "user", "content": large_content}]}
+        chat_timeout = server._compute_adaptive_timeout(
+            chat_body, base_timeout=60.0, per_token_timeout=0.015, max_timeout=1500.0
+        )
+        responses_timeout = server._compute_adaptive_timeout(
+            responses_body, base_timeout=60.0, per_token_timeout=0.015, max_timeout=1500.0
+        )
+        # Both should be identical (same content length)
+        assert chat_timeout == responses_timeout, (
+            f"Chat timeout ({chat_timeout}) != Responses timeout ({responses_timeout})"
+        )
+        # And both should be well above 60s
+        assert chat_timeout > 60.0
+        assert responses_timeout > 60.0
+
+    def test_responses_input_mixed_with_messages_counts_both(self):
+        """Body with both messages and input should sum both."""
+        chat_content = "Hello from chat" * 50  # 750 chars
+        input_content = "Hello from input" * 50  # 800 chars
+        body = {
+            "messages": [{"role": "user", "content": chat_content}],
+            "input": [{"role": "user", "content": input_content}],
+        }
+        tokens = server._estimate_prompt_tokens(body)
+        # 1550 chars / 4 = 387 tokens (both sources counted)
+        assert tokens >= 300, f"Expected >= 300 tokens from both sources, got {tokens}"
+        assert tokens <= 500
+
 
 class TestComputeAdaptiveTimeout:
     """Tests for _compute_adaptive_timeout function."""
