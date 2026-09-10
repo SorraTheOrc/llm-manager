@@ -97,7 +97,7 @@ class TestOperatorOverride:
     def test_oversized_override_falls_back(self, monkeypatch, tmp_path, caplog):
         monkeypatch.setattr("proxy.compaction_summarizer._OVERRIDE_DIR", tmp_path)
         _write_override(tmp_path, "x" * (_MAX_SYSTEM_PROMPT_SIZE + 1))
-        with caplog.at_level("WARNING", logger="proxy.compaction_summarizer"):
+        with caplog.at_level("WARNING", logger="llama-proxy.compaction_summarizer"):
             body = _capture_body(None, [{"role": "user", "content": "hi"}])
         assert body["messages"][0]["content"] == _SUMMARIZER_SYSTEM_PROMPT
         assert any("exceeds" in r.message for r in caplog.records)
@@ -105,7 +105,7 @@ class TestOperatorOverride:
     def test_invalid_utf8_override_falls_back(self, monkeypatch, tmp_path, caplog):
         monkeypatch.setattr("proxy.compaction_summarizer._OVERRIDE_DIR", tmp_path)
         _write_override(tmp_path, b"\xff\xfe\x00not-utf8")
-        with caplog.at_level("WARNING", logger="proxy.compaction_summarizer"):
+        with caplog.at_level("WARNING", logger="llama-proxy.compaction_summarizer"):
             body = _capture_body(None, [{"role": "user", "content": "hi"}])
         assert body["messages"][0]["content"] == _SUMMARIZER_SYSTEM_PROMPT
         assert any("UTF-8" in r.message for r in caplog.records)

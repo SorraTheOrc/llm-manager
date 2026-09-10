@@ -105,7 +105,7 @@ class TestFieldCompleteness:
             make_session(60), fast_config(), "fast",
             summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
         )  # action=compact, reason=compacted_within_target
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             fields = _emit(result)
         assert fields is not None
         assert set(fields.keys()) == _REQUIRED_FIELDS
@@ -129,7 +129,7 @@ class TestFieldCompleteness:
             summarizer=big_summarizer, estimate_tokens=counting_estimator,
             backstop=True,
         )  # reason=backstop_dropped
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             fields = _emit(result)
         assert fields["action"] == "compact"
         assert fields["reason"] == "backstop_dropped"
@@ -142,7 +142,7 @@ class TestFieldCompleteness:
             make_session(60), cheap_config(), "cheap",
             summarizer=None, estimate_tokens=counting_estimator,
         )  # action=remote_with_guidance
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             fields = _emit(result)
         assert fields["action"] == "remote_with_guidance"
         assert fields["reason"] == "summarizer_unavailable"
@@ -156,7 +156,7 @@ class TestFieldCompleteness:
             messages, fast_config(), "fast",
             summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
         )  # reason=compacted_over_budget (backstop off)
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             fields = _emit(result)
         assert fields["reason"] == "compacted_over_budget"
         assert fields["post_tokens"] > 38000
@@ -195,11 +195,11 @@ class TestNoSilentDrops:
                 summarizer=None, estimate_tokens=counting_estimator,
             )
         )
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             for result in paths:
                 _emit(result)
         emitted = [
-            r.getMessage() for r in caplog.records if r.name == "proxy.compaction"
+            r.getMessage() for r in caplog.records if r.name == "llama-proxy.compaction"
         ]
         assert len([e for e in emitted if e.startswith("compaction_event")]) == 3
 
@@ -208,11 +208,11 @@ class TestNoSilentDrops:
             make_session(3), fast_config(), "fast",
             summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
         )  # below_trigger
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             fields = _emit(result)
         assert fields is None
         assert not [
-            r for r in caplog.records if r.name == "proxy.compaction"
+            r for r in caplog.records if r.name == "llama-proxy.compaction"
         ]
 
 
@@ -227,7 +227,7 @@ class TestDryRunAndSummaryTokens:
             make_session(60), fast_config(), "fast",
             summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
         )
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             fields = _emit(result, dry_run=True)
         assert fields["dry_run"] is True
 
@@ -272,10 +272,10 @@ class TestLevelSelection:
             summarizer=big_summarizer, estimate_tokens=counting_estimator,
             backstop=True,
         )
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             _emit(result)
         rec = next(
-            r for r in caplog.records if r.name == "proxy.compaction"
+            r for r in caplog.records if r.name == "llama-proxy.compaction"
         )
         assert rec.levelno == 30  # WARNING
 
@@ -284,9 +284,9 @@ class TestLevelSelection:
             make_session(60), fast_config(), "fast",
             summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
         )
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             _emit(result)
         rec = next(
-            r for r in caplog.records if r.name == "proxy.compaction"
+            r for r in caplog.records if r.name == "llama-proxy.compaction"
         )
         assert rec.levelno == 20  # INFO

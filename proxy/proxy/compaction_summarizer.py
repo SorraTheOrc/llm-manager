@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("llama-proxy.compaction_summarizer")
 
 # ---------------------------------------------------------------------------
 # File-operation tracking (R2, LP-0MTTPXI1Y003YFOU)

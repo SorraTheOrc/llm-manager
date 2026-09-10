@@ -57,7 +57,7 @@ class TestRetriesOnTransientFailures:
             httpx.ConnectError("refused"),
             _success("RECOVERED"),
         ]
-        with caplog.at_level("WARNING", logger="proxy.compaction_summarizer"):
+        with caplog.at_level("WARNING", logger="llama-proxy.compaction_summarizer"):
             result, calls, sleeps = _run(mock_client)
         assert result == "RECOVERED"
         assert calls == 3
@@ -93,7 +93,7 @@ class TestRetriesOnTransientFailures:
     def test_exhausted_connect_errors_return_empty(self, caplog):
         mock_client = MagicMock()
         mock_client.post.side_effect = httpx.ConnectError("refused")
-        with caplog.at_level("WARNING", logger="proxy.compaction_summarizer"):
+        with caplog.at_level("WARNING", logger="llama-proxy.compaction_summarizer"):
             result, calls, _ = _run(mock_client)
         assert result == ""
         assert calls == 3  # default 2 retries + initial

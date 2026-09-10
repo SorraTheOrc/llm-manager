@@ -172,14 +172,14 @@ class TestDryRunEndToEnd:
         assert decision["messages"] is messages
 
     def test_advisory_log_with_dry_run_flag(self, caplog):
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             decide_session_compaction(
                 make_session(60), FAST_DRY, "fast",
                 summarizer=fixed_summarizer,
                 estimate_tokens=counting_estimator,
                 session_id="sess-dry-e2e",
             )
-        rec = next(r for r in caplog.records if r.name == "proxy.compaction")
+        rec = next(r for r in caplog.records if r.name == "llama-proxy.compaction")
         assert rec.getMessage().startswith("compaction_event")
         assert "dry_run=True" in rec.getMessage()
 
@@ -197,7 +197,7 @@ class TestDryRunEndToEnd:
     def test_dry_run_noop_emits_no_event_and_no_churn(self, caplog):
         collector = CompactionChurnCollector()
         messages = make_session(3)
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             decision = decide_session_compaction(
                 messages, FAST_DRY, "fast",
                 summarizer=fixed_summarizer,
@@ -207,7 +207,7 @@ class TestDryRunEndToEnd:
             )
         assert decision["action"] == "noop"
         assert decision["messages"] is messages
-        assert not [r for r in caplog.records if r.name == "proxy.compaction"]
+        assert not [r for r in caplog.records if r.name == "llama-proxy.compaction"]
         assert collector.churn_counts() == {}
 
 
@@ -345,14 +345,14 @@ class TestBackstopFlow:
 
 class TestLoggingFields:
     def test_compact_event_fields(self, caplog):
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             decide_session_compaction(
                 make_session(60), FAST, "fast",
                 summarizer=fixed_summarizer,
                 estimate_tokens=counting_estimator,
                 session_id="sess-logging-e2e",
             )
-        rec = next(r for r in caplog.records if r.name == "proxy.compaction")
+        rec = next(r for r in caplog.records if r.name == "llama-proxy.compaction")
         line = rec.getMessage()
         assert line.startswith("compaction_event")
         for field in (
@@ -363,14 +363,14 @@ class TestLoggingFields:
             assert field in line
 
     def test_non_compactable_logged_at_warning(self, caplog):
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             decide_session_compaction(
                 make_session(60), CHEAP, "cheap",
                 summarizer=None,
                 estimate_tokens=counting_estimator,
                 session_id="sess-logging-e2e",
             )
-        rec = next(r for r in caplog.records if r.name == "proxy.compaction")
+        rec = next(r for r in caplog.records if r.name == "llama-proxy.compaction")
         assert rec.levelno == 30  # WARNING — never silent
         assert "remote_with_guidance" in rec.getMessage()
 

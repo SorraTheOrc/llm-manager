@@ -151,11 +151,11 @@ class TestChurnCollector:
     def test_log_churn_report_emits_structured_lines(self, caplog):
         collector = CompactionChurnCollector()
         collector.record("sess-1234567890")
-        with caplog.at_level("WARNING", logger="proxy.compaction"):
+        with caplog.at_level("WARNING", logger="llama-proxy.compaction"):
             report = collector.log_churn_report()
         assert report["sess-1234567890"]["count"] == 1
         assert any(
-            r.name == "proxy.compaction" and "compaction_churn" in r.getMessage()
+            r.name == "llama-proxy.compaction" and "compaction_churn" in r.getMessage()
             for r in caplog.records
         )
 
@@ -194,14 +194,14 @@ class TestDryRunAdvisory:
 
     def test_dry_run_logs_with_dry_run_flag(self, caplog):
         messages = make_session(60)
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             result = run_dry_run_plan(
                 messages, fast_config(), "fast",
                 summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
                 session_id="sess-1234567890",
             )
         rec = next(
-            r for r in caplog.records if r.name == "proxy.compaction"
+            r for r in caplog.records if r.name == "llama-proxy.compaction"
         )
         assert rec.getMessage().startswith("compaction_event")
         assert "dry_run=True" in rec.getMessage()
@@ -224,7 +224,7 @@ class TestDryRunAdvisory:
 
     def test_dry_run_below_trigger_logs_nothing(self, caplog):
         messages = make_session(3)  # below trigger
-        with caplog.at_level("INFO", logger="proxy.compaction"):
+        with caplog.at_level("INFO", logger="llama-proxy.compaction"):
             result = run_dry_run_plan(
                 messages, fast_config(), "fast",
                 summarizer=fixed_summarizer, estimate_tokens=counting_estimator,
@@ -233,7 +233,7 @@ class TestDryRunAdvisory:
         assert result["action"] == "noop"
         # Dry-run log_compaction_event skips non-events (no advisory noise).
         assert not [
-            r for r in caplog.records if r.name == "proxy.compaction"
+            r for r in caplog.records if r.name == "llama-proxy.compaction"
         ]
 
     def test_compose_collector_with_dry_run(self, caplog):

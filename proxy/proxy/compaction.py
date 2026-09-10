@@ -57,7 +57,7 @@ from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("llama-proxy.compaction")
 
 # ---------------------------------------------------------------------------
 # Per-mode compaction budgets (operator-approved, LP-0MTCWE8NG003P0SD):

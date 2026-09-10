@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("llama-proxy.session")
 
 
 # ---------------------------------------------------------------------------
