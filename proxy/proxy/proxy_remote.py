@@ -1255,16 +1255,16 @@ async def _handle_remote_streaming(
     # Read empty-response retry config (LP-0MRF77A0E0026B9T)
     try:
         empty_max_attempts = int(
-            _srv().config.get("server", {}).get("upstream_empty_retry_max_attempts", 1) or 1
+            _srv().config.get("server", {}).get("upstream_empty_retry_max_attempts", 3) or 3
         )
     except Exception:
-        empty_max_attempts = 1
+        empty_max_attempts = 3
     try:
         empty_base_delay = float(
-            _srv().config.get("server", {}).get("upstream_empty_retry_base_delay_seconds", 0.5) or 0.5
+            _srv().config.get("server", {}).get("upstream_empty_retry_base_delay_seconds", 3.0) or 3.0
         )
     except Exception:
-        empty_base_delay = 0.5
+        empty_base_delay = 3.0
 
     media_type = response.headers.get("content-type", "text/event-stream")
     key = f"{request.method.upper()} {request.url.path} -> remote"
@@ -2074,16 +2074,16 @@ async def _handle_remote_non_streaming(
     server_config = _srv().config.get("server", {})
     try:
         empty_max_attempts = int(
-            server_config.get("upstream_empty_retry_max_attempts", 1) or 1
+            server_config.get("upstream_empty_retry_max_attempts", 3) or 3
         )
     except Exception:
-        empty_max_attempts = 1
+        empty_max_attempts = 3
     try:
         empty_base_delay = float(
-            server_config.get("upstream_empty_retry_base_delay_seconds", 0.5) or 0.5
+            server_config.get("upstream_empty_retry_base_delay_seconds", 3.0) or 3.0
         )
     except Exception:
-        empty_base_delay = 0.5
+        empty_base_delay = 3.0
 
     async def _do_request() -> httpx.Response:
         """Make one upstream request and return the response."""

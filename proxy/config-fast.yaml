@@ -929,11 +929,11 @@ server:
   # (no content, stopReason: stop, total_tokens: 0), retry with the same
   # model up to this many additional attempts before falling through to
   # the next provider in the fallback chain.
-  # Default: 1 retry (1 additional attempt).
-  upstream_empty_retry_max_attempts: 1
+  # Default: 3 retries (3 additional attempts).
+  upstream_empty_retry_max_attempts: 3
   # Base delay (in seconds) before retrying on empty response.
-  # Default: 2.0 seconds.
-  upstream_empty_retry_base_delay_seconds: 2.0
+  # Default: 3.0 seconds.
+  upstream_empty_retry_base_delay_seconds: 3.0
 
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
