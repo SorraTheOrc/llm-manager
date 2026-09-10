@@ -9,7 +9,11 @@ entry on the same broken gateway.  Router endpoints (e.g.
 ``https://opencode.ai/zen/go``) can now distinguish between different upstream
 models — a failure for model A does not exclude model B on the same gateway.
 
-Covers (parent AC1-AC4 / F1 AC1-AC6):
+Covers (parent AC1-AC4 / F1 AC1-AC6, F4 AC1-AC3, F5 AC1-AC2):
+
+- F4 integration tests: per-model sibling fallback — different models on
+  the same gateway are NOT skipped together; same-model entries still are.
+- F5: skip log lines include the model-scoped failure-domain key.
 
 - ``_failure_domain_key()``: remote entries key on
   ``normalized_endpoint:model`` (model falls back to ``*`` when absent);
@@ -673,3 +677,150 @@ def test_same_domain_skip_logs_failure_domain_key(opencode_same_gateway_chain, c
         and domain in record.getMessage()
         for record in caplog.records
     ), f"Expected 'same failure domain as' log with domain={domain}, got: {caplog.text}"
+
+
+# ---------------------------------------------------------------------------
+# F4: Integration test — per-model sibling fallback (LP-0MTVMB685003GO2F)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def opencode_muse_deepseek_chain():
+    """Two entries on the SAME gateway but DIFFERENT models (Muse and
+    DeepSeek), followed by a direct DeepSeek entry on a different gateway.
+    Tests that after a Muse failure, the same-gateway DeepSeek entry is
+    NOT skipped as the same failure domain (F4 AC1)."""
+    return {
+        "providers": [
+            {
+                "name": "opencode-go-muse",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "muse-spark-1.3-contributor",
+            },
+            {
+                "name": "opencode-go-deepseek",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_2_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+            {
+                "name": "deepseek-v4-flash",
+                "type": "remote",
+                "provider": "deepseek",
+                "endpoint": "https://api.deepseek.com",
+                "api_key_env": "DEEPSEEK_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ],
+        "aliases": ["test*"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_different_model_same_gateway_not_skipped(opencode_muse_deepseek_chain):
+    """F4 AC1: After a Muse stall on a shared router endpoint, the
+    same-gateway DeepSeek entry is selected next (NOT skipped as same
+    failure domain). Only same-model siblings on that gateway are skipped.
+    """
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            return _make_streaming_response(_reasoning_only_stall_stream())
+        if name == "opencode-go-deepseek":
+            return _ok_json_response()
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", opencode_muse_deepseek_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    # Muse stalls -> DeepSeek on same gateway is selected (not skipped)
+    assert call_order == ["opencode-go-muse", "opencode-go-deepseek"]
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_same_model_same_gateway_still_skipped(opencode_same_gateway_chain):
+    """F4 AC2: Same-model entries on the same gateway ARE still skipped
+    together after a failure (existing behavior preserved)."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-2-deepseek":
+            return _make_streaming_response(_reasoning_only_stall_stream())
+        if name == "opencode-go-deepseek":
+            # Same endpoint + same model: skipped by failure domain logic
+            raise AssertionError("Should not be called — same failure domain")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", opencode_same_gateway_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    # Same-model sibling skipped, goes directly to deepseek-v4-flash
+    assert call_order == ["opencode-go-2-deepseek", "deepseek-v4-flash"]
+    assert result.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# F5: Logging includes model scope
+# ---------------------------------------------------------------------------
+
+
+def test_skip_log_includes_model_scope(opencode_same_gateway_chain, caplog):
+    """F5 AC1: When a same-model same-gateway entry is skipped, the log
+    line includes the model scope (e.g.
+    ``https://opencode.ai/zen/go:deepseek-v4-flash``)."""
+    first = opencode_same_gateway_chain["providers"][0]
+    domain = provider._failure_domain_key(first)
+    # Both entries have model=deepseek-v4-flash, so domain includes model
+    assert ":deepseek-v4-flash" in domain
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy.provider"):
+        provider._resolve_provider_with_exclusions(
+            opencode_same_gateway_chain,
+            excluded_provider_names={"opencode-go-2-deepseek"},
+            excluded_domains={domain},
+        )
+
+    assert any(
+        "same failure domain as" in record.getMessage()
+        and domain in record.getMessage()
+        for record in caplog.records
+    ), f"Expected log with domain={domain}, got: {caplog.text}"
+
+
+def test_resolve_skips_same_model_same_gateway_logs_scope(opencode_same_gateway_chain, caplog):
+    """F5 AC1: When same-model same-gateway entry is skipped, the log
+    includes the model-scoped failure-domain key."""
+    first = opencode_same_gateway_chain["providers"][0]
+    domain = provider._failure_domain_key(first)
+    # Both entries have model=deepseek-v4-flash, so key is
+    # https://opencode.ai/zen/go:deepseek-v4-flash
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy.provider"):
+        provider._resolve_provider_with_exclusions(
+            opencode_same_gateway_chain,
+            excluded_provider_names={"opencode-go-2-deepseek"},
+            excluded_domains={domain},
+        )
+
+    assert any(
+        "same failure domain as" in record.getMessage()
+        and domain in record.getMessage()
+        for record in caplog.records
+    ), f"Expected log with domain={domain}, got: {caplog.text}"
