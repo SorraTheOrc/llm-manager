@@ -40,6 +40,28 @@ from .router_helpers import (
 from .stall_circuit_breaker import _check_stall_circuit_breaker
 
 # ---------------------------------------------------------------------------
+# Body snippet helper
+# ---------------------------------------------------------------------------
+
+
+def _snippet_body(text: bytes | str, max_len: int = 512) -> str:
+    """Return a truncated body snippet for logging.
+
+    The raw body is model output (safe), but we truncate defensively to
+    avoid oversized log lines and to prevent any accidental secret leakage
+    in edge cases.
+    """
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    if not text:
+        return "<empty>"
+    snippet = text[:max_len]
+    if len(text) > max_len:
+        snippet += "..."
+    return snippet
+
+
+# ---------------------------------------------------------------------------
 # Auth.json fallback helpers
 # ---------------------------------------------------------------------------
 
@@ -1284,6 +1306,9 @@ async def _handle_remote_streaming(
         _disconnect_check_count = 0
         # Collect chunks for session recording (LP-0MR94O16S000WFQ0)
         collected_chunks = [] if session_id else None
+        # Capture raw upstream body from the first stream for body-snippet logging
+        # (LP-0MTVPJWWZ000REYU) — independent of session recording.
+        _first_stream_body = b""
 
         # Log stream started with session context (LP-0MR90HJED005WI1Z)
         try:
@@ -1329,10 +1354,12 @@ async def _handle_remote_streaming(
                 _should_empty_retry = False
                 _empty_retry_count += 1
                 try:
+                    _upstream_body_snippet = _snippet_body(_first_stream_body) if _first_stream_body else "<empty>"
                     _srv().logger.info(
                         "Empty response detected on stream attempt %s/%s, "
                         "retrying in %.2fs (provider=%s model=%s "
-                        "saw_tool_calls=%s saw_reasoning=%s)",
+                        "saw_tool_calls=%s saw_reasoning=%s "
+                        "upstream_body_snippet=%s)",
                         _empty_retry_count,
                         empty_max_attempts + 1,
                         empty_base_delay,
@@ -1340,6 +1367,7 @@ async def _handle_remote_streaming(
                         model_name,
                         _saw_tool_calls,
                         _saw_reasoning,
+                        _upstream_body_snippet,
                     )
                 except Exception:
                     pass
@@ -1667,6 +1695,8 @@ async def _handle_remote_streaming(
 
                     if collected_chunks is not None:
                         collected_chunks.append(chunk)
+                    # Capture first stream body for body-snippet logging (LP-0MTVPJWWZ000REYU)
+                    _first_stream_body += chunk
                     yield chunk
                     log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
 
@@ -2128,15 +2158,17 @@ async def _handle_remote_non_streaming(
             translated_body = json.dumps(resp_json).encode("utf-8")
 
         if _is_empty_remote_response(resp_json):
+            _empty_body_snippet = _snippet_body(resp_text)
             if attempt < empty_max_attempts:
                 try:
                     _srv().logger.info(
                         "Empty upstream response detected on attempt %s/%s, "
-                        "retrying in %.2fs (model=%s)",
+                        "retrying in %.2fs (model=%s body_snippet=%s)",
                         attempt + 1,
                         empty_max_attempts + 1,
                         empty_base_delay,
                         model_name,
+                        _empty_body_snippet,
                     )
                 except Exception:
                     pass
@@ -2145,10 +2177,12 @@ async def _handle_remote_non_streaming(
                 try:
                     _srv().logger.warning(
                         "Empty upstream response persisted after %s/%s retries, "
-                        "returning empty response for fallback (model=%s)",
+                        "returning empty response for fallback (model=%s status=%d body_snippet=%s)",
                         attempt + 1,
                         empty_max_attempts + 1,
                         model_name,
+                        response.status_code,
+                        _empty_body_snippet,
                     )
                 except Exception:
                     pass

@@ -183,6 +183,21 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
     return None
 
 
+def _snippet_body(text: str, max_len: int = 512) -> str:
+    """Return a truncated body snippet for logging.
+
+    The raw body is model output (safe), but we truncate defensively to
+    avoid oversized log lines and to prevent any accidental secret leakage
+    in edge cases (e.g. proxy debug dumps).
+    """
+    if not text:
+        return "<empty>"
+    snippet = text[:max_len]
+    if len(text) > max_len:
+        snippet += "..."
+    return snippet
+
+
 def _is_empty_response(response_text: str, resp_json: dict | None = None) -> bool:
     """Check if a response is effectively empty (no content, no tool calls).
 
@@ -351,17 +366,20 @@ async def _call_with_empty_retry(
             return response  # not valid JSON or content not readable, use as-is
 
         if _is_empty_response(content or "", resp_json):
+            body_snippet = _snippet_body(content)
             if attempt < max_retries:
                 srv.logger.info(
-                    "Empty response detected on attempt %s/%s, retrying...",
+                    "Empty response detected on attempt %s/%s, retrying... (body_snippet=%s)",
                     attempt + 1,
                     max_retries,
+                    body_snippet,
                 )
                 await asyncio.sleep(retry_delay)
             else:
                 srv.logger.warning(
-                    "Empty response persisted after %s retries, returning empty response",
+                    "Empty response persisted after %s retries, returning empty response (body_snippet=%s)",
                     max_retries,
+                    body_snippet,
                 )
         else:
             if attempt > 0:
