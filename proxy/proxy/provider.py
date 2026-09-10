@@ -3027,11 +3027,17 @@ def _has_next_provider(
 def _failure_domain_key(provider_cfg: dict) -> str:
     """Return a canonical failure-domain key for a provider entry.
 
-    Remote entries key on the normalized ``endpoint`` URL: scheme and host
-    lowercased, default ports dropped, trailing slash and fragment stripped,
-    path case and query strings preserved. Local / no-endpoint entries fall
-    back to the ``provider`` brand, then to the entry name (last resort so
-    entries without either never share a key).
+    Remote entries (with an ``endpoint``) key on the normalized endpoint URL
+    PLUS the upstream ``model``: ``normalized_endpoint:model``. This allows
+    router endpoints (e.g. ``https://opencode.ai/zen/go``) to distinguish
+    between different upstream models — a failure for model A does not exclude
+    model B on the same gateway.
+
+    When no ``model`` is provided for a remote entry, a wildcard ``*`` is used
+    so all such entries on the same endpoint still share one domain.
+
+    Local / no-endpoint entries fall back to the ``provider`` brand, then to
+    the entry name (last resort so entries without either never share a key).
 
     Entries that share a failure-domain key are treated as ONE failure domain:
     a stall/terminal error on one entry excludes the whole domain from the
@@ -3041,7 +3047,8 @@ def _failure_domain_key(provider_cfg: dict) -> str:
     if endpoint:
         normalized = _normalize_endpoint_for_failure_domain(str(endpoint))
         if normalized:
-            return normalized
+            model = provider_cfg.get("model") or "*"
+            return f"{normalized}:{model}"
     brand = provider_cfg.get("provider")
     if brand:
         return str(brand)

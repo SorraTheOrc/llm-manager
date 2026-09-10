@@ -1,17 +1,19 @@
 """
-Tests for failure-domain grouping in provider fallback (LP-0MSG45I8Q0020N1F).
+Tests for failure-domain grouping in provider fallback (LP-0MSG45I8Q0020N1F, LP-0MTVMB685003GO2F).
 
 Failure-domain grouping treats provider entries that share the same
-normalized endpoint (e.g. ``https://opencode.ai/zen/go``) as a single
-failure domain, so a stall on one entry causes the fallback chain /
-mid-stream re-route to skip to the first entry of a *different* domain
-instead of hopping to another API-key entry on the same broken gateway.
+normalized endpoint AND upstream model as a single failure domain, so a stall
+on one entry causes the fallback chain / mid-stream re-route to skip to the
+first entry of a *different* domain instead of hopping to another API-key
+entry on the same broken gateway.  Router endpoints (e.g.
+``https://opencode.ai/zen/go``) can now distinguish between different upstream
+models — a failure for model A does not exclude model B on the same gateway.
 
 Covers (parent AC1-AC4 / F1 AC1-AC6):
 
-- ``_failure_domain_key()``: normalized endpoint key derivation (lowercase
-  scheme+host, strip trailing slash and fragment, drop default ports, keep
-  path case and query strings), brand fallback for local/no-endpoint entries.
+- ``_failure_domain_key()``: remote entries key on
+  ``normalized_endpoint:model`` (model falls back to ``*`` when absent);
+  local/no-endpoint entries fall back to brand, then name.
 - Same-domain skip in ``_resolve_provider_with_exclusions`` after a stall.
 - No over-grouping: entries with different endpoints are NOT skipped together.
 - ``resolve_provider(failed_provider=...)`` skips entries sharing the failed
@@ -216,41 +218,41 @@ async def _collect(result: Response) -> str:
 
 
 def test_failure_domain_key_basic_endpoint():
-    """A plain remote endpoint yields itself as the failure-domain key."""
+    """A plain remote endpoint without model yields endpoint: *."""
     cfg = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai/zen/go"}
-    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go"
+    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go:*"
 
 
 def test_failure_domain_key_normalizes_scheme_host_case():
     """Scheme and host are lowercased; path case is preserved."""
     cfg = {"name": "a", "type": "remote", "endpoint": "HTTPS://Opencode.AI/Zen/Go"}
-    assert provider._failure_domain_key(cfg) == "https://opencode.ai/Zen/Go"
+    assert provider._failure_domain_key(cfg) == "https://opencode.ai/Zen/Go:*"
 
 
 def test_failure_domain_key_strips_trailing_slash():
     """A trailing slash on the path is stripped."""
     cfg = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai/zen/go/"}
-    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go"
+    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go:*"
 
 
 def test_failure_domain_key_strips_fragment():
     """A URL fragment is dropped from the key."""
     cfg = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai/zen/go#section"}
-    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go"
+    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go:*"
 
 
 def test_failure_domain_key_drops_default_ports():
     """Default ports (443 for https, 80 for http) are dropped."""
     https_cfg = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai:443/zen/go"}
-    assert provider._failure_domain_key(https_cfg) == "https://opencode.ai/zen/go"
+    assert provider._failure_domain_key(https_cfg) == "https://opencode.ai/zen/go:*"
     http_cfg = {"name": "a", "type": "remote", "endpoint": "http://opencode.ai:80/zen/go"}
-    assert provider._failure_domain_key(http_cfg) == "http://opencode.ai/zen/go"
+    assert provider._failure_domain_key(http_cfg) == "http://opencode.ai/zen/go:*"
 
 
 def test_failure_domain_key_keeps_query_strings():
     """Query strings are retained in the key."""
     cfg = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai/zen/go?api=v1&k=2"}
-    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go?api=v1&k=2"
+    assert provider._failure_domain_key(cfg) == "https://opencode.ai/zen/go?api=v1&k=2:*"
 
 
 def test_failure_domain_key_falls_back_to_brand_for_local():
@@ -289,10 +291,14 @@ def test_resolve_with_exclusions_skips_same_endpoint_entry(opencode_same_gateway
 
 def test_resolve_with_exclusions_does_not_skip_different_endpoint(opencode_distinct_endpoints_chain):
     """No over-grouping: excluding the ``https://opencode.ai/zen`` domain must
-    NOT skip the ``https://opencode.ai/zen/go`` entry (parent AC2)."""
+    NOT skip the ``https://opencode.ai/zen/go`` entry (parent AC2).
+
+    Both entries share the same model, so their keys differ only by endpoint path.
+    """
     free_entry = opencode_distinct_endpoints_chain["providers"][0]
     domain = provider._failure_domain_key(free_entry)
-    assert domain == "https://opencode.ai/zen"
+    # Keys now include model: https://opencode.ai/zen:deepseek-v4-flash
+    assert ":deepseek-v4-flash" in domain
 
     result = provider._resolve_provider_with_exclusions(
         opencode_distinct_endpoints_chain,
@@ -549,6 +555,99 @@ async def test_reroute_sse_comment_present_when_skipping_same_gateway(opencode_s
     )
     assert "stall_after_reasoning" in collected
     assert "Hello" in collected
+
+
+# ---------------------------------------------------------------------------
+# F1 AC1-AC4: model-scoped failure-domain keys
+# ---------------------------------------------------------------------------
+
+
+def test_failure_domain_key_different_models_same_endpoint():
+    """F1 AC1: Same endpoint, different upstream models → different keys."""
+    cfg_muse = {
+        "name": "opencode-muse",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "model": "muse-spark-1.3-contributor",
+    }
+    cfg_deepseek = {
+        "name": "opencode-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "model": "deepseek-v4-flash",
+    }
+    assert provider._failure_domain_key(cfg_muse) != provider._failure_domain_key(cfg_deepseek)
+
+
+def test_failure_domain_key_same_model_same_endpoint():
+    """F1 AC2: Same endpoint + same model → same key."""
+    cfg1 = {
+        "name": "opencode-go-2-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "model": "deepseek-v4-flash",
+        "api_key_env": "OPENCODE_2_API_KEY",
+    }
+    cfg2 = {
+        "name": "opencode-go-deepseek",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+        "model": "deepseek-v4-flash",
+        "api_key_env": "OPENCODE_API_KEY",
+    }
+    assert provider._failure_domain_key(cfg1) == provider._failure_domain_key(cfg2)
+
+
+def test_failure_domain_key_no_model_fallback():
+    """F1 AC4: When no model is provided, entries key on a wildcard.
+    Two entries with the same endpoint but no model both get the * wildcard.
+    """
+    cfg1 = {
+        "name": "entry1",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+    }
+    cfg2 = {
+        "name": "entry2",
+        "type": "remote",
+        "endpoint": "https://opencode.ai/zen/go",
+    }
+    key1 = provider._failure_domain_key(cfg1)
+    key2 = provider._failure_domain_key(cfg2)
+    assert key1 == key2 == "https://opencode.ai/zen/go:*"
+
+
+def test_failure_domain_key_local_unchanged_by_model():
+    """F1 AC3: Local/no-endpoint entries retain brand-based keying.
+    Adding a model field to a local entry does NOT affect its key.
+    """
+    cfg_with_model = {
+        "name": "local-qwen3",
+        "type": "local",
+        "llama_model": "Qwen3",
+        "provider": "qwen",
+        "model": "qwen3-8b",
+    }
+    cfg_without_model = {
+        "name": "local-qwen3",
+        "type": "local",
+        "llama_model": "Qwen3",
+        "provider": "qwen",
+    }
+    assert provider._failure_domain_key(cfg_with_model) == "qwen"
+    assert provider._failure_domain_key(cfg_without_model) == "qwen"
+
+
+def test_failure_domain_key_normalization_still_applied():
+    """F1 AC4: Endpoint normalization (lowercase, default port drop,
+    trailing slash strip) is still applied to the endpoint part of the key."""
+    cfg = {
+        "name": "a",
+        "type": "remote",
+        "endpoint": "HTTPS://Opencode.AI:443/Zen/Go/",
+        "model": "deepseek-v4-flash",
+    }
+    assert provider._failure_domain_key(cfg) == "https://opencode.ai/Zen/Go:deepseek-v4-flash"
 
 
 # ---------------------------------------------------------------------------
