@@ -126,6 +126,37 @@ class TestDisconnectReaperMiddleware:
         reaper_registry.clear()
 
     @pytest.mark.asyncio
+    async def test_middleware_suppresses_cancelled_error(self):
+        """CancelledError (from reaper task.cancel()) is suppressed."""
+        from proxy.disconnect_reaper import (
+            DisconnectReaperMiddleware,
+            reaper_registry,
+        )
+
+        reaper_registry.clear()
+        mock_request = MagicMock()
+        mock_request.url.path = "/v1/leases/release"
+
+        async def cancelled_call_next(req):
+            # Simulates what happens when the reaper calls task.cancel()
+            # while the handler is awaiting recv_stream.receive().
+            raise asyncio.CancelledError()
+
+        mw = DisconnectReaperMiddleware(app=None)
+
+        # Must NOT raise CancelledError — it should be suppressed and a
+        # Response returned instead, avoiding the noisy
+        # "ERROR: Exception in ASGI application" traceback.
+        response = await mw.dispatch(mock_request, cancelled_call_next)
+
+        assert response.status_code == 499, (
+            "Cancelled requests should return 499 (client closed connection)"
+        )
+        # Task must be unregistered.
+        assert asyncio.current_task() not in reaper_registry
+        reaper_registry.clear()
+
+    @pytest.mark.asyncio
     async def test_unregisters_on_exception(self):
         """The task is removed from the registry even when the handler raises."""
         from proxy.disconnect_reaper import (
