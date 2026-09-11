@@ -70,6 +70,12 @@ _sibling_failure_streak_start: dict[str, float] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
+# Empty-response cooldown cap (LP-0MTVPJBF0001SQF4): empty responses are
+# typically transient gateway quirks, not hard endpoint failures, so cap
+# their effective cooldown at a short bound (default 10s). Retry-After
+# headers still override upward.
+_EMPTY_RESPONSE_MAX_COOLDOWN_SECONDS = 10.0
+
 # FreeUsageLimitError cooldown: 3 hours (10800 seconds) by default.
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details. The per-provider overrides
@@ -2055,6 +2061,23 @@ def _get_cooldown_seconds(config: dict) -> float:
     return float(val)
 
 
+def _get_empty_response_max_cooldown_seconds(config: dict) -> float:
+    """Read ``empty_response_max_cooldown_seconds`` from config.
+
+    Checks ``config[\"empty_response_max_cooldown_seconds\"]`` (flat) first
+    for backward compatibility with unit tests, then falls back to
+    ``config[\"server\"][\"empty_response_max_cooldown_seconds\"]`` (nested)
+    for production configs.  Defaults to 10.
+    """
+    val = config.get("empty_response_max_cooldown_seconds")
+    if val is None:
+        val = config.get("server", {}).get(
+            "empty_response_max_cooldown_seconds",
+            _EMPTY_RESPONSE_MAX_COOLDOWN_SECONDS,
+        )
+    return float(val)
+
+
 def _get_sibling_fallback_threshold(config: dict) -> int:
     """Read the sibling-fallback failure threshold from config.
 
@@ -3857,12 +3880,15 @@ def _handle_empty_response_with_cooldown(
     cooldown_seconds: float,
     attempts: list[dict[str, Any]],
     body_text: str,
+    config: dict | None = None,
 ) -> float:
     """Handle an empty (non-reasoning) successful response: compute effective
     cooldown, mark the provider unavailable, record a diagnostic attempt entry,
     and return the effective cooldown duration.
 
-    Applies exponential backoff for remote providers.
+    Applies exponential backoff for remote providers, capped at
+    ``empty_response_max_cooldown_seconds`` (default 10s).  Retry-After
+    headers still override upward.
 
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
@@ -3880,6 +3906,13 @@ def _handle_empty_response_with_cooldown(
         )
         cooldown = min(backoff, cooldown_seconds)
         _provider_failure_count[provider_name] = count + 1
+
+    # Cap for empty responses (LP-0MTVPJBF0001SQF4): transient quirks deserve
+    # a lighter penalty than hard failures.  Retry-After still overrides
+    # upward (checked below).
+    if config is not None:
+        max_cd = _get_empty_response_max_cooldown_seconds(config)
+        cooldown = min(cooldown, max_cd)
 
     # Respect Retry-After header regardless of backoff
     if retry_after is not None:
@@ -4580,7 +4613,7 @@ async def _proxy_with_remote_fallback_cycle(
                     # Shared primitive: empty response with cooldown
                     _handle_empty_response_with_cooldown(
                         response, provider_name, provider_type,
-                        cooldown_seconds, attempts, body_text,
+                        cooldown_seconds, attempts, body_text, config,
                     )
                     # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
                     # track consecutive empty/stall failures across cycles.
@@ -5537,7 +5570,7 @@ async def _proxy_with_fallback_cycle(
                             # Shared primitive: empty response with cooldown
                             _handle_empty_response_with_cooldown(
                                 response, provider_name, provider_type,
-                                cooldown_seconds, attempts, body_text,
+                                cooldown_seconds, attempts, body_text, config,
                             )
                             _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                             attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -5549,7 +5582,7 @@ async def _proxy_with_fallback_cycle(
                         # Shared primitive: empty response with cooldown
                         _handle_empty_response_with_cooldown(
                             response, provider_name, provider_type,
-                            cooldown_seconds, attempts, body_text,
+                            cooldown_seconds, attempts, body_text, config,
                         )
                         _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                         attempted_domains.add(_failure_domain_key(provider_cfg))

@@ -4823,3 +4823,210 @@ async def test_local_slot_exhaustion_persistent_falls_back_after_two_retries(
     assert result.status_code == 200
     assert local_calls == 3, "Expected initial + 2 retries = 3 local calls before fallback"
     assert remote_called, "Should fall back to remote after all retries exhausted"
+
+
+# ===================================================================
+# LP-0MTVPJBF0001SQF4: Cap empty-response cooldown at configurable max
+# ===================================================================
+
+def test_empty_response_cooldown_capped_at_default_10s():
+    """AC1: A single empty_response applies a cooldown no longer than 10s.
+
+    Even with a high cooldown_seconds and accumulated failure count,
+    the effective cooldown is capped at the default 10s.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    config = {"server": {"empty_response_max_cooldown_seconds": 10.0}}
+    with patch('time.time', return_value=1000.0):
+        # Simulate 5 prior failures (would give 1*2^5=32s without cap)
+        provider._provider_failure_count["cap-default-provider"] = 5
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "cap-default-provider", "remote", 60.0, [],
+            "{}", config,
+        )
+        assert cooldown == 10.0, (
+            f"Expected cooldown capped at 10s, got {cooldown}"
+        )
+
+def test_empty_response_cooldown_capped_at_custom_value():
+    """AC1: Configurable max cooldown overrides the default 10s.
+
+    When ``empty_response_max_cooldown_seconds`` is set to a different
+    value, the cap respects that custom setting.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    config = {"server": {"empty_response_max_cooldown_seconds": 5.0}}
+    with patch('time.time', return_value=1000.0):
+        provider._provider_failure_count["cap-custom-provider"] = 5
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "cap-custom-provider", "remote", 60.0, [],
+            "{}", config,
+        )
+        assert cooldown == 5.0, (
+            f"Expected cooldown capped at 5s, got {cooldown}"
+        )
+
+def test_empty_response_cooldown_capped_on_single_call():
+    """AC1: The cap applies even to the very first empty_response.
+
+    With no prior failures the backoff would be 1s, which is under the
+    10s cap — so the effective cooldown should still be bounded by the
+    lower of (backoff, max_cd).
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    config = {"server": {"empty_response_max_cooldown_seconds": 3.0}}
+    with patch('time.time', return_value=1000.0):
+        # First call: backoff = 1s, max_cd = 3s → cooldown = 1s
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "cap-first-provider", "remote", 60.0, [],
+            "{}", config,
+        )
+        assert cooldown == 1.0, (
+            f"Expected cooldown 1s (backoff < cap), got {cooldown}"
+        )
+
+def test_empty_response_cooldown_flat_config_key():
+    """Config key works via flat config key (for unit-test convenience)."""
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    config = {"empty_response_max_cooldown_seconds": 7.0}
+    with patch('time.time', return_value=1000.0):
+        provider._provider_failure_count["flat-config-provider"] = 4
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "flat-config-provider", "remote", 60.0, [],
+            "{}", config,
+        )
+        assert cooldown == 7.0, (
+            f"Expected cooldown capped at 7s (flat key), got {cooldown}"
+        )
+
+def test_empty_response_retry_after_overrides_cap():
+    """AC2: Retry-After headers still extend cooldown beyond the cap.
+
+    When the upstream sends a Retry-After header larger than the cap,
+    the effective cooldown should use the Retry-After value.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(
+        status_code=200, content=b"{}",
+        headers={"Retry-After": "30"},
+    )
+    config = {"server": {"empty_response_max_cooldown_seconds": 10.0}}
+    with patch('time.time', return_value=1000.0):
+        provider._provider_failure_count["retry-after-provider"] = 5
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "retry-after-provider", "remote", 60.0, [],
+            "{}", config,
+        )
+        # backoff=32, min(32,60)=32, min(32,10)=10, max(10,30)=30
+        assert cooldown == 30.0, (
+            f"Expected max(10s cap, 30s Retry-After)=30, got {cooldown}"
+        )
+
+def test_empty_response_no_config_uses_old_behavior():
+    """Backward compat: callers passing no config get old exponential backoff.
+
+    The config parameter is optional (default None). When None, the cap
+    is NOT applied — preserving the original exponential backoff
+    behaviour for callers that haven't been migrated.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    with patch('time.time', return_value=1000.0):
+        provider._provider_failure_count["no-config-provider"] = 4
+        cooldown = provider._handle_empty_response_with_cooldown(
+            response, "no-config-provider", "remote", 60.0, [],
+            "{}", None,  # No config → no cap
+        )
+        # backoff = 1*2^4 = 16, min(16, 60) = 16
+        assert cooldown == 16.0, (
+            f"Expected old backoff 16s (no cap), got {cooldown}"
+        )
+
+def test_empty_response_consecutive_calls_still_capped():
+    """AC1: Even with accumulated failures, the cap holds.
+
+    Multiple consecutive empty responses on the same provider should
+    each respect the cap.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    config = {"server": {"empty_response_max_cooldown_seconds": 10.0}}
+    with patch('time.time', return_value=1000.0):
+        for i, expected_backoff in enumerate([1.0, 2.0, 4.0, 8.0, 16.0]):
+            cooldown = provider._handle_empty_response_with_cooldown(
+                response, "cap-seq-provider", "remote", 60.0, [],
+                "{}", config,
+            )
+            # Without cap it would be min(expected_backoff, 60),
+            # with cap it's min(min(expected_backoff, 60), 10)
+            expected = min(expected_backoff, 10.0)
+            assert cooldown == expected, (
+                f"Call {i+1}: expected {expected}s, got {cooldown}"
+            )
+
+def test_empty_response_capped_readtimeout_unaffected():
+    """AC3: ReadTimeout / stream_error backoff behaviour is unchanged.
+
+    The cap only applies to _handle_empty_response_with_cooldown.
+    The _handle_http_error_with_cooldown and
+    _handle_connection_error_in_fallback functions are NOT affected.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=502, content=b"Bad gateway")
+    config = {"server": {"empty_response_max_cooldown_seconds": 10.0}}
+    with patch('time.time', return_value=1000.0):
+        # HTTP error path should still use full exponential backoff, even
+        # with the cap config present.  Note: _handle_http_error_with_cooldown
+        # has NO config parameter — the cap is exclusive to the
+        # empty-response path.
+        cooldown = provider._handle_http_error_with_cooldown(
+            response, "http-error-provider", "remote", 60.0, [],
+            "bad",
+        )
+        assert cooldown == 1.0
+        # 5th call: backoff = 16, cap doesn't apply to HTTP errors
+        for _ in range(3):
+            cooldown = provider._handle_http_error_with_cooldown(
+                response, "http-error-provider", "remote", 60.0, [],
+                "bad",
+            )
+        cooldown = provider._handle_http_error_with_cooldown(
+            response, "http-error-provider", "remote", 60.0, [],
+            "bad",
+        )
+        assert cooldown == 16.0, (
+            f"HTTP error should NOT be capped, expected 16s, got {cooldown}"
+        )
+
+def test_empty_response_local_provider_unaffected():
+    """Local providers: cap is a no-op since they skip backoff entirely.
+
+    Local providers always use cooldown_seconds directly (no exponential
+    backoff), and the cap only reduces — so the result stays at
+    cooldown_seconds when it's already under the cap.
+    """
+    provider._provider_failure_count.clear()
+    provider._provider_unavailable_until.clear()
+    response = Response(status_code=200, content=b"{}")
+    config = {"server": {"empty_response_max_cooldown_seconds": 10.0}}
+    with patch('time.time', return_value=1000.0):
+        for _ in range(3):
+            cooldown = provider._handle_empty_response_with_cooldown(
+                response, "local-cap-provider", "local", 5.0, [],
+                "{}", config,
+            )
+            assert cooldown == 5.0, (
+                f"Local provider should use cooldown_seconds=5, got {cooldown}"
+            )
