@@ -17,7 +17,12 @@ immediately below the retained first prompt (AC5).
 
 Non-compactable sessions (summarizer unavailable) resolve to an explicit
 ``remote_with_guidance`` action: the dispatcher must route remote with
-guidance, never silently (AC4).
+guidance, never silently (AC4). The same path is taken when the summarizer
+is present but fails open with a blank result (LP-0MTXGU8T00066WVH): an
+empty summary is NEVER applied, because it would silently drop the folded
+middle turns and — the injected marker being empty — make
+``extract_previous_summary`` unable to detect them, so every subsequent
+compaction would re-run CREATION on the same base and never converge.
 
 The ``estimate_tokens`` callable is injectable so callers can reuse the
 production routing estimator (``_estimate_prompt_tokens_for_routing``);
@@ -119,6 +124,37 @@ def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
         if text is not None:
             found = text
     return found
+
+
+class EmptySummary(str):
+    """Falsy ``str`` sentinel for a summarizer that could not summarize.
+
+    ``build_local_summarizer`` is fail-open: on a transport / HTTP / parse
+    failure it returns a blank string so compaction never blocks dispatch.
+    To keep that contract (existing callers compare ``result == ""``) while
+    still letting the planner distinguish "nothing to summarize" from
+    "summarization failed", the failure return value is this ``str``
+    subclass: it compares equal to ``""`` (and is falsy) but also carries
+    the machine-readable ``kind`` (e.g. ``"timeout"``, ``"http_500"``) and
+    the number of ``attempts`` made.
+
+    ``plan_session_compaction`` treats a blank summary — sentinel or plain
+    ``""`` — as a summarizer failure: it leaves the session untouched and
+    returns ``remote_with_guidance`` instead of injecting an empty marker
+    that silently drops the folded turns (LP-0MTXGU8T00066WVH).
+    """
+
+    kind: str
+    attempts: int
+
+    def __new__(cls, kind: str = "empty_summary", attempts: int = 1) -> EmptySummary:
+        obj = super().__new__(cls, "")
+        obj.kind = str(kind)
+        obj.attempts = int(attempts)
+        return obj
+
+    def __getnewargs__(self) -> tuple[str, int]:
+        return (self.kind, self.attempts)
 
 
 # Callable that folds the middle messages into a summary string. The second,
@@ -338,6 +374,7 @@ _WARNING_REASONS = frozenset(
         "backstop_exhausted",
         "compacted_over_budget",
         "remote_with_guidance",
+        "summarizer_failed",
     }
 )
 
@@ -402,6 +439,15 @@ def log_compaction_event(
         "summary_tokens": int(summary_tokens),
         "dry_run": bool(dry_run),
     }
+    failure_kind = plan_result.get("summarizer_failure_kind")
+    if failure_kind:
+        # A summarizer failure that prevented compaction is surfaced on the
+        # (WARNING) entry with the session id, failure kind and attempt
+        # count — never silently degraded to an empty summary
+        # (LP-0MTXGU8T00066WVH).
+        fields["failure_kind"] = str(failure_kind)
+        fields["attempts"] = int(plan_result.get("summarizer_attempts", 1) or 1)
+        fields["session_id"] = str(session_id)
     line = "compaction_event " + " ".join(f"{k}={v}" for k, v in fields.items())
     emit = logger_obj if logger_obj is not None else logger
     if fields["action"] == "remote_with_guidance" or (fields["reason"] in _WARNING_REASONS):
@@ -643,9 +689,12 @@ def plan_session_compaction(
        a summary injected immediately below the first prompt (AC5); whole
        recent turns are kept while the total estimate stays within the
        per-mode target.
-    3. If no summarizer is available the session cannot be compacted — the
-       result is ``action="remote_with_guidance"`` so the dispatcher routes
-       remote WITH guidance, never silently (AC4).
+    3. If no summarizer is available, or the summarizer fails open with a
+       blank result, the session cannot be compacted — the result is
+       ``action="remote_with_guidance"`` so the dispatcher routes remote
+       WITH guidance, never silently (AC4), and the session history is left
+       untouched (an empty summary is never applied, AC1 of
+       LP-0MTXGU8T00066WVH).
 
     Args:
         messages: The session's message list (OpenAI-style role/content).
@@ -667,6 +716,9 @@ def plan_session_compaction(
         - messages: original list (noop / compactable-missing) or the
           compacted list
         - summary_text: the summarizer output when compacted, else None
+        - summarizer_failure_kind / summarizer_attempts: populated on the
+          ``remote_with_guidance`` / ``summarizer_failed`` path so the
+          structured event can record why compaction was prevented
         - turns_summarized / recent_turns_kept: turn accounting
         - estimated_before / estimated_after: token estimates (same
           estimator)
@@ -742,7 +794,28 @@ def plan_session_compaction(
     middle_turns = turns[: len(turns) - len(recent)]
     middle_messages = [m for turn in middle_turns for m in turn if not _is_compaction_summary_message(m)]
     previous_summary = extract_previous_summary(messages)
-    summary_text = summarizer(middle_messages, previous_summary)
+    try:
+        summary_text = summarizer(middle_messages, previous_summary)
+    except Exception as exc:
+        # A summarizer that raises is a failure, never a silent empty
+        # compaction: leave the history untouched and route remote with
+        # guidance (LP-0MTXGU8T00066WVH).
+        result["action"] = "remote_with_guidance"
+        result["reason"] = "summarizer_failed"
+        result["summarizer_failure_kind"] = str(getattr(exc, "kind", type(exc).__name__))
+        result["summarizer_attempts"] = int(getattr(exc, "attempts", 1) or 1)
+        return result
+
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        # Empty / whitespace summary: NEVER inject an empty marker. It drops
+        # the folded turns with no record and (the marker being empty) breaks
+        # previous-summary detection on the next pass, so compaction never
+        # converges. Fail open to remote_with_guidance instead.
+        result["action"] = "remote_with_guidance"
+        result["reason"] = "summarizer_failed"
+        result["summarizer_failure_kind"] = str(getattr(summary_text, "kind", "empty_summary"))
+        result["summarizer_attempts"] = int(getattr(summary_text, "attempts", 1) or 1)
+        return result
 
     compacted = list(retained) + [_summary_message(summary_text)] + [m for turn in recent for m in turn]
     estimated_after = est(compacted)

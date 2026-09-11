@@ -16,7 +16,23 @@ from typing import Any
 
 import httpx
 
+from proxy.compaction import EmptySummary
+
 logger = logging.getLogger("llama-proxy.compaction_summarizer")
+
+
+def _transport_failure_kind(exc: BaseException) -> str:
+    """Classify a summarizer transport exception into a stable kind string.
+
+    Used to populate :class:`proxy.compaction.EmptySummary` so the compaction
+    planner can log why summarization failed (LP-0MTXGU8T00066WVH).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connect"
+    return "transport"
+
 
 # ---------------------------------------------------------------------------
 # File-operation tracking (R2, LP-0MTTPXI1Y003YFOU)
@@ -269,8 +285,13 @@ def build_local_summarizer(
     The returned callable matches ``proxy.compaction.Summarizer``:
     ``Callable[[list[dict]], str]`` — takes the middle messages and
     returns the summary text. Empty input returns "" without a network
-    call. Any transport / HTTP / parse error is fail-open (warning log,
-    return "") so compaction never blocks dispatch.
+    call. Any transport / HTTP / parse error is fail-open: the call returns
+    an :class:`proxy.compaction.EmptySummary` — a falsy ``str`` subclass
+    that compares equal to ``""`` but carries the failure ``kind`` and the
+    number of ``attempts`` made. The compaction planner treats any blank
+    summary (sentinel or plain ``""``) as a summarizer failure and routes
+    ``remote_with_guidance`` rather than applying an empty summary
+    (LP-0MTXGU8T00066WVH); dispatch is therefore never blocked.
 
     Args:
         config: Proxy config dict (read via ``compaction_config`` for
@@ -355,7 +376,7 @@ def build_local_summarizer(
                         exc,
                         exc_info=True,
                     )
-                    return ""
+                    return EmptySummary(_transport_failure_kind(exc), attempts)
                 if resp.status_code == 200:
                     break
                 transient = resp.status_code >= 500 or resp.status_code == 429
@@ -375,12 +396,12 @@ def build_local_summarizer(
                     resp.status_code,
                     getattr(resp, "text", "") or "",
                 )
-                return ""
+                return EmptySummary(f"http_{resp.status_code}", attempt + 1)
             data = resp.json()
             choices = data.get("choices") if isinstance(data, dict) else None
             if not choices:
                 logger.warning("local summarizer empty choices payload=%.500s", str(data)[:500])
-                return ""
+                return EmptySummary("malformed_response", attempts)
             msg = choices[0].get("message") if isinstance(choices[0], dict) else None
             content = (msg or {}).get("content") if isinstance(msg, dict) else None
             if not isinstance(content, str):
@@ -391,13 +412,13 @@ def build_local_summarizer(
                     content = str(content or "")
             content = content.strip()
             if not content:
-                return ""
+                return EmptySummary("empty_completion", attempts)
             # R2: append file-operation XML (read/modified tool calls in the
             # summarised turns) to the model's summary, Pi-style.
             ops = extract_file_operations(middle_messages)
             return content + format_file_operations(ops["read"], ops["modified"])
         except Exception as exc:
             logger.warning("local summarizer call failed: %s", exc, exc_info=True)
-            return ""
+            return EmptySummary(type(exc).__name__, attempts)
 
     return _summarizer

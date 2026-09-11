@@ -136,6 +136,24 @@ verbatim, middle folded, newest whole turns kept ≤ target), the dispatch body
 is replaced with the compacted full history, and `remote_with_guidance`
 enforces non-compactable sessions never reach local near-full-slot.
 
+**Summarizer fail-open contract (LP-0MTXGU8T00066WVH).** The local summariser
+(`proxy/proxy/compaction_summarizer.py`) is fail-open: a transport timeout,
+HTTP error, malformed payload, or empty completion never raises out of the
+dispatch path. Instead it returns an `EmptySummary` — a falsy `str` subclass
+that compares equal to `""` but carries the failure `.kind` (e.g. `timeout`,
+`http_500`, `empty_completion`) and `.attempts`. The compaction planner
+(`plan_session_compaction` in `proxy/proxy/compaction.py`) treats **any** blank
+summary — sentinel or plain `""` — as a summariser failure: it leaves the
+session history untouched and returns `remote_with_guidance`
+(`reason=summarizer_failed`) rather than injecting an empty marker. An empty
+marker would silently drop the folded middle turns and make
+`extract_previous_summary` unable to detect them, so every subsequent pass
+would re-run CREATION on the same base and never converge. The failure is
+logged at WARNING on the `compaction_event` line with the session id, the
+failure kind and the attempt count. Transient failures are retried
+`server.compaction_summarizer_retries` times (default 2) with
+`server.compaction_summarizer_retry_delay_seconds` between attempts.
+
 The config is validated at startup (`validate_compaction_config` in
 `proxy/proxy/provider.py`, invoked from `proxy/proxy/utils.py` and
 `proxy/proxy/server.py`): an out-of-range trigger ratio, an explicitly empty
