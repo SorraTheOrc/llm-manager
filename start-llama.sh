@@ -237,6 +237,9 @@ if [[ "$router_mode" -eq 1 ]]; then
   # Keeping these values aligned is critical: mismatch causes slot exhaustion
   # or restore failures at runtime.
   : "${LLAMA_PARALLEL:=1}"
+  # Batch window defaults — override via LLAMA_BATCH_SIZE / LLAMA_UBATCH_SIZE.
+  : "${LLAMA_BATCH_SIZE:=8192}"
+  : "${LLAMA_UBATCH_SIZE:=1024}"
   LLAMA_CMD=(
     "$LLAMA_BIN"
     --models-preset "$MODELS_INI"
@@ -248,6 +251,8 @@ if [[ "$router_mode" -eq 1 ]]; then
     -ngl "$GLOBAL_NGL"
     --threads "${LLAMA_THREADS:-8}"
     --port $PORT
+    --batch-size "$LLAMA_BATCH_SIZE"
+    --ubatch-size "${LLAMA_UBATCH_SIZE}"
   )
 
   if [[ -n "${LLAMA_MODELS_DIR:-}" ]]; then
@@ -273,8 +278,8 @@ case "$model" in
     MODEL=gpt-oss-120b-GGUF
     QUANTIZATION=Q5_K_M
     CONTEXT=131072
-    BATCH_SIZE=512 # Try values between 256 and 2048 (default)
-    # TODO --ubatch-size value between 64 and 512 (default) note batch_size >= ubatch_size
+    BATCH_SIZE=8192
+    UBATCH_SIZE=1024
     # TODO --cache-type-k try q4_0, q8_0 and f16 (default)
     # TODO --cache-type-v try q4_0, q8_0 and f16 (default)
 
@@ -299,8 +304,8 @@ case "$model" in
     MODEL=unsloth/Qwen3.6-35B-A3B-GGUF
     QUANTIZATION=Q8_0
     CONTEXT=131072 # 128k context window (canonical size; max supported is 262144)
-    BATCH_SIZE=4096
-    UBATCH_SIZE=256
+    BATCH_SIZE=8192
+    UBATCH_SIZE=1024
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
@@ -324,8 +329,8 @@ case "$model" in
     MODEL=unsloth/Qwen3.6-35B-A3B-MTP-GGUF
     QUANTIZATION=Q4_K_S
     CONTEXT=262144 # matches [Qwen3] and models.ini [Qwen3-MTP] (fair A/B, LP-0MSY0SDAS0031Y7F / LP-0MSYLL3LY004CANG)
-    BATCH_SIZE=4096
-    UBATCH_SIZE=256
+    BATCH_SIZE=8192
+    UBATCH_SIZE=1024
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
@@ -341,7 +346,8 @@ case "$model" in
     MODEL=mxbai-embed-large-v1-Q8_0-GGUF
     QUANTIZATION=Q8_0
     CONTEXT=2048
-    BATCH_SIZE=512
+    BATCH_SIZE=8192
+    UBATCH_SIZE=1024
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek
 
@@ -357,7 +363,8 @@ case "$model" in
     MODEL=gemma-4-31B-it-GGUF
     QUANTIZATION=Q8_0
     CONTEXT=262144
-    BATCH_SIZE=512
+    BATCH_SIZE=8192
+    UBATCH_SIZE=1024
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=none
 
@@ -481,6 +488,9 @@ echo "Using llama-server binary: $LLAMA_BIN"
   # Keeping these values aligned is critical: mismatch causes slot exhaustion
   # or restore failures at runtime.
   : "${LLAMA_PARALLEL:=1}"
+  # Env overrides (same names as router branch).
+  BATCH_SIZE="${LLAMA_BATCH_SIZE:-$BATCH_SIZE}"
+  UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-$UBATCH_SIZE}"
   LLAMA_CMD=(
     "$LLAMA_BIN"
     -hf "$REPOID/$MODEL:$QUANTIZATION"
