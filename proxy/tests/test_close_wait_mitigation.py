@@ -147,6 +147,28 @@ class TestDisconnectReaperMiddleware:
         reaper_registry.clear()
 
     @pytest.mark.asyncio
+    async def test_suppresses_cancellation_and_returns_499(self):
+        """A reaper cancellation is suppressed: 499 returned, task unregistered."""
+        from proxy.disconnect_reaper import (
+            DisconnectReaperMiddleware,
+            reaper_registry,
+        )
+
+        reaper_registry.clear()
+        mock_request = MagicMock()
+        mock_request.url.path = "/admin/sessions"
+
+        async def call_next(req):
+            raise asyncio.CancelledError()
+
+        mw = DisconnectReaperMiddleware(app=None)
+        response = await mw.dispatch(mock_request, call_next)
+
+        assert response.status_code == 499
+        assert asyncio.current_task() not in reaper_registry
+        reaper_registry.clear()
+
+    @pytest.mark.asyncio
     async def test_reaper_registry_reaps_stale_requests(self):
         """The reaper cancels tasks whose client disconnected while running."""
         from proxy.disconnect_reaper import (

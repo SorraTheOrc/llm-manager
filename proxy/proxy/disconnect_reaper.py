@@ -26,6 +26,7 @@ import logging
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 logger = logging.getLogger("llama-proxy.disconnect_reaper")
 
@@ -55,6 +56,18 @@ class DisconnectReaperMiddleware(BaseHTTPMiddleware):
                 reaper_registry[current_task] = request
         try:
             return await call_next(request)
+        except asyncio.CancelledError:
+            # The DisconnectReaper background loop may have cancelled this
+            # task because the client disconnected. This is expected and
+            # benign — the response may already have been sent (200 OK)
+            # or the task genuinely was abandoned. Either way, suppress
+            # the CancelledError so it does not surface as an
+            # "ERROR: Exception in ASGI application" in the logs.
+            logger.debug(
+                "task cancelled (likely by DisconnectReaper); request=%s",
+                request.url.path,
+            )
+            return Response(status_code=499, content=b"")
         finally:
             if current_task is not None:
                 async with _REGISTRY_LOCK:
