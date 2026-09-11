@@ -2810,14 +2810,14 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
 # ---------------------------------------------------------------------------
 
 def _contention_queue_enabled(config: dict) -> bool:
-    """True when the contention queue should engage: queue policy AND cheap mode.
+    """True when the contention queue should engage: queue policy.
 
     The per-mode policy comes from the active mode config
-    (``contention_queue_policy``; config-cheap.yaml declares ``queue``,
-    config-fast.yaml declares ``fallback``). Belt-and-braces: the queue also
-    requires ``proxy.mode.read_mode() == "cheap"`` so an operator override of
-    LLAMA_PROXY_CONFIG cannot enable queueing in fast mode (LP-0MSORQVK50012Q4D
-    constraint 5). Fail-open: any error → queue disabled (today's behavior).
+    (``contention_queue_policy``; config-cheap.yaml declares ``queue`` with
+    depth 8 / wait 120s, config-fast.yaml declares ``queue`` with depth 3 /
+    wait 45s — LP-0MTQYIK4Z008XF2V). The active mode's config determines
+    the depth and wait caps; the policy gate ensures ``fallback`` config
+    files never engage the queue. Fail-open: any error → queue disabled.
     """
     try:
         from proxy.router import _get_contention_queue_config
@@ -2826,9 +2826,7 @@ def _contention_queue_enabled(config: dict) -> bool:
         cq = _get_contention_queue_config(server_cfg)
         if cq["policy"] != "queue":
             return False
-        from proxy.mode import read_mode
-
-        return read_mode() == "cheap"
+        return True
     except Exception:
         return False
 

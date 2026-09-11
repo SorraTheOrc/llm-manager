@@ -78,27 +78,17 @@ def metrics() -> dict:
 def status_fields(server_config: dict) -> dict:
     """Queue fields for the status_request log line.
 
-    Returns an empty dict when the per-mode policy is not ``queue`` OR the
-    proxy is not in cheap operating mode, so fast mode (fallback policy)
-    logs stay unchanged (F4 AC4). The mode gate mirrors
-    ``provider._contention_queue_enabled`` (which requires
-    ``proxy.mode.read_mode() == "cheap"``) so a config override pointing at
-    a queue-policy config while mode=fast never emits queue fields.
+    Returns an empty dict when the per-mode policy is not ``queue``.
     Otherwise exposes queue depth, queued count, queued duration, and
-    fallback-after-queue count (F4 AC1).
+    fallback-after-queue count (F4 AC1). The policy gate is the only
+    check — per-mode config (config-fast.yaml vs config-cheap.yaml)
+    determines the depth/wait caps, and both modes can declare ``queue``
+    (LP-0MTQYIK4Z008XF2V).
     """
     policy = str(
         (server_config or {}).get("contention_queue_policy", "fallback") or "fallback"
     ).strip().lower()
     if policy != "queue":
-        return {}
-    try:
-        from proxy.mode import read_mode
-
-        if read_mode() != "cheap":
-            return {}
-    except Exception:
-        # Mode unreadable — fail closed: do not emit queue fields.
         return {}
     m = metrics()
     return {

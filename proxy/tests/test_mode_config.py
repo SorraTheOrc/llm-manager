@@ -287,10 +287,13 @@ class TestCheapConfigProfile:
         cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
         # local_model_ctx_size now identical (262144) per LP-0MTO8SZ8K0080RHT.
         cheap_srv["local_model_ctx_size"] = fast_srv["local_model_ctx_size"]
-        # Cheap declares queue + caps; fast declares fallback (no caps).
+        # Cheap declares queue + larger caps; fast declares queue + smaller caps
+        # (LP-0MTQYIK4Z008XF2V: both modes queue, fast < cheap).
         cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
         cheap_srv.pop("contention_queue_max_wait_seconds", None)
         cheap_srv.pop("contention_queue_max_depth", None)
+        fast_srv.pop("contention_queue_max_wait_seconds", None)
+        fast_srv.pop("contention_queue_max_depth", None)
         # Cold-cache threshold (LP-0MSOMVOPH004ATAK; reverted per
         # LP-0MSRM54YO007YG0K AC7 then re-raised to 38000 per
         # LP-0MSY0V4ZO002ANPL, raised to 42000 for cheap only per
@@ -322,10 +325,16 @@ class TestCheapConfigProfile:
         assert cheap["server"]["contention_queue_policy"] == "queue"
         # Caps tuned per LP-0MTF6EVLW007PEHN (T4 recommendation,
         # LP-0MTED3OFP006I7NO): wait 60→120, depth 4→8 (projected +35
-        # dispatches/window, T3 a26bc66).  Fast mode keeps no-queue fallback.
+        # dispatches/window, T3 a26bc66).  Fast mode declares a smaller queue
+        # (LP-0MTQYIK4Z008XF2V: 3/45 vs cheap 8/120) so bursts spill to
+        # remotes sooner during peak hours.
         assert cheap["server"]["contention_queue_max_wait_seconds"] == 120
         assert cheap["server"]["contention_queue_max_depth"] == 8
-        assert fast["server"]["contention_queue_policy"] == "fallback"
+        assert fast["server"]["contention_queue_policy"] == "queue"
+        assert fast["server"]["contention_queue_max_wait_seconds"] == 45
+        assert fast["server"]["contention_queue_max_depth"] == 3
+        assert fast["server"]["contention_queue_max_depth"] < cheap["server"]["contention_queue_max_depth"]
+        assert fast["server"]["contention_queue_max_wait_seconds"] < cheap["server"]["contention_queue_max_wait_seconds"]
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
         # Per-mode persistence caps derive from each profile's hard-routing
         # cap when enabled (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4)

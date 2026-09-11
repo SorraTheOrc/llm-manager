@@ -723,10 +723,14 @@ def test_metrics_emitted_when_queue_policy():
     assert "contention_fallback_after_queue_count" in fields
 
 
-def test_metrics_suppressed_when_queue_policy_but_fast_mode():
-    """status_fields returns {} for queue-policy config while mode=fast (F4
-    AC4): a config override must never emit queue fields unless the proxy is
-    actually in cheap operating mode."""
+def test_metrics_emitted_when_queue_policy_in_fast_mode():
+    """status_fields emits queue metrics when policy is queue, regardless of
+    operating mode (LP-0MTQYIK4Z008XF2V): fast mode can also declare queue
+    with smaller caps.
+
+    Previously (pre-LP-0MTQYIK4Z008XF2V) the mode gate suppressed queue
+    fields in fast mode. Now both modes use the policy gate only.
+    """
     from proxy.contention_queue import status_fields
 
     with patch("proxy.mode.read_mode", return_value="fast"):
@@ -737,7 +741,8 @@ def test_metrics_suppressed_when_queue_policy_but_fast_mode():
                 "contention_queue_max_depth": 4,
             }
         )
-    assert fields == {}
+    assert fields.get("contention_queue_policy") == "queue"
+    assert "contention_queue_depth" in fields
 
 
 @pytest.mark.asyncio
@@ -908,11 +913,37 @@ def test_cheap_config_declares_queue_policy():
     assert server["contention_queue_max_depth"] == 8
 
 
-def test_fast_config_declares_fallback_policy():
-    """config-fast.yaml declares fallback policy (F2 AC2)."""
+def test_fast_config_declares_small_queue_policy():
+    """config-fast.yaml declares a small queue (depth 3, wait 45s) — LP-0MTQYIK4Z008XF2V.
+
+    Fast mode uses a smaller queue than cheap (depth 3 vs 8, wait 45s vs 120s)
+    so burst traffic spills to remotes sooner during peak hours.
+    """
     import yaml
     from proxy.mode import proxy_dir
 
     with open(proxy_dir() / "config-fast.yaml") as fh:
         server = yaml.safe_load(fh)["server"]
-    assert server["contention_queue_policy"] == "fallback"
+    assert server["contention_queue_policy"] == "queue"
+    assert server["contention_queue_max_wait_seconds"] == 45
+    assert server["contention_queue_max_depth"] == 3
+
+
+def test_fast_queue_caps_strictly_less_than_cheap():
+    """Fast mode queue caps are strictly less than cheap (LP-0MTQYIK4Z008XF2V AC1)."""
+    import yaml
+    from proxy.mode import proxy_dir
+
+    with open(proxy_dir() / "config-cheap.yaml") as fh:
+        cheap = yaml.safe_load(fh)["server"]
+    with open(proxy_dir() / "config-fast.yaml") as fh:
+        fast = yaml.safe_load(fh)["server"]
+
+    assert fast["contention_queue_max_depth"] < cheap["contention_queue_max_depth"], (
+        f"fast depth {fast['contention_queue_max_depth']} must be < cheap depth "
+        f"{cheap['contention_queue_max_depth']}"
+    )
+    assert fast["contention_queue_max_wait_seconds"] < cheap["contention_queue_max_wait_seconds"], (
+        f"fast wait {fast['contention_queue_max_wait_seconds']} must be < cheap wait "
+        f"{cheap['contention_queue_max_wait_seconds']}"
+    )

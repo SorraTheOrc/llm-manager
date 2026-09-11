@@ -654,11 +654,14 @@ server:
   # Option C (3 slots) restored per LP-0MSEGPO77005CYCQ F4.
   session_slot_pool_size: 3
 
-  # Per-mode contention policy (LP-0MSORQVK50012Q4D): fast mode keeps today's
-  # fallback behavior — slot contention falls back to the next remote
-  # provider immediately (no queueing). Cheap mode (config-cheap.yaml)
-  # declares ``queue`` with caps.
-  contention_queue_policy: fallback
+  # Per-mode contention policy (LP-0MSORQVK50012Q4D, LP-0MTQYIK4Z008XF2V):
+  # fast mode queues a small number of local items (depth ≤3, wait ≤45s)
+  # so burst requests get a short local wait before falling back to remotes
+  # — reducing tail latency while still utilising the local model. Cheap
+  # mode (config-cheap.yaml) declares ``queue`` with larger caps (8/120).
+  contention_queue_policy: queue
+  contention_queue_max_wait_seconds: 45
+  contention_queue_max_depth: 3
 
   # -----------------------------------------------------------------------
   # Slot schedule (LP-0MRXZU90M007WNWT)
