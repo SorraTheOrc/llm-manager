@@ -119,8 +119,12 @@ active mode config:
 
 | Mode (config file) | `contention_queue_policy` | Slot-contention behavior |
 |--------------------|---------------------------|--------------------------|
-| cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (60) and `contention_queue_max_depth` (4); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
-| fast (config-fast.yaml) | `fallback` | Today's behavior — skip to the next remote provider immediately |
+| cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (120) and `contention_queue_max_depth` (8); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
+| fast (config-fast.yaml) | `queue` | Short-queue: bounded by `contention_queue_max_wait_seconds` (45) and `contention_queue_max_depth` (3); falls back to remotes sooner than cheap to minimise latency |
+
+Fast mode defaults (depth 3 / wait 45s) are deliberately smaller than cheap
+(depth 8 / wait 120s) so burst traffic during peak hours spills to remotes
+more quickly — see LP-0MTQYIK4Z008XF2V for the tuning rationale.
 
 Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
 `proxy/proxy/contention_queue.py`):
@@ -158,14 +162,20 @@ Config reference:
 
 ```yaml
 server:
-  # cheap profile
-  contention_queue_policy: queue              # or "fallback" (fast)
-  contention_queue_max_wait_seconds: 60      # clamped to [1, max_runtime_seconds]
-  contention_queue_max_depth: 4              # clamped to [1, 16]
+  # cheap profile (config-cheap.yaml)
+  contention_queue_policy: queue
+  contention_queue_max_wait_seconds: 120    # clamped to [1, max_runtime_seconds]
+  contention_queue_max_depth: 8             # clamped to [1, 16]
+
+  # fast profile (config-fast.yaml)
+  contention_queue_policy: queue
+  contention_queue_max_wait_seconds: 45     # clamped to [1, max_runtime_seconds]
+  contention_queue_max_depth: 3             # clamped to [1, 16]
 ```
 
-The queue engages only in cheap operating mode (`proxy.mode.read_mode() ==
-"cheap"`); absent keys default to fallback for backward compatibility.
+The queue engages only when ``contention_queue_policy`` is ``queue`` AND the
+proxy is in the corresponding operating mode. Absent keys default to
+``fallback`` for backward compatibility.
 
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
