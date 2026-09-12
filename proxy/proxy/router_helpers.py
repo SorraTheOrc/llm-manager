@@ -2173,6 +2173,16 @@ async def _handle_session(
                         _compaction.get("estimated_before", 0),
                         _compaction.get("estimated_after", 0),
                     )
+                    # After compaction, update the session's message history so
+                    # downstream token estimates (e.g. routing_estimate_session)
+                    # reflect the compacted count, not the pre-compaction value.
+                    try:
+                        await srv.session_manager.update_messages(
+                            result["session_id"],
+                            list(_compaction["messages"]),
+                        )
+                    except Exception:
+                        pass  # non-fatal: routing estimate still uses body messages
                 elif (
                     _compaction.get("action") == "remote_with_guidance"
                     and not _compaction.get("dry_run")

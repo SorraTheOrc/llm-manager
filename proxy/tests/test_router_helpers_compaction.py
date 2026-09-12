@@ -32,6 +32,10 @@ def _make_server(**overrides):
     srv.session_manager.get_or_create = AsyncMock(
         return_value=(MagicMock(session_id="sess-wire", message_count=0), True)
     )
+    # Return empty delta, history matches (default behavior)
+    srv.session_manager.compute_delta = MagicMock(
+        return_value=([], True)
+    )
     return srv
 
 
@@ -197,3 +201,136 @@ class TestHandleSessionCompactionWiring:
             estimate_tokens=_counting_estimator,
         )
         assert decision["action"] == "compact"
+
+    @pytest.mark.asyncio
+    async def test_compaction_updates_session_messages(self):
+        """AC1 — after live compaction, session.messages reflect the compacted count.
+
+        Verifies that _handle_session calls session_manager.update_messages()
+        with the compacted message list when compaction is applied, so that
+        downstream routing_estimate_session reads the post-compaction token
+        count instead of the stale pre-compaction value.
+        """
+        from proxy.router_helpers import _handle_session
+
+        pre_compact_messages = _make_session_messages(60)  # ~122 messages
+
+        # Create a compacted message list (fewer messages)
+        post_compact_messages = _make_session_messages(20)  # ~42 messages
+
+        srv = _make_server()
+        # Pre-populate the session with the original (pre-compaction) messages
+        mock_session = MagicMock(session_id="sess-update", message_count=len(pre_compact_messages))
+        mock_session.messages = list(pre_compact_messages)
+        srv.session_manager.get_or_create = AsyncMock(
+            return_value=(mock_session, False)
+        )
+        srv.session_manager.update_messages = AsyncMock(return_value=True)
+
+        body_json = {"model": "Qwen3", "messages": pre_compact_messages}
+        server_config = srv.config["server"]
+        headers = {"x-session-id": "sess-update"}
+
+        def fake_compaction(*a, **kw):
+            return {
+                "action": "compact",
+                "applied": True,
+                "dry_run": False,
+                "messages": post_compact_messages,
+                "estimated_before": 122000,
+                "estimated_after": 42000,
+            }
+
+        with patch("proxy.router_helpers._evaluate_session_compaction", side_effect=fake_compaction):
+            with patch("proxy.compaction_summarizer.build_local_summarizer") as mock_build:
+                mock_build.return_value = MagicMock(return_value="fake_summary")
+                result = await _handle_session(srv, body_json, server_config, headers)
+
+        # Compaction should be applied
+        assert result["compaction_applied"] is True
+
+        # Session manager update_messages should be called with compacted messages
+        assert srv.session_manager.update_messages.called
+        call_args = srv.session_manager.update_messages.call_args
+        assert call_args[0][0] == "sess-update"  # session_id
+        assert len(call_args[0][1]) == len(post_compact_messages)  # compacted message count
+
+    @pytest.mark.asyncio
+    async def test_compaction_dry_run_does_not_update_session_messages(self):
+        """AC3 — dry-run mode does not update session messages.
+
+        When compaction is in dry-run (advisory) mode, the session's message
+        history must remain untouched.
+        """
+        from proxy.router_helpers import _handle_session
+
+        messages = _make_session_messages(60)
+
+        srv = _make_server()
+        mock_session = MagicMock(session_id="sess-dry", message_count=len(messages))
+        mock_session.messages = list(messages)
+        srv.session_manager.get_or_create = AsyncMock(
+            return_value=(mock_session, False)
+        )
+        srv.session_manager.update_messages = AsyncMock(return_value=True)
+
+        body_json = {"model": "Qwen3", "messages": messages}
+        server_config = srv.config["server"]
+        headers = {"x-session-id": "sess-dry"}
+
+        def fake_dry_run(*a, **kw):
+            return {
+                "action": "compact",
+                "applied": False,
+                "dry_run": True,
+                "messages": messages,
+                "estimated_before": 122000,
+                "estimated_after": 42000,
+            }
+
+        with patch("proxy.router_helpers._evaluate_session_compaction", side_effect=fake_dry_run):
+            await _handle_session(srv, body_json, server_config, headers)
+
+        # update_messages should NOT be called in dry-run
+        assert not srv.session_manager.update_messages.called
+
+    @pytest.mark.asyncio
+    async def test_compaction_update_messages_failure_is_non_fatal(self):
+        """AC1 — if session_manager.update_messages fails, compaction still proceeds.
+
+        The update is best-effort; a failure should not break dispatch.
+        """
+        from proxy.router_helpers import _handle_session
+
+        pre_compact_messages = _make_session_messages(60)
+        post_compact_messages = _make_session_messages(20)
+
+        srv = _make_server()
+        mock_session = MagicMock(session_id="sess-nonfatal", message_count=len(pre_compact_messages))
+        mock_session.messages = list(pre_compact_messages)
+        srv.session_manager.get_or_create = AsyncMock(
+            return_value=(mock_session, False)
+        )
+        srv.session_manager.update_messages = AsyncMock(side_effect=RuntimeError("db error"))
+
+        body_json = {"model": "Qwen3", "messages": pre_compact_messages}
+        server_config = srv.config["server"]
+        headers = {"x-session-id": "sess-nonfatal"}
+
+        def fake_compaction(*a, **kw):
+            return {
+                "action": "compact",
+                "applied": True,
+                "dry_run": False,
+                "messages": post_compact_messages,
+                "estimated_before": 122000,
+                "estimated_after": 42000,
+            }
+
+        with patch("proxy.router_helpers._evaluate_session_compaction", side_effect=fake_compaction):
+            with patch("proxy.compaction_summarizer.build_local_summarizer") as mock_build:
+                mock_build.return_value = MagicMock(return_value="fake_summary")
+                result = await _handle_session(srv, body_json, server_config, headers)
+
+        # Compaction still applied despite update failure
+        assert result["compaction_applied"] is True
