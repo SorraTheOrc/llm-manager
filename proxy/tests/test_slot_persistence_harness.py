@@ -439,8 +439,12 @@ class TestIncidentReproduction:
         without /var/log/llama-proxy does not break the suite. The ratios are
         only reproducible from that exact snapshot (same guard as
         ``test_incident_day_file_counts``).
+
+        ``LLAMA_PROXY_LOG_DIR`` overrides the default log directory, so a
+        preserved incident-day snapshot (e.g. ``/tmp/log-snapshot``) can be
+        used to verify the ratios after the live file has rotated out.
         """
-        log_dir = Path("/var/log/llama-proxy")
+        log_dir = Path(os.environ.get("LLAMA_PROXY_LOG_DIR", "/var/log/llama-proxy"))
         incident_llama = log_dir / "llama-server.log-2026-08-27.gz"
         if not log_dir.exists() or not incident_llama.exists():
             pytest.skip("incident-day llama log snapshot not available")
