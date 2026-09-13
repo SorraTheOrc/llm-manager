@@ -252,8 +252,9 @@ class TestRealConfigRatioResolution:
     def test_fast_yaml_ratio_and_resolution(self, provider_mod, real_config):
         fast = real_config["fast"]
         server = fast.get("server", fast)
-        # Hard-routing cap DISABLED (LP-0MTLB1LK80098R43): 0 = per-slot clamp.
-        assert server.get("local_hard_routing_cap_ratio_fast") == 0
+        # Hard-routing cap knob RETIRED (LP-0MTVXP7DG00613ZB AC3): absent =
+        # disabled, so the per-slot clamp governs (no second detection knob).
+        assert "local_hard_routing_cap_ratio_fast" not in server
         assert server.get("session_slot_max_prompt_tokens") == 0
         cap = provider_mod.compute_hard_routing_cap("fast", server)
         assert cap == 0
@@ -261,7 +262,7 @@ class TestRealConfigRatioResolution:
     def test_cheap_yaml_ratio_and_resolution(self, provider_mod, real_config):
         cheap = real_config["cheap"]
         server = cheap.get("server", cheap)
-        assert server.get("local_hard_routing_cap_ratio_cheap") == 0
+        assert "local_hard_routing_cap_ratio_cheap" not in server
         assert server.get("session_slot_max_prompt_tokens") == 0
         # Live cheap schedule pairs: 2 × 262144 — but cap disabled so 0.
         cap = provider_mod.compute_hard_routing_cap("cheap", server)
@@ -270,8 +271,8 @@ class TestRealConfigRatioResolution:
     def test_base_yaml_uses_fast_ratio(self, provider_mod, real_config):
         base = real_config["base"]
         server = base.get("server", base)
-        assert server.get("local_hard_routing_cap_ratio_fast") == 0
-        assert server.get("local_hard_routing_cap_ratio_cheap") in (None, 0)
+        assert "local_hard_routing_cap_ratio_fast" not in server
+        assert "local_hard_routing_cap_ratio_cheap" not in server
         cap = provider_mod.compute_hard_routing_cap("fast", server)
         assert cap == 0
 

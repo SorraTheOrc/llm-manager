@@ -604,6 +604,129 @@ async def _cleanup_after_request(
 # Core proxy routing: Local llama-server dispatch
 # ===================================================================
 
+
+def _compaction_guidance_value(server_config: dict, estimated_tokens: int) -> str:
+    """Build the client-facing ``context_pressure`` guidance signal.
+
+    Non-compactable oversized sessions are routed remote with this signal
+    attached to the response (LP-0MTVXP7DG00613ZB AC1). It is informational —
+    no protocol change and no client cooperation is required; clients that
+    understand it can compact proactively.
+    """
+    try:
+        from proxy.provider import (
+            _get_active_local_ctx_size,
+            _get_active_local_slots,
+            effective_per_slot_threshold,
+        )
+
+        ctx_size = _get_active_local_ctx_size(server_config)
+        slots = _get_active_local_slots(server_config)
+        per_slot = effective_per_slot_threshold(ctx_size, slots)
+    except Exception:
+        per_slot = 0
+    ratio = (estimated_tokens / per_slot) if per_slot > 0 else 0.0
+    return (
+        "context_pressure;"
+        f"estimated_tokens={int(estimated_tokens)};"
+        f"per_slot_ctx={int(per_slot)};"
+        f"ratio={ratio:.2f};"
+        "action=compact_session_history"
+    )
+
+
+async def _route_remote_with_compaction_guidance(
+    srv,
+    request: Request,
+    path: str,
+    model_name: str | None,
+    session_id: str | None,
+    session_result: dict,
+) -> Response:
+    """Route a non-compactable oversized session remote with guidance (AC1).
+
+    The session exceeded the compaction trigger but could not be compacted
+    (summarizer unavailable / failed), so dispatching local would run a
+    near-full-slot request — the slow path this work item removes. Remote
+    providers do not consume local KV slots, so the request escalates there
+    with the ``context_pressure`` guidance attached to the response.
+
+    When the model has no remote provider, the explicit compaction gate is
+    returned instead (the client must compact before retrying) — local
+    dispatch is never attempted in either case.
+    """
+    server_config = (
+        srv.config.get("server", {}) if isinstance(getattr(srv, "config", None), dict) else {}
+    )
+    estimated = int(session_result.get("compaction_estimated_before", 0) or 0)
+    reason = session_result.get("compaction_reason") or "remote_with_guidance"
+    guidance = _compaction_guidance_value(server_config, estimated)
+    try:
+        from proxy.mode import read_mode as _read_mode
+
+        mode = _read_mode()
+    except Exception:
+        mode = "fast"
+
+    model_cfg = None
+    if model_name:
+        try:
+            model_cfg = srv.get_model_config(model_name)
+        except Exception:
+            model_cfg = None
+    remote_providers = [
+        p
+        for p in ((model_cfg or {}).get("providers") or [])
+        if isinstance(p, dict) and p.get("type") == "remote"
+    ]
+
+    srv.logger.warning(
+        "compaction_remote_with_guidance session=%s model=%s mode=%s "
+        "estimated_tokens=%d reason=%s remote_providers=%d; refusing local "
+        "near-full-slot dispatch",
+        session_id or "unknown",
+        model_name or "unknown",
+        mode,
+        estimated,
+        reason,
+        len(remote_providers),
+    )
+
+    if not remote_providers:
+        # No remote provider to escalate to: surface the explicit gate so the
+        # client compacts, rather than dispatching local near-full-slot.
+        from proxy.provider import (
+            _build_compaction_gate_response,
+            compute_hard_routing_cap,
+        )
+
+        try:
+            cap = compute_hard_routing_cap(mode, server_config)
+        except Exception:
+            cap = 0
+        if cap <= 0:
+            cap = estimated
+        gate = _build_compaction_gate_response(
+            estimated, cap, mode, session_id, model_name,
+        )
+        try:
+            gate.headers["X-Session-Compaction-Guidance"] = guidance
+        except Exception:
+            pass
+        return gate
+
+    from proxy.provider import proxy_with_remote_fallback
+
+    resp = await proxy_with_remote_fallback(
+        request, path, {"providers": remote_providers}, srv.config,
+    )
+    try:
+        resp.headers["X-Session-Compaction-Guidance"] = guidance
+    except Exception:
+        pass
+    return resp
+
+
 async def proxy_to_local(request: Request, path: str, endpoint: str | None = None) -> Response:
     """Proxy request to local llama-server with session-based incremental ingestion.
 
@@ -678,6 +801,22 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             session_id=session_id,
             client_payload=_client_request_payload,
             model=_recording_model,
+        )
+
+    # ── Compaction guidance enforcement (LP-0MTVXP7DG00613ZB AC1) ──
+    # When prompt-assembly compaction resolves to ``remote_with_guidance``
+    # (summarizer unavailable / failed), the session cannot be compacted and
+    # MUST NOT be dispatched local near-full-slot. Route to the model's
+    # remote providers instead, carrying the context_pressure guidance.
+    # Checked before any slot context / lease / cap resource is acquired.
+    if session_result.get("compaction_remote_with_guidance"):
+        return await _route_remote_with_compaction_guidance(
+            srv,
+            request,
+            path,
+            _recording_model or srv.current_model,
+            session_id,
+            session_result,
         )
 
     slot_id = None

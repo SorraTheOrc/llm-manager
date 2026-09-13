@@ -552,13 +552,6 @@ def _get_active_local_slots(config: dict) -> int:
     return 1
 
 
-# Default fraction of the effective per-slot context at which the proxy
-# emits a session-context-pressure warning suggesting compaction
-# (LP-0MSDCLQ2W001LGWC). Configurable via ``context_pressure_warn_ratio``
-# on the server config; 0 disables the warning.
-_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
-
-
 def _get_active_local_ctx_size(config: dict) -> int:
     """Return the currently active local context size.
 
@@ -570,20 +563,18 @@ def _get_active_local_ctx_size(config: dict) -> int:
 
 
 def _get_context_pressure_warn_ratio(config: dict) -> float:
-    """Read the context-pressure warning ratio from config.
+    """Return the unified session-detection ratio.
 
-    Supports both nested (server.*) and flat keys. 0 disables the warning.
-    Defaults to ``_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO`` (0.8).
+    LP-0MTVXP7DG00613ZB AC3: ``context_pressure_warn_ratio`` is no longer a
+    separate operator knob — the advisory warning fires at the single
+    ``compaction_trigger_ratio`` detection threshold. The legacy key is
+    ignored; this function remains the single read point for the routing-time
+    advisory log.
     """
-    val = config.get("context_pressure_warn_ratio")
-    if val is None:
-        val = config.get("server", {}).get(
-            "context_pressure_warn_ratio", _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
-        )
     try:
-        ratio = float(val or 0)
-    except (ValueError, TypeError):
-        return _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
+        ratio = float(compaction_config(config)["trigger_ratio"])
+    except Exception:
+        ratio = _DEFAULT_COMPACTION_TRIGGER_RATIO
     return max(0.0, ratio)
 
 
@@ -612,12 +603,13 @@ def context_pressure_ratio(estimated_tokens: int, ctx_size: int, slots: int) -> 
 
 def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
     """Whether a session at ``estimated_tokens`` should trigger the
-    context-pressure compaction warning.
+    context-pressure compaction advisory.
 
-    Uses the effective per-slot context (clamped with output headroom) and
-    the configured ``context_pressure_warn_ratio`` (default 0.8). Returns
-    False when the clamp is disabled (ctx_size 0), the ratio is 0, or the
-    session is below the ratio.
+    LP-0MTVXP7DG00613ZB AC3: the advisory fires at the SAME threshold as
+    prompt-assembly compaction (``compaction_trigger_ratio`` × effective
+    per-slot clamp, strict ``>``) — one detection knob drives both the
+    advisory log and the live compaction path. Returns False when compaction
+    is disabled (trigger 0) or the session is at/below the trigger.
 
     Args:
         estimated_tokens: Session estimated prompt/context tokens.
@@ -626,14 +618,17 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
     Returns:
         True when the session should be flagged for compaction.
     """
-    ctx_size = _get_local_model_ctx_size(config)
-    if ctx_size <= 0 or estimated_tokens <= 0:
+    if estimated_tokens <= 0:
         return False
-    slots = _get_active_local_slots(config)
-    ratio = _get_context_pressure_warn_ratio(config)
-    if ratio <= 0:
+    try:
+        from proxy.compaction import compaction_trigger_tokens
+
+        trigger = compaction_trigger_tokens("fast", config)
+    except Exception:
         return False
-    return context_pressure_ratio(estimated_tokens, ctx_size, slots) >= ratio
+    if trigger <= 0:
+        return False
+    return int(estimated_tokens) > trigger
 
 
 # ===================================================================
@@ -641,8 +636,9 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
 # ===================================================================
 
 # Default compaction trigger ratio (0.70 × effective per-slot context).
-# Fires before the 0.8 context_pressure warn ratio, giving proactive
-# compaction rather than reactive warning.
+# LP-0MTVXP7DG00613ZB AC3: this is the SINGLE detection knob — the
+# context_pressure advisory, the live compaction path and the 429 gate all
+# fire from it (the legacy 0.8 context_pressure_warn_ratio is retired).
 _DEFAULT_COMPACTION_TRIGGER_RATIO = 0.70
 
 # Default summarizer context size (tokens). 8192 is enough for a short

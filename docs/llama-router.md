@@ -90,16 +90,40 @@ llama-server (defaulting to f16 when unset).
 Sessions with contexts near the per-slot limit decode far slower (KV reads scale
 with context), and compaction is performed by the agents, not the proxy. The proxy
 emits a `context_pressure` WARNING at routing time when a session's estimated
-context reaches the configured fraction of the effective per-slot context
-(`ctx_size / slots - 4096` output headroom).
+context exceeds the compaction trigger (strictly greater than
+`compaction_trigger_ratio × effective per-slot context`, i.e. `ctx_size / slots -
+4096` output headroom).
+
+LP-0MTVXP7DG00613ZB AC3 unified session detection onto the single
+`compaction_trigger_ratio` knob: the legacy `context_pressure_warn_ratio` and
+`local_hard_routing_cap_ratio_*` keys are retired (ignored if present). The
+advisory, the prompt-assembly compaction path, and the compaction gate all fire
+from the same trigger, so what the log warns about is what the proxy acts on.
 
 ```yaml
 server:
-  context_pressure_warn_ratio: 0.8  # 0 disables; default 0.8
+  compaction_trigger_ratio: 0.70   # single detection knob; 0 disables
 ```
 
 The warning names the session and the ratio so operators/agents can compact before
 decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
+
+### Oversized-session enforcement (LP-0MTVXP7DG00613ZB)
+
+When a session exceeds the trigger but cannot be compacted (the summarizer is
+unavailable or failed), the proxy refuses local near-full-slot dispatch and routes
+the request to the model's remote providers instead, attaching an informational
+`X-Session-Compaction-Guidance` response header (e.g.
+`context_pressure;estimated_tokens=90000;per_slot_ctx=83285;ratio=1.08;action=compact_session_history`).
+When the model has no remote provider, the explicit 429 compaction gate is
+returned. No client cooperation is required.
+
+After a live compaction the client still holds its pre-compaction history. The
+proxy records the client/base anchors at compaction time and, on the next request,
+recognises the still-stale history and accepts the genuinely new tail as a delta
+against the compacted base instead of invalidating the session — the compacted
+history (and its KV cache) survives across turns. See
+`proxy/tests/test_oversized_session_enforcement.py`.
 
 ## Session compaction config (LP-0MTG6RW3L003X122)
 

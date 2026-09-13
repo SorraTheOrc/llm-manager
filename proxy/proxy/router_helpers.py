@@ -2000,6 +2000,29 @@ def _evaluate_session_compaction(
         }
 
 
+def _apply_post_compaction_heal(
+    srv,
+    session,
+    body_json: dict,
+) -> list | None:
+    """Heal a post-compaction client/session sync break (AC2).
+
+    Thin, fail-open wrapper around
+    :func:`proxy.session_manager.compute_post_compaction_delta`: returns the
+    healed delta when the incoming history still aligns with the stored
+    compacted base, otherwise ``None`` so the caller keeps the existing
+    ``history_mismatch`` invalidation behavior.
+    """
+    try:
+        from proxy.session_manager import compute_post_compaction_delta
+
+        incoming = body_json.get("messages", []) if isinstance(body_json, dict) else []
+        return compute_post_compaction_delta(session, incoming)
+    except Exception:
+        srv.logger.debug("Post-compaction heal evaluation failed", exc_info=True)
+        return None
+
+
 async def _handle_session(
     srv,
     body_json: dict,
@@ -2090,6 +2113,42 @@ async def _handle_session(
                     )
                 else:
                     if session_fallback_reason == "history_mismatch":
+                        # Post-compaction resync (LP-0MTVXP7DG00613ZB AC2):
+                        # a live compaction leaves the client holding its
+                        # pre-compaction history. When the stored compacted
+                        # recent turns + appended messages still align with
+                        # the incoming history, accept the new tail as a
+                        # delta against the compacted base instead of
+                        # invalidating the session (which would undo the
+                        # compaction and drop the KV cache).
+                        _healed = _apply_post_compaction_heal(
+                            srv, session, body_json
+                        )
+                        if _healed is not None:
+                            delta_messages = _healed
+                            result["delta_messages"] = _healed
+                            result["is_delta_request"] = True
+                            result["session_fallback_reason"] = None
+                            session_fallback_reason = None
+                            body_json["messages"] = list(_healed)
+                            try:
+                                _record_delta_payload_bytes(
+                                    len(
+                                        json.dumps(
+                                            _healed,
+                                            separators=(",", ":"),
+                                            ensure_ascii=False,
+                                        ).encode("utf-8")
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            srv.logger.info(
+                                "post_compaction_resync session=%s delta_messages=%d",
+                                result["session_id"][:8],
+                                len(_healed),
+                            )
+                    if session_fallback_reason == "history_mismatch":
                         from proxy.session import _build_slot_context, _invalidate_session_and_slot
                         _, slot_filename, _ = _build_slot_context(
                             server_config, result["session_id"]
@@ -2143,10 +2202,27 @@ async def _handle_session(
                 def _estimate_fn(msgs):
                     return _estimate_prompt_tokens_for_routing({"messages": msgs})
 
+                # The full history this request produces: the persistent
+                # session history PLUS this request's new turn(s). Compaction
+                # must operate on this produced history — evaluating only the
+                # stored history would drop the current turn from the
+                # compacted dispatch body (LP-0MTVXP7DG00613ZB AC2).
+                _delta_for_compaction = result.get("delta_messages")
+                if result.get("is_delta_request") and _delta_for_compaction:
+                    _pre_compaction_messages = list(
+                        getattr(session, "messages", None) or []
+                    ) + list(_delta_for_compaction)
+                else:
+                    _pre_compaction_messages = list(
+                        body_json.get("messages", [])
+                        or getattr(session, "messages", None)
+                        or []
+                    )
+
                 _compaction = _evaluate_session_compaction(
                     srv,
                     result["session_id"],
-                    list(getattr(session, "messages", None) or body_json.get("messages", [])),
+                    _pre_compaction_messages,
                     _read_mode(),
                     summarizer=_summarizer,
                     estimate_tokens=_estimate_fn,
@@ -2165,6 +2241,10 @@ async def _handle_session(
                     result["is_delta_request"] = False
                     result["delta_messages"] = None
                     result["compaction_applied"] = True
+                    result["compaction_estimated_before"] = int(
+                        _compaction.get("estimated_before", 0) or 0
+                    )
+                    result["compaction_reason"] = _compaction.get("reason")
                     srv.logger.info(
                         "session_compaction applied session=%s mode=%s "
                         "est_before=%d est_after=%d",
@@ -2175,11 +2255,18 @@ async def _handle_session(
                     )
                     # After compaction, update the session's message history so
                     # downstream token estimates (e.g. routing_estimate_session)
-                    # reflect the compacted count, not the pre-compaction value.
+                    # reflect the compacted count, not the pre-compaction value,
+                    # and record the client/base anchors the next request needs
+                    # to heal the sync break (AC2).
                     try:
                         await srv.session_manager.update_messages(
                             result["session_id"],
                             list(_compaction["messages"]),
+                        )
+                        await srv.session_manager.mark_compacted(
+                            result["session_id"],
+                            len(_pre_compaction_messages),
+                            len(_compaction["messages"]),
                         )
                     except Exception:
                         pass  # non-fatal: routing estimate still uses body messages
@@ -2191,6 +2278,10 @@ async def _handle_session(
                     # cannot be compacted; the dispatcher must escalate
                     # remote WITH guidance.
                     result["compaction_remote_with_guidance"] = True
+                    result["compaction_estimated_before"] = int(
+                        _compaction.get("estimated_before", 0) or 0
+                    )
+                    result["compaction_reason"] = _compaction.get("reason")
             except Exception:
                 srv.logger.warning(
                     "Compaction evaluation failed; continuing unchanged "

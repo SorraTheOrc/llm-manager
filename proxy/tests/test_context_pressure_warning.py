@@ -43,52 +43,71 @@ class TestContextPressureRatio:
 
 
 class TestShouldWarnContextPressure:
-    """Threshold logic for the compaction warning."""
+    """Threshold logic for the compaction advisory.
 
-    def test_below_warn_ratio_no_warning(self):
+    LP-0MTVXP7DG00613ZB AC3: the advisory is unified with the single
+    ``compaction_trigger_ratio`` detection knob (default 0.70); the legacy
+    ``context_pressure_warn_ratio`` key is ignored.
+    """
+
+    def test_below_trigger_no_warning(self):
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,
         }}
         assert should_warn_context_pressure(30000, config) is False
 
-    def test_at_warn_ratio_warns(self):
-        """Effective per-slot = 61440; 0.8 * 61440 = 49152."""
+    def test_at_trigger_warns(self):
+        """Effective per-slot = 61440; trigger 0.70 * 61440 = 43008."""
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,
         }}
-        assert should_warn_context_pressure(49152, config) is True
+        # Strictly above the trigger, matching ``should_compact_session``.
+        assert should_warn_context_pressure(43008, config) is False
+        assert should_warn_context_pressure(43009, config) is True
         assert should_warn_context_pressure(50000, config) is True
 
-    def test_configured_warn_ratio_lowered(self):
-        """Operator can lower the warn ratio (e.g. 0.6) for earlier signal."""
+    def test_configured_trigger_lowers_threshold(self):
+        """Operator can lower ``compaction_trigger_ratio`` for earlier signal."""
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,
-            "context_pressure_warn_ratio": 0.6,
+            "compaction_trigger_ratio": 0.6,
         }}
         # 0.6 * 61440 = 36864
-        assert should_warn_context_pressure(36864, config) is True
+        assert should_warn_context_pressure(36864, config) is False
+        assert should_warn_context_pressure(36865, config) is True
         assert should_warn_context_pressure(30000, config) is False
 
-    def test_ratio_zero_disables_warning(self):
+    def test_legacy_warn_ratio_key_is_ignored(self):
+        """The retired ``context_pressure_warn_ratio`` key no longer lowers it."""
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,
-            "context_pressure_warn_ratio": 0,
+            "context_pressure_warn_ratio": 0.1,
+        }}
+        # 0.1 * 61440 = 6144 would warn, but the trigger (43008) governs.
+        assert should_warn_context_pressure(10000, config) is False
+        assert should_warn_context_pressure(43009, config) is True
+
+    def test_compaction_disabled_disables_warning(self):
+        config = {"server": {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 4,
+            "compaction_trigger_ratio": 0,
         }}
         assert should_warn_context_pressure(100000, config) is False
 
     def test_no_ctx_size_disables_warning(self):
         assert should_warn_context_pressure(50000, {"server": {}}) is False
 
-    def test_default_ratio_is_08(self):
-        """Default warn ratio 0.8 -> session at 80% of per-slot warns."""
+    def test_default_trigger_is_070(self):
+        """Default compaction trigger 0.70 -> session above 70% of per-slot warns."""
         config = {"server": {
             "local_model_ctx_size": 131072,
             "session_slot_pool_size": 2,
         }}
-        # per-slot 65536 - 4096 headroom = 61440; 0.8 * 61440 = 49152
-        assert should_warn_context_pressure(49152, config) is True
-        assert should_warn_context_pressure(49151, config) is False
+        # per-slot 65536 - 4096 headroom = 61440; 0.70 * 61440 = 43008
+        assert should_warn_context_pressure(43009, config) is True
+        assert should_warn_context_pressure(43008, config) is False

@@ -335,10 +335,11 @@ class TestCheapConfigProfile:
         # LP-0MTBTCK2I005MOTE NOT EFFECTIVE verdict): static 0 and hard cap 0.
         assert cheap["server"]["session_slot_max_prompt_tokens"] == 0
         assert fast["server"]["session_slot_max_prompt_tokens"] == 0
-        # Per-mode hard-routing-cap ratios DISABLED (LP-0MTLB1LK80098R43
-        # revert of LP-0MTBOX45O005LD1S): 0 = dynamic per-slot clamp.
-        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0
-        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0
+        # Per-mode hard-routing-cap ratios RETIRED (LP-0MTVXP7DG00613ZB AC3):
+        # ``compaction_trigger_ratio`` is the single detection knob; the
+        # legacy per-mode cap keys are removed from the live config surface.
+        assert "local_hard_routing_cap_ratio_cheap" not in cheap["server"]
+        assert "local_hard_routing_cap_ratio_fast" not in fast["server"]
         assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
