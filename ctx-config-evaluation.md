@@ -5,6 +5,12 @@
 **Data window:** 2026-08-24 → 2026-08-26 (proxy-usage-reports) + live system state  
 **Previous eval:** LP-0MSAOQTJS000FFVM (benchmark F2/F3, 2026-08-03/04)
 
+> **NOTE (2026-09-13):** this is a dated evaluation. The slot configuration
+> later changed: `slot_schedule` was removed (LP-0MTZRM5HV0007S0V) and the
+> per-mode counts are now default/fast **1 slot**, cheap **3 slots**
+> (LP-0MU03AL730000B5W). The `slot_schedule`/3-slot/2-slot references below
+> reflect the 2026-08-27 configuration at analysis time.
+
 ---
 
 ## 1. Remote-Tier Status Report

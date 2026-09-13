@@ -4,20 +4,21 @@
 # Selected automatically when the persisted operating mode is "cheap"
 # (proxy/.mode); see proxy/proxy/mode.py and POST /admin/set-mode.
 #
-# Cheap mode is 2-SLOT with the SAME models/provider chains as fast mode
-# (LP-0MSMIPPJI007GU9N, amended LP-0MSMZOAJW002UR2A):
-#   - session_slot_pool_size: 2 (two GPU slots, the single slot-count
+# Cheap mode is 3-SLOT with the SAME models/provider chains as fast mode
+# (LP-0MSMIPPJI007GU9N, amended LP-0MSMZOAJW002UR2A; slot count changed to 3
+# per operator direction LP-0MU03AL730000B5W):
+#   - session_slot_pool_size: 3 (three GPU slots, the single slot-count
 #     definition for this mode; local_model_ctx_size 262144 below gives
-#     2x262144)
+#     3x262144)
 #   - Remote/cloud providers (opencode/deepseek/github tiers) are ENABLED,
 #     so remote calls (including paid tiers) may occur when local slots are
 #     exhausted. Keep this file's models section in sync with
 #     config-fast.yaml (test_cheap_config_matches_fast_models guards it).
 #
 # CTX NOTE (LP-0MSMZOAJW002UR2A + LP-0MSY0SDAS0031Y7F + LP-0MTO8SZ8K0080RHT):
-# local_model_ctx_size below runs 262144, so cheap boots 2x262144 natively
-# (no catch-up needed), giving a per-slot clamp of 126976 (262144//2 - 4096).
-# Warm threshold: min(100000, 126976) = 100000; trigger: 0.70 * 126976 ≈ 88883.
+# local_model_ctx_size below runs 262144, so cheap boots 3x262144 natively
+# (no catch-up needed), giving a per-slot clamp of 83285 (262144//3 - 4096).
+# Warm threshold: min(100000, 83285) = 83285; trigger: 0.70 * 83285 ≈ 58300.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -689,10 +690,9 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # 2 slots with per-period ctx_size 262144 (full model 256K) per
-  # LP-0MSMZOAJW002UR2A (previously 1 slot). Fast mode keeps 3 slots
-  # (Option C, LP-0MSEGPO77005CYCQ F4).
-  session_slot_pool_size: 2
+  # Operator-directed 2026-09-13 (LP-0MU03AL730000B5W): cheap runs 3 slots
+  # with local_model_ctx_size 262144 (full model 256K); default/fast run 1.
+  session_slot_pool_size: 3
 
   # Per-mode contention policy (LP-0MSORQVK50012Q4D): when all local slots
   # are busy, QUEUE the request (bounded, cross-session) instead of

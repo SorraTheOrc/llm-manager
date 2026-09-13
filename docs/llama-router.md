@@ -110,8 +110,8 @@ summariser and a configurable compaction trigger ratio. Both are read from the
 ```yaml
 server:
   # Fires when est_tokens > ratio × effective per-slot threshold
-  # (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K;
-  #  cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K).
+  # (fast: 0.70 × 258,048 = 180,634 → target ≤ 117K;
+  #  cheap: 0.70 × 83,285 = 58,300 → target ≤ 38K).
   compaction_trigger_ratio: 0.70   # default 0.70; 0 disables
   # Summariser model — reuses the existing local Qwen3 model, no new download.
   summarizer_model:
@@ -230,15 +230,14 @@ server:
 > (cold, warm] band must never collapse — dead-code guard
 > LP-0MSI2M5BT004BCDP):
 >
-> - `proxy/config-fast.yaml` — `38000` (fast mode runs 3 slots × 262144 total
->   ctx since the operator supersede LP-0MSY0SDAS0031Y7F, so the warm clamp is
->   `262144//3 − 4096 =
->   83285`; recaptures the old (30000, 38000] cold-cache bypass band).
-> - `proxy/config-cheap.yaml` — `38000` (warm resolves to `100000` via the
->   2×262144 schedule entries; also below the boot-transient clamp 61440,
->   LP-0MSMZOAJW002UR2A; symmetric with fast after the 60000 raise failed
->   guardrails and was reverted — see LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K
->   / LP-0MSY0V4ZO002ANPL).
+> - `proxy/config-fast.yaml` — `38000` (fast mode runs 1 slot × 262144 total
+>   ctx, LP-0MU03AL730000B5W, so the warm clamp is
+>   `min(100000, 262144//1 − 4096 = 258048) = 100000`; recaptures the old
+>   (30000, 38000] cold-cache bypass band).
+> - `proxy/config-cheap.yaml` — `38000` (3 slots → warm resolves to
+>   `min(100000, 262144//3 − 4096 = 83285) = 83285`; symmetric with fast after
+>   the 60000 raise failed guardrails and was reverted — see
+>   LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K / LP-0MSY0V4ZO002ANPL).
 > - `proxy/config.yaml` (default/fallback) — `38000`, mirroring fast mode.
 >
 > Prompts above the per-slot warm clamp are **never** routed local
@@ -247,17 +246,18 @@ server:
 ## Per-mode slot counts (operator-directed simplification LP-0MTZRM5HV0007S0V)
 
 Each mode profile defines its slot count **once** via
-``session_slot_pool_size`` (default/fast: 3, cheap: 2). There is no
+``session_slot_pool_size`` (default/fast: 1, cheap: 3; counts set by
+LP-0MU03AL730000B5W, structure from LP-0MTZRM5HV0007S0V). There is no
 ``slot_schedule``; the time-based slot scheduler was removed. The slot
 count changes only when the operating mode changes (a mode switch restarts
 the proxy with the new profile).
 
 Per-slot context is derived from the profile's static pair:
-``local_model_ctx_size // session_slot_pool_size`` (262144 across both
+``local_model_ctx_size // session_slot_pool_size`` (262144 across all
 profiles since the operator supersede LP-0MSY0SDAS0031Y7F), so the routing
 clamp (``_effective_large_context_thresholds``) resolves to
-`262144 // 3 - 4096 = 83285` in fast/default and `262144 // 2 - 4096 =
-126976` in cheap (clamped to `100000` by the warm config cap).
+`262144 // 1 - 4096 = 258048` per-slot in fast/default (clamped to `100000`
+by the warm config cap) and `262144 // 3 - 4096 = 83285` in cheap.
 
 **Router-mode mechanism:** a global `--ctx-size` on the router command line
 would override per-model INI `ctx-size` for EVERY model (CLI args take highest

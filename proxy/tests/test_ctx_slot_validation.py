@@ -297,36 +297,39 @@ class TestLiveConfigsValidate:
         assert problems == [], f"{config_file}: {problems}"
 
     def test_fast_mode_cold_below_warm(self):
-        """Fast mode: cold 38000 < effective warm per-slot clamp 83285
-        (3x262144 → per-slot 83285; hard-routing cap DISABLED per
-        LP-0MTLB1LK80098R43, warm = min(100000, 83285) = 83285)."""
+        """Fast mode: cold 38000 < effective warm per-slot clamp 258048
+        (1x262144 → per-slot 258048; hard-routing cap DISABLED per
+        LP-0MTLB1LK80098R43, warm = min(100000, 258048) = 100000).
+
+        NOTE: the warm threshold config caps this at 100000; the per-slot
+        clamp itself is 258048."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config-fast.yaml"))
         assert cold == 38000
-        assert warm == 83285
+        assert warm == 100000  # min(warm_config=100000, per-slot 258048)
         assert cold < warm
 
     def test_default_mode_cold_below_warm(self):
-        """Default profile (config.yaml) mirrors fast: cold 38000 < 83285."""
+        """Default profile (config.yaml) mirrors fast: cold 38000 < 100000."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 83285
+        assert warm == 100000
         assert cold < warm
 
     def test_cheap_mode_cold_below_warm(self, monkeypatch):
-        """Cheap mode: cold 42000 < effective warm per-slot clamp 100000
-        (2×262144 → per-slot 126976; hard-routing cap DISABLED per
-        LP-0MTLB1LK80098R43, warm = min(100000, 126976) = 100000)."""
+        """Cheap mode: cold 42000 < effective warm per-slot clamp 83285
+        (3×262144 → per-slot 83285; hard-routing cap DISABLED per
+        LP-0MTLB1LK80098R43, warm = min(100000, 83285) = 83285)."""
         import proxy.mode as mode_mod
         from proxy.provider import _effective_large_context_thresholds
 
         monkeypatch.setattr(mode_mod, "read_mode", lambda: "cheap")
         cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
         assert cold == 42000
-        assert warm == 100000
+        assert warm == 83285
         assert cold < warm
 
 

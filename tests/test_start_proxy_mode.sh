@@ -298,16 +298,16 @@ test_per_slot_context() {
     printf 'cheap\n' > "$PROXY_DIR/.mode"
     local out
     out=$(run_script)
-    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$CHEAP_SLOTS ctx_size=$CHEAP_LOCAL_CTX policy=$CHEAP_POLICY cold_cache_threshold=$CHEAP_COLD local_model_ctx_size=$CHEAP_LOCAL_CTX effective_per_slot_threshold=126976"; then
-        pass "cheap per-slot context = 126976 ($CHEAP_LOCAL_CTX//$CHEAP_SLOTS - 4096)"
+    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$CHEAP_SLOTS ctx_size=$CHEAP_LOCAL_CTX policy=$CHEAP_POLICY cold_cache_threshold=$CHEAP_COLD local_model_ctx_size=$CHEAP_LOCAL_CTX effective_per_slot_threshold=83285"; then
+        pass "cheap per-slot context = 83285 ($CHEAP_LOCAL_CTX//$CHEAP_SLOTS - 4096)"
     else
         fail "cheap per-slot context: unexpected output: $out"
     fi
 
     printf 'fast\n' > "$PROXY_DIR/.mode"
     out=$(run_script)
-    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$FAST_SLOTS ctx_size=$FAST_LOCAL_CTX policy=$FAST_POLICY cold_cache_threshold=$FAST_COLD local_model_ctx_size=$FAST_LOCAL_CTX effective_per_slot_threshold=83285"; then
-        pass "fast per-slot context = 83285 ($FAST_LOCAL_CTX//$FAST_SLOTS - 4096)"
+    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$FAST_SLOTS ctx_size=$FAST_LOCAL_CTX policy=$FAST_POLICY cold_cache_threshold=$FAST_COLD local_model_ctx_size=$FAST_LOCAL_CTX effective_per_slot_threshold=258048"; then
+        pass "fast per-slot context = 258048 ($FAST_LOCAL_CTX//$FAST_SLOTS - 4096)"
     else
         fail "fast per-slot context: unexpected output: $out"
     fi

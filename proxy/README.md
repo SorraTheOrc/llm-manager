@@ -818,8 +818,8 @@ The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and requests can
   fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
-  3-slot pool).
-- **cheap** — 2-slot local pool with the same models/provider chains as
+  1-slot pool).
+- **cheap** — 3-slot local pool with the same models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (`proxy/config-cheap.yaml`,
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
@@ -951,9 +951,9 @@ Each operating-mode profile defines its local llama-server slot count
 
 | Profile | Slots |
 |---------|-------|
-| `config.yaml` (default/fallback) | 3 |
-| `config-fast.yaml` | 3 |
-| `config-cheap.yaml` | 2 |
+| `config.yaml` (default/fallback) | 1 |
+| `config-fast.yaml` | 1 |
+| `config-cheap.yaml` | 3 |
 
 There is **no time-based slot schedule** (the previous `slot_schedule`
 mechanism was removed, LP-0MTZRM5HV0007S0V): the slot count changes only
@@ -965,7 +965,7 @@ always `local_model_ctx_size // session_slot_pool_size`.
 #### Changing the slot count
 
 Edit the profile's `session_slot_pool_size` and restart the proxy (no hot
-reload). Fast/default use 3 slots; cheap uses 2. The slot count feeds
+reload). Fast/default use 1 slot; cheap uses 3. The slot count feeds
 llama-server's `--parallel` (via `LLAMA_PARALLEL`, set by the lifecycle)
 and the local dispatch lease pool — keep `session_slot_pool_size` aligned
 with what llama-server actually runs.### Upstream Timeout Configuration
@@ -1460,7 +1460,7 @@ curl -X POST http://localhost:8000/admin/set-mode \
   -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
 ```
 Switches the proxy between **fast** (cloud-backed) and **cheap**
-(2-slot local pool, same models as fast — remote providers enabled)
+(3-slot local pool, same models as fast — remote providers enabled)
 operating modes. Requesting the active mode is a noop; a
 different mode is persisted (survives restarts) and triggers a full proxy
 restart in the background. Invalid modes return `400`; a switch while a
@@ -1802,9 +1802,9 @@ the default `config.yaml`, and `config-cheap.yaml` all use `38000` (cheap is
 symmetric with fast after the initial 60000 raise breached the cheap queue
 guardrails and was reverted — LP-0MSRM54YO007YG0K AC7 — then re-raised to
 38000, LP-0MSY0V4ZO002ANPL).
-Each value stays below its mode's effective warm clamp (fast `131072//3 − 4096
-= 39594`; cheap resolves to `100000` via its 2×262144 schedule entries, and is
-also below the boot-transient clamp 61440) so the (cold, warm] band never
+Each value stays below its mode's effective warm clamp (fast resolves to
+`min(100000, 262144//1 − 4096 = 258048) = 100000`; cheap resolves to
+`min(100000, 262144//3 − 4096 = 83285) = 83285`) so the (cold, warm] band never
 collapses (LP-0MSI2M5BT004BCDP). Prompts above the per-slot warm clamp are
 never routed local (`context_too_large` — physical capacity).
 
