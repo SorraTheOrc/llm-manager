@@ -4985,7 +4985,6 @@ def test_empty_response_capped_readtimeout_unaffected():
     provider._provider_failure_count.clear()
     provider._provider_unavailable_until.clear()
     response = Response(status_code=502, content=b"Bad gateway")
-    config = {"server": {"empty_response_max_cooldown_seconds": 10.0}}
     with patch('time.time', return_value=1000.0):
         # HTTP error path should still use full exponential backoff, even
         # with the cap config present.  Note: _handle_http_error_with_cooldown

@@ -92,7 +92,7 @@ class TestLoggerHierarchy:
     def test_non_dry_run_compact_emits_at_info(self, caplog):
         result = plan_session_compaction(_session(60), _fast_config(), "fast", summarizer=_summ, estimate_tokens=_est)
         with caplog.at_level(logging.INFO, logger="llama-proxy.compaction"):
-            fields = log_compaction_event(result, session_id="sess-xyz", dry_run=False, estimate_tokens=_est)
+            log_compaction_event(result, session_id="sess-xyz", dry_run=False, estimate_tokens=_est)
         rec = next(r for r in caplog.records if r.name == "llama-proxy.compaction")
         assert rec.levelno == logging.INFO
         assert "dry_run=False" in rec.getMessage()

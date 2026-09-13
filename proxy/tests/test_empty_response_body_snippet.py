@@ -18,14 +18,15 @@ import httpx
 import pytest
 from fastapi import Request
 from fastapi.responses import StreamingResponse
-
 from proxy.proxy_remote import (
     _handle_remote_non_streaming,
     _handle_remote_streaming,
+)
+from proxy.proxy_remote import (
     _snippet_body as _remote_snippet,
 )
-from proxy.utils import _snippet_body as _utils_snippet, _call_with_empty_retry
-
+from proxy.utils import _call_with_empty_retry
+from proxy.utils import _snippet_body as _utils_snippet
 
 # ===================================================================
 # Async iterator helpers
@@ -234,7 +235,8 @@ async def test_streaming_empty_response_log_includes_body_snippet(mock_request, 
                                 upstream_idle_timeout_seconds=1.0,
                             )
 
-                            collected = [chunk async for chunk in result.body_iterator]
+                            async for _ in result.body_iterator:
+                                pass
 
     # Verify the empty-retry INFO log includes a body snippet
     empty_retry_logs = [
@@ -303,7 +305,8 @@ async def test_streaming_empty_response_log_body_snippet_truncated(mock_request,
                                 upstream_idle_timeout_seconds=1.0,
                             )
 
-                            collected = [chunk async for chunk in result.body_iterator]
+                            async for _ in result.body_iterator:
+                                pass
 
     # Verify truncation
     empty_retry_logs = [
@@ -566,7 +569,7 @@ async def test_utils_empty_response_retry_includes_body_snippet():
 
     with patch("proxy.utils._lifecycle", return_value=mock_lifecycle):
         with patch("proxy.utils._srv", return_value=mock_srv_instance):
-            result = await _call_with_empty_retry(
+            await _call_with_empty_retry(
                 send_fn=MagicMock(),  # send_fn not actually called by the function
                 path="/v1/chat/completions",
                 max_retries=2,
@@ -615,7 +618,7 @@ async def test_utils_empty_response_warning_includes_body_snippet():
 
     with patch("proxy.utils._lifecycle", return_value=mock_lifecycle):
         with patch("proxy.utils._srv", return_value=mock_srv_instance):
-            result = await _call_with_empty_retry(
+            await _call_with_empty_retry(
                 send_fn=MagicMock(),
                 path="/v1/chat/completions",
                 max_retries=1,
