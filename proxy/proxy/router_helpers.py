@@ -1133,6 +1133,16 @@ async def _increment_generating_only_slot(srv, session_key: str | None = None) -
 
     Prefill-aware guard: the session's prefill hold is released on first-byte
     so the prefill cap slot is freed for waiters.
+
+    Adds *session_key* to ``local_generating_sessions`` (a set tracking which
+    sessions are generating) and increments ``local_generating_queries``.
+    This counter gates dispatch to the local model via ``_try_acquire_local_dispatch``
+    — when it reaches ``max_local``, new dispatches are denied.
+
+    Self-healing: if the corresponding decrement (``_decrement_generating_only_slot``)
+    is skipped due to an exception in the streaming generator's finally block,
+    the ``_dispatch_cleanup_loop`` periodically reclaims stale entries via
+    ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU).
     """
     # Prefill-aware guard: clear the prefill hold on first-byte.
     try:
@@ -1184,6 +1194,15 @@ async def _decrement_generating_only_slot(srv, session_key: str | None = None) -
     """Decrement generating-only slot for *session_key* (safe / not negative).
 
     Also clears any remaining prefill hold (prefill-only aborts).
+
+    Called from the streaming generator's ``finally`` block (``router.py:1790``)
+    after stream termination. If this call is skipped — e.g., due to an
+    exception in the preceding slot-save path (``router.py:1700-1722``)
+    — the session key leaks into ``local_generating_queries`` /
+    ``local_generating_sessions`` and wedges the dispatch pool at capacity.
+
+    Self-healing: the dispatch cleanup loop periodically reclaims such stale
+    entries via ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU).
     """
     # Clear prefill hold for prefill-only sessions (no generating).
     try:

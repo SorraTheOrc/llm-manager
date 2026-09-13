@@ -43,6 +43,25 @@ For local models, the proxy checks:
 - If in **router mode** (`llama_router_mode: true`), it queries the router to see if the model is already loaded
 - Otherwise, it schedules a **background load** and returns `503 Model Loading` to the client
 
+#### Generating-only dispatch pool
+
+The local model uses a **generating-only dispatch pool** to limit concurrent
+sessions that are actively generating tokens. The key design choices are:
+
+- **Prefill does NOT count against the pool** — sessions in the prefill
+  phase (waiting for the LLM to start producing) are allowed concurrently,
+  up to `session_slot_pool_size` parallel prefills. This prevents the
+  llama-server internal queue from saturating (LP-0MTJET4I5009EHNX).
+- **Only generating sessions count** — the counter (`local_generating_queries`)
+  increments when the first token arrives and decrements on stream end.
+- **Self-healing recovery** — if the decrement in the streaming generator's
+  `finally` block aborts (e.g., slot-save exception), a session key can leak
+  into the generating pool, wedging it at capacity. The dispatch cleanup loop
+  (`_dispatch_cleanup_loop`, runs every 10 s) periodically reclaims stale
+  generating entries by reconciling them against active dispatch records
+  (LP-0MTYAWDCQ006RGYU). This self-healing mechanism recovers the pool within
+  ~20 seconds without a proxy restart.
+
 ### 5. Remote Model Handling
 
 For remote models (`proxy_to_remote()`):

@@ -109,6 +109,14 @@ local_active_queries_lock = asyncio.Lock()
 # Slots are counted only during the generating phase (first-byte onward)
 # and released immediately on stream end — prefill time does NOT count
 # against session_slot_pool_size.
+#
+# Self-healing: when the streaming generator's finally block aborts before
+# calling ``_decrement_generating_only_slot`` (router.py:1700-1801), session
+# keys can leak into ``local_generating_queries`` / ``local_generating_sessions``.
+# The dispatch cleanup loop periodically reclaims these stale entries via
+# ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU), so the local
+# dispatch pool self-heals within a bounded interval (~20s) without a proxy
+# restart.
 local_generating_queries: int = 0
 local_generating_queries_lock = asyncio.Lock()
 local_generating_sessions: set = set()
@@ -183,11 +191,24 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
 
 
 async def _dispatch_cleanup_loop() -> None:
-    """Background task that periodically removes stale dispatch leases.
+    """Background task that periodically cleans up stale dispatch state.
 
-    Runs every 10 seconds and
-    calls ``_cleanup_stale_local_dispatch`` on the server state to
-    evict inactive lease records whose *expires_at* has passed.
+    Runs every 10 seconds and invokes a chain of recovery functions that
+    re-establish counter consistency:
+
+    1. ``_cleanup_stale_local_dispatch`` — evicts inactive lease records
+       whose *expires_at* has passed.
+    2. ``_recover_stuck_local_active_queries`` — resets a stuck
+       ``local_active_queries`` counter when no active dispatch records exist.
+    3. ``_recover_stuck_global_active_queries`` — resets the global
+       ``active_queries`` counter when no local work remains.
+    4. ``_recover_stuck_generating_queries`` — reclaims stale
+       ``local_generating_queries`` / ``local_generating_sessions`` entries
+       (session keys leaked by an aborted decrement in the streaming
+       generator's finally block, LP-0MTYAWDCQ006RGYU).
+
+    Together these provide a bounded self-healing mechanism (~20s) that
+    recovers the local dispatch pool without a proxy restart.
     """
     while True:
         try:
