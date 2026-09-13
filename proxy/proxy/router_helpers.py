@@ -1736,6 +1736,134 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     return removed
 
 
+async def _recover_stuck_generating_queries(srv) -> None:
+    """Detect and reclaim stale ``local_generating_queries`` / ``local_generating_sessions`` entries.
+
+    Session keys stuck in ``local_generating_sessions`` (from an aborted
+    ``_decrement_generating_only_slot`` in the streaming generator's finally
+    block, ``router.py:1700-1801``) wedge the local dispatch pool when
+    ``local_generating_queries >= max_local``. Nothing in
+    ``_dispatch_cleanup_loop`` previously reclaimed these entries, causing
+    prolonged outages (e.g. 2h 11m, 2026-09-11; LP-0MTYAWDCQ006RGYU).
+
+    This function reconciles ``local_generating_queries`` and
+    ``local_generating_sessions`` against ``local_dispatch_records``:
+
+    - For each session key in ``local_generating_sessions``, check whether
+      an active dispatch record exists.
+    - Keys with **no** active record are stale — removed from the set and
+      ``local_generating_queries`` is reset to the count of remaining
+      legitimate entries.
+    - If **no** active dispatch records exist at all, all generating state
+      is considered stale: the session set is emptied and the counter is
+      reset to 0. This also reclaims a counter-only leak (positive counter
+      with an empty session set), which can occur for anonymous sessions
+      where increment/decrement touch the counter but not the set.
+    - If the set is empty and the counter is 0 there is nothing to do.
+
+    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
+    as part of the periodic self-healing cycle, providing a bounded
+    recovery mechanism that runs every 10 seconds. O(n) in the number
+    of generating sessions; no llama-server HTTP calls.
+
+    Lock ordering: acquires ``local_generating_queries_lock`` only. Does
+    not acquire ``local_dispatch_records_lock`` — reads the records
+    snapshot without holding the lock. This is acceptable because the
+    check is self-correcting (runs every 10s) and a slightly stale
+    snapshot cannot cause harm (false negatives simply defer recovery;
+    false positives are prevented by the ``active`` flag check).
+
+    On reclaim, emits a WARNING log and wakes contention-queue waiters
+    so blocked dispatch retries can proceed.
+    """
+    try:
+        generating_sessions: set | None = getattr(
+            srv, "local_generating_sessions", None
+        )
+        if generating_sessions is None:
+            # No generating-session tracking at all — nothing to reconcile.
+            return
+
+        prev_count = int(
+            getattr(srv, "local_generating_queries", 0) or 0
+        )
+        if not generating_sessions and prev_count == 0:
+            return  # Nothing to do
+
+        generating_lock = getattr(
+            srv, "local_generating_queries_lock", None
+        )
+        records = getattr(srv, "local_dispatch_records", None)
+
+        if records is not None:
+            has_active = any(
+                r.get("active", False) for r in records.values()
+            )
+        else:
+            has_active = False  # legacy mode: no dispatch records
+
+        if not has_active:
+            # No in-flight streams anywhere — all generating state is stale
+            # (this includes a counter-only leak with an empty session set).
+            stale_keys = set(generating_sessions)
+            new_count = 0
+        else:
+            # Identify stale keys: those without an active dispatch record.
+            stale_keys = set()
+            for key in generating_sessions:
+                # Support both string keys and tuple (endpoint, session)
+                # keys.
+                record = records.get(key)
+                if record is None and not isinstance(key, tuple):
+                    record = records.get(("local", key))
+                if record is None or not record.get("active", False):
+                    stale_keys.add(key)
+            # The session set is authoritative for the legitimate count.
+            new_count = len(generating_sessions) - len(stale_keys)
+
+        if not stale_keys and prev_count == new_count:
+            return  # Nothing to reclaim
+
+        prev_sessions_count = len(generating_sessions)
+
+        if generating_lock is not None:
+            async with generating_lock:
+                for key in stale_keys:
+                    generating_sessions.discard(key)
+                srv.local_generating_queries = max(0, new_count)
+        else:
+            for key in stale_keys:
+                generating_sessions.discard(key)
+            srv.local_generating_queries = max(0, new_count)
+
+        new_count = int(getattr(srv, "local_generating_queries", 0) or 0)
+
+        # Log the recovery.
+        try:
+            srv.logger.warning(
+                "local_generating_queries counter recovered: "
+                "reclaimed %d stale session(s) (reset from %d to %d, "
+                "%d sessions removed from local_generating_sessions)",
+                prev_count - new_count,
+                prev_count,
+                new_count,
+                prev_sessions_count - len(generating_sessions),
+            )
+        except Exception:
+            pass
+
+        # Wake contention-queue waiters so blocked dispatches can retry.
+        try:
+            from proxy.contention_queue import wake_all
+
+            await wake_all()
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+
 async def _recover_stuck_local_active_queries(srv) -> None:
     """Detect and reset a stuck ``local_active_queries`` counter.
 
