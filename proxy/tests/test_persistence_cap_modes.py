@@ -286,14 +286,14 @@ class TestFastModeOversizedSaveRestore:
 
 
 # ---------------------------------------------------------------------------
-# AC2: cheap mode (cap 126976) — oversized save→restore via 2-slot schedule
+# AC2: cheap mode (cap 126976) — oversized save→restore via the 2-slot profile
 # ---------------------------------------------------------------------------
 
 
 class TestCheapModeOversizedSaveRestore:
     """Cheap mode (2 slots, 262144 ctx → 126976 cap): same save→restore
-    cycle validated at the cheap clamp, fixtures exercise the 2-slot
-    schedule so the derived cap matches 126976."""
+    cycle validated at the cheap clamp (the profile's static pair;
+    LP-0MTZRM5HV0007S0V removed the time-based slot scheduler)."""
 
     def test_cheap_oversized_within_cap_persists(self):
         cfg = _cheap_config()
@@ -321,34 +321,21 @@ class TestCheapModeOversizedSaveRestore:
             slot, fname, _ = _build_slot_context(cfg, "cheap-over", {})
             assert slot is None
 
-    def test_cheap_2slot_schedule_derived_cap_is_126976(self, monkeypatch):
-        """The 2-slot schedule (262144 ctx, 2 slots) must derive 126976 via
-        the schedule-aware path (_get_active_local_ctx_size /
-        _get_active_local_slots), not just the static config."""
+    def test_cheap_2slot_static_cap_is_126976(self):
+        """The cheap profile's static pair (262144 ctx, 2 slots) derives
+        126976 via _get_active_local_ctx_size / _get_active_local_slots —
+        the static profile values, with no live slot scheduler
+        (LP-0MTZRM5HV0007S0V)."""
         cfg = _make_config(
             session_slot_save_path="/tmp/slot-cache",
-            # Static values would otherwise be different (e.g. 131072 cheap
-            # boot ctx); the ACTIVE schedule overrides them.
-            session_slot_pool_size=FAST_SLOTS,
-            local_model_ctx_size=131072,
+            session_slot_pool_size=CHEAP_SLOTS,
+            local_model_ctx_size=CTX_262K,
             session_slot_max_prompt_tokens=0,
             local_hard_routing_cap_ratio_fast=0,
             local_hard_routing_cap_ratio_cheap=0,
             warm_cache_threshold=100000,
             session_slot_skip_when_busy=False,
         )
-        # Simulate the cheap schedule active: 2 slots @ 262144
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched, raising=False)
         # Verify the derived clamp matches cheap's pinned value
         from proxy.provider import _get_active_local_ctx_size, _get_active_local_slots
 
@@ -360,8 +347,8 @@ class TestCheapModeOversizedSaveRestore:
 
         # And _build_slot_context uses that derived cap
         with patch("proxy.session._estimate_slot_prompt_tokens", return_value=100000):
-            slot, fname, _ = _build_slot_context(cfg, "cheap-sched-100k", {})
-            assert slot is not None, "100K must persist via schedule-derived 126976"
+            slot, fname, _ = _build_slot_context(cfg, "cheap-static-100k", {})
+            assert slot is not None, "100K must persist via the static 126976 cap"
         _slot_owners.clear()
         with patch("proxy.session._estimate_slot_prompt_tokens", return_value=CHEAP_CLAMP + 1):
             slot, fname, _ = _build_slot_context(cfg, "cheap-sched-over", {})

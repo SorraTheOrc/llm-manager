@@ -23,7 +23,6 @@ import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.p
 from proxy import mode as mode_module
 from proxy.disconnect_reaper import DisconnectReaperMiddleware
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
-from proxy.slot_scheduler import SlotScheduler
 
 # Global state
 llama_process: subprocess.Popen | None = None
@@ -254,9 +253,6 @@ tts_recovery_state: dict = {
 # Background model health monitoring task (started in lifespan)
 model_health_task: asyncio.Task | None = None
 
-# Slot scheduler for time-based slot count transitions (LP-0MRXZU90M007WNWT)
-slot_scheduler: SlotScheduler | None = None
-
 # Token counting
 token_counts: dict = {}
 token_lock = asyncio.Lock()
@@ -427,7 +423,8 @@ def _startup_config_logging():
 
     # Log resolved hard-routing caps for both modes (LP-0MTBOX45O005LD1S).
     # The caps are derived from per-mode ratios against the active per-slot
-    # threshold, so they rescale automatically when slot_schedule changes.
+    # threshold, so they rescale automatically when the mode profile's slot
+    # count changes.
     try:
         from proxy.mode import read_mode as _read_mode
         from proxy.provider import compute_hard_routing_cap
@@ -929,48 +926,18 @@ def _shutdown_stop_recording_prune():
         _recording_prune_task = None
 
 
-def _startup_launch_slot_scheduler():
-    """Start the slot scheduler background task.
-
-    Creates a ``SlotScheduler`` instance from the current config and
-    starts its background time-check loop.  When no schedule is configured,
-    the scheduler is a no-op.
-    """
-    global slot_scheduler
-    try:
-        scheduler = SlotScheduler(_srv())
-        if scheduler.enabled:
-            slot_scheduler = scheduler
-            loop = asyncio.get_running_loop()
-            loop.create_task(scheduler.start())
-            logger.info(
-                "Slot scheduler: configured with %d entries",
-                len(scheduler._config.entries),
-            )
-        else:
-            slot_scheduler = None
-            logger.debug("Slot scheduler: no schedule configured, disabled")
-    except Exception as e:
-        logger.warning("Failed to start slot scheduler: %s", e)
-        slot_scheduler = None
-
-
 def _startup_launch_mode_scheduler():
     """Start the automatic fast/cheap mode-scheduler background thread.
 
-    Enforces the ``mode_schedule`` (default cheap 01:00-10:00, fast
-    10:00-01:00). A manual API override (persisted override-until expiry)
-    is respected until the next scheduled transition, so a restart
-    mid-override does NOT revert it (LP-0MSMF25V9002AY1J). The first check
-    runs immediately so schedule transitions apply right away instead of
-    waiting a full interval.
+    Enforces the standalone ``proxy/mode_schedule.yaml`` schedule (default
+    cheap 01:00-10:00, fast 10:00-01:00). A manual API override (persisted
+    override-until expiry) is respected until the next scheduled
+    transition, so a restart mid-override does NOT revert it
+    (LP-0MSMF25V9002AY1J). The first check runs immediately so schedule
+    transitions apply right away instead of waiting a full interval.
     """
     try:
-        srv_config = _srv().config
-        server_config = (
-            srv_config.get("server", {}) if isinstance(srv_config, dict) else None
-        )
-        schedule = mode_module.ModeScheduleConfig.from_server_config(server_config)
+        schedule = mode_module.ModeScheduleConfig.from_file()
         if schedule.enabled:
             mode_module.start_mode_scheduler(schedule)
             logger.info(
@@ -979,7 +946,9 @@ def _startup_launch_mode_scheduler():
                 [(e.time.strftime("%H:%M"), e.mode) for e in schedule.entries],
             )
         else:
-            logger.debug("Mode scheduler: disabled via config (enabled: false)")
+            logger.debug("Mode scheduler: disabled via %s (enabled: false)",
+                mode_module.mode_schedule_file(),
+            )
     except Exception as e:
         logger.warning("Failed to start mode scheduler: %s", e)
 
@@ -1103,14 +1072,6 @@ def _shutdown_tts_server():
     stop_tts_server()
 
 
-async def _shutdown_slot_scheduler():
-    """Stop the slot scheduler background task."""
-    global slot_scheduler
-    if slot_scheduler is not None:
-        await slot_scheduler.stop()
-        slot_scheduler = None
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler.
@@ -1136,7 +1097,6 @@ async def lifespan(app: FastAPI):
     _startup_start_session_cleanup()
     _startup_start_dispatch_cleanup()
     _startup_register_session_routes(app)
-    _startup_launch_slot_scheduler()
     _startup_launch_mode_scheduler()
     _startup_initialize_grandfathering()
     _startup_launch_disconnect_reaper()
@@ -1155,7 +1115,6 @@ async def lifespan(app: FastAPI):
     _shutdown_tts_server()
     await _shutdown_http_client()
     _shutdown_llama_server()
-    await _shutdown_slot_scheduler()
     await _shutdown_disconnect_reaper()
 
 

@@ -180,8 +180,8 @@ class TestDynamicCapOverridesStaticConfig:
         _slot_owners.clear()
 
     def _make_config(self, ctx_size=131072, pool_size=3, max_prompt_tokens=0):
-        """Build a config dict (slot_schedule slot counts are derived from
-        pool_size in these unit tests)."""
+        """Build a config dict; the profile's static pair is the source of
+        truth for the derived cap (LP-0MTZRM5HV0007S0V)."""
         return {
             "session_slot_save_path": "/tmp/slot-cache",
             "session_slot_pool_size": pool_size,
@@ -449,76 +449,43 @@ class TestDynamicCapPerPeriodCtx:
             "session_slot_timeout_seconds": 3.0,
         }
 
-    def test_night_2slot_262k_admits_100k(self, monkeypatch):
-        """Night period (262144, 2) → cap 126,976. A 100K-token context is
-        admitted even though it exceeds the day-period cap (39,594)."""
+    def test_cheap_2slot_262k_admits_100k(self):
+        """Cheap profile (262144, 2) → cap 126,976. A 100K-token context is
+        admitted even though it exceeds the fast/default cap (39,594)."""
         from proxy.session import _build_slot_context
 
-        config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        config = self._make_config(ctx_size=262144, pool_size=2, max_prompt_tokens=0)
         slot_id, _, _ = _build_slot_context(
-            config, "night-100k", _body_for_tokens(100000)
+            config, "cheap-100k", _body_for_tokens(100000)
         )
         assert slot_id is not None, (
-            "100K tokens should be admitted under night 2-slot @ 262144 "
+            "100K tokens should be admitted under the cheap 2-slot @ 262144 "
             "cap (126976)"
         )
 
-    def test_night_2slot_262k_rejects_150k(self, monkeypatch):
-        """A 150K-token context exceeds the 126,976 night cap → rejected."""
+    def test_cheap_2slot_262k_rejects_150k(self):
+        """A 150K-token context exceeds the 126,976 cheap cap → rejected."""
         from proxy.session import _build_slot_context
 
-        config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        config = self._make_config(ctx_size=262144, pool_size=2, max_prompt_tokens=0)
         slot_id, _, _ = _build_slot_context(
-            config, "night-150k", _body_for_tokens(150000)
+            config, "cheap-150k", _body_for_tokens(150000)
         )
         assert slot_id is None, (
-            "150K tokens should be rejected under night 2-slot @ 262144 "
+            "150K tokens should be rejected under the cheap 2-slot @ 262144 "
             "cap (126976)"
         )
 
-    def test_day_3slot_131k_rejects_100k(self, monkeypatch):
-        """Day period (131072, 3) → cap 39,594. The same 100K-token context
-        that night admits is rejected during the day."""
+    def test_fast_3slot_131k_rejects_100k(self):
+        """Fast/default profile (131072, 3) → cap 39,594. The same 100K-token
+        context that cheap admits is rejected in fast/default."""
         from proxy.session import _build_slot_context
 
         config = self._make_config(ctx_size=131072, pool_size=3, max_prompt_tokens=0)
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: None,
-                "get_active_slot": lambda self, now=None: 3,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         slot_id, _, _ = _build_slot_context(
-            config, "day-100k", _body_for_tokens(100000)
+            config, "fast-100k", _body_for_tokens(100000)
         )
         assert slot_id is None, (
-            "100K tokens should be rejected under day 3-slot @ 131072 "
-            "cap (39594)"
+            "100K tokens should be rejected under the fast/default 3-slot @ "
+            "131072 cap (39594)"
         )

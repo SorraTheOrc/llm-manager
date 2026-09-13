@@ -241,12 +241,13 @@ Rationale:
    never a silent 10-min prefill; guidance surfaces the existing
    `context_pressure` compaction signal. Companion item (session-compaction
    evaluation) remains the owner of the compaction UX.
-4. **`slot_schedule` / `--parallel` alignment (constraint):** the hard cap
-   is derived from the *active* schedule entry's `(ctx_size, slots)` exactly
+4. **`session_slot_pool_size` / `--parallel` alignment (constraint):** the hard cap
+   is derived from the active mode profile's static `(ctx_size, slots)` exactly
    like the current clamp (`_effective_large_context_thresholds` /
-   `effective_per_slot_threshold`), so fast 23:59→3 and cheap 10:00→2
-   entries each resolve their own cap. No change to llama-server `--parallel`
-   or `slot_schedule`.
+   `effective_per_slot_threshold`), so fast/default 3 slots and cheap 2 slots
+   each resolve their own cap. After the slot_schedule removal
+   (LP-0MTZRM5HV0007S0V) the proxy never restarts llama-server on a time
+   schedule; the slot count is the profile's `session_slot_pool_size`.
 5. **Warm-cache efficiency:** sessions below the hard cap that use the ratio
    check keep their warm-cache wins unchanged; the hard cap only removes the
    zone where the warm-cache benefit is outweighed by prefill cost and

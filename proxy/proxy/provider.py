@@ -536,22 +536,12 @@ def _get_local_model_ctx_size(config: dict) -> int:
 def _get_active_local_slots(config: dict) -> int:
     """Return the number of currently active local slots.
 
-    Prefers the live slot scheduler (schedule-aware) when available;
-    otherwise falls back to ``session_slot_pool_size`` from config.
+    The slot count is a single per-mode definition: the active mode-profile
+    config's ``session_slot_pool_size`` (default/fast: 3, cheap: 2). The
+    time-based slot scheduler was removed (operator-directed simplification
+    LP-0MTZRM5HV0007S0V) — there is no schedule-aware live slot count.
     Returns 1 as a safe default when nothing is configured.
     """
-    # Live slot scheduler (schedule-aware; e.g. 6 day / 8 night).
-    try:
-        import proxy.server as _srv
-
-        scheduler = getattr(_srv, "slot_scheduler", None)
-        if scheduler is not None and hasattr(scheduler, "get_active_slot"):
-            slots = scheduler.get_active_slot()
-            if slots and int(slots) > 0:
-                return int(slots)
-    except Exception:
-        pass
-
     server_cfg = config.get("server", config)
     try:
         val = server_cfg.get("session_slot_pool_size")
@@ -570,24 +560,12 @@ _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
 
 
 def _get_active_local_ctx_size(config: dict) -> int:
-    """Return the currently active local context size (schedule-aware).
+    """Return the currently active local context size.
 
-    Prefers the live slot scheduler's per-period ``ctx_size`` (the ACTIVE
-    schedule entry's override, LP-0MSLNK96T0018W4D); falls back to the
-    static ``local_model_ctx_size`` from config, which ``restart_services``
-    keeps in sync with the last applied transition. Mirrors
-    ``_get_active_local_slots``.
+    Static ``local_model_ctx_size`` from the active mode-profile config; the
+    time-based slot scheduler was removed (operator-directed simplification
+    LP-0MTZRM5HV0007S0V) so there is no per-period override.
     """
-    try:
-        import proxy.server as _srv
-
-        scheduler = getattr(_srv, "slot_scheduler", None)
-        if scheduler is not None and hasattr(scheduler, "get_active_ctx_size"):
-            ctx = scheduler.get_active_ctx_size()
-            if ctx and int(ctx) > 0:
-                return int(ctx)
-    except Exception:
-        pass
     return _get_local_model_ctx_size(config)
 
 
@@ -1041,12 +1019,13 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
 
 
 def _collect_local_ctx_pairs(config: dict) -> list[tuple[int, int]]:
-    """All (ctx_size, slots) pairs the proxy may run with.
+    """The single (ctx_size, slots) pair the active mode profile runs with.
 
-    The static ``local_model_ctx_size``/``session_slot_pool_size`` pair plus
-    every ``slot_schedule`` entry, where an entry's per-period ``ctx_size``
-    overrides the global value (falling back to it when unset)
-    (LP-0MSLNK96T0018W4D). Pairs are de-duplicated while preserving order.
+    Derived from the static ``local_model_ctx_size`` and
+    ``session_slot_pool_size`` of the active profile. The time-based slot
+    scheduler (whose entries could add per-period pairs) was removed
+    (operator-directed simplification LP-0MTZRM5HV0007S0V), so there is
+    exactly one pair.
     """
     server_cfg = config.get("server", config)
     ctx_size = _get_local_model_ctx_size(config)
@@ -1057,18 +1036,6 @@ def _collect_local_ctx_pairs(config: dict) -> list[tuple[int, int]]:
         pool = 0
     if pool > 0:
         pairs.append((ctx_size, pool))
-
-    try:
-        from proxy.slot_scheduler import SlotScheduleConfig
-
-        schedule = SlotScheduleConfig.from_server_config(server_cfg)
-    except Exception:
-        schedule = None
-    if schedule is not None and schedule.enabled:
-        for entry in schedule.entries:
-            entry_ctx = entry.ctx_size if entry.ctx_size is not None else ctx_size
-            if entry.slots > 0 and (entry_ctx, entry.slots) not in pairs:
-                pairs.append((entry_ctx, entry.slots))
     return pairs
 
 
@@ -1097,7 +1064,7 @@ def _get_min_local_routing_threshold(config: dict) -> int:
 # Per-mode ratio of the effective per-slot context below which local routing
 # is allowed.  Ratios are applied against the *effective per-slot threshold*
 # (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``) so they
-# automatically rescale when ``slot_schedule`` changes.
+# automatically rescale when the mode profile's slot count changes.
 #
 # Resolved caps (operator-approved 2026-08-27):
 #   fast:  70 000 tokens  → ratio 70000/83285 ≈ 0.84049
@@ -1168,11 +1135,12 @@ def compute_hard_routing_cap(mode: str, config: dict) -> int:
     available, the cheap profile falls back to its static pair
     (local_model_ctx_size=131072, 2 slots) → per-slot clamp
     min(100000, 61440)=61440 → 0.6144 × 61440 ≈ 37749, NOT the approved
-    61440.  Production always runs the live scheduler (both schedule entries
-    override ctx to 262144), so the approved absolute holds; the transient
-    boot-static value is strictly more conservative (never routes local what
-    the scheduled view would allow) and is accepted per the item's "caps
-    rescale automatically when slot_schedule changes" caveat.
+    61440.  Production always runs the active mode profile's static pair
+    (session_slot_pool_size set in the profile, per-slot ctx derived from
+    local_model_ctx_size), so the approved absolute holds; the transient
+    boot-static value is strictly more conservative and is accepted per the
+    item's "caps rescale automatically when the profile's slot count
+    changes" caveat.
 
     Args:
         mode: Operating mode ("fast" or "cheap").
@@ -1293,11 +1261,9 @@ def validate_local_routing_config(config: dict) -> list[str]:
 
     Computes the effective per-slot large-context routing threshold
     (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``, mirroring
-    ``_effective_large_context_thresholds``) for EVERY (ctx_size, slots)
-    pair the proxy may run with — the static
-    ``local_model_ctx_size``/``session_slot_pool_size`` AND all
-    ``slot_schedule`` entries (each entry's per-period ``ctx_size``
-    overriding the global when set, LP-0MSLNK96T0018W4D) — and reports a
+    ``_effective_large_context_thresholds``) for the (ctx_size, slots) pair
+    the active mode profile runs with — the static
+    ``local_model_ctx_size``/``session_slot_pool_size`` — and reports a
     problem when the threshold falls below the configured minimum (default
     10000 tokens).
 

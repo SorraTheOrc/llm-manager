@@ -244,31 +244,20 @@ server:
 > Prompts above the per-slot warm clamp are **never** routed local
 > (`context_too_large` — physical capacity, unchanged).
 
-## Per-period ctx_size in slot_schedule (LP-0MSLNK96T0018W4D)
+## Per-mode slot counts (operator-directed simplification LP-0MTZRM5HV0007S0V)
 
-`slot_schedule` entries may carry an optional `ctx_size`: the total context
-across all slots (llama-server `--ctx-size`) while that entry is active.
-When absent, the global `local_model_ctx_size` applies.
+Each mode profile defines its slot count **once** via
+``session_slot_pool_size`` (default/fast: 3, cheap: 2). There is no
+``slot_schedule``; the time-based slot scheduler was removed. The slot
+count changes only when the operating mode changes (a mode switch restarts
+the proxy with the new profile).
 
-```yaml
-server:
-  slot_schedule:
-    enabled: true
-    entries:
-      - time: "10:00"
-        slots: 3
-      - time: "23:59"
-        slots: 2
-        ctx_size: 262144   # overnight: 2 slots @ 256K
-```
-
-At a transition the proxy restarts llama-server with the new `--parallel`
-AND context size, and the routing clamp (`_effective_large_context_thresholds`)
-plus the `session_slot_max_prompt_tokens` dynamic derivation use the ACTIVE
-period's `(ctx_size, slots)` — so overnight the per-slot cap becomes
-`262144 // 2 - 4096 = 126976` while daytime stays `262144 // 3 - 4096 = 83285`
-(the shared `local_model_ctx_size: 262144` supersede LP-0MSY0SDAS0031Y7F
-applies when the daytime entry omits ctx_size).
+Per-slot context is derived from the profile's static pair:
+``local_model_ctx_size // session_slot_pool_size`` (262144 across both
+profiles since the operator supersede LP-0MSY0SDAS0031Y7F), so the routing
+clamp (``_effective_large_context_thresholds``) resolves to
+`262144 // 3 - 4096 = 83285` in fast/default and `262144 // 2 - 4096 =
+126976` in cheap (clamped to `100000` by the warm config cap).
 
 **Router-mode mechanism:** a global `--ctx-size` on the router command line
 would override per-model INI `ctx-size` for EVERY model (CLI args take highest

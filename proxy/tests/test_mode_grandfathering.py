@@ -379,18 +379,16 @@ class TestRegistryFromConfig:
         )
         assert reg.grace_seconds == 900
 
-    def test_mode_schedule_derived_from_server_config(self, tmp_path):
+    def test_mode_schedule_loaded_from_standalone_file(self, tmp_path, monkeypatch):
         from proxy.grandfathering import registry_from_config
 
-        reg = registry_from_config(
-            {
-                "mode_schedule": {
-                    "enabled": True,
-                    "entries": [{"time": "10:00", "mode": "fast"}],
-                }
-            },
-            state_file=tmp_path / "s.json",
+        sched_path = tmp_path / "mode_schedule.yaml"
+        sched_path.write_text(
+            "enabled: true\nentries:\n  - time: '10:00'\n    mode: fast\n",
+            encoding="utf-8",
         )
+        monkeypatch.setattr("proxy.mode.mode_schedule_file", lambda: sched_path)
+        reg = registry_from_config({}, state_file=tmp_path / "s.json")
         assert reg.mode_schedule is not None
         assert reg.mode_schedule.active_mode(dt_time(11, 0)) == "fast"
 

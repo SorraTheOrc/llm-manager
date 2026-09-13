@@ -69,19 +69,12 @@ server_val() {
     grep -E "^  ${2}:" "$1" | head -1 | sed "s/.*${2}: *//" | tr -d '[:space:]'
 }
 
-# per-period ctx_size from the first slot_schedule entry
-slot_ctx_size() {
-    grep -E "^        ctx_size:" "$1" | head -1 | sed 's/.*ctx_size: *//' | tr -d '[:space:]'
-}
-
 CHEAP_SLOTS="$(server_val "$REAL_CONFIG_DIR/config-cheap.yaml" session_slot_pool_size)"
-CHEAP_CTX="$(slot_ctx_size "$REAL_CONFIG_DIR/config-cheap.yaml")"
 CHEAP_POLICY="$(server_val "$REAL_CONFIG_DIR/config-cheap.yaml" contention_queue_policy)"
 CHEAP_COLD="$(server_val "$REAL_CONFIG_DIR/config-cheap.yaml" local_large_context_cold_cache_threshold)"
 CHEAP_LOCAL_CTX="$(server_val "$REAL_CONFIG_DIR/config-cheap.yaml" local_model_ctx_size)"
 
 FAST_SLOTS="$(server_val "$REAL_CONFIG_DIR/config-fast.yaml" session_slot_pool_size)"
-FAST_CTX="$(slot_ctx_size "$REAL_CONFIG_DIR/config-fast.yaml")"
 FAST_POLICY="$(server_val "$REAL_CONFIG_DIR/config-fast.yaml" contention_queue_policy)"
 FAST_COLD="$(server_val "$REAL_CONFIG_DIR/config-fast.yaml" local_large_context_cold_cache_threshold)"
 FAST_LOCAL_CTX="$(server_val "$REAL_CONFIG_DIR/config-fast.yaml" local_model_ctx_size)"
@@ -90,8 +83,8 @@ BASE_SLOTS="$(server_val "$REAL_CONFIG_DIR/config.yaml" session_slot_pool_size)"
 
 # Sanity: the extraction must have found real values (guards against a
 # refactored YAML layout silently dropping the fixture fidelity).
-if [ -z "$CHEAP_SLOTS" ] || [ -z "$CHEAP_CTX" ] || [ -z "$FAST_SLOTS" ] || [ -z "$FAST_CTX" ]; then
-    fail "could not extract mode-relevant values from real configs (cheap slots=$CHEAP_SLOTS ctx=$CHEAP_CTX; fast slots=$FAST_SLOTS ctx=$FAST_CTX)"
+if [ -z "$CHEAP_SLOTS" ] || [ -z "$CHEAP_LOCAL_CTX" ] || [ -z "$FAST_SLOTS" ] || [ -z "$FAST_LOCAL_CTX" ]; then
+    fail "could not extract mode-relevant values from real configs (cheap slots=$CHEAP_SLOTS ctx=$CHEAP_LOCAL_CTX; fast slots=$FAST_SLOTS ctx=$FAST_LOCAL_CTX)"
     exit 1
 fi
 
@@ -118,15 +111,6 @@ models:
         llama_model: Test
 server:
   session_slot_pool_size: $FAST_SLOTS
-  slot_schedule:
-    enabled: true
-    entries:
-      - time: "23:59"
-        slots: $FAST_SLOTS
-        ctx_size: $FAST_CTX
-      - time: "10:00"
-        slots: $FAST_SLOTS
-        ctx_size: $FAST_CTX
   contention_queue_policy: $FAST_POLICY
   local_large_context_cold_cache_threshold: $FAST_COLD
   local_model_ctx_size: $FAST_LOCAL_CTX
@@ -141,15 +125,6 @@ models:
         llama_model: Test
 server:
   session_slot_pool_size: $CHEAP_SLOTS
-  slot_schedule:
-    enabled: true
-    entries:
-      - time: "23:59"
-        slots: $CHEAP_SLOTS
-        ctx_size: $CHEAP_CTX
-      - time: "10:00"
-        slots: $CHEAP_SLOTS
-        ctx_size: $CHEAP_CTX
   contention_queue_policy: $CHEAP_POLICY
   local_large_context_cold_cache_threshold: $CHEAP_COLD
   local_model_ctx_size: $CHEAP_LOCAL_CTX
@@ -185,12 +160,9 @@ slots = server_val("session_slot_pool_size")
 policym = re.search(r"^  contention_queue_policy:\s*(\S+)", src, re.M)
 cold = server_val("local_large_context_cold_cache_threshold")
 local_ctx = server_val("local_model_ctx_size")
-sm = re.search(r"slot_schedule:.*?entries:", src, re.S)
-ctx = None
-if sm:
-    cm = re.search(r"ctx_size:\s*(\d+)", src[sm.end():])
-    if cm:
-        ctx = cm.group(1)
+# No per-period slot schedule (LP-0MTZRM5HV0007S0V): the static
+# local_model_ctx_size is the total context across the pool slots.
+ctx = local_ctx
 effective = 0
 if ctx is not None and slots is not None:
     try:
@@ -199,7 +171,7 @@ if ctx is not None and slots is not None:
             effective = per_slot - 4096
     except (ValueError, ZeroDivisionError):
         effective = 0
-print("FAKE_MODE_FACTS slots=%s schedule_ctx_size=%s policy=%s cold_cache_threshold=%s local_model_ctx_size=%s effective_per_slot_threshold=%s" % (
+print("FAKE_MODE_FACTS slots=%s ctx_size=%s policy=%s cold_cache_threshold=%s local_model_ctx_size=%s effective_per_slot_threshold=%s" % (
     slots, ctx, policym.group(1) if policym else None, cold, local_ctx, effective))
 ' "$LLAMA_PROXY_CONFIG" 2>/dev/null || true
     fi
@@ -326,16 +298,16 @@ test_per_slot_context() {
     printf 'cheap\n' > "$PROXY_DIR/.mode"
     local out
     out=$(run_script)
-    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$CHEAP_SLOTS schedule_ctx_size=$CHEAP_CTX policy=$CHEAP_POLICY cold_cache_threshold=$CHEAP_COLD local_model_ctx_size=$CHEAP_LOCAL_CTX effective_per_slot_threshold=126976"; then
-        pass "cheap per-slot context = 126976 ($CHEAP_CTX//$CHEAP_SLOTS - 4096)"
+    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$CHEAP_SLOTS ctx_size=$CHEAP_LOCAL_CTX policy=$CHEAP_POLICY cold_cache_threshold=$CHEAP_COLD local_model_ctx_size=$CHEAP_LOCAL_CTX effective_per_slot_threshold=126976"; then
+        pass "cheap per-slot context = 126976 ($CHEAP_LOCAL_CTX//$CHEAP_SLOTS - 4096)"
     else
         fail "cheap per-slot context: unexpected output: $out"
     fi
 
     printf 'fast\n' > "$PROXY_DIR/.mode"
     out=$(run_script)
-    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$FAST_SLOTS schedule_ctx_size=$FAST_CTX policy=$FAST_POLICY cold_cache_threshold=$FAST_COLD local_model_ctx_size=$FAST_LOCAL_CTX effective_per_slot_threshold=39594"; then
-        pass "fast per-slot context = 39594 ($FAST_CTX//$FAST_SLOTS - 4096)"
+    if echo "$out" | grep -q "FAKE_MODE_FACTS slots=$FAST_SLOTS ctx_size=$FAST_LOCAL_CTX policy=$FAST_POLICY cold_cache_threshold=$FAST_COLD local_model_ctx_size=$FAST_LOCAL_CTX effective_per_slot_threshold=83285"; then
+        pass "fast per-slot context = 83285 ($FAST_LOCAL_CTX//$FAST_SLOTS - 4096)"
     else
         fail "fast per-slot context: unexpected output: $out"
     fi
@@ -349,14 +321,15 @@ test_web_ui_slots_text() {
         fail "index.html not found at $index_html"
         return
     fi
-    local content
-    content=$(cat "$index_html")
-    if echo "$content" | grep -q "${CHEAP_SLOTS}-slot local pool"; then
+    # grep the FILE directly (not a pipe): under `set -o pipefail` a large
+    # `echo "$content" | grep -q <match>` SIGPIPEs when grep exits early,
+    # making the check flaky (LP-0MTZRM5HV0007S0V touched this test).
+    if grep -q "${CHEAP_SLOTS}-slot local pool" "$index_html"; then
         pass "Web UI slots section says '${CHEAP_SLOTS}-slot local pool' (cheap = $CHEAP_SLOTS slots)"
     else
         fail "Web UI slots section missing '${CHEAP_SLOTS}-slot local pool' text"
     fi
-    if [ "$CHEAP_SLOTS" -ne 1 ] && echo "$content" | grep -q "1-slot local pool"; then
+    if [ "$CHEAP_SLOTS" -ne 1 ] && grep -q "1-slot local pool" "$index_html"; then
         fail "Web UI slots section still says stale '1-slot local pool' (cheap is $CHEAP_SLOTS slots)"
     else
         pass "Web UI slots section has no stale '1-slot local pool' text"

@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
+- **Per-Mode Slot Counts**: Each operating-mode profile (`config.yaml` / `config-fast.yaml` / `config-cheap.yaml`) defines its own local llama-server slot count via `session_slot_pool_size` — one definition per mode, no time-based slot schedule. See [Slot configuration](#slot-configuration) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -76,7 +76,7 @@ python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
 `fast_sessions.csv`, `cheap_sessions.csv`
-(one row per session; fast/cheap split derived from the `slot_schedule` in
+(one row per session; fast/cheap split derived from the mode timeline
 the active config profile), and `report.md` (aggregates + recommendations). Existing
 outputs are archived into a dated subdirectory before each run overwrites
 them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
@@ -912,23 +912,23 @@ restart). With `enabled: false` or a schedule that never changes mode, a
 manual switch persists until the next API call. A switch in progress
 (pending restart) is left alone and retried on the next check.
 
-The schedule is configured in the `mode_schedule` section of the active
-config profile (same section in `config.yaml` / `config-fast.yaml` /
-`config-cheap.yaml`):
+The schedule is configured in the standalone `proxy/mode_schedule.yaml`
+file (NOT inside the model profiles — each profile keeps a single
+slot-count definition, LP-0MTZRM5HV0007S0V):
 
 ```yaml
-mode_schedule:
-  enabled: true
-  entries:
-    - time: "01:00"
-      mode: cheap
-    - time: "10:00"
-      mode: fast
+# proxy/mode_schedule.yaml
+enabled: true
+entries:
+  - time: "01:00"
+    mode: cheap
+  - time: "10:00"
+    mode: fast
 ```
 
-Set `enabled: false` to disable the timer; an absent section uses the
+Set `enabled: false` to disable the timer; an absent file uses the
 built-in schedule above. Entries follow the same "most recent time at or
-before now, wrapping circularly" rule as `slot_schedule`.
+before now, wrapping circularly" rule.
 
 ### Environment Variables
 
@@ -944,51 +944,31 @@ before now, wrapping circularly" rule as `slot_schedule`.
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
 
-### Slot Scheduling
+### Slot configuration
 
-The proxy supports **time-based slot scheduling**, allowing operators to vary the number of concurrent llama-server slots (`session_slot_pool_size` / `--parallel N`) based on the time of day. This is useful when the same server handles both latency-sensitive interactive requests (fewer slots → faster per-request response) and high-throughput batch workloads (more slots).
+Each operating-mode profile defines its local llama-server slot count
+**once** via `session_slot_pool_size` (the pool size / `--parallel N`):
 
-#### Configuration
+| Profile | Slots |
+|---------|-------|
+| `config.yaml` (default/fallback) | 3 |
+| `config-fast.yaml` | 3 |
+| `config-cheap.yaml` | 2 |
 
-Add a `slot_schedule` section under `server:` in `config.yaml`:
+There is **no time-based slot schedule** (the previous `slot_schedule`
+mechanism was removed, LP-0MTZRM5HV0007S0V): the slot count changes only
+when the operating mode changes, because a mode switch restarts the proxy
+with the new profile. Each profile also pins its total context
+(`local_model_ctx_size`, 262144 in all three), so the per-slot context is
+always `local_model_ctx_size // session_slot_pool_size`.
 
-```yaml
-server:
-  slot_schedule:
-    enabled: true
-    entries:
-      - time: "10:00"
-        slots: 4
-      - time: "12:00"
-        slots: 8
-```
+#### Changing the slot count
 
-| Field | Description |
-|-------|-------------|
-| `enabled` | Set to `true` to activate the schedule. When `false` or absent, the feature is disabled and the static `session_slot_pool_size` value is used (backward compatible). |
-| `drain_minutes` | **Deprecated — ignored.** Parsed for backward compatibility only; transitions no longer have a drain window (LP-0MSF9RUSQ007M346). |
-| `entries` | List of time-to-slot mappings. Each entry has a `time` (HH:MM format) and a `slots` value. Entries are sorted chronologically. |
-
-#### How It Works
-
-1. At startup, the proxy reads the `slot_schedule` section from `config.yaml`.
-2. A background scheduler checks the current time against the schedule and sleeps until the next transition where the slot count changes.
-3. At the transition time, llama-server is restarted immediately with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
-4. There is **no drain window and no 503 rejection period** (LP-0MSF9RUSQ007M346): requests continue to be served until the restart. In-flight requests are terminated by the restart and clients retry.
-
-#### Disabling
-
-To disable the feature, either:
-- Set `enabled: false` in the `slot_schedule` section, or
-- Remove the `slot_schedule` section entirely from `config.yaml`.
-
-When disabled, the proxy uses the static `session_slot_pool_size` value (unchanged from the original behavior).
-
-#### Midnight Wrapping
-
-The schedule supports midnight wrapping: if only one entry is defined (e.g., `10:00 → 4`), the slot count wraps to the last entry's value from the previous day during the hours before the first entry. This ensures a sensible slot count is always active, even before the first scheduled transition of the day.
-
-### Upstream Timeout Configuration
+Edit the profile's `session_slot_pool_size` and restart the proxy (no hot
+reload). Fast/default use 3 slots; cheap uses 2. The slot count feeds
+llama-server's `--parallel` (via `LLAMA_PARALLEL`, set by the lifecycle)
+and the local dispatch lease pool — keep `session_slot_pool_size` aligned
+with what llama-server actually runs.### Upstream Timeout Configuration
 
 The proxy uses two separate timeout values for upstream remote connections:
 

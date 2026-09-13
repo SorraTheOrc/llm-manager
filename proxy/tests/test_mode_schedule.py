@@ -1,12 +1,12 @@
 """Tests for the automatic fast/cheap mode schedule (LP-0MSM5K4TX004MICX).
 
 Covers the schedule semantics (cheap 01:00-10:00, fast 10:00-01:00 with
-midnight wrap), config parsing (disabled / custom / invalid entries /
-built-in fallback), and the background enforcement step (applies the
-scheduled mode when the persisted mode diverges, defers while a restart is
-pending). The enforcement-step tests isolate the manual-override state file
-so they are hermetic — a live proxy override in the checkout never leaks
-into them (LP-0MSMM59TU002X1HA).
+midnight wrap), config parsing from the standalone ``proxy/mode_schedule.yaml``
+file (disabled / custom / invalid entries / built-in fallback), and the
+background enforcement step (applies the scheduled mode when the persisted
+mode diverges, defers while a restart is pending). The enforcement-step tests
+isolate the manual-override state file so they are hermetic — a live proxy
+override in the checkout never leaks into them (LP-0MSMM59TU002X1HA).
 """
 
 from datetime import datetime
@@ -113,16 +113,42 @@ class TestModeScheduleConfig:
             (T(10, 0), "fast"),
         ]
 
-    def test_from_server_config_reads_server_section(self):
-        schedule = ModeScheduleConfig.from_server_config(
-            {"mode_schedule": {"enabled": False, "entries": []}}
+    def test_from_file_reads_schedule(self, tmp_path):
+        path = tmp_path / "mode_schedule.yaml"
+        path.write_text(
+            "enabled: false\nentries:\n  - time: '00:01'\n    mode: cheap\n",
+            encoding="utf-8",
         )
+        schedule = ModeScheduleConfig.from_file(path)
         assert schedule.enabled is False
 
-    def test_from_server_config_absent_section(self):
-        schedule = ModeScheduleConfig.from_server_config({})
+    def test_from_file_absent_uses_builtin(self, tmp_path):
+        schedule = ModeScheduleConfig.from_file(tmp_path / "missing.yaml")
         assert schedule.enabled is True
         assert schedule.active_mode(T(3, 0)) == "cheap"
+
+    def test_from_file_invalid_yaml_uses_builtin(self, tmp_path):
+        path = tmp_path / "mode_schedule.yaml"
+        path.write_text("enabled: [unclosed\n", encoding="utf-8")
+        schedule = ModeScheduleConfig.from_file(path)
+        assert schedule.enabled is True
+        assert [(e.time, e.mode) for e in schedule.entries] == [
+            (T(1, 0), "cheap"),
+            (T(10, 0), "fast"),
+        ]
+
+    def test_from_file_default_path_is_proxy_mode_schedule_yaml(self):
+        assert mode_module.mode_schedule_file().name == "mode_schedule.yaml"
+        assert mode_module.mode_schedule_file().parent == mode_module.proxy_dir()
+
+    def test_shipped_default_schedule_file_matches_builtin(self):
+        """The repo's proxy/mode_schedule.yaml is the documented default."""
+        schedule = ModeScheduleConfig.from_file()
+        assert schedule.enabled is True
+        assert [(e.time, e.mode) for e in schedule.entries] == [
+            (T(1, 0), "cheap"),
+            (T(10, 0), "fast"),
+        ]
 
     def test_entries_sorted_by_time(self):
         schedule = ModeScheduleConfig({"enabled": True, "entries": [

@@ -521,7 +521,7 @@ server:
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
-  # ctx-size) and the slot_schedule ctx_size pins below. Used to compute the
+  # ctx-size). Used to compute the
   # actual per-slot context (ctx_size / active_slots) which clamps the
   # large-context routing thresholds (LP-0MSAZXXDY005AWA1). 0 disables the
   # clamp.
@@ -558,8 +558,8 @@ server:
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
   # routing threshold (local_model_ctx_size // slots - 4096 output headroom,
-  # mirroring provider.py) for the static session_slot_pool_size AND every
-  # slot_schedule entry. When the threshold falls below
+  # mirroring provider.py) for the profile's session_slot_pool_size. When
+  # the threshold falls below
   # min_local_routing_threshold (default 10000), a WARNING is logged at
   # startup. A threshold this small means every realistic agent session
   # exceeds the clamp, silently bypassing ALL local traffic to remote
@@ -663,92 +663,12 @@ server:
   contention_queue_max_wait_seconds: 45
   contention_queue_max_depth: 3
 
-  # -----------------------------------------------------------------------
-  # Slot schedule (LP-0MRXZU90M007WNWT)
-  # -----------------------------------------------------------------------
-  # Time-based slot count scheduling. When enabled, the proxy automatically
-  # varies the number of concurrent slots (``--parallel N``) based on the
-  # time of day. Transitions apply immediately: at the scheduled time the
-  # proxy restarts llama-server with the new slot count. There is NO drain
-  # window and no 503 rejection period (LP-0MSF9RUSQ007M346); in-flight
-  # requests are terminated by the restart and clients retry.
+  # Slot count is defined ONCE per mode profile via ``session_slot_pool_size``
+  # above (default/fast: 3, cheap: 2). There is no time-based slot schedule:
+  # the slot count changes only when the operating mode changes. The
+  # mode-switch schedule (when to switch fast<->cheap) lives in the
+  # standalone ``proxy/mode_schedule.yaml`` file, not in this model profile.
   #
-  # Disabled by default (no schedule → static slot count from
-  # ``session_slot_pool_size`` above).
-  #
-  # Fields:
-  #   enabled:        Set to true to activate scheduling.
-  #   drain_minutes:  DEPRECATED — parsed for backward compatibility but
-  #                   IGNORED. Transitions no longer have a drain window.
-  #   entries:        List of transition rules. Each entry has:
-  #     time:         "HH:MM" format (24-hour). The time at which the new
-  #                   slot count becomes active.
-  #     slots:        The ``--parallel N`` value to apply from this time
-  #                   onward until the next entry.
-  #     ctx_size:     OPTIONAL per-period total context (llama-server
-  #                   ``--ctx-size``) while this entry is active; overrides
-  #                   the global ``local_model_ctx_size`` below
-  #                   (LP-0MSLNK96T0018W4D).
-  #
-  # Time-based slot count transitions (LP-0MSF9RUSQ007M346).
-  #
-  # Each entry maps a time-of-day to a slot count. Entries may also carry
-  # an optional per-period ctx_size (LP-0MSLNK96T0018W4D): the total
-  # context across all slots (llama-server --ctx-size) while that entry is
-  # active, overriding the global local_model_ctx_size below. When absent,
-  # the global local_model_ctx_size applies. The routing clamp and
-  # session_slot_max_prompt_tokens derive per-slot thresholds from the
-  # ACTIVE period's (ctx_size, slots) — keep clamp × slots <= the real
-  # rounded n_ctx (llama.cpp pads n_ctx_seq up to 256).
-  #
-  # Example:
-  #   slot_schedule:
-  #     enabled: true
-  #     drain_minutes: 3  # DEPRECATED — ignored
-  #     entries:
-  #       - time: "10:00"
-  #         slots: 3
-  #       - time: "23:59"
-  #         slots: 2
-  #         ctx_size: 262144
-  #
-  # Entries with the same slot count as the current value are skipped
-  # (no unnecessary restart) UNLESS the per-period ctx_size differs.
-  # Midnight wrapping is supported.
-  # Fast mode stays 3 slots @ 262144 total ctx (per-slot ~87.4K) — operator
-  # supersede 2026-08-18 (LP-0MSY0SDAS0031Y7F) of the 3x87.4K NO-GO
-  # (LP-0MSAOQTJS000FFVM / LP-0MSEGPO77005CYCQ); see local_model_ctx_size
-  # above for rationale. The explicit ctx_size: 262144 pins below ensure a
-  # future models.ini [Qwen3] ctx-size change cannot leak into fast mode: the
-  # slot-scheduler only applies per-period ctx via a transition/catch-up
-  # restart, and static local_model_ctx_size (262144) matches these entries so
-  # fast boots correct from the shared base.
-  slot_schedule:
-    enabled: true
-    drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
-    entries:
-      - time: "23:59"
-        slots: 3
-        ctx_size: 262144
-      - time: "10:00"
-        slots: 3
-        ctx_size: 262144
-  # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
-  # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
-  # times. A manual API switch (POST /admin/set-mode) overrides the schedule
-  # until the next scheduled transition (LP-0MSMF25V9002AY1J). The active
-  # entry is the most
-  # recent one at or before the current time (circular wrap, so the last
-  # entry covers 00:00-00:59). Set enabled: false to disable; an absent
-  # section uses this same built-in schedule.
-  mode_schedule:
-    enabled: true
-    entries:
-      - time: "01:00"
-        mode: cheap
-      - time: "10:00"
-        mode: fast
-
   # -----------------------------------------------------------------------
   # Session grandfathering across mode switches (LP-0MSMF5LXO006YDNM)
   # -----------------------------------------------------------------------
@@ -761,7 +681,7 @@ server:
   # guarantee for those grandfathered sessions only, and only within the grace
   # deadline. New sessions (and requests without a session id) are never
   # grandfathered. Set enabled: false to turn the whole feature off.
-  # fallback_grace_seconds: only used when mode_schedule is disabled
+  # fallback_grace_seconds: only used when the mode schedule is disabled
   # (default = session TTL, 3h).
   mode_switch_grandfathering:
     enabled: true
