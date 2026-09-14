@@ -221,7 +221,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -237,7 +237,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -253,7 +253,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -289,7 +289,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -305,7 +305,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -321,7 +321,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -355,7 +355,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -371,7 +371,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -387,7 +387,7 @@ models:
         # Deepseek
         #
         model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
