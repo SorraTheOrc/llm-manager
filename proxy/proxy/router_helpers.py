@@ -1834,7 +1834,18 @@ async def _recover_stuck_generating_queries(srv) -> None:
                 # keys.
                 record = records.get(key)
                 if record is None and not isinstance(key, tuple):
+                    # Direct string-key lookup failed. Try the legacy
+                    # ("local", session) tuple key.
                     record = records.get(("local", key))
+                    # If that also fails, the dispatch record may be keyed
+                    # by a full endpoint URL tuple (endpoint_url, session).
+                    # Search through all tuple keys for a match.
+                    if record is None:
+                        for rk in records:
+                            if isinstance(rk, tuple) and len(rk) == 2:
+                                if rk[1] == key:
+                                    record = records[rk]
+                                    break
                 if record is None or not record.get("active", False):
                     stale_keys.add(key)
             # The session set is authoritative for the legitimate count.
