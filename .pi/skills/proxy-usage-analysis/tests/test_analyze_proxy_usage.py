@@ -17,6 +17,7 @@ Fixtures are derived from real lines in /var/log/llama-proxy/proxy.log
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import re
 import sys
@@ -407,15 +408,53 @@ class TestErrorLineParsing:
         assert len(events) == 1
         assert events[0].src_file == "proxy.log.2026-08-03_13"
 
+    def test_iter_events_decompresses_gzip_rotated_file(self, tmp_path):
+        """A ``.gz`` rotated file is transparently decompressed and parsed.
+
+        Regression: gzip-suffixed files were discovered but read as plain
+        text, yielding 0 parseable lines and silently dropping all in-window
+        data (real case: proxy.log.2026-09-13_00.gz holds 778 stream starts).
+        """
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        path = log_dir / "proxy.log.2026-08-03_13.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            fh.write(fixtures.STREAM_ERROR_LINE + "\n")
+        events = list(
+            log_parser.iter_events(path, ERROR_WINDOW_START, ERROR_WINDOW_END)
+        )
+        assert len(events) == 1
+        assert events[0].kind == "stream_error"
+        assert events[0].src_file == "proxy.log.2026-08-03_13.gz"
+
+    def test_iter_events_between_gzip_and_plain_same_content(self, tmp_path):
+        """Plain and gzipped forms of the same log line yield identical events."""
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        plain = log_dir / "proxy.log.2026-08-03_13"
+        gz = log_dir / "proxy.log.2026-08-03_13.gz"
+        plain.write_text(fixtures.STREAM_ERROR_LINE + "\n")
+        with gzip.open(gz, "wt", encoding="utf-8") as fh:
+            fh.write(fixtures.STREAM_ERROR_LINE + "\n")
+        from_plain = list(log_parser.iter_events(plain, ERROR_WINDOW_START, ERROR_WINDOW_END))
+        from_gz = list(log_parser.iter_events(gz, ERROR_WINDOW_START, ERROR_WINDOW_END))
+        assert len(from_plain) == len(from_gz) == 1
+        assert from_plain[0].ts == from_gz[0].ts
+        # src_file reflects the actual source path
+        assert from_plain[0].src_file == "proxy.log.2026-08-03_13"
+        assert from_gz[0].src_file == "proxy.log.2026-08-03_13.gz"
+
 
 class TestDiscoverLogFiles:
     """Discovery of proxy log files for an analysis window.
 
-    Rotated files (``proxy.log.YYYY-MM-DD_HH``) are included regardless of
-    their name-encoded timestamp: in this deployment a rotated file routinely
-    holds data well past its encoded rotation time (e.g. ``proxy.log.2026-08-07_03``
-    contains data until 09:03), so discovery must never exclude a file based on
-    its name. ``iter_events`` per-line timestamp filtering is the only boundary.
+    Two rotation mechanisms produce two naming patterns in this deployment:
+    in-process ``TimedRotatingFileHandler`` → ``proxy.log.YYYY-MM-DD_HH`` (dot)
+    and logrotate safety net → ``proxy.log-YYYY-MM-DD_HH`` (dash). Both are
+    included regardless of name-encoded timestamp: rotated files routinely hold
+    data well past their encoded rotation time, so discovery must never exclude
+    a file based on its name. ``iter_events`` per-line timestamp filtering is
+    the only boundary.
     """
 
     def test_live_log_always_included(self, tmp_path):
@@ -484,6 +523,50 @@ class TestDiscoverLogFiles:
         assert [p.name for p in files] == [
             "proxy.log",
             "proxy.log.2026-08-01_10",
+            "proxy.log.2026-08-02_14",
+        ]
+
+    def test_gzipped_rotated_files_included(self, tmp_path):
+        """Plain and gzipped rotated files are both discovered.
+
+        Both rotation mechanisms may compress older files, so discovery must
+        return ``.gz`` and plain siblings; ``iter_events`` decompresses.
+        """
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        for name in [
+            "proxy.log.2026-08-02_14.gz",
+            "proxy.log-2026-08-02_14.gz",
+            "proxy.log.2026-08-02_14",
+            "proxy.log-2026-08-02_14",
+        ]:
+            (log_dir / name).write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert {p.name for p in files} == {
+            "proxy.log.2026-08-02_14.gz",
+            "proxy.log-2026-08-02_14.gz",
+            "proxy.log.2026-08-02_14",
+            "proxy.log-2026-08-02_14",
+        }
+
+    def test_dotted_and_dashed_files_sorted_correctly(self, tmp_path):
+        """Both dot and dash rotated files appear in sorted order.
+
+        '-' (0x2D) sorts before '.' (0x2E) in ASCII, so dash files come
+        before dot files for the same date.
+        """
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        for name in [
+            "proxy.log.2026-08-02_14",
+            "proxy.log-2026-08-02_14",
+            "proxy.log",
+        ]:
+            (log_dir / name).write_text("garbage\n")
+        files = log_parser.discover_log_files(log_dir, WINDOW_START)
+        assert [p.name for p in files] == [
+            "proxy.log",
+            "proxy.log-2026-08-02_14",
             "proxy.log.2026-08-02_14",
         ]
 
@@ -2271,6 +2354,58 @@ class TestEndToEnd:
         )
         assert log_dir / "proxy.log.2026-08-02_13" in result.files
         assert set(result.summary.sessions) == {"carried", "live"}
+
+    def test_window_straddling_dash_file_boundary(self, tmp_path):
+        """A window spanning a dash-file boundary reports sessions from both sides.
+
+        The dash file holds the earlier part of the window and the live log the
+        later part. Both must contribute; before the fix the dash file was
+        undiscovered and its sessions vanished despite falling inside the
+        window.
+        """
+        log_dir = tmp_path / "logs-dash-boundary"
+        log_dir.mkdir()
+        (log_dir / "proxy.log-2026-08-02_13").write_text(
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=early request=[]\n"
+            "2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=early provider=local model=Qwen3 request=[]\n"
+        )
+        (log_dir / "proxy.log").write_text(
+            "2026-08-02 14:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=late request=[]\n"
+            "2026-08-02 14:30:02,000 - INFO - Stream finished: reason=stop tokens=200/20/220 session=late provider=local model=Qwen3 request=[]\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out-dash-boundary",
+            config=None,
+        )
+        assert log_dir / "proxy.log-2026-08-02_13" in result.files
+        assert set(result.summary.sessions) == {"early", "late"}
+
+    def test_gzipped_dash_file_contributes_sessions(self, tmp_path):
+        """A gzipped dash-named rotated file contributes its in-window sessions.
+
+        Combines both defects: the dash name must be discovered AND the gzip
+        payload must be decompressed. Reading a ``.gz`` as plain text yields no
+        parseable lines, so the session would be silently absent.
+        """
+        log_dir = tmp_path / "logs-dash-gz"
+        log_dir.mkdir()
+        with gzip.open(log_dir / "proxy.log-2026-08-02_13.gz", "wt", encoding="utf-8") as fh:
+            fh.write(
+                "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=gzsession request=[]\n"
+                "2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=gzsession provider=local model=Qwen3 request=[]\n"
+            )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out-dash-gz",
+            config=None,
+        )
+        assert log_dir / "proxy.log-2026-08-02_13.gz" in result.files
+        assert list(result.summary.sessions) == ["gzsession"]
 
 
 class TestDefaultOutputDir:
