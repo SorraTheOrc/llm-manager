@@ -220,6 +220,13 @@ models:
         #
         # Deepseek
         #
+        # IMPORTANT: deepseek-v4-flash via api.deepseek.com has available_times
+        # windows that leave gaps (UTC 01:00-04:00 and 06:00-10:00). During
+        # these gaps the provider is skipped and requests fall to the next
+        # available provider (or enter chain-hold retry). The 10:00-00:00
+        # window covers 14 hours; the 3+2 hour gaps are accepted risk.
+        # (LP-0MU1RXEPL005CK97)
+        #
         model: deepseek-v4-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
@@ -848,10 +855,10 @@ server:
   # Raised from 120 to 240s (LP-0MSF5I7XN009ENWQ / LP-0MSF1PUM90099ZSW F4):
   # opencode-go/deepseek-v4-flash frequently pause >120s mid-generation while
   # still alive, so the lower bound produced false stalls (~31% of requests).
-  # Trade-off: true failures are detected more slowly (up to 240s of silence).
-  # The stall-gap distribution analysis (LP-0MSF5IAXE005BG33) will refine this.
-  # Default: 240 seconds.
-  upstream_idle_timeout_seconds: 240
+  # Trade-off: true failures are detected more slowly (up to 30s of silence).
+  # Bounded by upstream_request_timeout_seconds (120s) — the idle timeout
+  # never exceeds the total request timeout. See LP-0MU1RXEPL005CK97.
+  upstream_idle_timeout_seconds: 30
 
   # Remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
   # The per-chunk idle timeout above only fires on SILENCE — an upstream
@@ -939,6 +946,12 @@ server:
   # Base delay (in seconds) before retrying on empty response.
   # Default: 3.0 seconds.
   upstream_empty_retry_base_delay_seconds: 3.0
+  # Total time budget (in seconds) for empty-response retries across all
+  # attempts. Once this budget is exceeded, retries stop immediately and the
+  # error is returned for fallback. This prevents infinite retry loops when
+  # an upstream consistently returns empty bodies. Default: 30 seconds.
+  # (LP-0MU1RXEPL005CK97)
+  upstream_empty_retry_timeout_seconds: 30
 
   # Bounded provider retry failover budget (LP-0MU1RXEPL005CK97).
   # Hard wall-clock cap on the total time a single remote provider may spend
