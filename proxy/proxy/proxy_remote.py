@@ -1088,6 +1088,7 @@ async def _handle_remote_streaming(
     upstream_retry_connect_timeout_seconds: float | None = None,
     upstream_max_stream_duration_seconds: float | None = None,
     upstream_activity_timeout_seconds: float | None = None,
+    upstream_retry_failover_budget_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
     responses_mode: bool = False,
 ) -> Response:
@@ -1164,6 +1165,26 @@ async def _handle_remote_streaming(
             )
         except Exception:
             upstream_activity_timeout_seconds = 1800.0
+
+    # Bounded provider failover budget (LP-0MU1RXEPL005CK97). A hard
+    # wall-clock cap on the time a single remote provider may spend retrying
+    # stalls/empty responses (including backoff sleeps) before yielding a
+    # terminal error so the fallback chain routes to the next provider.
+    # Without it the per-chunk idle-timeout wait repeats once per Tier-1
+    # retry (default 4 x 240s) plus empty-response retries, so one stalled
+    # gateway can sit in the request's critical path far past the client's
+    # 900s queue-timeout. The budget only applies while ZERO content-bearing
+    # chunks have been delivered: once content is flowing the stream is
+    # governed by the idle/activity/max-duration budgets instead.
+    if upstream_retry_failover_budget_seconds is None:
+        try:
+            upstream_retry_failover_budget_seconds = float(
+                _srv().config.get("server", {}).get(
+                    "upstream_retry_failover_budget_seconds", 300
+                ) or 300
+            )
+        except Exception:
+            upstream_retry_failover_budget_seconds = 300.0
 
     # Resolve upstream_retry_connect_timeout_seconds from parameter or config
     if upstream_retry_connect_timeout_seconds is None:
@@ -1326,6 +1347,12 @@ async def _handle_remote_streaming(
 
         # Per-chunk idle timeout and retry state (LP-0MRE52D3C001KP1H)
         _retry_count = 0
+        # Bounded provider failover deadline (LP-0MU1RXEPL005CK97): wall-clock
+        # deadline for the total time this provider may spend retrying
+        # stalls/empty responses before a terminal error triggers failover.
+        _failover_deadline = (
+            time.monotonic() + upstream_retry_failover_budget_seconds
+        )
         # Remote-stream watchdog state (LP-0MSVP7ZML003XZTJ): bounded
         # deadlines that terminate a "connected but idle" stream which the
         # per-chunk idle timeout cannot catch (heartbeats flowing, no
@@ -1350,6 +1377,75 @@ async def _handle_remote_streaming(
         # iteration 0; retries are iterations 1..max_retries) or
         # empty-response retry (LP-0MRF77A0E0026B9T).
         while True:
+            # Bounded provider failover budget (LP-0MU1RXEPL005CK97): once a
+            # provider has spent its retry budget without delivering any
+            # content, stop retrying and yield a terminal error so the
+            # fallback chain fails over. Checked BEFORE the stall/empty retry
+            # handlers so a pending retry cannot extend the critical path.
+            if (
+                (_should_retry or _should_empty_retry)
+                and not _has_content
+                and time.monotonic() >= _failover_deadline
+            ):
+                _failover_elapsed = upstream_retry_failover_budget_seconds - max(
+                    0.0, _failover_deadline - time.monotonic()
+                )
+                try:
+                    _srv().logger.warning(
+                        "Upstream retry failover budget exhausted: yielding "
+                        "terminal error session=%s provider=%s model=%s "
+                        "budget=%.2fs elapsed=%.2fs stall_retries=%d "
+                        "empty_retries=%d",
+                        session_id or "unknown",
+                        provider or "remote",
+                        model_name,
+                        upstream_retry_failover_budget_seconds,
+                        _failover_elapsed,
+                        _retry_count,
+                        _empty_retry_count,
+                    )
+                except Exception:
+                    pass
+                # Record the failure in the Tier 3 circuit breaker so repeated
+                # failover-budget exhaustions accumulate toward cooldown
+                # (LP-0MRFEXXVC001RYKB).
+                try:
+                    _config = _srv().config if hasattr(_srv(), "config") else {}
+                    _check_stall_circuit_breaker(provider or "remote", _config)
+                except Exception:
+                    pass
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="retry_budget_exhausted",
+                    message=(
+                        "Remote provider spent its "
+                        f"{upstream_retry_failover_budget_seconds:.0f}s retry "
+                        "failover budget without delivering content"
+                    ),
+                    suggested_action=(
+                        "Failing over to the next provider; check upstream "
+                        "gateway health"
+                    ),
+                    session_id=session_id,
+                )
+                _final_error_bytes = (
+                    f"data: {json.dumps(_final_error_obj)}\n\n"
+                ).encode()
+                if collected_chunks is not None:
+                    collected_chunks.append(_final_error_bytes)
+                yield _final_error_bytes
+                log_response_chunk(
+                    _final_error_bytes,
+                    session_id=session_id,
+                    model=model_name,
+                    provider=provider,
+                    body_json=body_json,
+                    entry=entry,
+                )
+                break
+
             if _should_empty_retry:
                 _should_empty_retry = False
                 _empty_retry_count += 1
@@ -1371,7 +1467,15 @@ async def _handle_remote_streaming(
                     )
                 except Exception:
                     pass
-                await asyncio.sleep(empty_base_delay)
+                # Cap the empty-retry sleep by the remaining failover budget
+                # (LP-0MU1RXEPL005CK97) so the budget stays a hard bound.
+                _empty_sleep = empty_base_delay
+                if not _has_content:
+                    _empty_sleep = min(
+                        _empty_sleep,
+                        max(0.0, _failover_deadline - time.monotonic()),
+                    )
+                await asyncio.sleep(_empty_sleep)
                 # Create fresh stream connection for empty retry
                 try:
                     _current_client = _pool_client
@@ -1519,6 +1623,13 @@ async def _handle_remote_streaming(
                     retry_base_delay * (2 ** (_retry_count - 1)),
                     retry_max_delay,
                 )
+                # Cap the backoff by the remaining failover budget
+                # (LP-0MU1RXEPL005CK97) so the budget stays a hard bound.
+                if not _has_content:
+                    _backoff_delay = min(
+                        _backoff_delay,
+                        max(0.0, _failover_deadline - time.monotonic()),
+                    )
                 try:
                     _srv().logger.info(
                         "Upstream stall: retrying session=%s provider=%s model=%s attempt=%d backoff=%.1fs",
@@ -1602,6 +1713,13 @@ async def _handle_remote_streaming(
                         _duration_remaining,
                         _activity_remaining,
                     )
+                    if not _has_content:
+                        # Pre-content reads cannot extend past the retry
+                        # failover deadline (LP-0MU1RXEPL005CK97).
+                        _read_budget = min(
+                            _read_budget,
+                            max(0.0, _failover_deadline - _now),
+                        )
                     try:
                         chunk = await asyncio.wait_for(
                             _aiter.__anext__(),

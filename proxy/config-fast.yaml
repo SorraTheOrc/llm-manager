@@ -854,6 +854,23 @@ server:
   # Default: 3.0 seconds.
   upstream_empty_retry_base_delay_seconds: 3.0
 
+  # Bounded provider retry failover budget (LP-0MU1RXEPL005CK97).
+  # Hard wall-clock cap on the total time a single remote provider may spend
+  # retrying stalls/empty responses (including backoff sleeps) before the
+  # proxy yields a terminal finish_reason:error (error.type
+  # retry_budget_exhausted) so the fallback chain fails over to the next
+  # provider. Without this the per-chunk idle timeout
+  # (upstream_idle_timeout_seconds, default 240s) repeats once per Tier-1
+  # retry (default 4 x 240s) plus empty-response retries, so one stalled
+  # gateway can sit in the request's critical path past the client's 900s
+  # queue-timeout.
+  # The budget applies only while ZERO content-bearing chunks have been
+  # delivered; once content is flowing the stream is governed by the
+  # idle/activity/max-duration budgets instead, so productive streams are
+  # never cut off. Failover-budget exhaustion is logged with the configured
+  # budget and elapsed time. Default: 300 seconds.
+  upstream_retry_failover_budget_seconds: 300
+
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy
   # emits {"type":"heartbeat"} events every N seconds to keep the client
