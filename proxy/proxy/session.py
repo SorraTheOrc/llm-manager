@@ -1546,6 +1546,18 @@ def merge_session_history_for_update(
     assistant_content: str | None,
     assistant_message: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """Merge session history for update after a response.
+
+    When ``is_delta_request`` and ``delta_messages`` are present, appends
+    the delta to the existing messages. Otherwise replaces the session's
+    history with ``request_messages`` from the client.
+
+    **Dispatch-base contract (LP-0MTXGU9N1009QNSB AC3):** when compaction
+    fires, the dispatch body carries the compacted history (not the
+    client's original full history). The ``request_messages`` in that
+    case ARE the compacted messages, so this function correctly stores
+    the compacted base — ensuring durability across turns.
+    """
     if is_delta_request and delta_messages:
         merged = list(existing_messages) + list(delta_messages)
     else:
@@ -1579,6 +1591,13 @@ def _classify_delta_routing(
 
     When ``require_restore_signal`` is True, delta routing requires explicit
     restore confirmation from backend signals/logs.
+
+    ``force_full_prompt=True`` (set by config for all proxy models) disables
+    delta routing — the session must dispatch its full prompt every turn.
+    This is the legacy path that prevented compaction from being durable
+    (LP-0MTXGU9N1009QNSB): the client resends its full, uncompacted history
+    every request, and ``force_full_prompt`` causes the proxy to reject
+    delta routing and replace the session store with the client's full body.
 
     Returns (use_delta, reason) where reason is None when delta can be used,
     or a string explaining why a full re-process is required.

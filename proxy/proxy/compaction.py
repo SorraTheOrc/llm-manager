@@ -29,6 +29,19 @@ production routing estimator (``_estimate_prompt_tokens_for_routing``);
 unit tests inject deterministic estimators. Output is fully deterministic
 for a given input (AC7 — composes with slot save/restore).
 
+Dispatch-base contract (LP-0MTXGU9N1009QNSB AC1/AC3/AC5):
+  When compaction fires and is applied, the compacted message list replaces
+  the client's full history in the dispatch body. This compacted list is
+  the **dispatch base** — it is what the session stores, what subsequent
+  turns compute deltas against, and what the llama-server processes to
+  compute the KV prefix. The slot save that follows uses the KV cache
+  computed from this dispatch base, so the compacted prefix IS the saved
+  prefix. On slot restore, the same compacted prefix is replayed.
+
+  This means compaction is **durable across turns**: the next request
+  dispatches compacted + new turns (not the client's original full history),
+  and the session stays within the per-slot budget.
+
 The backstop (``truncate_backstop``, LP-0MTGBOYJX006KVN8) is the logged
 safety net: when the summary path alone leaves the session over budget it
 drops the oldest whole recent turns; ``plan_session_compaction(backstop=True)``
