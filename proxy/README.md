@@ -628,6 +628,28 @@ repeatedly across requests is quarantined after the threshold is exceeded.
 - **Integration**: Uses the same `mark_provider_unavailable()` mechanism as Tier 2.
   Stalls during cooldown are recorded but do not extend the cooldown.
 
+##### Local HTTP 400 Observability & Deterministic Escalation (LP-0MTXEBQ4E001BMI2)
+
+A local 4xx is treated as a request-shape incompatibility: the request falls
+back to the next provider WITHOUT poisoning the local provider cooldown
+(transient one-off noise stays cheap). But local 400 rejections were
+otherwise **silent** — no log line, no metric — so a 400 that is
+deterministic for a session (e.g. a compacted history llama-server rejects
+every turn) routed remote invisibly turn after turn.
+
+- **Per occurrence:** every local 400 logs
+  `Local HTTP 400 from provider=... body_snippet=<upstream body>` at INFO and
+  increments `proxy_http_errors_total{status="400", reason="local_http_400"}`
+  so the rejection cause is discoverable from the snippet.
+- **Deterministic repeat:** when the SAME session repeats a local 400 within
+  a 600 s sliding window (threshold 2), a WARNING
+  (`Deterministic local HTTP 400: ...`) plus
+  `proxy_http_errors_total{status="400", reason="local_http_400_deterministic"}`
+  escalates the failure instead of silently routing remote each turn. A
+  successful local dispatch resets the streak (only unbroken same-session 400
+  runs escalate). No cooldown is applied either way — the local provider
+  stays eligible for the next request.
+
 #### All Providers Exhausted
 
 When all providers are exhausted:

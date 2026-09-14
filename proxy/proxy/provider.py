@@ -122,6 +122,36 @@ _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS = 600  # 10 minutes
 _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS = 600  # 10 minutes
 
 # ---------------------------------------------------------------------------
+# Deterministic local HTTP 400 escalation (LP-0MTXEBQ4E001BMI2)
+#
+# A local 4xx is treated as a request-shape incompatibility: same-request
+# fallback to the next provider WITHOUT local cooldown (transient one-off
+# noise must stay cheap — AC4). But a 400 that repeats turn after turn for
+# the SAME session on the SAME history is deterministic — compacted history
+# that llama-server rejects every time — and would otherwise route remote
+# silently forever. These streaks escalate to a visible WARNING + dedicated
+# metric once they cross the threshold.
+#
+# State is in-memory (no persistence), consistent with the sibling-failure
+# and cooldown mechanisms, and bounded by a stale-entry prune.
+# ---------------------------------------------------------------------------
+
+# Consecutive local-400 count per (session_id, provider): the number of
+# consecutive same-session local 400s within the sliding window.
+_local_http_400_streaks: dict[tuple[str, str], dict[str, float | int]] = {}
+
+# Repeat threshold: the 2nd same-session local 400 within the window is
+# already 'turn after turn' — escalate.
+_DETERMINISTIC_LOCAL_400_THRESHOLD = 2
+
+# Sliding window (seconds) for the local-400 streak before it resets.
+_DETERMINISTIC_LOCAL_400_WINDOW_SECONDS = 600.0  # 10 minutes
+
+# Upper bound on tracked (session, provider) streak entries before pruning
+# stale ones (avoids unbounded growth on many short sessions).
+_MAX_LOCAL_HTTP_400_STREAK_ENTRIES = 1000
+
+# ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
 #
 # Provider entries may carry an optional ``available_times`` list of
@@ -3833,6 +3863,113 @@ def _observe_http_error_400(
         pass
 
 
+def _reset_local_http_400_streak(session_id: str | None, provider_name: str) -> None:
+    """Reset the deterministic local-400 streak after a successful dispatch.
+
+    A session whose local 400s are interspersed with successful local
+    dispatches is NOT deterministic — only an unbroken same-session run of
+    400s escalates (LP-0MTXEBQ4E001BMI2, mirroring the sibling-failure
+    streak semantics). Called from the local success paths of
+    ``_proxy_with_fallback_cycle``.
+    """
+    key = (session_id or "unknown", provider_name)
+    _local_http_400_streaks.pop(key, None)
+
+
+def _prune_local_http_400_streaks(now: float) -> None:
+    """Drop stale (session, provider) local-400 streak entries.
+
+    Keeps the in-memory streak dict bounded (LP-0MTXEBQ4E001BMI2); entries
+    whose window has fully elapsed are removed on the prune path.
+    """
+    for key in list(_local_http_400_streaks):
+        entry = _local_http_400_streaks[key]
+        if now - float(entry.get("start", 0.0)) > _DETERMINISTIC_LOCAL_400_WINDOW_SECONDS:
+            del _local_http_400_streaks[key]
+
+
+def _observe_local_http_error_400(
+    response: Response,
+    provider_name: str,
+    path: str,
+    body_text: str,
+    session_id: str | None = None,
+) -> None:
+    """Observability for local HTTP 400 fallbacks (LP-0MTXEBQ4E001BMI2).
+
+    A local 400 is otherwise silent: the local-4xx branch falls back to the
+    next provider without cooldown and without any log/metric, so a
+    request-shape rejection that is deterministic for a session (repeats
+    turn after turn on the same history) invisibly routes remote forever.
+
+    This helper makes every occurrence visible:
+
+    1. **Per occurrence (AC1):** INFO log line with the upstream body
+       snippet plus ``proxy_http_errors_total{status=400, reason="local_http_400"}``
+       so the rejection cause is discoverable (the snippet is the first
+       diagnostic an operator needs to root-cause a compacted-pointer or
+       request-shape 400).
+    2. **Deterministic repeat (AC2):** when the same session repeats the
+       400 within the sliding window (threshold ``_DETERMINISTIC_LOCAL_400_THRESHOLD``),
+       a WARNING + ``local_http_400_deterministic`` metric escalates the
+       failure instead of silently routing remote each turn.
+
+    Transient one-off 400s never cooldown the local provider (the caller's
+    ``http_error_no_cooldown`` path is unchanged — AC4). Best-effort: never
+    raises.
+    """
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return
+        snippet = (body_text or "")[:512]
+        logger.info(
+            "Local HTTP 400 from provider=%s model=%s session=%s body_snippet=%s",
+            provider_name,
+            path,
+            session_id or "unknown",
+            snippet,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", "local_http_400")
+        except Exception:
+            pass
+
+        # Deterministic-repeat escalation (AC2): same session + provider
+        # rejecting turn after turn is a request-shape incompatibility that
+        # will recur every turn; make it visible instead of silent routing.
+        key = (session_id or "unknown", provider_name)
+        now = time.monotonic()
+        entry = _local_http_400_streaks.get(key)
+        if entry is None or now - float(entry.get("start", 0.0)) > _DETERMINISTIC_LOCAL_400_WINDOW_SECONDS:
+            entry = {"count": 0, "start": now}
+            _local_http_400_streaks[key] = entry
+            if len(_local_http_400_streaks) > _MAX_LOCAL_HTTP_400_STREAK_ENTRIES:
+                _prune_local_http_400_streaks(now)
+        entry["count"] = int(entry.get("count", 0) or 0) + 1
+        if int(entry["count"]) >= _DETERMINISTIC_LOCAL_400_THRESHOLD:
+            logger.warning(
+                "Deterministic local HTTP 400: provider=%s model=%s session=%s "
+                "consecutive=%d threshold=%d body_snippet=%s — local rejects this "
+                "history every turn; inspect llama-server for the request-shape cause",
+                provider_name,
+                path,
+                session_id or "unknown",
+                int(entry["count"]),
+                _DETERMINISTIC_LOCAL_400_THRESHOLD,
+                snippet,
+            )
+            try:
+                from proxy.metrics import record_http_error
+
+                record_http_error(path, "400", "local_http_400_deterministic")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _handle_empty_response_with_cooldown(
     response: Response,
     provider_name: str,
@@ -5171,6 +5308,10 @@ async def _proxy_with_fallback_cycle(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
+                # local-400 streak (only unbroken same-session 400 runs escalate).
+                if provider_type == "local":
+                    _reset_local_http_400_streak(_session_id, provider_name)
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 if _pending_reroute:
@@ -5405,6 +5546,19 @@ async def _proxy_with_fallback_cycle(
                             body_snippet=(body_text[:512] if body_text else None),
                         )
                         all_slot_exhaustion = False
+                        # LP-0MTXEBQ4E001BMI2: local 400s are otherwise silent —
+                        # log the upstream body snippet (AC1) and escalate when
+                        # the same session repeats the 400 (AC2), so a
+                        # deterministic compacted-history rejection never routes
+                        # remote invisibly turn after turn.
+                        if int(response.status_code) == 400:
+                            _observe_local_http_error_400(
+                                response,
+                                provider_name,
+                                path,
+                                body_text,
+                                _session_id,
+                            )
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
@@ -5558,6 +5712,10 @@ async def _proxy_with_fallback_cycle(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
+            # local-400 streak (only unbroken same-session 400 runs escalate).
+            if provider_type == "local":
+                _reset_local_http_400_streak(_session_id, provider_name)
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result
