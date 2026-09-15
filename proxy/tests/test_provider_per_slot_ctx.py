@@ -431,3 +431,80 @@ class TestEffectiveLargeContextThresholdsPerMode:
         # 131072 // 3 - 4096 = 39594
         assert warm == 39594
         assert cold == 60000
+
+
+class TestEffectiveLargeContextThresholds1Slot:
+    """1-slot profile routing thresholds (LP-0MU1RXF6R004S8XL).
+
+    The 1-slot profile runs with 262144 ctx / 1 slot = 258048 per-slot cap.
+    The configured warm threshold (100000) is BELOW this cap, so it stays
+    unchanged. This is intentional: compaction handles sessions between
+    the trigger (0.70 × 100000 = 70000) and the warm threshold.
+    """
+
+    def test_1slot_warm_not_clamped(self):
+        """1-slot: 262144 ctx / 1 slot → per-slot cap 258048.
+
+        The warm config (100000) is below the cap, so it passes through
+        unchanged — the clamp is min(100000, 258048) = 100000 (no expansion).
+        """
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 38000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        # 262144 // 1 - 4096 = 258048; min(100000, 258048) = 100000
+        assert warm == 100000
+        assert cold == 38000
+
+    def test_1slot_min_only_never_expansion(self):
+        """AC4: The clamp is min-only — more context per slot does NOT
+        raise the threshold above the configured warm value."""
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        # The per-slot cap is 258048, but warm config (100000) is binding.
+        assert warm == 100000
+        assert warm <= 258048  # never expands above config
+
+    def test_1slot_cold_below_warm(self):
+        """AC1: cold 38000 < warm 100000 — the (cold, warm] band exists."""
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 38000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        assert cold < warm
+        assert cold == 38000
+        assert warm == 100000
+
+    def test_1slot_large_prompt_routed_remote(self):
+        """AC2: A prompt above the warm threshold is routed remote
+        (context_too_large) even on 1-slot with high per-slot capacity."""
+        from proxy.provider import _effective_large_context_thresholds, _should_skip_local
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 38000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        # 110K > warm 100K → context_too_large → skip local
+        body = {"messages": [{"role": "user", "content": "x " * 110000}]}
+        assert _should_skip_local(
+            "Qwen3", "large_sess", body, cold, warm_cache_threshold=warm
+        ) is True

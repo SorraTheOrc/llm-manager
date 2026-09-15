@@ -463,6 +463,28 @@ def _startup_config_logging():
     except Exception:
         pass  # Logging is best-effort; don't block startup
 
+    # Log effective warm/cold thresholds clamped to per-slot capacity (LP-0MU1RXF6R004S8XL).
+    # Operators can verify the runtime threshold matches expectations for their
+    # slot count and context size.
+    try:
+        from proxy.provider import (
+            _effective_large_context_thresholds as _eff_thresholds,
+            _get_active_local_ctx_size as _eff_ctx,
+            _get_active_local_slots as _eff_slots,
+        )
+        _cold, _warm = _eff_thresholds(config)
+        _ctx = _eff_ctx(config)
+        _slots = _eff_slots(config)
+        if _ctx > 0 and _slots > 0:
+            _per_slot = _ctx // _slots - 4096  # _LOCAL_ROUTING_OUTPUT_HEADROOM
+            logger.info(
+                "Large-context routing thresholds: cold=%s warm=%s "
+                "(ctx=%s slots=%s per_slot_cap=%s)",
+                _cold, _warm, _ctx, _slots, _per_slot,
+            )
+    except Exception:
+        pass  # Logging is best-effort; don't block startup
+
     logger.info("Starting LLama Proxy Server")
     return config, logger
 
