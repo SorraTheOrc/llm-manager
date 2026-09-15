@@ -22,6 +22,7 @@ from proxy.provider import (
     _DEFAULT_SUMMARIZER_MAX_TOKENS,
     _DEFAULT_SUMMARIZER_RETRIES,
     _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS,
+    _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS,
     _SUMMARIZATION_PROMPT,
     _SUMMARIZER_SYSTEM_PROMPT,
     compaction_config,
@@ -259,6 +260,40 @@ class TestCompactionRetryConfig:
             c["summarizer_retry_delay_seconds"]
             == _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
         )
+
+
+class TestCompactionTimeoutConfig:
+    """HTTP timeout for the local summarizer (LP-0MU1RXEY10075TUU).
+
+    The default is 600 s so the summarizer can wait for the single local
+    slot to free up while a long generating request holds it; 30 s was
+    too short and caused a 100% summarizer_failed rate.
+    """
+
+    def test_defaults(self):
+        c = compaction_config({})
+        assert c["summarizer_timeout_seconds"] == _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
+
+    def test_server_override(self):
+        cfg = {"server": {"compaction_summarizer_timeout": 120}}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == 120.0
+
+    def test_flat_override(self):
+        cfg = {"compaction_summarizer_timeout": 45.5}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == 45.5
+
+    def test_values_clamped_to_minimum(self):
+        # Sub-1s timeouts are nonsense for a slot wait; clamp to 1 s.
+        cfg = {"server": {"compaction_summarizer_timeout": 0.1}}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == 1.0
+
+    def test_bad_type_falls_back_to_default(self):
+        cfg = {"server": {"compaction_summarizer_timeout": "soon"}}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
 
 
 # ===================================================================

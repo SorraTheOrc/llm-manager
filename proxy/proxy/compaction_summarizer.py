@@ -278,7 +278,7 @@ def _load_prompt_constants() -> tuple[str, str, str]:
 def build_local_summarizer(
     config: dict | None,
     llama_port: int = 8080,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float | None = None,
 ):
     """Build a production Summarizer backed by the local llama-server.
 
@@ -295,9 +295,13 @@ def build_local_summarizer(
 
     Args:
         config: Proxy config dict (read via ``compaction_config`` for
-            model name and max_tokens). ``None`` uses defaults.
+            model name, max_tokens and the timeout). ``None`` uses defaults.
         llama_port: Local llama-server port (default 8080).
-        timeout_seconds: HTTP timeout for the summarization call.
+        timeout_seconds: HTTP timeout for the summarization call. ``None``
+            resolves ``config["server"]["compaction_summarizer_timeout"]``
+            (default 600 s — see ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``)
+            so the summarizer can wait for the single local slot to free up
+            while a long generating request holds it (LP-0MU1RXEY10075TUU).
 
     Returns:
         A ``Summarizer`` callable.
@@ -311,6 +315,8 @@ def build_local_summarizer(
     _system_prompt = _resolve_system_prompt_override() or _system_default
     retries = int(cfg.get("summarizer_retries") or 0)
     retry_delay = float(cfg.get("summarizer_retry_delay_seconds") or 0.0)
+    if timeout_seconds is None:
+        timeout_seconds = float(cfg.get("summarizer_timeout_seconds") or 600.0)
 
     def _summarizer(
         middle_messages: list[dict[str, Any]],

@@ -2353,10 +2353,17 @@ async def _handle_session(
                 _summarizer = build_local_summarizer(
                     _top_cfg,
                     llama_port=_llama_port,
-                    timeout_seconds=float(
-                        server_config.get("compaction_summarizer_timeout", 30.0)
-                    ),
                 )
+                # The summarizer timeout resolves inside build_local_summarizer
+                # from config (``compaction_summarizer_timeout``, default
+                # 600 s — ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s
+                # timeout could not wait for the single local slot to free up
+                # while a long generating request held it, so every compaction
+                # failed (summarizer_failed/timeout) and the session was
+                # routed remote with guidance, stalling until the 900 s
+                # upstream timeout. 600 s exceeds the observed worst-case
+                # stall (max dispatch_first_byte_ms 713 s). See
+                # LP-0MU1RXEY10075TUU.
                 def _estimate_fn(msgs):
                     return _estimate_prompt_tokens_for_routing({"messages": msgs})
 
@@ -2377,7 +2384,15 @@ async def _handle_session(
                         or []
                     )
 
-                _compaction = _evaluate_session_compaction(
+                # The summarizer call blocks on the local llama-server slot
+                # (up to ``compaction_summarizer_timeout``, default 600 s on
+                # a 1-slot backend where a long generating request holds the
+                # slot). Run the whole evaluation in a worker thread so the
+                # event loop keeps serving other requests (notably the
+                # streaming request whose slot we are waiting on) instead of
+                # freezing for the whole wait (LP-0MU1RXEY10075TUU).
+                _compaction = await asyncio.to_thread(
+                    _evaluate_session_compaction,
                     srv,
                     result["session_id"],
                     _pre_compaction_messages,

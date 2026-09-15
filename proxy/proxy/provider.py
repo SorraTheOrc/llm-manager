@@ -679,6 +679,16 @@ _DEFAULT_SUMMARIZER_CTX_SIZE = 8192
 # is enough for a concise middle-turn condensation without wasting GPU.
 _DEFAULT_SUMMARIZER_MAX_TOKENS = 512
 
+# Default HTTP timeout for the local summarizer call to llama-server.
+# 600 seconds (10 minutes) — allows the summariser to wait for the local
+# slot to become free when it is occupied by a long generating stream.
+# This is critical for 1-slot deployments where a single generating request
+# can hold the slot for many minutes (observed max dispatch_first_byte_ms
+# was 713 s; sessions blocked 17-18 min before the 900 s upstream timeout
+# fired).  See LP-0MU1RXEY10075TUU.
+# An operator may override via ``server.compaction_summarizer_timeout``.
+_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS = 600.0
+
 # Retry policy for transient summarizer failures (R3, LP-0MTTPXIAB0031AC4).
 # The summarizer retries connection errors / read timeouts / 5xx / 429 up to
 # ``summarizer_retries`` times (default 2) with a fixed inter-attempt delay
@@ -896,6 +906,16 @@ def compaction_config(config: dict) -> dict:
     except (ValueError, TypeError):
         retry_delay = _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
 
+    # Summarizer HTTP timeout (seconds; allows waiting for slot to free)
+    timeout = server.get("compaction_summarizer_timeout")
+    if timeout is None:
+        timeout = config.get("compaction_summarizer_timeout")
+    try:
+        timeout = float(timeout)
+        timeout = max(1.0, timeout)
+    except (ValueError, TypeError):
+        timeout = _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
+
     return {
         "trigger_ratio": trigger_ratio,
         "summarizer_model_type": summarizer_model_type,
@@ -905,6 +925,7 @@ def compaction_config(config: dict) -> dict:
         "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
         "summarizer_retries": retries,
         "summarizer_retry_delay_seconds": retry_delay,
+        "summarizer_timeout_seconds": timeout,
     }
 
 
