@@ -22,16 +22,17 @@ These are unit/integration tests on _handle_session and the compaction
 decision pipeline; the slot save itself is tested separately in
 test_slot_snapshot.py.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_server(**overrides):
     """Build a mock server with compaction config."""
@@ -104,13 +105,9 @@ class TestKvSlotPrefixCorrectness:
         post_messages = _make_session_messages(20)
 
         srv = _make_server()
-        mock_session = MagicMock(
-            session_id="sess-ac5", message_count=len(pre_messages)
-        )
+        mock_session = MagicMock(session_id="sess-ac5", message_count=len(pre_messages))
         mock_session.messages = list(pre_messages)
-        srv.session_manager.get_or_create = AsyncMock(
-            return_value=(mock_session, False)
-        )
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, False))
         srv.session_manager.update_messages = AsyncMock(return_value=True)
 
         body_json = {"model": "Qwen3", "messages": list(pre_messages)}
@@ -138,6 +135,7 @@ class TestKvSlotPrefixCorrectness:
 
         # Parse the body_override to verify the compacted messages are there.
         import json
+
         dispatched = json.loads(result["body_override"])
         assert len(dispatched["messages"]) == len(post_messages)
         # Retention invariant: first two messages are system + first prompt.
@@ -155,13 +153,9 @@ class TestKvSlotPrefixCorrectness:
         post_messages = _make_session_messages(20)
 
         srv = _make_server()
-        mock_session = MagicMock(
-            session_id="sess-ac5-store", message_count=len(pre_messages)
-        )
+        mock_session = MagicMock(session_id="sess-ac5-store", message_count=len(pre_messages))
         mock_session.messages = list(pre_messages)
-        srv.session_manager.get_or_create = AsyncMock(
-            return_value=(mock_session, False)
-        )
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, False))
         srv.session_manager.update_messages = AsyncMock(return_value=True)
         srv.session_manager.mark_compacted = AsyncMock(return_value=True)
 
@@ -208,8 +202,9 @@ class TestKvSlotPrefixCorrectness:
         NOTE: json.loads creates new dicts, so identity is tested against
         the body_override raw messages, not through JSON round-trip.
         """
-        from proxy.router_helpers import _handle_session
         import json
+
+        from proxy.router_helpers import _handle_session
 
         pre_messages = _make_session_messages(60)
         system_msg, first_msg = pre_messages[0], pre_messages[1]
@@ -221,10 +216,12 @@ class TestKvSlotPrefixCorrectness:
             decision_messages = a[3]  # msgs passed to decide_session_compaction
             # Simulate retention: keep system and first prompt (same objects).
             retained = [system_msg, first_msg]
-            retained.append({
-                "role": "user",
-                "content": "The conversation history before this point was compacted into the following summary:\n\n<summary>\nSOME SUMMARY\n</summary>",
-            })
+            retained.append(
+                {
+                    "role": "user",
+                    "content": "The conversation history before this point was compacted into the following summary:\n\n<summary>\nSOME SUMMARY\n</summary>",
+                }
+            )
             # Add recent turns (last 20 messages).
             retained.extend(decision_messages[-40:])
             compacted_result.append(retained)
@@ -238,13 +235,9 @@ class TestKvSlotPrefixCorrectness:
             }
 
         srv = _make_server()
-        mock_session = MagicMock(
-            session_id="sess-ac5-retain", message_count=len(pre_messages)
-        )
+        mock_session = MagicMock(session_id="sess-ac5-retain", message_count=len(pre_messages))
         mock_session.messages = list(pre_messages)
-        srv.session_manager.get_or_create = AsyncMock(
-            return_value=(mock_session, False)
-        )
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, False))
         srv.session_manager.update_messages = AsyncMock(return_value=True)
 
         body_json = {"model": "Qwen3", "messages": list(pre_messages)}
@@ -296,13 +289,9 @@ class TestNoRegression:
 
         messages = _make_session_messages(3)  # well below trigger
         srv = _make_server()
-        mock_session = MagicMock(
-            session_id="sess-nr1", message_count=len(messages)
-        )
+        mock_session = MagicMock(session_id="sess-nr1", message_count=len(messages))
         mock_session.messages = list(messages)
-        srv.session_manager.get_or_create = AsyncMock(
-            return_value=(mock_session, False)
-        )
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, False))
 
         body_json = {"model": "Qwen3", "messages": list(messages)}
         server_config = srv.config["server"]
@@ -321,6 +310,7 @@ class TestNoRegression:
         assert result.get("body_override") is not None
         # Body must carry the ORIGINAL messages.
         import json
+
         dispatched = json.loads(result["body_override"])
         assert dispatched["messages"] == messages
 
@@ -331,13 +321,9 @@ class TestNoRegression:
 
         messages = _make_session_messages(60)
         srv = _make_server()
-        mock_session = MagicMock(
-            session_id="sess-nr2", message_count=len(messages)
-        )
+        mock_session = MagicMock(session_id="sess-nr2", message_count=len(messages))
         mock_session.messages = list(messages)
-        srv.session_manager.get_or_create = AsyncMock(
-            return_value=(mock_session, False)
-        )
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, False))
         srv.session_manager.update_messages = AsyncMock(return_value=True)
 
         body_json = {"model": "Qwen3", "messages": list(messages)}
@@ -398,13 +384,9 @@ class TestNoRegression:
 
         messages = _make_session_messages(60)
         srv = _make_server()
-        mock_session = MagicMock(
-            session_id="sess-nr3", message_count=len(messages)
-        )
+        mock_session = MagicMock(session_id="sess-nr3", message_count=len(messages))
         mock_session.messages = list(messages)
-        srv.session_manager.get_or_create = AsyncMock(
-            return_value=(mock_session, False)
-        )
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, False))
 
         body_json = {"model": "Qwen3", "messages": list(messages)}
         server_config = srv.config["server"]
@@ -427,6 +409,7 @@ class TestNoRegression:
         assert result.get("compaction_applied") is not True
         assert result.get("compaction_remote_with_guidance") is True
         import json
+
         dispatched = json.loads(result["body_override"])
         assert dispatched["messages"] == messages
 
@@ -446,11 +429,13 @@ class TestDocumentation:
         from proxy.compaction import __doc__ as compaction_doc
 
         assert compaction_doc is not None
-        assert "dispatch" in compaction_doc.lower() or \
-               "prefix" in compaction_doc.lower() or \
-               "slot" in compaction_doc.lower() or \
-               "base" in compaction_doc.lower() or \
-               "compacted" in compaction_doc.lower()
+        assert (
+            "dispatch" in compaction_doc.lower()
+            or "prefix" in compaction_doc.lower()
+            or "slot" in compaction_doc.lower()
+            or "base" in compaction_doc.lower()
+            or "compacted" in compaction_doc.lower()
+        )
 
     def test_session_module_documents_delta_and_force_full_prompt(self):
         """The session module must document the delta routing and
@@ -459,9 +444,7 @@ class TestDocumentation:
 
         assert session_doc is not None
         # The module docstring should mention session coordination / delta.
-        assert "session" in session_doc.lower() or \
-               "delta" in session_doc.lower() or \
-               "slot" in session_doc.lower()
+        assert "session" in session_doc.lower() or "delta" in session_doc.lower() or "slot" in session_doc.lower()
 
     def test_router_helpers_documents_compaction_path(self):
         """_handle_session docstring must document the compaction path."""
@@ -470,6 +453,4 @@ class TestDocumentation:
         assert _handle_session.__doc__ is not None
         doc = _handle_session.__doc__
         # Must mention compaction or delta handling.
-        assert "compaction" in doc.lower() or \
-               "delta" in doc.lower() or \
-               "session" in doc.lower()
+        assert "compaction" in doc.lower() or "delta" in doc.lower() or "session" in doc.lower()

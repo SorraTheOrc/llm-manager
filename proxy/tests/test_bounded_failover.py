@@ -10,8 +10,8 @@ Covers the ACs from LP-0MU1RXEPL005CK97:
 """
 
 import asyncio
-import time
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
@@ -60,14 +60,13 @@ def _make_streaming_mock_response(
     type(mock_resp).status_code = PropertyMock(return_value=status_code)
     mock_resp.headers = headers or {"content-type": "text/event-stream"}
     if aiter_chunks is not None:
-        mock_resp.aiter_bytes = MagicMock(
-            return_value=AsyncChunkIterator(aiter_chunks, hang_after=hang_after)
-        )
+        mock_resp.aiter_bytes = MagicMock(return_value=AsyncChunkIterator(aiter_chunks, hang_after=hang_after))
     if body_bytes is not None:
         mock_resp.content = body_bytes
 
     async def _aread():
         return body_bytes or b'{"error": "timeout"}'
+
     mock_resp.aread = _aread
 
     return mock_resp
@@ -102,6 +101,7 @@ def _make_mock_request():
 # ===================================================================
 # AC1: Idle timeout capped by upstream_request_timeout_seconds
 # ===================================================================
+
 
 @pytest.mark.asyncio
 async def test_idle_timeout_never_exceeds_request_timeout():
@@ -205,13 +205,11 @@ async def test_empty_response_retries_have_total_time_budget():
 
     # Stream that returns empty response (no content chunks, just [DONE])
     empty_chunks = [
-        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\n",
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n',
         b"data: [DONE]\n\n",
     ]
 
-    empty_cm = _make_stream_context(
-        _make_streaming_mock_response(aiter_chunks=empty_chunks)
-    )
+    empty_cm = _make_stream_context(_make_streaming_mock_response(aiter_chunks=empty_chunks))
 
     pool_client = _make_pool_client(empty_cm)
 
@@ -263,14 +261,18 @@ async def test_non_streaming_empty_response_bounded():
     mock_request = _make_mock_request()
     mock_request.body = AsyncMock(return_value=b'{"stream": false, "model": "test"}')
 
-    empty_body = json.dumps({
-        "choices": [{
-            "message": {"content": "", "stopReason": "stop"},
-            "finish_reason": "stop",
-            "index": 0,
-        }],
-        "usage": {"total_tokens": 0},
-    }).encode()
+    empty_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {"content": "", "stopReason": "stop"},
+                    "finish_reason": "stop",
+                    "index": 0,
+                }
+            ],
+            "usage": {"total_tokens": 0},
+        }
+    ).encode()
 
     empty_resp = _make_streaming_mock_response(status_code=200, body_bytes=empty_body)
     empty_resp.content = empty_body
@@ -311,6 +313,7 @@ async def test_non_streaming_empty_response_bounded():
 # AC4: Regression — stalling then empty upstream → bounded failover
 # ===================================================================
 
+
 @pytest.mark.asyncio
 async def test_stalling_then_empty_upstream_bounded_failover():
     """AC4: Regression test asserting bounded failover when upstream first
@@ -335,12 +338,10 @@ async def test_stalling_then_empty_upstream_bounded_failover():
 
     # Retry attempts: empty responses
     empty_chunks = [
-        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\n",
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n',
         b"data: [DONE]\n\n",
     ]
-    empty_cm = _make_stream_context(
-        _make_streaming_mock_response(aiter_chunks=empty_chunks)
-    )
+    empty_cm = _make_stream_context(_make_streaming_mock_response(aiter_chunks=empty_chunks))
 
     # Need two stream calls: initial stall + one retry
     pool_client = MagicMock(spec=httpx.AsyncClient)
@@ -388,9 +389,7 @@ async def test_stalling_then_empty_upstream_bounded_failover():
     elapsed = asyncio.get_event_loop().time() - start
 
     # Should complete quickly (within a few seconds), not hang
-    assert elapsed < 5.0, (
-        f"Bounded failover took {elapsed:.1f}s — exceeds reasonable budget"
-    )
+    assert elapsed < 5.0, f"Bounded failover took {elapsed:.1f}s — exceeds reasonable budget"
     assert len(collected) >= 1
 
     last_chunk = collected[-1].decode("utf-8", errors="replace")
@@ -398,14 +397,13 @@ async def test_stalling_then_empty_upstream_bounded_failover():
     assert '"finish_reason"' in last_chunk.replace(" ", ""), (
         f"Expected terminal finish_reason in last chunk, got: {last_chunk[:300]}"
     )
-    assert '"error"' in last_chunk.lower(), (
-        f"Expected error in last chunk, got: {last_chunk[:300]}"
-    )
+    assert '"error"' in last_chunk.lower(), f"Expected error in last chunk, got: {last_chunk[:300]}"
 
 
 # ===================================================================
 # _delta_has_content regression
 # ===================================================================
+
 
 def test_delta_has_content_with_content():
     """Verify _delta_has_content correctly identifies content-bearing deltas."""
