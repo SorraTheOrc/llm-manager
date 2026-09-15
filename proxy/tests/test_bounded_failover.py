@@ -215,8 +215,6 @@ async def test_empty_response_retries_have_total_time_budget():
 
     pool_client = _make_pool_client(empty_cm)
 
-    start = asyncio.get_event_loop().time()
-
     with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
         with patch("proxy.proxy_remote.log_response_chunk"):
             with patch("proxy.proxy_remote.log_response"):
@@ -248,8 +246,6 @@ async def test_empty_response_retries_have_total_time_budget():
                         )
 
                         collected = [chunk async for chunk in result.body_iterator]
-
-    elapsed = asyncio.get_event_loop().time() - start
 
     assert len(collected) >= 1
     last_chunk = collected[-1].decode("utf-8", errors="replace")
