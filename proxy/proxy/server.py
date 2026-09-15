@@ -469,7 +469,11 @@ def _startup_config_logging():
     try:
         from proxy.provider import (
             _effective_large_context_thresholds as _eff_thresholds,
+        )
+        from proxy.provider import (
             _get_active_local_ctx_size as _eff_ctx,
+        )
+        from proxy.provider import (
             _get_active_local_slots as _eff_slots,
         )
         _cold, _warm = _eff_thresholds(config)

@@ -21,12 +21,12 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-
-from proxy import provider, router_helpers
 from proxy.provider import (
     _check_local_backend_gpu_oom,
     _get_local_provider_endpoint,
 )
+
+from proxy import provider, router_helpers
 
 
 def _clear_provider_state():
@@ -283,10 +283,10 @@ async def test_local_fallback_chain_tries_next_server(monkeypatch):
 
     class _Req:
         headers = {}
-        body = b"{'messages': [{'role': 'user', 'content': 'hi'}]}"
+        _body_bytes = b"{'messages': [{'role': 'user', 'content': 'hi'}]}"
 
         async def body(self):
-            return self.body
+            return self._body_bytes
 
     result = await provider._proxy_with_fallback_cycle(
         _Req(), "v1/chat/completions", model_config, config
@@ -317,10 +317,10 @@ async def test_local_provider_endpoint_passed_to_proxy_to_local(monkeypatch):
 
     class _Req:
         headers = {}
-        body = b'{"messages": [{"role": "user", "content": "hi"}]}'
+        _body_bytes = b'{"messages": [{"role": "user", "content": "hi"}]}'
 
         async def body(self):
-            return self.body
+            return self._body_bytes
 
     result = await provider._proxy_with_fallback_cycle(
         _Req(), "v1/chat/completions", model_config, config
