@@ -5,9 +5,10 @@ Covers:
 1. AC1: Streaming empty response log includes truncated upstream body snippet
 2. AC2: Non-streaming empty response log includes body snippet (≤512 chars)
 3. AC3: No secrets leak into logged snippets (body is model output, truncated)
-4. Edge cases: empty body, long body truncation, None handling
+4. AC4: SSE keep-alive lines (starting with ":") are stripped before snippet
+5. Edge cases: empty body, long body truncation, None handling
 
-Related: LP-0MTVPJWWZ000REYU
+Related: LP-0MTVPJWWZ000REYU, LP-0MU1RXFFC003RYC4
 """
 
 import asyncio
@@ -128,6 +129,116 @@ def mock_srv():
     srv.config = {}
     srv.logger = MagicMock()
     return srv
+
+
+# ===================================================================
+# AC1-bis: SSE keep-alive lines are stripped from snippets
+# ===================================================================
+
+
+class TestSnippetBodySSEKeepAlive:
+    """AC: SSE comment lines (starting with ':') are stripped from snippets."""
+
+    def test_sse_keep_alive_stripped_from_snippet(self):
+        """SSE keep-alive lines (starting with ':') are removed from the snippet."""
+        sse_keep_alive = ": keep-alive\n: keep-alive\n: keep-alive\n"
+        snippet = _utils_snippet(sse_keep_alive)
+        assert snippet == "<empty>", (
+            f"Expected '<empty>' for keep-alive-only body, got: {repr(snippet)}"
+        )
+
+    def test_sse_keep_alive_stripped_leaves_content(self):
+        """SSE keep-alive lines are removed but real content is preserved."""
+        mixed = ": keep-alive\ndata: {\"choices\":[]}\n: keep-alive\n"
+        snippet = _utils_snippet(mixed)
+        assert ": keep-alive" not in snippet, (
+            f"SSE keep-alive should be stripped, snippet: {repr(snippet)}"
+        )
+        assert '{"choices":[]}' in snippet, (
+            f"Real content should be preserved, snippet: {repr(snippet)}"
+        )
+
+    def test_sse_keep_alive_only_bytes_stripped(self):
+        """Bytes input with only SSE keep-alive returns '<empty>'."""
+        sse_keep_alive_bytes = b": keep-alive\n: keep-alive\n"
+        snippet = _remote_snippet(sse_keep_alive_bytes)
+        assert snippet == "<empty>"
+
+    def test_sse_keep_alive_mixed_bytes_stripped(self):
+        """Mixed bytes input: keep-alive stripped, content preserved."""
+        mixed_bytes = b": keep-alive\ndata: {\"choices\":[]}\n"
+        snippet = _remote_snippet(mixed_bytes)
+        assert ": keep-alive" not in snippet
+        assert '{"choices":[]}' in snippet
+
+    def test_multiline_sse_keep_alive_only(self):
+        """Multiple lines of only SSE keep-alive returns '<empty>'."""
+        lines = "\n".join([": keep-alive"] * 20)
+        snippet = _utils_snippet(lines)
+        assert snippet == "<empty>"
+
+    @pytest.mark.asyncio
+    async def test_empty_response_log_does_not_contain_keep_alive(self, mock_request, mock_srv):
+        """AC: No ': keep-alive' text can reach the log via the empty-response path.
+
+        Regression test: when the upstream body is pure SSE keep-alive,
+        the logged snippet must not contain it.
+        """
+        # Upstream sends only SSE keep-alive comments
+        keep_alive_chunks = [
+            b": keep-alive\n",
+            b": keep-alive\n",
+            b": keep-alive\n",
+        ]
+        valid_stream_chunks = [
+            b'data: {"choices":[{"delta":{"content":"Retry"},"index":0}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+
+        first_resp = _make_streaming_mock_response(
+            status_code=200,
+            aiter_chunks=keep_alive_chunks,
+        )
+        second_resp = _make_streaming_mock_response(
+            status_code=200,
+            aiter_chunks=valid_stream_chunks,
+        )
+
+        client = _make_client(stream_responses=[first_resp, second_resp])
+        mock_srv.config = {}
+
+        with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client):
+            with patch("proxy.proxy_remote._srv", return_value=mock_srv):
+                with patch("proxy.proxy_remote.log_response_chunk"):
+                    with patch("proxy.proxy_remote.log_response"):
+                        with patch("proxy.proxy_remote.log_request"):
+                            with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+                                result = await _handle_remote_streaming(
+                                    request=mock_request,
+                                    target_url="https://api.example.com/v1/chat/completions",
+                                    headers={"Authorization": "Bearer test"},
+                                    body=b'{"stream": true, "model": "test"}',
+                                    body_json={"stream": True, "model": "test"},
+                                    model_name="test-model",
+                                    remote_timeout=httpx.Timeout(30.0),
+                                    upstream_idle_timeout_seconds=1.0,
+                                )
+
+                                async for _ in result.body_iterator:
+                                    pass
+
+        # Verify the empty-retry INFO log does NOT contain ': keep-alive'
+        empty_retry_logs = [
+            call for call in mock_srv.logger.info.call_args_list
+            if "Empty response detected" in str(call.args[0]) and "stream attempt" in str(call.args[0])
+        ]
+        assert len(empty_retry_logs) == 1
+
+        log_fmt, *log_args = empty_retry_logs[0].args
+        body_snippet = log_args[-1]
+        assert ": keep-alive" not in body_snippet, (
+            f"Log snippet must not contain ': keep-alive', got: {repr(body_snippet[:200])}"
+        )
 
 
 # ===================================================================

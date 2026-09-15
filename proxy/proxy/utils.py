@@ -186,10 +186,18 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
 def _snippet_body(text: str, max_len: int = 512) -> str:
     """Return a truncated body snippet for logging.
 
+    SSE comment lines (starting with ":") are stripped to prevent raw
+    keep-alive traffic from polluting log lines (LP-0MU1RXFFC003RYC4).
     The raw body is model output (safe), but we truncate defensively to
     avoid oversized log lines and to prevent any accidental secret leakage
     in edge cases (e.g. proxy debug dumps).
     """
+    if not text:
+        return "<empty>"
+    # Strip SSE comment lines (start with ":") which are keep-alive signals
+    lines = text.splitlines()
+    filtered = [line for line in lines if not line.lstrip().startswith(":")]
+    text = "\n".join(filtered)
     if not text:
         return "<empty>"
     snippet = text[:max_len]
