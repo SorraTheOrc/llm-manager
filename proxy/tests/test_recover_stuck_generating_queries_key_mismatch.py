@@ -150,9 +150,6 @@ async def test_mixed_tuple_and_string_keyed_records():
         active_queries=2,
     )
 
-    initial_count = srv.local_generating_queries
-    initial_active = {session_id_tuple, session_id_string}
-
     with patch("proxy.contention_queue.wake_all", AsyncMock()):
         await _recover_stuck_generating_queries(srv)
 
