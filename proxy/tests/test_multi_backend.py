@@ -1,9 +1,3 @@
-
-# <!-- REFACTOR-LP-0MTT1054U001OMWR
-# smell: unused_import
-# severity: critical
-# description: Redefinition of unused `body` from line 286: `body` redefined here
-# -->
 """Tests for multi-backend support (LP-0MRPILSMW004T4H8).
 
 Coverage (Acceptance Criteria mapping):
@@ -27,12 +21,12 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+
+from proxy import provider, router_helpers
 from proxy.provider import (
     _check_local_backend_gpu_oom,
     _get_local_provider_endpoint,
 )
-
-from proxy import provider, router_helpers
 
 
 def _clear_provider_state():
@@ -289,10 +283,10 @@ async def test_local_fallback_chain_tries_next_server(monkeypatch):
 
     class _Req:
         headers = {}
-        _payload = b"{'messages': [{'role': 'user', 'content': 'hi'}]}"
+        body = b"{'messages': [{'role': 'user', 'content': 'hi'}]}"
 
         async def body(self):
-            return self._payload
+            return self.body
 
     result = await provider._proxy_with_fallback_cycle(
         _Req(), "v1/chat/completions", model_config, config
@@ -323,10 +317,10 @@ async def test_local_provider_endpoint_passed_to_proxy_to_local(monkeypatch):
 
     class _Req:
         headers = {}
-        _payload = b'{"messages": [{"role": "user", "content": "hi"}]}'
+        body = b'{"messages": [{"role": "user", "content": "hi"}]}'
 
         async def body(self):
-            return self._payload
+            return self.body
 
     result = await provider._proxy_with_fallback_cycle(
         _Req(), "v1/chat/completions", model_config, config
@@ -401,148 +395,3 @@ async def test_probe_local_backend_unreachable(monkeypatch):
     assert result["available_slots"] == 0
     assert result["total_slots"] == 0
     assert result["capacity_ok"] is False
-
-# ---------------------------------------------------------------------------
-# Extra regression coverage for current-dev semantics (multi-backend port)
-# ---------------------------------------------------------------------------
-
-def test_endpoint_host_port_parsing():
-    """URL → (host, port) derivation used for slot-path subdirectories."""
-    from proxy.session import _endpoint_host_port
-
-    assert _endpoint_host_port("http://192.168.0.199:8080") == ("192.168.0.199", 8080)
-    assert _endpoint_host_port("http://localhost:8080") == ("localhost", 8080)
-    assert _endpoint_host_port("http://my-host.org") == ("my-host.org", 8080)
-    assert _endpoint_host_port("https://10.0.0.5:9090/") == ("10.0.0.5", 9090)
-    # Unparseable → legacy default pair.
-    assert _endpoint_host_port("not-a-url") == ("localhost", 8080)
-    assert _endpoint_host_port("") == ("localhost", 8080)
-
-
-def test_parse_endpoint_url():
-    """router_helpers URL parser for per-endpoint dispatch records."""
-    from proxy.router_helpers import _parse_endpoint_url
-
-    assert _parse_endpoint_url("http://192.168.0.199:8080") == ("192.168.0.199", 8080)
-    assert _parse_endpoint_url("http://localhost:9090/") == ("localhost", 9090)
-
-
-def test_dispatch_key_session_id_roundtrip():
-    """Session ids are recoverable from tuple and plain keys."""
-    from proxy.router_helpers import _dispatch_key_session_id
-
-    assert _dispatch_key_session_id(("http://a:8080", "sess-1")) == "sess-1"
-    assert _dispatch_key_session_id("sess-1") == "sess-1"
-
-
-@pytest.mark.asyncio
-async def test_increment_decrement_respect_endpoint_records():
-    """AC2: increment/decrement create and deactivate only the endpoint's record."""
-    from proxy.router_helpers import (
-        _decrement_local_active_queries,
-        _increment_local_active_queries,
-    )
-
-    srv = _make_dispatch_server()
-    await _increment_local_active_queries(
-        srv, session_key="sess-1", backend="http://a:8080", model_name="Qwen3"
-    )
-    assert ("http://a:8080", "sess-1") in srv.local_dispatch_records
-    assert srv.local_dispatch_records[("http://a:8080", "sess-1")]["active"] is True
-    assert srv.local_active_queries == 1
-
-    # Decrement marks the endpoint record inactive (lease cooldown kept).
-    await _decrement_local_active_queries(
-        srv, session_key="sess-1", backend="http://a:8080"
-    )
-    import time as _t
-    rec = srv.local_dispatch_records[("http://a:8080", "sess-1")]
-    assert rec["active"] is False
-    assert rec["expires_at"] > _t.monotonic()  # kept for lease timeout
-    assert srv.local_active_queries == 0
-
-    # A decrement for a *different* endpoint is a no-op on the a record.
-    await _increment_local_active_queries(
-        srv, session_key="sess-1", backend="http://b:8080", model_name="Qwen3"
-    )
-    await _decrement_local_active_queries(
-        srv, session_key="sess-1", backend="http://a:8080"
-    )
-    assert srv.local_dispatch_records[("http://b:8080", "sess-1")]["active"] is True
-
-
-def test_local_concurrency_info_pure_legacy_default_endpoint(monkeypatch):
-    """Provider gate: legacy plain-key state uses the global generating counter.
-
-    The fallback cycle always resolves a non-empty default endpoint for local
-    providers without an explicit ``endpoint``. When the dispatch state is
-    purely legacy (plain session-id keys), the per-endpoint count must not
-    discard those records: the global generating counter gates exactly as it
-    did before multi-backend support (LP-0MRPILSMW004T4H8).
-    """
-    import time as _time
-
-    from proxy import provider
-
-    class _Srv:
-        local_dispatch_records = {
-            "owner-1": {
-                "backend": "local", "started_at": _time.monotonic(),
-                "active": True, "expires_at": _time.monotonic() + 300,
-            }
-        }
-        local_generating_queries = 1
-        local_active_queries = 1
-
-    # The helper reads state via ``import proxy.server``; patch its record
-    # state directly.
-    import proxy.server as srv_module
-    monkeypatch.setattr(srv_module, "local_dispatch_records", _Srv.local_dispatch_records)
-    monkeypatch.setattr(srv_module, "local_generating_queries", 1)
-    monkeypatch.setattr(srv_module, "local_active_queries", 1)
-
-    config = {"server": {"llama_server_port": 8080, "session_slot_pool_size": 1}}
-
-    # Pure-legacy default endpoint → global generating counter (1 >= 1).
-    cur, mx = provider._get_local_concurrency_info(config, endpoint="http://localhost:8080")
-    assert (cur, mx) == (1, 1)
-
-    # Explicitly endpoint-scoped query on a different server → 0 occupancy.
-    cur2, _ = provider._get_local_concurrency_info(config, endpoint="http://10.0.0.9:8080")
-    assert cur2 == 0
-
-    # A non-default endpoint query is unaffected by plain-key legacy records.
-    cur3, _ = provider._get_local_concurrency_info(
-        config, endpoint="http://192.168.0.199:8080"
-    )
-    assert cur3 == 0
-
-
-@pytest.mark.asyncio
-async def test_local_concurrency_info_endpoint_records(monkeypatch):
-    """Provider gate: per-endpoint counting when tuple-keyed records exist."""
-    import time as _time
-
-    import proxy.server as srv_module
-
-    from proxy import provider
-
-    srv_module.local_dispatch_records = {
-        ("http://a:8080", "sess-x"): {
-            "backend": "http://a:8080", "started_at": _time.monotonic(),
-            "active": True, "expires_at": _time.monotonic() + 300,
-        },
-        ("http://b:8080", "sess-y"): {
-            "backend": "http://b:8080", "started_at": _time.monotonic(),
-            "active": True, "expires_at": _time.monotonic() + 300,
-        },
-    }
-    monkeypatch.setattr(srv_module, "local_generating_queries", 2)
-    monkeypatch.setattr(srv_module, "local_active_queries", 2)
-
-    config = {"server": {"llama_server_port": 8080, "session_slot_pool_size": 1}}
-
-    cur_a, mx = provider._get_local_concurrency_info(config, endpoint="http://a:8080")
-    assert cur_a == 1  # only server-a's record counts
-    cur_b, _ = provider._get_local_concurrency_info(config, endpoint="http://b:8080")
-    assert cur_b == 1

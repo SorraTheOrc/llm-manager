@@ -96,7 +96,6 @@ backend_signal_counts: dict = {
     "concurrency_rejects": 0,
     "gpu_wedge": 0,
     "grandfathered": 0,
-    "context_too_large": 0,  # LP-0MTBOX45O005LD1S fast-mode cap skip
 }
 
 
@@ -230,7 +229,7 @@ def last_known_slot_counts() -> tuple[int, int] | None:
 
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
-    base_url: str | None = None,
+    endpoint: str | None = None,
 ) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
@@ -242,9 +241,10 @@ async def _query_slots(
     endpoint and return HTTP 400 without it (LP-0MSHFGO0M003Q5BL), so
     pass *model* when the current model is known.
 
-    When *base_url* is provided (a full ``http://host:port`` URL), the
-    query targets that specific llama-server instance (LP-0MRPILSMW004T4H8).
-    Otherwise ``http://localhost:{llama_port}`` is used.
+    When *endpoint* is provided (a full ``http://host:port`` URL), the
+    query targets that specific llama-server instance
+    (LP-0MRPILSMW004T4H8). Otherwise ``http://localhost:{llama_port}``
+    is used.
 
     The 2.0-second default timeout matches the original inline query in
     ``get_llama_local_status()``.
@@ -255,7 +255,7 @@ async def _query_slots(
     sustained /slots outage surfaces as an alert.
     """
     try:
-        url = _build_llama_url(llama_port, "/slots", base_url=base_url)
+        url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
         if model:
             url = f"{url}?model={model}"
         slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
@@ -303,7 +303,6 @@ async def _query_slots_detail(
     llama_port: int,
     timeout: float = 2.0,
     model: str | None = None,
-    endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
@@ -332,7 +331,7 @@ async def _query_slots_detail(
     timeout, or unexpected response shape).
     """
     try:
-        url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
+        url = _build_llama_url(llama_port, "/slots")
         if model:
             url = f"{url}?model={model}"
         if _client is not None:
@@ -373,13 +372,10 @@ async def _query_slots_progress(
     llama_port: int,
     timeout: float = 2.0,
     model: str | None = None,
-    endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
+    endpoint: str | None = None,
 ) -> dict[int, dict]:
     """Query the llama-server ``/slots`` endpoint for per-slot prefill state.
-
-    When *endpoint* is provided (a full ``http://host:port`` URL), the query
-    targets that specific llama-server instance (LP-0MRPILSMW004T4H8).
 
     Returns a dict mapping slot id -> ``{"progress": int|None,
     "processing": bool}``:
@@ -393,6 +389,11 @@ async def _query_slots_progress(
       liveness signal b8782 still exposes. While True the slot is actively
       working a request (prefill or generation), so the dispatch lease can
       be kept alive on liveness even when no numeric progress is reported.
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the
+    query targets that specific llama-server instance
+    (LP-0MRPILSMW004T4H8). Otherwise ``http://localhost:{llama_port}``
+    is used.
 
     Returns an empty dict on any failure (HTTP error, connection error,
     timeout, or unexpected response shape), mirroring ``_query_slots_detail``.
@@ -1058,47 +1059,6 @@ def _build_slot_to_session_map(srv, slot_details=None) -> dict:
     return dict(_processing_slot_assignments)
 
 
-def _build_slot_to_lease_map(srv) -> dict[int, dict]:
-    """Map each llama-server slot to the dispatch lease holding it.
-
-    Slot persistence registry (``proxy.session._slot_owners``) binds a
-    llama-server slot id to the session that owns it; each owning session's
-    dispatch record (``srv.local_dispatch_records``) carries the lease
-    ``active`` flag and ``expires_at`` (monotonic). This merges the two so
-    the WebUI can show, per slot, which work item/session holds the lease
-    and how long it remains (LP-0MTCZ35X7009IZKE AC2).
-
-    A slot is included only when its owning session has a dispatch record
-    (active or inactive/unexpired) — i.e. when a lease actually reserves it.
-
-    Args:
-        srv: The server module (from ``_srv()``).
-
-    Returns:
-        ``{slot_id: {"session_id": str, "active": bool,
-        "remaining_seconds": float}}``.
-    """
-    try:
-        from proxy.session import _slot_owners
-    except Exception:
-        _slot_owners = {}
-    records = getattr(srv, "local_dispatch_records", {}) or {}
-    result: dict[int, dict] = {}
-    now = time.monotonic()
-    for slot_id, session_id in list(_slot_owners.items()):
-        rec = records.get(session_id)
-        if not rec:
-            continue
-        expires_at = rec.get("expires_at", 0) or 0
-        remaining = max(0.0, expires_at - now)
-        result[slot_id] = {
-            "session_id": session_id,
-            "active": bool(rec.get("active")),
-            "remaining_seconds": round(remaining, 1),
-        }
-    return result
-
-
 def _enrich_slot_details_with_progress(slot_details: list[dict],
                                         srv=None) -> list[dict]:
     """Merge log-parsed progress n_tokens into slot_details.
@@ -1133,15 +1093,6 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
             pass
 
     now = time.time()
-    # Resolve dispatch-lease metadata once for this batch (LP-0MTCZ35X7009IZKE
-    # AC2): maps each llama-server slot to the session holding an active or
-    # inactive (post-request cooldown) dispatch lease, plus its remaining time.
-    slot_to_lease: dict = {}
-    if srv is not None:
-        try:
-            slot_to_lease = _build_slot_to_lease_map(srv)
-        except Exception:
-            pass
     for slot in slot_details:
         sid = slot.get("slot_id")
         if sid is None:
@@ -1150,13 +1101,6 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
         # Attach session_id if we found an active dispatch for this slot
         if sid in slot_to_session:
             slot["session_id"] = slot_to_session[sid]
-
-        # Attach lease metadata (owner session + remaining seconds + active flag)
-        lease = slot_to_lease.get(sid)
-        if lease:
-            slot["lease_session_id"] = lease["session_id"]
-            slot["lease_active"] = lease["active"]
-            slot["lease_remaining_seconds"] = lease["remaining_seconds"]
 
         prog = _slot_progress_cache.get(sid)
         if prog is None:
@@ -1250,24 +1194,8 @@ async def _periodic_broadcast_loop():
                     try:
                         server_cfg = srv.config.get("server", {})
                         llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-                        # Prefer the discovered local child port: the router
-                        # serializes /slots?model=... behind the busy child
-                        # (LP-0MTDGBRPU003Z7KU, 5-7s vs 0.17s direct), so the
-                        # broadcast SSE loop must query the model instance
-                        # directly to avoid the 6,865/day router 500 storm
-                        # (LP-0MTIHZ8M5005ZAU8 / F3 triage rank 1).
                         # Use current_model as the model param for /slots
                         model_name = srv.current_model or None
-                        try:
-                            from proxy.router_helpers import _discover_local_child_port
-                            # LP-0MTP1FQXH004JYEF: filter to the current model
-                            # so the SSE broadcast does not query the embed
-                            # child (idle 256-ctx slots) when Qwen3 is busy.
-                            _child = _discover_local_child_port(srv, model=model_name)
-                            if _child is not None:
-                                llama_port = _child
-                        except Exception:
-                            pass
                         # 5s timeout: llama-server may be slow to respond
                         # to /slots when busy generating tokens.
                         slot_details = await _query_slots_detail(

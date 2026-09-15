@@ -1,9 +1,3 @@
-
-# <!-- REFACTOR-LP-0MTRWI65I005VXOC
-# smell: formatting
-# severity: high
-# description: Do not assign a `lambda` expression, use a `def`
-# -->
 """
 Router Helpers Module
 
@@ -25,7 +19,6 @@ import os
 import re
 import time
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -293,12 +286,6 @@ def log_response_chunk(
     entry name (e.g. ``opencode-go-2-deepseek``) so per-account traffic is
     attributable (LP-0MSC7F7BG0043TE1); it is omitted when absent.
 
-    For ``finish_reason: error`` events carrying an enriched ``error``
-    object (LP-0MSETOTWY000SU0Z), the line additionally carries
-    ``error_type``, ``error_message``, and ``suggested_action`` so the
-    proxy-usage analysis tool can classify the informative-error fallback
-    (LP-0MT60S55M000TK1H).
-
     When *body_json* is provided, a request preview (first 80 characters of
     the first non-system user message) is included in the finished line.
     """
@@ -347,25 +334,6 @@ def log_response_chunk(
                     tt = usage.get("total_tokens")
                     if pt is not None or ct is not None or tt is not None:
                         parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
-                # LP-0MT60S55M000TK1H: when the error is a synthetic stream-error
-                # event (LP-0MSETOTWY000SU0Z) carry the enriched error payload so
-                # the proxy-usage analysis tool can classify it (previously the
-                # log line reported "no error payload").
-                if finish_reason == "error":
-                    for choice in j.get("choices", []):
-                        if isinstance(choice, dict):
-                            err = choice.get("error")
-                            if isinstance(err, dict):
-                                err_type = err.get("type")
-                                err_msg = err.get("message")
-                                err_action = err.get("suggested_action")
-                                if err_type:
-                                    parts.append(f"error_type={err_type}")
-                                if err_msg:
-                                    parts.append(f"error_message={err_msg}")
-                                if err_action:
-                                    parts.append(f"suggested_action={err_action}")
-                                break  # only use the first choice's error
                 # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
                 if session_id:
                     parts.append(f"session={session_id}")
@@ -908,6 +876,10 @@ async def _extend_lease_during_prefill(
     token-estimate cap of 1500s — cannot lose its lease mid-prefill
     (LP-0MSE05J53004C6EL).
 
+    When *endpoint* is provided, the dispatch record lookup uses a
+    per-endpoint key so the correct server's lease is extended
+    (LP-0MRPILSMW004T4H8).
+
     Extension triggers:
 
     - **Progress advance** — observed numeric progress (per-slot
@@ -959,14 +931,14 @@ async def _extend_lease_during_prefill(
                         if advancing:
                             srv.logger.info(
                                 "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                                session_key if session_key else "unknown",
+                                session_key[:8] if session_key else "unknown",
                                 progress,
                                 buffer_seconds,
                             )
                         else:
                             srv.logger.info(
                                 "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
-                                session_key if session_key else "unknown",
+                                session_key[:8] if session_key else "unknown",
                                 buffer_seconds,
                             )
                     except Exception:
@@ -997,7 +969,7 @@ async def _decrement_local_active_queries(
         async with srv.local_active_queries_lock:
             srv.local_active_queries = max(0, srv.local_active_queries - 1)
     except Exception as exc:
-        session_hint = f" session={session_key}" if session_key else ""
+        session_hint = f" session={session_key[:8]}" if session_key else ""
         try:
             srv.logger.warning(
                 "Failed to decrement local_active_queries: %s: %s%s",
@@ -1013,8 +985,8 @@ async def _decrement_local_active_queries(
             lock = getattr(srv, "local_dispatch_records_lock", None)
             if lock is not None:
                 lease_timeout = _get_lease_timeout_seconds(srv)
+                record_key = _dispatch_lease_key(backend, session_key)
                 async with lock:
-                    record_key = _dispatch_lease_key(backend, session_key)
                     if record_key in srv.local_dispatch_records:
                         srv.local_dispatch_records[record_key]["active"] = False
                         srv.local_dispatch_records[record_key]["expires_at"] = (
@@ -1023,14 +995,18 @@ async def _decrement_local_active_queries(
                         try:
                             srv.logger.info(
                                 "lease_renewed session=%s timeout=%.0fs",
-                                _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
+                                _dispatch_key_session_id(record_key)[:8]
+                                if _dispatch_key_session_id(record_key)
+                                else "unknown",
                                 lease_timeout,
                             )
                         except Exception as exc:
                             try:
                                 srv.logger.warning(
                                     "Failed to log lease_renewed for session=%s: %s: %s",
-                                    _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
+                                    _dispatch_key_session_id(record_key)[:8]
+                                    if _dispatch_key_session_id(record_key)
+                                    else "unknown",
                                     type(exc).__name__,
                                     exc,
                                 )
@@ -1040,7 +1016,7 @@ async def _decrement_local_active_queries(
             try:
                 srv.logger.warning(
                     "Failed to mark dispatch record inactive for session=%s: %s: %s",
-                    session_key if session_key else "unknown",
+                    session_key[:8] if session_key else "unknown",
                     type(exc).__name__,
                     exc,
                 )
@@ -1069,7 +1045,9 @@ async def _increment_local_active_queries(
 
     When *session_key* and *backend* are provided, a corresponding
     dispatch record is created in *local_dispatch_records* to track
-    lease ownership. *model_name* is stored on the record so orphan
+    lease ownership. The record is keyed by ``(endpoint, session_key)``
+    so each llama-server instance tracks its concurrency independently
+    (LP-0MRPILSMW004T4H8). *model_name* is stored on the record so orphan
     cleanup can verify the session's slot against llama-server's
     ``/slots`` before freeing the lease (LP-0MSUO6XRP001MCB2).
 
@@ -1091,8 +1069,8 @@ async def _increment_local_active_queries(
             lock = getattr(srv, "local_dispatch_records_lock", None)
             if lock is not None:
                 lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
+                record_key = _dispatch_lease_key(backend, session_key)
                 async with lock:
-                    record_key = _dispatch_lease_key(backend, session_key)
                     srv.local_dispatch_records[record_key] = {
                         "backend": backend,
                         "started_at": time.monotonic(),
@@ -1102,159 +1080,6 @@ async def _increment_local_active_queries(
                     }
         except Exception:
             pass
-
-
-def _get_generating_only_count(srv) -> int:
-    """Return the current generating-only pool occupancy."""
-    try:
-        return max(0, int(getattr(srv, "local_generating_queries", 0) or 0))
-    except Exception:
-        return 0
-
-
-def _get_prefill_in_flight_count(srv) -> int:
-    """Return the number of sessions currently in prefill (dispatch→first-byte).
-
-    Prefill-aware guard (LP-0MTJET4I5009EHNX): caps concurrent prefills to
-    ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the llama-
-    server internal queue does not saturate under generating-only occupancy.
-    """
-    try:
-        d = getattr(srv, "local_prefill_in_flight", None)
-        if d is None:
-            return 0
-        return max(0, int(len(d)))
-    except Exception:
-        return 0
-
-
-async def _increment_generating_only_slot(srv, session_key: str | None = None) -> None:
-    """Increment generating-only slot once per session (idempotent).
-
-    Prefill-aware guard: the session's prefill hold is released on first-byte
-    so the prefill cap slot is freed for waiters.
-
-    Adds *session_key* to ``local_generating_sessions`` (a set tracking which
-    sessions are generating) and increments ``local_generating_queries``.
-    This counter gates dispatch to the local model via ``_try_acquire_local_dispatch``
-    — when it reaches ``max_local``, new dispatches are denied.
-
-    Self-healing: if the corresponding decrement (``_decrement_generating_only_slot``)
-    is skipped due to an exception in the streaming generator's finally block,
-    the ``_dispatch_cleanup_loop`` periodically reclaims stale entries via
-    ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU).
-    """
-    # Prefill-aware guard: clear the prefill hold on first-byte.
-    try:
-        _p = getattr(srv, "local_prefill_in_flight", None)
-        if _p is not None and session_key and session_key in _p:
-            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
-            if _plock is not None:
-                async with _plock:
-                    _p.pop(session_key, None)
-            else:
-                _p.pop(session_key, None)
-            try:
-                from proxy.contention_queue import wake
-                await wake(1)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    if not hasattr(srv, "local_generating_queries"):
-        return
-    # Ensure the per-session set exists so duplicate increments are idempotent
-    # even for test SimpleNamespace fixtures that lack the attribute.
-    if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
-        try:
-            srv.local_generating_sessions = set()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    try:
-        lock = getattr(srv, "local_generating_queries_lock", None)
-        sessions: set | None = getattr(srv, "local_generating_sessions", None)
-        if lock is not None:
-            async with lock:
-                if session_key and sessions is not None and session_key in sessions:
-                    return
-                srv.local_generating_queries = int(getattr(srv, "local_generating_queries", 0) or 0) + 1
-                if session_key and sessions is not None:
-                    sessions.add(session_key)
-        else:
-            if session_key and sessions is not None and session_key in sessions:
-                return
-            srv.local_generating_queries = int(getattr(srv, "local_generating_queries", 0) or 0) + 1
-            if session_key and sessions is not None:
-                sessions.add(session_key)
-    except Exception:
-        pass
-
-
-async def _decrement_generating_only_slot(srv, session_key: str | None = None) -> None:
-    """Decrement generating-only slot for *session_key* (safe / not negative).
-
-    Also clears any remaining prefill hold (prefill-only aborts).
-
-    Called from the streaming generator's ``finally`` block (``router.py:1790``)
-    after stream termination. If this call is skipped — e.g., due to an
-    exception in the preceding slot-save path (``router.py:1700-1722``)
-    — the session key leaks into ``local_generating_queries`` /
-    ``local_generating_sessions`` and wedges the dispatch pool at capacity.
-
-    Self-healing: the dispatch cleanup loop periodically reclaims such stale
-    entries via ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU).
-    """
-    # Clear prefill hold for prefill-only sessions (no generating).
-    try:
-        _p = getattr(srv, "local_prefill_in_flight", None)
-        if _p is not None and session_key and session_key in _p:
-            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
-            if _plock is not None:
-                async with _plock:
-                    _p.pop(session_key, None)
-            else:
-                _p.pop(session_key, None)
-            try:
-                from proxy.contention_queue import wake
-                await wake(1)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    if not hasattr(srv, "local_generating_queries"):
-        return
-    if not hasattr(srv, "local_generating_sessions") or getattr(srv, "local_generating_sessions", None) is None:
-        try:
-            srv.local_generating_sessions = set()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    try:
-        lock = getattr(srv, "local_generating_queries_lock", None)
-        sessions: set | None = getattr(srv, "local_generating_sessions", None)
-        if lock is not None and sessions is not None:
-            async with lock:
-                if session_key and session_key not in sessions:
-                    return
-                srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
-                if session_key:
-                    sessions.discard(session_key)
-        elif lock is not None:
-            async with lock:
-                srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
-        else:
-            if sessions is not None and session_key and session_key not in sessions:
-                return
-            srv.local_generating_queries = max(0, int(getattr(srv, "local_generating_queries", 0) or 0) - 1)
-            if session_key and sessions is not None:
-                sessions.discard(session_key)
-    except Exception:
-        pass
-    try:
-        from proxy.contention_queue import wake
-
-        await wake(1)
-    except Exception:
-        pass
 
 
 async def _try_acquire_local_dispatch(
@@ -1320,21 +1145,24 @@ async def _try_acquire_local_dispatch(
     # window in which an anonymous-session increment could land between the
     # records count and the counter check and falsely deny an explicit
     # session that had a free slot (LP-0MS8ZM98R000M8AN).
+    record_key = _dispatch_lease_key(backend, session_key)
+    # The record dict's key type tells us whether the deployment is endpoint-
+    # aware (multi-backend, LP-0MRPILSMW004T4H8): once any per-endpoint tuple
+    # key exists, per-endpoint records are the authoritative occupancy source
+    # and the global counter is no longer consulted. In legacy single-server
+    # mode (no tuple keys), the global ``local_active_queries`` counter keeps
+    # its original deny semantics.
+    has_endpoint_records = any(
+        isinstance(k, tuple) for k in srv.local_dispatch_records
+    )
+    endpoint_scope = (
+        backend if (isinstance(record_key, tuple) and backend and backend != "local")
+        else ""
+    )
     try:
         async with srv.local_active_queries_lock:
             async with srv.local_dispatch_records_lock:
-                # Multi-backend per-endpoint scoping (LP-0MRPILSMW004T4H8):
-                # record keys are ``(endpoint, session_key)``. Derive the
-                # record key + endpoint scope so only records in the same
-                # endpoint scope count toward occupancy.
-                record_key = _dispatch_lease_key(backend, session_key)
-                has_endpoint_records = any(
-                    isinstance(k, tuple) for k in srv.local_dispatch_records
-                )
-                endpoint_scope = (
-                    backend if (isinstance(record_key, tuple) and backend and backend != "local")
-                    else ""
-                )
+                # ... (cleaning, checking, acquiring logic)
                 for existing_key, record in list(srv.local_dispatch_records.items()):
                     if not record.get("active") and record.get("expires_at", 0) <= now:
                         del srv.local_dispatch_records[existing_key]
@@ -1353,61 +1181,48 @@ async def _try_acquire_local_dispatch(
                     )
                 )
 
-                occupied_by_others = 0
-                first_occupied_owner = None
-                for existing_key, record in srv.local_dispatch_records.items():
-                    if existing_key == record_key:
-                        continue
-                    if has_endpoint_records:
-                        # Endpoint-aware mode: only records in the same
-                        # endpoint scope count toward this server's pool.
-                        ek_endpoint = existing_key[0] if isinstance(existing_key, tuple) else ""
-                        if ek_endpoint != endpoint_scope:
-                            continue
-                    if record.get("active") or record.get("expires_at", 0) > now:
-                        occupied_by_others += 1
-                        if first_occupied_owner is None:
-                            first_occupied_owner = _dispatch_key_session_id(existing_key)
-                _generating_count = _get_generating_only_count(srv)
-                _prefill_count = _get_prefill_in_flight_count(srv)
-                has_generating_state = (
-                    hasattr(srv, "local_generating_queries")
-                    or hasattr(srv, "local_generating_sessions")
-                    or hasattr(srv, "local_generating_queries_lock")
-                )
                 if not own_has_lease:
-                    if has_generating_state:
-                        # Generating-only pool (LP-0MTH7JX82000YS5N): prefill
-                        # dispatches do not count against the cap — only
-                        # generating sessions do. Inactive leases (cooldown)
-                        # are not counted here; they are covered by the
-                        # streaming-phase counter.
-                        if _generating_count >= max_local:
-                            active_owner = None
-                            for ek, er in srv.local_dispatch_records.items():
-                                if ek != record_key and er.get("active"):
-                                    active_owner = _dispatch_key_session_id(ek)
-                                    break
-                            if active_owner is None:
-                                active_owner = first_occupied_owner
-                            return (False, active_owner, _generating_count, max(1.0, lease_timeout))
-                        # Prefill-aware guard (LP-0MTJET4I5009EHNX): cap
-                        # concurrent prefills to ``parallel`` (max_local) so
-                        # the llama-server internal queue does not saturate.
-                        if _prefill_count >= max_local:
-                            active_owner = None
-                            for ek, er in srv.local_dispatch_records.items():
-                                if ek != record_key and er.get("active"):
-                                    active_owner = _dispatch_key_session_id(ek)
-                                    break
-                            if active_owner is None:
-                                active_owner = first_occupied_owner
-                            return (False, active_owner, _prefill_count, max(1.0, lease_timeout))
-                        # Also enforce the traditional slot-cap when no
-                        # generating backing state is present (legacy).
-                    else:
-                        if occupied_by_others >= max_local:
-                            return (False, first_occupied_owner, occupied_by_others, max(1.0, lease_timeout))
+                    occupied_by_others = 0
+                    first_occupied_owner = None
+                    for existing_key, record in srv.local_dispatch_records.items():
+                        if existing_key == record_key:
+                            continue
+                        if has_endpoint_records:
+                            # Endpoint-aware mode: only records in the same
+                            # endpoint scope count toward this server's pool.
+                            ek_endpoint = existing_key[0] if isinstance(existing_key, tuple) else ""
+                            if ek_endpoint != endpoint_scope:
+                                continue
+                        if record.get("active") or record.get("expires_at", 0) > now:
+                            occupied_by_others += 1
+                            if first_occupied_owner is None:
+                                first_occupied_owner = _dispatch_key_session_id(existing_key)
+
+                    if occupied_by_others >= max_local:
+                        active_count = getattr(srv, "local_active_queries", 0)
+                        retry_after = max(1.0, lease_timeout)
+                        return (False, first_occupied_owner, active_count, retry_after)
+
+                # Counter gate: endpoint-aware deployments trust the per-endpoint
+                # records (counted above). Legacy mode (no tuple keys) keeps the
+                # global-counter deny so anonymous-session occupancy still gates
+                # explicit acquisitions exactly as before.
+                if (
+                    not has_endpoint_records
+                    and srv.local_active_queries >= max_local
+                    and not own_has_lease
+                ):
+                    active_owner = None
+                    for ek, er in srv.local_dispatch_records.items():
+                        if er.get("active"):
+                            active_owner = _dispatch_key_session_id(ek)
+                            break
+                    return (
+                        False,
+                        active_owner,
+                        srv.local_active_queries,
+                        max(1.0, lease_timeout),
+                    )
 
                 srv.local_active_queries += 1
 
@@ -1418,13 +1233,6 @@ async def _try_acquire_local_dispatch(
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
                 }
-                # Register prefill hold for the prefill-aware guard.
-                try:
-                    _p = getattr(srv, "local_prefill_in_flight", None)
-                    if _p is not None:
-                        _p[session_key] = True
-                except Exception:
-                    pass
 
             return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
     except Exception:
@@ -1479,7 +1287,7 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                 try:
                     srv.logger.info(
                         "lease_released session=%s reason=explicit_release",
-                        session_id if session_id else "unknown",
+                        session_id[:8] if session_id else "unknown",
                         extra=_client_identity_extra(request),
                     )
                 except Exception:
@@ -1500,12 +1308,6 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     except Exception:
         raise
     # Free the slot registry entry
-    try:
-        _p = getattr(srv, "local_prefill_in_flight", None)
-        if _p is not None and session_id and session_id in _p:
-            _p.pop(session_id, None)
-    except Exception:
-        pass
     if session_id:
         try:
             from proxy.session import _free_slot_assignment
@@ -1637,15 +1439,11 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                     try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-                    except Exception:
-                        pass
-                    try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout endpoint=%s",
-                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                            _dispatch_key_session_id(sid)[:8]
+                            if _dispatch_key_session_id(sid)
+                            else "unknown",
                             _endpoint_from_record(record) or "default",
                         )
                     except Exception:
@@ -1695,19 +1493,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             srv.logger.info(
                                 "lease_verified_active session=%s "
                                 "reason=active_slot stream_abandoned=False",
-                                _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                                _dispatch_key_session_id(sid)[:8]
+                                if _dispatch_key_session_id(sid)
+                                else "unknown",
                             )
                         except Exception:
                             pass
                         continue
                     # Genuinely orphaned active record past its expires_at
                     del srv.local_dispatch_records[sid]
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-                    except Exception:
-                        pass
                     removed += 1
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
@@ -1732,12 +1526,16 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         srv.logger.warning(
                             "lease_released session=%s reason=orphan_cleanup "
                             "stream_abandoned=True endpoint=%s",
-                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                            _dispatch_key_session_id(sid)[:8]
+                            if _dispatch_key_session_id(sid)
+                            else "unknown",
                             _endpoint_from_record(record) or "default",
                         )
                         srv.logger.info(
                             "lease_released session=%s reason=orphan_cleanup",
-                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                            _dispatch_key_session_id(sid)[:8]
+                            if _dispatch_key_session_id(sid)
+                            else "unknown",
                         )
                     except Exception:
                         pass
@@ -1753,145 +1551,6 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
         except Exception:
             pass
     return removed
-
-
-async def _recover_stuck_generating_queries(srv) -> None:
-    """Detect and reclaim stale ``local_generating_queries`` / ``local_generating_sessions`` entries.
-
-    Session keys stuck in ``local_generating_sessions`` (from an aborted
-    ``_decrement_generating_only_slot`` in the streaming generator's finally
-    block, ``router.py:1700-1801``) wedge the local dispatch pool when
-    ``local_generating_queries >= max_local``. Nothing in
-    ``_dispatch_cleanup_loop`` previously reclaimed these entries, causing
-    prolonged outages (e.g. 2h 11m, 2026-09-11; LP-0MTYAWDCQ006RGYU).
-
-    This function reconciles ``local_generating_queries`` and
-    ``local_generating_sessions`` against ``local_dispatch_records``:
-
-    - For each session key in ``local_generating_sessions``, check whether
-      an active dispatch record exists.
-    - Keys with **no** active record are stale — removed from the set and
-      ``local_generating_queries`` is reset to the count of remaining
-      legitimate entries.
-    - If **no** active dispatch records exist at all, all generating state
-      is considered stale: the session set is emptied and the counter is
-      reset to 0. This also reclaims a counter-only leak (positive counter
-      with an empty session set), which can occur for anonymous sessions
-      where increment/decrement touch the counter but not the set.
-    - If the set is empty and the counter is 0 there is nothing to do.
-
-    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
-    as part of the periodic self-healing cycle, providing a bounded
-    recovery mechanism that runs every 10 seconds. O(n) in the number
-    of generating sessions; no llama-server HTTP calls.
-
-    Lock ordering: acquires ``local_generating_queries_lock`` only. Does
-    not acquire ``local_dispatch_records_lock`` — reads the records
-    snapshot without holding the lock. This is acceptable because the
-    check is self-correcting (runs every 10s) and a slightly stale
-    snapshot cannot cause harm (false negatives simply defer recovery;
-    false positives are prevented by the ``active`` flag check).
-
-    On reclaim, emits a WARNING log and wakes contention-queue waiters
-    so blocked dispatch retries can proceed.
-    """
-    try:
-        generating_sessions: set | None = getattr(
-            srv, "local_generating_sessions", None
-        )
-        if generating_sessions is None:
-            # No generating-session tracking at all — nothing to reconcile.
-            return
-
-        prev_count = int(
-            getattr(srv, "local_generating_queries", 0) or 0
-        )
-        if not generating_sessions and prev_count == 0:
-            return  # Nothing to do
-
-        generating_lock = getattr(
-            srv, "local_generating_queries_lock", None
-        )
-        records = getattr(srv, "local_dispatch_records", None)
-
-        if records is not None:
-            has_active = any(
-                r.get("active", False) for r in records.values()
-            )
-        else:
-            has_active = False  # legacy mode: no dispatch records
-
-        if not has_active:
-            # No in-flight streams anywhere — all generating state is stale
-            # (this includes a counter-only leak with an empty session set).
-            stale_keys = set(generating_sessions)
-            new_count = 0
-        else:
-            # Identify stale keys: those without an active dispatch record.
-            stale_keys = set()
-            for key in generating_sessions:
-                # Support both string keys and tuple (endpoint, session)
-                # keys.
-                record = records.get(key)
-                if record is None and not isinstance(key, tuple):
-                    # Direct string-key lookup failed. Try the legacy
-                    # ("local", session) tuple key.
-                    record = records.get(("local", key))
-                    # If that also fails, the dispatch record may be keyed
-                    # by a full endpoint URL tuple (endpoint_url, session).
-                    # Search through all tuple keys for a match.
-                    if record is None:
-                        for rk in records:
-                            if isinstance(rk, tuple) and len(rk) == 2:
-                                if rk[1] == key:
-                                    record = records[rk]
-                                    break
-                if record is None or not record.get("active", False):
-                    stale_keys.add(key)
-            # The session set is authoritative for the legitimate count.
-            new_count = len(generating_sessions) - len(stale_keys)
-
-        if not stale_keys and prev_count == new_count:
-            return  # Nothing to reclaim
-
-        prev_sessions_count = len(generating_sessions)
-
-        if generating_lock is not None:
-            async with generating_lock:
-                for key in stale_keys:
-                    generating_sessions.discard(key)
-                srv.local_generating_queries = max(0, new_count)
-        else:
-            for key in stale_keys:
-                generating_sessions.discard(key)
-            srv.local_generating_queries = max(0, new_count)
-
-        new_count = int(getattr(srv, "local_generating_queries", 0) or 0)
-
-        # Log the recovery.
-        try:
-            srv.logger.warning(
-                "local_generating_queries counter recovered: "
-                "reclaimed %d stale session(s) (reset from %d to %d, "
-                "%d sessions removed from local_generating_sessions)",
-                prev_count - new_count,
-                prev_count,
-                new_count,
-                prev_sessions_count - len(generating_sessions),
-            )
-        except Exception:
-            pass
-
-        # Wake contention-queue waiters so blocked dispatches can retry.
-        try:
-            from proxy.contention_queue import wake_all
-
-            await wake_all()
-        except Exception:
-            pass
-
-    except Exception:
-        pass
 
 
 async def _recover_stuck_local_active_queries(srv) -> None:
@@ -2082,105 +1741,6 @@ def _normalize_outgoing_headers(
 # Session handling helper
 # ===================================================================
 
-
-def _evaluate_session_compaction(
-    srv,
-    session_id: str,
-    session_messages: list,
-    mode: str,
-    summarizer=None,
-    estimate_tokens=None,
-    churn_collector=None,
-    logger_obj=None,
-) -> dict:
-    """Prompt-assembly-time compaction decision for a session (integration).
-
-    Parent LP-0MTCWE8NG003P0SD: proactive session compaction at
-    prompt-assembly / session-persistence time. Wires the pure decision
-    (``decide_session_compaction``) to the router's session machinery:
-
-    - Warn-only dry-run (default, AC8 gate not passed): returns
-      ``applied=False`` and the ORIGINAL list — the persistence layer
-      stores exactly what it would have stored before. Advisory log +
-      churn only.
-    - Live (opt-in ``compaction_dry_run: false``): when the session
-      exceeds the trigger and is compactable, returns ``applied=True``
-      with the COMPACTED history for the caller to persist; the slot/KV
-      is invalidated by the caller so the next request re-prefills
-      cleanly from the compacted history.
-    - ``remote_with_guidance``: returns ``applied=False`` and the reason;
-      the dispatcher must route remote with guidance rather than dispatch
-      local near-full-slot.
-
-    Fail-open: any exception falls back to the untouched plan (original
-    messages, ``applied=False``) and logs a warning — compaction must
-    never break dispatch.
-
-    Args:
-        srv: Server object (config at ``srv.config``).
-        session_id: The session being assembled.
-        session_messages: The full session message list.
-        mode: "fast" or "cheap" (from ``proxy.mode.read_mode``).
-        summarizer: Production summarizer callable (see compaction module).
-        estimate_tokens: Production routing estimator.
-
-    Returns:
-        The ``decide_session_compaction`` result (always includes
-        ``messages``, ``applied``, ``dry_run``).
-    """
-    try:
-        from proxy.compaction import decide_session_compaction
-
-        server_config = getattr(srv, "config", {}).get("server", {})
-        return decide_session_compaction(
-            session_messages,
-            server_config,
-            mode,
-            summarizer=summarizer,
-            estimate_tokens=estimate_tokens,
-            session_id=session_id or "",
-            churn_collector=churn_collector,
-            logger_obj=logger_obj,
-        )
-    except Exception:
-        getattr(getattr(srv, "logger", None), "warning", lambda *a, **k: None)(
-            "Session compaction evaluation failed; dispatching untouched "
-            "(session=%s)",
-            (session_id or "")[:8],
-            exc_info=True,
-        )
-        return {
-            "action": "noop",
-            "applied": False,
-            "dry_run": True,
-            "messages": session_messages,
-            "reason": "evaluation_failed",
-        }
-
-
-def _apply_post_compaction_heal(
-    srv,
-    session,
-    body_json: dict,
-) -> list | None:
-    """Heal a post-compaction client/session sync break (AC2).
-
-    Thin, fail-open wrapper around
-    :func:`proxy.session_manager.compute_post_compaction_delta`: returns the
-    healed delta when the incoming history still aligns with the stored
-    compacted base, otherwise ``None`` so the caller keeps the existing
-    ``history_mismatch`` invalidation behavior.
-    """
-    try:
-        from proxy.session_manager import compute_post_compaction_delta
-
-        incoming = body_json.get("messages", []) if isinstance(body_json, dict) else []
-        return compute_post_compaction_delta(session, incoming)
-    except Exception:
-        srv.logger.debug("Post-compaction heal evaluation failed", exc_info=True)
-        return None
-
-
 async def _handle_session(
     srv,
     body_json: dict,
@@ -2271,42 +1831,6 @@ async def _handle_session(
                     )
                 else:
                     if session_fallback_reason == "history_mismatch":
-                        # Post-compaction resync (LP-0MTVXP7DG00613ZB AC2):
-                        # a live compaction leaves the client holding its
-                        # pre-compaction history. When the stored compacted
-                        # recent turns + appended messages still align with
-                        # the incoming history, accept the new tail as a
-                        # delta against the compacted base instead of
-                        # invalidating the session (which would undo the
-                        # compaction and drop the KV cache).
-                        _healed = _apply_post_compaction_heal(
-                            srv, session, body_json
-                        )
-                        if _healed is not None:
-                            delta_messages = _healed
-                            result["delta_messages"] = _healed
-                            result["is_delta_request"] = True
-                            result["session_fallback_reason"] = None
-                            session_fallback_reason = None
-                            body_json["messages"] = list(_healed)
-                            try:
-                                _record_delta_payload_bytes(
-                                    len(
-                                        json.dumps(
-                                            _healed,
-                                            separators=(",", ":"),
-                                            ensure_ascii=False,
-                                        ).encode("utf-8")
-                                    )
-                                )
-                            except Exception:
-                                pass
-                            srv.logger.info(
-                                "post_compaction_resync session=%s delta_messages=%d",
-                                result["session_id"][:8],
-                                len(_healed),
-                            )
-                    if session_fallback_reason == "history_mismatch":
                         from proxy.session import _build_slot_context, _invalidate_session_and_slot
                         _, slot_filename, _ = _build_slot_context(
                             server_config, result["session_id"]
@@ -2329,139 +1853,6 @@ async def _handle_session(
                     )
             elif session_created:
                 result["session_fallback_reason"] = "no_existing_history"
-
-            # Proactive session compaction at prompt-assembly time
-            # (LP-0MTCWE8NG003P0SD / LP-0MTGBQ01A000ZFT9 wiring). Evaluates
-            # the persistent history this request produces. Warn-only
-            # dry-run (default, AC8 gate pending) logs advisories only —
-            # zero dispatch change. Opt-in live enforcement rewrites the
-            # dispatch body to the compacted full history and marks the
-            # request full-prompt so forward + persistence stay consistent.
-            try:
-                from proxy.compaction_summarizer import build_local_summarizer
-                from proxy.mode import read_mode as _read_mode
-                from proxy.provider import _estimate_prompt_tokens_for_routing
-
-                # Build the production summarizer + token estimator once
-                # per request so decide_session_compaction has real
-                # capabilities rather than the always-None defaults
-                # that caused the compaction hang (LP-0MTPK77WG009A4VH).
-                _llama_port = server_config.get("llama_server_port", 8080)
-                _top_cfg = getattr(srv, "config", None)
-                if not isinstance(_top_cfg, dict):
-                    _top_cfg = {"server": dict(server_config)}
-                _summarizer = build_local_summarizer(
-                    _top_cfg,
-                    llama_port=_llama_port,
-                )
-                # The summarizer timeout resolves inside build_local_summarizer
-                # from config (``compaction_summarizer_timeout``, default
-                # 600 s — ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s
-                # timeout could not wait for the single local slot to free up
-                # while a long generating request held it, so every compaction
-                # failed (summarizer_failed/timeout) and the session was
-                # routed remote with guidance, stalling until the 900 s
-                # upstream timeout. 600 s exceeds the observed worst-case
-                # stall (max dispatch_first_byte_ms 713 s). See
-                # LP-0MU1RXEY10075TUU.
-                def _estimate_fn(msgs):
-                    return _estimate_prompt_tokens_for_routing({"messages": msgs})
-
-                # The full history this request produces: the persistent
-                # session history PLUS this request's new turn(s). Compaction
-                # must operate on this produced history — evaluating only the
-                # stored history would drop the current turn from the
-                # compacted dispatch body (LP-0MTVXP7DG00613ZB AC2).
-                _delta_for_compaction = result.get("delta_messages")
-                if result.get("is_delta_request") and _delta_for_compaction:
-                    _pre_compaction_messages = list(
-                        getattr(session, "messages", None) or []
-                    ) + list(_delta_for_compaction)
-                else:
-                    _pre_compaction_messages = list(
-                        body_json.get("messages", [])
-                        or getattr(session, "messages", None)
-                        or []
-                    )
-
-                # The summarizer call blocks on the local llama-server slot
-                # (up to ``compaction_summarizer_timeout``, default 600 s on
-                # a 1-slot backend where a long generating request holds the
-                # slot). Run the whole evaluation in a worker thread so the
-                # event loop keeps serving other requests (notably the
-                # streaming request whose slot we are waiting on) instead of
-                # freezing for the whole wait (LP-0MU1RXEY10075TUU).
-                _compaction = await asyncio.to_thread(
-                    _evaluate_session_compaction,
-                    srv,
-                    result["session_id"],
-                    _pre_compaction_messages,
-                    _read_mode(),
-                    summarizer=_summarizer,
-                    estimate_tokens=_estimate_fn,
-                )
-                if (
-                    _compaction.get("action") == "compact"
-                    and _compaction.get("applied")
-                    and not _compaction.get("dry_run")
-                ):
-                    # Live: dispatch the compacted history as a full prompt
-                    # (its prefix no longer matches the client's history).
-                    body_json["messages"] = list(_compaction["messages"])
-                    body_json["cache_prompt"] = True
-                    body_json["session_id"] = result["session_id"]
-                    result["body_override"] = json.dumps(body_json).encode("utf-8")
-                    result["is_delta_request"] = False
-                    result["delta_messages"] = None
-                    result["compaction_applied"] = True
-                    result["compaction_estimated_before"] = int(
-                        _compaction.get("estimated_before", 0) or 0
-                    )
-                    result["compaction_reason"] = _compaction.get("reason")
-                    srv.logger.info(
-                        "session_compaction applied session=%s mode=%s "
-                        "est_before=%d est_after=%d",
-                        result["session_id"][:8],
-                        _compaction.get("mode"),
-                        _compaction.get("estimated_before", 0),
-                        _compaction.get("estimated_after", 0),
-                    )
-                    # After compaction, update the session's message history so
-                    # downstream token estimates (e.g. routing_estimate_session)
-                    # reflect the compacted count, not the pre-compaction value,
-                    # and record the client/base anchors the next request needs
-                    # to heal the sync break (AC2).
-                    try:
-                        await srv.session_manager.update_messages(
-                            result["session_id"],
-                            list(_compaction["messages"]),
-                        )
-                        await srv.session_manager.mark_compacted(
-                            result["session_id"],
-                            len(_pre_compaction_messages),
-                            len(_compaction["messages"]),
-                        )
-                    except Exception:
-                        pass  # non-fatal: routing estimate still uses body messages
-                elif (
-                    _compaction.get("action") == "remote_with_guidance"
-                    and not _compaction.get("dry_run")
-                ):
-                    # Never dispatch local near-full-slot when the session
-                    # cannot be compacted; the dispatcher must escalate
-                    # remote WITH guidance.
-                    result["compaction_remote_with_guidance"] = True
-                    result["compaction_estimated_before"] = int(
-                        _compaction.get("estimated_before", 0) or 0
-                    )
-                    result["compaction_reason"] = _compaction.get("reason")
-            except Exception:
-                srv.logger.warning(
-                    "Compaction evaluation failed; continuing unchanged "
-                    "(session=%s)",
-                    str(result.get("session_id") or "")[:8],
-                    exc_info=True,
-                )
 
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True
@@ -2664,244 +2055,6 @@ async def _schedule_recv_token_increment(
 
 
 # ===================================================================
-# Local child-port discovery
-# ===================================================================
-
-_QWEN3_SPAWN_RE = re.compile(r"name=(\S+) on port (\d+)")
-# Alias kept for backward-compat; new code uses _SPAWN_RE.
-_SPAWN_RE = _QWEN3_SPAWN_RE
-
-_child_port_cache: dict[tuple[int, str], int | None] = {}
-"""Cached child port per (llama-server pid, normalized target model).
-
-The router llama-server (port 8080) spawns child instances on dynamic ports
-(``--port 0``). The child port is discoverable from the spawn line in the
-llama-server log (``spawning server instance with name=Qwen3 on port 58113``).
-
-The router serializes ``GET /slots?model=...`` behind the busy child's
-generation loop (LP-0MTDGBRPU003Z7KU: measured 5-7s via the router vs 0.17s
-direct), so availability/status checks should target the child port directly.
-
-LP-0MTP1FQXH004JYEF: the previous implementation returned the *first*
-spawn line (which is ``mxbai-embed`` — embeddings child) instead of the
-target model (Qwen3), so ``/llama/local/status`` queried the embed child
-(``n_ctx 256, is_processing=false``) and reported ``3/3`` idle while the
-Qwen3 child was busy. The cache was also per-pid only and sticky. Now the
-lookup filters by target model, strips NUL padding from sparse logrotate
-files, scans the full current log + rotated logs, and caches per
-``(pid, model)``. Callers should pass the target model (``current_model``
-or ``slot_model``) so the right child is returned.
-"""
-
-
-def _is_sparse_log(log_path: Path) -> bool:
-    """Return True when *log_path* is sparse/NUL-padded/empty (logrotate).
-
-    A non-sparse file with real content (even without a spawn line) returns
-    False so :func:`_discover_local_child_port` does NOT fall back to global
-    rotated logs — this preserves tmp_path isolation in tests
-    (LP-0MTP1FQXH004JYEF).
-    """
-    try:
-        if not log_path.exists():
-            return False
-        size = log_path.stat().st_size
-        if size == 0:
-            return True
-        read_size = min(8192, size)
-        with open(log_path, "rb") as f:
-            chunk = f.read(read_size)
-        if not chunk:
-            return True
-        # Sparse if >50% NULs or stripped text is empty/short whitespace.
-        nul_ratio = chunk.count(b"\x00") / len(chunk)
-        if nul_ratio > 0.5:
-            return True
-        text = chunk.decode("utf-8", errors="replace").replace("\x00", "").strip()
-        return len(text) == 0
-    except Exception:
-        return False
-
-
-def _llama_log_path(srv) -> Path:
-    """Resolve the llama-server log path for a given server context."""
-    log_dir = getattr(srv, "log_dir", None)
-    if log_dir:
-        return Path(log_dir) / "llama-server.log"
-    return Path(__file__).parent / "logs" / "llama-server.log"
-
-
-def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
-    """Scan a single log file for spawn ports, filtered by target model.
-
-    Strips NUL padding (sparse logrotate files) and returns the *last*
-    matching port for *target_model* so restarts pick the newest line.
-    ``target_model`` is matched case-insensitively; when no exact match is
-    found the function returns ``None`` (caller may fall back to a non-embed
-    heuristic or to ``None`` / router port). Returns a special sentinel
-    ``None`` both for "file unreadable" and "no matching spawn" — caller
-    distinguishes sparse vs. real-content via :func:`_is_sparse_log`.
-    """
-    try:
-        if not log_path.exists():
-            return None
-        size = log_path.stat().st_size
-        # Spawn lines are at startup (head) but NUL-padded sparse files can
-        # hide them; read up to 256 KiB so we cover head + a bit of tail
-        # without loading multi-MB logs fully. If the file is larger we still
-        # scan only that window — the caller iterates rotated logs for older
-        # spawn lines.
-        read_size = min(262144, size) if size else 0
-        if read_size == 0:
-            return None
-        with open(log_path, "rb") as f:
-            raw = f.read(read_size)
-        text = raw.decode("utf-8", errors="replace").replace("\x00", "")
-        if not text.strip():
-            return None
-        want = (target_model or "").strip().lower() or None
-        # Collect all matches so the last (newest) wins after a restart.
-        matches: list[tuple[str, int]] = []
-        for line in text.splitlines():
-            m = _SPAWN_RE.search(line)
-            if not m:
-                continue
-            try:
-                name = str(m.group(1)).strip()
-                port = int(m.group(2))
-            except (TypeError, ValueError, IndexError):
-                continue
-            matches.append((name, port))
-        if not matches:
-            return None
-        if want is not None:
-            # Exact case-insensitive match for the requested model.
-            filtered = [p for n, p in matches if n.lower() == want]
-            if filtered:
-                return filtered[-1]
-            return None
-        # No target requested — prefer a non-embed model (Qwen3) over
-        # mxbai-embed; fall back to the last match.
-        non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
-        if non_embed:
-            return non_embed[-1][1]
-        return matches[-1][1]
-    except Exception:
-        return None
-
-
-def _discover_local_child_port(srv, model: str | None = None) -> int | None:
-    """Discover the local model child port from the llama-server log.
-
-    The router (``llama_server_port``) spawns model children on dynamic ports
-    (``--port 0``); the spawn line ``spawning server instance with
-    name=<model> on port <port>`` is written near the top of the fresh
-    llama-server log on startup.
-
-    Args:
-        srv: Server module / namespace with ``llama_process.pid`` and
-            ``log_dir`` / ``current_model``.
-        model: Optional target model name to filter by (e.g. ``"Qwen3"``).
-            When ``None`` the function uses ``srv.current_model`` or
-            ``"Qwen3"`` as the target. Matching is case-insensitive.
-            Passing the wrong model previously returned the embed child port
-            (first spawn line ``mxbai-embed``) — LP-0MTP1FQXH004JYEF.
-
-    Returns the port for the target model, or ``None`` when the log is
-    missing/unreadable or contains no matching spawn line (caller should
-    fall back to the router port). NUL padding from sparse logrotate files
-    is stripped before matching.
-
-    The result is cached per ``(pid, normalized target model)`` so repeated
-    calls (every request) do not re-read the log; a new pid (restart) or
-    different target re-parses. A sparse/empty read is *not* cached as a
-    hard ``None`` for the pid — only for the specific ``(pid, model)`` key
-    — so a later valid log or rotated log can still be found.
-    """
-    try:
-        proc = getattr(srv, "llama_process", None)
-        pid = getattr(proc, "pid", None) if proc is not None else None
-        if pid is None:
-            return None
-        # Resolve the target model: explicit arg wins, then current_model.
-        target = (model or getattr(srv, "current_model", None) or "Qwen3")
-        target = str(target).strip() if target is not None else "Qwen3"
-        if not target:
-            target = "Qwen3"
-        cache_key = (int(pid), target.lower())
-        if cache_key in _child_port_cache:
-            return _child_port_cache[cache_key]
-        # Compatibility: legacy cache used int pid -> port; honour it for
-        # the default Qwen3 target so old tests that populate {pid: port}
-        # still hit.
-        legacy = _child_port_cache.get(int(pid))  # type: ignore[arg-type]
-        if legacy is not None and target.lower() in ("qwen3",):
-            # Only reuse legacy for Qwen3; otherwise re-parse correctly.
-            return legacy  # type: ignore[return-value]
-        # Primary log path.
-        log_path = _llama_log_path(srv)
-        # Missing file -> no fallback scan (test isolation: tmp_path that
-        # does not contain the log should stay None, not find the global
-        # /var/log/llama-proxy file — LP-0MTP1FQXH004JYEF).
-        if not log_path.exists():
-            _child_port_cache[cache_key] = None
-            return None
-        port = _scan_spawn_ports(log_path, target)
-        if port is not None:
-            _child_port_cache[cache_key] = port
-            return port
-        # Primary had real content but no matching spawn for this target
-        # (e.g. test file "[58113] main: model loaded" or a non-Qwen3-only
-        # log) — do NOT fall back to global /var/log/llama-proxy rotated
-        # logs, otherwise tmp_path isolation leaks into tests. Only fall
-        # back when the primary is sparse/NUL-padded/empty (logrotate case)
-        # — LP-0MTP1FQXH004JYEF.
-        if not _is_sparse_log(log_path):
-            _child_port_cache[cache_key] = None
-            return None
-        # Sparse current log (e.g. NUL-padded after logrotate) — scan
-        # rotated logs (llama-server*.log) by mtime descending for the most
-        # recent matching spawn line. Only when the primary file exists but
-        # had no matching spawn line; a missing file already returned above.
-        try:
-            parent = log_path.parent
-            # Also check the canonical /var/log/llama-proxy location when
-            # log_dir is custom, so a sparse worktree log can still find the
-            # real spawn line.
-            candidates: list[Path] = []
-            for base in {parent, Path("/var/log/llama-proxy")}:
-                try:
-                    if base.exists():
-                        for p in base.glob("llama-server*.log*"):
-                            # Avoid re-scanning the primary we already tried.
-                            try:
-                                if p.resolve() == log_path.resolve():
-                                    continue
-                            except Exception:
-                                if p == log_path:
-                                    continue
-                            # Skip compressed archives.
-                            if p.suffix == ".gz":
-                                continue
-                            candidates.append(p)
-                except Exception:
-                    continue
-            # Most-recent first so the newest restart wins.
-            candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-            for cand in candidates[:8]:
-                cand_port = _scan_spawn_ports(cand, target)
-                if cand_port is not None:
-                    _child_port_cache[cache_key] = cand_port
-                    return cand_port
-        except Exception:
-            pass
-        _child_port_cache[cache_key] = None
-        return None
-    except Exception:
-        return None
-
-
-# ===================================================================
 # Slot availability check
 # ===================================================================
 
@@ -2912,30 +2065,16 @@ async def _check_slot_availability(
     slot_model_name: str | None,
     model_name: str | None,
     path: str,
-    lease_held: bool = False,
     endpoint: str | None = None,
 ) -> JSONResponse | None:
     """Check llama-server slot availability.
 
     Returns a 503 JSONResponse if no slots are available, None otherwise.
 
-    When *lease_held* is True the check is skipped entirely: the caller has
-    already acquired a dispatch lease (``_try_acquire_local_dispatch``),
-    which gates concurrency to ``session_slot_pool_size`` — the /slots query
-    would be redundant and, via the router, can take 5-7s under load
-    (LP-0MTDGBRPU003Z7KU).
-
-    The query targets the discovered local child port (``_discover_local_child_port``)
-    instead of the router port when available — the router serializes
-    ``GET /slots?model=...`` behind the busy child's generation loop.
-
-    The query uses a dedicated per-call ``httpx.AsyncClient`` with a short
-    timeout (``session_slot_availability_timeout_seconds``, default 2.0) so a
-    slow router/child response fails fast and can never exhaust the shared
-    ``_http_client`` pool (LP-0MTDH2U6V0062TUF).
+    When *endpoint* is provided, the slot query targets that specific
+    llama-server instance (LP-0MRPILSMW004T4H8). Otherwise falls back
+    to the legacy ``http://localhost:{llama_port}`` URL.
     """
-    if lease_held:
-        return None
     if not (path == "v1/chat/completions" or path.endswith("chat/completions")):
         return None
 
@@ -2943,43 +2082,31 @@ async def _check_slot_availability(
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
         )
-        # LP-0MTP1FQXH004JYEF: target the slot's model so we query the
-        # Qwen3 child not the embed child (first spawn line).
         if endpoint:
-            slots_url = f"{endpoint.rstrip('/')}/slots?model={slot_model}"
+            slots_url = f"{endpoint}/slots?model={slot_model}"
         else:
-            child_port = _discover_local_child_port(srv, model=slot_model)
-            slots_port = child_port if child_port is not None else llama_port
-            slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
-        availability_timeout = float(
-            server_config.get(
-                "session_slot_availability_timeout_seconds", 2.0
-            )
-            or 2.0
+            slots_url = f"http://localhost:{llama_port}/slots?model={slot_model}"
+        client = (
+            srv._http_client
+            if srv._http_client
+            else httpx.AsyncClient(timeout=httpx.Timeout(5.0))
         )
-        # Dedicated per-call client with a short timeout — never borrow the
-        # shared _http_client, so a slow /slots response cannot hold shared
-        # pool connections and starve slot_save/status under multi-session
-        # load (LP-0MTDH2U6V0062TUF).
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(availability_timeout)
-        ) as client:
-            slots_resp = await client.get(slots_url, timeout=availability_timeout)
-            if slots_resp.status_code == 200:
-                slots_data = slots_resp.json()
-                available_slots = 0
-                total_slots = 0
-                if isinstance(slots_data, list):
-                    total_slots = len(slots_data)
-                    available_slots = sum(
-                        1
-                        for s in slots_data
-                        if not s.get("is_processing", True)
-                    )
-                if available_slots == 0 and total_slots > 0:
-                    return _build_slot_exhaustion_response(
-                        server_config, srv, total_slots
-                    )
+        slots_resp = await client.get(slots_url, timeout=5.0)
+        if slots_resp.status_code == 200:
+            slots_data = slots_resp.json()
+            available_slots = 0
+            total_slots = 0
+            if isinstance(slots_data, list):
+                total_slots = len(slots_data)
+                available_slots = sum(
+                    1
+                    for s in slots_data
+                    if not s.get("is_processing", True)
+                )
+            if available_slots == 0 and total_slots > 0:
+                return _build_slot_exhaustion_response(
+                    server_config, srv, total_slots
+                )
     except HTTPException:
         raise
     except Exception:

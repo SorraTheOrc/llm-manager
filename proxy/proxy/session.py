@@ -861,7 +861,9 @@ def _sanitize_session_id(session_id: str) -> str:
 # Tracks which session_id currently owns each slot number, replacing the
 # previous hash-based deterministic mapping. Slots are assigned on demand
 # (lowest-numbered free slot first) so that session_id ↔ slot_number is
-# transparent and doesn't rely on a digest.
+# transparent and doesn't rely on a digest. With multiple local backends
+# (LP-0MRPILSMW004T4H8) the mapping is keyed by endpoint so each
+# llama-server instance has its own independent slot pool.
 # ---------------------------------------------------------------------------
 
 _slot_owners: dict[tuple, str] = {}
@@ -1070,6 +1072,11 @@ def _build_slot_context(
       ``session_slot_skip_when_busy``; LP-0MSI1RWLM007N367 F3), or
     - the slot is in circuit-breaker cooldown after repeated save/restore
       failures.
+
+    When *endpoint* is provided, the slot save directory is derived
+    per-endpoint under the global ``session_slot_save_path`` root using a
+    ``{host}-{port}`` subdirectory so different llama-server instances never
+    collide (LP-0MRPILSMW004T4H8).
 
     When ``session_slot_timeout_per_token_seconds`` is configured, the
     returned timeout scales with the estimated context size, capped at

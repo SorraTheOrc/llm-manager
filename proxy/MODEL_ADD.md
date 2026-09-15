@@ -98,52 +98,46 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 |-------|------|----------|-------------|
 | `name` | string | yes | Unique identifier for this provider entry |
 | `type` | string | yes | `"local"` or `"remote"` |
-| `endpoint` | string | remote; local (optional) | Base URL of the remote API; for `type: local` providers, the URL of a specific llama-server instance (see below) |
+| `endpoint` | string | remote / local (optional) | Base URL of the provider API. For `remote`, required. For `local`, optional: points at a pre-existing llama-server instance (LP-0MRPILSMW004T4H8). |
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
 
-### Multi-backend: multiple local llama-server instances (LP-0MRPILSMW004T4H8)
+### Multiple local backends (LP-0MRPILSMW004T4H8)
 
-A model may list **several `type: local` providers**, each pointing at its own
-llama-server instance. Every `type: local` provider can declare an optional
-`endpoint` field containing the full base URL of that instance
-(`http://host:port`). When `endpoint` is omitted the legacy default is used:
-`http://localhost:{llama_server_port}` (default port `8080`), which keeps
-single-server deployments working unchanged.
+Each `type: local` provider may declare its own `endpoint` URL (host:port)
+pointing at a pre-existing llama-server instance. Listing several local
+providers with different endpoints pools their GPU slot capacity: the proxy
+routes to the first local provider and falls through to the next when it is
+busy or unhealthy (sequential fallback, no load balancing).
+
+- Omitting `endpoint` keeps the legacy behaviour — the provider routes to
+  `http://localhost:{server.llama_server_port}`.
+- Each server tracks its own dispatch leases (keyed per-endpoint) and
+  persists its slot snapshots in its own `{session_slot_save_path}/{host}-{port}/`
+  subdirectory.
+- The proxy assumes the servers are already running; lifecycle management
+  is out of scope for multi-backend setups.
 
 ```yaml
 models:
-  multi-local:
+  qwen3:
     providers:
-      - name: local-qwen3-srv1
+      - name: local-qwen3-server-1
         type: local
-        llama_model: qwen3
+        llama_model: Qwen3
         endpoint: http://192.168.0.199:8080
-      - name: local-qwen3-srv2
+      - name: local-qwen3-server-2
         type: local
-        llama_model: qwen3
+        llama_model: Qwen3
         endpoint: http://192.168.0.200:8080
-      - name: primary_remote
+      - name: remote-fallback
         type: remote
         endpoint: https://api.provider-a.com/v1
         api_key_env: PROVIDER_A_KEY
     aliases:
-      - multi-local
+      - qwen3*
 ```
-
-Per-endpoint behaviour:
-
-- **Dispatch leases** are keyed per endpoint `(endpoint, session_id)`, so the
-  same session can hold an independent slot on each server and slot pools are
-  evaluated independently (AC2).
-- **Slot persistence** is stored per endpoint under
-  `{session_slot_save_path}/{host}-{port}/` so servers never share slot files
-  (AC3).
-- **Fallback** iterates the local providers in order; when a server is
-  unavailable/busy the chain routes to the next one (AC4).
-- **Health probing** (`/slots`, GPU OOM error patterns, slot capacity) is
-  performed per endpoint (AC5).
 
 ### Example: Local model with remote fallback
 
@@ -253,7 +247,7 @@ comments and follow best practices.
 
 ## Routing to local backends
 
- - Ensure the model's `type` value is consulted when routing. For `type: local` entries, use the existing `proxy_to_local(request, path)` helper and pass the configured `llama_model`. For `type: remote` entries, use `proxy_to_remote` and the configured `endpoint`/`api_key_env`.
+ - Ensure the model's `type` value is consulted when routing. For `type: local` entries, use the existing `proxy_to_local(request, path)` helper and pass the configured `llama_model`. When the local provider declares an `endpoint`, pass it as the third argument so the request routes to that specific llama-server (`proxy_to_local(request, path, endpoint)`; `None`/omitted falls back to `localhost:{llama_server_port}` — see LP-0MRPILSMW004T4H8). For `type: remote` entries, use `proxy_to_remote` and the configured `endpoint`/`api_key_env`.
 
 ## Native tokenizer (optional, LP-0MSEQ71IF0003FRT)
 
@@ -315,55 +309,5 @@ comments and follow best practices.
 - Add alias mapping code in `get_model_config()`.
 - Add the integration test `proxy/tests/test_embeddings_integration.py`.
 
-## Timed access to providers (optional, LP-0MS4ETBNO0022QAC)
-
-A provider may carry an `available_times` list restricting when it may be used.
-Entries are `"HH:MM-HH:MM"` UTC windows; window start is inclusive, end is
-_exclusive_, and overnight ranges (e.g. `"22:00-02:00"`) wrap past midnight.
-Routing skips providers outside their window at selection time. Unrestricted
-providers (no `available_times` or only malformed entries) are always
-eligible — malformed entries are logged and ignored (fail-open).
-
-```yaml
-models:
-  example:
-    providers:
-      - name: deepseek-v4-flash
-        type: remote
-        provider: deepseek
-        endpoint: https://api.deepseek.com
-        api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-```
-
-### Validating timed access
-
-| Helper | Location | Purpose |
-|--------|----------|---------|
-| `_parse_window` | `proxy/proxy/provider.py` | Parse a single window string |
-| `_parse_available_times` | `proxy/proxy/provider.py` | Parse + cache a provider's list |
-| `_is_within_allowed_window` | `proxy/proxy/provider.py` | Check if now-UTC is inside any window |
-| `format_available_times` | `proxy/proxy/provider.py` | Render windows for the UI (e.g. `00:00-01:00, ... (UTC)`) |
-| `format_active_status` | `proxy/proxy/provider.py` | Render `Active`/`Inactive` for the UI |
-
-### Home tab display (LP-0MT2WMACO003SE7M)
-
-The **Home tab** `Model Endpoints` table shows, per provider entry within each
-model's fallback chain:
-
-| Column | Content |
-|--------|---------|
-| `Active Times` | The provider's `available_times` in config order, e.g. `00:00–01:00, 04:00–06:00 (UTC)`. Unrestricted providers show `Always`. |
-| `Status` | `Active` (green badge) when the provider is usable right now — i.e. inside any of its windows or unrestricted; `Inactive` (red badge) otherwise. |
-
-Both values are computed **once at page-serve time** (current UTC) via the
-shared `proxy.provider` helpers, so the display can never disagree with
-routing. The flag is static until the page is refreshed (no client-side
-clock/polling — operator decision per LP-0MT2WMACO003SE7M). Windows are shown in
-UTC with an explicit `(UTC)` label — no local-time conversion.
-
 ## References
 - Parent work item: LP-0MN557XBD0H8B8PC - Add an embeddings specific model
-- LP-0MS4ETBNO0022QAC — Timed access (backend)
-- LP-0MT2WMACO003SE7M — Home tab Active Times / Status columns

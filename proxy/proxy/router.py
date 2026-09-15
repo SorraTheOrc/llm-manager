@@ -135,17 +135,20 @@ def _get_local_max_concurrent_queries(server_config: dict) -> int:
     Returns the configured parallel session count, which determines how
     many concurrent sessions can hold local dispatch leases simultaneously.
 
-    Reads ``session_slot_pool_size`` (same value that controls
-    ``--parallel`` in llama-server). The legacy
-    ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
-    and a missing value is caught at launch by
-    ``validate_local_routing_config``.  Defaults to 1.
+    The primary config key is ``session_slot_pool_size`` (same value that
+    controls ``--parallel`` in llama-server). If not set, falls back to
+    the legacy ``local_max_concurrent_queries`` key.  Defaults to 1.
 
     This limit is separate from the global ``max_concurrent_queries``
     which applies to remote providers.
     """
     try:
-        return max(1, int(server_config.get("session_slot_pool_size", 1) or 1))
+        # Primary: session_slot_pool_size (configurable parallel session count)
+        val = server_config.get("session_slot_pool_size", None)
+        if val is None:
+            # Fallback: local_max_concurrent_queries for backward compatibility
+            val = server_config.get("local_max_concurrent_queries", 1)
+        return max(1, int(val or 1))
     except (ValueError, TypeError):
         return 1
 
@@ -570,7 +573,7 @@ async def _cleanup_after_request(
                             try:
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
-                                    session_id if session_id else "unknown",
+                                    session_id[:8] if session_id else "unknown",
                                     extra=_client_identity_extra(request),
                                 )
                             except Exception:
@@ -591,7 +594,7 @@ async def _cleanup_after_request(
                         try:
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
-                                session_id if session_id else "unknown",
+                                session_id[:8] if session_id else "unknown",
                                 extra=_client_identity_extra(request),
                             )
                         except Exception:
@@ -604,129 +607,6 @@ async def _cleanup_after_request(
 # Core proxy routing: Local llama-server dispatch
 # ===================================================================
 
-
-def _compaction_guidance_value(server_config: dict, estimated_tokens: int) -> str:
-    """Build the client-facing ``context_pressure`` guidance signal.
-
-    Non-compactable oversized sessions are routed remote with this signal
-    attached to the response (LP-0MTVXP7DG00613ZB AC1). It is informational —
-    no protocol change and no client cooperation is required; clients that
-    understand it can compact proactively.
-    """
-    try:
-        from proxy.provider import (
-            _get_active_local_ctx_size,
-            _get_active_local_slots,
-            effective_per_slot_threshold,
-        )
-
-        ctx_size = _get_active_local_ctx_size(server_config)
-        slots = _get_active_local_slots(server_config)
-        per_slot = effective_per_slot_threshold(ctx_size, slots)
-    except Exception:
-        per_slot = 0
-    ratio = (estimated_tokens / per_slot) if per_slot > 0 else 0.0
-    return (
-        "context_pressure;"
-        f"estimated_tokens={int(estimated_tokens)};"
-        f"per_slot_ctx={int(per_slot)};"
-        f"ratio={ratio:.2f};"
-        "action=compact_session_history"
-    )
-
-
-async def _route_remote_with_compaction_guidance(
-    srv,
-    request: Request,
-    path: str,
-    model_name: str | None,
-    session_id: str | None,
-    session_result: dict,
-) -> Response:
-    """Route a non-compactable oversized session remote with guidance (AC1).
-
-    The session exceeded the compaction trigger but could not be compacted
-    (summarizer unavailable / failed), so dispatching local would run a
-    near-full-slot request — the slow path this work item removes. Remote
-    providers do not consume local KV slots, so the request escalates there
-    with the ``context_pressure`` guidance attached to the response.
-
-    When the model has no remote provider, the explicit compaction gate is
-    returned instead (the client must compact before retrying) — local
-    dispatch is never attempted in either case.
-    """
-    server_config = (
-        srv.config.get("server", {}) if isinstance(getattr(srv, "config", None), dict) else {}
-    )
-    estimated = int(session_result.get("compaction_estimated_before", 0) or 0)
-    reason = session_result.get("compaction_reason") or "remote_with_guidance"
-    guidance = _compaction_guidance_value(server_config, estimated)
-    try:
-        from proxy.mode import read_mode as _read_mode
-
-        mode = _read_mode()
-    except Exception:
-        mode = "fast"
-
-    model_cfg = None
-    if model_name:
-        try:
-            model_cfg = srv.get_model_config(model_name)
-        except Exception:
-            model_cfg = None
-    remote_providers = [
-        p
-        for p in ((model_cfg or {}).get("providers") or [])
-        if isinstance(p, dict) and p.get("type") == "remote"
-    ]
-
-    srv.logger.warning(
-        "compaction_remote_with_guidance session=%s model=%s mode=%s "
-        "estimated_tokens=%d reason=%s remote_providers=%d; refusing local "
-        "near-full-slot dispatch",
-        session_id or "unknown",
-        model_name or "unknown",
-        mode,
-        estimated,
-        reason,
-        len(remote_providers),
-    )
-
-    if not remote_providers:
-        # No remote provider to escalate to: surface the explicit gate so the
-        # client compacts, rather than dispatching local near-full-slot.
-        from proxy.provider import (
-            _build_compaction_gate_response,
-            compute_hard_routing_cap,
-        )
-
-        try:
-            cap = compute_hard_routing_cap(mode, server_config)
-        except Exception:
-            cap = 0
-        if cap <= 0:
-            cap = estimated
-        gate = _build_compaction_gate_response(
-            estimated, cap, mode, session_id, model_name,
-        )
-        try:
-            gate.headers["X-Session-Compaction-Guidance"] = guidance
-        except Exception:
-            pass
-        return gate
-
-    from proxy.provider import proxy_with_remote_fallback
-
-    resp = await proxy_with_remote_fallback(
-        request, path, {"providers": remote_providers}, srv.config,
-    )
-    try:
-        resp.headers["X-Session-Compaction-Guidance"] = guidance
-    except Exception:
-        pass
-    return resp
-
-
 async def proxy_to_local(request: Request, path: str, endpoint: str | None = None) -> Response:
     """Proxy request to local llama-server with session-based incremental ingestion.
 
@@ -736,7 +616,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
     When *endpoint* is provided (a full ``http://host:port`` URL), the
     request is routed to that specific llama-server instance instead of the
-    default ``http://localhost:{llama_port}`` (LP-0MRPILSMW004T4H8).
+    default ``http://localhost:{llama_server_port}`` (LP-0MRPILSMW004T4H8).
     """
     srv = _srv()
     server_config = srv.config.get("server", {})
@@ -801,22 +681,6 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             session_id=session_id,
             client_payload=_client_request_payload,
             model=_recording_model,
-        )
-
-    # ── Compaction guidance enforcement (LP-0MTVXP7DG00613ZB AC1) ──
-    # When prompt-assembly compaction resolves to ``remote_with_guidance``
-    # (summarizer unavailable / failed), the session cannot be compacted and
-    # MUST NOT be dispatched local near-full-slot. Route to the model's
-    # remote providers instead, carrying the context_pressure guidance.
-    # Checked before any slot context / lease / cap resource is acquired.
-    if session_result.get("compaction_remote_with_guidance"):
-        return await _route_remote_with_compaction_guidance(
-            srv,
-            request,
-            path,
-            _recording_model or srv.current_model,
-            session_id,
-            session_result,
         )
 
     slot_id = None
@@ -889,83 +753,6 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         server_config.get("session_single_flight_queue_timeout_seconds", 120) or 120
     )
 
-    # ── Hard local-routing cap (LP-0MTBOX45O005LD1S) ──
-    # Check BEFORE concurrency/lease/slot gating so requests above the cap
-    # never acquire a dispatch lease or consume slot resources.
-    # Fast mode: skip local with context_too_large when above cap.
-    # Cheap mode: return a 429 compaction-gate response (no silent remote).
-    #
-    # The estimate MUST use the provider's authoritative pipeline
-    # (``_get_tokenizer_for_model`` + ``_estimate_effective_prompt_tokens_for_routing``)
-    # — native tokenizer + session history + multiplier — IDENTICAL to the
-    # provider smart-routing block (provider.py ``_should_skip_local`` path),
-    # so the gate fires whenever the provider would skip local.  The body-
-    # only tiktoken estimate (``_estimate_tokens_sent``, which returns a DICT
-    # and would crash the cap comparison) undercounts session-heavy /
-    # native-tokenized requests (~1.69x vs Qwen3).  With a lower gate
-    # estimate an over-cap cheap request passes the gate, then the provider
-    # block fires ``context_too_large`` → routes to the next REMOTE provider
-    # = silent remote fallback in cheap mode (AC2 violation).
-    try:
-        from proxy.provider import (
-            _estimate_effective_prompt_tokens_for_routing,
-            _get_tokenizer_for_model,
-        )
-        _model_cfg = srv.get_model_config(model_name) if model_name else None
-        _tokenizer, _multiplier = _get_tokenizer_for_model(_model_cfg, server_config)
-        _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
-            request, body_json, tokenizer=_tokenizer,
-        )
-        if _multiplier != 1.0:
-            _estimated_tokens = int(_estimated_tokens * _multiplier)
-    except Exception:
-        # Fail-open: an estimate error must never break local routing.  The
-        # provider smart-routing block re-estimates per attempt anyway.
-        _estimated_tokens = 0
-    try:
-        from proxy.mode import read_mode as _read_mode
-        _mode = _read_mode()
-    except Exception:
-        _mode = "fast"
-    from proxy.provider import (
-        check_hard_routing_cap,
-        compute_hard_routing_cap,
-    )
-    if check_hard_routing_cap(_estimated_tokens, _mode, server_config):
-        _cap = compute_hard_routing_cap(_mode, server_config)
-        if _mode == "cheap":
-            # Cheap mode: return a 429 compaction-gate response.
-            srv.logger.info(
-                "compaction_gate session=%s tokens=%d cap=%d mode=%s",
-                session_id or "anonymous",
-                _estimated_tokens,
-                _cap,
-                _mode,
-            )
-            from proxy.provider import _build_compaction_gate_response
-            return _build_compaction_gate_response(
-                _estimated_tokens, _cap, _mode, session_id, model_name,
-            )
-        else:
-            # Fast mode: skip local with context_too_large.
-            srv.logger.info(
-                "context_too_large session=%s tokens=%d cap=%d mode=%s",
-                session_id or "anonymous",
-                _estimated_tokens,
-                _cap,
-                _mode,
-            )
-            _record_backend_signal("context_too_large")
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Context ({_estimated_tokens} tokens) exceeds the "
-                    f"{model_name or 'model'} local routing cap ({_cap} tokens) "
-                    "in fast mode. Compact the session and retry."
-                ),
-                headers={"X-Context-Too-Large": "true"},
-            )
-
     # Check concurrency limit
     max_queries = server_config.get("max_concurrent_queries", 4)
     try:
@@ -1017,7 +804,6 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     # Anonymous/auto-generated sessions are ephemeral and should not
     # acquire a persistent lease.
     # -------------------------------------------------------------------
-    acquired = False
     if session_id and session_explicit:
         local_max = _get_local_max_concurrent_queries(server_config)
         backend_label = endpoint or "local"
@@ -1032,8 +818,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         if not acquired:
             srv.logger.info(
                 "local_dispatch_denied session=%s owner=%s active=%s",
-                session_id if session_id else "unknown",
-                owner if owner else "none",
+                session_id[:8] if session_id else "unknown",
+                owner[:8] if owner else "none",
                 active_count,
             )
             _record_backend_signal("local_dispatch_denied")
@@ -1055,14 +841,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             }
             return JSONResponse(status_code=503, content=payload)
 
-    # Check slot availability — skipped when the dispatch lease was acquired
-    # (the lease already gates concurrency to session_slot_pool_size; the
-    # router /slots?model= check is redundant and can take 5-7s under load,
-    # LP-0MTDGBRPU003Z7KU).
-    _lease_held = bool(session_id and session_explicit) and acquired
+    # Check slot availability
     slot_response = await _check_slot_availability(
         srv, server_config, llama_port, slot_model_name, model_name, path,
-        lease_held=_lease_held, endpoint=endpoint,
+        endpoint=endpoint,
     )
     if slot_response is not None:
         return slot_response
@@ -1094,13 +876,6 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     # Token accounting
     tokens_sent = _estimate_tokens_sent(body, body_json, model_name)
     await _schedule_token_increment(key, tokens_sent)
-
-    # Dispatch→first-byte capture (LP-0MTJET616005S7PN: prefill/audit latency).
-    _dispatch_start = None
-    try:
-        _dispatch_start = time.monotonic()
-    except Exception:
-        pass
 
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
@@ -1148,7 +923,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             slot_timeout,
                             model=slot_model_payload,
                             endpoint=endpoint,
-                        )
+                            )
                         if restored:
                             srv.logger.info(
                                 "slot_restore success session=%s slot=%s",
@@ -1367,9 +1142,6 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             #     max_runtime_seconds (long — large prompt ingestion).
                             #   Phase 2 (between chunks): budget =
                             #     stream_idle_timeout_seconds (short).
-                            _generating_slot_counted = False
-                            # Dispatch→first-byte capture uses this stable per-stream scope
-                            _first_byte_emitted = False
                             _stream_aiter = response.aiter_bytes().__aiter__()
                             _stream_iter = asyncio.ensure_future(
                                 _stream_aiter.__anext__()
@@ -1563,41 +1335,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     pass
 
                                 if _has_actual_data:
-                                    # Dispatch→first-byte capture: first actual data chunk marks the
-                                    # generating phase and gives the distribution-relevant latency
-                                    # without request-ID correlation (LP-0MTJET616005S7PN).
-                                    if not _first_byte_emitted:
-                                        try:
-                                            _now = time.monotonic()
-                                            _delta = (_now - _dispatch_start) if isinstance(_dispatch_start, float) else None
-                                            if _delta is not None and _delta >= 0:
-                                                srv.logger.info(
-                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f session=%s model=%s",
-                                                    _delta * 1000.0,
-                                                    _delta * 1000.0,
-                                                    session_id or "unknown",
-                                                    model_name or "unknown",
-                                                )
-                                            _first_byte_emitted = True
-                                        except Exception:
-                                            try:
-                                                _first_byte_emitted = True
-                                            except Exception:
-                                                pass
                                     remaining_budget = float(stream_idle_timeout)
-                                    # First actual data chunk marks the
-                                    # generating phase for the pool gate
-                                    # (LP-0MTH7JX82000YS5N).
-                                    if not _generating_slot_counted and _has_actual_data:
-                                        try:
-                                            from proxy.router_helpers import _increment_generating_only_slot
-
-                                            await _increment_generating_only_slot(
-                                                srv, session_key=session_id
-                                            )
-                                            _generating_slot_counted = True
-                                        except Exception:
-                                            pass
                                     # Prefill phase is over: the first actual data
                                     # chunk has arrived, so stop progress-based
                                     # lease extension — the chunk-refresh path
@@ -1825,54 +1563,22 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     provider="local",
                                 )
 
-                            # Restore-before-save ordering (LP-0MTIHXPP9005182I):
-                            # streaming saves previously ran outside slot_guard,
-                            # so a hot same-slot restore could race behind the
-                            # save and overwrite the candidate (~438K tokens/day).
-                            # Re-acquire the slot lock around the save so
-                            # same-slot restores (which also hold the lock at
-                            # request start) are serialized before the save.
-                            # Zero GPU footprint: same save/restore calls and
-                            # timeouts (AC4), just ordered behind the existing
-                            # SlotLockCoordinator (AC2 unchanged).
-                            if slot_save_allowed and slot_enabled and slot_id is not None:
-                                async with slot_lock_coordinator.acquire(slot_id):
-                                    await _update_session_and_slot(
-                                        srv, session_id, body_json,
-                                        is_delta_request, delta_messages,
-                                        original_message_count,
-                                        response,
-                                        llama_port, slot_id, slot_filename,
-                                        slot_timeout, slot_model_payload,
-                                        slot_enabled,
-                                        upstream_status=upstream_status,
-                                        slot_save_allowed=slot_save_allowed,
-                                        collected_content=collected_content,
-                                        llama_log_path=llama_log_path,
-                                        llama_log_offset=llama_log_offset,
-                                        endpoint=endpoint,
-                                    )
-                                    try:
-                                        from proxy.session import _record_hot_slot_owner
-                                        _record_hot_slot_owner(slot_id, session_id)
-                                    except Exception:
-                                        pass
-                            else:
-                                await _update_session_and_slot(
-                                    srv, session_id, body_json,
-                                    is_delta_request, delta_messages,
-                                    original_message_count,
-                                    response,
-                                    llama_port, slot_id, slot_filename,
-                                    slot_timeout, slot_model_payload,
-                                    slot_enabled,
-                                    upstream_status=upstream_status,
-                                    slot_save_allowed=slot_save_allowed,
-                                    collected_content=collected_content,
-                                    llama_log_path=llama_log_path,
-                                    llama_log_offset=llama_log_offset,
-                                    endpoint=endpoint,
-                                )
+                            # Update session history and save slot (shared helper)
+                            await _update_session_and_slot(
+                                srv, session_id, body_json,
+                                is_delta_request, delta_messages,
+                                original_message_count,
+                                response,
+                                llama_port, slot_id, slot_filename,
+                                slot_timeout, slot_model_payload,
+                                slot_enabled,
+                                upstream_status=upstream_status,
+                                slot_save_allowed=slot_save_allowed,
+                                collected_content=collected_content,
+                                llama_log_path=llama_log_path,
+                                llama_log_offset=llama_log_offset,
+                                endpoint=endpoint,
+                            )
 
                             # Wrap both cm.__aexit__ and client.aclose() with a
                             # configurable timeout so that an unresponsive upstream
@@ -1924,15 +1630,6 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 # _stream_iter may not exist in all code paths
                                 pass
 
-                            if _generating_slot_counted:
-                                try:
-                                    from proxy.router_helpers import _decrement_generating_only_slot
-
-                                    await _decrement_generating_only_slot(
-                                        srv, session_key=session_id
-                                    )
-                                except Exception:
-                                    pass
                             # Decrement local active queries now that the stream
                             # has finished (LP-0MR96QL8400022BW: streaming path was
                             # not decrementing local_active_queries, causing subsequent
@@ -2003,7 +1700,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             slot_timeout,
                             model=slot_model_payload,
                             endpoint=endpoint,
-                        )
+                            )
                         if restored:
                             srv.logger.info(
                                 "slot_restore success session=%s slot=%s",
