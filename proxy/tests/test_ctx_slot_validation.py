@@ -127,41 +127,6 @@ class TestValidateLocalRoutingConfig:
         }}
         assert validate_local_routing_config(config) == []
 
-    def test_schedule_aware_all_entries_checked(self):
-        """AC2: ALL slot_schedule entries are checked, not just static pool."""
-        config = {"server": {
-            "local_model_ctx_size": 65536,
-            "session_slot_pool_size": 3,  # ok: 65536//3 - 4096 = 21832
-            "slot_schedule": {
-                "enabled": True,
-                "entries": [
-                    {"time": "10:00", "slots": 6},  # bad: 6826
-                    {"time": "23:59", "slots": 4},  # bad: 12288
-                ],
-            },
-        }}
-        problems = validate_local_routing_config(config)
-        # 4 slots → 16384 - 4096 = 12288 ≥ 10000 → ok
-        # 6 slots → 10922 - 4096 = 6826 < 10000 → bad
-        # So one problem for the 6-slot entry
-        assert len(problems) == 1
-        assert "6" in problems[0]
-
-    def test_schedule_aware_best_case_ok(self):
-        """When all schedule entries pass, no problems reported."""
-        config = {"server": {
-            "local_model_ctx_size": 131072,
-            "session_slot_pool_size": 6,  # ok
-            "slot_schedule": {
-                "enabled": True,
-                "entries": [
-                    {"time": "10:00", "slots": 6},  # ok: 39594
-                    {"time": "23:59", "slots": 4},  # ok: 57832
-                ],
-            },
-        }}
-        assert validate_local_routing_config(config) == []
-
     def test_custom_minimum_threshold(self):
         """AC1: minimum is configurable via min_local_routing_threshold."""
         config = {"server": {
@@ -196,23 +161,24 @@ class TestValidateLocalRoutingConfig:
         }}
         assert validate_local_routing_config(config) == []
 
-    def test_no_schedule_only_static_checked(self):
-        """Without slot_schedule, only static pool size is validated."""
+    def test_static_pair_only(self):
+        """The profile's static (ctx, slots) pair is validated."""
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,
-            # no slot_schedule key at all
         }}
         assert validate_local_routing_config(config) == []
 
-    def test_disabled_schedule_only_static_checked(self):
-        """Disabled slot_schedule: only static pool size is validated."""
+    def test_legacy_slot_schedule_key_is_ignored(self):
+        """Regression (LP-0MTZRM5HV0007S0V): a stale slot_schedule key left
+        in an old config is ignored — only the static pair is validated, so
+        a previously-bad entry cannot block startup."""
         config = {"server": {
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 4,
             "slot_schedule": {
-                "enabled": False,
-                "entries": [],
+                "enabled": True,
+                "entries": [{"time": "10:00", "slots": 6}],
             },
         }}
         assert validate_local_routing_config(config) == []
@@ -241,79 +207,6 @@ class TestValidateLocalRoutingConfig:
         assert "slot" in msg.lower() or "6" in msg
         assert "threshold" in msg.lower() or "effective" in msg
         assert "remote" in msg.lower() or "bypass" in msg or "bypassed" in msg
-
-
-class TestValidateLocalRoutingConfigPerPeriodCtx:
-    """Per-entry ctx_size validation (LP-0MSLNK96T0018W4D)."""
-
-    def test_entry_ctx_size_checked_independently(self):
-        """Each entry's (ctx_size, slots) is validated with ITS ctx_size."""
-        config = {"server": {
-            "local_model_ctx_size": 131072,
-            "session_slot_pool_size": 3,  # ok: 131072//3 - 4096 = 39594
-            "slot_schedule": {
-                "enabled": True,
-                "entries": [
-                    {"time": "10:00", "slots": 3},
-                    # Bad: 65536//6 - 4096 = 6826 < 10000
-                    {"time": "23:59", "slots": 6, "ctx_size": 65536},
-                ],
-            },
-        }}
-        problems = validate_local_routing_config(config)
-        assert len(problems) == 1
-        assert "65536" in problems[0]
-        assert "6" in problems[0]
-
-    def test_entry_ctx_size_high_ok(self):
-        """Night entry 2 slots @ 262144 → 126,976 ≥ minimum → no problem."""
-        config = {"server": {
-            "local_model_ctx_size": 131072,
-            "session_slot_pool_size": 3,  # ok
-            "slot_schedule": {
-                "enabled": True,
-                "entries": [
-                    {"time": "10:00", "slots": 3},
-                    {"time": "23:59", "slots": 2, "ctx_size": 262144},
-                ],
-            },
-        }}
-        assert validate_local_routing_config(config) == []
-
-    def test_entries_without_ctx_use_global(self):
-        """Entries without ctx_size fall back to the global value."""
-        config = {"server": {
-            "local_model_ctx_size": 65536,
-            "session_slot_pool_size": 3,  # ok: 65536//3 - 4096 = 21832
-            "slot_schedule": {
-                "enabled": True,
-                "entries": [
-                    {"time": "10:00", "slots": 6},  # bad: 6826 (global ctx)
-                ],
-            },
-        }}
-        problems = validate_local_routing_config(config)
-        assert len(problems) == 1
-        assert "65536" in problems[0]
-
-    def test_global_zero_but_entry_ctx_enables_clamp(self):
-        """A global ctx of 0 (clamp disabled) still validates entries that
-        carry their own ctx_size."""
-        config = {"server": {
-            "local_model_ctx_size": 0,
-            "session_slot_pool_size": 3,
-            "slot_schedule": {
-                "enabled": True,
-                "entries": [
-                    {"time": "10:00", "slots": 3},
-                    # Bad despite global 0: 65536//6 - 4096 = 6826 < 10000
-                    {"time": "23:59", "slots": 6, "ctx_size": 65536},
-                ],
-            },
-        }}
-        problems = validate_local_routing_config(config)
-        assert len(problems) == 1
-        assert "65536" in problems[0]
 
 
 class TestCtxSlotConsistency:
@@ -403,91 +296,40 @@ class TestLiveConfigsValidate:
         problems = validate_local_routing_config(cfg)
         assert problems == [], f"{config_file}: {problems}"
 
-    def test_fast_mode_cold_below_warm(self, monkeypatch):
-        """Fast mode: cold 38000 < effective warm per-slot clamp 83285
-        (3x262144 → per-slot 83285; hard-routing cap DISABLED per
-        LP-0MTLB1LK80098R43, warm = min(100000, 83285) = 83285)."""
-        import proxy.server as srv_mod
+    def test_fast_mode_cold_below_warm(self):
+        """Fast mode: cold 38000 < effective warm per-slot clamp 258048
+        (1x262144 → per-slot 258048; hard-routing cap DISABLED per
+        LP-0MTLB1LK80098R43, warm = min(100000, 258048) = 100000).
+
+        NOTE: the warm threshold config caps this at 100000; the per-slot
+        clamp itself is 258048."""
         from proxy.provider import _effective_large_context_thresholds
 
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 3,
-            },
-        )()
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config-fast.yaml"))
         assert cold == 38000
-        assert warm == 83285
+        assert warm == 100000  # min(warm_config=100000, per-slot 258048)
         assert cold < warm
 
-    def test_default_mode_cold_below_warm(self, monkeypatch):
-        """Default profile (config.yaml) mirrors fast: cold 38000 < 83285."""
-        import proxy.server as srv_mod
+    def test_default_mode_cold_below_warm(self):
+        """Default profile (config.yaml) mirrors fast: cold 38000 < 100000."""
         from proxy.provider import _effective_large_context_thresholds
 
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 3,
-            },
-        )()
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 83285
+        assert warm == 100000
         assert cold < warm
 
     def test_cheap_mode_cold_below_warm(self, monkeypatch):
-        """Cheap mode: cold 42000 < effective warm per-slot clamp 100000
-        (scheduled 2×262144 → per-slot 126976; hard-routing cap
-        DISABLED per LP-0MTLB1LK80098R43, warm = min(100000, 126976) = 100000)."""
+        """Cheap mode: cold 42000 < effective warm per-slot clamp 83285
+        (3×262144 → per-slot 83285; hard-routing cap DISABLED per
+        LP-0MTLB1LK80098R43, warm = min(100000, 83285) = 83285)."""
         import proxy.mode as mode_mod
-        import proxy.server as srv_mod
         from proxy.provider import _effective_large_context_thresholds
 
         monkeypatch.setattr(mode_mod, "read_mode", lambda: "cheap")
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
         assert cold == 42000
-        assert warm == 100000
-        assert cold < warm
-
-    def test_cheap_mode_scheduled_warm_resolves_100000(self, monkeypatch):
-        """Cheap mode with the live schedule active (2 slots × 262144):
-        warm resolves to 100000 — the per-slot clamp
-        (hard-routing cap DISABLED per LP-0MTLB1LK80098R43;
-        min(100000, 126976) = 100000; band (42000, 100000])."""
-        import proxy.mode as mode_mod
-        import proxy.server as srv_mod
-        from proxy.provider import _effective_large_context_thresholds
-
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: "cheap")
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
-        cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
-        assert cold == 42000
-        assert warm == 100000
+        assert warm == 83285
         assert cold < warm
 
 
@@ -523,19 +365,9 @@ class TestLiveConfigPersistenceCap:
         so ``compute_hard_routing_cap`` returns 0 and persistence falls back
         to the per-slot routing clamp (no dead-band via session.py F3)."""
         import proxy.mode as mode_mod
-        import proxy.server as srv_mod
         from proxy.provider import compute_hard_routing_cap
 
         monkeypatch.setattr(mode_mod, "read_mode", lambda: mode)
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 3 if mode == "fast" else 2,
-            },
-        )()
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
 
         cfg = self._load(config_file)
         server_cfg = cfg["server"]

@@ -3,11 +3,12 @@
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and the server
-  behaves as before (current day settings; ``config-fast.yaml``, 3-slot
-  pool).
-- **cheap** — 2-slot local pool with the SAME models/provider chains as
+  behaves as before (current day settings; ``config-fast.yaml``, 1-slot
+  pool; LP-0MU03AL730000B5W).
+- **cheap** — 3-slot local pool with the SAME models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
-  when local slots are exhausted (``config-cheap.yaml``, LP-0MSMIPPJI007GU9N).
+  when local slots are exhausted (``config-cheap.yaml``, LP-0MSMIPPJI007GU9N;
+  3 slots per LP-0MU03AL730000B5W).
   The only intended difference from fast mode is the local slot pool.
 
 The active mode is persisted in a small runtime state file
@@ -19,12 +20,14 @@ falls back to the mode-selected config when ``LLAMA_PROXY_CONFIG`` is unset.
 Switching modes via ``POST /admin/set-mode`` persists the new mode and
 triggers a full proxy restart (``scripts/start-proxy.sh --restart``) so the
 new config profile takes effect. A mode-switch restart terminates in-flight
-requests — clients retry (same semantics as slot-schedule transitions,
-LP-0MSF9RUSQ007M346). This is accepted behavior, not a bug.
+requests — clients retry (same semantics as the previous slot-schedule
+transitions, LP-0MSF9RUSQ007M346). This is accepted behavior, not a bug.
 
-An automatic ``mode_schedule`` (default: cheap 01:00-10:00, fast
-10:00-01:00, local server time) is enforced by a background scheduler — see
-``ModeScheduleConfig`` and ``start_mode_scheduler`` (LP-0MSM5K4TX004MICX).
+An automatic mode schedule (default: cheap 01:00-10:00, fast
+10:00-01:00, local server time) is enforced by a background scheduler — the
+schedule lives in the standalone ``proxy/mode_schedule.yaml`` file, NOT in
+the model profiles (operator-directed simplification); see ``ModeScheduleConfig``
+and ``start_mode_scheduler`` (LP-0MSM5K4TX004MICX).
 
 A mode switched via ``POST /admin/set-mode`` is a **manual override**: it is
 respected until the next scheduled mode transition (``ModeScheduleConfig.next_change``)
@@ -45,6 +48,8 @@ from datetime import datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 logger = logging.getLogger("llama-proxy")
 
@@ -268,17 +273,18 @@ class ModeScheduleEntry:
 class ModeScheduleConfig:
     """Parsed automatic mode-schedule configuration.
 
-    Reads the ``mode_schedule`` section from the server config. An absent
-    section (or absent ``entries``) falls back to the built-in schedule
-    (cheap 01:00-10:00, fast 10:00-01:00) so the timer stays on unless
-    explicitly disabled with ``enabled: false``. Invalid entries (bad time
-    format or unknown mode) are skipped with a warning; if no valid entry
-    remains, the built-in schedule is used.
+    Reads the standalone ``proxy/mode_schedule.yaml`` file (operator-directed
+    simplification: the switching schedule no longer lives inside the model
+    profiles). An absent file (or absent ``entries``) falls back to the
+    built-in schedule (cheap 01:00-10:00, fast 10:00-01:00) so the timer
+    stays on unless explicitly disabled with ``enabled: false``. Invalid
+    entries (bad time format or unknown mode) are skipped with a warning; if
+    no valid entry remains, the built-in schedule is used.
 
     The active mode at any instant is the most recent entry whose time is
     at or before *now*; before the first entry of the day the schedule
     wraps circularly to the last entry (so ``10:00 -> fast`` also covers
-    00:00-00:59, matching the slot_schedule semantics).
+    00:00-00:59).
     """
 
     def __init__(self, raw: dict[str, Any] | None):
@@ -292,13 +298,33 @@ class ModeScheduleConfig:
         self.entries = self._parse_entries(raw.get("entries"))
 
     @classmethod
-    def from_server_config(
-        cls, server_config: dict[str, Any] | None
+    def from_file(
+        cls, path: Path | str | None = None
     ) -> "ModeScheduleConfig":
-        """Extract the mode schedule from the server config dict."""
-        if not server_config or not isinstance(server_config, dict):
+        """Load the schedule from the standalone schedule file.
+
+        When *path* is ``None``, the default ``proxy/mode_schedule.yaml``
+        next to the mode state files is used. A missing file (or one that
+        does not parse) falls back to the built-in default schedule via
+        ``cls(None)``.
+        """
+        if path is None:
+            path = mode_schedule_file()
+        try:
+            raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            logger.debug("mode_schedule: no schedule file at %s, using built-in", path)
             return cls(None)
-        return cls(server_config.get("mode_schedule"))
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "mode_schedule: failed to read %s (%s); using built-in schedule",
+                path,
+                exc,
+            )
+            return cls(None)
+        if not isinstance(raw, dict):
+            return cls(None)
+        return cls(raw)
 
     @staticmethod
     def _parse_entries(raw_entries: Any) -> list[ModeScheduleEntry]:
@@ -489,6 +515,16 @@ def proxy_dir() -> Path:
 def mode_state_file() -> Path:
     """Path to the persisted mode state file (``proxy/.mode``)."""
     return proxy_dir() / ".mode"
+
+
+def mode_schedule_file() -> Path:
+    """Path to the standalone mode schedule file (``proxy/mode_schedule.yaml``).
+
+    The switching schedule lives outside the model profiles so each profile
+    keeps a single slot-count definition (``session_slot_pool_size``) and
+    mode-switching policy is configured in one place.
+    """
+    return proxy_dir() / "mode_schedule.yaml"
 
 
 def override_until_file() -> Path:

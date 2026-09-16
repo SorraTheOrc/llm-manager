@@ -31,7 +31,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from proxy.provider import effective_per_slot_threshold
 from proxy.session import (
     _build_slot_context,
@@ -49,7 +48,7 @@ CTX_262K = 262144
 HEADROOM = 4096
 FAST_SLOTS = 3
 CHEAP_SLOTS = 2
-FAST_CLAMP = 83285   # 262144 // 3 - 4096
+FAST_CLAMP = 83285  # 262144 // 3 - 4096
 CHEAP_CLAMP = 126976  # 262144 // 2 - 4096
 
 # Baselines from F2 (docs/dev/save-restore-reuse-gap-root-cause.md)
@@ -67,6 +66,7 @@ WEDGE_COOLDOWN_SECONDS = 300.0
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _body_for_tokens(n: int) -> dict:
     return {"messages": [{"role": "user", "content": "x" * (n * 8)}]}
@@ -127,6 +127,7 @@ def _clear_state():
 # AC-preamble: derivation check — caps come from effective_per_slot_threshold
 # ---------------------------------------------------------------------------
 
+
 class TestCapDerivationSource:
     """Tests must derive from the same source as production (hard cap 0 →
     effective_per_slot_threshold) not a separately hard-coded number."""
@@ -163,6 +164,7 @@ class TestCapDerivationSource:
 # ---------------------------------------------------------------------------
 # AC1: fast mode (cap 83285) — oversized save→restore cycle
 # ---------------------------------------------------------------------------
+
 
 class TestFastModeOversizedSaveRestore:
     """Fast mode (3 slots, 262144 ctx → 83285 cap): oversized session
@@ -279,17 +281,19 @@ class TestFastModeOversizedSaveRestore:
                 assert ok_restore is True
 
         import asyncio
+
         asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
-# AC2: cheap mode (cap 126976) — oversized save→restore via 2-slot schedule
+# AC2: cheap mode (cap 126976) — oversized save→restore via the 2-slot profile
 # ---------------------------------------------------------------------------
+
 
 class TestCheapModeOversizedSaveRestore:
     """Cheap mode (2 slots, 262144 ctx → 126976 cap): same save→restore
-    cycle validated at the cheap clamp, fixtures exercise the 2-slot
-    schedule so the derived cap matches 126976."""
+    cycle validated at the cheap clamp (the profile's static pair;
+    LP-0MTZRM5HV0007S0V removed the time-based slot scheduler)."""
 
     def test_cheap_oversized_within_cap_persists(self):
         cfg = _cheap_config()
@@ -317,34 +321,21 @@ class TestCheapModeOversizedSaveRestore:
             slot, fname, _ = _build_slot_context(cfg, "cheap-over", {})
             assert slot is None
 
-    def test_cheap_2slot_schedule_derived_cap_is_126976(self, monkeypatch):
-        """The 2-slot schedule (262144 ctx, 2 slots) must derive 126976 via
-        the schedule-aware path (_get_active_local_ctx_size /
-        _get_active_local_slots), not just the static config."""
+    def test_cheap_2slot_static_cap_is_126976(self):
+        """The cheap profile's static pair (262144 ctx, 2 slots) derives
+        126976 via _get_active_local_ctx_size / _get_active_local_slots —
+        the static profile values, with no live slot scheduler
+        (LP-0MTZRM5HV0007S0V)."""
         cfg = _make_config(
             session_slot_save_path="/tmp/slot-cache",
-            # Static values would otherwise be different (e.g. 131072 cheap
-            # boot ctx); the ACTIVE schedule overrides them.
-            session_slot_pool_size=FAST_SLOTS,
-            local_model_ctx_size=131072,
+            session_slot_pool_size=CHEAP_SLOTS,
+            local_model_ctx_size=CTX_262K,
             session_slot_max_prompt_tokens=0,
             local_hard_routing_cap_ratio_fast=0,
             local_hard_routing_cap_ratio_cheap=0,
             warm_cache_threshold=100000,
             session_slot_skip_when_busy=False,
         )
-        # Simulate the cheap schedule active: 2 slots @ 262144
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched, raising=False)
         # Verify the derived clamp matches cheap's pinned value
         from proxy.provider import _get_active_local_ctx_size, _get_active_local_slots
 
@@ -356,8 +347,8 @@ class TestCheapModeOversizedSaveRestore:
 
         # And _build_slot_context uses that derived cap
         with patch("proxy.session._estimate_slot_prompt_tokens", return_value=100000):
-            slot, fname, _ = _build_slot_context(cfg, "cheap-sched-100k", {})
-            assert slot is not None, "100K must persist via schedule-derived 126976"
+            slot, fname, _ = _build_slot_context(cfg, "cheap-static-100k", {})
+            assert slot is not None, "100K must persist via the static 126976 cap"
         _slot_owners.clear()
         with patch("proxy.session._estimate_slot_prompt_tokens", return_value=CHEAP_CLAMP + 1):
             slot, fname, _ = _build_slot_context(cfg, "cheap-sched-over", {})
@@ -421,6 +412,7 @@ class TestCheapModeOversizedSaveRestore:
 # ---------------------------------------------------------------------------
 # AC3: restore-rate measurement for >50K contexts
 # ---------------------------------------------------------------------------
+
 
 class TestRestoreRateForOversizedContexts:
     """Verify a restore-rate measurement for >50K contexts (computed as
@@ -486,12 +478,10 @@ class TestRestoreRateForOversizedContexts:
         assert saves > 0
         rate = (restores / saves * 100.0) if saves else 0.0
         assert rate > NATIVE_RESTORE_BASELINE_PCT, (
-            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) must exceed "
-            f"native {NATIVE_RESTORE_BASELINE_PCT}%"
+            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) must exceed native {NATIVE_RESTORE_BASELINE_PCT}%"
         )
         assert rate > PROXY_EXPECTED_RESTORE_PCT, (
-            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) below "
-            f"expected >{PROXY_EXPECTED_RESTORE_PCT}%"
+            f"cheap restore rate {rate:.1f}% ({restores}/{saves}) below expected >{PROXY_EXPECTED_RESTORE_PCT}%"
         )
 
     def test_restore_rate_regression_would_fail(self, tmp_path):
@@ -532,6 +522,7 @@ class TestRestoreRateForOversizedContexts:
 # ---------------------------------------------------------------------------
 # AC4: GPU-wedge parameters unchanged
 # ---------------------------------------------------------------------------
+
 
 class TestGpuWedgeParametersUnchanged:
     """Tests verify GPU-wedge parameters are unchanged: adaptive timeout
@@ -666,6 +657,7 @@ class TestGpuWedgeParametersUnchanged:
 # Cross-mode sanity: fast vs cheap caps differ exactly as expected
 # ---------------------------------------------------------------------------
 
+
 class TestCrossModeSanity:
     def test_fast_and_cheap_caps_differ_by_expected_amount(self):
         assert CHEAP_CLAMP - FAST_CLAMP == 43691  # 126976 - 83285
@@ -683,4 +675,3 @@ class TestCrossModeSanity:
         with patch("proxy.session._estimate_slot_prompt_tokens", return_value=CHEAP_CLAMP):
             slot2, _, _ = _build_slot_context(cheap_cfg, "cross-cheap", {})
             assert slot2 is not None, "126976 must persist under cheap cap"
-

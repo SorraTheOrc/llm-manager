@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MTRWI65I005VXOC
+# smell: formatting
+# severity: high
+# description: Do not assign a `lambda` expression, use a `def`
+# -->
 """
 Router Helpers Module
 
@@ -33,6 +39,62 @@ from fastapi.responses import JSONResponse
 def _srv():
     import proxy.server as _m
     return _m
+
+
+# ===================================================================
+# Per-endpoint dispatch-lease key helpers (LP-0MRPILSMW004T4H8)
+# ===================================================================
+
+def _dispatch_lease_key(endpoint: str | None, session_id: str) -> str | tuple:
+    """Build the dispatch-lease record key.
+
+    Records are keyed by ``(endpoint, session_id)`` so each local
+    llama-server instance (identified by its endpoint URL) tracks its
+    concurrency independently (LP-0MRPILSMW004T4H8). When *endpoint* is
+    None or empty (legacy single-server mode / tests), the bare
+    *session_id* string is used for backward compatibility. The literal
+    legacy label ``"local"`` is also treated as no-endpoint so existing
+    callers that pass ``backend="local"`` keep using plain session-id keys.
+    """
+    if not endpoint or endpoint == "local":
+        return session_id
+    return (endpoint, session_id)
+
+
+def _dispatch_key_session_id(key) -> str:
+    """Return the session-id component of a dispatch-lease key.
+
+    Accepts both legacy string keys (returned unchanged) and per-endpoint
+    ``(endpoint, session_id)`` tuple keys.
+    """
+    if isinstance(key, tuple) and len(key) == 2:
+        return key[1]
+    return key
+
+
+def _parse_endpoint_url(url: str) -> tuple[str, int]:
+    """Parse an endpoint URL into ``(host, port)``.
+
+    Returns ``(host, port)`` for use in slot-path derivation.
+    """
+    m = re.match(r'https?://([^/:]+):?(\d*)', url)
+    if m:
+        host = m.group(1)
+        port = int(m.group(2) or 8080)
+        return host, port
+    return "localhost", 8080
+
+
+def _endpoint_from_record(record: dict) -> str | None:
+    """Extract the endpoint URL from a dispatch record's 'backend' field.
+
+    The backend field stores the endpoint URL (or "local" for legacy
+    single-server mode). Returns None when no endpoint URL is found.
+    """
+    backend = record.get("backend")
+    if backend and backend.startswith("http"):
+        return backend
+    return None
 
 
 # ===================================================================
@@ -714,6 +776,7 @@ async def _query_prefill_progress(
     llama_port: int,
     model_name: str | None = None,
     slot_id: int | None = None,
+    endpoint: str | None = None,
 ) -> tuple[int | None, bool]:
     """Observe llama-server prefill state: ``(progress, alive)``.
 
@@ -721,6 +784,10 @@ async def _query_prefill_progress(
     same ``STATUS_QUERY_TIMEOUT`` (default 1.0s) pattern as the
     ``/llama/local/status`` endpoint, so the stream loop is never blocked
     waiting on llama-server.
+
+    When *endpoint* is provided, the queries target that specific
+    llama-server instance (LP-0MRPILSMW004T4H8). Otherwise the legacy
+    ``localhost:{llama_port}`` URL is used.
 
     Progress sources, in preference order:
 
@@ -753,7 +820,8 @@ async def _query_prefill_progress(
 
             states = await asyncio.wait_for(
                 _query_slots_progress(
-                    llama_port, timeout=timeout, model=model_name
+                    llama_port, timeout=timeout, model=model_name,
+                    endpoint=endpoint,
                 ),
                 timeout=timeout + 0.5,
             )
@@ -823,6 +891,7 @@ async def _extend_lease_during_prefill(
     srv,
     session_key: str,
     *,
+    endpoint: str | None = None,
     llama_port: int,
     model_name: str | None = None,
     slot_id: int | None = None,
@@ -838,6 +907,10 @@ async def _extend_lease_during_prefill(
     ``now + safety buffer`` so a very large prefill — beyond the adaptive
     token-estimate cap of 1500s — cannot lose its lease mid-prefill
     (LP-0MSE05J53004C6EL).
+
+    When *endpoint* is provided, the dispatch record lookup uses a
+    per-endpoint key so the correct server's lease is extended
+    (LP-0MRPILSMW004T4H8).
 
     Extension triggers:
 
@@ -866,7 +939,8 @@ async def _extend_lease_during_prefill(
         return last_progress, False
 
     progress, alive = await _query_prefill_progress(
-        srv, llama_port, model_name=model_name, slot_id=slot_id
+        srv, llama_port, model_name=model_name, slot_id=slot_id,
+        endpoint=endpoint,
     )
     advancing = progress is not None and progress > last_progress
     if not advancing and not alive:
@@ -879,7 +953,9 @@ async def _extend_lease_during_prefill(
         lock = getattr(srv, "local_dispatch_records_lock", None)
         if lock is not None:
             async with lock:
-                record = srv.local_dispatch_records.get(session_key)
+                record = srv.local_dispatch_records.get(
+                    _dispatch_lease_key(endpoint, session_key)
+                )
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
                     extended = True
@@ -909,12 +985,17 @@ async def _extend_lease_during_prefill(
 async def _decrement_local_active_queries(
     srv,
     session_key: str | None = None,
+    backend: str | None = None,
 ) -> None:
     """Safely decrement the local-only active queries counter.
 
     When *session_key* is provided, the corresponding dispatch record
     (if any) is marked as inactive with a future *expires_at* timestamp,
     keeping the lease alive for the owner session until the timeout.
+
+    The *backend* parameter specifies the endpoint URL of the llama-server
+    instance; it is used to build a per-endpoint dispatch-lease key so the
+    correct server's record is updated (LP-0MRPILSMW004T4H8).
     """
     try:
         async with srv.local_active_queries_lock:
@@ -936,23 +1017,28 @@ async def _decrement_local_active_queries(
             lock = getattr(srv, "local_dispatch_records_lock", None)
             if lock is not None:
                 lease_timeout = _get_lease_timeout_seconds(srv)
+                record_key = _dispatch_lease_key(backend, session_key)
                 async with lock:
-                    if session_key in srv.local_dispatch_records:
-                        srv.local_dispatch_records[session_key]["active"] = False
-                        srv.local_dispatch_records[session_key]["expires_at"] = (
+                    record_key = _dispatch_lease_key(backend, session_key)
+
+                    if record_key in srv.local_dispatch_records:
+                        srv.local_dispatch_records[record_key]["active"] = False
+                        srv.local_dispatch_records[record_key]["expires_at"] = (
                             time.monotonic() + lease_timeout
                         )
                         try:
                             srv.logger.info(
                                 "lease_renewed session=%s timeout=%.0fs",
-                                session_key if session_key else "unknown",
+                                _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
+
                                 lease_timeout,
                             )
                         except Exception as exc:
                             try:
                                 srv.logger.warning(
                                     "Failed to log lease_renewed for session=%s: %s: %s",
-                                    session_key if session_key else "unknown",
+                                    _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
+
                                     type(exc).__name__,
                                     exc,
                                 )
@@ -991,7 +1077,9 @@ async def _increment_local_active_queries(
 
     When *session_key* and *backend* are provided, a corresponding
     dispatch record is created in *local_dispatch_records* to track
-    lease ownership. *model_name* is stored on the record so orphan
+    lease ownership. The record is keyed by ``(endpoint, session_key)``
+    so each llama-server instance tracks its concurrency independently
+    (LP-0MRPILSMW004T4H8). *model_name* is stored on the record so orphan
     cleanup can verify the session's slot against llama-server's
     ``/slots`` before freeing the lease (LP-0MSUO6XRP001MCB2).
 
@@ -1013,8 +1101,11 @@ async def _increment_local_active_queries(
             lock = getattr(srv, "local_dispatch_records_lock", None)
             if lock is not None:
                 lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
+                record_key = _dispatch_lease_key(backend, session_key)
                 async with lock:
-                    srv.local_dispatch_records[session_key] = {
+                    record_key = _dispatch_lease_key(backend, session_key)
+
+                    srv.local_dispatch_records[record_key] = {
                         "backend": backend,
                         "started_at": time.monotonic(),
                         "active": True,
@@ -1054,6 +1145,16 @@ async def _increment_generating_only_slot(srv, session_key: str | None = None) -
 
     Prefill-aware guard: the session's prefill hold is released on first-byte
     so the prefill cap slot is freed for waiters.
+
+    Adds *session_key* to ``local_generating_sessions`` (a set tracking which
+    sessions are generating) and increments ``local_generating_queries``.
+    This counter gates dispatch to the local model via ``_try_acquire_local_dispatch``
+    — when it reaches ``max_local``, new dispatches are denied.
+
+    Self-healing: if the corresponding decrement (``_decrement_generating_only_slot``)
+    is skipped due to an exception in the streaming generator's finally block,
+    the ``_dispatch_cleanup_loop`` periodically reclaims stale entries via
+    ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU).
     """
     # Prefill-aware guard: clear the prefill hold on first-byte.
     try:
@@ -1105,6 +1206,15 @@ async def _decrement_generating_only_slot(srv, session_key: str | None = None) -
     """Decrement generating-only slot for *session_key* (safe / not negative).
 
     Also clears any remaining prefill hold (prefill-only aborts).
+
+    Called from the streaming generator's ``finally`` block (``router.py:1790``)
+    after stream termination. If this call is skipped — e.g., due to an
+    exception in the preceding slot-save path (``router.py:1700-1722``)
+    — the session key leaks into ``local_generating_queries`` /
+    ``local_generating_sessions`` and wedges the dispatch pool at capacity.
+
+    Self-healing: the dispatch cleanup loop periodically reclaims such stale
+    entries via ``_recover_stuck_generating_queries`` (LP-0MTYAWDCQ006RGYU).
     """
     # Clear prefill hold for prefill-only sessions (no generating).
     try:
@@ -1222,20 +1332,45 @@ async def _try_acquire_local_dispatch(
     # window in which an anonymous-session increment could land between the
     # records count and the counter check and falsely deny an explicit
     # session that had a free slot (LP-0MS8ZM98R000M8AN).
+    record_key = _dispatch_lease_key(backend, session_key)
+    # The record dict's key type tells us whether the deployment is endpoint-
+    # aware (multi-backend, LP-0MRPILSMW004T4H8): once any per-endpoint tuple
+    # key exists, per-endpoint records are the authoritative occupancy source
+    # and the global counter is no longer consulted. In legacy single-server
+    # mode (no tuple keys), the global ``local_active_queries`` counter keeps
+    # its original deny semantics.
+    has_endpoint_records = any(
+        isinstance(k, tuple) for k in srv.local_dispatch_records
+    )
+    endpoint_scope = (
+        backend if (isinstance(record_key, tuple) and backend and backend != "local")
+        else ""
+    )
     try:
         async with srv.local_active_queries_lock:
             async with srv.local_dispatch_records_lock:
-                # ... (cleaning, checking, acquiring logic)
+                # Multi-backend per-endpoint scoping (LP-0MRPILSMW004T4H8):
+                # record keys are ``(endpoint, session_key)``. Derive the
+                # record key + endpoint scope so only records in the same
+                # endpoint scope count toward occupancy.
+                record_key = _dispatch_lease_key(backend, session_key)
+                has_endpoint_records = any(
+                    isinstance(k, tuple) for k in srv.local_dispatch_records
+                )
+                endpoint_scope = (
+                    backend if (isinstance(record_key, tuple) and backend and backend != "local")
+                    else ""
+                )
                 for existing_key, record in list(srv.local_dispatch_records.items()):
                     if not record.get("active") and record.get("expires_at", 0) <= now:
                         del srv.local_dispatch_records[existing_key]
                         try:
                             from proxy.session import _free_slot_assignment
-                            _free_slot_assignment(existing_key)
+                            _free_slot_assignment(_dispatch_key_session_id(existing_key))
                         except Exception:
                             pass
 
-                own_record = srv.local_dispatch_records.get(session_key)
+                own_record = srv.local_dispatch_records.get(record_key)
                 own_has_lease = (
                     own_record is not None
                     and (
@@ -1247,12 +1382,18 @@ async def _try_acquire_local_dispatch(
                 occupied_by_others = 0
                 first_occupied_owner = None
                 for existing_key, record in srv.local_dispatch_records.items():
-                    if existing_key == session_key:
+                    if existing_key == record_key:
                         continue
+                    if has_endpoint_records:
+                        # Endpoint-aware mode: only records in the same
+                        # endpoint scope count toward this server's pool.
+                        ek_endpoint = existing_key[0] if isinstance(existing_key, tuple) else ""
+                        if ek_endpoint != endpoint_scope:
+                            continue
                     if record.get("active") or record.get("expires_at", 0) > now:
                         occupied_by_others += 1
                         if first_occupied_owner is None:
-                            first_occupied_owner = existing_key
+                            first_occupied_owner = _dispatch_key_session_id(existing_key)
                 _generating_count = _get_generating_only_count(srv)
                 _prefill_count = _get_prefill_in_flight_count(srv)
                 has_generating_state = (
@@ -1270,8 +1411,8 @@ async def _try_acquire_local_dispatch(
                         if _generating_count >= max_local:
                             active_owner = None
                             for ek, er in srv.local_dispatch_records.items():
-                                if ek != session_key and er.get("active"):
-                                    active_owner = ek
+                                if ek != record_key and er.get("active"):
+                                    active_owner = _dispatch_key_session_id(ek)
                                     break
                             if active_owner is None:
                                 active_owner = first_occupied_owner
@@ -1282,8 +1423,8 @@ async def _try_acquire_local_dispatch(
                         if _prefill_count >= max_local:
                             active_owner = None
                             for ek, er in srv.local_dispatch_records.items():
-                                if ek != session_key and er.get("active"):
-                                    active_owner = ek
+                                if ek != record_key and er.get("active"):
+                                    active_owner = _dispatch_key_session_id(ek)
                                     break
                             if active_owner is None:
                                 active_owner = first_occupied_owner
@@ -1294,9 +1435,10 @@ async def _try_acquire_local_dispatch(
                         if occupied_by_others >= max_local:
                             return (False, first_occupied_owner, occupied_by_others, max(1.0, lease_timeout))
 
+
                 srv.local_active_queries += 1
 
-                srv.local_dispatch_records[session_key] = {
+                srv.local_dispatch_records[record_key] = {
                     "backend": backend,
                     "started_at": now,
                     "active": True,
@@ -1338,12 +1480,16 @@ def _client_identity_extra(request: Request | None) -> dict:
         return {}
 
 
-async def _release_local_dispatch(srv, session_id: str, request: Request | None = None) -> bool:
+async def _release_local_dispatch(srv, session_id: str, request: Request | None = None, endpoint: str | None = None) -> bool:
     """Explicitly release the dispatch lease for *session_id*.
 
     Removes the dispatch record from ``local_dispatch_records`` under
     the existing lock. Returns ``True`` if a record was removed, or
     ``False`` if no matching record existed (idempotent no-op).
+
+    When *endpoint* is provided, only the per-endpoint record for that
+    llama-server instance is released (LP-0MRPILSMW004T4H8); otherwise
+    the legacy single-server record keyed by *session_id* is removed.
 
     This is the programmatic equivalent of what the
     ``POST /v1/leases/release`` endpoint provides, allowing callers
@@ -1351,15 +1497,30 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     without going through the HTTP layer.
     """
     removed = False
+    record_key = _dispatch_lease_key(endpoint, session_id)
     try:
         async with srv.local_dispatch_records_lock:
-            if session_id in srv.local_dispatch_records:
-                del srv.local_dispatch_records[session_id]
+            if record_key in srv.local_dispatch_records:
+                del srv.local_dispatch_records[record_key]
                 removed = True
                 try:
                     srv.logger.info(
                         "lease_released session=%s reason=explicit_release",
                         session_id if session_id else "unknown",
+
+                        extra=_client_identity_extra(request),
+                    )
+                except Exception:
+                    pass
+            elif endpoint and (endpoint, session_id) in srv.local_dispatch_records:
+                # Belt-and-braces: tuple-key form for any caller that passes
+                # the endpoint directly.
+                del srv.local_dispatch_records[(endpoint, session_id)]
+                removed = True
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=explicit_release",
+                        session_id[:8] if session_id else "unknown",
                         extra=_client_identity_extra(request),
                     )
                 except Exception:
@@ -1376,7 +1537,7 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     if session_id:
         try:
             from proxy.session import _free_slot_assignment
-            _free_slot_assignment(session_id)
+            _free_slot_assignment(session_id, endpoint=endpoint)
         except Exception:
             pass
     # A slot-persistence / lease release frees the backend — wake the
@@ -1390,7 +1551,7 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
-async def _query_slot_processing(srv, session_id: str, model_name: str | None) -> bool:
+async def _query_slot_processing(srv, session_id: str, model_name: str | None, endpoint: str | None = None) -> bool:
     """Check whether the session's llama-server slot is still processing.
 
     Queries llama-server ``/slots`` (via ``_query_slots_progress``) for the
@@ -1399,6 +1560,10 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None) -
     orphan cleanup to avoid freeing the dispatch lease / slot registry
     entry for a stream that is still generating on the backend
     (LP-0MSUO6XRP001MCB2).
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the
+    query targets that llama-server instance so per-endpoint dispatch
+    records are verified against the correct server (LP-0MRPILSMW004T4H8).
 
     Returns False (do not treat as alive) when the session has no slot
     assignment, no *model_name* is known (the router requires a model
@@ -1410,18 +1575,27 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None) -
     try:
         from proxy.session import _assigned_slot_for_session
 
-        slot_id = _assigned_slot_for_session(session_id)
+        if endpoint:
+            slot_id = _assigned_slot_for_session(session_id, endpoint=endpoint)
+        else:
+            # Legacy single-server path — call with session_id only so tests
+            # that mock the helper with a 1-arg lambda keep working.
+            slot_id = _assigned_slot_for_session(session_id)
         if slot_id is None:
             return False  # no slot assignment — cannot verify
 
         server_cfg = srv.config.get("server", {})
         llama_port = server_cfg.get("llama_server_port", 8080)
+        if endpoint:
+            _, llama_port = _parse_endpoint_url(endpoint)
 
         from proxy.observability import _query_slots_progress
 
         timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
         states = await asyncio.wait_for(
-            _query_slots_progress(llama_port, timeout=timeout, model=model_name),
+            _query_slots_progress(
+                llama_port, timeout=timeout, model=model_name, endpoint=endpoint
+            ),
             timeout=timeout + 0.5,
         )
         state = states.get(slot_id)
@@ -1465,7 +1639,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     # Phase 1 (under lock): collect expired records. Inactive records are
     # freed immediately; expired ACTIVE records are deferred to phase 3 so
     # the slot liveness check runs OUTSIDE the records lock (it performs
-    # an HTTP query to llama-server).
+    # an HTTP query to llama-server). Records are keyed per-endpoint
+    # (LP-0MRPILSMW004T4H8); ``_dispatch_key_session_id`` recovers the
+    # session portion for logging and slot-registry lookup.
     try:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
@@ -1482,19 +1658,25 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
                         from proxy.session import _free_slot_assignment
-                        _free_slot_assignment(sid)
+                        _free_slot_assignment(
+                            _dispatch_key_session_id(sid),
+                            endpoint=_endpoint_from_record(record),
+                        )
                     except Exception:
                         pass
                     try:
                         _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and sid in _p:
-                            _p.pop(sid, None)
+                        if _p is not None and _dispatch_key_session_id(sid) in _p:
+                            _p.pop(_dispatch_key_session_id(sid), None)
+
                     except Exception:
                         pass
                     try:
                         srv.logger.info(
-                            "lease_released session=%s reason=idle_timeout",
-                            sid if sid else "unknown",
+                            "lease_released session=%s reason=idle_timeout endpoint=%s",
+                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+
+                            _endpoint_from_record(record) or "default",
                         )
                     except Exception:
                         pass
@@ -1511,7 +1693,10 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     for sid, record in verify_candidates:
         try:
             if await _query_slot_processing(
-                srv, sid, record.get("model_name")
+                srv,
+                _dispatch_key_session_id(sid),
+                record.get("model_name"),
+                endpoint=_endpoint_from_record(record),
             ):
                 alive.add(sid)
         except Exception:
@@ -1540,7 +1725,8 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             srv.logger.info(
                                 "lease_verified_active session=%s "
                                 "reason=active_slot stream_abandoned=False",
-                                sid if sid else "unknown",
+                                _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+
                             )
                         except Exception:
                             pass
@@ -1549,8 +1735,8 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     del srv.local_dispatch_records[sid]
                     try:
                         _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and sid in _p:
-                            _p.pop(sid, None)
+                        if _p is not None and _dispatch_key_session_id(sid) in _p:
+                            _p.pop(_dispatch_key_session_id(sid), None)
                     except Exception:
                         pass
                     removed += 1
@@ -1558,7 +1744,10 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
                         from proxy.session import _free_slot_assignment
-                        _free_slot_assignment(sid)
+                        _free_slot_assignment(
+                            _dispatch_key_session_id(sid),
+                            endpoint=_endpoint_from_record(record),
+                        )
                     except Exception:
                         pass
                     # Decrement local_active_queries for orphaned records
@@ -1573,12 +1762,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     try:
                         srv.logger.warning(
                             "lease_released session=%s reason=orphan_cleanup "
-                            "stream_abandoned=True",
-                            sid if sid else "unknown",
+                            "stream_abandoned=True endpoint=%s",
+                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+
+                            _endpoint_from_record(record) or "default",
                         )
                         srv.logger.info(
                             "lease_released session=%s reason=orphan_cleanup",
-                            sid if sid else "unknown",
+                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+
                         )
                     except Exception:
                         pass
@@ -1594,6 +1786,145 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
         except Exception:
             pass
     return removed
+
+
+async def _recover_stuck_generating_queries(srv) -> None:
+    """Detect and reclaim stale ``local_generating_queries`` / ``local_generating_sessions`` entries.
+
+    Session keys stuck in ``local_generating_sessions`` (from an aborted
+    ``_decrement_generating_only_slot`` in the streaming generator's finally
+    block, ``router.py:1700-1801``) wedge the local dispatch pool when
+    ``local_generating_queries >= max_local``. Nothing in
+    ``_dispatch_cleanup_loop`` previously reclaimed these entries, causing
+    prolonged outages (e.g. 2h 11m, 2026-09-11; LP-0MTYAWDCQ006RGYU).
+
+    This function reconciles ``local_generating_queries`` and
+    ``local_generating_sessions`` against ``local_dispatch_records``:
+
+    - For each session key in ``local_generating_sessions``, check whether
+      an active dispatch record exists.
+    - Keys with **no** active record are stale — removed from the set and
+      ``local_generating_queries`` is reset to the count of remaining
+      legitimate entries.
+    - If **no** active dispatch records exist at all, all generating state
+      is considered stale: the session set is emptied and the counter is
+      reset to 0. This also reclaims a counter-only leak (positive counter
+      with an empty session set), which can occur for anonymous sessions
+      where increment/decrement touch the counter but not the set.
+    - If the set is empty and the counter is 0 there is nothing to do.
+
+    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
+    as part of the periodic self-healing cycle, providing a bounded
+    recovery mechanism that runs every 10 seconds. O(n) in the number
+    of generating sessions; no llama-server HTTP calls.
+
+    Lock ordering: acquires ``local_generating_queries_lock`` only. Does
+    not acquire ``local_dispatch_records_lock`` — reads the records
+    snapshot without holding the lock. This is acceptable because the
+    check is self-correcting (runs every 10s) and a slightly stale
+    snapshot cannot cause harm (false negatives simply defer recovery;
+    false positives are prevented by the ``active`` flag check).
+
+    On reclaim, emits a WARNING log and wakes contention-queue waiters
+    so blocked dispatch retries can proceed.
+    """
+    try:
+        generating_sessions: set | None = getattr(
+            srv, "local_generating_sessions", None
+        )
+        if generating_sessions is None:
+            # No generating-session tracking at all — nothing to reconcile.
+            return
+
+        prev_count = int(
+            getattr(srv, "local_generating_queries", 0) or 0
+        )
+        if not generating_sessions and prev_count == 0:
+            return  # Nothing to do
+
+        generating_lock = getattr(
+            srv, "local_generating_queries_lock", None
+        )
+        records = getattr(srv, "local_dispatch_records", None)
+
+        if records is not None:
+            has_active = any(
+                r.get("active", False) for r in records.values()
+            )
+        else:
+            has_active = False  # legacy mode: no dispatch records
+
+        if not has_active:
+            # No in-flight streams anywhere — all generating state is stale
+            # (this includes a counter-only leak with an empty session set).
+            stale_keys = set(generating_sessions)
+            new_count = 0
+        else:
+            # Identify stale keys: those without an active dispatch record.
+            stale_keys = set()
+            for key in generating_sessions:
+                # Support both string keys and tuple (endpoint, session)
+                # keys.
+                record = records.get(key)
+                if record is None and not isinstance(key, tuple):
+                    # Direct string-key lookup failed. Try the legacy
+                    # ("local", session) tuple key.
+                    record = records.get(("local", key))
+                    # If that also fails, the dispatch record may be keyed
+                    # by a full endpoint URL tuple (endpoint_url, session).
+                    # Search through all tuple keys for a match.
+                    if record is None:
+                        for rk in records:
+                            if isinstance(rk, tuple) and len(rk) == 2:
+                                if rk[1] == key:
+                                    record = records[rk]
+                                    break
+                if record is None or not record.get("active", False):
+                    stale_keys.add(key)
+            # The session set is authoritative for the legitimate count.
+            new_count = len(generating_sessions) - len(stale_keys)
+
+        if not stale_keys and prev_count == new_count:
+            return  # Nothing to reclaim
+
+        prev_sessions_count = len(generating_sessions)
+
+        if generating_lock is not None:
+            async with generating_lock:
+                for key in stale_keys:
+                    generating_sessions.discard(key)
+                srv.local_generating_queries = max(0, new_count)
+        else:
+            for key in stale_keys:
+                generating_sessions.discard(key)
+            srv.local_generating_queries = max(0, new_count)
+
+        new_count = int(getattr(srv, "local_generating_queries", 0) or 0)
+
+        # Log the recovery.
+        try:
+            srv.logger.warning(
+                "local_generating_queries counter recovered: "
+                "reclaimed %d stale session(s) (reset from %d to %d, "
+                "%d sessions removed from local_generating_sessions)",
+                prev_count - new_count,
+                prev_count,
+                new_count,
+                prev_sessions_count - len(generating_sessions),
+            )
+        except Exception:
+            pass
+
+        # Wake contention-queue waiters so blocked dispatches can retry.
+        try:
+            from proxy.contention_queue import wake_all
+
+            await wake_all()
+        except Exception:
+            pass
+
+    except Exception:
+        pass
 
 
 async def _recover_stuck_local_active_queries(srv) -> None:
@@ -1860,6 +2191,29 @@ def _evaluate_session_compaction(
         }
 
 
+def _apply_post_compaction_heal(
+    srv,
+    session,
+    body_json: dict,
+) -> list | None:
+    """Heal a post-compaction client/session sync break (AC2).
+
+    Thin, fail-open wrapper around
+    :func:`proxy.session_manager.compute_post_compaction_delta`: returns the
+    healed delta when the incoming history still aligns with the stored
+    compacted base, otherwise ``None`` so the caller keeps the existing
+    ``history_mismatch`` invalidation behavior.
+    """
+    try:
+        from proxy.session_manager import compute_post_compaction_delta
+
+        incoming = body_json.get("messages", []) if isinstance(body_json, dict) else []
+        return compute_post_compaction_delta(session, incoming)
+    except Exception:
+        srv.logger.debug("Post-compaction heal evaluation failed", exc_info=True)
+        return None
+
+
 async def _handle_session(
     srv,
     body_json: dict,
@@ -1950,6 +2304,42 @@ async def _handle_session(
                     )
                 else:
                     if session_fallback_reason == "history_mismatch":
+                        # Post-compaction resync (LP-0MTVXP7DG00613ZB AC2):
+                        # a live compaction leaves the client holding its
+                        # pre-compaction history. When the stored compacted
+                        # recent turns + appended messages still align with
+                        # the incoming history, accept the new tail as a
+                        # delta against the compacted base instead of
+                        # invalidating the session (which would undo the
+                        # compaction and drop the KV cache).
+                        _healed = _apply_post_compaction_heal(
+                            srv, session, body_json
+                        )
+                        if _healed is not None:
+                            delta_messages = _healed
+                            result["delta_messages"] = _healed
+                            result["is_delta_request"] = True
+                            result["session_fallback_reason"] = None
+                            session_fallback_reason = None
+                            body_json["messages"] = list(_healed)
+                            try:
+                                _record_delta_payload_bytes(
+                                    len(
+                                        json.dumps(
+                                            _healed,
+                                            separators=(",", ":"),
+                                            ensure_ascii=False,
+                                        ).encode("utf-8")
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            srv.logger.info(
+                                "post_compaction_resync session=%s delta_messages=%d",
+                                result["session_id"][:8],
+                                len(_healed),
+                            )
+                    if session_fallback_reason == "history_mismatch":
                         from proxy.session import _build_slot_context, _invalidate_session_and_slot
                         _, slot_filename, _ = _build_slot_context(
                             server_config, result["session_id"]
@@ -1981,13 +2371,67 @@ async def _handle_session(
             # dispatch body to the compacted full history and marks the
             # request full-prompt so forward + persistence stay consistent.
             try:
+                from proxy.compaction_summarizer import build_local_summarizer
                 from proxy.mode import read_mode as _read_mode
+                from proxy.provider import _estimate_prompt_tokens_for_routing
 
-                _compaction = _evaluate_session_compaction(
+                # Build the production summarizer + token estimator once
+                # per request so decide_session_compaction has real
+                # capabilities rather than the always-None defaults
+                # that caused the compaction hang (LP-0MTPK77WG009A4VH).
+                _llama_port = server_config.get("llama_server_port", 8080)
+                _top_cfg = getattr(srv, "config", None)
+                if not isinstance(_top_cfg, dict):
+                    _top_cfg = {"server": dict(server_config)}
+                _summarizer = build_local_summarizer(
+                    _top_cfg,
+                    llama_port=_llama_port,
+                )
+                # The summarizer timeout resolves inside build_local_summarizer
+                # from config (``compaction_summarizer_timeout``, default
+                # 600 s — ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s
+                # timeout could not wait for the single local slot to free up
+                # while a long generating request held it, so every compaction
+                # failed (summarizer_failed/timeout) and the session was
+                # routed remote with guidance, stalling until the 900 s
+                # upstream timeout. 600 s exceeds the observed worst-case
+                # stall (max dispatch_first_byte_ms 713 s). See
+                # LP-0MU1RXEY10075TUU.
+                def _estimate_fn(msgs):
+                    return _estimate_prompt_tokens_for_routing({"messages": msgs})
+
+                # The full history this request produces: the persistent
+                # session history PLUS this request's new turn(s). Compaction
+                # must operate on this produced history — evaluating only the
+                # stored history would drop the current turn from the
+                # compacted dispatch body (LP-0MTVXP7DG00613ZB AC2).
+                _delta_for_compaction = result.get("delta_messages")
+                if result.get("is_delta_request") and _delta_for_compaction:
+                    _pre_compaction_messages = list(
+                        getattr(session, "messages", None) or []
+                    ) + list(_delta_for_compaction)
+                else:
+                    _pre_compaction_messages = list(
+                        body_json.get("messages", [])
+                        or getattr(session, "messages", None)
+                        or []
+                    )
+
+                # The summarizer call blocks on the local llama-server slot
+                # (up to ``compaction_summarizer_timeout``, default 600 s on
+                # a 1-slot backend where a long generating request holds the
+                # slot). Run the whole evaluation in a worker thread so the
+                # event loop keeps serving other requests (notably the
+                # streaming request whose slot we are waiting on) instead of
+                # freezing for the whole wait (LP-0MU1RXEY10075TUU).
+                _compaction = await asyncio.to_thread(
+                    _evaluate_session_compaction,
                     srv,
                     result["session_id"],
-                    list(getattr(session, "messages", None) or body_json.get("messages", [])),
+                    _pre_compaction_messages,
                     _read_mode(),
+                    summarizer=_summarizer,
+                    estimate_tokens=_estimate_fn,
                 )
                 if (
                     _compaction.get("action") == "compact"
@@ -2003,6 +2447,10 @@ async def _handle_session(
                     result["is_delta_request"] = False
                     result["delta_messages"] = None
                     result["compaction_applied"] = True
+                    result["compaction_estimated_before"] = int(
+                        _compaction.get("estimated_before", 0) or 0
+                    )
+                    result["compaction_reason"] = _compaction.get("reason")
                     srv.logger.info(
                         "session_compaction applied session=%s mode=%s "
                         "est_before=%d est_after=%d",
@@ -2011,6 +2459,23 @@ async def _handle_session(
                         _compaction.get("estimated_before", 0),
                         _compaction.get("estimated_after", 0),
                     )
+                    # After compaction, update the session's message history so
+                    # downstream token estimates (e.g. routing_estimate_session)
+                    # reflect the compacted count, not the pre-compaction value,
+                    # and record the client/base anchors the next request needs
+                    # to heal the sync break (AC2).
+                    try:
+                        await srv.session_manager.update_messages(
+                            result["session_id"],
+                            list(_compaction["messages"]),
+                        )
+                        await srv.session_manager.mark_compacted(
+                            result["session_id"],
+                            len(_pre_compaction_messages),
+                            len(_compaction["messages"]),
+                        )
+                    except Exception:
+                        pass  # non-fatal: routing estimate still uses body messages
                 elif (
                     _compaction.get("action") == "remote_with_guidance"
                     and not _compaction.get("dry_run")
@@ -2019,6 +2484,10 @@ async def _handle_session(
                     # cannot be compacted; the dispatcher must escalate
                     # remote WITH guidance.
                     result["compaction_remote_with_guidance"] = True
+                    result["compaction_estimated_before"] = int(
+                        _compaction.get("estimated_before", 0) or 0
+                    )
+                    result["compaction_reason"] = _compaction.get("reason")
             except Exception:
                 srv.logger.warning(
                     "Compaction evaluation failed; continuing unchanged "
@@ -2477,6 +2946,8 @@ async def _check_slot_availability(
     model_name: str | None,
     path: str,
     lease_held: bool = False,
+
+    endpoint: str | None = None,
 ) -> JSONResponse | None:
     """Check llama-server slot availability.
 
@@ -2496,6 +2967,7 @@ async def _check_slot_availability(
     timeout (``session_slot_availability_timeout_seconds``, default 2.0) so a
     slow router/child response fails fast and can never exhaust the shared
     ``_http_client`` pool (LP-0MTDH2U6V0062TUF).
+
     """
     if lease_held:
         return None
@@ -2508,14 +2980,18 @@ async def _check_slot_availability(
         )
         # LP-0MTP1FQXH004JYEF: target the slot's model so we query the
         # Qwen3 child not the embed child (first spawn line).
-        child_port = _discover_local_child_port(srv, model=slot_model)
-        slots_port = child_port if child_port is not None else llama_port
-        slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
+        if endpoint:
+            slots_url = f"{endpoint.rstrip('/')}/slots?model={slot_model}"
+        else:
+            child_port = _discover_local_child_port(srv, model=slot_model)
+            slots_port = child_port if child_port is not None else llama_port
+            slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
         availability_timeout = float(
             server_config.get(
                 "session_slot_availability_timeout_seconds", 2.0
             )
             or 2.0
+
         )
         # Dedicated per-call client with a short timeout — never borrow the
         # shared _http_client, so a slow /slots response cannot hold shared

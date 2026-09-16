@@ -11,7 +11,32 @@
 #   For remote: endpoint, api_key_env, headers (optional),
 #               provider (optional, actual provider brand name used in
 #                        X-Resolved-Model header; falls back to name)
-#   For local:  llama_model
+#   For local:  llama_model, endpoint (optional)
+#
+# Local provider endpoints (LP-0MRPILSMW004T4H8):
+#   Each ``type: local`` provider may declare its own ``endpoint`` URL
+#   (host:port) pointing at a pre-existing llama-server instance. Multiple
+#   local entries with different endpoints pool their GPU slots: the proxy
+#   routes to the first local provider and falls through to the next when
+#   it is busy or unhealthy (sequential fallback). Omitting ``endpoint``
+#   keeps the legacy behaviour of routing to
+#   ``http://localhost:{server.llama_server_port}``. Each server tracks its
+#   own dispatch leases (keyed per-endpoint) and persists slot snapshots in
+#   its own ``{session_slot_save_path}/{host}-{port}/`` subdirectory.
+#   The proxy assumes the servers are already running (no lifecycle
+#   management). Example:
+#
+#     models:
+#       qwen3:
+#         providers:
+#           - name: local-qwen3-server-1
+#             type: local
+#             llama_model: Qwen3
+#             endpoint: http://192.168.0.199:8080
+#           - name: local-qwen3-server-2
+#             type: local
+#             llama_model: Qwen3
+#             endpoint: http://192.168.0.200:8080
 #
 # FreeUsageLimitError cooldown (LP-0MSMCM5UG00378G8):
 #   When a provider returns HTTP 429 with error.type = "FreeUsageLimitError"
@@ -19,14 +44,18 @@
 #   per-provider cooldown: 3 hours (10800s, LP-0MRGU0I91006ODFD) applied to all
 #   providers.
 #
-# Failure-domain grouping (LP-0MSG45I8Q0020N1F):
-#   Provider entries that share the same normalized endpoint form a SINGLE
-#   failure domain and are treated as one unit during mid-stream re-route /
-#   fallback resolution. When one entry of a gateway stalls or terminally
-#   fails, the chain skips every other entry on the same endpoint for the
-#   remainder of that request, hopping straight to the first entry of a
-#   different gateway. Entries on different endpoints are never grouped
-#   (e.g. https://opencode.ai/zen and https://opencode.ai/zen/go are distinct
+# Failure-domain grouping (LP-0MSG45I8Q0020N1F, LP-0MTVMB685003GO2F):
+#   Provider entries that share the same normalized endpoint AND upstream
+#   `model` form a SINGLE failure domain and are treated as one unit during
+#   mid-stream re-route / fallback resolution. When one entry of a gateway
+#   stalls or terminally fails, the chain skips every other entry with the
+#   same model on the same endpoint for the remainder of that request,
+#   hopping straight to the first entry of a different gateway or a
+#   different model on the same gateway. Router endpoints (e.g.
+#   https://opencode.ai/zen/go) can distinguish between different upstream
+#   models — a failure for model A does not exclude model B on the same
+#   gateway. Entries on different endpoints are never grouped (e.g.
+#   https://opencode.ai/zen and https://opencode.ai/zen/go are distinct
 #   failure domains). Local / no-endpoint entries key on the `provider` brand
 #   (falling back to the entry name). Per-entry cooldowns and the ordered
 #   chain are unchanged; this grouping is per-request only (cross-request
@@ -176,6 +205,13 @@ audit_model_fallbacks:
   - "deepseek-v4-flash"
 
 models:
+  # Multi-backend local providers (LP-0MRPILSMW004T4H8): a ``type: local``
+  # provider may declare an optional ``endpoint`` (full ``http://host:port``
+  # URL of a specific llama-server instance) to run several local servers
+  # behind one model with per-endpoint fallback, slot persistence
+  # (``{host}-{port}/`` subdirs) and dispatch leases. Omitted ``endpoint``
+  # keeps the legacy single-server default
+  # ``http://localhost:{llama_server_port}``. See proxy/MODEL_ADD.md.
   embed:
     providers:
       - name: local-embed
@@ -209,13 +245,20 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        # IMPORTANT: deepseek-v4-flash via api.deepseek.com has available_times
+        # windows that leave gaps (UTC 01:00-04:00 and 06:00-10:00). During
+        # these gaps the provider is skipped and requests fall to the next
+        # available provider (or enter chain-hold retry). The 10:00-00:00
+        # window covers 14 hours; the 3+2 hour gaps are accepted risk.
+        # (LP-0MU1RXEPL005CK97)
+        #
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
       - name: opencode-go-2
         type: remote
         provider: opencode-go
@@ -225,13 +268,13 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
       - name: opencode-go
         type: remote
         provider: opencode-go
@@ -241,19 +284,19 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
-      - name: deepseek-v4-flash
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
+      - name: deepseek-flash
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
+        model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - plan*
@@ -277,13 +320,13 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
       - name: opencode-go-2
         type: remote
         provider: opencode-go
@@ -293,13 +336,13 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
       - name: opencode-go
         type: remote
         provider: opencode-go
@@ -309,19 +352,19 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
-      - name: deepseek-v4-flash
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
+      - name: deepseek-flash
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
+        model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - author
@@ -343,13 +386,13 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
       - name: opencode-go-2
         type: remote
         provider: opencode-go
@@ -359,13 +402,13 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
       - name: opencode-go
         type: remote
         provider: opencode-go
@@ -375,19 +418,19 @@ models:
         #
         # Deepseek
         #
-        # model: deepseek-v4-flash
-        # available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
-        model: muse-spark-1.2-contributor
-        api: openai-responses
-      - name: deepseek-v4-flash
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
+      - name: deepseek-flash
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
-        model: deepseek-v4-flash
+        model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
@@ -530,9 +573,9 @@ server:
   # tokenizer).
   #
   # MODE-AWARE value (LP-0MSOMVOPH004ATAK): this default profile mirrors the
-  # fast-mode profile (3 slots x 262144; superseded per LP-0MSY0SDAS0031Y7F);
-  # keep it aligned with config-fast.yaml
-  # (38000). See the mode-aware note there.
+  # fast-mode profile (1 slot x 262144; LP-0MU03AL730000B5W; slot count
+  # superseded per LP-0MSY0SDAS0031Y7F); keep it aligned with
+  # config-fast.yaml (38000). See the mode-aware note there.
   local_large_context_cold_cache_threshold: 38000
 
   # Context-too-large bypass threshold (skip reason `context_too_large`;
@@ -549,17 +592,14 @@ server:
   # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
   local_large_context_warm_cache_threshold: 100000
 
-  # Hard local-routing cap ratio — DISABLED (LP-0MTLB1LK80098R43 revert of
-  # LP-0MTBOX45O005LD1S; 2026-09-03: follows LP-0MTBTCK2I005MOTE verdict
-  # NOT EFFECTIVE — caps too restrictive). 0 = dynamic per-slot clamp
-  # (provider.py effective_per_slot_threshold: 262144//slots - 4096
-  # → 83285 fast / 126976 cheap, warm 100000 caps). Rollback: restore
-  # 0.84049 for 70000 fast cap (70000/83285) and 0.6144 for 61440 cheap.
-  local_hard_routing_cap_ratio_fast: 0
+  # `local_hard_routing_cap_ratio_fast` RETIRED (LP-0MTVXP7DG00613ZB AC3):
+  # the single `compaction_trigger_ratio` below is the only session detection
+  # knob. Non-compactable oversized sessions route remote with guidance; the
+  # gate remains only as a defensive fallback.
 
   # Total context size of the local model (across ALL slots). Must match the
   # per-model ctx-size in models.ini for the local model (e.g. [Qwen3]
-  # ctx-size) and the slot_schedule ctx_size pins below. Used to compute the
+  # ctx-size). Used to compute the
   # actual per-slot context (ctx_size / active_slots) which clamps the
   # large-context routing thresholds (LP-0MSAZXXDY005AWA1). 0 disables the
   # clamp.
@@ -572,19 +612,16 @@ server:
   # serves 262144 ctx and the 120 GB GPU has headroom (context ~47 GB at
   # 3x262144 q8_0).
   local_model_ctx_size: 262144
-  # Session context-pressure warning ratio (LP-0MSDCLQ2W001LGWC).
-  # When a session's estimated context reaches this fraction of the
-  # effective per-slot context (ctx_size / slots - 4096 headroom), the
-  # proxy logs a context_pressure WARNING suggesting session compaction.
-  # KV reads scale linearly with context, so sessions at ~80% of the
-  # per-slot limit decode far slower than short sessions. 0 disables.
-  context_pressure_warn_ratio: 0.8
+  # Session context-pressure advisory (LP-0MSDCLQ2W001LGWC; unified by
+  # LP-0MTVXP7DG00613ZB AC3): the advisory fires at the single
+  # `compaction_trigger_ratio` below — the legacy
+  # `context_pressure_warn_ratio` knob is retired.
 
   # --- Session compaction config (LP-0MTG6RW3L003X122) ---
   # Proxy-side proactive session compaction at prompt-assembly time.
   # trigger_ratio: fires when est_tokens > ratio × per-slot threshold
-  #   (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K)
-  #   (cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K)
+  #   (fast: 0.70 × 258,048 = 180,634 → target ≤ 117K)
+  #   (cheap: 0.70 × 83,285 = 58,300 → target ≤ 38K)
   compaction_trigger_ratio: 0.70
   # Summariser model: local llama.cpp model used for in-proxy summarisation.
   # Reuses the existing Qwen3 model — no new model download required.
@@ -600,13 +637,13 @@ server:
   # advisory logging only, zero dispatch change. TRUE until the AC8
   # enforcement gate passes (experiment bar + client-side compaction
   # review); flip to false to enable live enforcement.
-  compaction_dry_run: true
+  compaction_dry_run: false
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context
   # routing threshold (local_model_ctx_size // slots - 4096 output headroom,
-  # mirroring provider.py) for the static session_slot_pool_size AND every
-  # slot_schedule entry. When the threshold falls below
+  # mirroring provider.py) for the profile's session_slot_pool_size. When
+  # the threshold falls below
   # min_local_routing_threshold (default 10000), a WARNING is logged at
   # startup. A threshold this small means every realistic agent session
   # exceeds the clamp, silently bypassing ALL local traffic to remote
@@ -679,6 +716,12 @@ server:
   # Directory for KV-cache slot snapshots written by slot save/restore
   # (llama-server prompt_save/prompt_load). Must be writable by the proxy
   # user; retention is handled by scripts/cleanup-slot-cache.sh.
+  #
+  # With multiple local backends (LP-0MRPILSMW004T4H8) each server stores
+  # its slot snapshots in its own subdirectory derived from its endpoint:
+  #   {session_slot_save_path}/{host}-{port}/slot_<session_id>.bin
+  # so slot state from one server never collides with another. Single-server
+  # setups (no per-provider ``endpoint``) keep using the directory directly.
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   # Number of parallel sessions (GPU contexts) for local dispatch.
   # Controls how many concurrent Pi agent sessions can hold dispatch leases
@@ -698,85 +741,16 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Option C (3 slots) restored per LP-0MSEGPO77005CYCQ F4.
-  session_slot_pool_size: 3
+  # Operator-directed 2026-09-13 (LP-0MU03AL730000B5W): default profile
+  # runs a single slot.
+  session_slot_pool_size: 1
 
-  # -----------------------------------------------------------------------
-  # Slot schedule (LP-0MRXZU90M007WNWT)
-  # -----------------------------------------------------------------------
-  # Time-based slot count scheduling. When enabled, the proxy automatically
-  # varies the number of concurrent slots (``--parallel N``) based on the
-  # time of day. Transitions apply immediately: at the scheduled time the
-  # proxy restarts llama-server with the new slot count. There is NO drain
-  # window and no 503 rejection period (LP-0MSF9RUSQ007M346); in-flight
-  # requests are terminated by the restart and clients retry.
+  # Slot count is defined ONCE per mode profile via ``session_slot_pool_size``
+  # above (default/fast: 3, cheap: 2). There is no time-based slot schedule:
+  # the slot count changes only when the operating mode changes. The
+  # mode-switch schedule (when to switch fast<->cheap) lives in the
+  # standalone ``proxy/mode_schedule.yaml`` file, not in this model profile.
   #
-  # Disabled by default (no schedule → static slot count from
-  # ``session_slot_pool_size`` above).
-  #
-  # Fields:
-  #   enabled:        Set to true to activate scheduling.
-  #   drain_minutes:  DEPRECATED — parsed for backward compatibility but
-  #                   IGNORED. Transitions no longer have a drain window.
-  #   entries:        List of transition rules. Each entry has:
-  #     time:         "HH:MM" format (24-hour). The time at which the new
-  #                   slot count becomes active.
-  #     slots:        The ``--parallel N`` value to apply from this time
-  #                   onward until the next entry.
-  #     ctx_size:     OPTIONAL per-period total context (llama-server
-  #                   ``--ctx-size``) while this entry is active; overrides
-  #                   the global ``local_model_ctx_size`` below
-  #                   (LP-0MSLNK96T0018W4D).
-  #
-  # Time-based slot count transitions (LP-0MSF9RUSQ007M346).
-  #
-  # Each entry maps a time-of-day to a slot count. Entries may also carry
-  # an optional per-period ctx_size (LP-0MSLNK96T0018W4D): the total
-  # context across all slots (llama-server --ctx-size) while that entry is
-  # active, overriding the global local_model_ctx_size below. When absent,
-  # the global local_model_ctx_size applies. The routing clamp and
-  # session_slot_max_prompt_tokens derive per-slot thresholds from the
-  # ACTIVE period's (ctx_size, slots) — keep clamp × slots <= the real
-  # rounded n_ctx (llama.cpp pads n_ctx_seq up to 256).
-  #
-  # Example:
-  #   slot_schedule:
-  #     enabled: true
-  #     drain_minutes: 3  # DEPRECATED — ignored
-  #     entries:
-  #       - time: "10:00"
-  #         slots: 3
-  #       - time: "23:59"
-  #         slots: 2
-  #         ctx_size: 262144
-  #
-  # Entries with the same slot count as the current value are skipped
-  # (no unnecessary restart) UNLESS the per-period ctx_size differs.
-  # Midnight wrapping is supported.
-  slot_schedule:
-    enabled: true
-    drain_minutes: 3  # DEPRECATED — ignored (LP-0MSF9RUSQ007M346)
-    entries:
-      - time: "23:59"
-        slots: 3
-      - time: "10:00"
-        slots: 3
-  # Automatic operating-mode schedule (LP-0MSM5K4TX004MICX): switches the
-  # proxy between cheap (01:00-10:00) and fast (10:00-01:00) at the listed
-  # times. A manual API switch (POST /admin/set-mode) overrides the schedule
-  # until the next scheduled transition (LP-0MSMF25V9002AY1J). The active
-  # entry is the most
-  # recent one at or before the current time (circular wrap, so the last
-  # entry covers 00:00-00:59). Set enabled: false to disable; an absent
-  # section uses this same built-in schedule.
-  mode_schedule:
-    enabled: true
-    entries:
-      - time: "01:00"
-        mode: cheap
-      - time: "10:00"
-        mode: fast
-
   # -----------------------------------------------------------------------
   # Session grandfathering across mode switches (LP-0MSMF5LXO006YDNM)
   # -----------------------------------------------------------------------
@@ -789,7 +763,7 @@ server:
   # guarantee for those grandfathered sessions only, and only within the grace
   # deadline. New sessions (and requests without a session id) are never
   # grandfathered. Set enabled: false to turn the whole feature off.
-  # fallback_grace_seconds: only used when mode_schedule is disabled
+  # fallback_grace_seconds: only used when the mode schedule is disabled
   # (default = session TTL, 3h).
   mode_switch_grandfathering:
     enabled: true
@@ -912,10 +886,10 @@ server:
   # Raised from 120 to 240s (LP-0MSF5I7XN009ENWQ / LP-0MSF1PUM90099ZSW F4):
   # opencode-go/deepseek-v4-flash frequently pause >120s mid-generation while
   # still alive, so the lower bound produced false stalls (~31% of requests).
-  # Trade-off: true failures are detected more slowly (up to 240s of silence).
-  # The stall-gap distribution analysis (LP-0MSF5IAXE005BG33) will refine this.
-  # Default: 240 seconds.
-  upstream_idle_timeout_seconds: 240
+  # Trade-off: true failures are detected more slowly (up to 30s of silence).
+  # Bounded by upstream_request_timeout_seconds (120s) — the idle timeout
+  # never exceeds the total request timeout. See LP-0MU1RXEPL005CK97.
+  upstream_idle_timeout_seconds: 30
 
   # Remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
   # The per-chunk idle timeout above only fires on SILENCE — an upstream
@@ -998,11 +972,34 @@ server:
   # (no content, stopReason: stop, total_tokens: 0), retry with the same
   # model up to this many additional attempts before falling through to
   # the next provider in the fallback chain.
-  # Default: 1 retry (1 additional attempt).
-  upstream_empty_retry_max_attempts: 1
+  # Default: 3 retries (3 additional attempts).
+  upstream_empty_retry_max_attempts: 3
   # Base delay (in seconds) before retrying on empty response.
-  # Default: 2.0 seconds.
-  upstream_empty_retry_base_delay_seconds: 2.0
+  # Default: 3.0 seconds.
+  upstream_empty_retry_base_delay_seconds: 3.0
+  # Total time budget (in seconds) for empty-response retries across all
+  # attempts. Once this budget is exceeded, retries stop immediately and the
+  # error is returned for fallback. This prevents infinite retry loops when
+  # an upstream consistently returns empty bodies. Default: 30 seconds.
+  # (LP-0MU1RXEPL005CK97)
+  upstream_empty_retry_timeout_seconds: 30
+
+  # Bounded provider retry failover budget (LP-0MU1RXEPL005CK97).
+  # Hard wall-clock cap on the total time a single remote provider may spend
+  # retrying stalls/empty responses (including backoff sleeps) before the
+  # proxy yields a terminal finish_reason:error (error.type
+  # retry_budget_exhausted) so the fallback chain fails over to the next
+  # provider. Without this the per-chunk idle timeout
+  # (upstream_idle_timeout_seconds, default 240s) repeats once per Tier-1
+  # retry (default 4 x 240s) plus empty-response retries, so one stalled
+  # gateway can sit in the request's critical path past the client's 900s
+  # queue-timeout.
+  # The budget applies only while ZERO content-bearing chunks have been
+  # delivered; once content is flowing the stream is governed by the
+  # idle/activity/max-duration budgets instead, so productive streams are
+  # never cut off. Failover-budget exhaustion is logged with the configured
+  # budget and elapsed time. Default: 300 seconds.
+  upstream_retry_failover_budget_seconds: 300
 
   # Heartbeat interval (in seconds) for SSE streaming.
   # During idle periods (e.g. long pre-fill on large prompts), the proxy

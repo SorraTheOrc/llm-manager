@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Time-Based Slot Scheduling**: Automatically vary the number of concurrent llama-server slots based on the time of day — more slots for batch throughput off-peak, fewer for latency-sensitive work during peak hours. Scheduling is configured in `config.yaml` with time ranges and slot counts. See [Slot Scheduling](#slot-scheduling) below.
+- **Per-Mode Slot Counts**: Each operating-mode profile (`config.yaml` / `config-fast.yaml` / `config-cheap.yaml`) defines its own local llama-server slot count via `session_slot_pool_size` — one definition per mode, no time-based slot schedule. See [Slot configuration](#slot-configuration) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -76,7 +76,7 @@ python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
 `fast_sessions.csv`, `cheap_sessions.csv`
-(one row per session; fast/cheap split derived from the `slot_schedule` in
+(one row per session; fast/cheap split derived from the mode timeline
 the active config profile), and `report.md` (aggregates + recommendations). Existing
 outputs are archived into a dated subdirectory before each run overwrites
 them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
@@ -628,6 +628,28 @@ repeatedly across requests is quarantined after the threshold is exceeded.
 - **Integration**: Uses the same `mark_provider_unavailable()` mechanism as Tier 2.
   Stalls during cooldown are recorded but do not extend the cooldown.
 
+##### Local HTTP 400 Observability & Deterministic Escalation (LP-0MTXEBQ4E001BMI2)
+
+A local 4xx is treated as a request-shape incompatibility: the request falls
+back to the next provider WITHOUT poisoning the local provider cooldown
+(transient one-off noise stays cheap). But local 400 rejections were
+otherwise **silent** — no log line, no metric — so a 400 that is
+deterministic for a session (e.g. a compacted history llama-server rejects
+every turn) routed remote invisibly turn after turn.
+
+- **Per occurrence:** every local 400 logs
+  `Local HTTP 400 from provider=... body_snippet=<upstream body>` at INFO and
+  increments `proxy_http_errors_total{status="400", reason="local_http_400"}`
+  so the rejection cause is discoverable from the snippet.
+- **Deterministic repeat:** when the SAME session repeats a local 400 within
+  a 600 s sliding window (threshold 2), a WARNING
+  (`Deterministic local HTTP 400: ...`) plus
+  `proxy_http_errors_total{status="400", reason="local_http_400_deterministic"}`
+  escalates the failure instead of silently routing remote each turn. A
+  successful local dispatch resets the streak (only unbroken same-session 400
+  runs escalate). No cooldown is applied either way — the local provider
+  stays eligible for the next request.
+
 #### All Providers Exhausted
 
 When all providers are exhausted:
@@ -818,8 +840,8 @@ The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and requests can
   fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
-  3-slot pool).
-- **cheap** — 2-slot local pool with the same models/provider chains as
+  1-slot pool).
+- **cheap** — 3-slot local pool with the same models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (`proxy/config-cheap.yaml`,
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
@@ -912,23 +934,23 @@ restart). With `enabled: false` or a schedule that never changes mode, a
 manual switch persists until the next API call. A switch in progress
 (pending restart) is left alone and retried on the next check.
 
-The schedule is configured in the `mode_schedule` section of the active
-config profile (same section in `config.yaml` / `config-fast.yaml` /
-`config-cheap.yaml`):
+The schedule is configured in the standalone `proxy/mode_schedule.yaml`
+file (NOT inside the model profiles — each profile keeps a single
+slot-count definition, LP-0MTZRM5HV0007S0V):
 
 ```yaml
-mode_schedule:
-  enabled: true
-  entries:
-    - time: "01:00"
-      mode: cheap
-    - time: "10:00"
-      mode: fast
+# proxy/mode_schedule.yaml
+enabled: true
+entries:
+  - time: "01:00"
+    mode: cheap
+  - time: "10:00"
+    mode: fast
 ```
 
-Set `enabled: false` to disable the timer; an absent section uses the
+Set `enabled: false` to disable the timer; an absent file uses the
 built-in schedule above. Entries follow the same "most recent time at or
-before now, wrapping circularly" rule as `slot_schedule`.
+before now, wrapping circularly" rule.
 
 ### Environment Variables
 
@@ -944,51 +966,31 @@ before now, wrapping circularly" rule as `slot_schedule`.
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
 
-### Slot Scheduling
+### Slot configuration
 
-The proxy supports **time-based slot scheduling**, allowing operators to vary the number of concurrent llama-server slots (`session_slot_pool_size` / `--parallel N`) based on the time of day. This is useful when the same server handles both latency-sensitive interactive requests (fewer slots → faster per-request response) and high-throughput batch workloads (more slots).
+Each operating-mode profile defines its local llama-server slot count
+**once** via `session_slot_pool_size` (the pool size / `--parallel N`):
 
-#### Configuration
+| Profile | Slots |
+|---------|-------|
+| `config.yaml` (default/fallback) | 1 |
+| `config-fast.yaml` | 1 |
+| `config-cheap.yaml` | 3 |
 
-Add a `slot_schedule` section under `server:` in `config.yaml`:
+There is **no time-based slot schedule** (the previous `slot_schedule`
+mechanism was removed, LP-0MTZRM5HV0007S0V): the slot count changes only
+when the operating mode changes, because a mode switch restarts the proxy
+with the new profile. Each profile also pins its total context
+(`local_model_ctx_size`, 262144 in all three), so the per-slot context is
+always `local_model_ctx_size // session_slot_pool_size`.
 
-```yaml
-server:
-  slot_schedule:
-    enabled: true
-    entries:
-      - time: "10:00"
-        slots: 4
-      - time: "12:00"
-        slots: 8
-```
+#### Changing the slot count
 
-| Field | Description |
-|-------|-------------|
-| `enabled` | Set to `true` to activate the schedule. When `false` or absent, the feature is disabled and the static `session_slot_pool_size` value is used (backward compatible). |
-| `drain_minutes` | **Deprecated — ignored.** Parsed for backward compatibility only; transitions no longer have a drain window (LP-0MSF9RUSQ007M346). |
-| `entries` | List of time-to-slot mappings. Each entry has a `time` (HH:MM format) and a `slots` value. Entries are sorted chronologically. |
-
-#### How It Works
-
-1. At startup, the proxy reads the `slot_schedule` section from `config.yaml`.
-2. A background scheduler checks the current time against the schedule and sleeps until the next transition where the slot count changes.
-3. At the transition time, llama-server is restarted immediately with the new `--parallel N` value. The proxy verifies the backend port is released before starting the new server.
-4. There is **no drain window and no 503 rejection period** (LP-0MSF9RUSQ007M346): requests continue to be served until the restart. In-flight requests are terminated by the restart and clients retry.
-
-#### Disabling
-
-To disable the feature, either:
-- Set `enabled: false` in the `slot_schedule` section, or
-- Remove the `slot_schedule` section entirely from `config.yaml`.
-
-When disabled, the proxy uses the static `session_slot_pool_size` value (unchanged from the original behavior).
-
-#### Midnight Wrapping
-
-The schedule supports midnight wrapping: if only one entry is defined (e.g., `10:00 → 4`), the slot count wraps to the last entry's value from the previous day during the hours before the first entry. This ensures a sensible slot count is always active, even before the first scheduled transition of the day.
-
-### Upstream Timeout Configuration
+Edit the profile's `session_slot_pool_size` and restart the proxy (no hot
+reload). Fast/default use 1 slot; cheap uses 3. The slot count feeds
+llama-server's `--parallel` (via `LLAMA_PARALLEL`, set by the lifecycle)
+and the local dispatch lease pool — keep `session_slot_pool_size` aligned
+with what llama-server actually runs.### Upstream Timeout Configuration
 
 The proxy uses two separate timeout values for upstream remote connections:
 
@@ -1480,7 +1482,7 @@ curl -X POST http://localhost:8000/admin/set-mode \
   -H 'Content-Type: application/json' -d '{"mode": "cheap"}'
 ```
 Switches the proxy between **fast** (cloud-backed) and **cheap**
-(2-slot local pool, same models as fast — remote providers enabled)
+(3-slot local pool, same models as fast — remote providers enabled)
 operating modes. Requesting the active mode is a noop; a
 different mode is persisted (survives restarts) and triggers a full proxy
 restart in the background. Invalid modes return `400`; a switch while a
@@ -1822,9 +1824,9 @@ the default `config.yaml`, and `config-cheap.yaml` all use `38000` (cheap is
 symmetric with fast after the initial 60000 raise breached the cheap queue
 guardrails and was reverted — LP-0MSRM54YO007YG0K AC7 — then re-raised to
 38000, LP-0MSY0V4ZO002ANPL).
-Each value stays below its mode's effective warm clamp (fast `131072//3 − 4096
-= 39594`; cheap resolves to `100000` via its 2×262144 schedule entries, and is
-also below the boot-transient clamp 61440) so the (cold, warm] band never
+Each value stays below its mode's effective warm clamp (fast resolves to
+`min(100000, 262144//1 − 4096 = 258048) = 100000`; cheap resolves to
+`min(100000, 262144//3 − 4096 = 83285) = 83285`) so the (cold, warm] band never
 collapses (LP-0MSI2M5BT004BCDP). Prompts above the per-slot warm clamp are
 never routed local (`context_too_large` — physical capacity).
 

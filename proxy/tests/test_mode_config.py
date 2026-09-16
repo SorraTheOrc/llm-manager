@@ -3,12 +3,15 @@
 Covers (LP-0MSLMYEEU002IBH6):
 - load_config() precedence: LLAMA_PROXY_CONFIG env > mode-selected file >
   proxy/config.yaml default
-- config-fast.yaml mirrors the current config.yaml day settings (3-slot,
+- config-fast.yaml mirrors the current config.yaml day settings (1-slot,
   remote providers eligible)
-- config-cheap.yaml is a 2-slot profile with the SAME models/provider
+- config-cheap.yaml is a 3-slot profile with the SAME models/provider
   chains as fast (remote providers enabled, LP-0MSMIPPJI007GU9N); it
-  differs only in the local slot pool (2 vs 3) and the per-period
-  ctx_size (262144 vs 131072, LP-0MSMZOAJW002UR2A)
+  differs only in the local slot pool (1 vs 3, the profile's single
+  slot-count definition) and the contention/cold-cache caps
+- no profile carries a ``slot_schedule`` or ``mode_schedule``: slot count
+  is ``session_slot_pool_size`` and the mode-switch schedule lives in the
+  standalone ``proxy/mode_schedule.yaml`` (LP-0MTZRM5HV0007S0V)
 - resolve_config_path() maps modes to the correct profile files
 """
 
@@ -39,30 +42,30 @@ class TestConfigResolution:
         mode_file.write_text("cheap\n")
         monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(mode_module.proxy_dir() / "config.yaml"))
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 3
+        assert cfg["server"]["session_slot_pool_size"] == 1
 
     def test_cheap_mode_selects_cheap_config(self, mode_file, monkeypatch):
-        """Persisted cheap mode -> load_config reads config-cheap.yaml (2 slots)."""
+        """Persisted cheap mode -> load_config reads config-cheap.yaml (3 slots)."""
         monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
         mode_file.write_text("cheap\n")
         monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 2
+        assert cfg["server"]["session_slot_pool_size"] == 3
 
     def test_fast_mode_selects_fast_config(self, mode_file, monkeypatch):
-        """Persisted fast mode -> load_config reads config-fast.yaml (3 slots)."""
+        """Persisted fast mode -> load_config reads config-fast.yaml (1 slot)."""
         monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
         mode_file.write_text("fast\n")
         monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 3
+        assert cfg["server"]["session_slot_pool_size"] == 1
 
     def test_no_mode_file_defaults_to_fast(self, mode_file, monkeypatch):
         """No persisted mode -> load_config reads the fast profile (default)."""
         monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
         monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 3
+        assert cfg["server"]["session_slot_pool_size"] == 1
 
     def test_resolve_config_path_precedence(self, mode_file, monkeypatch):
         """resolve_config_path follows env > mode > default."""
@@ -144,13 +147,14 @@ def _strip_available_times(models: dict) -> dict:
 
 
 class TestFastConfigProfile:
-    def test_fast_config_is_3_slot(self):
-        """config-fast.yaml keeps the 3-slot pool and 3/3 schedule."""
+    def test_fast_config_is_1_slot(self):
+        """config-fast.yaml defines its slot count once (1) and has no
+        time-based slot schedule (LP-0MTZRM5HV0007S0V)."""
         cfg = _load("config-fast.yaml")
         srv = cfg["server"]
-        assert srv["session_slot_pool_size"] == 3
-        entries = srv["slot_schedule"]["entries"]
-        assert [e["slots"] for e in entries] == [3, 3]
+        assert srv["session_slot_pool_size"] == 1
+        assert "slot_schedule" not in srv
+        assert "mode_schedule" not in srv
 
     def test_fast_config_has_remote_providers(self):
         """config-fast.yaml keeps the cloud provider cascade (day settings)."""
@@ -194,27 +198,21 @@ class TestFastConfigProfile:
 
 
 class TestCheapConfigProfile:
-    def test_cheap_config_is_2_slot(self):
-        """config-cheap.yaml uses a 2-slot pool, 2/2 schedule entries, each
-        carrying the full-model ctx_size override (262144, LP-0MSMZOAJW002UR2A)."""
+    def test_cheap_config_is_3_slot(self):
+        """config-cheap.yaml defines its slot count once (3) and has no
+        time-based slot schedule (LP-0MTZRM5HV0007S0V; count per
+        LP-0MU03AL730000B5W)."""
         cfg = _load("config-cheap.yaml")
         srv = cfg["server"]
-        assert srv["session_slot_pool_size"] == 2
-        entries = srv["slot_schedule"]["entries"]
-        assert [e["slots"] for e in entries] == [2, 2]
-        assert all(e.get("ctx_size") == 262144 for e in entries)
+        assert srv["session_slot_pool_size"] == 3
+        assert "slot_schedule" not in srv
+        assert "mode_schedule" not in srv
 
-    def test_cheap_config_static_ctx_aligned_with_schedule(self):
-        """The cheap profile's static local_model_ctx_size is aligned with
-        the schedule entries' 262144 (LP-0MTO8SZ8K0080RHT) — static clamp
-        equals scheduled clamp (126976), no catch-up needed."""
+    def test_cheap_config_static_ctx_262144(self):
+        """The cheap profile's static local_model_ctx_size is 262144
+        (LP-0MTO8SZ8K0080RHT), giving the 2x262144 per-slot clamp."""
         cfg = _load("config-cheap.yaml")
-        srv = cfg["server"]
-        assert srv["local_model_ctx_size"] == 262144
-        assert all(
-            e.get("ctx_size") == srv["local_model_ctx_size"]
-            for e in srv["slot_schedule"]["entries"]
-        )
+        assert cfg["server"]["local_model_ctx_size"] == 262144
 
     def test_cheap_config_has_remote_providers(self):
         """config-cheap.yaml keeps remote providers enabled (LP-0MSMIPPJI007GU9N)."""
@@ -268,29 +266,31 @@ class TestCheapConfigProfile:
 
     def test_cheap_config_differs_from_fast_only_by_slot_pool_ctx_and_contention(self):
         """The only intended cheap-vs-fast server differences are the local
-        slot pool (2 vs 3), the per-period ctx_size (cheap schedules 262144
-        override; fast pins 262144 inline per LP-0MSY0SDAS0031Y7F),
-        local_model_ctx_size (fast 262144 inline, cheap 131072 base + 262144
-        schedule override), the per-mode contention-queue policy (cheap=queue
-        vs fast=fallback, LP-0MSORQVK50012Q4D F2), the cold-cache
+        slot pool (2 vs 3, the profile's single slot-count definition),
+        local_model_ctx_size (both 262144 since LP-0MTO8SZ8K0080RHT), the
+        per-mode contention-queue policy (both queue; fast smaller,
+        LP-0MSORQVK50012Q4D F2 / LP-0MTQYIK4Z008XF2V), the cold-cache
         threshold (cheap 42000 raised from 38000, LP-0MSOMVOPH004ATAK
         / LP-0MSRM54YO007YG0K AC7 / LP-0MSY0V4ZO002ANPL / LP-0MT50SMU1005ZAD6;
         fast/default stays 38000 — cheap-only change, LP-0MT50WCCP000DU00), and
         the persistence cap (cheap 126976 vs fast 83285, each pinned to its
         mode's routing clamp, LP-0MTBTCB8D000OQ0C). Everything else
-        (models, warm threshold) is identical."""
+        (models, warm threshold) is identical. There is no slot_schedule in
+        either profile (LP-0MTZRM5HV0007S0V)."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
         fast_srv = dict(fast["server"])
         cheap_srv["session_slot_pool_size"] = fast_srv["session_slot_pool_size"]
-        cheap_srv["slot_schedule"] = fast_srv["slot_schedule"]
         # local_model_ctx_size now identical (262144) per LP-0MTO8SZ8K0080RHT.
         cheap_srv["local_model_ctx_size"] = fast_srv["local_model_ctx_size"]
-        # Cheap declares queue + caps; fast declares fallback (no caps).
+        # Cheap declares queue + larger caps; fast declares queue + smaller caps
+        # (LP-0MTQYIK4Z008XF2V: both modes queue, fast < cheap).
         cheap_srv["contention_queue_policy"] = fast_srv["contention_queue_policy"]
         cheap_srv.pop("contention_queue_max_wait_seconds", None)
         cheap_srv.pop("contention_queue_max_depth", None)
+        fast_srv.pop("contention_queue_max_wait_seconds", None)
+        fast_srv.pop("contention_queue_max_depth", None)
         # Cold-cache threshold (LP-0MSOMVOPH004ATAK; reverted per
         # LP-0MSRM54YO007YG0K AC7 then re-raised to 38000 per
         # LP-0MSY0V4ZO002ANPL, raised to 42000 for cheap only per
@@ -311,21 +311,23 @@ class TestCheapConfigProfile:
         assert cheap_srv == fast_srv
 
         # The intended diffs, asserted explicitly:
-        assert cheap["server"]["session_slot_pool_size"] == 2
-        assert fast["server"]["session_slot_pool_size"] == 3
-        cheap_entries = cheap["server"]["slot_schedule"]["entries"]
-        fast_entries = fast["server"]["slot_schedule"]["entries"]
-        assert [e["slots"] for e in cheap_entries] == [2, 2]
-        assert [e["slots"] for e in fast_entries] == [3, 3]
-        assert all(e.get("ctx_size") == 262144 for e in cheap_entries)
-        assert all(e.get("ctx_size") == 262144 for e in fast_entries)  # LP-0MSY0SDAS0031Y7F
+        assert cheap["server"]["session_slot_pool_size"] == 3
+        assert fast["server"]["session_slot_pool_size"] == 1
+        assert "slot_schedule" not in cheap["server"]
+        assert "slot_schedule" not in fast["server"]
         assert cheap["server"]["contention_queue_policy"] == "queue"
         # Caps tuned per LP-0MTF6EVLW007PEHN (T4 recommendation,
         # LP-0MTED3OFP006I7NO): wait 60→120, depth 4→8 (projected +35
-        # dispatches/window, T3 a26bc66).  Fast mode keeps no-queue fallback.
+        # dispatches/window, T3 a26bc66).  Fast mode declares a smaller queue
+        # (LP-0MTQYIK4Z008XF2V: 3/45 vs cheap 8/120) so bursts spill to
+        # remotes sooner during peak hours.
         assert cheap["server"]["contention_queue_max_wait_seconds"] == 120
         assert cheap["server"]["contention_queue_max_depth"] == 8
-        assert fast["server"]["contention_queue_policy"] == "fallback"
+        assert fast["server"]["contention_queue_policy"] == "queue"
+        assert fast["server"]["contention_queue_max_wait_seconds"] == 45
+        assert fast["server"]["contention_queue_max_depth"] == 3
+        assert fast["server"]["contention_queue_max_depth"] < cheap["server"]["contention_queue_max_depth"]
+        assert fast["server"]["contention_queue_max_wait_seconds"] < cheap["server"]["contention_queue_max_wait_seconds"]
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
         # Per-mode persistence caps derive from each profile's hard-routing
         # cap when enabled (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4)
@@ -333,22 +335,55 @@ class TestCheapConfigProfile:
         # LP-0MTBTCK2I005MOTE NOT EFFECTIVE verdict): static 0 and hard cap 0.
         assert cheap["server"]["session_slot_max_prompt_tokens"] == 0
         assert fast["server"]["session_slot_max_prompt_tokens"] == 0
-        # Per-mode hard-routing-cap ratios DISABLED (LP-0MTLB1LK80098R43
-        # revert of LP-0MTBOX45O005LD1S): 0 = dynamic per-slot clamp.
-        assert cheap["server"]["local_hard_routing_cap_ratio_cheap"] == 0
-        assert fast["server"]["local_hard_routing_cap_ratio_fast"] == 0
+        # Per-mode hard-routing-cap ratios RETIRED (LP-0MTVXP7DG00613ZB AC3):
+        # ``compaction_trigger_ratio`` is the single detection knob; the
+        # legacy per-mode cap keys are removed from the live config surface.
+        assert "local_hard_routing_cap_ratio_cheap" not in cheap["server"]
+        assert "local_hard_routing_cap_ratio_fast" not in fast["server"]
         assert fast["server"]["local_large_context_cold_cache_threshold"] == 38000
         assert cheap["server"]["local_large_context_warm_cache_threshold"] == fast["server"]["local_large_context_warm_cache_threshold"]
 
     def test_cheap_config_matches_fast_on_local_ctx(self):
-        """The local model context size: both fast and cheap now inline
+        """The local model context size: both fast and cheap inline
         262144 (LP-0MSY0SDAS0031Y7F + LP-0MTO8SZ8K0080RHT).
         """
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         assert fast["server"]["local_model_ctx_size"] == 262144
         assert cheap["server"]["local_model_ctx_size"] == 262144
-        assert all(
-            e.get("ctx_size") == 262144
-            for e in cheap["server"]["slot_schedule"]["entries"]
-        )
+
+
+class TestSlotCountSingleSourceOfTruth:
+    """Every mode profile defines its slot count exactly once
+    (LP-0MTZRM5HV0007S0V)."""
+
+    @pytest.mark.parametrize(
+        "profile,expected_slots",
+        [
+            ("config.yaml", 1),
+            ("config-fast.yaml", 1),
+            ("config-cheap.yaml", 3),
+        ],
+    )
+    def test_profile_defines_one_slot_count(self, profile, expected_slots):
+        cfg = _load(profile)
+        srv = cfg["server"]
+        assert srv["session_slot_pool_size"] == expected_slots
+        assert "slot_schedule" not in srv
+
+    @pytest.mark.parametrize(
+        "profile", ["config.yaml", "config-fast.yaml", "config-cheap.yaml"]
+    )
+    def test_profile_has_no_mode_schedule(self, profile):
+        """Mode-switching policy lives in mode_schedule.yaml, not profiles."""
+        assert "mode_schedule" not in _load(profile)["server"]
+
+    def test_standalone_mode_schedule_file_exists_and_parses(self):
+        path = mode_module.mode_schedule_file()
+        assert path.is_file(), "proxy/mode_schedule.yaml must be tracked"
+        schedule = mode_module.ModeScheduleConfig.from_file()
+        assert schedule.enabled is True
+        assert [(e.time.strftime("%H:%M"), e.mode) for e in schedule.entries] == [
+            ("01:00", "cheap"),
+            ("10:00", "fast"),
+        ]

@@ -434,12 +434,20 @@ class TestIncidentReproduction:
     def test_incident_ratio_reproduction(self):
         """Out-of-process run over live logs reproduces the claimed ratios.
 
-        Guarded: skips (rather than fails) when live logs are unavailable so
-        CI without /var/log/llama-proxy does not break.
+        Guarded: skips (rather than fails) when the specific incident-day log
+        snapshot is unavailable, so a rotated-out snapshot or a CI host
+        without /var/log/llama-proxy does not break the suite. The ratios are
+        only reproducible from that exact snapshot (same guard as
+        ``test_incident_day_file_counts``).
+
+        ``LLAMA_PROXY_LOG_DIR`` overrides the default log directory, so a
+        preserved incident-day snapshot (e.g. ``/tmp/log-snapshot``) can be
+        used to verify the ratios after the live file has rotated out.
         """
-        log_dir = Path("/var/log/llama-proxy")
-        if not log_dir.exists() or not list(log_dir.glob("llama-server.log-*")):
-            pytest.skip("live incident logs not available")
+        log_dir = Path(os.environ.get("LLAMA_PROXY_LOG_DIR", "/var/log/llama-proxy"))
+        incident_llama = log_dir / "llama-server.log-2026-08-27.gz"
+        if not log_dir.exists() or not incident_llama.exists():
+            pytest.skip("incident-day llama log snapshot not available")
 
         import subprocess
         out = subprocess.run(

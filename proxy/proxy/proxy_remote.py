@@ -40,6 +40,36 @@ from .router_helpers import (
 from .stall_circuit_breaker import _check_stall_circuit_breaker
 
 # ---------------------------------------------------------------------------
+# Body snippet helper
+# ---------------------------------------------------------------------------
+
+
+def _snippet_body(text: bytes | str, max_len: int = 512) -> str:
+    """Return a truncated body snippet for logging.
+
+    SSE comment lines (starting with ":") are stripped to prevent raw
+    keep-alive traffic from polluting log lines (LP-0MU1RXFFC003RYC4).
+    The raw body is model output (safe), but we truncate defensively to
+    avoid oversized log lines and to prevent any accidental secret leakage
+    in edge cases.
+    """
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    if not text:
+        return "<empty>"
+    # Strip SSE comment lines (start with ":") which are keep-alive signals
+    lines = text.splitlines()
+    filtered = [line for line in lines if not line.lstrip().startswith(":")]
+    text = "\n".join(filtered)
+    if not text:
+        return "<empty>"
+    snippet = text[:max_len]
+    if len(text) > max_len:
+        snippet += "..."
+    return snippet
+
+
+# ---------------------------------------------------------------------------
 # Auth.json fallback helpers
 # ---------------------------------------------------------------------------
 
@@ -900,13 +930,25 @@ async def proxy_to_remote(
             _provider_name,
         )
 
-    # Read upstream idle timeout from config (LP-0MRE52D3C001KP1H)
-    # Default raised 60 -> 120 -> 240 to tolerate long reasoning pauses on
-    # remote upstreams (LP-0MS9FR9LG002AJ4C; LP-0MSF5I7XN009ENWQ raises the
-    # default to 240s for LP-0MSF1PUM90099ZSW F4). Keep in sync with the
-    # fallback in _handle_remote_streaming and proxy/config.yaml.
+    # Read upstream idle timeout from config (LP-0MRE52D3C001KP1H).
+    # Bounded by upstream_request_timeout_seconds (LP-0MU1RXEPL005CK97):
+    # the per-chunk idle timeout can never exceed the total request timeout,
+    # ensuring a stalled stream fails over within the request budget.
     _upstream_idle_timeout = float(
-        server_config.get("upstream_idle_timeout_seconds", 240) or 240
+        server_config.get("upstream_idle_timeout_seconds", 30) or 30
+    )
+    # Cap idle timeout: never exceed the upstream request timeout budget.
+    if _upstream_idle_timeout > _upstream_request_timeout:
+        _upstream_idle_timeout = _upstream_request_timeout
+    # Read upstream retry connect timeout from config (LP-0MRE8FYKV008WOTB)
+    _upstream_retry_connect_timeout = float(
+        server_config.get("upstream_retry_connect_timeout_seconds", 30) or 30
+    )
+    # Read upstream empty-retry timeout budget (LP-0MU1RXEPL005CK97).
+    # Total time budget across all empty-retry attempts. Once exceeded,
+    # retries stop immediately and the error is returned for fallback.
+    _upstream_empty_retry_timeout = float(
+        server_config.get("upstream_empty_retry_timeout_seconds", 30) or 30
     )
     # Read upstream retry connect timeout from config (LP-0MRE8FYKV008WOTB)
     _upstream_retry_connect_timeout = float(
@@ -927,6 +969,7 @@ async def proxy_to_remote(
                 entry=entry_name,
                 upstream_idle_timeout_seconds=_upstream_idle_timeout,
                 upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
+                upstream_empty_retry_timeout_seconds=_upstream_empty_retry_timeout,
                 pool_client=_pool_client,
                 responses_mode=responses_mode,
             )
@@ -938,6 +981,7 @@ async def proxy_to_remote(
             entry=entry_name,
             upstream_idle_timeout_seconds=_upstream_idle_timeout,
             upstream_retry_connect_timeout_seconds=_upstream_retry_connect_timeout,
+            upstream_empty_retry_timeout_seconds=_upstream_empty_retry_timeout,
             pool_client=_pool_client,
             responses_mode=responses_mode,
         )
@@ -947,12 +991,14 @@ async def proxy_to_remote(
                 request, target_url, headers, body, model_name, remote_timeout,
                 resolved_model=_resolved_model_header,
                 session_id=_remote_session_id,
+                upstream_empty_retry_timeout_seconds=_upstream_empty_retry_timeout,
                 pool_client=_pool_client,
                 responses_mode=responses_mode,
             )
         return await _handle_remote_non_streaming(
             request, target_url, headers, body, model_name, remote_timeout,
             resolved_model=_resolved_model_header,
+            upstream_empty_retry_timeout_seconds=_upstream_empty_retry_timeout,
             pool_client=_pool_client,
             responses_mode=responses_mode,
         )
@@ -1064,8 +1110,10 @@ async def _handle_remote_streaming(
     entry: str | None = None,
     upstream_idle_timeout_seconds: float | None = None,
     upstream_retry_connect_timeout_seconds: float | None = None,
+    upstream_empty_retry_timeout_seconds: float | None = None,
     upstream_max_stream_duration_seconds: float | None = None,
     upstream_activity_timeout_seconds: float | None = None,
+    upstream_retry_failover_budget_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
     responses_mode: bool = False,
 ) -> Response:
@@ -1111,6 +1159,18 @@ async def _handle_remote_streaming(
         except Exception:
             upstream_idle_timeout_seconds = 240.0
 
+    # Resolve upstream_empty_retry_timeout_seconds (LP-0MU1RXEPL005CK97).
+    # Total time budget for empty-response retries across all attempts.
+    if upstream_empty_retry_timeout_seconds is None:
+        try:
+            upstream_empty_retry_timeout_seconds = float(
+                _srv().config.get("server", {}).get(
+                    "upstream_empty_retry_timeout_seconds", 30
+                ) or 30
+            )
+        except Exception:
+            upstream_empty_retry_timeout_seconds = 30.0
+
     # Resolve remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
     # A "connected but idle" upstream that never goes SILENT (heartbeats /
     # keep-alives flowing, empty deltas) defeats the per-chunk idle timeout
@@ -1142,6 +1202,26 @@ async def _handle_remote_streaming(
             )
         except Exception:
             upstream_activity_timeout_seconds = 1800.0
+
+    # Bounded provider failover budget (LP-0MU1RXEPL005CK97). A hard
+    # wall-clock cap on the time a single remote provider may spend retrying
+    # stalls/empty responses (including backoff sleeps) before yielding a
+    # terminal error so the fallback chain routes to the next provider.
+    # Without it the per-chunk idle-timeout wait repeats once per Tier-1
+    # retry (default 4 x 240s) plus empty-response retries, so one stalled
+    # gateway can sit in the request's critical path far past the client's
+    # 900s queue-timeout. The budget only applies while ZERO content-bearing
+    # chunks have been delivered: once content is flowing the stream is
+    # governed by the idle/activity/max-duration budgets instead.
+    if upstream_retry_failover_budget_seconds is None:
+        try:
+            upstream_retry_failover_budget_seconds = float(
+                _srv().config.get("server", {}).get(
+                    "upstream_retry_failover_budget_seconds", 300
+                ) or 300
+            )
+        except Exception:
+            upstream_retry_failover_budget_seconds = 300.0
 
     # Resolve upstream_retry_connect_timeout_seconds from parameter or config
     if upstream_retry_connect_timeout_seconds is None:
@@ -1255,16 +1335,16 @@ async def _handle_remote_streaming(
     # Read empty-response retry config (LP-0MRF77A0E0026B9T)
     try:
         empty_max_attempts = int(
-            _srv().config.get("server", {}).get("upstream_empty_retry_max_attempts", 1) or 1
+            _srv().config.get("server", {}).get("upstream_empty_retry_max_attempts", 3) or 3
         )
     except Exception:
-        empty_max_attempts = 1
+        empty_max_attempts = 3
     try:
         empty_base_delay = float(
-            _srv().config.get("server", {}).get("upstream_empty_retry_base_delay_seconds", 0.5) or 0.5
+            _srv().config.get("server", {}).get("upstream_empty_retry_base_delay_seconds", 3.0) or 3.0
         )
     except Exception:
-        empty_base_delay = 0.5
+        empty_base_delay = 3.0
 
     media_type = response.headers.get("content-type", "text/event-stream")
     key = f"{request.method.upper()} {request.url.path} -> remote"
@@ -1284,6 +1364,9 @@ async def _handle_remote_streaming(
         _disconnect_check_count = 0
         # Collect chunks for session recording (LP-0MR94O16S000WFQ0)
         collected_chunks = [] if session_id else None
+        # Capture raw upstream body from the first stream for body-snippet logging
+        # (LP-0MTVPJWWZ000REYU) — independent of session recording.
+        _first_stream_body = b""
 
         # Log stream started with session context (LP-0MR90HJED005WI1Z)
         try:
@@ -1301,6 +1384,12 @@ async def _handle_remote_streaming(
 
         # Per-chunk idle timeout and retry state (LP-0MRE52D3C001KP1H)
         _retry_count = 0
+        # Bounded provider failover deadline (LP-0MU1RXEPL005CK97): wall-clock
+        # deadline for the total time this provider may spend retrying
+        # stalls/empty responses before a terminal error triggers failover.
+        _failover_deadline = (
+            time.monotonic() + upstream_retry_failover_budget_seconds
+        )
         # Remote-stream watchdog state (LP-0MSVP7ZML003XZTJ): bounded
         # deadlines that terminate a "connected but idle" stream which the
         # per-chunk idle timeout cannot catch (heartbeats flowing, no
@@ -1325,14 +1414,103 @@ async def _handle_remote_streaming(
         # iteration 0; retries are iterations 1..max_retries) or
         # empty-response retry (LP-0MRF77A0E0026B9T).
         while True:
+            # Bounded provider failover budget (LP-0MU1RXEPL005CK97): once a
+            # provider has spent its retry budget without delivering any
+            # content, stop retrying and yield a terminal error so the
+            # fallback chain fails over. Checked BEFORE the stall/empty retry
+            # handlers so a pending retry cannot extend the critical path.
+            if (
+                (_should_retry or _should_empty_retry)
+                and not _has_content
+                and time.monotonic() >= _failover_deadline
+            ):
+                _failover_elapsed = upstream_retry_failover_budget_seconds - max(
+                    0.0, _failover_deadline - time.monotonic()
+                )
+                try:
+                    _srv().logger.warning(
+                        "Upstream retry failover budget exhausted: yielding "
+                        "terminal error session=%s provider=%s model=%s "
+                        "budget=%.2fs elapsed=%.2fs stall_retries=%d "
+                        "empty_retries=%d",
+                        session_id or "unknown",
+                        provider or "remote",
+                        model_name,
+                        upstream_retry_failover_budget_seconds,
+                        _failover_elapsed,
+                        _retry_count,
+                        _empty_retry_count,
+                    )
+                except Exception:
+                    pass
+                # Record the failure in the Tier 3 circuit breaker so repeated
+                # failover-budget exhaustions accumulate toward cooldown
+                # (LP-0MRFEXXVC001RYKB).
+                try:
+                    _config = _srv().config if hasattr(_srv(), "config") else {}
+                    _check_stall_circuit_breaker(provider or "remote", _config)
+                except Exception:
+                    pass
+                _final_error_obj = _build_stream_error_event(
+                    provider=provider,
+                    model=model_name,
+                    entry=entry,
+                    error_type="retry_budget_exhausted",
+                    message=(
+                        "Remote provider spent its "
+                        f"{upstream_retry_failover_budget_seconds:.0f}s retry "
+                        "failover budget without delivering content"
+                    ),
+                    suggested_action=(
+                        "Failing over to the next provider; check upstream "
+                        "gateway health"
+                    ),
+                    session_id=session_id,
+                )
+                _final_error_bytes = (
+                    f"data: {json.dumps(_final_error_obj)}\n\n"
+                ).encode()
+                if collected_chunks is not None:
+                    collected_chunks.append(_final_error_bytes)
+                yield _final_error_bytes
+                log_response_chunk(
+                    _final_error_bytes,
+                    session_id=session_id,
+                    model=model_name,
+                    provider=provider,
+                    body_json=body_json,
+                    entry=entry,
+                )
+                break
+
             if _should_empty_retry:
                 _should_empty_retry = False
                 _empty_retry_count += 1
+                # Check empty-retry timeout budget (LP-0MU1RXEPL005CK97)
+                _elapsed_since_start = time.monotonic() - _watchdog_started
+                if _elapsed_since_start > upstream_empty_retry_timeout_seconds:
+                    _srv().logger.warning(
+                        "Empty response retry budget exceeded "
+                        "session=%s provider=%s model=%s elapsed=%.1fs "
+                        "budget=%.1fs retries=%d/%d",
+                        session_id or "unknown",
+                        provider or "remote",
+                        model_name,
+                        _elapsed_since_start,
+                        upstream_empty_retry_timeout_seconds,
+                        _empty_retry_count,
+                        empty_max_attempts,
+                    )
+                    # Exhaust: fall through to the error yield below
+                    _empty_retry_count = empty_max_attempts + 1
+                    break
                 try:
+                    _upstream_body_snippet = _snippet_body(_first_stream_body) if _first_stream_body else "<empty>"
                     _srv().logger.info(
                         "Empty response detected on stream attempt %s/%s, "
                         "retrying in %.2fs (provider=%s model=%s "
-                        "saw_tool_calls=%s saw_reasoning=%s)",
+                        "saw_tool_calls=%s saw_reasoning=%s "
+                        "upstream_body_snippet=%s)",
                         _empty_retry_count,
                         empty_max_attempts + 1,
                         empty_base_delay,
@@ -1340,10 +1518,19 @@ async def _handle_remote_streaming(
                         model_name,
                         _saw_tool_calls,
                         _saw_reasoning,
+                        _upstream_body_snippet,
                     )
                 except Exception:
                     pass
-                await asyncio.sleep(empty_base_delay)
+                # Cap the empty-retry sleep by the remaining failover budget
+                # (LP-0MU1RXEPL005CK97) so the budget stays a hard bound.
+                _empty_sleep = empty_base_delay
+                if not _has_content:
+                    _empty_sleep = min(
+                        _empty_sleep,
+                        max(0.0, _failover_deadline - time.monotonic()),
+                    )
+                await asyncio.sleep(_empty_sleep)
                 # Create fresh stream connection for empty retry
                 try:
                     _current_client = _pool_client
@@ -1491,6 +1678,13 @@ async def _handle_remote_streaming(
                     retry_base_delay * (2 ** (_retry_count - 1)),
                     retry_max_delay,
                 )
+                # Cap the backoff by the remaining failover budget
+                # (LP-0MU1RXEPL005CK97) so the budget stays a hard bound.
+                if not _has_content:
+                    _backoff_delay = min(
+                        _backoff_delay,
+                        max(0.0, _failover_deadline - time.monotonic()),
+                    )
                 try:
                     _srv().logger.info(
                         "Upstream stall: retrying session=%s provider=%s model=%s attempt=%d backoff=%.1fs",
@@ -1574,6 +1768,13 @@ async def _handle_remote_streaming(
                         _duration_remaining,
                         _activity_remaining,
                     )
+                    if not _has_content:
+                        # Pre-content reads cannot extend past the retry
+                        # failover deadline (LP-0MU1RXEPL005CK97).
+                        _read_budget = min(
+                            _read_budget,
+                            max(0.0, _failover_deadline - _now),
+                        )
                     try:
                         chunk = await asyncio.wait_for(
                             _aiter.__anext__(),
@@ -1667,6 +1868,8 @@ async def _handle_remote_streaming(
 
                     if collected_chunks is not None:
                         collected_chunks.append(chunk)
+                    # Capture first stream body for body-snippet logging (LP-0MTVPJWWZ000REYU)
+                    _first_stream_body += chunk
                     yield chunk
                     log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
 
@@ -2048,6 +2251,7 @@ async def _handle_remote_non_streaming(
     remote_timeout: httpx.Timeout,
     resolved_model: str | None = None,
     session_id: str | None = None,
+    upstream_empty_retry_timeout_seconds: float = 30.0,
     pool_client: httpx.AsyncClient | None = None,
     responses_mode: bool = False,
 ) -> Response:
@@ -2074,16 +2278,16 @@ async def _handle_remote_non_streaming(
     server_config = _srv().config.get("server", {})
     try:
         empty_max_attempts = int(
-            server_config.get("upstream_empty_retry_max_attempts", 1) or 1
+            server_config.get("upstream_empty_retry_max_attempts", 3) or 3
         )
     except Exception:
-        empty_max_attempts = 1
+        empty_max_attempts = 3
     try:
         empty_base_delay = float(
-            server_config.get("upstream_empty_retry_base_delay_seconds", 0.5) or 0.5
+            server_config.get("upstream_empty_retry_base_delay_seconds", 3.0) or 3.0
         )
     except Exception:
-        empty_base_delay = 0.5
+        empty_base_delay = 3.0
 
     async def _do_request() -> httpx.Response:
         """Make one upstream request and return the response."""
@@ -2106,7 +2310,21 @@ async def _handle_remote_non_streaming(
 
     last_response = None
     translated_body = None
+    _empty_start = time.monotonic()
     for attempt in range(empty_max_attempts + 1):
+        # Check empty-retry timeout budget (LP-0MU1RXEPL005CK97)
+        if time.monotonic() - _empty_start > upstream_empty_retry_timeout_seconds:
+            _srv().logger.warning(
+                "Non-streaming empty retry budget exceeded "
+                "session=%s model=%s elapsed=%.1fs budget=%.1fs attempt=%d/%d",
+                session_id or "unknown",
+                model_name,
+                time.monotonic() - _empty_start,
+                upstream_empty_retry_timeout_seconds,
+                attempt + 1,
+                empty_max_attempts + 1,
+            )
+            break
         response = await _do_request()
         last_response = response
 
@@ -2128,15 +2346,17 @@ async def _handle_remote_non_streaming(
             translated_body = json.dumps(resp_json).encode("utf-8")
 
         if _is_empty_remote_response(resp_json):
+            _empty_body_snippet = _snippet_body(resp_text)
             if attempt < empty_max_attempts:
                 try:
                     _srv().logger.info(
                         "Empty upstream response detected on attempt %s/%s, "
-                        "retrying in %.2fs (model=%s)",
+                        "retrying in %.2fs (model=%s body_snippet=%s)",
                         attempt + 1,
                         empty_max_attempts + 1,
                         empty_base_delay,
                         model_name,
+                        _empty_body_snippet,
                     )
                 except Exception:
                     pass
@@ -2145,10 +2365,12 @@ async def _handle_remote_non_streaming(
                 try:
                     _srv().logger.warning(
                         "Empty upstream response persisted after %s/%s retries, "
-                        "returning empty response for fallback (model=%s)",
+                        "returning empty response for fallback (model=%s status=%d body_snippet=%s)",
                         attempt + 1,
                         empty_max_attempts + 1,
                         model_name,
+                        response.status_code,
+                        _empty_body_snippet,
                     )
                 except Exception:
                     pass

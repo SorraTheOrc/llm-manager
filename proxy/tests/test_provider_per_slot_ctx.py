@@ -34,14 +34,16 @@ class TestGetActiveLocalSlots:
         config = {"session_slot_pool_size": 4}
         assert _get_active_local_slots(config) == 4
 
-    def test_schedule_overrides_pool_size(self, monkeypatch):
-        """When a slot schedule is active, its current slot count wins."""
+    def test_ignores_legacy_slot_scheduler_attribute(self, monkeypatch):
+        """Regression (LP-0MTZRM5HV0007S0V): the time-based slot scheduler
+        was removed, so a lingering ``slot_scheduler`` attribute must not
+        override the profile's static ``session_slot_pool_size``."""
         config = {"server": {"session_slot_pool_size": 6}}
         sched = type("S", (), {"get_active_slot": lambda self, now=None: 8})()
         import proxy.server as srv_mod
 
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
-        assert _get_active_local_slots(config) == 8
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched, raising=False)
+        assert _get_active_local_slots(config) == 6
 
 
 class TestEffectiveLargeContextThresholds:
@@ -263,23 +265,24 @@ class TestCheapModeColdThreshold:
         assert cold == 42000
         assert cold < warm
 
-    def test_cheap_cold_below_scheduled_effective_warm(self, monkeypatch):
-        """AC1 (cheap mode, scheduled): with the live schedule active
-        (2 slots @ 262144), the effective warm resolves to 100000 and cold
-        42000 stays below it — the (42000, 100000] band is non-empty."""
-        import proxy.server as srv_mod
+    def test_cheap_cold_below_production_effective_warm(self):
+        """AC1 (cheap mode): cold 42000 < effective warm.
+
+        The production cheap profile has local_model_ctx_size 262144 and 2
+        slots (LP-0MTO8SZ8K0080RHT), so the warm clamp resolves to
+        min(100000, 262144//2 - 4096) = 100000. Cold 42000 stays below it;
+        the (42000, 100000] band is non-empty. No live scheduler is involved
+        (slot_schedule removed, LP-0MTZRM5HV0007S0V).
+        """
         from proxy.provider import _effective_large_context_thresholds
 
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
-        cold, warm = _effective_large_context_thresholds(self._cheap_config())
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 42000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
         assert warm == 100000  # min(100000, 262144//2 - 4096)
         assert cold == 42000
         assert cold < warm
@@ -371,61 +374,51 @@ class TestGetActiveLocalCtxSize:
 
         assert _get_active_local_ctx_size({"server": {}}) == 0
 
-    def test_scheduler_override_wins(self, monkeypatch):
-        """When the live scheduler exposes a per-period ctx_size it wins."""
+    def test_ignores_legacy_scheduler_ctx_override(self, monkeypatch):
+        """Regression (LP-0MTZRM5HV0007S0V): a lingering scheduler providing
+        a per-period ctx must be ignored — the static config wins."""
         from proxy.provider import _get_active_local_ctx_size
 
         config = {"server": {"local_model_ctx_size": 131072}}
         sched = type("S", (), {"get_active_ctx_size": lambda self, now=None: 262144})()
         import proxy.server as srv_mod
 
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
-        assert _get_active_local_ctx_size(config) == 262144
+        monkeypatch.setattr(srv_mod, "slot_scheduler", sched, raising=False)
+        assert _get_active_local_ctx_size(config) == 131072
 
-    def test_scheduler_none_falls_back(self, monkeypatch):
-        """A scheduler with no per-period ctx falls back to config."""
+    def test_scheduler_none_uses_config(self, monkeypatch):
+        """No scheduler attribute → the static local_model_ctx_size applies."""
         from proxy.provider import _get_active_local_ctx_size
 
         config = {"server": {"local_model_ctx_size": 131072}}
-        sched = type("S", (), {"get_active_ctx_size": lambda self, now=None: None})()
         import proxy.server as srv_mod
 
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
+        monkeypatch.setattr(srv_mod, "slot_scheduler", None, raising=False)
         assert _get_active_local_ctx_size(config) == 131072
 
 
-class TestEffectiveLargeContextThresholdsPerPeriod:
-    """Thresholds must use the ACTIVE period's (ctx_size, slots)
-    (LP-0MSLNK96T0018W4D)."""
+class TestEffectiveLargeContextThresholdsPerMode:
+    """Thresholds must use the active mode profile's static (ctx_size,
+    slots) — the time-based slot scheduler was removed
+    (LP-0MTZRM5HV0007S0V)."""
 
-    def test_night_period_2slots_262144(self, monkeypatch):
-        """Night: 2 slots @ 262144 → per-slot cap 126,976."""
+    def test_cheap_2slots_262144(self):
+        """Cheap: 2 slots @ 262144 → per-slot cap 126,976."""
         from proxy.provider import _effective_large_context_thresholds
 
         config = {"server": {
             "local_large_context_cold_cache_threshold": 60000,
             "local_large_context_warm_cache_threshold": 200000,
-            "local_model_ctx_size": 131072,
-            "session_slot_pool_size": 3,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,
         }}
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: 262144,
-                "get_active_slot": lambda self, now=None: 2,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(config)
         # 262144 // 2 - 4096 = 126976 → warm clamped down to the per-slot cap.
         assert warm == 126976
         assert cold == 60000  # cold stays as the economic threshold
 
-    def test_day_period_3slots_131072(self, monkeypatch):
-        """Day: 3 slots @ 131072 → per-slot cap 39,594."""
+    def test_fast_3slots_131072(self):
+        """Fast/default: 3 slots @ 131072 → per-slot cap 39,594."""
         from proxy.provider import _effective_large_context_thresholds
 
         config = {"server": {
@@ -434,17 +427,84 @@ class TestEffectiveLargeContextThresholdsPerPeriod:
             "local_model_ctx_size": 131072,
             "session_slot_pool_size": 3,
         }}
-        sched = type(
-            "S",
-            (),
-            {
-                "get_active_ctx_size": lambda self, now=None: None,
-                "get_active_slot": lambda self, now=None: 3,
-            },
-        )()
-        import proxy.server as srv_mod
-
-        monkeypatch.setattr(srv_mod, "slot_scheduler", sched)
         cold, warm = _effective_large_context_thresholds(config)
         # 131072 // 3 - 4096 = 39594
         assert warm == 39594
+        assert cold == 60000
+
+
+class TestEffectiveLargeContextThresholds1Slot:
+    """1-slot profile routing thresholds (LP-0MU1RXF6R004S8XL).
+
+    The 1-slot profile runs with 262144 ctx / 1 slot = 258048 per-slot cap.
+    The configured warm threshold (100000) is BELOW this cap, so it stays
+    unchanged. This is intentional: compaction handles sessions between
+    the trigger (0.70 × 100000 = 70000) and the warm threshold.
+    """
+
+    def test_1slot_warm_not_clamped(self):
+        """1-slot: 262144 ctx / 1 slot → per-slot cap 258048.
+
+        The warm config (100000) is below the cap, so it passes through
+        unchanged — the clamp is min(100000, 258048) = 100000 (no expansion).
+        """
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 38000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        # 262144 // 1 - 4096 = 258048; min(100000, 258048) = 100000
+        assert warm == 100000
+        assert cold == 38000
+
+    def test_1slot_min_only_never_expansion(self):
+        """AC4: The clamp is min-only — more context per slot does NOT
+        raise the threshold above the configured warm value."""
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        # The per-slot cap is 258048, but warm config (100000) is binding.
+        assert warm == 100000
+        assert warm <= 258048  # never expands above config
+
+    def test_1slot_cold_below_warm(self):
+        """AC1: cold 38000 < warm 100000 — the (cold, warm] band exists."""
+        from proxy.provider import _effective_large_context_thresholds
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 38000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        assert cold < warm
+        assert cold == 38000
+        assert warm == 100000
+
+    def test_1slot_large_prompt_routed_remote(self):
+        """AC2: A prompt above the warm threshold is routed remote
+        (context_too_large) even on 1-slot with high per-slot capacity."""
+        from proxy.provider import _effective_large_context_thresholds, _should_skip_local
+
+        config = {"server": {
+            "local_large_context_cold_cache_threshold": 38000,
+            "local_large_context_warm_cache_threshold": 100000,
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 1,
+        }}
+        cold, warm = _effective_large_context_thresholds(config)
+        # 110K > warm 100K → context_too_large → skip local
+        body = {"messages": [{"role": "user", "content": "x " * 110000}]}
+        assert _should_skip_local(
+            "Qwen3", "large_sess", body, cold, warm_cache_threshold=warm
+        ) is True

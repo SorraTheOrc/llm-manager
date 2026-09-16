@@ -184,3 +184,26 @@ any rollout; triggers and aggressiveness are quantified in F4.
 - Do NOT silently drop content: log every compaction event (session,
   before/after token counts, what was dropped or summarized) so quality
   regressions are traceable.
+
+### 7.1 Summarizer timeout and slot contention (LP-0MU1RXEY10075TUU)
+
+The summarizer is the same local Qwen3 that serves normal requests. On a
+1-slot backend it must wait for the single slot to free up while a long
+generating request holds it. The original 30 s HTTP timeout was far too
+short: every compaction in the 2026-09-14 window failed
+(`summarizer_failed`, 35 `timeout` + 6 `empty_completion`) and the session
+was pushed to `remote_with_guidance`, which then stalled until the upstream
+900 s queue timeout.
+
+- **Default timeout is now 600 s** (`_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS`
+in `proxy/provider.py`), resolved through
+`compaction_config()["summarizer_timeout_seconds"]` and applied by
+`build_local_summarizer`. Operators override it with
+`server.compaction_summarizer_timeout`.
+- 600 s exceeds the observed worst-case local `dispatch_first_byte_ms`
+  (713 s) for the p99 and most of the tail; the slot-accounting fix
+  (LP-0MU1RXEGB002CAL4) removed the spurious counter recoveries that were
+  blocking new dispatches on a 1-slot backend.
+- The evaluation is offloaded with `asyncio.to_thread` in
+  `_handle_session` so a long slot wait does not freeze the event loop
+  (which would also stall the very stream whose slot is being waited on).

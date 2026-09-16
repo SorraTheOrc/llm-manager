@@ -95,14 +95,14 @@ def registry_from_config(
     - ``fallback_grace_seconds`` (default = session TTL) — the grace window
       used when the mode schedule is disabled.
 
-    The mode schedule is derived from ``server.mode_schedule`` via
-    ``ModeScheduleConfig.from_server_config`` so grandfathering expiry follows
-    the same schedule that drives mode switching.
+    The mode schedule is loaded from the standalone ``proxy/mode_schedule.yaml``
+    via ``ModeScheduleConfig.from_file`` so grandfathering expiry follows the
+    same schedule that drives mode switching.
     """
     section = (server_config or {}).get("mode_switch_grandfathering") or {}
     enabled = bool(section.get("enabled", True))
     grace_seconds = section.get("fallback_grace_seconds")
-    schedule = ModeScheduleConfig.from_server_config(server_config)
+    schedule = ModeScheduleConfig.from_file()
     return GrandfatheringRegistry(
         state_file=state_file or default_state_file(),
         mode_schedule=schedule,

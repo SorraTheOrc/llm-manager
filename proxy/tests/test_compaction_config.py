@@ -20,6 +20,10 @@ from proxy.provider import (
     _DEFAULT_COMPACTION_TRIGGER_RATIO,
     _DEFAULT_SUMMARIZER_CTX_SIZE,
     _DEFAULT_SUMMARIZER_MAX_TOKENS,
+    _DEFAULT_SUMMARIZER_RETRIES,
+    _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS,
+    _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS,
+    _SUMMARIZATION_PROMPT,
     _SUMMARIZER_SYSTEM_PROMPT,
     compaction_config,
     validate_compaction_config,
@@ -128,6 +132,168 @@ class TestSummarizerSystemPrompt:
         """compaction_config returns the same prompt via summarizer_system_prompt."""
         c = compaction_config({})
         assert c["summarizer_system_prompt"] is _SUMMARIZER_SYSTEM_PROMPT
+
+    def test_system_prompt_matches_pi_role_and_guard_rails(self):
+        """Pi verbatim: role + Do NOT continue/respond/ONLY-output guard rails."""
+        assert _SUMMARIZER_SYSTEM_PROMPT.startswith(
+            "You are a context summarization assistant."
+        )
+        assert "Do NOT continue the conversation." in _SUMMARIZER_SYSTEM_PROMPT
+        assert "Do NOT respond to any questions" in _SUMMARIZER_SYSTEM_PROMPT
+        assert "ONLY output the structured summary." in _SUMMARIZER_SYSTEM_PROMPT
+
+    def test_system_prompt_has_no_format_template(self):
+        """Structured sections live in the USER template, mirroring Pi's split.
+
+        R1 (LP-0MTTPXHTI0081WIR) merged the format template into the system
+        prompt; the R1-companion (LP-0MTTSL2AW000A5OG) restores Pi's exact
+        system/user split, so no "## Goal"-style sections belong here.
+        """
+        assert "Use this EXACT format" not in _SUMMARIZER_SYSTEM_PROMPT
+        assert "## Goal" not in _SUMMARIZER_SYSTEM_PROMPT
+        assert "## Next Steps" not in _SUMMARIZER_SYSTEM_PROMPT
+
+    def test_system_prompt_is_pi_verbatim(self):
+        """Exact Pi SUMMARIZATION_SYSTEM_PROMPT text (guard against drift)."""
+        expected = (
+            "You are a context summarization assistant. Your task is to read a "
+            "conversation between a user and an AI coding assistant, then produce "
+            "a structured summary following the exact format specified.\n"
+            "\n"
+            "Do NOT continue the conversation. Do NOT respond to any questions "
+            "in the conversation. ONLY output the structured summary."
+        )
+        assert _SUMMARIZER_SYSTEM_PROMPT == expected
+
+
+class TestSummarizationPromptTemplate:
+    """Pi's SUMMARIZATION_PROMPT — the structured format template delivered in
+    the summarizer's USER message after the <conversation> serialization."""
+
+    def test_template_is_non_empty(self):
+        """_SUMMARIZATION_PROMPT must be a non-empty string."""
+        assert isinstance(_SUMMARIZATION_PROMPT, str)
+        assert len(_SUMMARIZATION_PROMPT) > 0
+
+    def test_template_starts_with_conversation_reference(self):
+        """Pi verbatim opening: the conversation is serialised above the template."""
+        assert _SUMMARIZATION_PROMPT.startswith(
+            "The messages above are a conversation to summarize."
+        )
+
+    def test_template_has_structured_sections(self):
+        """All Pi structured sections are present."""
+        for section in (
+            "## Goal",
+            "## Constraints & Preferences",
+            "## Progress",
+            "### Done",
+            "### In Progress",
+            "### Blocked",
+            "## Key Decisions",
+            "## Next Steps",
+            "## Critical Context",
+        ):
+            assert section in _SUMMARIZATION_PROMPT
+
+    def test_template_preserves_exact_references_instruction(self):
+        """Verbatim Pi tail: keep paths/function names/errors exact."""
+        assert (
+            "Keep each section concise. Preserve exact file paths, function "
+            "names, and error messages." in _SUMMARIZATION_PROMPT
+        )
+
+
+class TestCompactionRetryConfig:
+    """Retry policy for transient summarizer failures (R3)."""
+
+    def test_defaults(self):
+        c = compaction_config({})
+        assert c["summarizer_retries"] == _DEFAULT_SUMMARIZER_RETRIES
+        assert (
+            c["summarizer_retry_delay_seconds"]
+            == _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
+        )
+
+    def test_server_overrides(self):
+        cfg = {
+            "server": {
+                "compaction_summarizer_retries": 5,
+                "compaction_summarizer_retry_delay_seconds": 1.5,
+            }
+        }
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == 5
+        assert c["summarizer_retry_delay_seconds"] == 1.5
+
+    def test_flat_overrides(self):
+        cfg = {"compaction_summarizer_retries": 0}
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == 0  # 0 disables retries
+
+    def test_explicit_zero_delay(self):
+        cfg = {"server": {"compaction_summarizer_retry_delay_seconds": 0}}
+        c = compaction_config(cfg)
+        assert c["summarizer_retry_delay_seconds"] == 0.0
+
+    def test_negative_values_clamped_to_zero(self):
+        cfg = {
+            "server": {
+                "compaction_summarizer_retries": -3,
+                "compaction_summarizer_retry_delay_seconds": -1,
+            }
+        }
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == 0
+        assert c["summarizer_retry_delay_seconds"] == 0.0
+
+    def test_bad_types_fall_back_to_defaults(self):
+        cfg = {
+            "server": {
+                "compaction_summarizer_retries": "lots",
+                "compaction_summarizer_retry_delay_seconds": "soon",
+            }
+        }
+        c = compaction_config(cfg)
+        assert c["summarizer_retries"] == _DEFAULT_SUMMARIZER_RETRIES
+        assert (
+            c["summarizer_retry_delay_seconds"]
+            == _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
+        )
+
+
+class TestCompactionTimeoutConfig:
+    """HTTP timeout for the local summarizer (LP-0MU1RXEY10075TUU).
+
+    The default is 600 s so the summarizer can wait for the single local
+    slot to free up while a long generating request holds it; 30 s was
+    too short and caused a 100% summarizer_failed rate.
+    """
+
+    def test_defaults(self):
+        c = compaction_config({})
+        assert c["summarizer_timeout_seconds"] == _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
+
+    def test_server_override(self):
+        cfg = {"server": {"compaction_summarizer_timeout": 120}}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == 120.0
+
+    def test_flat_override(self):
+        cfg = {"compaction_summarizer_timeout": 45.5}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == 45.5
+
+    def test_values_clamped_to_minimum(self):
+        # Sub-1s timeouts are nonsense for a slot wait; clamp to 1 s.
+        cfg = {"server": {"compaction_summarizer_timeout": 0.1}}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == 1.0
+
+    def test_bad_type_falls_back_to_default(self):
+        cfg = {"server": {"compaction_summarizer_timeout": "soon"}}
+        c = compaction_config(cfg)
+        assert c["summarizer_timeout_seconds"] == _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
 
 
 # ===================================================================
