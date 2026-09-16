@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.1.18 (2026-09-16)
+### Features
+- Slot counts: default and fast -> 1 slot, cheap -> 3 slots (LP-0MU03AL730000B5W)
+- Change the number of queued local items between fast and cheap (LP-0MTQYIK4Z008XF2V)
+- Simplify slot config: per-mode slot counts, standalone mode schedule, remove timed slot scheduler (LP-0MTZRM5HV0007S0V)
+- Restore dev-only code clobbered by multi-backend merge; fix release lint blockers (LP-0MU39T96U008XJN1)
+### Bug Fixes
+- Fix ruff code-quality blockers (E731, F811 x2) (LP-0MTU28DH3008GR67)
+- proxy-usage-analysis: report collapses fast/cheap compaction triggers to same value (LP-0MTSU19N9007TYZC)
+- proxy-usage-analysis: discover_log_files drops logrotate dash-named daily files (daytime traffic missing from reports) (LP-0MTYARXXZ002VNF5)
+- Scope remote failure-domain exclusion by upstream model behind router endpoints (LP-0MTVMB685003GO2F)
+- Adaptive timeout ignores Responses input bodies, collapses to 60s ReadTimeout (LP-0MTVVCHC1000I7ON)
+- Proxy: three separate oversized-session paths with no enforcement (LP-0MTVXP7DG00613ZB)
+- Bug: local dispatch pool permanently wedged by leaked generating-only counter (no self-healing); only restart recovers (LP-0MTYAWDCQ006RGYU)
+- Fix compaction dry-run advisory logging suppressed by logger hierarchy (LP-0MTV5GFL8007WSK2)
+- Suppress CancelledError noise in disconnect_reaper middleware (LP-0MTXF2YAO0044XRI)
+### Other
+- Compare Pi and proxy compaction approaches (LP-0MTT890RO000AEQM)
+- Revert hard-routing cap to dynamic (disable 70K/61.4K caps) — follow-up to LP-0MTBTCK2I005MOTE verdict (LP-0MTLB1LK80098R43)
+- Quality Improvement - Refactoring (LP-0MTTULUMK00223L1)
+- Increase empty-response retry attempts to 3 with 3s delay (LP-0MTVPIO4O008V12K)
+- Cap empty-response cooldown at 10s instead of exponential backoff (LP-0MTVPJBF0001SQF4)
+- Log raw upstream body snippet on empty_response detection (LP-0MTVPJWWZ000REYU)
+- Quality Improvement - Refactoring (LP-0MU1JNLKR0077GV8)
+- Create proxy-log-debug skill for proxy log troubleshooting (LP-0MTVLO8G80012EQ0)
+- Quality Improvement - Refactoring (LP-0MTQF4YJ1003FR6J)
+- Verify cheap-mode contention caps guardrails post-rollout (8 windows) (LP-0MTFNQOL0009IO5X)
+
 ## v0.1.17 (2026-09-07)
 ### Features
 - proxy-usage-analysis: report server-side compactions and fallback avoidance impact (LP-0MTHCTLAF00147IT)
