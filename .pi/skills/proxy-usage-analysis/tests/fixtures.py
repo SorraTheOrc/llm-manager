@@ -222,9 +222,8 @@ MANUAL_MODE_SWITCH_RESTART = (
 STATUS_REQUEST_CHEAP = (
     "2026-08-15 07:00:19,968 - INFO - status_request active_query=true available_slots=0 "
     "client_ip=192.168.0.199 client_ip_source=direct client_port=57414 "
-    "contention_fallback_after_queue_count=328 contention_queue_depth=1 "
-    "contention_queue_policy=queue contention_queued_count=339 "
-    "contention_queued_duration_seconds=17959.429 current_model=Qwen3 latency_ms=3024 "
+    "contention_queue_depth=1 contention_queue_policy=queue "
+    "current_model=Qwen3 latency_ms=3024 "
     "llama_server_running=true local_active_query=true "
     "local_owner_lease_remaining_seconds=304.8219530270435 "
     "local_owner_session_id=01a003ed-2bce-7dc2-bf15-21fcba2411c9 "
@@ -233,9 +232,8 @@ STATUS_REQUEST_CHEAP = (
 STATUS_REQUEST_FAST = (
     "2026-08-15 10:05:00,000 - INFO - status_request active_query=true available_slots=2 "
     "client_ip=192.168.0.191 client_ip_source=direct client_port=54852 "
-    "contention_fallback_after_queue_count=0 contention_queue_depth=0 "
-    "contention_queue_policy=fallback contention_queued_count=0 "
-    "contention_queued_duration_seconds=0.0 current_model=Qwen3 latency_ms=3025 "
+    "contention_queue_depth=0 contention_queue_policy=fallback "
+    "current_model=Qwen3 latency_ms=3025 "
     "llama_server_running=true local_active_query=true "
     "local_owner_lease_remaining_seconds=298.6892733310815 "
     "local_owner_session_id=01a003ed-2bce-7dc2-bf15-21fcba2411c9 "

@@ -19,8 +19,7 @@ Covered acceptance criteria (F1 LP-0MSOZESW90057SRR):
   slot-persistence / lease release.
 - AC7: queued wait subtracts from the client-visible adaptive timeout budget
   (Q2=a).
-- AC8: queue metrics (queued count, queued duration, fallback-after-queue
-  count) are emitted when policy is queue; not emitted when fallback.
+- AC8: queue depth is logged on dispatch; no cumulative counters exposed.
 
 Time mocking: the 60s wait cap is exercised with tiny caps (0.05-0.2s) or by
 patching ``_get_contention_queue_config`` — never a real 60s sleep.
@@ -208,12 +207,8 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
 
     assert result.status_code == 200
     assert call_log == ["local"], "queued request must dispatch local"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 1
-    assert metrics["contention_queued_duration_seconds"] >= 0.0
-    assert metrics["contention_fallback_after_queue_count"] == 0
 
-    # F4 AC1: the dispatch log line carries queue depth + policy.
+    # F1 AC1: the dispatch log line carries queue depth + policy.
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_dispatch" in messages
     assert "policy=queue" in messages
@@ -264,11 +259,8 @@ async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
 
     assert result.status_code == 200
     assert call_log == ["remote"], "wait-cap exceeded must fall back to remote"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 1
-    assert metrics["contention_fallback_after_queue_count"] == 1
 
-    # F4 AC2: the fallback-after-queue log line carries the elapsed wait.
+    # F1 AC2: the fallback-after-queue log line carries the elapsed wait.
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages
     assert "queued_duration=" in messages
@@ -300,8 +292,6 @@ async def test_queue_module_depth_cap_returns_none():
         5.0, max_depth=1, slot_free_check=_slot_free
     )
     assert result is None
-    metrics = contention_queue.metrics()
-    assert metrics["contention_fallback_after_queue_count"] == 1
     assert contention_queue.queue_depth() == 1, "second request must not enqueue"
 
     # Cleanup: cancel the held waiter.
@@ -358,8 +348,6 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
         )
         assert result2.status_code == 200
         assert "remote" in call_log
-        metrics = contention_queue.metrics()
-        assert metrics["contention_fallback_after_queue_count"] >= 1
 
         # Free the slot → the queued first request dispatches local.
         concurrency.active = 0
@@ -413,10 +401,7 @@ async def test_context_bypass_never_queued(mixed_model_config):
 
     assert result.status_code == 200
     assert call_log == ["remote"], "context bypass must fall back to remote"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 0, "context bypass must not queue"
     assert contention_queue.queue_depth() == 0
-    assert metrics["contention_fallback_after_queue_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +445,6 @@ async def test_fast_mode_fallback_policy_unchanged(mixed_model_config):
 
     assert result.status_code == 200
     assert call_log == ["remote"], "fast mode falls back immediately, no queue"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 0
-    assert metrics["contention_fallback_after_queue_count"] == 0
     assert contention_queue.queue_depth() == 0
     # F1 AC5 byte-for-byte: the client-visible response is byte-identical to
     # what the remote provider returned (no queue layer mutates the payload).
@@ -533,9 +515,6 @@ async def test_fast_mode_fallback_dispatch_bytes_unchanged(mixed_model_config):
     )
     # No queue involvement in fast mode.
     assert contention_queue.queue_depth() == 0
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 0
-    assert metrics["contention_fallback_after_queue_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -561,7 +540,7 @@ async def test_absent_contention_keys_default_to_fallback(mixed_model_config):
 
     assert result.status_code == 200
     assert call_log == ["remote"]
-    assert contention_queue.metrics()["contention_queued_count"] == 0
+    assert contention_queue.queue_depth() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -694,55 +673,6 @@ async def test_queued_dispatch_marks_request_budget(mixed_model_config):
 # ---------------------------------------------------------------------------
 # AC8: metrics emitted when policy is queue; not when fallback
 # ---------------------------------------------------------------------------
-
-
-def test_metrics_not_emitted_when_fallback_policy():
-    """status_request fields helper returns no queue fields for fallback."""
-    from proxy.contention_queue import status_fields
-
-    assert status_fields({"contention_queue_policy": "fallback"}) == {}
-
-
-def test_metrics_emitted_when_queue_policy():
-    """status_request fields helper exposes queue metrics for queue policy
-    while in cheap mode."""
-    from proxy.contention_queue import status_fields
-
-    with patch("proxy.mode.read_mode", return_value="cheap"):
-        fields = status_fields(
-            {
-                "contention_queue_policy": "queue",
-                "contention_queue_max_wait_seconds": 60,
-                "contention_queue_max_depth": 4,
-            }
-        )
-    assert fields.get("contention_queue_policy") == "queue"
-    assert "contention_queue_depth" in fields
-    assert "contention_queued_count" in fields
-    assert "contention_queued_duration_seconds" in fields
-    assert "contention_fallback_after_queue_count" in fields
-
-
-def test_metrics_emitted_when_queue_policy_in_fast_mode():
-    """status_fields emits queue metrics when policy is queue, regardless of
-    operating mode (LP-0MTQYIK4Z008XF2V): fast mode can also declare queue
-    with smaller caps.
-
-    Previously (pre-LP-0MTQYIK4Z008XF2V) the mode gate suppressed queue
-    fields in fast mode. Now both modes use the policy gate only.
-    """
-    from proxy.contention_queue import status_fields
-
-    with patch("proxy.mode.read_mode", return_value="fast"):
-        fields = status_fields(
-            {
-                "contention_queue_policy": "queue",
-                "contention_queue_max_wait_seconds": 60,
-                "contention_queue_max_depth": 4,
-            }
-        )
-    assert fields.get("contention_queue_policy") == "queue"
-    assert "contention_queue_depth" in fields
 
 
 @pytest.mark.asyncio

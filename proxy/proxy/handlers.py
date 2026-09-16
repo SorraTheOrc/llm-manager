@@ -588,18 +588,6 @@ async def get_llama_local_status(request: Request):
     client_id = _resolve_client_id(request)
     if client_id:
         status_extra["client_id"] = client_id
-    # Contention-queue metrics (LP-0MSORQVK50012Q4D F4 AC1): queue depth,
-    # queued count/duration, fallback-after-queue count — only when the
-    # per-mode policy is queue (fast mode logs unchanged, F4 AC4).
-    try:
-        from proxy.contention_queue import status_fields
-
-        server_cfg_for_queue = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
-        _cq_fields = status_fields(server_cfg_for_queue)
-        if _cq_fields:
-            status_extra.update(_cq_fields)
-    except Exception:
-        pass
     logger.info("status_request", extra=status_extra)
 
     return {
@@ -620,27 +608,7 @@ async def get_llama_local_status(request: Request):
         "slots": slots,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
-        # Contention-queue snapshot (LP-0MSORQVK50012Q4D F4 AC3): live queue
-        # depth + cumulative queued/fallback counters, exposed for the 24h
-        # report aggregation (empty when policy != queue or mode != cheap).
-        **contention_queue_snapshot(srv.config),
     }
-
-
-def contention_queue_snapshot(server_config) -> dict:
-    """Live contention-queue metrics for the status payload.
-
-    Delegates to ``observability.contention_queue_snapshot`` (which calls
-    ``contention_queue.status_fields``) so the gating (queue policy + cheap
-    mode, F4 AC4) and field names stay consistent with the status_request
-    log line. Returns {} when queueing is inactive.
-    """
-    try:
-        from proxy.observability import contention_queue_snapshot as _cq_snap
-
-        return _cq_snap(server_config)
-    except Exception:
-        return {}
 
 
 # ---------------------------------------------------------------------------

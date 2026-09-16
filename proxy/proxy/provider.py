@@ -5009,22 +5009,16 @@ async def _proxy_with_fallback_cycle(
                         try:
                             from proxy import contention_queue
 
-                            _cq_m = contention_queue.metrics()
+                            _cq_depth = contention_queue.queue_depth()
                         except Exception:
-                            _cq_m = {}
+                            _cq_depth = 0
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
-                            _cq_m.get("contention_queue_depth", 0),
+                            _cq_depth,
                         )
-                        try:
-                            from proxy.metrics import record_contention_queued
-
-                            record_contention_queued(_cq_elapsed or 0.0)
-                        except Exception:
-                            pass
                     elif _cq_action == "fallback":
                         # Caps exceeded — fall back to the next remote provider
                         # exactly as today (fallback-after-queue recorded with
@@ -5047,12 +5041,6 @@ async def _proxy_with_fallback_cycle(
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                         )
-                        try:
-                            from proxy.metrics import record_contention_fallback_after_queue
-
-                            record_contention_fallback_after_queue()
-                        except Exception:
-                            pass
                         continue
                     elif _cq_action == "context_bypass":
                         # Context bypasses never queue (AC4): fall back exactly
