@@ -413,6 +413,11 @@ def build_report(
         ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, total_fast_sessions):.1f}%) | "
            f"{cheap} ({_pct(cheap, total_cheap_sessions):.1f}%) | {reqs} | {fb} |")
 
+    # TTFT section: collect all parsed TTFT values (LP-0MTSSM5SO003PKU0)
+    ttft_values: list[float] = [
+        e.ttft_ms for e in summary.ttft_events if e.ttft_ms is not None
+    ]
+    _append_ttft_section(ap, ttft_values)
     _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
@@ -1148,6 +1153,45 @@ def _percentile(values: list[float], pct: float) -> float | None:
     return s[f] + (k - f) * (s[c] - s[f])
 
 
+def _ttft_cell(value: float | None) -> str:
+    """Format a TTFT value (milliseconds) for the report table."""
+    if value is None:
+        return "-"
+    # Display in milliseconds; values > 1s show seconds
+    if value >= 1000:
+        return f"{value/1000:.1f}s"
+    return f"{value:.0f}ms"
+
+
+def _append_ttft_section(
+    ap,
+    ttft_values: list[float],
+) -> None:
+    """Append the ``## Time to first token`` section to the report.
+
+    Shows p10 / median / p90 of TTFT (dispatch → first token),
+    parsed from both local ``dispatch_first_byte_ms=`` and remote
+    ``ttft_seconds=`` log lines.
+    """
+    ap("")
+    ap("## Time to first token")
+    ap("")
+    if not ttft_values:
+        ap("_No TTFT data in window._")
+        return
+    ap("Percentiles of time from dispatch to first token (ms), from local")
+    ap("``dispatch_first_byte_ms=`` and remote ``ttft_seconds=`` log lines.")
+    ap("")
+    ap("| Bucket | Samples | p10 | Median | p90 |")
+    ap("|---|---|---|---|---|")
+    p10 = _percentile(ttft_values, 10)
+    med = _percentile(ttft_values, 50)
+    p90 = _percentile(ttft_values, 90)
+    ap(f"| Total | {len(ttft_values)} | "
+       f"{_ttft_cell(p10)} | {_ttft_cell(med)} | {_ttft_cell(p90)} |")
+    ap("")
+
+
 def _append_ttc_section(
     ap,
     sessions: list[SessionStats],
@@ -1414,6 +1458,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
+        "ttft": _ttft_json(summary.ttft_events),
     }
 
 
@@ -1428,6 +1473,37 @@ def _hourly_session_classification_json(sessions: list[SessionStats]) -> list[di
         }
         for hour, counts in sorted(_hourly_session_classification(sessions).items())
     ]
+
+
+def _ttft_json(ttft_events: list[object]) -> dict | None:
+    """Machine-readable TTFT summary for ``summary_to_json``.
+
+    Returns p10 / median / p90 in milliseconds for Total/Fast/Cheak buckets,
+    or ``None`` when no TTFT data is available.
+    """
+    values = [e.ttft_ms for e in ttft_events if e.ttft_ms is not None]
+    if not values:
+        return None
+    return {
+        "total": {
+            "samples": len(values),
+            "p10": round(_percentile(values, 10), 1),
+            "median": round(_percentile(values, 50), 1),
+            "p90": round(_percentile(values, 90), 1),
+        },
+        "fast": {
+            "samples": 0,
+            "p10": None,
+            "median": None,
+            "p90": None,
+        },
+        "cheap": {
+            "samples": 0,
+            "p10": None,
+            "median": None,
+            "p90": None,
+        },
+    }
 
 
 def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:

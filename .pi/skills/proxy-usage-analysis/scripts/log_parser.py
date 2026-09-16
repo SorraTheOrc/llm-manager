@@ -28,6 +28,16 @@ LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - (\w+) - 
 RE_PROVIDER = re.compile(r"\bprovider=(\S+)")
 RE_MODEL = re.compile(r"\bmodel=(\S+)")
 RE_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.-]+)")
+
+# TTFT (Time to First Token) measurement lines.
+# Local stream path (router.py): "dispatch_first_byte_ms=<ms> dispatch_to_first_byte_ms=<ms> session=<id> model=<model>"
+# Remote stream path (proxy_remote.py): "ttft_seconds=<s> session=<id> provider=<provider> model=<model>"
+RE_DISPATCH_FIRST_BYTE = re.compile(
+    r"dispatch_first_byte_ms=([\d.]+)"
+)
+RE_TTFT_SECONDS = re.compile(
+    r"ttft_seconds=([\d.]+)"
+)
 RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
 RE_ENTRY = re.compile(r"\bentry=(\S+)")
 RE_ERROR_DETAIL = re.compile(r"\berror=([^\s,}]+)")
@@ -268,6 +278,10 @@ class LogEvent:
     # Churn-specific.
     churn_count: int | None = None
     churn_rate: float | None = None
+    # TTFT (Time to First Token) in milliseconds, from local or remote stream
+    # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
+    # (local) or ttft_seconds= (remote) log lines.
+    ttft_ms: float | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -518,6 +532,36 @@ def parse_log_line(line: str) -> LogEvent | None:
             churn_rate=churn_rate_val,
             raw=line,
         )
+
+    # TTFT (Time to First Token) lines (LP-0MTSSM5SO003PKU0).
+    # Local stream path: "dispatch_first_byte_ms=<ms> dispatch_to_first_byte_ms=<ms> session=<id> model=<model>"
+    # Remote stream path: "ttft_seconds=<s> session=<id> provider=<provider> model=<model>"
+    dispatch_m = RE_DISPATCH_FIRST_BYTE.search(msg)
+    ttft_m = RE_TTFT_SECONDS.search(msg)
+    if dispatch_m or ttft_m:
+        # Convert remote ttft_seconds (float) to milliseconds for consistency
+        ttft_ms_val = None
+        if ttft_m:
+            try:
+                ttft_ms_val = float(ttft_m.group(1)) * 1000.0
+            except (ValueError, TypeError):
+                pass
+        if dispatch_m:
+            try:
+                ttft_ms_val = float(dispatch_m.group(1))
+            except (ValueError, TypeError):
+                pass
+        if ttft_ms_val is not None:
+            return LogEvent(
+                "ttft",
+                ts,
+                provider=_first(RE_PROVIDER, msg),
+                model=_first(RE_MODEL, msg),
+                session=_session_from(msg),
+                ttft_ms=ttft_ms_val,
+                raw=line,
+            )
+
     return None
 
 
