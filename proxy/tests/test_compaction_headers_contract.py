@@ -10,12 +10,10 @@ its next turn:
 ``X-Compaction-Turns-Summarized: <decimal int>``
 ``X-Compaction-Recent-Turns-Kept: <decimal int>``
 
-TDD red phase (child LP-0MU44KR5F0015D7A): the headers are emitted by the
-implementation child LP-0MU44KSMS002DBWA. The positive-contract tests below are
-``xfail(strict=True)`` so the suite stays green on ``dev`` while the assertions
-genuinely fail against the current code. ``strict=True`` makes the red phase
-self-clearing: as soon as the headers land the tests XPASS, turning them into
-failures that force removal of the marker (AC7).
+TDD history: this contract was authored test-first in child
+LP-0MU44KR5F0015D7A as a red phase (``xfail(strict=True)``) and made green
+by the implementation child LP-0MU44KSMS002DBWA, which surfaces the metadata
+on the session result and emits the four headers on both response paths.
 
 The negative-path tests (dry-run / noop / below-trigger / remote_with_guidance
 / fail-safe) are green in both phases — they assert that non-compaction
@@ -253,7 +251,6 @@ def _mock_server_state(monkeypatch):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(strict=True, reason="headers emitted by LP-0MU44KSMS002DBWA")
 @pytest.mark.asyncio
 async def test_streaming_applied_compaction_emits_header_set(monkeypatch):
     """Live compaction over SSE sets the four headers on the StreamingResponse."""
@@ -282,7 +279,6 @@ async def test_streaming_applied_compaction_emits_header_set(monkeypatch):
     assert "x-compaction-marker" in headers
 
 
-@pytest.mark.xfail(strict=True, reason="headers emitted by LP-0MU44KSMS002DBWA")
 @pytest.mark.asyncio
 async def test_buffered_applied_compaction_emits_header_set(monkeypatch):
     """Live compaction over a buffered response sets the four headers."""
@@ -319,7 +315,6 @@ async def test_buffered_applied_compaction_emits_header_set(monkeypatch):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(strict=True, reason="headers emitted by LP-0MU44KSMS002DBWA")
 @pytest.mark.asyncio
 async def test_marker_decodes_to_exact_injected_summary_message(monkeypatch):
     """X-Compaction-Marker base64-decodes to the verbatim injected message."""
@@ -349,7 +344,6 @@ async def test_marker_decodes_to_exact_injected_summary_message(monkeypatch):
     assert decoded.endswith(_SUMMARY_MARKER_END)
 
 
-@pytest.mark.xfail(strict=True, reason="headers emitted by LP-0MU44KSMS002DBWA")
 @pytest.mark.asyncio
 async def test_turn_count_headers_are_decimal_integers(monkeypatch):
     """Both turn-count headers carry canonical decimal integers."""

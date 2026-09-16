@@ -12,6 +12,7 @@ Functions in this module:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -256,6 +257,43 @@ def _build_session_headers(
         if session_fallback_reason:
             headers["X-Session-Fallback-Reason"] = session_fallback_reason
     return headers
+
+
+def _build_compaction_headers(session_result: dict) -> dict:
+    """Build the compaction metadata response headers (LP-0MTYGZ1DI0004QP8).
+
+    Returns an empty dict unless live compaction was applied *and* the
+    summary text is available. ``X-Compaction-Marker`` is the base64 encoding
+    of the exact summary message the proxy injected into the compacted history
+    (``_SUMMARY_MARKER`` / ``_SUMMARY_MARKER_END`` delimiters included), so
+    clients never replicate the marker format and can never drift from it.
+
+    Fail-safe (AC4): any error yields no headers and never affects dispatch —
+    the emission is additive, after compaction has already been applied.
+    """
+    try:
+        if not session_result.get("compaction_applied"):
+            return {}
+        summary_text = session_result.get("compaction_summary_text")
+        if not isinstance(summary_text, str) or not summary_text:
+            return {}
+        from proxy.compaction import _SUMMARY_MARKER, _SUMMARY_MARKER_END
+
+        marker_message = f"{_SUMMARY_MARKER}{summary_text}{_SUMMARY_MARKER_END}"
+        marker_b64 = base64.b64encode(marker_message.encode("utf-8")).decode("ascii")
+        return {
+            "X-Compaction-Occurred": "true",
+            "X-Compaction-Marker": marker_b64,
+            "X-Compaction-Turns-Summarized": str(
+                int(session_result.get("compaction_turns_summarized", 0) or 0)
+            ),
+            "X-Compaction-Recent-Turns-Kept": str(
+                int(session_result.get("compaction_recent_turns_kept", 0) or 0)
+            ),
+        }
+    except Exception:
+        logger.debug("Failed to build compaction headers; omitting", exc_info=True)
+        return {}
 
 
 def _get_guardrail_config(server_config: dict) -> dict:
@@ -1282,6 +1320,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     )
                     # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                     outgoing_headers["X-Resolved-Model"] = f"local/{model_name}"
+                    # LP-0MTYGZ1DI0004QP8: Surface server-side compaction metadata
+                    # so the Pi client can mirror the compacted dispatch base.
+                    outgoing_headers.update(_build_compaction_headers(session_result))
                     media_type = response.headers.get(
                         "content-type", "text/event-stream"
                     )
@@ -2123,6 +2164,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             )
                             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                             resp_headers["X-Resolved-Model"] = f"local/{model_name}"
+                            # LP-0MTYGZ1DI0004QP8: Surface server-side compaction metadata.
+                            resp_headers.update(_build_compaction_headers(session_result))
 
                             return Response(
                                 content=response.content,

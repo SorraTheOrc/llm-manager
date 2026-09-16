@@ -203,6 +203,77 @@ class TestHandleSessionCompactionWiring:
         assert decision["action"] == "compact"
 
     @pytest.mark.asyncio
+    async def test_live_compaction_surfaces_summary_and_turn_metadata(self):
+        """AC6 — live compaction surfaces summary text and turn counts.
+
+        proxy_to_local builds the X-Compaction-* response headers from these
+        session-result fields, so they must be present exactly when live
+        compaction is applied (LP-0MTYGZ1DI0004QP8).
+        """
+        from proxy.router_helpers import _handle_session
+
+        srv = _make_server()
+        post_compact_messages = _make_session_messages(20)
+        body_json = {"model": "Qwen3", "messages": _make_session_messages(60)}
+
+        def fake_compaction(*a, **kw):
+            return {
+                "action": "compact",
+                "applied": True,
+                "dry_run": False,
+                "messages": post_compact_messages,
+                "summary_text": "SUMMARY_BODY",
+                "turns_summarized": 7,
+                "recent_turns_kept": 3,
+                "estimated_before": 122000,
+                "estimated_after": 30000,
+                "reason": "compacted_within_target",
+            }
+
+        with patch("proxy.router_helpers._evaluate_session_compaction", side_effect=fake_compaction):
+            result = await _handle_session(srv, body_json, srv.config["server"], {"x-session-id": "s"})
+
+        assert result["compaction_applied"] is True
+        assert result["compaction_summary_text"] == "SUMMARY_BODY"
+        assert result["compaction_turns_summarized"] == 7
+        assert result["compaction_recent_turns_kept"] == 3
+
+    @pytest.mark.asyncio
+    async def test_non_applied_compaction_omits_metadata_fields(self):
+        """AC6 — noop/dry-run results carry none of the compaction metadata.
+
+        "when and only when live compaction is applied": the header builder in
+        proxy_to_local keys off ``compaction_applied``, so absent metadata on
+        the non-applied paths guarantees no header emission (AC3).
+        """
+        from proxy.router_helpers import _handle_session
+
+        srv = _make_server()
+        messages = _make_session_messages(3)
+        body_json = {"model": "Qwen3", "messages": messages}
+
+        def fake_dry_run(*a, **kw):
+            return {
+                "action": "compact",
+                "applied": False,
+                "dry_run": True,
+                "messages": messages,
+                "summary_text": "SHOULD_NOT_SURFACE",
+                "turns_summarized": 2,
+                "recent_turns_kept": 1,
+                "estimated_before": 122000,
+                "estimated_after": 42000,
+            }
+
+        with patch("proxy.router_helpers._evaluate_session_compaction", side_effect=fake_dry_run):
+            result = await _handle_session(srv, body_json, srv.config["server"], {"x-session-id": "s"})
+
+        assert "compaction_applied" not in result
+        assert "compaction_summary_text" not in result
+        assert "compaction_turns_summarized" not in result
+        assert "compaction_recent_turns_kept" not in result
+
+    @pytest.mark.asyncio
     async def test_compaction_updates_session_messages(self):
         """AC1 — after live compaction, session.messages reflect the compacted count.
 

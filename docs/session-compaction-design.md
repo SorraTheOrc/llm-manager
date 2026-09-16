@@ -240,3 +240,37 @@ falls back to `remote_with_guidance` instead of blocking dispatch.
   its own provider config).
 - The chain is declared identically in `config.yaml`, `config-fast.yaml` and
   `config-cheap.yaml` (the active mode config is what the proxy loads).
+### 7.3 Compaction metadata response headers — Pi client bridge (LP-0MTYGZ1DI0004QP8)
+
+Server-side compaction rewrites the dispatch base to
+`[system, first_user, summary_marker, recent...]`, but the client keeps
+sending its full un-compacted history. Without visibility the client↔proxy
+views diverge, forcing `history_mismatch` fallbacks and CREATION
+re-summarization on every turn.
+
+When live compaction is applied, `_handle_session` surfaces the decision on
+the session result (`compaction_summary_text`,
+`compaction_turns_summarized`, `compaction_recent_turns_kept`) and
+`proxy_to_local` emits the bridge headers — on both the streaming SSE and
+buffered response paths, next to `X-Resolved-Model`:
+
+| Header | Value |
+|---|---|
+| `X-Compaction-Occurred` | `true` |
+| `X-Compaction-Marker` | base64 of the exact injected summary message |
+| `X-Compaction-Turns-Summarized` | decimal integer |
+| `X-Compaction-Recent-Turns-Kept` | decimal integer |
+
+- The marker is built from the proxy's own `_SUMMARY_MARKER` /
+  `_SUMMARY_MARKER_END` delimiters, so clients never replicate (or drift
+  from) the marker format; it decodes to the verbatim message content the
+  proxy injected.
+- Emission is fail-safe and additive: any error (or missing summary text)
+  yields no compaction headers and never changes dispatch. Non-compaction
+  paths (noop / below-trigger / dry-run / `remote_with_guidance`) set none of
+  the headers.
+- Consumer: the Pi client extension (SorraAgents SA-0MTYGZIWF000ZLU0) mirrors
+  the compacted view in its dispatch layer; JSONL storage is untouched.
+- Header-size caveat: summaries are base64'd into a single header. Summaries
+  beyond a few KB should move to a sidecar endpoint
+  (`GET /sessions/<id>/compaction`).

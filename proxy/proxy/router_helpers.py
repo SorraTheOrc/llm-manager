@@ -2456,6 +2456,16 @@ async def _handle_session(
                         _compaction.get("estimated_before", 0) or 0
                     )
                     result["compaction_reason"] = _compaction.get("reason")
+                    # LP-0MTYGZ1DI0004QP8: surface the compaction decision so
+                    # proxy_to_local can emit the X-Compaction-* bridge headers.
+                    # Set only on the live-applied path (AC6).
+                    result["compaction_summary_text"] = _compaction.get("summary_text")
+                    result["compaction_turns_summarized"] = int(
+                        _compaction.get("turns_summarized", 0) or 0
+                    )
+                    result["compaction_recent_turns_kept"] = int(
+                        _compaction.get("recent_turns_kept", 0) or 0
+                    )
                     srv.logger.info(
                         "session_compaction applied session=%s mode=%s "
                         "est_before=%d est_after=%d",
