@@ -35,7 +35,11 @@ data-backed recommendations — including an **error taxonomy** and quantified
 ## Inputs
 
 - Log source (read-only): `/var/log/llama-proxy/proxy.log` plus rotated
-  siblings (`proxy.log.YYYY-MM-DD_HH`, 6-hourly rotation, 90-day retention).
+  siblings. Two rotation mechanisms produce two naming patterns —
+  in-process rotation (`proxy.log.YYYY-MM-DD_HH`, dot) and logrotate safety
+  net (`proxy.log-YYYY-MM-DD_HH`, dash) — and either may be gzipped (`.gz`).
+  The script discovers all of them and decompresses `.gz` transparently; the
+  log directory should contain both types.
 - Config (reference only, for slot schedule + thresholds):
   `proxy/config.yaml` in the llm project (auto-discovered by walking up from
   the current directory, or pass `--config`). When the persisted operating
@@ -189,11 +193,15 @@ run (`Previous outputs archived to …`).
 ## How it works
 
 1. **File discovery** — the live `proxy.log` plus every rotated sibling
-   (`proxy.log.YYYY-MM-DD_HH`). All rotated files are included regardless of
+   (`proxy.log.YYYY-MM-DD_HH` and `proxy.log-YYYY-MM-DD_HH`, both dot and
+   dash naming, plain or `.gz`). All rotated files are included regardless of
    their name-encoded timestamp: in this deployment a rotated file routinely
    holds data well past its encoded rotation time, so a name-based inclusion
    test would silently drop in-window data. Per-line timestamp filtering in
-   step 2 is the authoritative window boundary.
+   step 2 is the authoritative window boundary. **Gzip-compressed files are
+   decompressed transparently** — reading a `.gz` as plain text yields zero
+   parseable lines while still counting the file as scanned, which silently
+   discards its entire contents.
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
@@ -470,6 +478,10 @@ lines (`proxy.log` and `llama-server.log`).
   a conservative lower bound.
 - Log-format drift is tolerated (missing fields default to empty), but a
   major format change may require updating the regexes in `scripts/log_parser.py`.
+- Rotated logs may be gzipped. `iter_events` decompresses `.gz` files
+  transparently (via `open_log_text`), so discovery never has to distinguish
+  plain from compressed siblings. A truncated/corrupt gzip member would raise,
+  but the surrounding deployment rewrites complete members only.
 - Compaction events are window-filtered by per-line timestamp (`ts`) and
   by the same streaming, per-line margin as session / fallback / error
   events; the bucket (fast/cheap) of each `compaction_event` comes from its

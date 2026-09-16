@@ -20,7 +20,7 @@ import logging
 from functools import cache
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("llama-proxy.tokenizers")
 
 # name -> vendored tokenizer.json path (relative to this module)
 TOKENIZER_REGISTRY: dict[str, Path] = {

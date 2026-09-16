@@ -8,7 +8,7 @@ fail-open on errors, and timeout handling.
 from unittest.mock import MagicMock, patch
 
 import pytest
-from proxy.provider import _SUMMARIZER_SYSTEM_PROMPT
+from proxy.provider import _SUMMARIZATION_PROMPT, _SUMMARIZER_SYSTEM_PROMPT
 
 
 def _mock_success_response(content: str = "SUMMARY TEXT", status: int = 200):
@@ -72,14 +72,19 @@ class TestBuildLocalSummarizer:
             assert body["model"] == "Qwen3"
             assert body["max_tokens"] == 512
             assert body["stream"] is False
-            # System prompt present
+            # System prompt present (Pi role + guard rails only)
             msgs = body["messages"]
             assert msgs[0]["role"] == "system"
             assert msgs[0]["content"] == _SUMMARIZER_SYSTEM_PROMPT
-            # Transcript contains middle content
-            user_contents = " ".join(m.get("content", "") for m in msgs if m.get("role") == "user")
-            assert "hello" in user_contents
-            assert "world" in user_contents
+            # User message: transcript serialised inside <conversation> tags,
+            # then the structured format template appended (Pi's split)
+            user_msg = next(m for m in msgs if m.get("role") == "user")
+            user_content = user_msg["content"]
+            assert user_content.startswith("<conversation>\n")
+            assert "user: hello" in user_content
+            assert "assistant: world" in user_content
+            assert "\n</conversation>\n\n" in user_content
+            assert _SUMMARIZATION_PROMPT in user_content
 
     def test_uses_config_values_for_model_and_max_tokens(self):
         from proxy.compaction_summarizer import build_local_summarizer
@@ -106,20 +111,26 @@ class TestBuildLocalSummarizer:
         import httpx
         from proxy.compaction_summarizer import build_local_summarizer
 
-        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
             mock_client = MagicMock()
             mock_cls.return_value.__enter__.return_value = mock_client
             mock_client.post.side_effect = httpx.ConnectError("refused")
 
             s = build_local_summarizer({}, llama_port=8080, timeout_seconds=2)
-            # Must not raise, must return empty string
+            # Must not raise, must return empty string after retries exhausted
             assert s([{"role": "user", "content": "hi"}]) == ""
 
     def test_fail_open_on_timeout(self):
         import httpx
         from proxy.compaction_summarizer import build_local_summarizer
 
-        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
             mock_client = MagicMock()
             mock_cls.return_value.__enter__.return_value = mock_client
             mock_client.post.side_effect = httpx.ReadTimeout("timeout")
@@ -130,7 +141,10 @@ class TestBuildLocalSummarizer:
     def test_fail_open_on_non_200(self):
         from proxy.compaction_summarizer import build_local_summarizer
 
-        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
             mock_client = MagicMock()
             mock_cls.return_value.__enter__.return_value = mock_client
             resp = MagicMock()
@@ -139,6 +153,7 @@ class TestBuildLocalSummarizer:
             mock_client.post.return_value = resp
 
             s = build_local_summarizer({}, llama_port=8080)
+            # 500 is transient — retried (default 2) then fail-open
             assert s([{"role": "user", "content": "hi"}]) == ""
 
     def test_fail_open_on_malformed_response(self):
@@ -194,6 +209,91 @@ class TestBuildLocalSummarizer:
             timeout_arg = kwargs.get("timeout")
             assert timeout_arg is not None
 
+    def test_build_local_summarizer_accepts_timeout_param(self):
+        """build_local_summarizer uses the passed timeout_seconds param."""
+        import httpx
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.return_value = _mock_success_response("ok")
+
+            # Call with explicit 600s timeout (the value router_helpers uses)
+            s = build_local_summarizer({}, llama_port=8080, timeout_seconds=600)
+            s([{"role": "user", "content": "hi"}])
+
+            # Check httpx.Client was called with timeout=600
+            call_args = mock_cls.call_args
+            timeout_arg = call_args.kwargs.get("timeout") if hasattr(call_args, "kwargs") else None
+            if timeout_arg is None:
+                timeout_arg = call_args.args[0] if call_args.args else None
+            assert timeout_arg is not None, "timeout was not passed to httpx.Client"
+            # httpx.Timeout wraps the value; extract it
+            if hasattr(timeout_arg, "connect"):
+                assert timeout_arg.connect == 600.0
+            elif hasattr(timeout_arg, "read"):
+                assert timeout_arg.read == 600.0
+            else:
+                assert float(timeout_arg) == 600.0
+
+    def test_default_timeout_is_600s_for_slot_contention(self):
+        """build_local_summarizer defaults to a 600 s HTTP timeout.
+
+        This is the production path: on a 1-slot backend a long generating
+        request can hold the local slot for many minutes (observed max
+        dispatch_first_byte_ms was 713 s; sessions blocked 17-18 min before
+        the 900 s upstream timeout). The summarizer must wait for the slot
+        to free rather than timing out at 30 s and forcing
+        remote_with_guidance. See LP-0MU1RXEY10075TUU.
+        """
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.return_value = _mock_success_response("ok")
+
+            # No explicit timeout_seconds → resolves the config default (600)
+            s = build_local_summarizer({}, llama_port=8080)
+            s([{"role": "user", "content": "hi"}])
+
+            call_args = mock_cls.call_args
+            timeout_arg = call_args.kwargs.get("timeout") if hasattr(call_args, "kwargs") else None
+            if timeout_arg is None:
+                timeout_arg = call_args.args[0] if call_args.args else None
+            assert timeout_arg is not None, "timeout was not passed to httpx.Client"
+            if hasattr(timeout_arg, "connect"):
+                assert timeout_arg.connect == 600.0
+            elif hasattr(timeout_arg, "read"):
+                assert timeout_arg.read == 600.0
+            else:
+                assert float(timeout_arg) == 600.0
+
+    def test_config_timeout_override(self):
+        """Explicit config value overrides the 600 s default."""
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.return_value = _mock_success_response("ok")
+
+            cfg = {"server": {"compaction_summarizer_timeout": 120}}
+            s = build_local_summarizer(cfg, llama_port=8080)
+            s([{"role": "user", "content": "hi"}])
+
+            call_args = mock_cls.call_args
+            timeout_arg = call_args.kwargs.get("timeout") if hasattr(call_args, "kwargs") else None
+            if timeout_arg is None:
+                timeout_arg = call_args.args[0] if call_args.args else None
+            if hasattr(timeout_arg, "connect"):
+                assert timeout_arg.connect == 120.0
+            elif hasattr(timeout_arg, "read"):
+                assert timeout_arg.read == 120.0
+            else:
+                assert float(timeout_arg) == 120.0
+
     def test_integration_with_plan_session_compaction(self):
         """Summarizer integrates with the pure compaction planner."""
         from proxy.compaction import plan_session_compaction
@@ -239,3 +339,93 @@ class TestBuildLocalSummarizer:
                 "The conversation history before this point was compacted" in str(m.get("content", ""))
                 for m in result["messages"]
             )
+
+
+class TestCompactionDoesNotBlockEventLoop:
+    """LP-0MU1RXEY10075TUU: summarizer slot-wait must not freeze the loop.
+
+    On a 1-slot backend the summarizer can block for many minutes waiting
+    for the generating request to release the local slot. Before this fix
+    the blocking httpx call ran directly inside ``_handle_session`` (an
+    async function), so a long wait froze the whole event loop — including
+    the stream of the request whose slot was being waited on. The
+    evaluation now runs via ``asyncio.to_thread``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_handle_session_keeps_loop_responsive_during_slot_wait(self):
+        """A slow compaction evaluation does not stall other coroutines."""
+        import asyncio
+        import time
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from proxy.router_helpers import _handle_session
+
+        msgs = [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "FIRST"},
+            {"role": "assistant", "content": "FR"},
+        ]
+        srv = MagicMock()
+        srv.config = {
+            "server": {
+                "local_model_ctx_size": 262144,
+                "session_slot_pool_size": 1,
+                "compaction_trigger_ratio": 0.70,
+            }
+        }
+        srv.logger = MagicMock()
+        mock_session = MagicMock(session_id="sess-block", message_count=len(msgs))
+        mock_session.messages = list(msgs)
+        srv.session_manager = MagicMock()
+        srv.session_manager.get_or_create = AsyncMock(return_value=(mock_session, True))
+        srv.session_manager.update_messages = AsyncMock(return_value=True)
+
+        # Simulate the summarizer blocking on the busy slot for 300 ms.
+        # A flag marks the window during which the slot-wait is happening;
+        # the heartbeat must keep ticking inside that window to prove the
+        # event loop was not frozen by the blocking HTTP call.
+        wait_started = False
+
+        def slow_compaction(*a, **kw):
+            nonlocal wait_started
+            wait_started = True
+            time.sleep(0.3)
+            return {
+                "action": "noop",
+                "applied": False,
+                "dry_run": True,
+                "messages": msgs,
+                "reason": "below_trigger",
+            }
+
+        heartbeats = 0
+
+        async def heartbeat():
+            nonlocal heartbeats
+            while True:
+                await asyncio.sleep(0.02)
+                if wait_started:
+                    heartbeats += 1
+
+        with (
+            patch("proxy.router_helpers._evaluate_session_compaction", side_effect=slow_compaction),
+            patch("proxy.compaction_summarizer.build_local_summarizer"),
+        ):
+            hb = asyncio.create_task(heartbeat())
+            await _handle_session(
+                srv,
+                {"model": "Qwen3", "messages": list(msgs)},
+                srv.config["server"],
+                {"x-session-id": "sess-block"},
+            )
+            hb.cancel()
+
+        # Only ticks that occurred DURING the 300 ms slot-wait count. With
+        # the evaluation offloaded via asyncio.to_thread the loop runs
+        # freely (>= 10 ticks at 20 ms); a synchronous call would freeze it
+        # and yield zero ticks inside the window.
+        assert heartbeats >= 4, (
+            f"event loop was blocked during compaction slot-wait "
+            f"(heartbeats={heartbeats})"
+        )

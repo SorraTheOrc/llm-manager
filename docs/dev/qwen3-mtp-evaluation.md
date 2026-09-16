@@ -84,7 +84,8 @@ Either path disrupts the live proxy; it is an operator decision.
 > production router runs `--parallel 3` (3 slots, per-slot ctx 43.7K). Deploying
 > MTP therefore means swapping concurrency for per-request speed — the A/B must
 > weigh TPS-per-request vs lost slot concurrency, and the proxy's
-> `session_slot_pool_size`/slot_schedule would need to drop to 1 for a
+> `session_slot_pool_size` (the profile's single slot-count definition since
+> the slot_schedule removal, LP-0MTZRM5HV0007S0V) would need to drop to 1 for a
 > representative measurement.
 
 ## Baseline results (AC1)

@@ -882,12 +882,13 @@ async def test_empty_retry_log_includes_diagnostics(mock_request, mock_srv):
     )
 
     # The empty-retry INFO log must include tool_calls/reasoning diagnostics
+    # plus the upstream body snippet (LP-0MTVPJWWZ000REYU)
     empty_retry_logs = [
         call for call in mock_srv.logger.info.call_args_list
-        if "Empty response detected" in str(call.args[0])
+        if "Empty response detected" in str(call.args[0]) and "stream attempt" in str(call.args[0])
     ]
     assert len(empty_retry_logs) == 1, (
-        f"Expected exactly one 'Empty response detected' log, got {len(empty_retry_logs)}"
+        f"Expected exactly one 'Empty response detected on stream' log, got {len(empty_retry_logs)}"
     )
     log_fmt, *log_args = empty_retry_logs[0].args
     assert "saw_tool_calls=%s" in log_fmt, (
@@ -897,9 +898,10 @@ async def test_empty_retry_log_includes_diagnostics(mock_request, mock_srv):
         f"Empty-retry log missing saw_reasoning placeholder: {log_fmt}"
     )
     # For a genuinely empty stream both diagnostic flags must be False
+    # (body_snippet is the last arg, saw_reasoning is second-to-last)
     assert log_args[-2] is False, (
         f"Expected saw_tool_calls=False for empty stream, got {log_args[-2]}"
     )
-    assert log_args[-1] is False, (
-        f"Expected saw_reasoning=False for empty stream, got {log_args[-1]}"
+    assert log_args[-3] is False, (
+        f"Expected saw_reasoning=False for empty stream, got {log_args[-3]}"
     )

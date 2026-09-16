@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("llama-proxy.session")
 
 
 # ---------------------------------------------------------------------------
@@ -698,8 +698,14 @@ async def _call_slot_endpoint(
     filename: str,
     timeout: float,
     model: str | None = None,
+    endpoint: str | None = None,
 ) -> bool:
     """Make a slot save/restore HTTP call to llama-server.
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the
+    save/restore targets that specific llama-server instance
+    (LP-0MRPILSMW004T4H8). Otherwise the legacy
+    ``http://localhost:{llama_port}`` URL is used.
 
     Improved logging (LP-0MQWXX17C005BX1E):
     - Exceptions include the exception type name in the warning message so
@@ -722,6 +728,8 @@ async def _call_slot_endpoint(
     if not filename:
         return False
     url = f"http://localhost:{llama_port}/slots/{slot_id}?action={action}"
+    if endpoint:
+        url = f"{endpoint.rstrip('/')}/slots/{slot_id}?action={action}"
     payload = {"filename": Path(filename).name}
     if model:
         payload["model"] = model
@@ -799,6 +807,7 @@ async def _restore_slot_snapshot(
     filename: str,
     timeout: float,
     model: str | None = None,
+    endpoint: str | None = None,
 ) -> bool:
     try:
         if not Path(filename).exists():
@@ -812,6 +821,7 @@ async def _restore_slot_snapshot(
         filename,
         timeout,
         model=model,
+        endpoint=endpoint,
     )
 
 
@@ -821,6 +831,7 @@ async def _save_slot_snapshot(
     filename: str,
     timeout: float,
     model: str | None = None,
+    endpoint: str | None = None,
 ) -> bool:
     return await _call_slot_endpoint(
         llama_port,
@@ -829,6 +840,7 @@ async def _save_slot_snapshot(
         filename,
         timeout,
         model=model,
+        endpoint=endpoint,
     )
 
 
@@ -849,50 +861,101 @@ def _sanitize_session_id(session_id: str) -> str:
 # Tracks which session_id currently owns each slot number, replacing the
 # previous hash-based deterministic mapping. Slots are assigned on demand
 # (lowest-numbered free slot first) so that session_id ↔ slot_number is
-# transparent and doesn't rely on a digest.
+# transparent and doesn't rely on a digest. With multiple local backends
+# (LP-0MRPILSMW004T4H8) the mapping is keyed by endpoint so each
+# llama-server instance has its own independent slot pool.
 # ---------------------------------------------------------------------------
 
-_slot_owners: dict[int, str] = {}
-"""Active slot assignments: ``{slot_id: session_id}``."""
+_slot_owners: dict[tuple, str] = {}
+"""Active slot assignments: ``{(endpoint_or_empty, slot_id): session_id}``."""
 
 
-def _slot_id_for_session(session_id: str, pool_size: int) -> int | None:
+def _slot_registry_key(endpoint: str | None, slot_id: int) -> tuple:
+    """Build the per-endpoint slot-registry key.
+
+    Endpoints are normalized (None/empty -> "") so legacy single-server
+    usage and multi-backend usage share the same registry.
+    """
+    return (endpoint or "", slot_id)
+
+
+def _slot_key_endpoint(key) -> str:
+    """Return the endpoint component of a slot-registry key.
+
+    Legacy integer keys (pre-multi-backend) are treated as the empty
+    endpoint so existing tests / callers that populate the registry with
+    bare slot ids keep working (LP-0MRPILSMW004T4H8).
+    """
+    if isinstance(key, tuple) and len(key) == 2:
+        return key[0]
+    return ""
+
+
+def _slot_key_slot_id(key) -> int:
+    """Return the slot-id component of a slot-registry key.
+
+    Legacy integer keys return themselves.
+    """
+    if isinstance(key, tuple) and len(key) == 2:
+        return key[1]
+    return key
+
+
+def _slot_id_for_session(
+    session_id: str, pool_size: int, endpoint: str | None = None
+) -> int | None:
     """Return the slot number assigned to *session_id*.
 
-    If the session already has an assigned slot, returns it.
+    If the session already has an assigned slot on this endpoint, returns it.
     Otherwise assigns the lowest-numbered free slot in ``[0, pool_size)``.
     Returns ``None`` when *session_id* is empty or *pool_size* ≤ 0.
+
+    The registry is keyed per-endpoint so different llama-server instances
+    track their own slot pools independently (LP-0MRPILSMW004T4H8).
     """
     if not session_id or pool_size <= 0:
         return None
 
-    # Check existing assignment
-    for sid, owner in list(_slot_owners.items()):
-        if owner == session_id:
-            return sid
+    ep = endpoint or ""
+    # Check existing assignment on this endpoint
+    for key, owner in list(_slot_owners.items()):
+        if owner == session_id and _slot_key_endpoint(key) == ep:
+            return _slot_key_slot_id(key)
 
-    # Find the lowest-numbered free slot
-    used = set(_slot_owners.keys())
+    # Find the lowest-numbered free slot on this endpoint
+    used = {
+        _slot_key_slot_id(key)
+        for key in _slot_owners.keys() if _slot_key_endpoint(key) == ep
+    }
     for sid in range(pool_size):
         if sid not in used:
-            _slot_owners[sid] = session_id
+            _slot_owners[_slot_registry_key(endpoint, sid)] = session_id
             return sid
 
     # All slots occupied — pool is exhausted
     return None
 
 
-def _free_slot_assignment(session_id: str) -> None:
-    """Release the slot assigned to *session_id*, if any."""
+def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
+    """Release the slot assigned to *session_id* on *endpoint*, if any.
+
+    When *endpoint* is None (legacy single-server mode), the first matching
+    assignment is released for backward compatibility.
+    """
     if not session_id:
         return
-    for sid, owner in list(_slot_owners.items()):
-        if owner == session_id:
-            _slot_owners.pop(sid, None)
+    ep = endpoint or ""
+    for key, owner in list(_slot_owners.items()):
+        if owner == session_id and (
+            endpoint is None or _slot_key_endpoint(key) == ep
+        ):
+            _slot_owners.pop(key, None)
             return
 
 
-def _assigned_slot_for_session(session_id: str) -> int | None:
+def _assigned_slot_for_session(
+    session_id: str, endpoint: str | None = None
+) -> int | None:
     """Return the slot currently assigned to *session_id*, if any.
 
     Read-only lookup: unlike ``_slot_id_for_session`` it never assigns a
@@ -900,12 +963,18 @@ def _assigned_slot_for_session(session_id: str) -> int | None:
     session's slot is still processing on llama-server before freeing the
     dispatch lease (LP-0MSUO6XRP001MCB2). Returns ``None`` when the session
     has no slot assignment or *session_id* is empty.
+
+    When *endpoint* is provided, only assignments on that llama-server
+    instance are considered (LP-0MRPILSMW004T4H8).
     """
     if not session_id:
         return None
-    for sid, owner in list(_slot_owners.items()):
-        if owner == session_id:
-            return sid
+    ep = endpoint or ""
+    for key, owner in list(_slot_owners.items()):
+        if owner == session_id and (
+            endpoint is None or _slot_key_endpoint(key) == ep
+        ):
+            return _slot_key_slot_id(key)
     return None
 
 
@@ -963,10 +1032,33 @@ def _slot_filename_for_session(session_id: str, base_dir: Path | str) -> str:
     return str(Path(base_dir) / f"slot_{safe_id}.bin")
 
 
+def _endpoint_host_port(endpoint: str) -> tuple[str, int]:
+    """Derive ``(host, port)`` from an endpoint URL for slot-path naming.
+
+    Examples::
+
+        http://192.168.0.199:8080  -> ("192.168.0.199", 8080)
+        http://localhost:8080      -> ("localhost", 8080)
+        http://my-host.org         -> ("my-host.org", 8080)
+
+    Falls back to ``("localhost", 8080)`` when the URL cannot be parsed.
+    """
+    try:
+        m = re.match(r"https?://([^/:]+):?(\d*)", endpoint or "")
+        if m:
+            host = m.group(1)
+            port = int(m.group(2) or 8080)
+            return host, port
+    except Exception:
+        pass
+    return "localhost", 8080
+
+
 def _build_slot_context(
     server_config: dict,
     session_id: str | None,
     body_json: dict | None = None,
+    endpoint: str | None = None,
 ) -> tuple[int | None, str | None, float]:
     """Build the slot context for a request, applying persistence safeguards.
 
@@ -981,17 +1073,25 @@ def _build_slot_context(
     - the slot is in circuit-breaker cooldown after repeated save/restore
       failures.
 
+    When *endpoint* is provided, the slot save directory is derived
+    per-endpoint under the global ``session_slot_save_path`` root using a
+    ``{host}-{port}`` subdirectory so different llama-server instances never
+    collide (LP-0MRPILSMW004T4H8).
+
     When ``session_slot_timeout_per_token_seconds`` is configured, the
     returned timeout scales with the estimated context size, capped at
     ``session_slot_max_timeout_seconds``.
     """
     slot_path = server_config.get("session_slot_save_path")
+    if slot_path and endpoint:
+        host, port = _endpoint_host_port(endpoint)
+        slot_path = str(Path(slot_path) / f"{host}-{port}")
     slot_pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
     slot_timeout = float(server_config.get("session_slot_timeout_seconds", 3.0) or 3.0)
     slot_dir = _ensure_slot_dir(slot_path)
     if not session_id or not _slot_persistence_enabled(slot_dir, slot_pool_size):
         return None, None, slot_timeout
-    slot_id = _slot_id_for_session(session_id, slot_pool_size)
+    slot_id = _slot_id_for_session(session_id, slot_pool_size, endpoint=endpoint)
     if slot_id is None:
         return None, None, slot_timeout
 
@@ -1125,8 +1225,13 @@ async def _invalidate_session_and_slot(
         try:
             srv = _srv()
             async with srv.local_dispatch_records_lock:
-                if session_id in srv.local_dispatch_records:
-                    del srv.local_dispatch_records[session_id]
+                matching = [
+                    k for k in srv.local_dispatch_records
+                    if (isinstance(k, tuple) and k[1] == session_id)
+                    or k == session_id
+                ]
+                for k in matching:
+                    del srv.local_dispatch_records[k]
                     try:
                         _srv().logger.info(
                             "lease_released session=%s reason=%s",
@@ -1448,6 +1553,18 @@ def merge_session_history_for_update(
     assistant_content: str | None,
     assistant_message: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """Merge session history for update after a response.
+
+    When ``is_delta_request`` and ``delta_messages`` are present, appends
+    the delta to the existing messages. Otherwise replaces the session's
+    history with ``request_messages`` from the client.
+
+    **Dispatch-base contract (LP-0MTXGU9N1009QNSB AC3):** when compaction
+    fires, the dispatch body carries the compacted history (not the
+    client's original full history). The ``request_messages`` in that
+    case ARE the compacted messages, so this function correctly stores
+    the compacted base — ensuring durability across turns.
+    """
     if is_delta_request and delta_messages:
         merged = list(existing_messages) + list(delta_messages)
     else:
@@ -1481,6 +1598,13 @@ def _classify_delta_routing(
 
     When ``require_restore_signal`` is True, delta routing requires explicit
     restore confirmation from backend signals/logs.
+
+    ``force_full_prompt=True`` (set by config for all proxy models) disables
+    delta routing — the session must dispatch its full prompt every turn.
+    This is the legacy path that prevented compaction from being durable
+    (LP-0MTXGU9N1009QNSB): the client resends its full, uncompacted history
+    every request, and ``force_full_prompt`` causes the proxy to reject
+    delta routing and replace the session store with the client's full body.
 
     Returns (use_delta, reason) where reason is None when delta can be used,
     or a string explaining why a full re-process is required.

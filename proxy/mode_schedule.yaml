@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# Operating-mode schedule (fast / cheap)
+# ---------------------------------------------------------------------------
+# Standalone schedule file: when the proxy switches between the fast and
+# cheap mode profiles. The mode profiles themselves (config.yaml /
+# config-fast.yaml / config-cheap.yaml) own their model definitions and
+# their single slot count (session_slot_pool_size); THIS file owns only the
+# mode-switching policy.
+#
+# The active mode at any instant is the most recent entry at or before the
+# current LOCAL time; before the first entry of the day the schedule wraps
+# circularly to the last entry (so 10:00 -> fast also covers 00:00-00:59).
+#
+# A manual switch via POST /admin/set-mode is respected until the next
+# scheduled change below (LP-0MSMF25V9002AY1J).
+#
+# Set enabled: false to disable automatic mode switching. An ABSENT file
+# falls back to this built-in default schedule (cheap 01:00-10:00, fast
+# 10:00-01:00).
+enabled: true
+entries:
+  - time: "01:00"
+    mode: cheap
+  - time: "10:00"
+    mode: fast

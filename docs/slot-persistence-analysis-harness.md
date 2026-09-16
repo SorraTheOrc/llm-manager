@@ -92,6 +92,23 @@ The incident description (LP-0MTAQNB7J0094X71) claimed, for 2026-08-26:
 The harness records multiple prefill measures so downstream analysis (F4) can
 pick the correct one per question — see the next section.
 
+### Reproducing the incident ratios in tests
+
+`TestIncidentReproduction` asserts the ratios above against the incident-day
+file. The log rotation window moves on, so that exact snapshot
+(`llama-server.log-2026-08-27.gz`) eventually rotates out of
+`/var/log/llama-proxy`; when it is absent the test **skips** rather than
+fails, so CI hosts without the snapshot stay green.
+
+Set `LLAMA_PROXY_LOG_DIR` to point the test at a preserved snapshot (for
+example `/tmp/log-snapshot`) to run the ratio assertions instead of skipping:
+
+```bash
+LLAMA_PROXY_LOG_DIR=/tmp/log-snapshot \
+  python3 -m pytest proxy/tests/test_slot_persistence_harness.py \
+  -k test_incident_ratio_reproduction
+```
+
 ## Prefill-token measures
 
 - `prompt_done_tokens_total` / `prompt_processing_done` — llama-server

@@ -499,6 +499,44 @@ controls the GPU-level parallelism.
 - If pool_size is increased in the future (e.g., multiple GPUs), the hybrid
   approach scales naturally
 
+### 8.6 Generating-only Pool & Self-healing (LP-0MTYAWDCQ006RGYU)
+
+The generating-only pool (`local_generating_queries` / `local_generating_sessions`)
+controls how many sessions can be actively generating tokens against the local
+LLM. Only generating (not prefill) sessions count against this pool.
+
+#### Leak scenario
+
+When a streaming session's `finally` block aborts during slot-save
+(`router.py:1700-1722`), the call to ``_decrement_generating_only_slot``
+(`router.py:1790`) never executes. The session key remains in
+``local_generating_sessions`` and ``local_generating_queries`` stays at
+capacity, permanently wedging the pool. Production observations showed this
+causing 2-hour+ outages (2026-09-11, 39.7% of `local_concurrency_limit` fallbacks).
+
+#### Recovery mechanism
+
+The dispatch cleanup loop (``_dispatch_cleanup_loop``, runs every 10 s)
+now calls ``_recover_stuck_generating_queries`` which:
+
+1. Scans ``local_generating_sessions`` for entries without an active
+   dispatch record in ``local_dispatch_records``.
+2. Removes stale entries and resets ``local_generating_queries`` to
+   the count of remaining legitimate sessions.
+3. Emits a WARNING log and wakes contention-queue waiters.
+
+Self-healing completes within a bounded interval (~2 ticks / ~20 s) without
+a proxy restart. The recovery is O(n) in generating session count and
+acquires no locks other than the generating-queries lock, preventing
+deadlocks with the existing recovery chain.
+
+#### Key invariants
+
+- ``local_generating_queries == len(local_generating_sessions)`` (reconciled periodically)
+- A session in ``local_generating_sessions`` should have an active dispatch record
+  — if not, it is stale and reclaimed.
+- The recovery function is idempotent and safe to call on empty state.
+
 ---
 
 ## 9. Compatibility with Existing Machinery

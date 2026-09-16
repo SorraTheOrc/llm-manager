@@ -209,6 +209,40 @@ Dispatch-lease settings (per-session reservation of the local backend):
 | `local_dispatch_lease_prefill_poll_seconds` | `10` | Cadence (s) at which the proxy polls llama-server for observed prefill progress and extends the lease while progress advances (explicit sessions; `0` disables). |
 | `local_dispatch_lease_prefill_buffer_seconds` | `30` | Safety buffer added to the lease expiry after each observed prefill-progress advance. |
 
+Per-mode contention-queue tuning (cost vs latency)
+---------------------------------------------------
+
+When all local slots are busy the proxy can **queue** a request waiting for
+a slot to free, or **fall back** immediately to the next remote provider.
+Per-mode config lets you trade local utilisation for tail latency:
+
+| Config key | Meaning | Clamped to |
+|---|---|---|
+| `contention_queue_policy` | ``queue`` or ``fallback`` | — |
+| `contention_queue_max_depth` | Max queued requests per mode | `[1, 16]` |
+| `contention_queue_max_wait_seconds` | Max seconds to wait for a local slot | `[1, session_guardrail_max_runtime_seconds]` |
+
+**Shipped defaults (fast vs cheap):**
+
+| Mode | Policy | Depth | Max wait | Rationale |
+|---|---|---|---|---|
+| **fast** (10:00–01:00) | ``queue`` | `3` | `45s` | Short queue — spills to remotes quickly to minimise latency |
+| **cheap** (01:00–10:00) | ``queue`` | `8` | `120s` | Deeper queue — batches requests to local to maximise cost savings |
+
+**Tuning guidance:**
+
+- **Raise depth/wait** → more local hits, higher cost, better throughput but
+  worse tail latency under burst.
+- **Lower depth/wait** → faster fallback to remotes, lower local utilisation,
+  better tail latency.
+- Fast mode defaults (3/45s) are deliberately smaller than cheap (8/120s)
+  so burst traffic spills to remotes sooner during peak hours.
+- Set ``contention_queue_policy: fallback`` to disable queuing entirely
+  (legacy fast-mode behaviour).
+
+See `proxy/docs/routing.md` for the full contention-queue semantics and
+metrics.
+
 Contributing
 - Open issues and PRs in the `SorraTheOrc/llm-manager` repo. If you want changes merged upstream to `rgardler/llm`, open a PR from this repo to the upstream repository.
 

@@ -39,6 +39,17 @@ class Session:
     invalidated: bool = False
     # Set to True after explicit backend restore evidence is observed.
     restore_confirmed: bool = False
+    # Number of client messages that made up the full history at the last
+    # live compaction (LP-0MTVXP7DG00613ZB AC2). The client keeps resending
+    # its pre-compaction history, so this offset anchors the delta heal.
+    # None = never compacted.
+    compacted_from_count: int | None = None
+    # Length of the stored compacted base at compaction time. Messages
+    # appended after the compaction (the assistant response, tool results)
+    # live at ``messages[compacted_base_count:]`` and are already present in
+    # the client's next request; the heal uses this to strip them from the
+    # computed delta. None = never compacted.
+    compacted_base_count: int | None = None
 
     @property
     def age_seconds(self) -> float:
@@ -55,6 +66,92 @@ class Session:
     def is_expired(self, ttl: float) -> bool:
         """Return True if this session has been idle longer than ttl seconds."""
         return self.idle_seconds > ttl
+
+
+def _role_content_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Same prefix comparison the delta protocol uses (role + content only)."""
+    return (
+        isinstance(a, dict)
+        and isinstance(b, dict)
+        and a.get("role") == b.get("role")
+        and a.get("content") == b.get("content")
+    )
+
+
+def compute_post_compaction_delta(
+    session,
+    incoming_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Heal the client/session sync break after a live compaction (AC2).
+
+    A live compaction replaces the stored history with a shortened list, but
+    the client keeps sending its full pre-compaction history. The next
+    request therefore prefix-mismatches and would normally invalidate the
+    session — undoing the compaction and dropping the KV cache.
+
+    The stored history records ``compacted_from_count`` (the client's full
+    history length at compaction time) and ``compacted_base_count`` (the
+    length of the stored compacted base), see
+    :meth:`SessionManager.mark_compacted`.
+
+    Let ``block`` be everything in the stored history after the injected
+    summary marker — the compacted recent turns plus the messages appended
+    after compaction (assistant / tool results). In the client's incoming
+    history those messages appear verbatim ending at
+    ``known_end = compacted_from_count + len(appended)``. When the block
+    matches there, everything at ``incoming[known_end:]`` is genuinely new
+    and the delta protocol can append it to the compacted base — the
+    compacted history persists and the session is not invalidated.
+
+    Returns the delta message list when the heal applies, otherwise ``None``
+    (the caller keeps the existing invalidation behavior).
+    """
+    try:
+        from proxy.compaction import _is_compaction_summary_message
+    except Exception:
+        return None
+
+    from_count = getattr(session, "compacted_from_count", None)
+    base_count = getattr(session, "compacted_base_count", None)
+    if not isinstance(from_count, int) or from_count <= 0:
+        return None
+    if not isinstance(base_count, int) or base_count <= 0:
+        return None
+    if not isinstance(incoming_messages, list):
+        return None
+    stored = list(getattr(session, "messages", None) or [])
+    if not stored or base_count > len(stored):
+        return None
+
+    base = stored[:base_count]
+    appended_count = len(stored) - base_count
+    summary_idx = next(
+        (i for i, m in enumerate(base) if _is_compaction_summary_message(m)),
+        None,
+    )
+    if summary_idx is None:
+        return None
+
+    # Everything after the summary marker: compacted recent turns + appended.
+    block = stored[summary_idx + 1 :]
+    block_len = len(block)
+    if block_len <= 0:
+        return None
+
+    known_end = from_count + appended_count
+    if known_end >= len(incoming_messages) or known_end - block_len < 0:
+        return None
+
+    anchor = incoming_messages[known_end - block_len : known_end]
+    if not all(
+        _role_content_equal(a, b) for a, b in zip(block, anchor, strict=False)
+    ):
+        return None
+
+    delta = list(incoming_messages[known_end:])
+    if not delta:
+        return None
+    return delta
 
 
 class SessionManager:
@@ -376,6 +473,12 @@ class SessionManager:
         This replaces the stored history with the provided messages and
         increments the message count.
 
+        Note: the compaction anchors (``compacted_from_count`` /
+        ``compacted_base_count``) are deliberately NOT cleared here — the
+        post-compaction delta heal (LP-0MTVXP7DG00613ZB AC2) relies on them
+        across subsequent response-time history updates. A genuinely new
+        session starts with the attributes unset.
+
         Returns True if the session was found and updated, False otherwise.
         """
         async with self._lock:
@@ -384,6 +487,38 @@ class SessionManager:
                 return False
             session.messages = list(messages)
             session.message_count = len(messages)
+            session.touch()
+            return True
+
+    async def mark_compacted(
+        self, session_id: str, from_count: int, base_count: int | None = None,
+    ) -> bool:
+        """Record the anchors produced by a live compaction.
+
+        Called after the compacted history has been stored (LP-0MTVXP7DG00613ZB
+        AC2). *from_count* is the number of messages in the full client
+        history at compaction time; *base_count* is the number of messages in
+        the stored compacted base (defaults to the current stored length).
+
+        Returns True when the session was found and updated.
+        """
+        try:
+            count = int(from_count)
+        except (TypeError, ValueError):
+            return False
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            if base_count is None:
+                base = len(session.messages)
+            else:
+                try:
+                    base = int(base_count)
+                except (TypeError, ValueError):
+                    base = len(session.messages)
+            session.compacted_from_count = max(0, count)
+            session.compacted_base_count = max(0, base)
             session.touch()
             return True
 

@@ -66,7 +66,7 @@ def over_budget_compacted(num_recent_turns: int = 40) -> list[dict]:
     return msgs
 
 
-def fixed_summarizer(middle_messages) -> str:
+def fixed_summarizer(middle_messages, previous_summary=None) -> str:
     return f"MIDDLE_SUMMARY: folded {len(middle_messages)} messages."
 
 
@@ -189,7 +189,7 @@ class TestChaining:
     def test_plan_backstop_flag_chains_when_summary_over_budget(self):
         # Summarizer output larger than the selection placeholder blows the
         # budget after selection → backstop drops the oldest recent turns.
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         result = plan_session_compaction(
@@ -205,7 +205,7 @@ class TestChaining:
 
     def test_plan_backstop_off_keeps_over_budget_reason(self):
         # Default plan (backstop off) still reports compacted_over_budget.
-        def big_summarizer(middle_messages):
+        def big_summarizer(middle_messages, previous_summary=None):
             return "B" * 20000
 
         result = plan_session_compaction(
@@ -223,7 +223,7 @@ class TestChaining:
         messages = make_session(10)
         messages[0]["content"] = "HUGE_SYSTEM_" + "x" * 250000
 
-        def fixed(middle_messages):
+        def fixed(middle_messages, previous_summary=None):
             return "S"
 
         result = plan_session_compaction(

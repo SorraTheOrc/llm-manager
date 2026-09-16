@@ -90,16 +90,40 @@ llama-server (defaulting to f16 when unset).
 Sessions with contexts near the per-slot limit decode far slower (KV reads scale
 with context), and compaction is performed by the agents, not the proxy. The proxy
 emits a `context_pressure` WARNING at routing time when a session's estimated
-context reaches the configured fraction of the effective per-slot context
-(`ctx_size / slots - 4096` output headroom).
+context exceeds the compaction trigger (strictly greater than
+`compaction_trigger_ratio × effective per-slot context`, i.e. `ctx_size / slots -
+4096` output headroom).
+
+LP-0MTVXP7DG00613ZB AC3 unified session detection onto the single
+`compaction_trigger_ratio` knob: the legacy `context_pressure_warn_ratio` and
+`local_hard_routing_cap_ratio_*` keys are retired (ignored if present). The
+advisory, the prompt-assembly compaction path, and the compaction gate all fire
+from the same trigger, so what the log warns about is what the proxy acts on.
 
 ```yaml
 server:
-  context_pressure_warn_ratio: 0.8  # 0 disables; default 0.8
+  compaction_trigger_ratio: 0.70   # single detection knob; 0 disables
 ```
 
 The warning names the session and the ratio so operators/agents can compact before
 decode degrades. See `proxy/tests/test_context_pressure_warning.py`.
+
+### Oversized-session enforcement (LP-0MTVXP7DG00613ZB)
+
+When a session exceeds the trigger but cannot be compacted (the summarizer is
+unavailable or failed), the proxy refuses local near-full-slot dispatch and routes
+the request to the model's remote providers instead, attaching an informational
+`X-Session-Compaction-Guidance` response header (e.g.
+`context_pressure;estimated_tokens=90000;per_slot_ctx=83285;ratio=1.08;action=compact_session_history`).
+When the model has no remote provider, the explicit 429 compaction gate is
+returned. No client cooperation is required.
+
+After a live compaction the client still holds its pre-compaction history. The
+proxy records the client/base anchors at compaction time and, on the next request,
+recognises the still-stale history and accepts the genuinely new tail as a delta
+against the compacted base instead of invalidating the session — the compacted
+history (and its KV cache) survives across turns. See
+`proxy/tests/test_oversized_session_enforcement.py`.
 
 ## Session compaction config (LP-0MTG6RW3L003X122)
 
@@ -110,8 +134,8 @@ summariser and a configurable compaction trigger ratio. Both are read from the
 ```yaml
 server:
   # Fires when est_tokens > ratio × effective per-slot threshold
-  # (fast: 0.70 × 83,285 = 58,300 → target ≤ 38K;
-  #  cheap: 0.70 × 61,440 = 43,000 → target ≤ 30K).
+  # (fast: 0.70 × 258,048 = 180,634 → target ≤ 117K;
+  #  cheap: 0.70 × 83,285 = 58,300 → target ≤ 38K).
   compaction_trigger_ratio: 0.70   # default 0.70; 0 disables
   # Summariser model — reuses the existing local Qwen3 model, no new download.
   summarizer_model:
@@ -135,6 +159,24 @@ over-trigger session is summarized (strategy: system + first prompt retained
 verbatim, middle folded, newest whole turns kept ≤ target), the dispatch body
 is replaced with the compacted full history, and `remote_with_guidance`
 enforces non-compactable sessions never reach local near-full-slot.
+
+**Summarizer fail-open contract (LP-0MTXGU8T00066WVH).** The local summariser
+(`proxy/proxy/compaction_summarizer.py`) is fail-open: a transport timeout,
+HTTP error, malformed payload, or empty completion never raises out of the
+dispatch path. Instead it returns an `EmptySummary` — a falsy `str` subclass
+that compares equal to `""` but carries the failure `.kind` (e.g. `timeout`,
+`http_500`, `empty_completion`) and `.attempts`. The compaction planner
+(`plan_session_compaction` in `proxy/proxy/compaction.py`) treats **any** blank
+summary — sentinel or plain `""` — as a summariser failure: it leaves the
+session history untouched and returns `remote_with_guidance`
+(`reason=summarizer_failed`) rather than injecting an empty marker. An empty
+marker would silently drop the folded middle turns and make
+`extract_previous_summary` unable to detect them, so every subsequent pass
+would re-run CREATION on the same base and never converge. The failure is
+logged at WARNING on the `compaction_event` line with the session id, the
+failure kind and the attempt count. Transient failures are retried
+`server.compaction_summarizer_retries` times (default 2) with
+`server.compaction_summarizer_retry_delay_seconds` between attempts.
 
 The config is validated at startup (`validate_compaction_config` in
 `proxy/proxy/provider.py`, invoked from `proxy/proxy/utils.py` and
@@ -212,45 +254,34 @@ server:
 > (cold, warm] band must never collapse — dead-code guard
 > LP-0MSI2M5BT004BCDP):
 >
-> - `proxy/config-fast.yaml` — `38000` (fast mode runs 3 slots × 262144 total
->   ctx since the operator supersede LP-0MSY0SDAS0031Y7F, so the warm clamp is
->   `262144//3 − 4096 =
->   83285`; recaptures the old (30000, 38000] cold-cache bypass band).
-> - `proxy/config-cheap.yaml` — `38000` (warm resolves to `100000` via the
->   2×262144 schedule entries; also below the boot-transient clamp 61440,
->   LP-0MSMZOAJW002UR2A; symmetric with fast after the 60000 raise failed
->   guardrails and was reverted — see LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K
->   / LP-0MSY0V4ZO002ANPL).
+> - `proxy/config-fast.yaml` — `38000` (fast mode runs 1 slot × 262144 total
+>   ctx, LP-0MU03AL730000B5W, so the warm clamp is
+>   `min(100000, 262144//1 − 4096 = 258048) = 100000`; recaptures the old
+>   (30000, 38000] cold-cache bypass band).
+> - `proxy/config-cheap.yaml` — `38000` (3 slots → warm resolves to
+>   `min(100000, 262144//3 − 4096 = 83285) = 83285`; symmetric with fast after
+>   the 60000 raise failed guardrails and was reverted — see
+>   LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K / LP-0MSY0V4ZO002ANPL).
 > - `proxy/config.yaml` (default/fallback) — `38000`, mirroring fast mode.
 >
 > Prompts above the per-slot warm clamp are **never** routed local
 > (`context_too_large` — physical capacity, unchanged).
 
-## Per-period ctx_size in slot_schedule (LP-0MSLNK96T0018W4D)
+## Per-mode slot counts (operator-directed simplification LP-0MTZRM5HV0007S0V)
 
-`slot_schedule` entries may carry an optional `ctx_size`: the total context
-across all slots (llama-server `--ctx-size`) while that entry is active.
-When absent, the global `local_model_ctx_size` applies.
+Each mode profile defines its slot count **once** via
+``session_slot_pool_size`` (default/fast: 1, cheap: 3; counts set by
+LP-0MU03AL730000B5W, structure from LP-0MTZRM5HV0007S0V). There is no
+``slot_schedule``; the time-based slot scheduler was removed. The slot
+count changes only when the operating mode changes (a mode switch restarts
+the proxy with the new profile).
 
-```yaml
-server:
-  slot_schedule:
-    enabled: true
-    entries:
-      - time: "10:00"
-        slots: 3
-      - time: "23:59"
-        slots: 2
-        ctx_size: 262144   # overnight: 2 slots @ 256K
-```
-
-At a transition the proxy restarts llama-server with the new `--parallel`
-AND context size, and the routing clamp (`_effective_large_context_thresholds`)
-plus the `session_slot_max_prompt_tokens` dynamic derivation use the ACTIVE
-period's `(ctx_size, slots)` — so overnight the per-slot cap becomes
-`262144 // 2 - 4096 = 126976` while daytime stays `262144 // 3 - 4096 = 83285`
-(the shared `local_model_ctx_size: 262144` supersede LP-0MSY0SDAS0031Y7F
-applies when the daytime entry omits ctx_size).
+Per-slot context is derived from the profile's static pair:
+``local_model_ctx_size // session_slot_pool_size`` (262144 across all
+profiles since the operator supersede LP-0MSY0SDAS0031Y7F), so the routing
+clamp (``_effective_large_context_thresholds``) resolves to
+`262144 // 1 - 4096 = 258048` per-slot in fast/default (clamped to `100000`
+by the warm config cap) and `262144 // 3 - 4096 = 83285` in cheap.
 
 **Router-mode mechanism:** a global `--ctx-size` on the router command line
 would override per-model INI `ctx-size` for EVERY model (CLI args take highest

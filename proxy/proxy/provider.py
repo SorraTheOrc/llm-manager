@@ -18,6 +18,7 @@ Provides:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -69,6 +70,12 @@ _sibling_failure_streak_start: dict[str, float] = {}
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 45.0
 
+# Empty-response cooldown cap (LP-0MTVPJBF0001SQF4): empty responses are
+# typically transient gateway quirks, not hard endpoint failures, so cap
+# their effective cooldown at a short bound (default 10s). Retry-After
+# headers still override upward.
+_EMPTY_RESPONSE_MAX_COOLDOWN_SECONDS = 10.0
+
 # FreeUsageLimitError cooldown: 3 hours (10800 seconds) by default.
 # Applied when upstream returns HTTP 429 with error.type = "FreeUsageLimitError"
 # See LP-0MRGU0I91006ODFD for details. The per-provider overrides
@@ -113,6 +120,36 @@ _DEFAULT_SIBLING_FALLBACK_COOLDOWN_SECONDS = 600  # 10 minutes
 # provider has no failures for longer than this window, the streak
 # is considered stale and resets.
 _DEFAULT_SIBLING_FALLBACK_WINDOW_SECONDS = 600  # 10 minutes
+
+# ---------------------------------------------------------------------------
+# Deterministic local HTTP 400 escalation (LP-0MTXEBQ4E001BMI2)
+#
+# A local 4xx is treated as a request-shape incompatibility: same-request
+# fallback to the next provider WITHOUT local cooldown (transient one-off
+# noise must stay cheap — AC4). But a 400 that repeats turn after turn for
+# the SAME session on the SAME history is deterministic — compacted history
+# that llama-server rejects every time — and would otherwise route remote
+# silently forever. These streaks escalate to a visible WARNING + dedicated
+# metric once they cross the threshold.
+#
+# State is in-memory (no persistence), consistent with the sibling-failure
+# and cooldown mechanisms, and bounded by a stale-entry prune.
+# ---------------------------------------------------------------------------
+
+# Consecutive local-400 count per (session_id, provider): the number of
+# consecutive same-session local 400s within the sliding window.
+_local_http_400_streaks: dict[tuple[str, str], dict[str, float | int]] = {}
+
+# Repeat threshold: the 2nd same-session local 400 within the window is
+# already 'turn after turn' — escalate.
+_DETERMINISTIC_LOCAL_400_THRESHOLD = 2
+
+# Sliding window (seconds) for the local-400 streak before it resets.
+_DETERMINISTIC_LOCAL_400_WINDOW_SECONDS = 600.0  # 10 minutes
+
+# Upper bound on tracked (session, provider) streak entries before pruning
+# stale ones (avoids unbounded growth on many short sessions).
+_MAX_LOCAL_HTTP_400_STREAK_ENTRIES = 1000
 
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
@@ -529,22 +566,12 @@ def _get_local_model_ctx_size(config: dict) -> int:
 def _get_active_local_slots(config: dict) -> int:
     """Return the number of currently active local slots.
 
-    Prefers the live slot scheduler (schedule-aware) when available;
-    otherwise falls back to ``session_slot_pool_size`` from config.
+    The slot count is a single per-mode definition: the active mode-profile
+    config's ``session_slot_pool_size`` (default/fast: 3, cheap: 2). The
+    time-based slot scheduler was removed (operator-directed simplification
+    LP-0MTZRM5HV0007S0V) — there is no schedule-aware live slot count.
     Returns 1 as a safe default when nothing is configured.
     """
-    # Live slot scheduler (schedule-aware; e.g. 6 day / 8 night).
-    try:
-        import proxy.server as _srv
-
-        scheduler = getattr(_srv, "slot_scheduler", None)
-        if scheduler is not None and hasattr(scheduler, "get_active_slot"):
-            slots = scheduler.get_active_slot()
-            if slots and int(slots) > 0:
-                return int(slots)
-    except Exception:
-        pass
-
     server_cfg = config.get("server", config)
     try:
         val = server_cfg.get("session_slot_pool_size")
@@ -555,50 +582,29 @@ def _get_active_local_slots(config: dict) -> int:
     return 1
 
 
-# Default fraction of the effective per-slot context at which the proxy
-# emits a session-context-pressure warning suggesting compaction
-# (LP-0MSDCLQ2W001LGWC). Configurable via ``context_pressure_warn_ratio``
-# on the server config; 0 disables the warning.
-_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO = 0.8
-
-
 def _get_active_local_ctx_size(config: dict) -> int:
-    """Return the currently active local context size (schedule-aware).
+    """Return the currently active local context size.
 
-    Prefers the live slot scheduler's per-period ``ctx_size`` (the ACTIVE
-    schedule entry's override, LP-0MSLNK96T0018W4D); falls back to the
-    static ``local_model_ctx_size`` from config, which ``restart_services``
-    keeps in sync with the last applied transition. Mirrors
-    ``_get_active_local_slots``.
+    Static ``local_model_ctx_size`` from the active mode-profile config; the
+    time-based slot scheduler was removed (operator-directed simplification
+    LP-0MTZRM5HV0007S0V) so there is no per-period override.
     """
-    try:
-        import proxy.server as _srv
-
-        scheduler = getattr(_srv, "slot_scheduler", None)
-        if scheduler is not None and hasattr(scheduler, "get_active_ctx_size"):
-            ctx = scheduler.get_active_ctx_size()
-            if ctx and int(ctx) > 0:
-                return int(ctx)
-    except Exception:
-        pass
     return _get_local_model_ctx_size(config)
 
 
 def _get_context_pressure_warn_ratio(config: dict) -> float:
-    """Read the context-pressure warning ratio from config.
+    """Return the unified session-detection ratio.
 
-    Supports both nested (server.*) and flat keys. 0 disables the warning.
-    Defaults to ``_DEFAULT_CONTEXT_PRESSURE_WARN_RATIO`` (0.8).
+    LP-0MTVXP7DG00613ZB AC3: ``context_pressure_warn_ratio`` is no longer a
+    separate operator knob — the advisory warning fires at the single
+    ``compaction_trigger_ratio`` detection threshold. The legacy key is
+    ignored; this function remains the single read point for the routing-time
+    advisory log.
     """
-    val = config.get("context_pressure_warn_ratio")
-    if val is None:
-        val = config.get("server", {}).get(
-            "context_pressure_warn_ratio", _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
-        )
     try:
-        ratio = float(val or 0)
-    except (ValueError, TypeError):
-        return _DEFAULT_CONTEXT_PRESSURE_WARN_RATIO
+        ratio = float(compaction_config(config)["trigger_ratio"])
+    except Exception:
+        ratio = _DEFAULT_COMPACTION_TRIGGER_RATIO
     return max(0.0, ratio)
 
 
@@ -627,12 +633,13 @@ def context_pressure_ratio(estimated_tokens: int, ctx_size: int, slots: int) -> 
 
 def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
     """Whether a session at ``estimated_tokens`` should trigger the
-    context-pressure compaction warning.
+    context-pressure compaction advisory.
 
-    Uses the effective per-slot context (clamped with output headroom) and
-    the configured ``context_pressure_warn_ratio`` (default 0.8). Returns
-    False when the clamp is disabled (ctx_size 0), the ratio is 0, or the
-    session is below the ratio.
+    LP-0MTVXP7DG00613ZB AC3: the advisory fires at the SAME threshold as
+    prompt-assembly compaction (``compaction_trigger_ratio`` × effective
+    per-slot clamp, strict ``>``) — one detection knob drives both the
+    advisory log and the live compaction path. Returns False when compaction
+    is disabled (trigger 0) or the session is at/below the trigger.
 
     Args:
         estimated_tokens: Session estimated prompt/context tokens.
@@ -641,14 +648,17 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
     Returns:
         True when the session should be flagged for compaction.
     """
-    ctx_size = _get_local_model_ctx_size(config)
-    if ctx_size <= 0 or estimated_tokens <= 0:
+    if estimated_tokens <= 0:
         return False
-    slots = _get_active_local_slots(config)
-    ratio = _get_context_pressure_warn_ratio(config)
-    if ratio <= 0:
+    try:
+        from proxy.compaction import compaction_trigger_tokens
+
+        trigger = compaction_trigger_tokens("fast", config)
+    except Exception:
         return False
-    return context_pressure_ratio(estimated_tokens, ctx_size, slots) >= ratio
+    if trigger <= 0:
+        return False
+    return int(estimated_tokens) > trigger
 
 
 # ===================================================================
@@ -656,8 +666,9 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
 # ===================================================================
 
 # Default compaction trigger ratio (0.70 × effective per-slot context).
-# Fires before the 0.8 context_pressure warn ratio, giving proactive
-# compaction rather than reactive warning.
+# LP-0MTVXP7DG00613ZB AC3: this is the SINGLE detection knob — the
+# context_pressure advisory, the live compaction path and the 429 gate all
+# fire from it (the legacy 0.8 context_pressure_warn_ratio is retired).
 _DEFAULT_COMPACTION_TRIGGER_RATIO = 0.70
 
 # Default summarizer context size (tokens). 8192 is enough for a short
@@ -668,14 +679,151 @@ _DEFAULT_SUMMARIZER_CTX_SIZE = 8192
 # is enough for a concise middle-turn condensation without wasting GPU.
 _DEFAULT_SUMMARIZER_MAX_TOKENS = 512
 
+# Default HTTP timeout for the local summarizer call to llama-server.
+# 600 seconds (10 minutes) — allows the summariser to wait for the local
+# slot to become free when it is occupied by a long generating stream.
+# This is critical for 1-slot deployments where a single generating request
+# can hold the slot for many minutes (observed max dispatch_first_byte_ms
+# was 713 s; sessions blocked 17-18 min before the 900 s upstream timeout
+# fired).  See LP-0MU1RXEY10075TUU.
+# An operator may override via ``server.compaction_summarizer_timeout``.
+_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS = 600.0
+
+# Retry policy for transient summarizer failures (R3, LP-0MTTPXIAB0031AC4).
+# The summarizer retries connection errors / read timeouts / 5xx / 429 up to
+# ``summarizer_retries`` times (default 2) with a fixed inter-attempt delay
+# before failing open (returns ""). Other 4xx responses (auth, model-not-
+# found, …) are permanent and never retried. Configurable via
+# ``server.compaction_summarizer_retries`` and
+# ``server.compaction_summarizer_retry_delay_seconds``; 0 disables retries.
+_DEFAULT_SUMMARIZER_RETRIES = 2
+_DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS = 0.5
+
 # Dedicated system prompt for the proxy-side compaction summariser.
-# Keeps the summariser focused on content condensation, not creative writing.
+#
+# Rationale (LP-0MTTSL2AW000A5OG — R1 companion): Pi delivers summarization
+# instructions through TWO separate messages — SUMMARIZATION_SYSTEM_PROMPT
+# (role + guard rails, dist/core/compaction/utils.js) and SUMMARIZATION_PROMPT
+# (the structured format template, dist/core/compaction/compaction.js).
+# R1 (LP-0MTTPXHTI0081WIR) merged both into a single system-prompt constant;
+# this companion restores Pi's exact split so the model treats the transcript
+# as material to summarise, not a conversation to continue:
+#   - _SUMMARIZER_SYSTEM_PROMPT — role + "Do NOT continue / Do NOT respond /
+#     ONLY output" guard rails (verbatim Pi SUMMARIZATION_SYSTEM_PROMPT).
+#   - _SUMMARIZATION_PROMPT — the structured format template (Goal,
+#     Constraints, Progress, Decisions, Next Steps, Critical Context),
+#     appended AFTER the serialised <conversation> in the summarizer's USER
+#     message (see proxy/compaction_summarizer.py:build_local_summarizer).
+# Keeping Pi's wording verbatim closes the prompt-quality gap from the
+# compaction comparison (docs/session-compaction-pi-comparison.md §5.1) and
+# avoids format drift across the local Qwen3 and future remote `compact`
+# (Muse → DeepSeek, LP-0MTT0O74N009E7N2) paths. Operators may override this
+# system prompt per-installation by dropping a file at
+# .sorraAgents/prompts/compaction-summarizer.txt (see
+# proxy/compaction_summarizer.py:_resolve_system_prompt_override).
 _SUMMARIZER_SYSTEM_PROMPT = (
-    "Summarise the middle portion of this conversation for context retention. "
-    "Preserve essential instructions, decisions, and key facts. "
-    "Omit routine back-and-forth, acknowledgments, and redundant context. "
-    "Write in a neutral, concise style suitable for feeding into a subsequent "
-    "LLM prompt. Do NOT include any preamble or closing remarks."
+    "You are a context summarization assistant. Your task is to read a "
+    "conversation between a user and an AI coding assistant, then produce "
+    "a structured summary following the exact format specified.\n"
+    "\n"
+    "Do NOT continue the conversation. Do NOT respond to any questions in the "
+    "conversation. ONLY output the structured summary."
+)
+
+# Structured summarization format template — verbatim Pi SUMMARIZATION_PROMPT
+# (dist/core/compaction/compaction.js). Delivered in the summarizer's USER
+# message directly after the serialised <conversation> so the model follows
+# the exact checkpoint format below for the condensed middle turns. File
+# operations (<read-files>/<modified-files>) are appended to the OUTPUT by
+# the file-ops tracker (R2, LP-0MTTPXI1Y003YFOU), matching Pi's
+# utils.js:formatFileOperations — they are not part of the template.
+_SUMMARIZATION_PROMPT = (
+    "The messages above are a conversation to summarize. Create a structured "
+    "context checkpoint summary that another LLM will use to continue the work.\n"
+    "\n"
+    "Use this EXACT format:\n"
+    "\n"
+    "## Goal\n"
+    "[What is the user trying to accomplish? Can be multiple items if the "
+    "session covers different tasks.]\n"
+    "\n"
+    "## Constraints & Preferences\n"
+    "- [Any constraints, preferences, or requirements mentioned by user]\n"
+    "- [Or \"(none)\" if none were mentioned]\n"
+    "\n"
+    "## Progress\n"
+    "### Done\n"
+    "- [x] [Completed tasks/changes]\n"
+    "\n"
+    "### In Progress\n"
+    "- [ ] [Current work]\n"
+    "\n"
+    "### Blocked\n"
+    "- [Issues preventing progress, if any]\n"
+    "\n"
+    "## Key Decisions\n"
+    "- **[Decision]**: [Brief rationale]\n"
+    "\n"
+    "## Next Steps\n"
+    "1. [Ordered list of what should happen next]\n"
+    "\n"
+    "## Critical Context\n"
+    "- [Any data, examples, or references needed to continue]\n"
+    "- [Or \"(none)\" if not applicable]\n"
+    "\n"
+    "Keep each section concise. Preserve exact file paths, function names, "
+    "and error messages."
+)
+
+# Incremental summarization template — verbatim Pi UPDATE_SUMMARIZATION_PROMPT
+# (dist/core/compaction/compaction.js). Used (R5, LP-0MTTPXIIX005Y0Z9) when the
+# session already carries a compaction summary: the summarizer merges the NEW
+# middle turns into the existing summary rather than regenerating from scratch,
+# preserving all prior sections and updating only what changed. The existing
+# summary is passed in the ``<previous-summary>`` block that precedes this
+# template in the USER message (see proxy/compaction_summarizer.py).
+_UPDATE_SUMMARIZATION_PROMPT = (
+    "The messages above are NEW conversation messages to incorporate into the "
+    "existing summary provided in <previous-summary> tags.\n"
+    "\n"
+    "Update the existing structured summary with new information. RULES:\n"
+    "- PRESERVE all existing information from the previous summary\n"
+    "- ADD new progress, decisions, and context from the new messages\n"
+    "- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" "
+    "when completed\n"
+    "- UPDATE \"Next Steps\" based on what was accomplished\n"
+    "- PRESERVE exact file paths, function names, and error messages\n"
+    "- If something is no longer relevant, you may remove it\n"
+    "\n"
+    "Use this EXACT format:\n"
+    "\n"
+    "## Goal\n"
+    "[Preserve existing goals, add new ones if the task expanded]\n"
+    "\n"
+    "## Constraints & Preferences\n"
+    "- [Preserve existing, add new ones discovered]\n"
+    "\n"
+    "## Progress\n"
+    "### Done\n"
+    "- [x] [Include previously done items AND newly completed items]\n"
+    "\n"
+    "### In Progress\n"
+    "- [ ] [Current work - update based on progress]\n"
+    "\n"
+    "### Blocked\n"
+    "- [Current blockers - remove if resolved]\n"
+    "\n"
+    "## Key Decisions\n"
+    "- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n"
+    "\n"
+    "## Next Steps\n"
+    "1. [Update based on current state]\n"
+    "\n"
+    "## Critical Context\n"
+    "- [Preserve important context, add new if needed]\n"
+    "\n"
+    "Keep each section concise. Preserve exact file paths, function names, "
+    "and error messages."
 )
 
 
@@ -696,6 +844,9 @@ def compaction_config(config: dict) -> dict:
             - summarizer_ctx_size (int): Context size for the summariser.
             - summarizer_max_tokens (int): Max output tokens for summary.
             - summarizer_system_prompt (str): Dedicated system prompt.
+            - summarizer_retries (int): Retries on transient failures
+              (0 disables).
+            - summarizer_retry_delay_seconds (float): Inter-attempt delay.
     """
     server = config.get("server", {})
 
@@ -735,6 +886,36 @@ def compaction_config(config: dict) -> dict:
     except (ValueError, TypeError):
         max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
 
+    # Summarizer retries (transient failures only; 0 disables)
+    retries = server.get("compaction_summarizer_retries")
+    if retries is None:
+        retries = config.get("compaction_summarizer_retries")
+    try:
+        retries = int(retries)
+        retries = max(0, retries)
+    except (ValueError, TypeError):
+        retries = _DEFAULT_SUMMARIZER_RETRIES
+
+    # Summarizer retry inter-attempt delay (seconds; 0 = no wait)
+    retry_delay = server.get("compaction_summarizer_retry_delay_seconds")
+    if retry_delay is None:
+        retry_delay = config.get("compaction_summarizer_retry_delay_seconds")
+    try:
+        retry_delay = float(retry_delay)
+        retry_delay = max(0.0, retry_delay)
+    except (ValueError, TypeError):
+        retry_delay = _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS
+
+    # Summarizer HTTP timeout (seconds; allows waiting for slot to free)
+    timeout = server.get("compaction_summarizer_timeout")
+    if timeout is None:
+        timeout = config.get("compaction_summarizer_timeout")
+    try:
+        timeout = float(timeout)
+        timeout = max(1.0, timeout)
+    except (ValueError, TypeError):
+        timeout = _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
+
     return {
         "trigger_ratio": trigger_ratio,
         "summarizer_model_type": summarizer_model_type,
@@ -742,6 +923,9 @@ def compaction_config(config: dict) -> dict:
         "summarizer_ctx_size": ctx_size,
         "summarizer_max_tokens": max_tokens,
         "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
+        "summarizer_retries": retries,
+        "summarizer_retry_delay_seconds": retry_delay,
+        "summarizer_timeout_seconds": timeout,
     }
 
 
@@ -882,12 +1066,13 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
 
 
 def _collect_local_ctx_pairs(config: dict) -> list[tuple[int, int]]:
-    """All (ctx_size, slots) pairs the proxy may run with.
+    """The single (ctx_size, slots) pair the active mode profile runs with.
 
-    The static ``local_model_ctx_size``/``session_slot_pool_size`` pair plus
-    every ``slot_schedule`` entry, where an entry's per-period ``ctx_size``
-    overrides the global value (falling back to it when unset)
-    (LP-0MSLNK96T0018W4D). Pairs are de-duplicated while preserving order.
+    Derived from the static ``local_model_ctx_size`` and
+    ``session_slot_pool_size`` of the active profile. The time-based slot
+    scheduler (whose entries could add per-period pairs) was removed
+    (operator-directed simplification LP-0MTZRM5HV0007S0V), so there is
+    exactly one pair.
     """
     server_cfg = config.get("server", config)
     ctx_size = _get_local_model_ctx_size(config)
@@ -898,18 +1083,6 @@ def _collect_local_ctx_pairs(config: dict) -> list[tuple[int, int]]:
         pool = 0
     if pool > 0:
         pairs.append((ctx_size, pool))
-
-    try:
-        from proxy.slot_scheduler import SlotScheduleConfig
-
-        schedule = SlotScheduleConfig.from_server_config(server_cfg)
-    except Exception:
-        schedule = None
-    if schedule is not None and schedule.enabled:
-        for entry in schedule.entries:
-            entry_ctx = entry.ctx_size if entry.ctx_size is not None else ctx_size
-            if entry.slots > 0 and (entry_ctx, entry.slots) not in pairs:
-                pairs.append((entry_ctx, entry.slots))
     return pairs
 
 
@@ -938,7 +1111,7 @@ def _get_min_local_routing_threshold(config: dict) -> int:
 # Per-mode ratio of the effective per-slot context below which local routing
 # is allowed.  Ratios are applied against the *effective per-slot threshold*
 # (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``) so they
-# automatically rescale when ``slot_schedule`` changes.
+# automatically rescale when the mode profile's slot count changes.
 #
 # Resolved caps (operator-approved 2026-08-27):
 #   fast:  70 000 tokens  → ratio 70000/83285 ≈ 0.84049
@@ -1009,11 +1182,12 @@ def compute_hard_routing_cap(mode: str, config: dict) -> int:
     available, the cheap profile falls back to its static pair
     (local_model_ctx_size=131072, 2 slots) → per-slot clamp
     min(100000, 61440)=61440 → 0.6144 × 61440 ≈ 37749, NOT the approved
-    61440.  Production always runs the live scheduler (both schedule entries
-    override ctx to 262144), so the approved absolute holds; the transient
-    boot-static value is strictly more conservative (never routes local what
-    the scheduled view would allow) and is accepted per the item's "caps
-    rescale automatically when slot_schedule changes" caveat.
+    61440.  Production always runs the active mode profile's static pair
+    (session_slot_pool_size set in the profile, per-slot ctx derived from
+    local_model_ctx_size), so the approved absolute holds; the transient
+    boot-static value is strictly more conservative and is accepted per the
+    item's "caps rescale automatically when the profile's slot count
+    changes" caveat.
 
     Args:
         mode: Operating mode ("fast" or "cheap").
@@ -1134,11 +1308,9 @@ def validate_local_routing_config(config: dict) -> list[str]:
 
     Computes the effective per-slot large-context routing threshold
     (``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``, mirroring
-    ``_effective_large_context_thresholds``) for EVERY (ctx_size, slots)
-    pair the proxy may run with — the static
-    ``local_model_ctx_size``/``session_slot_pool_size`` AND all
-    ``slot_schedule`` entries (each entry's per-period ``ctx_size``
-    overriding the global when set, LP-0MSLNK96T0018W4D) — and reports a
+    ``_effective_large_context_thresholds``) for the (ctx_size, slots) pair
+    the active mode profile runs with — the static
+    ``local_model_ctx_size``/``session_slot_pool_size`` — and reports a
     problem when the threshold falls below the configured minimum (default
     10000 tokens).
 
@@ -1482,6 +1654,53 @@ def get_remote_endpoint(model_config: dict) -> str | None:
         if isinstance(p, dict) and p.get("type") == "remote":
             return p.get("endpoint")
     return None
+
+
+def _get_local_provider_endpoint(provider_cfg: dict, config: dict) -> str:
+    """Resolve the endpoint URL for a ``type: local`` provider entry.
+
+    When the provider config declares an explicit ``endpoint`` field, that
+    URL is returned unchanged (LP-0MRPILSMW004T4H8). Otherwise the legacy
+    single-server default ``http://localhost:{llama_server_port}`` (default
+    port 8080) is used for backward compatibility.
+
+    Args:
+        provider_cfg: The provider config dict (must be ``type: local``).
+        config: Server configuration dict (for ``server.llama_server_port``).
+
+    Returns:
+        The resolved endpoint URL string (no trailing slash).
+    """
+    endpoint = provider_cfg.get("endpoint")
+    if endpoint:
+        return str(endpoint).rstrip("/")
+    try:
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+    except (TypeError, ValueError):
+        port = 8080
+    return f"http://localhost:{port}"
+
+
+def _check_local_backend_gpu_oom(endpoint: str, body_text: str) -> bool:
+    """Detect GPU OOM / allocation-failure patterns in a local backend response.
+
+    Scope of this helper is the 5GB/8GB-class single-GPU case: llama-server
+    surfaces memory exhaustion as 500 responses whose body contains patterns
+    like ``out of memory`` (LP-0MRPILSMW004T4H8 AC5b). When detected, the
+    requesting code should mark the provider unhealthy so the fallback chain
+    skips the wedged server instead of hammering it.
+
+    Detection is best-effort: llama-server may return generic 500s without a
+    distinguishable body. Slot-capacity probes (HTTP health + available-slot
+    count) supplement this in ``probe_local_backend``.
+    """
+    try:
+        from proxy.backend_health import _detect_gpu_oom_in_text
+
+        return _detect_gpu_oom_in_text(body_text or "")
+    except Exception:
+        return False
 
 
 def mark_provider_unavailable(
@@ -1852,6 +2071,23 @@ def _get_cooldown_seconds(config: dict) -> float:
     val = config.get("provider_cooldown_seconds")
     if val is None:
         val = config.get("server", {}).get("provider_cooldown_seconds", 60)
+    return float(val)
+
+
+def _get_empty_response_max_cooldown_seconds(config: dict) -> float:
+    """Read ``empty_response_max_cooldown_seconds`` from config.
+
+    Checks ``config[\"empty_response_max_cooldown_seconds\"]`` (flat) first
+    for backward compatibility with unit tests, then falls back to
+    ``config[\"server\"][\"empty_response_max_cooldown_seconds\"]`` (nested)
+    for production configs.  Defaults to 10.
+    """
+    val = config.get("empty_response_max_cooldown_seconds")
+    if val is None:
+        val = config.get("server", {}).get(
+            "empty_response_max_cooldown_seconds",
+            _EMPTY_RESPONSE_MAX_COOLDOWN_SECONDS,
+        )
     return float(val)
 
 
@@ -2414,7 +2650,6 @@ def _get_proxy_to_remote():
 
 def _get_proxy_to_local():
     """Lazily import proxy_to_local.
-
     Select the best available implementation:
     - If `proxy.server.proxy_to_local` has been monkeypatched (differs from
       the router implementation), prefer that so server-level patches are used.
@@ -2459,12 +2694,60 @@ def _get_proxy_to_local():
     raise ImportError('No proxy_to_local implementation available')
 
 
-def _get_local_concurrency_info(config: dict) -> tuple:
+def _local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
+    """Per-endpoint-aware wrapper around ``_get_local_concurrency_info``.
+
+    Tests monkeypatch ``_get_local_concurrency_info`` with callables that only
+    accept ``(config)``; passing the endpoint kwarg would break them. This
+    helper inspects the callable signature and only forwards the endpoint when
+    it is accepted (LP-0MRPILSMW004T4H8).
+    """
+    fn = _get_local_concurrency_info
+    try:
+        sig = inspect.signature(fn)
+        accepts_endpoint = (
+            "endpoint" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except Exception:
+        accepts_endpoint = False
+    if accepts_endpoint and endpoint is not None:
+        return fn(config, endpoint=endpoint)
+    return fn(config)
+
+
+def _dispatch_local(ptr_local, request, path, endpoint: str | None):
+    """Dispatch to a local backend, passing the endpoint when supported.
+
+    The endpoint argument was added for multi-backend support
+    (LP-0MRPILSMW004T4H8). Legacy implementations / test mocks that accept
+    only ``(request, path)`` keep working by falling back to the default
+    endpoint resolution inside ``proxy_to_local``.
+    """
+    try:
+        sig = inspect.signature(ptr_local)
+        accepts_endpoint = "endpoint" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except Exception:
+        accepts_endpoint = False
+    if accepts_endpoint:
+        return ptr_local(request, path, endpoint=endpoint)
+    return ptr_local(request, path)
+
+
+def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
     """Lazily import and return (current_generating_active, max_local) from config.
 
     Generating-only pool (LP-0MTH7JX82000YS5N): occupancy is measured as the
     number of sessions currently in the generating phase (first-byte onward).
     Prefill time does not count against session_slot_pool_size.
+
+    When *endpoint* is provided (a full ``http://host:port`` URL), the active
+    count is scoped to that specific llama-server instance via its
+    per-endpoint dispatch records, so each server's slot pool is evaluated
+    independently (LP-0MRPILSMW004T4H8). When it is None (legacy
+    single-server mode), the global ``local_generating_queries`` counter is
+    used.
 
     Returns the current generating-only count and the configured
     local concurrency limit.  Reads ``session_slot_pool_size`` (same value
@@ -2472,15 +2755,60 @@ def _get_local_concurrency_info(config: dict) -> tuple:
     ``local_max_concurrent_queries`` fallback was removed (LP-0MTCZ35X7009IZKE)
     and a missing value is caught at launch by
     ``validate_local_routing_config``.  Defaults to (0, 1) on error.
+
     """
     cur_active = 0
     max_local = 1
     try:
         import proxy.server as _srv
-        try:
-            cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
-        except Exception:
-            cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+        if endpoint:
+            # Per-endpoint active count: count active/unexpired per-endpoint
+            # dispatch records for this endpoint.
+            records = getattr(_srv, "local_dispatch_records", None)
+            # The legacy single-server default URL (used when a ``type:
+            # local`` provider declares no explicit endpoint). Plain-key
+            # records (created by the pre-multi-backend code paths) occupy
+            # this default server (LP-0MRPILSMW004T4H8 backward compat).
+            try:
+                _server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+                default_ep = "http://localhost:{}".format(
+                    int(_server_cfg.get("llama_server_port", 8080) or 8080)
+                )
+            except (TypeError, ValueError):
+                default_ep = "http://localhost:8080"
+            if isinstance(records, dict):
+                if endpoint == default_ep and not any(
+                    isinstance(k, tuple) for k in records
+                ):
+                    # Pure legacy state (records keyed by plain session ids):
+                    # the global generating counter is authoritative and must
+                    # gate exactly as it did before multi-backend support.
+                    try:
+                        cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+                    except Exception:
+                        cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+                else:
+                    now = time.monotonic()
+                    for key, record in records.items():
+                        if isinstance(key, tuple) and len(key) == 2 and key[0] == endpoint:
+                            if record.get("active") or record.get("expires_at", 0) > now:
+                                cur_active += 1
+                        elif not isinstance(key, tuple) and endpoint == default_ep:
+                            # Legacy plain-key record occupies the default
+                            # server's pool alongside tuple-keyed records.
+                            if record.get("active") or record.get("expires_at", 0) > now:
+                                cur_active += 1
+            else:
+                try:
+                    cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+                except Exception:
+                    cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+        else:
+            try:
+                cur_active = max(0, int(getattr(_srv, 'local_generating_queries', 0) or 0))
+            except Exception:
+                cur_active = max(0, int(getattr(_srv, 'local_active_queries', 0) or 0))
+
     except Exception:
         pass
     try:
@@ -2496,14 +2824,14 @@ def _get_local_concurrency_info(config: dict) -> tuple:
 # ---------------------------------------------------------------------------
 
 def _contention_queue_enabled(config: dict) -> bool:
-    """True when the contention queue should engage: queue policy AND cheap mode.
+    """True when the contention queue should engage: queue policy.
 
     The per-mode policy comes from the active mode config
-    (``contention_queue_policy``; config-cheap.yaml declares ``queue``,
-    config-fast.yaml declares ``fallback``). Belt-and-braces: the queue also
-    requires ``proxy.mode.read_mode() == "cheap"`` so an operator override of
-    LLAMA_PROXY_CONFIG cannot enable queueing in fast mode (LP-0MSORQVK50012Q4D
-    constraint 5). Fail-open: any error → queue disabled (today's behavior).
+    (``contention_queue_policy``; config-cheap.yaml declares ``queue`` with
+    depth 8 / wait 120s, config-fast.yaml declares ``queue`` with depth 3 /
+    wait 45s — LP-0MTQYIK4Z008XF2V). The active mode's config determines
+    the depth and wait caps; the policy gate ensures ``fallback`` config
+    files never engage the queue. Fail-open: any error → queue disabled.
     """
     try:
         from proxy.router import _get_contention_queue_config
@@ -2512,9 +2840,7 @@ def _contention_queue_enabled(config: dict) -> bool:
         cq = _get_contention_queue_config(server_cfg)
         if cq["policy"] != "queue":
             return False
-        from proxy.mode import read_mode
-
-        return read_mode() == "cheap"
+        return True
     except Exception:
         return False
 
@@ -2736,11 +3062,17 @@ def _has_next_provider(
 def _failure_domain_key(provider_cfg: dict) -> str:
     """Return a canonical failure-domain key for a provider entry.
 
-    Remote entries key on the normalized ``endpoint`` URL: scheme and host
-    lowercased, default ports dropped, trailing slash and fragment stripped,
-    path case and query strings preserved. Local / no-endpoint entries fall
-    back to the ``provider`` brand, then to the entry name (last resort so
-    entries without either never share a key).
+    Remote entries (with an ``endpoint``) key on the normalized endpoint URL
+    PLUS the upstream ``model``: ``normalized_endpoint:model``. This allows
+    router endpoints (e.g. ``https://opencode.ai/zen/go``) to distinguish
+    between different upstream models — a failure for model A does not exclude
+    model B on the same gateway.
+
+    When no ``model`` is provided for a remote entry, a wildcard ``*`` is used
+    so all such entries on the same endpoint still share one domain.
+
+    Local / no-endpoint entries fall back to the ``provider`` brand, then to
+    the entry name (last resort so entries without either never share a key).
 
     Entries that share a failure-domain key are treated as ONE failure domain:
     a stall/terminal error on one entry excludes the whole domain from the
@@ -2750,7 +3082,8 @@ def _failure_domain_key(provider_cfg: dict) -> str:
     if endpoint:
         normalized = _normalize_endpoint_for_failure_domain(str(endpoint))
         if normalized:
-            return normalized
+            model = provider_cfg.get("model") or "*"
+            return f"{normalized}:{model}"
     brand = provider_cfg.get("provider")
     if brand:
         return str(brand)
@@ -3552,6 +3885,113 @@ def _observe_http_error_400(
         pass
 
 
+def _reset_local_http_400_streak(session_id: str | None, provider_name: str) -> None:
+    """Reset the deterministic local-400 streak after a successful dispatch.
+
+    A session whose local 400s are interspersed with successful local
+    dispatches is NOT deterministic — only an unbroken same-session run of
+    400s escalates (LP-0MTXEBQ4E001BMI2, mirroring the sibling-failure
+    streak semantics). Called from the local success paths of
+    ``_proxy_with_fallback_cycle``.
+    """
+    key = (session_id or "unknown", provider_name)
+    _local_http_400_streaks.pop(key, None)
+
+
+def _prune_local_http_400_streaks(now: float) -> None:
+    """Drop stale (session, provider) local-400 streak entries.
+
+    Keeps the in-memory streak dict bounded (LP-0MTXEBQ4E001BMI2); entries
+    whose window has fully elapsed are removed on the prune path.
+    """
+    for key in list(_local_http_400_streaks):
+        entry = _local_http_400_streaks[key]
+        if now - float(entry.get("start", 0.0)) > _DETERMINISTIC_LOCAL_400_WINDOW_SECONDS:
+            del _local_http_400_streaks[key]
+
+
+def _observe_local_http_error_400(
+    response: Response,
+    provider_name: str,
+    path: str,
+    body_text: str,
+    session_id: str | None = None,
+) -> None:
+    """Observability for local HTTP 400 fallbacks (LP-0MTXEBQ4E001BMI2).
+
+    A local 400 is otherwise silent: the local-4xx branch falls back to the
+    next provider without cooldown and without any log/metric, so a
+    request-shape rejection that is deterministic for a session (repeats
+    turn after turn on the same history) invisibly routes remote forever.
+
+    This helper makes every occurrence visible:
+
+    1. **Per occurrence (AC1):** INFO log line with the upstream body
+       snippet plus ``proxy_http_errors_total{status=400, reason="local_http_400"}``
+       so the rejection cause is discoverable (the snippet is the first
+       diagnostic an operator needs to root-cause a compacted-pointer or
+       request-shape 400).
+    2. **Deterministic repeat (AC2):** when the same session repeats the
+       400 within the sliding window (threshold ``_DETERMINISTIC_LOCAL_400_THRESHOLD``),
+       a WARNING + ``local_http_400_deterministic`` metric escalates the
+       failure instead of silently routing remote each turn.
+
+    Transient one-off 400s never cooldown the local provider (the caller's
+    ``http_error_no_cooldown`` path is unchanged — AC4). Best-effort: never
+    raises.
+    """
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return
+        snippet = (body_text or "")[:512]
+        logger.info(
+            "Local HTTP 400 from provider=%s model=%s session=%s body_snippet=%s",
+            provider_name,
+            path,
+            session_id or "unknown",
+            snippet,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", "local_http_400")
+        except Exception:
+            pass
+
+        # Deterministic-repeat escalation (AC2): same session + provider
+        # rejecting turn after turn is a request-shape incompatibility that
+        # will recur every turn; make it visible instead of silent routing.
+        key = (session_id or "unknown", provider_name)
+        now = time.monotonic()
+        entry = _local_http_400_streaks.get(key)
+        if entry is None or now - float(entry.get("start", 0.0)) > _DETERMINISTIC_LOCAL_400_WINDOW_SECONDS:
+            entry = {"count": 0, "start": now}
+            _local_http_400_streaks[key] = entry
+            if len(_local_http_400_streaks) > _MAX_LOCAL_HTTP_400_STREAK_ENTRIES:
+                _prune_local_http_400_streaks(now)
+        entry["count"] = int(entry.get("count", 0) or 0) + 1
+        if int(entry["count"]) >= _DETERMINISTIC_LOCAL_400_THRESHOLD:
+            logger.warning(
+                "Deterministic local HTTP 400: provider=%s model=%s session=%s "
+                "consecutive=%d threshold=%d body_snippet=%s — local rejects this "
+                "history every turn; inspect llama-server for the request-shape cause",
+                provider_name,
+                path,
+                session_id or "unknown",
+                int(entry["count"]),
+                _DETERMINISTIC_LOCAL_400_THRESHOLD,
+                snippet,
+            )
+            try:
+                from proxy.metrics import record_http_error
+
+                record_http_error(path, "400", "local_http_400_deterministic")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _handle_empty_response_with_cooldown(
     response: Response,
     provider_name: str,
@@ -3559,12 +3999,15 @@ def _handle_empty_response_with_cooldown(
     cooldown_seconds: float,
     attempts: list[dict[str, Any]],
     body_text: str,
+    config: dict | None = None,
 ) -> float:
     """Handle an empty (non-reasoning) successful response: compute effective
     cooldown, mark the provider unavailable, record a diagnostic attempt entry,
     and return the effective cooldown duration.
 
-    Applies exponential backoff for remote providers.
+    Applies exponential backoff for remote providers, capped at
+    ``empty_response_max_cooldown_seconds`` (default 10s).  Retry-After
+    headers still override upward.
 
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
@@ -3582,6 +4025,13 @@ def _handle_empty_response_with_cooldown(
         )
         cooldown = min(backoff, cooldown_seconds)
         _provider_failure_count[provider_name] = count + 1
+
+    # Cap for empty responses (LP-0MTVPJBF0001SQF4): transient quirks deserve
+    # a lighter penalty than hard failures.  Retry-After still overrides
+    # upward (checked below).
+    if config is not None:
+        max_cd = _get_empty_response_max_cooldown_seconds(config)
+        cooldown = min(cooldown, max_cd)
 
     # Respect Retry-After header regardless of backoff
     if retry_after is not None:
@@ -4282,7 +4732,7 @@ async def _proxy_with_remote_fallback_cycle(
                     # Shared primitive: empty response with cooldown
                     _handle_empty_response_with_cooldown(
                         response, provider_name, provider_type,
-                        cooldown_seconds, attempts, body_text,
+                        cooldown_seconds, attempts, body_text, config,
                     )
                     # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
                     # track consecutive empty/stall failures across cycles.
@@ -4526,10 +4976,20 @@ async def _proxy_with_fallback_cycle(
             # Mark attempt
             any_provider_tried = True
             if provider_type == "local":
+                # Resolve the per-endpoint target for this local provider
+                # (LP-0MRPILSMW004T4H8). When the provider config has no
+                # explicit ``endpoint`` the legacy default is used, keeping
+                # single-server deployments working without changes.
+                local_endpoint = _get_local_provider_endpoint(provider_cfg, config)
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
                 # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
-                # provider without marking local as unavailable.
-                cur_local, max_local = _get_local_concurrency_info(config)
+                # provider without marking local as unavailable. The check is
+                # scoped per-endpoint so each llama-server's own slot pool is
+                # evaluated independently (LP-0MRPILSMW004T4H8).
+                cur_local, max_local = _local_concurrency_info(
+
+                    config, endpoint=local_endpoint
+                )
                 if cur_local >= max_local:
                     # Per-mode contention queue (LP-0MSORQVK50012Q4D): in cheap
                     # mode with policy=queue, a request that finds local slots
@@ -4751,7 +5211,7 @@ async def _proxy_with_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
-                response = await ptr_local(request, path)
+                response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
                 # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
                 # (429) is TERMINAL.  Without this, the local-4xx branch
@@ -4766,6 +5226,7 @@ async def _proxy_with_fallback_cycle(
                         status_code=int(getattr(response, "status_code", 0) or 0),
                     )
                     return response
+
             else:
                 # Proactive rate-limit check for remote providers
                 # (LP-0MQNRDUP4008KT6T: rate limiter for remote models)
@@ -4871,6 +5332,10 @@ async def _proxy_with_fallback_cycle(
                 prev_provider, fallback_reason, path,
             )
             if stream_result is not None:
+                # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
+                # local-400 streak (only unbroken same-session 400 runs escalate).
+                if provider_type == "local":
+                    _reset_local_http_400_streak(_session_id, provider_name)
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 if _pending_reroute:
@@ -4924,7 +5389,7 @@ async def _proxy_with_fallback_cycle(
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)
 
-                        retry_response = await ptr_local(request, path)
+                        retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                         retry_body_text = _response_body_text(retry_response)
                         retry_slot_info = _parse_slot_exhaustion(retry_response)
 
@@ -5008,6 +5473,33 @@ async def _proxy_with_fallback_cycle(
 
             # Check for HTTP error status
             if _is_http_error_status(response.status_code):
+                # GPU OOM detection for local backends (LP-0MRPILSMW004T4H8
+                # AC5b): a wedged server surfaces memory-exhaustion patterns in
+                # its error body. When detected, put the provider in cooldown
+                # so the fallback chain skips it instead of retrying a server
+                # that is OOM-thrashing.
+                if provider_type == "local" and _check_local_backend_gpu_oom(
+                    local_endpoint, body_text
+                ):
+                    logger.warning(
+                        "local_gpu_oom provider=%s endpoint=%s status=%s",
+                        provider_name, local_endpoint, response.status_code,
+                    )
+                    mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="gpu_oom",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                    )
+                    fallback_reason = "gpu_oom"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+
                 if _is_model_loading_response(response, body_text):
                     fallback_reason = "model_loading"
                     prev_provider = provider_name
@@ -5029,7 +5521,7 @@ async def _proxy_with_fallback_cycle(
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)
 
-                        retry_response = await ptr_local(request, path)
+                        retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                         retry_body_text = _response_body_text(retry_response)
                         _record_attempt(
                             attempts,
@@ -5078,6 +5570,19 @@ async def _proxy_with_fallback_cycle(
                             body_snippet=(body_text[:512] if body_text else None),
                         )
                         all_slot_exhaustion = False
+                        # LP-0MTXEBQ4E001BMI2: local 400s are otherwise silent —
+                        # log the upstream body snippet (AC1) and escalate when
+                        # the same session repeats the 400 (AC2), so a
+                        # deterministic compacted-history rejection never routes
+                        # remote invisibly turn after turn.
+                        if int(response.status_code) == 400:
+                            _observe_local_http_error_400(
+                                response,
+                                provider_name,
+                                path,
+                                body_text,
+                                _session_id,
+                            )
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
@@ -5166,7 +5671,7 @@ async def _proxy_with_fallback_cycle(
                         for retry_idx in range(1, local_slot_retry_attempts + 1):
                             if local_slot_retry_delay_seconds > 0:
                                 await asyncio.sleep(local_slot_retry_delay_seconds)
-                            retry_response = await ptr_local(request, path)
+                            retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                             retry_body_text = _response_body_text(retry_response)
                             _record_attempt(
                                 attempts,
@@ -5203,7 +5708,7 @@ async def _proxy_with_fallback_cycle(
                             # Shared primitive: empty response with cooldown
                             _handle_empty_response_with_cooldown(
                                 response, provider_name, provider_type,
-                                cooldown_seconds, attempts, body_text,
+                                cooldown_seconds, attempts, body_text, config,
                             )
                             _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                             attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -5215,7 +5720,7 @@ async def _proxy_with_fallback_cycle(
                         # Shared primitive: empty response with cooldown
                         _handle_empty_response_with_cooldown(
                             response, provider_name, provider_type,
-                            cooldown_seconds, attempts, body_text,
+                            cooldown_seconds, attempts, body_text, config,
                         )
                         _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
                         attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -5231,6 +5736,10 @@ async def _proxy_with_fallback_cycle(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
             )
+            # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
+            # local-400 streak (only unbroken same-session 400 runs escalate).
+            if provider_type == "local":
+                _reset_local_http_400_streak(_session_id, provider_name)
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result
@@ -5263,7 +5772,7 @@ async def _proxy_with_fallback_cycle(
                         if local_slot_retry_delay_seconds > 0:
                             await asyncio.sleep(local_slot_retry_delay_seconds)
                         try:
-                            retry_response = await ptr_local(request, path)
+                            retry_response = await _dispatch_local(ptr_local, request, path, local_endpoint)
                         except Exception as inner_exc:
                             retry_exc = inner_exc
                             _record_attempt(

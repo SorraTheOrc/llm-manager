@@ -14,6 +14,7 @@ and log-format drift do not break the analysis.
 
 from __future__ import annotations
 
+import gzip
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -90,10 +91,13 @@ RE_UPSTREAM_URL = re.compile(r"url=(\S+)")
 # upstream error type appears in the JSON body as {"type":"error","error":{"type":"<Type>",...}}.
 RE_UPSTREAM_BODY_TYPE = re.compile(r'"type":"(FreeUsageLimitError|[A-Za-z]+Error)"')
 
-# Rotated log naming: proxy.log.YYYY-MM-DD_HH (the timestamp is the rotation
-# time). Note: the name-encoded time does NOT reliably bound a file's content
-# span in this deployment — rotated files routinely hold data past it — so
-# discovery includes every rotated file and iter_events is the only boundary.
+# Rotated log naming: two mechanisms produce two naming patterns:
+#   - In-process TimedRotatingFileHandler → proxy.log.YYYY-MM-DD_HH  (dot)
+#   - Logrotate safety net (dateformat -%Y-%m-%d_%H) → proxy.log-YYYY-MM-DD_HH  (dash)
+# Both can hold data in the same time window, so discovery includes both.
+# The name-encoded time does NOT reliably bound a file's content span in
+# this deployment — rotated files routinely hold data past it — so discovery
+# includes every rotated file and iter_events is the only boundary.
 
 STREAM_STARTED = "Stream started"
 STREAM_FINISHED = "Stream finished"
@@ -517,6 +521,21 @@ def parse_log_line(line: str) -> LogEvent | None:
     return None
 
 
+def open_log_text(path: Path):
+    """Open a proxy log file for text reading, transparently decompressing ``.gz``.
+
+    Rotation may compress older files (logrotate ``compress``, or the
+    in-process handler's ``.gz`` retention). Detecting the ``.gz`` suffix here
+    keeps every caller free of compression concerns; without it a compressed
+    file is read as plain text, yields no parseable lines, and is silently
+    counted as scanned (real case: ``proxy.log.2026-09-13_00.gz`` held 778
+    stream starts that contributed nothing).
+    """
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
 def iter_events(
     path: Path,
     window_start: datetime,
@@ -534,10 +553,14 @@ def iter_events(
     finished`` events that cross the analysis window boundary (the caller
     clips them back to ``[window_start, window_end]``). Defaults to zero so
     callers that only care about in-window events are unchanged.
+
+    Rotated files may be gzipped (``.gz`` suffix). When detected, the file is
+    transparently decompressed so callers never need to distinguish between
+    plain and compressed rotated logs.
     """
     lo = window_start - margin
     hi = window_end + margin
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
+    with open_log_text(path) as fh:
         for line in fh:
             if len(line) < 24 or not line[:4].isdigit():
                 continue
@@ -553,14 +576,19 @@ def discover_log_files(log_dir: Path, window_start: datetime) -> list[Path]:
     """Return the log files in ``log_dir`` that can overlap the analysis
     window, sorted by name.
 
-    The live ``proxy.log`` is always included, and so is every rotated file
-    (``proxy.log.YYYY-MM-DD_HH``). The name-encoded timestamp does not
-    reliably bound a rotated file's content in this deployment — files
-    routinely hold data well past their encoded rotation time (e.g.
-    ``proxy.log.2026-08-07_03`` contains data until 09:03) — so any name- or
-    mtime-based inclusion test risks silently dropping in-window data.
-    ``iter_events`` per-line timestamp filtering remains the authoritative
-    boundary check.
+    The live ``proxy.log`` is always included, and so is every rotated file.
+    Two rotation mechanisms produce two naming patterns in this deployment:
+
+    - In-process ``TimedRotatingFileHandler`` → ``proxy.log.YYYY-MM-DD_HH``
+    - Logrotate safety net (``dateformat -%Y-%m-%d_%H``) → ``proxy.log-YYYY-MM-DD_HH``
+
+    Both can hold data in the same time window, so both are included. The
+    name-encoded timestamp does not reliably bound a rotated file's content
+    in this deployment — files routinely hold data well past their encoded
+    rotation time (e.g. ``proxy.log.2026-08-07_03`` contains data until
+    09:03) — so any name- or mtime-based inclusion test risks silently
+    dropping in-window data. ``iter_events`` per-line timestamp filtering
+    remains the authoritative boundary check.
 
     ``window_start`` is retained for API compatibility; discovery no longer
     depends on it.
@@ -570,6 +598,10 @@ def discover_log_files(log_dir: Path, window_start: datetime) -> list[Path]:
         return []
     candidates: list[Path] = []
     for p in sorted(log_dir.iterdir()):
-        if p.is_file() and (p.name == "proxy.log" or p.name.startswith("proxy.log.")):
+        if p.is_file() and (
+            p.name == "proxy.log"
+            or p.name.startswith("proxy.log.")
+            or p.name.startswith("proxy.log-")
+        ):
             candidates.append(p)
     return sorted(candidates, key=lambda p: p.name)

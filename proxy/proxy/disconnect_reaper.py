@@ -26,6 +26,7 @@ import logging
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 logger = logging.getLogger("llama-proxy.disconnect_reaper")
 
@@ -55,6 +56,32 @@ class DisconnectReaperMiddleware(BaseHTTPMiddleware):
                 reaper_registry[current_task] = request
         try:
             return await call_next(request)
+        except asyncio.CancelledError:
+            # The DisconnectReaper background loop may have cancelled this
+            # task because the client disconnected. This is expected and
+            # benign — it happened for one of two reasons:
+            #
+            #   1. Response already sent: the handler finished and Starlette
+            #      rendered the response, but the reaper won a race and
+            #      cancelled us while `call_next` was still unwinding. The
+            #      ASGI `send()` became a no-op (uvicorn swallows sends to
+            #      a disconnected client), so accessing uvicorn's "error"
+            #      logging is fine but the explicit ERROR traceback is noise.
+            #
+            #   2. Abandoned request cancelled mid-processing: there is no
+            #      client left to read a response, so sending a new one is
+            #      pointless — return a body that will be discarded as a
+            #      no-op send.
+            #
+            # Either way, swallow the CancelledError so it does not surface
+            # as an "ERROR: Exception in ASGI application" in the logs.
+            # A body-less 499 (client closed request) is never shown to a
+            # client; the send is a no-op for a genuinely gone client.
+            logger.debug(
+                "task cancelled (likely by DisconnectReaper); request=%s",
+                request.url.path,
+            )
+            return Response(status_code=499, content=b"")
         finally:
             if current_task is not None:
                 async with _REGISTRY_LOCK:
