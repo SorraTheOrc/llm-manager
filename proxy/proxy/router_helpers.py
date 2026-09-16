@@ -2371,7 +2371,7 @@ async def _handle_session(
             # dispatch body to the compacted full history and marks the
             # request full-prompt so forward + persistence stay consistent.
             try:
-                from proxy.compaction_summarizer import build_local_summarizer
+                from proxy.compaction_summarizer import build_compact_summarizer
                 from proxy.mode import read_mode as _read_mode
                 from proxy.provider import _estimate_prompt_tokens_for_routing
 
@@ -2379,11 +2379,16 @@ async def _handle_session(
                 # per request so decide_session_compaction has real
                 # capabilities rather than the always-None defaults
                 # that caused the compaction hang (LP-0MTPK77WG009A4VH).
+                # build_compact_summarizer uses the remote-only
+                # ``models.compact`` chain (Muse -> DeepSeek) so summaries
+                # never contend with the local GPU slots; it falls back to
+                # the local summarizer when ``models.compact`` is absent
+                # (LP-0MTT0O74N009E7N2).
                 _llama_port = server_config.get("llama_server_port", 8080)
                 _top_cfg = getattr(srv, "config", None)
                 if not isinstance(_top_cfg, dict):
                     _top_cfg = {"server": dict(server_config)}
-                _summarizer = build_local_summarizer(
+                _summarizer = build_compact_summarizer(
                     _top_cfg,
                     llama_port=_llama_port,
                 )

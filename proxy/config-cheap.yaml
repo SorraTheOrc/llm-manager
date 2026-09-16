@@ -403,6 +403,33 @@ models:
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
+
+  # Remote-only compaction summarizer chain (LP-0MTT0O74N009E7N2): the
+  # proxy-side session compaction summarizer routes through here instead of
+  # the local llama-server, whose slot is frequently saturated (causing every
+  # summarizer call to time out). Muse via opencode-go is the primary tier,
+  # DeepSeek direct the fallback. No local tier — summarization never
+  # contends with the GPU slots. Selected programmatically by
+  # build_compact_summarizer (proxy/proxy/compaction_summarizer.py); not a
+  # user-facing alias. The direct-DeepSeek model id is ``deepseek-flash``
+  # (renamed from deepseek-v4-flash in ade62534), mirroring plan/author/code.
+  compact:
+    providers:
+      - name: opencode-go-compact
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.3-contributor
+        api: openai-responses
+        forward_session_headers: false
+      - name: deepseek-flash-compact
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0

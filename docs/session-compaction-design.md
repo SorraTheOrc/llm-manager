@@ -207,3 +207,36 @@ in `proxy/provider.py`), resolved through
 - The evaluation is offloaded with `asyncio.to_thread` in
   `_handle_session` so a long slot wait does not freeze the event loop
   (which would also stall the very stream whose slot is being waited on).
+
+### 7.2 Remote-only `compact` summarizer chain (LP-0MTT0O74N009E7N2)
+
+Waiting on the local slot is bounded but not free: under sustained load the
+slot is saturated and every summarizer call can time out (49/49 observed at
+30 s). To decouple summarization from the GPU slots, compaction now routes
+through a dedicated remote-only model, `models.compact`, built by
+`build_compact_summarizer` in `proxy/proxy/compaction_summarizer.py`:
+
+1. **Muse** (`muse-spark-1.3-contributor` via `opencode-go`,
+   `https://opencode.ai/zen/go`, `api: openai-responses`),
+2. **DeepSeek** (`deepseek-flash` via `deepseek`,
+   `https://api.deepseek.com`, `DEEPSEEK_API_KEY`).
+
+The chain declares **no local tier**, so summarization never contends with
+the GPU slots (no second llama-server is required). Providers are resolved
+with `resolve_provider`, so cooldowns, `available_times` windows and
+failure-domain grouping behave exactly as on the normal dispatch path. Each
+failed tier is logged at WARNING with its reason (`http_<status>`,
+`timeout`, `empty_completion`, …) before the next tier is tried; when every
+tier fails the summarizer returns a falsy `EmptySummary`, so compaction
+falls back to `remote_with_guidance` instead of blocking dispatch.
+
+- **Timeout:** each tier uses `models.compact.timeout_seconds` when set,
+  otherwise `server.compaction_summarizer_timeout` (default 600 s).
+- **Backward compatibility:** when `models.compact` is absent,
+  `build_compact_summarizer` delegates to `build_local_summarizer`, so
+  operators still using `server.summarizer_model: {type: local, llama_model:
+  Qwen3}` keep the previous behaviour. When `models.compact` is present,
+  `server.summarizer_model` is ignored for compaction (the compact model owns
+  its own provider config).
+- The chain is declared identically in `config.yaml`, `config-fast.yaml` and
+  `config-cheap.yaml` (the active mode config is what the proxy loads).

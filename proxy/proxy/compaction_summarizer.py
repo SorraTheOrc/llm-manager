@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -426,5 +427,321 @@ def build_local_summarizer(
         except Exception as exc:
             logger.warning("local summarizer call failed: %s", exc, exc_info=True)
             return EmptySummary(type(exc).__name__, attempts)
+
+    return _summarizer
+
+
+# ---------------------------------------------------------------------------
+# Remote-only ``compact`` summarizer (LP-0MTT0O74N009E7N2)
+#
+# Under local-slot saturation every local summarizer call timed out (49/49 at
+# 30 s) because the single slot was held by a long generating request. The
+# ``models.compact`` chain therefore contains NO local tier: Muse via
+# opencode-go first, DeepSeek (api.deepseek.com) second. ``build_compact_summarizer``
+# resolves the declared providers itself and calls each one directly over
+# httpx — reusing the proxy's provider auth / failure-domain plumbing
+# (``resolve_provider``, pi ``auth.json`` fallback, Responses-API translation)
+# without going through localhost:8080 (AC2/AC5). Fail-open: when every tier
+# fails it returns an :class:`proxy.compaction.EmptySummary` (falsy ``""``) so
+# compaction routes ``remote_with_guidance`` instead of blocking dispatch.
+#
+# Backward compatibility (AC3): when ``models.compact`` is absent the builder
+# delegates to :func:`build_local_summarizer`, so an operator who still uses
+# ``server.summarizer_model: {type: local, llama_model: Qwen3}`` keeps the
+# previous local behaviour unchanged.
+# ---------------------------------------------------------------------------
+_COMPACT_MODEL_KEY = "compact"
+
+
+def _compact_model_config(config: dict | None) -> dict | None:
+    """Return ``models.compact`` when it declares at least one provider.
+
+    Returns ``None`` for a missing/invalid ``models.compact`` so the caller
+    can fall back to the local summarizer (AC3).
+    """
+    if not isinstance(config, dict):
+        return None
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return None
+    model_cfg = models.get(_COMPACT_MODEL_KEY)
+    if not isinstance(model_cfg, dict):
+        return None
+    providers = model_cfg.get("providers")
+    if not isinstance(providers, list) or not providers:
+        return None
+    return model_cfg
+
+
+def _remote_chat_url(provider_cfg: dict) -> str:
+    """Return the upstream URL for a provider entry.
+
+    Mirrors ``proxy_remote.proxy_to_remote``: ``api: openai-responses``
+    providers are called on ``/v1/responses``; everything else uses
+    ``/v1/chat/completions``.
+    """
+    endpoint = str(provider_cfg.get("endpoint") or "").rstrip("/")
+    if provider_cfg.get("api") == "openai-responses":
+        return f"{endpoint}/v1/responses"
+    return f"{endpoint}/v1/chat/completions"
+
+
+def _resolve_remote_api_key(provider_cfg: dict) -> str | None:
+    """Resolve a provider API key from env, inline config, or pi auth.json.
+
+    Same precedence as ``proxy_remote.proxy_to_remote``:
+    ``api_key_env`` -> inline ``api_key`` -> ``~/.pi/agent/auth.json``.
+    """
+    import os
+
+    api_key = None
+    api_key_env = provider_cfg.get("api_key_env")
+    if api_key_env:
+        api_key = os.environ.get(api_key_env)
+    if not api_key:
+        api_key = provider_cfg.get("api_key")
+    if not api_key:
+        try:
+            from proxy.proxy_remote import _try_pi_auth_json
+
+            api_key = _try_pi_auth_json(api_key_env or "")
+        except Exception:
+            api_key = None
+    return api_key
+
+
+def _extract_summary_content(payload: Any) -> str:
+    """Extract assistant text from a chat/completions-shaped payload.
+
+    Tolerates list-form ``content`` parts; returns a stripped ``str`` (empty
+    when the payload carries no usable content).
+    """
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else None
+    msg = first.get("message") if isinstance(first, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, str):
+        if isinstance(content, list):
+            content = "\n".join(
+                str(part.get("text", "")) for part in content if isinstance(part, dict)
+            )
+        else:
+            content = str(content or "")
+    return content.strip()
+
+
+def _post_compact_tier(
+    provider_cfg: dict,
+    body: dict[str, Any],
+    timeout: float,
+    *,
+    opencode_session: str | None = None,
+) -> tuple[str, str]:
+    """POST one ``compact`` tier and return ``(content, failure_kind)``.
+
+    ``content`` is the summary text on success (and ``failure_kind`` is
+    ``""``); on failure ``content`` is ``""`` and ``failure_kind`` is a
+    stable machine-readable reason (``"timeout"``, ``"connect"``,
+    ``"transport"``, ``"http_<status>"``, ``"malformed_response"``,
+    ``"empty_completion"``). Never raises.
+    """
+    responses_mode = provider_cfg.get("api") == "openai-responses"
+    url = _remote_chat_url(provider_cfg)
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    api_key = _resolve_remote_api_key(provider_cfg)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    custom_headers = provider_cfg.get("headers")
+    if isinstance(custom_headers, dict):
+        headers.update(custom_headers)
+    attribution_headers = provider_cfg.get("attribution_headers")
+    if isinstance(attribution_headers, dict):
+        headers.update(attribution_headers)
+
+    translate_to_responses = None
+    translate_to_chat = None
+    try:
+        from proxy.proxy_remote import (
+            _is_opencode_upstream,
+            _sanitize_header_value,
+            _translate_chat_to_responses,
+            _translate_responses_to_chat,
+        )
+
+        translate_to_responses = _translate_chat_to_responses
+        translate_to_chat = _translate_responses_to_chat
+        # opencode.ai gateways reject requests without an x-opencode-session
+        # header (HTTP 400 MissingSessionID, LP-0MTR3CHEP007S699); synthesize
+        # a per-call value since compaction has no client session id.
+        if opencode_session and _is_opencode_upstream(provider_cfg.get("endpoint", "")):
+            headers["x-opencode-session"] = _sanitize_header_value(opencode_session)
+    except Exception:  # pragma: no cover - same-package import virtually never fails
+        logger.debug("compact summarizer: Responses-API helpers unavailable", exc_info=True)
+
+    outbound = dict(body)
+    if responses_mode and translate_to_responses is not None:
+        outbound = translate_to_responses(outbound)
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(float(timeout))) as client:
+            resp = client.post(url, json=outbound, headers=headers)
+    except httpx.TransportError as exc:
+        return "", _transport_failure_kind(exc)
+    except Exception as exc:
+        logger.warning("compact summarizer transport failure: %s", exc, exc_info=True)
+        return "", type(exc).__name__
+
+    if resp.status_code != 200:
+        logger.warning(
+            "compact summarizer non-200 status=%s body=%.500s",
+            resp.status_code,
+            getattr(resp, "text", "") or "",
+        )
+        return "", f"http_{resp.status_code}"
+    try:
+        data = resp.json()
+    except Exception:
+        return "", "malformed_response"
+    if responses_mode and translate_to_chat is not None:
+        try:
+            data = translate_to_chat(data)
+        except Exception:
+            return "", "malformed_response"
+    content = _extract_summary_content(data)
+    if not content:
+        return "", "empty_completion"
+    return content, ""
+
+
+def build_compact_summarizer(
+    config: dict | None,
+    llama_port: int = 8080,
+    timeout_seconds: float | None = None,
+):
+    """Build a production Summarizer backed by the remote ``compact`` model.
+
+    The chain is declared as ``models.compact`` in the proxy config (Muse via
+    opencode-go, then DeepSeek via api.deepseek.com — strictly remote, no
+    local tier). Providers are resolved with ``proxy.provider.resolve_provider``
+    so cooldowns, ``available_times`` windows and failure-domain grouping are
+    honoured exactly as on the normal dispatch path. Each failed tier is
+    logged at WARNING with its reason before the next tier is tried; when
+    every tier fails the summarizer returns an
+    :class:`proxy.compaction.EmptySummary` (falsy ``""``) — fail-open, so
+    compaction never blocks dispatch.
+
+    Backward compatibility (AC3): when ``models.compact`` is absent the
+    returned callable is :func:`build_local_summarizer` (the previous local
+    Qwen3 behaviour), so operators still on
+    ``server.summarizer_model: {type: local, llama_model: Qwen3}`` are
+    unaffected.
+
+    Args:
+        config: Proxy config dict (``models.compact`` selects the remote
+            chain; ``server.compaction_summarizer_timeout`` bounds each tier).
+            ``None`` falls back to the local summarizer.
+        llama_port: Local llama-server port used only by the local fallback.
+        timeout_seconds: Per-tier HTTP timeout. ``None`` resolves
+            ``models.compact.timeout_seconds`` when present, else
+            ``server.compaction_summarizer_timeout`` (default 600 s).
+
+    Returns:
+        A ``Summarizer`` callable.
+    """
+    compact_cfg = _compact_model_config(config)
+    if compact_cfg is None:
+        logger.info(
+            "models.compact not configured; using the local summarizer "
+            "(set models.compact to route compaction through the remote chain)"
+        )
+        return build_local_summarizer(
+            config,
+            llama_port=llama_port,
+            timeout_seconds=timeout_seconds,
+        )
+
+    from proxy.provider import compaction_config, resolve_provider
+
+    cfg = compaction_config(config or {})
+    max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
+    if timeout_seconds is None:
+        timeout_seconds = float(cfg.get("summarizer_timeout_seconds") or 600.0)
+    try:
+        per_tier_timeout = float(compact_cfg.get("timeout_seconds") or timeout_seconds)
+    except (TypeError, ValueError):
+        per_tier_timeout = float(timeout_seconds)
+
+    _system_default, _format_template, _update_template = _load_prompt_constants()
+    _system_prompt = _resolve_system_prompt_override() or _system_default
+    declared_providers = compact_cfg.get("providers") or []
+    tier_count = max(1, len(declared_providers))
+
+    def _summarizer(
+        middle_messages: list[dict[str, Any]],
+        previous_summary: str | None = None,
+    ) -> str:
+        if not middle_messages:
+            return ""
+        transcript = _transcript_for_summarizer(middle_messages)
+        if not transcript.strip():
+            return ""
+
+        user_content = f"<conversation>\n{transcript}\n</conversation>"
+        if previous_summary:
+            user_content += f"\n\n<previous-summary>\n{previous_summary}\n</previous-summary>"
+            template = _update_template
+        else:
+            template = _format_template
+        user_content += f"\n\n{template}"
+
+        # Per-call opencode session id; opencode.ai rejects requests without
+        # the header and compaction has no client session to derive it from.
+        opencode_session = f"compact-{uuid.uuid4().hex}"
+        attempts = 0
+        last_kind = "no_provider"
+        failed_provider: str | None = None
+        while attempts < tier_count:
+            provider = resolve_provider(compact_cfg, failed_provider=failed_provider)
+            if provider is None:
+                break
+            name = str(provider.get("name") or "?")
+            attempts += 1
+            body = {
+                "model": provider.get("model") or _COMPACT_MODEL_KEY,
+                "messages": [
+                    {"role": "system", "content": _system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "max_tokens": max_tokens,
+                "stream": False,
+                "temperature": 0.2,
+            }
+            content, kind = _post_compact_tier(
+                provider,
+                body,
+                per_tier_timeout,
+                opencode_session=opencode_session,
+            )
+            if content:
+                ops = extract_file_operations(middle_messages)
+                return content + format_file_operations(ops["read"], ops["modified"])
+            last_kind = kind or "unknown"
+            logger.warning(
+                "compact summarizer provider=%s failed (%s); falling back to next "
+                "provider",
+                name,
+                last_kind,
+            )
+            failed_provider = name
+
+        if attempts == 0:
+            logger.warning(
+                "compact summarizer: no eligible provider in models.compact chain"
+            )
+            return EmptySummary("no_provider", 0)
+        return EmptySummary(last_kind, attempts)
 
     return _summarizer
