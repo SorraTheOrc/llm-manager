@@ -488,14 +488,28 @@ class TestLiveConfigsValidate:
         fatal = [p for p in problems if p.startswith("FATAL:")]
         assert fatal == [], f"{config_file} has FATAL compaction issues: {fatal}"
 
-    def test_compaction_trigger_ratio_is_070(self):
-        """Verify the default trigger_ratio in config.yaml is 0.70."""
+    @pytest.mark.parametrize("config_file", [
+        "config.yaml",
+        "config-fast.yaml",
+        "config-cheap.yaml",
+    ])
+    def test_compaction_disabled_in_live_configs(self, config_file):
+        """Proxy-side compaction is disabled in every live profile.
+
+        Operator decision (LP-0MU61IRVC003RRN6): ``compaction_trigger_ratio``
+        is 0, so the trigger resolves to 0 and an arbitrarily large session
+        never fires compaction in either mode — the compaction path, the
+        context-pressure advisory and the 429 gate (all driven by this single
+        knob) are off.
+        """
         import yaml
-        config_path = pathlib.Path(__file__).parent.parent / "config.yaml"
+        config_path = pathlib.Path(__file__).parent.parent / config_file
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
-        c = compaction_config(cfg)
-        assert c["trigger_ratio"] == 0.70
+        assert compaction_config(cfg)["trigger_ratio"] == 0
+        for mode in ("fast", "cheap"):
+            assert compaction_trigger_tokens(mode, cfg) == 0
+            assert should_compact_session(10_000_000, mode, cfg) is False
 
     def test_summarizer_uses_qwen3(self):
         """Verify the summariser defaults to Qwen3 in config.yaml."""

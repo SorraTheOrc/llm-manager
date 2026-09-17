@@ -649,7 +649,10 @@ server:
   # trigger_ratio: fires when est_tokens > ratio × per-slot threshold
   #   (fast: 0.70 × 258,048 = 180,634 → target ≤ 117K)
   #   (cheap: 0.70 × 83,285 = 58,300 → target ≤ 38K)
-  compaction_trigger_ratio: 0.70
+  #
+  # Operator request 2026-09-17: DISABLED. 0 disables (docs/llama-router.md);
+  # the proxy no longer summarises/compacts sessions. Restore 0.70 to re-enable.
+  compaction_trigger_ratio: 0
   # Summariser model: local llama.cpp model used for in-proxy summarisation.
   # Reuses the existing Qwen3 model — no new model download required.
   summarizer_model:

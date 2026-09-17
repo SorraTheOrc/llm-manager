@@ -608,7 +608,8 @@ server:
   # `context_pressure_warn_ratio` knob is retired.
 
   # --- Session compaction config (LP-0MTG6RW3L003X122) ---
-  compaction_trigger_ratio: 0.70
+  # Operator request 2026-09-17: DISABLED (0 disables — docs/llama-router.md).
+  compaction_trigger_ratio: 0
   summarizer_model:
     type: local
     llama_model: Qwen3
