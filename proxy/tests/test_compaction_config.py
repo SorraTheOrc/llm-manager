@@ -16,6 +16,11 @@ ensure the compaction configuration is sane before the proxy starts.
 import pathlib
 
 import pytest
+from proxy.compaction import (
+    compaction_trigger_tokens,
+    decide_session_compaction,
+    should_compact_session,
+)
 from proxy.provider import (
     _DEFAULT_COMPACTION_TRIGGER_RATIO,
     _DEFAULT_SUMMARIZER_CTX_SIZE,
@@ -553,3 +558,140 @@ class TestSummarizerReasoningConfig:
     def test_disable_thinking_non_bool_falls_back_to_default(self):
         c = compaction_config({"server": {"summarizer_disable_thinking": "yes"}})
         assert c["summarizer_disable_thinking"] is True
+
+
+# ===================================================================
+# Trigger threshold consistency after estimator unification
+# (LP-0MU5FU2YG009KN57, parent LP-0MU5A84YU003YOTY)
+# ===================================================================
+
+
+def _fast_schedule() -> dict:
+    """3-slot fast schedule: per-slot 83,285 → trigger 58,300."""
+    return {
+        "server": {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 3,
+            "compaction_trigger_ratio": 0.70,
+        }
+    }
+
+
+def _cheap_schedule() -> dict:
+    """2-slot cheap schedule: per-slot 61,440 → trigger 43,008 (≈43K)."""
+    return {
+        "server": {
+            "local_model_ctx_size": 131072,
+            "session_slot_pool_size": 2,
+            "compaction_trigger_ratio": 0.70,
+        }
+    }
+
+
+def _compactable_messages() -> list:
+    """System + first user + two whole turns (so compaction has work to do)."""
+    return [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "FIRST"},
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+
+
+def _stub_summarizer(middle_messages, previous_summary=None) -> str:
+    return "SUMMARY"
+
+
+class TestTriggerThresholdConsistency:
+    """The operator-approved trigger constants are re-verified against the
+    now-unified estimator (LP-0MU5FU2YG009KN57 AC2/AC3).
+
+    The estimator unification changed only *which* tokenizer the compaction
+    path uses (tiktoken → the same native Qwen3 tokenizer routing already
+    used). The documented derivations remain valid: the constants were tuned
+    from routing-time ``estimated_tokens``, i.e. the unified estimate.
+    """
+
+    def test_fast_trigger_still_resolves_58300(self):
+        # 0.70 × (262144//3 − 4096 = 83285) = 58299.5 → round half-up 58300.
+        assert compaction_trigger_tokens("fast", _fast_schedule()) == 58300
+
+    def test_cheap_trigger_still_resolves_43008(self):
+        # 0.70 × (131072//2 − 4096 = 61440) = 43008.
+        assert compaction_trigger_tokens("cheap", _cheap_schedule()) == 43008
+
+    def test_should_compact_boundary_is_strictly_above(self):
+        # 58,300 itself does NOT fire; 58,301 does (unchanged semantics).
+        assert should_compact_session(58300, "fast", _fast_schedule()) is False
+        assert should_compact_session(58301, "fast", _fast_schedule()) is True
+        assert should_compact_session(43008, "cheap", _cheap_schedule()) is False
+        assert should_compact_session(43009, "cheap", _cheap_schedule()) is True
+
+    def test_unified_estimate_does_not_under_count_vs_legacy_tiktoken(self):
+        """AC1: no compaction-frequency regression.
+
+        The thresholds were derived from the native (Qwen3) routing estimate.
+        The legacy compaction path used tiktoken, which undercounts dense
+        prose, so it under-compacted.  On the canonical dense-prose fixture
+        the unified estimate is >= the legacy tiktoken estimate — the fix can
+        only compact *more* sessions, never fewer.
+        """
+        from proxy.provider import (
+            _estimate_prompt_tokens_for_routing,
+            _get_tokenizer_for_model,
+        )
+        try:
+            from benchmarks import slot_benchmark as sb
+        except ImportError:  # pragma: no cover - package layout fallback
+            from proxy.benchmarks import slot_benchmark as sb
+
+        messages = [{"role": "user", "content": sb.generate_large_prompt_fixture(46000)}]
+        tokenizer, multiplier = _get_tokenizer_for_model(
+            {"tokenizer": "qwen3"}, _fast_schedule()
+        )
+        assert tokenizer is not None and multiplier == 1.0
+        unified = _estimate_prompt_tokens_for_routing(
+            {"messages": messages}, tokenizer=tokenizer
+        )
+        legacy_tiktoken = _estimate_prompt_tokens_for_routing({"messages": messages})
+        assert unified >= legacy_tiktoken, (
+            f"unified estimate ({unified}) must not fall below the legacy "
+            f"tiktoken estimate ({legacy_tiktoken}) — sessions that compacted "
+            f"before must still compact"
+        )
+
+    @pytest.mark.parametrize(
+        "config_factory,trigger",
+        [(_fast_schedule, 58300), (_cheap_schedule, 43008)],
+        ids=["fast-58300", "cheap-43008"],
+    )
+    def test_decision_boundary_noop_below_and_compact_above(self, config_factory, trigger):
+        """AC4: a session *at* the exact trigger is a ``below_trigger``
+        noop; one token above it produces a real compaction decision."""
+        messages = _compactable_messages()
+
+        at_trigger = decide_session_compaction(
+            messages,
+            config_factory(),
+            "fast",
+            summarizer=_stub_summarizer,
+            estimate_tokens=lambda _msgs: trigger,
+            session_id="sess-boundary-at",
+        )
+        assert at_trigger["action"] == "noop"
+        assert at_trigger["reason"] == "below_trigger"
+        assert at_trigger["estimated_before"] == trigger
+
+        above_trigger = decide_session_compaction(
+            messages,
+            config_factory(),
+            "fast",
+            summarizer=_stub_summarizer,
+            estimate_tokens=lambda _msgs: trigger + 1,
+            session_id="sess-boundary-above",
+        )
+        assert above_trigger["reason"] != "below_trigger"
+        assert above_trigger["action"] in ("compact", "remote_with_guidance")

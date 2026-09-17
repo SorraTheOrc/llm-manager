@@ -215,12 +215,27 @@ LP-0MSEQ71IF0003FRT):
   in `proxy/config.yaml`, loading the vendored Qwen3 `tokenizer.json` via
   `proxy/proxy/tokenizers.py`. `_get_tokenizer_for_model` in
   `proxy/proxy/provider.py` resolves (tokenizer, multiplier) and is shared by
-  BOTH the routing estimate (provider.py) and the slot-persistence estimate
-  (session.py), so the routing clamp and the persistence cap compare exact
-  Qwen3-native token counts (multiplier forced to 1.0 when a native tokenizer
-  is active). The server-level `token_estimate_multiplier` heuristic was
-  removed — tiktoken+multiplier remains only as a fallback for models without
-  a named tokenizer.
+  the routing estimate (provider.py), the slot-persistence estimate
+  (session.py) **and the prompt-assembly compaction trigger**
+  (`router_helpers._handle_session`, LP-0MU5A84YU003YOTY), so the routing
+  clamp, the persistence cap and the compaction trigger all compare the same
+  exact Qwen3-native token counts (multiplier forced to 1.0 when a native
+  tokenizer is active). The server-level `token_estimate_multiplier`
+  heuristic was removed — tiktoken+multiplier remains only as a fallback for
+  models without a named tokenizer.
+
+  Before LP-0MU5A84YU003YOTY the compaction trigger's estimate closure called
+  `_estimate_prompt_tokens_for_routing({"messages": msgs})` with **no**
+  tokenizer, so it silently fell back to tiktoken while routing used the
+  native Qwen3 tokenizer. The ~1.7× estimator gap meant a session could log
+  `context_pressure ... ratio=0.73 >= 0.70; consider compacting` (native
+  estimate) and then decide `noop`/`below_trigger` because the compaction
+  estimate (tiktoken) was under the trigger — the advisory fired but
+  compaction never happened. The trigger now resolves the tokenizer through
+  the same `_get_tokenizer_for_model` call the routing path uses, so the
+  advisory and the trigger can never disagree about whether a session is over
+  the ratio. See `proxy/tests/test_routing_compaction_estimate_parity.py` and
+  `proxy/tests/test_context_pressure_compaction_agreement.py`.
 - The slot-persistence cap `session_slot_max_prompt_tokens` is derived
   dynamically from the effective per-slot clamp
   (`local_model_ctx_size // active_slots - 4096` output headroom, the same

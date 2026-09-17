@@ -160,6 +160,38 @@ C = A + B backstop + explicit remote for the residual extreme.
 | Drop policy | drop oldest whole turns | summarize oldest, then drop whole turns | never split a turn, never drop system prompt |
 | Event logging | required (session, before/after, turns dropped) | required (same + summary length) | traceability for quality regression |
 
+### 4.1 Estimator consistency (LP-0MU5A84YU003YOTY)
+
+The trigger constants above were derived from routing-time
+`estimated_tokens` (`routing_check` lines), which use the **native Qwen3
+tokenizer** when the model entry carries `tokenizer: qwen3`. The compaction
+trigger originally re-estimated the produced history with **tiktoken only**
+(its estimate closure passed no tokenizer), so the two numbers could differ
+by thousands of tokens on the same session and the trigger could resolve
+`noop`/`below_trigger` on a session the advisory had just flagged as over
+the ratio.
+
+The fix (LP-0MU5A84YU003YOTY) resolves the tokenizer in the compaction path
+through the same `_get_tokenizer_for_model` helper routing uses and feeds it
+to `_estimate_prompt_tokens_for_routing`, so routing, the
+`context_pressure` advisory and the compaction trigger all read one shared
+estimate over the same produced history (`session.messages + delta`, or the
+request body when not a delta request).
+
+**The operator-approved constants are unchanged** — the unification aligns
+the compaction estimate *with* the routing-time estimate the derivation was
+based on, it does not move the boundary. Re-verified by
+`proxy/tests/test_compaction_config.py::TestTriggerThresholdConsistency`:
+
+- fast: `round-half-up(0.70 × (262144//3 − 4096 = 83285)) = 58300`
+- cheap: `round-half-up(0.70 × (131072//2 − 4096 = 61440)) = 43008 (≈43K)`
+
+The trigger fires strictly above the constant (`58,300` itself is a
+`below_trigger` noop; `58,301` compacts), matching `should_compact_session`.
+Consistency and the repaired advisory/trigger agreement are pinned by
+`proxy/tests/test_routing_compaction_estimate_parity.py` and
+`proxy/tests/test_context_pressure_compaction_agreement.py`.
+
 ## 5. Interaction analysis
 
 - **Slot save/restore:** compaction keeps sessions below the persistence cap
