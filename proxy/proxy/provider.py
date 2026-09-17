@@ -699,6 +699,21 @@ _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS = 600.0
 _DEFAULT_SUMMARIZER_RETRIES = 2
 _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS = 0.5
 
+# Reasoning suppression for the compaction summarizer (LP-0MU58PBRD004OV1I).
+# Reasoning models (Muse via opencode-go, DeepSeek) share the
+# ``summarizer_max_tokens`` output budget with their reasoning tokens. With
+# the upstream default effort (Muse: "high") they can spend the entire budget
+# on reasoning and return an empty completion — which fails compaction and
+# forces remote-only dispatch. "minimal" leaves room for the summary text.
+# Configurable via ``server.summarizer_reasoning_effort``; an explicit
+# ``null`` disables the override (use the upstream default).
+_DEFAULT_SUMMARIZER_REASONING_EFFORT = "minimal"
+
+# Disable Qwen3 "thinking" for the local summarizer via the llama-server
+# ``chat_template_kwargs.enable_thinking`` request flag (LP-0MU58PBRD004OV1I).
+# Configurable via ``server.summarizer_disable_thinking``.
+_DEFAULT_SUMMARIZER_DISABLE_THINKING = True
+
 # Dedicated system prompt for the proxy-side compaction summariser.
 #
 # Rationale (LP-0MTTSL2AW000A5OG — R1 companion): Pi delivers summarization
@@ -886,6 +901,23 @@ def compaction_config(config: dict) -> dict:
     except (ValueError, TypeError):
         max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
 
+    # Summariser reasoning effort (reasoning models only; explicit null disables)
+    if "summarizer_reasoning_effort" in server:
+        reasoning_effort = server.get("summarizer_reasoning_effort")
+    elif "summarizer_reasoning_effort" in config:
+        reasoning_effort = config.get("summarizer_reasoning_effort")
+    else:
+        reasoning_effort = _DEFAULT_SUMMARIZER_REASONING_EFFORT
+    if isinstance(reasoning_effort, str):
+        reasoning_effort = reasoning_effort.strip() or None
+
+    # Disable local Qwen3 thinking for the summarizer (chat-template flag)
+    disable_thinking = server.get("summarizer_disable_thinking")
+    if disable_thinking is None:
+        disable_thinking = config.get("summarizer_disable_thinking")
+    if not isinstance(disable_thinking, bool):
+        disable_thinking = _DEFAULT_SUMMARIZER_DISABLE_THINKING
+
     # Summarizer retries (transient failures only; 0 disables)
     retries = server.get("compaction_summarizer_retries")
     if retries is None:
@@ -922,6 +954,8 @@ def compaction_config(config: dict) -> dict:
         "summarizer_model_name": summarizer_model_name,
         "summarizer_ctx_size": ctx_size,
         "summarizer_max_tokens": max_tokens,
+        "summarizer_reasoning_effort": reasoning_effort,
+        "summarizer_disable_thinking": disable_thinking,
         "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
         "summarizer_retries": retries,
         "summarizer_retry_delay_seconds": retry_delay,

@@ -429,3 +429,27 @@ class TestCompactionDoesNotBlockEventLoop:
             f"event loop was blocked during compaction slot-wait "
             f"(heartbeats={heartbeats})"
         )
+
+
+class TestLocalSummarizerThinkingDisabled:
+    """Local Qwen3 thinking is disabled for the summarizer (LP-0MU58PBRD004OV1I)."""
+
+    def _body(self, cfg):
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.return_value = _mock_success_response("hi")
+            s = build_local_summarizer(cfg, llama_port=8080)
+            s([{"role": "user", "content": "hello"}])
+            _, kwargs = mock_client.post.call_args
+            return kwargs.get("json")
+
+    def test_default_disables_thinking(self):
+        body = self._body(_make_config())
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_override_false_omits_thinking_flag(self):
+        body = self._body(_make_config(summarizer_disable_thinking=False))
+        assert "chat_template_kwargs" not in body

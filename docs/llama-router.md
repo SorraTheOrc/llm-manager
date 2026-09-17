@@ -143,6 +143,15 @@ server:
     llama_model: Qwen3
   summarizer_ctx_size: 8192        # default 8192; summariser KV footprint
   summarizer_max_tokens: 512       # default 512; summary output budget
+  # Reasoning suppression for the compaction summarizer (LP-0MU58PBRD004OV1I).
+  # Reasoning models (Muse via opencode-go, DeepSeek) share the output budget
+  # with their reasoning tokens; "minimal" leaves room for the summary. Set to
+  # null to use the upstream default. Mapped to reasoning.effort for
+  # openai-responses providers.
+  summarizer_reasoning_effort: minimal
+  # Disable Qwen3 thinking for the local summarizer (llama-server
+  # chat_template_kwargs.enable_thinking).
+  summarizer_disable_thinking: true
   # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
   # advisory logging only, zero dispatch change. TRUE until the AC8
   # enforcement gate passes (experiment LP-0MSG9PUHU0059TTZ bar + client-side

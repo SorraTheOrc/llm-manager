@@ -341,3 +341,60 @@ class TestShippedCompactConfig:
         # Strictly remote: no local tier may contend with the GPU slots.
         assert all(p["type"] != "local" for p in providers)
         assert "llama_model" not in muse and "llama_model" not in deepseek
+
+
+class TestCompactSummarizerReasoningEffort:
+    """Reasoning suppression on the remote compact tiers (LP-0MU58PBRD004OV1I)."""
+
+    @staticmethod
+    def _providers():
+        return COMPACT_CONFIG["models"]["compact"]["providers"]
+
+    def _config_with(self, **server_overrides):
+        return {
+            "models": {"compact": {"providers": self._providers()}},
+            "server": server_overrides,
+        }
+
+    def test_muse_tier_requests_minimal_reasoning_effort(self, monkeypatch):
+        from proxy.compaction_summarizer import build_compact_summarizer
+
+        monkeypatch.setenv("OPENCODE_API_KEY", "muse-key")
+        summarizer = build_compact_summarizer(COMPACT_CONFIG)
+        result, posts, _ = _run(summarizer, _MESSAGES, [_responses_response("muse summary")])
+        assert result == "muse summary"
+        # The Responses translation maps reasoning_effort -> reasoning.effort.
+        assert posts[0]["json"]["reasoning"] == {"effort": "minimal"}
+
+    def test_deepseek_tier_requests_minimal_reasoning_effort(self, monkeypatch):
+        from proxy.compaction_summarizer import build_compact_summarizer
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-key")
+        deepseek = [p for p in self._providers() if p["name"] == "deepseek-flash-compact"]
+        config = {"models": {"compact": {"providers": deepseek}}, "server": {}}
+        summarizer = build_compact_summarizer(config)
+        result, posts, _ = _run(summarizer, _MESSAGES, [_chat_response("deepseek summary")])
+        assert result == "deepseek summary"
+        assert posts[0]["json"]["reasoning_effort"] == "minimal"
+
+    def test_custom_effort_is_passed_through(self, monkeypatch):
+        from proxy.compaction_summarizer import build_compact_summarizer
+
+        monkeypatch.setenv("OPENCODE_API_KEY", "muse-key")
+        summarizer = build_compact_summarizer(
+            self._config_with(summarizer_reasoning_effort="medium")
+        )
+        _, posts, _ = _run(summarizer, _MESSAGES, [_responses_response("muse summary")])
+        assert posts[0]["json"]["reasoning"] == {"effort": "medium"}
+
+    def test_explicit_null_omits_reasoning_override(self, monkeypatch):
+        from proxy.compaction_summarizer import build_compact_summarizer
+
+        monkeypatch.setenv("OPENCODE_API_KEY", "muse-key")
+        summarizer = build_compact_summarizer(
+            self._config_with(summarizer_reasoning_effort=None)
+        )
+        _, posts, _ = _run(summarizer, _MESSAGES, [_responses_response("muse summary")])
+        body = posts[0]["json"]
+        assert "reasoning" not in body
+        assert "reasoning_effort" not in body

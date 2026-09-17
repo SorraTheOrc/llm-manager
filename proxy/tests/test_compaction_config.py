@@ -20,6 +20,7 @@ from proxy.provider import (
     _DEFAULT_COMPACTION_TRIGGER_RATIO,
     _DEFAULT_SUMMARIZER_CTX_SIZE,
     _DEFAULT_SUMMARIZER_MAX_TOKENS,
+    _DEFAULT_SUMMARIZER_REASONING_EFFORT,
     _DEFAULT_SUMMARIZER_RETRIES,
     _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS,
     _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS,
@@ -517,3 +518,38 @@ class TestLiveConfigsValidate:
             cfg = yaml.safe_load(f)
         c = compaction_config(cfg)
         assert c["summarizer_max_tokens"] == 512
+
+
+class TestSummarizerReasoningConfig:
+    """Reasoning suppression for the compaction summarizer (LP-0MU58PBRD004OV1I)."""
+
+    def test_defaults(self):
+        """Default effort is 'minimal' and local thinking is disabled."""
+        c = compaction_config({})
+        assert c["summarizer_reasoning_effort"] == _DEFAULT_SUMMARIZER_REASONING_EFFORT
+        assert c["summarizer_disable_thinking"] is True
+
+    def test_reasoning_effort_override(self):
+        c = compaction_config({"server": {"summarizer_reasoning_effort": "low"}})
+        assert c["summarizer_reasoning_effort"] == "low"
+
+    def test_reasoning_effort_flat_key(self):
+        c = compaction_config({"summarizer_reasoning_effort": "medium"})
+        assert c["summarizer_reasoning_effort"] == "medium"
+
+    def test_reasoning_effort_explicit_null_disables_override(self):
+        """An explicit null means 'use the upstream default', not the default."""
+        c = compaction_config({"server": {"summarizer_reasoning_effort": None}})
+        assert c["summarizer_reasoning_effort"] is None
+
+    def test_reasoning_effort_blank_becomes_none(self):
+        c = compaction_config({"server": {"summarizer_reasoning_effort": "  "}})
+        assert c["summarizer_reasoning_effort"] is None
+
+    def test_disable_thinking_override_false(self):
+        c = compaction_config({"server": {"summarizer_disable_thinking": False}})
+        assert c["summarizer_disable_thinking"] is False
+
+    def test_disable_thinking_non_bool_falls_back_to_default(self):
+        c = compaction_config({"server": {"summarizer_disable_thinking": "yes"}})
+        assert c["summarizer_disable_thinking"] is True

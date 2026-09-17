@@ -660,6 +660,19 @@ server:
   summarizer_ctx_size: 8192
   # Max output tokens for the summariser: concise summary budget.
   summarizer_max_tokens: 512
+  # Reasoning effort for the compaction summarizer tiers (LP-0MU58PBRD004OV1I).
+  # Reasoning models (Muse via opencode-go, DeepSeek) share
+  # summarizer_max_tokens with their reasoning tokens; at the upstream default
+  # effort (Muse: "high") they can spend the whole budget on reasoning and
+  # return an empty completion, which fails compaction and forces remote-only
+  # dispatch. "minimal" leaves room for the summary text. Mapped to
+  # ``reasoning.effort`` for openai-responses providers. Set to null to use the
+  # upstream default (not recommended for Muse).
+  summarizer_reasoning_effort: minimal
+  # Disable Qwen3 "thinking" for the local summarizer via the llama-server
+  # chat_template_kwargs.enable_thinking flag. Harmless when the remote
+  # ``compact`` chain is in use (LP-0MU58PBRD004OV1I).
+  summarizer_disable_thinking: true
   # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
   # advisory logging only, zero dispatch change. TRUE until the AC8
   # enforcement gate passes (experiment bar + client-side compaction

@@ -312,6 +312,7 @@ def build_local_summarizer(
     cfg = compaction_config(config or {})
     model_name = cfg.get("summarizer_model_name") or "Qwen3"
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
+    disable_thinking = bool(cfg.get("summarizer_disable_thinking", True))
     _system_default, _format_template, _update_template = _load_prompt_constants()
     _system_prompt = _resolve_system_prompt_override() or _system_default
     retries = int(cfg.get("summarizer_retries") or 0)
@@ -352,6 +353,8 @@ def build_local_summarizer(
             "stream": False,
             "temperature": 0.2,
         }
+        if disable_thinking:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         url = f"http://localhost:{int(llama_port)}/v1/chat/completions"
         timeout = httpx.Timeout(float(timeout_seconds))
         attempts = retries + 1  # initial attempt + configured retries
@@ -667,6 +670,7 @@ def build_compact_summarizer(
 
     cfg = compaction_config(config or {})
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
+    reasoning_effort = cfg.get("summarizer_reasoning_effort")
     if timeout_seconds is None:
         timeout_seconds = float(cfg.get("summarizer_timeout_seconds") or 600.0)
     try:
@@ -719,6 +723,8 @@ def build_compact_summarizer(
                 "stream": False,
                 "temperature": 0.2,
             }
+            if reasoning_effort:
+                body["reasoning_effort"] = reasoning_effort
             content, kind = _post_compact_tier(
                 provider,
                 body,
