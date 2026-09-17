@@ -29,7 +29,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from proxy.provider import (
     _estimate_effective_prompt_tokens_for_routing,
     _estimate_prompt_tokens_for_routing,
@@ -96,7 +95,7 @@ async def capture_compaction_estimate(
     body_json: dict,
     server_config: dict,
     model_config: dict,
-) -> "callable":
+) -> callable:
     """Run ``_handle_session`` and return the captured ``estimate_tokens``
     closure handed to ``_evaluate_session_compaction``."""
     from proxy.router_helpers import _handle_session
