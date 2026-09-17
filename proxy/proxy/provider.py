@@ -4953,6 +4953,87 @@ async def proxy_with_remote_fallback(
     )
 
 
+async def _evaluate_compaction_for_bypass(
+    config: dict,
+    provider_name: str,
+    body_json: dict,
+    session_id: str | None,
+) -> dict:
+    """Evaluate server-side session compaction in the local-bypass path.
+
+    LP-0MU5ARWSP001BYYB: the bypass path used to ``continue`` before any
+    session handling, so oversized sessions — the ones that need compaction
+    most — were never evaluated. This delegates to the shared
+    :func:`proxy.router_helpers.evaluate_and_apply_compaction` so the bypass
+    path and the local-dispatch path share one implementation.
+
+    The helper mutates ``body_json`` in place when a live compaction is
+    applied (rewriting ``messages`` to the compacted history) and also
+    updates the persisted session history.
+
+    Fail-open: any error is logged and a noop outcome is returned so routing
+    continues unchanged.
+    """
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "action": "noop",
+        "applied": False,
+        "estimated_before": 0,
+        "estimated_after": 0,
+        "reason": None,
+        "messages": None,
+    }
+    try:
+        import proxy.server as _server
+        from proxy.router_helpers import evaluate_and_apply_compaction
+
+        server_config = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        result = {"session_id": session_id}
+        return await evaluate_and_apply_compaction(
+            _server,
+            result,
+            body_json,
+            server_config,
+        )
+    except Exception:
+        logger.warning(
+            "Bypass compaction evaluation failed; continuing unchanged "
+            "(provider=%s session=%s)",
+            provider_name,
+            str(session_id or "")[:8],
+            exc_info=True,
+        )
+        return outcome
+
+
+def _refresh_request_body(
+    request,
+    body_json: dict,
+    provider_name: str,
+    session_id: str | None,
+) -> None:
+    """Replace the cached request body with the compacted ``body_json``.
+
+    ``proxy_to_local`` reads ``await request.body()``; Starlette caches the
+    parsed bytes in ``Request._body``. Re-serialising the compacted body into
+    that cache lets the ordinary local-dispatch path below forward the
+    compacted history without a second ``_dispatch_local`` call
+    (LP-0MU5ARWSP001BYYB).
+    """
+    try:
+        request._body = json.dumps(body_json).encode("utf-8")
+    except Exception:
+        logger.warning(
+            "compaction_local_redispatch body refresh failed provider=%s "
+            "session=%s",
+            provider_name,
+            str(session_id or "")[:8],
+            exc_info=True,
+        )
+
+
 async def _proxy_with_fallback_cycle(
     request,
     path: str,
@@ -5289,7 +5370,98 @@ async def _proxy_with_fallback_cycle(
                     fallback_reason = _skip_reason
                     prev_provider = provider_name
                     all_slot_exhaustion = False
-                    continue
+
+                    # Server-side compaction rescue (LP-0MU5ARWSP001BYYB).
+                    # The bypass used to ``continue`` here, before any session
+                    # handling, so oversized sessions were never evaluated for
+                    # compaction. Always evaluate now; a successful compaction
+                    # may bring the session back under the local thresholds.
+                    _bypass_compaction = await _evaluate_compaction_for_bypass(
+                        config, provider_name, body_json, _session_id,
+                    )
+                    _rescued_local = False
+                    if _bypass_compaction["applied"]:
+                        # Re-run local eligibility against the compacted size so
+                        # a session bypassed purely for size can return to
+                        # local on this same request (AC2).
+                        _compacted_tokens = (
+                            await _estimate_effective_prompt_tokens_for_routing(
+                                request, body_json, tokenizer=_tokenizer,
+                            )
+                        )
+                        if _multiplier != 1.0:
+                            _compacted_tokens = int(_compacted_tokens * _multiplier)
+                        _skip_after, _skip_after_reason = _should_skip_local(
+                            _llama_model,
+                            _session_id,
+                            body_json,
+                            _cold_threshold,
+                            estimated_tokens=_compacted_tokens,
+                            warm_cache_threshold=_warm_threshold,
+                            economic_bypass_serves_local=_recover_economic,
+                        )
+                        if _skip_after:
+                            logger.info(
+                                "routing_compaction_still_oversized provider=%s "
+                                "model=%s est_before=%d est_after=%d "
+                                "reason=%s session=%s",
+                                provider_name,
+                                _llama_model or "unknown",
+                                _bypass_compaction["estimated_before"],
+                                _bypass_compaction["estimated_after"],
+                                _skip_after_reason,
+                                _session_id or "unknown",
+                            )
+                        else:
+                            logger.info(
+                                "routing_compaction_local_redispatch provider=%s "
+                                "model=%s est_before=%d est_after=%d "
+                                "skip_reason=%s session=%s",
+                                provider_name,
+                                _llama_model or "unknown",
+                                _bypass_compaction["estimated_before"],
+                                _bypass_compaction["estimated_after"],
+                                _skip_reason,
+                                _session_id or "unknown",
+                            )
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="compaction_local_redispatch",
+                                estimated_tokens=_compacted_tokens,
+                                reason="compaction_reenabled_local",
+                            )
+                            # Refresh the cached body so the ordinary local
+                            # dispatch below forwards the compacted history.
+                            # Its own session handling re-evaluates compaction,
+                            # but the compacted history is below the trigger so
+                            # that evaluation is a cheap no-op — no second
+                            # summarisation and only one local dispatch.
+                            _refresh_request_body(
+                                request, body_json, provider_name, _session_id,
+                            )
+                            _rescued_local = True
+                    else:
+                        logger.info(
+                            "compaction_bypass_eval provider=%s model=%s "
+                            "evaluated=%s action=%s reason=%s est_before=%d "
+                            "est_after=%d session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _bypass_compaction["evaluated"],
+                            _bypass_compaction["action"],
+                            _bypass_compaction.get("reason"),
+                            _bypass_compaction["estimated_before"],
+                            _bypass_compaction["estimated_after"],
+                            _session_id or "unknown",
+                        )
+                    if not _rescued_local:
+                        # No rescue — preserve the original bypass behaviour
+                        # and continue to the next (remote) provider.
+                        continue
+                    # Rescued: fall through to the ordinary local dispatch
+                    # below with the compacted body.
 
                 # Cheap-mode economic-bypass recovery: log when a request
                 # that would have been cold-cache-bypassed proceeds to local
