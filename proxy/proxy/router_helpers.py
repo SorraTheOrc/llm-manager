@@ -2191,6 +2191,266 @@ def _evaluate_session_compaction(
         }
 
 
+async def evaluate_and_apply_compaction(
+    srv,
+    result: dict,
+    body_json: dict,
+    server_config: dict,
+    *,
+    session=None,
+    session_messages: list | None = None,
+    summarizer=None,
+    estimate_tokens=None,
+    mode: str | None = None,
+) -> dict:
+    """Evaluate session compaction and apply the decision to ``result``.
+
+    Shared by the local-dispatch path (``_handle_session``) and the router
+    bypass path (``_proxy_with_fallback_cycle``) so an oversized session is
+    always evaluated for compaction — including sessions the router skips
+    for local dispatch on size grounds (LP-0MU5ARWSP001BYYB).
+
+    On a live compact the helper mutates ``body_json`` in place to the
+    compacted history and sets the same ``result`` keys the inline
+    ``_handle_session`` block did: ``body_override``, ``compaction_applied``,
+    ``compaction_estimated_before``, ``compaction_reason``,
+    ``compaction_summary_text``, ``compaction_turns_summarized``,
+    ``compaction_recent_turns_kept``. On live ``remote_with_guidance`` it
+    sets ``result["compaction_remote_with_guidance"]``.
+
+    Idempotent: ``result["compaction_evaluated"]`` gates a second call in the
+    same request cycle so compaction never runs twice.
+
+    Fail-open: an exception is logged and leaves dispatch unchanged, exactly
+    like the inline block.
+
+    Args:
+        srv: Server object (config at ``srv.config``; session manager at
+            ``srv.session_manager``; logger at ``srv.logger``).
+        result: Per-request session result dict (mutated in place).
+        body_json: Parsed request body (mutated in place on live compact).
+        server_config: The ``server`` config mapping.
+        session: Optional session object exposing ``.messages``.
+        session_messages: Optional explicit stored history, used when
+            ``session`` is not available.
+        summarizer / estimate_tokens: Optional injectable production
+            callables (tests); built from config when omitted.
+        mode: Optional mode override; defaults to ``proxy.mode.read_mode()``.
+
+    Returns:
+        Outcome dict: ``evaluated``, ``action``, ``applied``, ``dry_run``,
+        ``estimated_before``, ``estimated_after``, ``reason``, and
+        ``messages`` (compacted messages when applied, else ``None``).
+    """
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "action": "noop",
+        "applied": False,
+        "dry_run": True,
+        "estimated_before": 0,
+        "estimated_after": 0,
+        "reason": None,
+        "messages": None,
+    }
+
+    # Idempotent gating — compaction already evaluated this cycle.
+    if result.get("compaction_evaluated"):
+        outcome["reason"] = "already_evaluated"
+        return outcome
+
+    try:
+        from proxy.compaction_summarizer import build_compact_summarizer
+        from proxy.mode import read_mode as _read_mode
+        from proxy.provider import (
+            _estimate_prompt_tokens_for_routing,
+            _get_tokenizer_for_model,
+        )
+
+        # Build the production summarizer + token estimator once per request
+        # so decide_session_compaction has real capabilities rather than the
+        # always-None defaults that caused the compaction hang
+        # (LP-0MTPK77WG009A4VH). build_compact_summarizer uses the
+        # remote-only ``models.compact`` chain (Muse -> DeepSeek) so summaries
+        # never contend with the local GPU slots; it falls back to the local
+        # summarizer when ``models.compact`` is absent (LP-0MTT0O74N009E7N2).
+        _llama_port = server_config.get("llama_server_port", 8080)
+        _top_cfg = getattr(srv, "config", None)
+        if not isinstance(_top_cfg, dict):
+            _top_cfg = {"server": dict(server_config)}
+        if summarizer is None:
+            summarizer = build_compact_summarizer(
+                _top_cfg,
+                llama_port=_llama_port,
+            )
+
+        # Resolve the native tokenizer for the model so the compaction
+        # trigger uses the same tokenizer + multiplier as routing
+        # (LP-0MU5A84YU003YOTY).
+        _model_name = body_json.get("model") if isinstance(body_json, dict) else None
+        _model_config: dict = {}
+        if _model_name:
+            try:
+                from proxy.lifecycle import get_model_config
+
+                _model_config = get_model_config(_model_name) or {}
+            except Exception:
+                _model_config = {}
+        _model_config = _model_config or {}
+        if estimate_tokens is None:
+            _tokenizer, _tok_multiplier = _get_tokenizer_for_model(
+                _model_config, server_config
+            )
+
+            # The summarizer timeout resolves inside build_local_summarizer
+            # from config (``compaction_summarizer_timeout``, default 600 s —
+            # ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s timeout could
+            # not wait for the single local slot to free up while a long
+            # generating request held it, so every compaction failed
+            # (summarizer_failed/timeout) and the session was routed remote
+            # with guidance, stalling until the 900 s upstream timeout. 600 s
+            # exceeds the observed worst-case stall (max
+            # dispatch_first_byte_ms 713 s). See LP-0MU1RXEY10075TUU.
+            def estimate_tokens(msgs):
+                return _estimate_prompt_tokens_for_routing(
+                    {"messages": msgs}, tokenizer=_tokenizer
+                )
+
+        # The full history this request produces: the persistent session
+        # history PLUS this request's new turn(s). Compaction must operate on
+        # this produced history — evaluating only the stored history would
+        # drop the current turn from the compacted dispatch body
+        # (LP-0MTVXP7DG00613ZB AC2).
+        _stored_messages = getattr(session, "messages", None)
+        if _stored_messages is None:
+            _stored_messages = session_messages
+        _delta_for_compaction = result.get("delta_messages")
+        if result.get("is_delta_request") and _delta_for_compaction:
+            _pre_compaction_messages = list(_stored_messages or []) + list(
+                _delta_for_compaction
+            )
+        else:
+            _pre_compaction_messages = list(
+                (body_json.get("messages") if isinstance(body_json, dict) else None)
+                or _stored_messages
+                or []
+            )
+
+        _session_id = result.get("session_id") or ""
+        _mode = mode if mode is not None else _read_mode()
+
+        # Mark evaluated BEFORE the await so a re-entrant call short-circuits.
+        result["compaction_evaluated"] = True
+
+        # The summarizer call blocks on the local llama-server slot (up to
+        # ``compaction_summarizer_timeout``, default 600 s on a 1-slot backend
+        # where a long generating request holds the slot). Run the whole
+        # evaluation in a worker thread so the event loop keeps serving other
+        # requests (notably the streaming request whose slot we are waiting
+        # on) instead of freezing for the whole wait (LP-0MU1RXEY10075TUU).
+        _compaction = await asyncio.to_thread(
+            _evaluate_session_compaction,
+            srv,
+            _session_id,
+            _pre_compaction_messages,
+            _mode,
+            summarizer=summarizer,
+            estimate_tokens=estimate_tokens,
+        )
+
+        outcome["action"] = _compaction.get("action", "noop")
+        outcome["applied"] = bool(_compaction.get("applied"))
+        outcome["dry_run"] = bool(_compaction.get("dry_run", True))
+        outcome["estimated_before"] = int(
+            _compaction.get("estimated_before", 0) or 0
+        )
+        outcome["estimated_after"] = int(
+            _compaction.get("estimated_after", 0) or 0
+        )
+        outcome["reason"] = _compaction.get("reason")
+        outcome["evaluated"] = True
+
+        if (
+            _compaction.get("action") == "compact"
+            and _compaction.get("applied")
+            and not _compaction.get("dry_run")
+        ):
+            # Live: dispatch the compacted history as a full prompt (its
+            # prefix no longer matches the client's history).
+            body_json["messages"] = list(_compaction["messages"])
+            body_json["cache_prompt"] = True
+            body_json["session_id"] = _session_id
+            result["body_override"] = json.dumps(body_json).encode("utf-8")
+            result["is_delta_request"] = False
+            result["delta_messages"] = None
+            result["compaction_applied"] = True
+            result["compaction_estimated_before"] = outcome["estimated_before"]
+            result["compaction_reason"] = _compaction.get("reason")
+            # LP-0MTYGZ1DI0004QP8: surface the compaction decision so
+            # proxy_to_local can emit the X-Compaction-* bridge headers.
+            # Set only on the live-applied path (AC6).
+            result["compaction_summary_text"] = _compaction.get("summary_text")
+            result["compaction_turns_summarized"] = int(
+                _compaction.get("turns_summarized", 0) or 0
+            )
+            result["compaction_recent_turns_kept"] = int(
+                _compaction.get("recent_turns_kept", 0) or 0
+            )
+            outcome["messages"] = list(_compaction["messages"])
+            _logger = getattr(srv, "logger", None)
+            if _logger is not None:
+                _logger.info(
+                    "session_compaction applied session=%s mode=%s "
+                    "est_before=%d est_after=%d",
+                    str(_session_id)[:8],
+                    _compaction.get("mode"),
+                    outcome["estimated_before"],
+                    outcome["estimated_after"],
+                )
+            # After compaction, update the session's message history so
+            # downstream token estimates (e.g. routing_estimate_session)
+            # reflect the compacted count, not the pre-compaction value, and
+            # record the client/base anchors the next request needs to heal
+            # the sync break (AC2).
+            try:
+                if _session_id:
+                    await srv.session_manager.update_messages(
+                        _session_id,
+                        list(_compaction["messages"]),
+                    )
+                    await srv.session_manager.mark_compacted(
+                        _session_id,
+                        len(_pre_compaction_messages),
+                        len(_compaction["messages"]),
+                    )
+            except Exception:
+                pass  # non-fatal: routing estimate still uses body messages
+        elif (
+            _compaction.get("action") == "remote_with_guidance"
+            and not _compaction.get("dry_run")
+        ):
+            # Never dispatch local near-full-slot when the session cannot be
+            # compacted; the dispatcher must escalate remote WITH guidance.
+            result["compaction_remote_with_guidance"] = True
+            result["compaction_estimated_before"] = outcome["estimated_before"]
+            result["compaction_reason"] = _compaction.get("reason")
+    except Exception:
+        # Fail-open: record that evaluation was attempted (so it is not
+        # retried this cycle) and leave dispatch unchanged.
+        result["compaction_evaluated"] = True
+        outcome["evaluated"] = True
+        outcome["reason"] = "evaluation_failed"
+        _logger = getattr(srv, "logger", None)
+        if _logger is not None:
+            _logger.warning(
+                "Compaction evaluation failed; continuing unchanged "
+                "(session=%s)",
+                str(result.get("session_id") or "")[:8],
+                exc_info=True,
+            )
+
+    return outcome
+
+
 def _apply_post_compaction_heal(
     srv,
     session,
@@ -2370,167 +2630,18 @@ async def _handle_session(
             # zero dispatch change. Opt-in live enforcement rewrites the
             # dispatch body to the compacted full history and marks the
             # request full-prompt so forward + persistence stay consistent.
-            try:
-                from proxy.compaction_summarizer import build_compact_summarizer
-                from proxy.mode import read_mode as _read_mode
-                from proxy.provider import (
-                    _estimate_prompt_tokens_for_routing,
-                    _get_tokenizer_for_model,
-                )
-
-                # Build the production summarizer + token estimator once
-                # per request so decide_session_compaction has real
-                # capabilities rather than the always-None defaults
-                # that caused the compaction hang (LP-0MTPK77WG009A4VH).
-                # build_compact_summarizer uses the remote-only
-                # ``models.compact`` chain (Muse -> DeepSeek) so summaries
-                # never contend with the local GPU slots; it falls back to
-                # the local summarizer when ``models.compact`` is absent
-                # (LP-0MTT0O74N009E7N2).
-                _llama_port = server_config.get("llama_server_port", 8080)
-                _top_cfg = getattr(srv, "config", None)
-                if not isinstance(_top_cfg, dict):
-                    _top_cfg = {"server": dict(server_config)}
-                _summarizer = build_compact_summarizer(
-                    _top_cfg,
-                    llama_port=_llama_port,
-                )
-                # Resolve the native tokenizer for the model so the
-                # compaction trigger uses the same tokenizer + multiplier
-                # as routing (LP-0MU5A84YU003YOTY).
-                _model_name = body_json.get("model") if isinstance(body_json, dict) else None
-                _model_config: dict = {}
-                if _model_name:
-                    try:
-                        from proxy.lifecycle import get_model_config
-
-                        _model_config = get_model_config(_model_name) or {}
-                    except Exception:
-                        _model_config = {}
-                _model_config = _model_config or {}
-                _tokenizer, _tok_multiplier = _get_tokenizer_for_model(
-                    _model_config, server_config
-                )
-                # The summarizer timeout resolves inside build_local_summarizer
-                # from config (``compaction_summarizer_timeout``, default
-                # 600 s — ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s
-                # timeout could not wait for the single local slot to free up
-                # while a long generating request held it, so every compaction
-                # failed (summarizer_failed/timeout) and the session was
-                # routed remote with guidance, stalling until the 900 s
-                # upstream timeout. 600 s exceeds the observed worst-case
-                # stall (max dispatch_first_byte_ms 713 s). See
-                # LP-0MU1RXEY10075TUU.
-                def _estimate_fn(msgs):
-                    return _estimate_prompt_tokens_for_routing(
-                        {"messages": msgs}, tokenizer=_tokenizer
-                    )
-
-                # The full history this request produces: the persistent
-                # session history PLUS this request's new turn(s). Compaction
-                # must operate on this produced history — evaluating only the
-                # stored history would drop the current turn from the
-                # compacted dispatch body (LP-0MTVXP7DG00613ZB AC2).
-                _delta_for_compaction = result.get("delta_messages")
-                if result.get("is_delta_request") and _delta_for_compaction:
-                    _pre_compaction_messages = list(
-                        getattr(session, "messages", None) or []
-                    ) + list(_delta_for_compaction)
-                else:
-                    _pre_compaction_messages = list(
-                        body_json.get("messages", [])
-                        or getattr(session, "messages", None)
-                        or []
-                    )
-
-                # The summarizer call blocks on the local llama-server slot
-                # (up to ``compaction_summarizer_timeout``, default 600 s on
-                # a 1-slot backend where a long generating request holds the
-                # slot). Run the whole evaluation in a worker thread so the
-                # event loop keeps serving other requests (notably the
-                # streaming request whose slot we are waiting on) instead of
-                # freezing for the whole wait (LP-0MU1RXEY10075TUU).
-                _compaction = await asyncio.to_thread(
-                    _evaluate_session_compaction,
-                    srv,
-                    result["session_id"],
-                    _pre_compaction_messages,
-                    _read_mode(),
-                    summarizer=_summarizer,
-                    estimate_tokens=_estimate_fn,
-                )
-                if (
-                    _compaction.get("action") == "compact"
-                    and _compaction.get("applied")
-                    and not _compaction.get("dry_run")
-                ):
-                    # Live: dispatch the compacted history as a full prompt
-                    # (its prefix no longer matches the client's history).
-                    body_json["messages"] = list(_compaction["messages"])
-                    body_json["cache_prompt"] = True
-                    body_json["session_id"] = result["session_id"]
-                    result["body_override"] = json.dumps(body_json).encode("utf-8")
-                    result["is_delta_request"] = False
-                    result["delta_messages"] = None
-                    result["compaction_applied"] = True
-                    result["compaction_estimated_before"] = int(
-                        _compaction.get("estimated_before", 0) or 0
-                    )
-                    result["compaction_reason"] = _compaction.get("reason")
-                    # LP-0MTYGZ1DI0004QP8: surface the compaction decision so
-                    # proxy_to_local can emit the X-Compaction-* bridge headers.
-                    # Set only on the live-applied path (AC6).
-                    result["compaction_summary_text"] = _compaction.get("summary_text")
-                    result["compaction_turns_summarized"] = int(
-                        _compaction.get("turns_summarized", 0) or 0
-                    )
-                    result["compaction_recent_turns_kept"] = int(
-                        _compaction.get("recent_turns_kept", 0) or 0
-                    )
-                    srv.logger.info(
-                        "session_compaction applied session=%s mode=%s "
-                        "est_before=%d est_after=%d",
-                        result["session_id"][:8],
-                        _compaction.get("mode"),
-                        _compaction.get("estimated_before", 0),
-                        _compaction.get("estimated_after", 0),
-                    )
-                    # After compaction, update the session's message history so
-                    # downstream token estimates (e.g. routing_estimate_session)
-                    # reflect the compacted count, not the pre-compaction value,
-                    # and record the client/base anchors the next request needs
-                    # to heal the sync break (AC2).
-                    try:
-                        await srv.session_manager.update_messages(
-                            result["session_id"],
-                            list(_compaction["messages"]),
-                        )
-                        await srv.session_manager.mark_compacted(
-                            result["session_id"],
-                            len(_pre_compaction_messages),
-                            len(_compaction["messages"]),
-                        )
-                    except Exception:
-                        pass  # non-fatal: routing estimate still uses body messages
-                elif (
-                    _compaction.get("action") == "remote_with_guidance"
-                    and not _compaction.get("dry_run")
-                ):
-                    # Never dispatch local near-full-slot when the session
-                    # cannot be compacted; the dispatcher must escalate
-                    # remote WITH guidance.
-                    result["compaction_remote_with_guidance"] = True
-                    result["compaction_estimated_before"] = int(
-                        _compaction.get("estimated_before", 0) or 0
-                    )
-                    result["compaction_reason"] = _compaction.get("reason")
-            except Exception:
-                srv.logger.warning(
-                    "Compaction evaluation failed; continuing unchanged "
-                    "(session=%s)",
-                    str(result.get("session_id") or "")[:8],
-                    exc_info=True,
-                )
+            #
+            # Extracted into the shared ``evaluate_and_apply_compaction``
+            # helper (LP-0MU5IBXD4000POV0) so the router bypass path can run
+            # the same evaluation for oversized sessions it would otherwise
+            # skip entirely (LP-0MU5ARWSP001BYYB).
+            await evaluate_and_apply_compaction(
+                srv,
+                result,
+                body_json,
+                server_config,
+                session=session,
+            )
 
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True
