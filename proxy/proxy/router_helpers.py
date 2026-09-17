@@ -2373,7 +2373,10 @@ async def _handle_session(
             try:
                 from proxy.compaction_summarizer import build_compact_summarizer
                 from proxy.mode import read_mode as _read_mode
-                from proxy.provider import _estimate_prompt_tokens_for_routing
+                from proxy.provider import (
+                    _estimate_prompt_tokens_for_routing,
+                    _get_tokenizer_for_model,
+                )
 
                 # Build the production summarizer + token estimator once
                 # per request so decide_session_compaction has real
@@ -2392,6 +2395,22 @@ async def _handle_session(
                     _top_cfg,
                     llama_port=_llama_port,
                 )
+                # Resolve the native tokenizer for the model so the
+                # compaction trigger uses the same tokenizer + multiplier
+                # as routing (LP-0MU5A84YU003YOTY).
+                _model_name = body_json.get("model") if isinstance(body_json, dict) else None
+                _model_config: dict = {}
+                if _model_name:
+                    try:
+                        from proxy.lifecycle import get_model_config
+
+                        _model_config = get_model_config(_model_name) or {}
+                    except Exception:
+                        _model_config = {}
+                _model_config = _model_config or {}
+                _tokenizer, _tok_multiplier = _get_tokenizer_for_model(
+                    _model_config, server_config
+                )
                 # The summarizer timeout resolves inside build_local_summarizer
                 # from config (``compaction_summarizer_timeout``, default
                 # 600 s — ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s
@@ -2403,7 +2422,9 @@ async def _handle_session(
                 # stall (max dispatch_first_byte_ms 713 s). See
                 # LP-0MU1RXEY10075TUU.
                 def _estimate_fn(msgs):
-                    return _estimate_prompt_tokens_for_routing({"messages": msgs})
+                    return _estimate_prompt_tokens_for_routing(
+                        {"messages": msgs}, tokenizer=_tokenizer
+                    )
 
                 # The full history this request produces: the persistent
                 # session history PLUS this request's new turn(s). Compaction
