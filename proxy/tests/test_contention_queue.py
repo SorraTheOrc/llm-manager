@@ -364,9 +364,9 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
 
 @pytest.mark.asyncio
 async def test_context_bypass_never_queued(mixed_model_config):
-    """A request that would be context-bypassed (context_too_large /
-    large_context_bypass) must NEVER wait in the contention queue — it falls
-    back exactly as today."""
+    """A physically-oversized request (context_too_large) must NEVER wait in
+    the contention queue — it falls back exactly as today in every mode
+    (LP-0MSORQVK50012Q4D AC4, LP-0MU5A4QBR003YJM0 AC3)."""
     concurrency = _MutableConcurrency(active=1, max_=1)
     call_log = []
 
@@ -387,13 +387,13 @@ async def test_context_bypass_never_queued(mixed_model_config):
     cfg = _queue_cfg(
         local_large_context_cold_cache_threshold=100,
         local_large_context_warm_cache_threshold=200,
+        local_large_context_economic_bypass_serves_local=True,
     )
 
     with (
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -402,6 +402,167 @@ async def test_context_bypass_never_queued(mixed_model_config):
     assert result.status_code == 200
     assert call_log == ["remote"], "context bypass must fall back to remote"
     assert contention_queue.queue_depth() == 0
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC2: config-driven economic bypass recovery (LP-0MU5A4QBR003YJM0)
+# ---------------------------------------------------------------------------
+
+
+def _economic_bypass_body() -> bytes:
+    """A body whose estimate sits between a small cold threshold and a large
+    warm threshold — an economic (not physical) bypass."""
+    phrase = "test message content for token estimation "
+    return json.dumps(
+        {"model": "test", "messages": [{"role": "user", "content": phrase * 2000}]}
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_cheap_mode_economic_bypass_serves_local(mixed_model_config, caplog):
+    """AC1 (LP-0MU5A4QBR003YJM0): with the cheap profile's recovery flag an
+    economic bypass (new_tokens > cold, total <= warm) is served locally — no
+    remote attempt.  A distinct ``routing_economic_bypass_local`` log line
+    records the recovery (AC5).
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    # Slots available → local dispatch directly.
+    concurrency = _MutableConcurrency(active=0, max_=1)
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(body=_economic_bypass_body())
+    cfg = _queue_cfg(
+        local_large_context_cold_cache_threshold=100,
+        local_large_context_warm_cache_threshold=100_000,
+        local_large_context_economic_bypass_serves_local=True,
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["local"], (
+        "cheap mode must serve the economic bypass locally (no remote)"
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_economic_bypass_local" in messages
+    assert "routing_skip_local" not in messages
+
+
+@pytest.mark.asyncio
+async def test_cheap_mode_economic_bypass_queues_when_busy(mixed_model_config):
+    """AC1 (LP-0MU5A4QBR003YJM0): with the recovery flag an economic bypass
+    enters the existing contention queue when all slots are busy and
+    dispatches local when a slot frees — it never falls back to a paid
+    remote."""
+    concurrency = _MutableConcurrency(active=1, max_=1)
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(body=_economic_bypass_body())
+    cfg = _queue_cfg(
+        local_large_context_cold_cache_threshold=100,
+        local_large_context_warm_cache_threshold=100_000,
+        local_large_context_economic_bypass_serves_local=True,
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+    ):
+        task = asyncio.create_task(
+            provider.proxy_with_fallback(
+                request, "v1/chat/completions", mixed_model_config, cfg
+            )
+        )
+        for _ in range(200):
+            if contention_queue.queue_depth() > 0:
+                break
+            await asyncio.sleep(0.005)
+        assert contention_queue.queue_depth() == 1, (
+            "economic bypass must queue behind the busy slot in cheap mode"
+        )
+
+        concurrency.active = 0
+        await contention_queue.wake_all()
+        result = await asyncio.wait_for(task, timeout=5)
+
+    assert result.status_code == 200
+    assert call_log == ["local"], (
+        "queued economic bypass must dispatch local, not remote"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fast_mode_economic_bypass_falls_back_remote(
+    mixed_model_config, caplog
+):
+    """AC2 (LP-0MU5A4QBR003YJM0): without the recovery flag (fast/default
+    profile) the same economic bypass still skips local
+    (``large_context_bypass``) and falls back to the next remote provider —
+    no local attempt, no queue."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    concurrency = _MutableConcurrency(active=0, max_=1)
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(body=_economic_bypass_body())
+    cfg = _queue_cfg(
+        local_large_context_cold_cache_threshold=100,
+        local_large_context_warm_cache_threshold=100_000,
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["remote"], (
+        "fast mode must keep the economic bypass remote fallback"
+    )
+    assert contention_queue.queue_depth() == 0
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_skip_local" in messages
+    assert "reason=large_context_bypass" in messages
+    assert "routing_economic_bypass_local" not in messages
 
 
 # ---------------------------------------------------------------------------

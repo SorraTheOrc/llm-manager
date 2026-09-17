@@ -219,8 +219,9 @@ class TestCachedTokensRouting:
         threshold = 40000
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=100, prompt_tokens=100)
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is False
+        assert reason is None
 
     def test_warm_cache_large_request_routes_local(self):
         """Warm cache (ratio >= 1) + large tokens → routes local (cache fully warm)."""
@@ -229,23 +230,26 @@ class TestCachedTokensRouting:
         threshold = 40000
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=100, prompt_tokens=100)
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is False
+        assert reason is None
 
     def test_cold_cache_small_request_routes_local(self):
         """Cold cache (no entry, defaults to 0.0) + small tokens → routes local."""
         body = {"messages": [{"role": "user", "content": "Hello"}]}
         threshold = 40000
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is False
+        assert reason is None
 
     def test_cold_cache_large_request_skips_local(self):
         """Cold cache (ratio < 1) + large tokens > threshold → skips local."""
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
         threshold = 40000
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is True
+        assert reason == "large_context_bypass"
 
     def test_partially_warm_cache_moderate_context_routes_local(self):
         """Partially warm cache (ratio 0.5) + 42K total → new_tokens=21K below
@@ -257,33 +261,37 @@ class TestCachedTokensRouting:
         threshold = 40000
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=50, prompt_tokens=100)
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is False
+        assert reason is None
 
     def test_threshold_zero_disables_bypass(self):
         """Threshold=0 → always routes local regardless of cache state."""
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 7000}]}
         threshold = 0
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is False
+        assert reason is None
 
     def test_exact_threshold_does_not_skip(self):
         """Tokens below threshold should NOT skip local even when cache is cold."""
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 3500}]}  # ~36K tokens
         threshold = 40000
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, threshold)
         assert should_skip is False
+        assert reason is None
 
     def test_precomputed_estimated_tokens_used(self):
         """Pre-computed estimated_tokens should be used when provided."""
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=10, prompt_tokens=100)
-        should_skip = _should_skip_local(
+        should_skip, reason = _should_skip_local(
             "Qwen3", "sess_a", {"messages": []}, 40000, estimated_tokens=50000
         )
         assert should_skip is True
+        assert reason == "large_context_bypass"
 
     # ------------------------------------------------------------------
     # Warm-cache threshold tests
@@ -298,11 +306,12 @@ class TestCachedTokensRouting:
         warm_threshold = 100000
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=95, prompt_tokens=100)
-        should_skip = _should_skip_local(
+        should_skip, reason = _should_skip_local(
             "Qwen3", "sess_a", body, cold_threshold,
             warm_cache_threshold=warm_threshold,
         )
         assert should_skip is False
+        assert reason is None
 
     def test_warm_cache_excessive_context_bypasses(self):
         """Warm cache (~0.95 ratio) + 200K total exceeds warm_threshold(100K)
@@ -313,11 +322,12 @@ class TestCachedTokensRouting:
         warm_threshold = 100000
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=95, prompt_tokens=100)
-        should_skip = _should_skip_local(
+        should_skip, reason = _should_skip_local(
             "Qwen3", "sess_a", body, cold_threshold,
             warm_cache_threshold=warm_threshold,
         )
         assert should_skip is True
+        assert reason == "context_too_large"
 
     def test_warm_cache_threshold_zero_disabled(self):
         """warm_cache_threshold=0 (default) disables the warm-cache hard cap,
@@ -328,11 +338,12 @@ class TestCachedTokensRouting:
         # warm_threshold defaults to 0 (disabled)
         from proxy.provider import update_cached_ratio
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=95, prompt_tokens=100)
-        should_skip = _should_skip_local(
+        should_skip, reason = _should_skip_local(
             "Qwen3", "sess_a", body, cold_threshold,
         )
         # new_tokens = 200K * (1-0.95) = 10K <= 30K, so route local
         assert should_skip is False
+        assert reason is None
 
     def test_cold_cache_new_token_dynamic_calculation(self):
         """Cold cache (ratio=0.0) with 60K total and threshold=30K:
@@ -341,17 +352,19 @@ class TestCachedTokensRouting:
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 10000}]}  # ~60K tokens
         cold_threshold = 30000
-        should_skip = _should_skip_local("Qwen3", "sess_a", body, cold_threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_a", body, cold_threshold)
         # new_tokens = 60K * (1-0.0) = 60K > 30K → bypass
         assert should_skip is True
+        assert reason == "large_context_bypass"
 
     def test_default_cold_for_new_session(self):
         """A session with no cached ratio entry defaults to cold."""
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 7000}]}
         threshold = 40000
-        should_skip = _should_skip_local("Qwen3", "sess_never_seen", body, threshold)
+        should_skip, reason = _should_skip_local("Qwen3", "sess_never_seen", body, threshold)
         assert should_skip is True
+        assert reason == "large_context_bypass"
 
     def test_warm_session_not_affected_by_other_cold_sessions(self):
         """A warm session should not be affected by cold sessions on same model."""
@@ -361,9 +374,192 @@ class TestCachedTokensRouting:
         from proxy.provider import update_cached_ratio
         # Session A is warm
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=100, prompt_tokens=100)
-        # Session B is cold (no entry)
-        assert _should_skip_local("Qwen3", "sess_a", body_big, threshold) is False  # warm → local
-        assert _should_skip_local("Qwen3", "sess_b", body_big, threshold) is True   # cold → skip
+        # Session B is cold (no entry) - _should_skip_local now returns (bool, reason)
+        skip_a, reason_a = _should_skip_local("Qwen3", "sess_a", body_big, threshold)
+        skip_b, reason_b = _should_skip_local("Qwen3", "sess_b", body_big, threshold)
+        assert skip_a is False  # warm → local
+        assert reason_a is None
+        assert skip_b is True   # cold → skip
+        assert reason_b == "large_context_bypass"
+
+
+# ---------------------------------------------------------------------------
+# Config-driven economic bypass recovery tests (LP-0MU5A4QBR003YJM0)
+# ---------------------------------------------------------------------------
+
+
+class TestEconomicBypassRecoveryFlag:
+    """Tests for the config-driven economic cold-cache bypass recovery.
+
+    Acceptance criteria:
+    - AC1: the recovery flag serves the economic-bypass case locally
+      (skip=False)
+    - AC2: without the flag the economic bypass still yields
+      large_context_bypass (skip=True) — fast mode unchanged
+    - AC3: physical capacity (context_too_large) is a hard bypass regardless
+      of the recovery flag
+    - AC4: gating is explicit via the config flag
+      (``local_large_context_economic_bypass_serves_local``), not a
+      hardcoded mode string branch in ``_should_skip_local``
+    """
+
+    def setup_method(self):
+        from proxy.provider import _last_cached_ratio
+        _last_cached_ratio.clear()
+
+    # AC1: the recovery flag serves the economic-bypass case locally
+    def test_recovery_flag_serves_economic_bypass_locally(self):
+        """Recovery flag on: economic bypass (new_tokens > cold, total <=
+        warm) returns (False, None) so the request proceeds to local."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
+        cold_threshold = 40000
+        warm_threshold = 100000
+        # Cold cache (no entry) → new_tokens = ~42K > 40K economic bypass
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_recover", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+            economic_bypass_serves_local=True,
+        )
+        assert skip is False, "recovery flag must serve the economic bypass locally"
+        assert reason is None
+
+    # AC2: without the flag the economic bypass still skips (fast mode)
+    def test_flag_off_economic_bypass_skips_local(self):
+        """Recovery flag off (fast/default): the same economic-bypass prompt
+        still yields large_context_bypass (skip=True)."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}  # ~42K tokens
+        cold_threshold = 40000
+        warm_threshold = 100000
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_fast", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+            economic_bypass_serves_local=False,
+        )
+        assert skip is True, "fast mode must keep the remote fallback"
+        assert reason == "large_context_bypass"
+
+    # AC2: the default (flag omitted) behaves like fast (unchanged)
+    def test_default_flag_economic_bypass_skips_local(self):
+        """Flag omitted (legacy/default): economic bypass still skips local."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}
+        cold_threshold = 40000
+        warm_threshold = 100000
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_legacy", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+        )
+        assert skip is True
+        assert reason == "large_context_bypass"
+
+    # AC3: physical capacity is a hard bypass regardless of the flag
+    def test_recovery_flag_physical_capacity_still_bypasses(self):
+        """Recovery flag on: estimated_tokens > warm_threshold →
+        context_too_large hard bypass (never served locally, never queued)."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 34000}]}  # ~200K tokens
+        cold_threshold = 30000
+        warm_threshold = 100000
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_cheap_cap", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+            economic_bypass_serves_local=True,
+        )
+        assert skip is True, "physical capacity must stay a hard bypass"
+        assert reason == "context_too_large"
+
+    def test_flag_off_physical_capacity_still_bypasses(self):
+        """Flag off: physical capacity check is a hard bypass."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 34000}]}  # ~200K tokens
+        cold_threshold = 30000
+        warm_threshold = 100000
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_fast_cap", body, cold_threshold,
+            warm_cache_threshold=warm_threshold,
+            economic_bypass_serves_local=False,
+        )
+        assert skip is True
+        assert reason == "context_too_large"
+
+    # AC1: warm cache with the flag on still routes local normally
+    def test_recovery_flag_warm_cache_routes_local(self):
+        """Recovery flag on: warm cache (ratio 1.0) → new_tokens=0, routes
+        local (the normal path, not the recovery path)."""
+        from proxy.provider import update_cached_ratio
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}
+        update_cached_ratio("Qwen3", "sess_warm", cached_tokens=100, prompt_tokens=100)
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_warm", body, 40000,
+            warm_cache_threshold=100000,
+            economic_bypass_serves_local=True,
+        )
+        assert skip is False
+        assert reason is None
+
+    # AC1: small prompt below the cold threshold routes local normally
+    def test_recovery_flag_small_prompt_routes_local(self):
+        """Recovery flag on: small prompt below cold threshold → routes local."""
+        body = {"messages": [{"role": "user", "content": "Hello"}]}
+        skip, reason = _should_skip_local(
+            "Qwen3", "sess_small", body, 40000,
+            warm_cache_threshold=100000,
+            economic_bypass_serves_local=True,
+        )
+        assert skip is False
+        assert reason is None
+
+    # AC4: threshold 0 disables the economic check under either flag value
+    def test_threshold_zero_disables_in_all_modes(self):
+        """cold_threshold=0 disables the economic check regardless of the
+        recovery flag."""
+        phrase = "test message content for token estimation "
+        body = {"messages": [{"role": "user", "content": phrase * 7000}]}
+        for flag in (True, False):
+            skip, reason = _should_skip_local(
+                "Qwen3", "sess_zero", body, 0,
+                economic_bypass_serves_local=flag,
+            )
+            assert skip is False
+            assert reason is None
+
+    # AC4: the flag is read from the active profile config (nested/flat)
+    def test_config_flag_helper_nested_and_flat(self):
+        """``_economic_bypass_serves_local`` reads the nested server key
+        (production) and the flat key (tests), defaulting to False."""
+        from proxy.provider import _economic_bypass_serves_local
+
+        assert _economic_bypass_serves_local(
+            {"server": {"local_large_context_economic_bypass_serves_local": True}}
+        ) is True
+        assert _economic_bypass_serves_local(
+            {"local_large_context_economic_bypass_serves_local": True}
+        ) is True
+        assert _economic_bypass_serves_local({}) is False
+        assert _economic_bypass_serves_local(
+            {"server": {"local_large_context_economic_bypass_serves_local": False}}
+        ) is False
+
+    # AC4: the shipped mode profiles declare the intended flag values
+    def test_shipped_profiles_declare_flag(self):
+        """config-cheap.yaml enables the flag; config-fast.yaml omits it."""
+        from pathlib import Path
+
+        import yaml
+
+        proxy_dir = Path(__file__).resolve().parent.parent
+        cheap = yaml.safe_load((proxy_dir / "config-cheap.yaml").read_text())
+        fast = yaml.safe_load((proxy_dir / "config-fast.yaml").read_text())
+        assert cheap["server"][
+            "local_large_context_economic_bypass_serves_local"
+        ] is True
+        assert (
+            "local_large_context_economic_bypass_serves_local"
+            not in fast["server"]
+        ), "fast profile must not enable economic-bypass local recovery"
 
 
 # ---------------------------------------------------------------------------

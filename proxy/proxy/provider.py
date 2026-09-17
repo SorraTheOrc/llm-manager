@@ -546,6 +546,34 @@ def _get_warm_cache_threshold(config: dict) -> int:
         return 0
 
 
+def _economic_bypass_serves_local(config: dict) -> bool:
+    """Whether the economic cold-cache bypass should be recovered locally.
+
+    Mode-gated via the active mode-profile config (LP-0MU5A4QBR003YJM0):
+    ``config-cheap.yaml`` sets
+    ``local_large_context_economic_bypass_serves_local: true`` so economic
+    bypasses (``new_tokens > cold_threshold`` while the prompt still fits the
+    per-slot KV capacity) are served locally — entering the contention queue
+    when all slots are busy — instead of falling back to a paid remote.
+
+    Fast/default profiles omit the key (or set it false), preserving the
+    remote-fallback behaviour for tail latency.  This is an explicit
+    mode-aware flag, not a hardcoded mode string branch: the active config
+    file selected by the mode decides the behaviour.
+
+    Supports both nested (``server:``) and flat config keys for test
+    compatibility.  Default: false.
+    """
+    val = config.get("local_large_context_economic_bypass_serves_local")
+    if val is None:
+        val = config.get("server", {}).get(
+            "local_large_context_economic_bypass_serves_local", False
+        )
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
 def _get_local_model_ctx_size(config: dict) -> int:
     """Read the local model's total context size (across all slots).
 
@@ -1480,7 +1508,8 @@ def _should_skip_local(
     cold_cache_threshold: int,
     estimated_tokens: int | None = None,
     warm_cache_threshold: int = 0,
-) -> bool:
+    economic_bypass_serves_local: bool = False,
+) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
     Implements a two-tier check:
@@ -1495,6 +1524,19 @@ def _should_skip_local(
        tokens: ``new_tokens = int(estimated_tokens * (1 - cached_ratio))``.
        If ``new_tokens > cold_cache_threshold``, the prefill is too
        expensive, so bypass local.  Otherwise route local.
+
+    Config-driven mode behaviour (LP-0MU5A4QBR003YJM0):
+
+    - **``economic_bypass_serves_local is True``** (set by the active mode
+      config — ``config-cheap.yaml``): when the *only* trigger is the
+      economic cold-cache check (``large_context_bypass``), the request is
+      served locally instead of being skipped.  This preserves cheap mode's
+      intent to avoid paid remote calls by waiting in the contention queue
+      rather than falling back.  The physical-capacity check
+      (``context_too_large``) still applies in both modes.
+    - **``economic_bypass_serves_local is False``** (default; fast profile):
+      behaviour is unchanged — the economic check still causes a skip
+      (``large_context_bypass``).
 
     This replaces the old binary ``ratio < 1.0`` check which was effectively
     always true (there is always new content in a conversation), causing
@@ -1516,27 +1558,49 @@ def _should_skip_local(
         cold_cache_threshold: Token threshold for bypass. 0 = disabled.
         estimated_tokens: Optional pre-computed estimate.
         warm_cache_threshold: Hard cap on total context. 0 = disabled.
+        economic_bypass_serves_local: Config-driven flag (from the active
+            mode profile) enabling cheap-mode economic-bypass recovery.
 
     Returns:
-        True if local should be skipped, False for normal local routing.
+        A tuple ``(skip, reason)`` where:
+
+        - ``skip`` is True if local should be skipped, False for normal
+          local routing.
+        - ``reason`` is the skip reason when ``skip`` is True
+          (``"context_too_large"`` or ``"large_context_bypass"``), or None
+          when ``skip`` is False.  When ``economic_bypass_serves_local`` is
+          True and the economic check would normally trigger but physical
+          capacity is available, ``(False, None)`` is returned so the
+          request proceeds to local (with contention-queue wait if slots
+          are busy).
     """
     if cold_cache_threshold <= 0:
-        return False
+        return (False, None)
     if estimated_tokens is None:
         estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
 
     # Check 1: Warm-cache threshold (hard cap on total context)
     if warm_cache_threshold > 0 and estimated_tokens > warm_cache_threshold:
-        return True
+        return (True, "context_too_large")
 
     # If estimated tokens are below cold cache threshold, always route local
     if estimated_tokens <= cold_cache_threshold:
-        return False
+        return (False, None)
 
     # Check 2: Dynamic new-token calculation
     ratio = _get_cached_ratio(model_name, session_id)
     new_tokens = int(estimated_tokens * (1 - ratio))
-    return new_tokens > cold_cache_threshold
+    if new_tokens <= cold_cache_threshold:
+        return (False, None)
+
+    # Economic cold-cache bypass (large_context_bypass)
+    if economic_bypass_serves_local:
+        # Active mode profile recovers economic bypasses locally. The
+        # contention queue (if enabled) will wait for a slot when all are
+        # busy.
+        return (False, None)
+
+    return (True, "large_context_bypass")
 
 
 # ---------------------------------------------------------------------------
@@ -2889,9 +2953,10 @@ async def _queue_context_bypass(
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
-    Used ONLY at the contention-queue decision point so context bypasses
-    (``context_too_large`` / ``large_context_bypass``) are NEVER queued — they
-    fall back exactly as today (LP-0MSORQVK50012Q4D AC4). Keeps the same
+    Used ONLY at the contention-queue decision point.  In cheap mode,
+    ``large_context_bypass`` is recovered (the request proceeds to local
+    and may queue); only ``context_too_large`` is a hard bypass
+    (LP-0MU5A4QBR003YJM0).  Keeps the same
     thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
     smart-routing block below; returns ``(skip_local, skip_reason)``.
     """
@@ -2903,18 +2968,15 @@ async def _queue_context_bypass(
     )
     if _multiplier != 1.0:
         _estimated_tokens = int(_estimated_tokens * _multiplier)
-    _skip_local = _should_skip_local(
+    # Pass the config-driven recovery flag so the cheap profile can recover
+    # economic bypasses (LP-0MU5A4QBR003YJM0)
+    _recover_economic = _economic_bypass_serves_local(config)
+    _skip_local, _skip_reason = _should_skip_local(
         _llama_model, session_id, body_json, _cold_threshold,
         estimated_tokens=_estimated_tokens,
         warm_cache_threshold=_warm_threshold,
+        economic_bypass_serves_local=_recover_economic,
     )
-    if _skip_local:
-        if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
-            _skip_reason = "context_too_large"
-        else:
-            _skip_reason = "large_context_bypass"
-    else:
-        _skip_reason = None
     return _skip_local, _skip_reason
 
 
@@ -5182,24 +5244,20 @@ async def _proxy_with_fallback_cycle(
                         ),
                         _get_context_pressure_warn_ratio(config),
                     )
-                _skip_local = _should_skip_local(
+                # Resolve the config-driven economic-bypass recovery flag
+                # (LP-0MU5A4QBR003YJM0): set by config-cheap.yaml, absent/
+                # false in fast/default profiles.
+                _recover_economic = _economic_bypass_serves_local(config)
+                _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
                     body_json,
                     _cold_threshold,
                     estimated_tokens=_estimated_tokens,
                     warm_cache_threshold=_warm_threshold,
+                    economic_bypass_serves_local=_recover_economic,
                 )
                 if _skip_local:
-                    # Determine reason: the context-too-large hard cap fires
-                    # when estimated_tokens > warm_cache_threshold (total
-                    # context too large regardless of cache state), logged as
-                    # ``context_too_large`` (LP-0MSF8XDG7000PERM).  Otherwise
-                    # the cold-cache new-token check triggered.
-                    if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
-                        _skip_reason = "context_too_large"
-                    else:
-                        _skip_reason = "large_context_bypass"
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
@@ -5232,6 +5290,42 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     continue
+
+                # Cheap-mode economic-bypass recovery: log when a request
+                # that would have been cold-cache-bypassed proceeds to local
+                # (LP-0MU5A4QBR003YJM0).  The `_recover_economic` /
+                # `_cold_threshold` variables are available from the scope
+                # above.
+                if (
+                    _recover_economic
+                    and _cold_threshold > 0
+                    and _routing_new_tokens > _cold_threshold
+                ):
+                    logger.info(
+                        "routing_economic_bypass_local provider=%s model=%s "
+                        "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
+                        "new_tokens=%d cached_ratio=%.2f session=%s",
+                        provider_name,
+                        _llama_model or "unknown",
+                        _estimated_tokens,
+                        _cold_threshold,
+                        _warm_threshold,
+                        _routing_new_tokens,
+                        _routing_cached_ratio,
+                        _session_id or "unknown",
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="economic_bypass_local_serve",
+                        estimated_tokens=_estimated_tokens,
+                        cold_threshold=_cold_threshold,
+                        warm_threshold=_warm_threshold,
+                        new_tokens=_routing_new_tokens,
+                        cached_ratio=_routing_cached_ratio,
+                        reason="economic_bypass_local_serve",
+                    )
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 

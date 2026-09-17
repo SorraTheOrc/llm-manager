@@ -130,6 +130,36 @@ models:
 - `{"model": "claude-3-opus"}` → matches `anthropic` config via exact alias → routes to Anthropic API
 - No model specified + `current_model` is set → uses the currently loaded local model
 
+## Large-Context Routing: Mode-Dependent Economic Bypass (LP-0MU5A4QBR003YJM0)
+
+When a request's estimated token count exceeds the cold-cache threshold
+(`local_large_context_cold_cache_threshold`), the proxy applies a two-tier
+check to decide whether to route local or skip to a remote provider:
+
+1. **Physical capacity check** (`context_too_large`): if the estimated tokens
+   exceed the warm-cache threshold (per-slot capacity clamp), the request
+   cannot fit the KV slot and always bypasses local.
+2. **Economic cold-cache check** (`large_context_bypass`): if the estimated
+   new tokens (estimated × (1 - cached_ratio)) exceed the cold threshold,
+   the prefill cost is too high for local.
+
+**Mode-dependent behaviour for the economic check** (selected by the active
+mode profile's ``local_large_context_economic_bypass_serves_local`` flag —
+not a hardcoded mode string):
+
+| Mode | `local_large_context_economic_bypass_serves_local` | Economic bypass behaviour |
+|------|-----------------------------------------------------|--------------------------|
+| **cheap** | `true` | Request proceeds to local; if all slots are busy it enters the contention queue (bounded by depth and wait caps). The request is **not** recorded as `large_context_bypass` — it is served locally (or queued). |
+| **fast** | absent / `false` | Request skips local and falls back to the next remote provider. The skip reason is `large_context_bypass`. |
+
+The physical capacity check applies in both modes — requests that cannot fit
+the KV slot are never served locally regardless of mode.
+
+**Observability:** when cheap mode serves an economic-bypass request locally,
+the proxy logs a `routing_economic_bypass_local` line with the token counts
+and cached ratio. The `routing_skip_local` line (with `reason=large_context_bypass`)
+remains parseable by reporting tools and only appears for fast mode.
+
 ## Slot Contention: Per-Mode Queue vs Fallback (LP-0MSORQVK50012Q4D)
 
 When every local slot is busy (``local_active_queries >= session_slot_pool_size``),
@@ -151,10 +181,13 @@ Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
 - **Cross-session**: the queue is process-global, so a request from session B
   can wait (bounded) behind a long audit stream from session A. This is what
   converts overnight contention fallbacks into queued-local dispatches.
-- **Context bypasses never queue**: requests that cannot fit the KV slot
-  (`context_too_large` / `large_context_bypass`, LP-0MSF8XDG7000PERM /
-  LP-0MRE4NBQ5009V5BX) fall back exactly as before — they are physical
-  capacity limits, not contention.
+- **Context bypasses**: requests that cannot fit the KV slot
+  (`context_too_large`, LP-0MSF8XDG7000PERM) always fall back — this is a
+  physical capacity limit, not contention.  The economic cold-cache bypass
+  (`large_context_bypass`, LP-0MRE4NBQ5009V5BX) is mode-dependent (LP-0MU5A4QBR003YJM0):
+  in **cheap mode** it is recovered (the request proceeds to local and may
+  queue); in **fast mode** it bypasses local and falls back to remote providers
+  for tail latency.
 - **Wake signals**: the queue wakes on BOTH `local_active_queries` decrement
   (a local stream ended) AND slot-persistence / lease release (slot
   save/restore frees the backend during model switches).

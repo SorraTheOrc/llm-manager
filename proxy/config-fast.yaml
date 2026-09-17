@@ -526,6 +526,12 @@ server:
   # NOTE: cheap mode raised its cold threshold to 42000 (LP-0MT50SMU1005ZAD6 /
   # LP-0MT50WCCP000DU00) but fast/default stay at 38000 — cheap-only change.
   local_large_context_cold_cache_threshold: 38000
+  # FAST MODE: The economic cold-cache bypass threshold.  Unlike cheap mode
+  # (LP-0MU5A4QBR003YJM0), fast mode retains the traditional behaviour:
+  # requests exceeding this threshold are skipped locally (``large_context_bypass``)
+  # and fall back to the next remote provider for tail-latency.  The cheap
+  # profile's ``local_large_context_economic_bypass_serves_local: true`` flag
+  # is intentionally omitted here (defaults to false).
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
@@ -682,6 +688,10 @@ server:
   # so burst requests get a short local wait before falling back to remotes
   # — reducing tail latency while still utilising the local model. Cheap
   # mode (config-cheap.yaml) declares ``queue`` with larger caps (8/120).
+  #
+  # Context bypasses in fast mode (LP-0MU5A4QBR003YJM0):
+  #   Both ``context_too_large`` and ``large_context_bypass`` cause the
+  #   request to skip local and fall back to remote providers.
   contention_queue_policy: queue
   contention_queue_max_wait_seconds: 45
   contention_queue_max_depth: 3

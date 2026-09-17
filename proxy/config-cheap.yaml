@@ -562,6 +562,17 @@ server:
   # Do NOT raise >= 46000 (measured inside the proven failure envelope
   # of the 60000 experiment).
   local_large_context_cold_cache_threshold: 42000
+  # CHEAP MODE: recover the economic cold-cache bypass locally.  When the
+  # only trigger is the economic check (``new_tokens > cold_threshold`` while
+  # the prompt still fits the per-slot KV capacity), this flag serves the
+  # request locally instead of falling back to paid remotes
+  # (LP-0MU5A4QBR003YJM0).  The contention queue waits for a slot when all
+  # are busy; the request is not recorded as ``large_context_bypass`` — it
+  # proceeds to local (with queue wait).  This is the explicit mode-aware
+  # flag: config-fast.yaml omits it (default false), so fast mode keeps the
+  # remote fallback for tail latency.  The hard capacity limit below
+  # (``warm_cache_threshold``) still applies in both modes.
+  local_large_context_economic_bypass_serves_local: true
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
@@ -717,9 +728,14 @@ server:
 
   # Per-mode contention policy (LP-0MSORQVK50012Q4D): when all local slots
   # are busy, QUEUE the request (bounded, cross-session) instead of
-  # immediately falling back to the next remote provider. Context bypasses
-  # (context_too_large / large_context_bypass) are physical capacity limits
-  # and never queue. Fast mode (config-fast.yaml) keeps fallback.
+  # immediately falling back to the next remote provider.
+  #
+  # Context bypasses (LP-0MU5A4QBR003YJM0):
+  #   - ``context_too_large``: physical capacity limit → always bypass
+  #     (never queued) in every mode.
+  #   - ``large_context_bypass``: economic threshold → in cheap mode, it is
+  #     recovered (served locally, queueing when slots are busy); in fast
+  #     mode it bypasses. Fast mode (config-fast.yaml) keeps fallback.
   contention_queue_policy: queue
   # Max time (seconds) a queued request waits for a local slot before
   # falling back to the next remote provider. Clamped to
