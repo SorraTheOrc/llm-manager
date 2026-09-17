@@ -27,7 +27,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from proxy.compaction import (
     compaction_trigger_tokens,
     decide_session_compaction,
@@ -112,7 +111,7 @@ async def capture_compaction_estimate(
     server_config: dict,
     body_json: dict,
     model_config: dict = NATIVE_MODEL_CONFIG,
-) -> "callable":
+) -> callable:
     """Run the real ``_handle_session`` wiring and return the production
     ``estimate_tokens`` closure handed to the compaction decision."""
     from proxy.router_helpers import _handle_session
