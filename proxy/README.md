@@ -880,6 +880,51 @@ the old "just restart" behavior. A second switch while a restart is pending
 is a noop if the mode matches, otherwise rejected with `409` (avoids
 restart loops).
 
+#### Fast → cheap cooldown
+
+Because every switch is a **full proxy restart** that kills in-flight
+streams, a stale mode-switch worker could otherwise revert an active
+worker's `fast` switch within seconds and repeatedly interrupt live
+requests (LP-0MU6MQIPP0058198: 10 switches in 12 h, several fast→cheap
+reverts only 13–20 s apart). A **30-minute cooldown on the fast→cheap
+direction** bounds that flip-flop:
+
+- A real transition to `fast` (manual or scheduled) records a
+  `last-fast-switch` timestamp in `proxy/.mode.last-fast-switch`
+  (gitignored runtime state). A no-op request for `fast` while already
+  `fast` does **not** refresh the clock.
+- A **manual** `POST /admin/set-mode {"mode":"cheap"}` inside that window
+  is rejected **before** any state mutation, so the mode is unchanged and
+  no restart is armed.
+- `cheap → fast` is never delayed (`fast` is the escape hatch for active
+  agent work), and the **scheduled** cheap transition at the schedule
+  boundary bypasses the cooldown, so the operator's configured schedule
+  still applies.
+- The timestamp is file-persisted so it survives the restart the `fast`
+  switch itself triggers; a missing file fails open (no cooldown on a
+  fresh install or when `fast` has never been recorded).
+
+The rejection is `429 Too Many Requests` with a `Retry-After` header and a
+machine-readable `retry_after_seconds` field so a caller can back off
+without another `GET /admin/mode` probe:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1620
+Content-Type: application/json
+
+{
+  "detail": "fast mode was switched on less than 30 minutes ago; refusing fast->cheap switch during the cooldown (retry in 27 minutes)",
+  "retry_after_seconds": 1620
+}
+```
+
+`retry_after_seconds` is `ceil(30 min − elapsed)`, at least `1`; the human
+hint rounds that up to whole minutes (`retry in 27 minutes` above). At
+exactly 30 minutes (or later) the switch succeeds as before. The cooldown
+window is a fixed module constant (`MODE_SWITCH_COOLDOWN_SECONDS`), not an
+operator-configurable key.
+
 #### Session grandfathering across mode switches
 
 Since a mode switch restarts the proxy and re-selects the config profile, a
@@ -1486,7 +1531,10 @@ Switches the proxy between **fast** (cloud-backed) and **cheap**
 operating modes. Requesting the active mode is a noop; a
 different mode is persisted (survives restarts) and triggers a full proxy
 restart in the background. Invalid modes return `400`; a switch while a
-restart is pending returns `409` when the mode differs.
+restart is pending returns `409` when the mode differs; a manual
+`fast`→`cheap` switch less than 30 minutes after a `fast` switch returns
+`429` with `Retry-After` and a `retry_after_seconds` body field (see
+[Fast → cheap cooldown](#fast--cheap-cooldown)).
 
 #### Stop LLama Server
 ```bash
