@@ -11,7 +11,7 @@ Covers (LP-0MSLMYEEU002IBH6):
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -360,3 +360,142 @@ class TestOverrideStateFile:
         mode_module.set_mode("cheap", manual=True, schedule=schedule)
         assert mode_module.read_override_until() == mode_module.OVERRIDE_UNTIL_NEVER
         assert mode_module.manual_override_active() is True
+
+
+# ---------------------------------------------------------------------------
+# Fast -> cheap cooldown (LP-0MU6MQIPP0058198)
+# ---------------------------------------------------------------------------
+
+
+class TestFastToCheapCooldown:
+    """A manual fast->cheap switch inside MODE_SWITCH_COOLDOWN_SECONDS of the
+    last real transition to fast is refused with 429 *before* any mutation."""
+
+    @pytest.mark.asyncio
+    async def test_within_cooldown_rejected_429(self, mode_file, client, monkeypatch):
+        """3 min after a fast switch -> 429 with a 27-minute hint, no mutation."""
+        mode_file.write_text("fast\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        spawned = []
+        monkeypatch.setattr(
+            mode_module, "_spawn_restart", lambda: spawned.append(True)
+        )
+        mode_module.write_last_fast_switch(datetime.now() - timedelta(minutes=3))
+
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "cheap"})
+            )
+
+        assert resp.status_code == 429
+        body = resp.json()
+        assert "retry in 27 minutes" in body["detail"]
+        assert body["retry_after_seconds"] == 27 * 60
+        assert resp.headers["Retry-After"] == str(27 * 60)
+        # Mode unchanged and no restart armed (gate runs before mutation).
+        assert mode_file.read_text().strip() == "fast"
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_exactly_at_window_succeeds(self, mode_file, client, monkeypatch):
+        """At exactly 30 minutes the cheap switch is allowed again."""
+        mode_file.write_text("fast\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_last_fast_switch(
+            datetime.now()
+            - timedelta(seconds=mode_module.MODE_SWITCH_COOLDOWN_SECONDS)
+        )
+
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "cheap"})
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["mode"] == "cheap"
+        assert resp.json()["restart"] is True
+        assert mode_file.read_text().strip() == "cheap"
+
+    @pytest.mark.asyncio
+    async def test_noop_fast_does_not_reset_clock(
+        self, mode_file, client, monkeypatch
+    ):
+        """A no-op POST fast while already fast must not extend the cooldown."""
+        mode_file.write_text("fast\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_last_fast_switch(datetime.now() - timedelta(minutes=10))
+        before = mode_module.read_last_fast_switch()
+
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "fast"})
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["restart"] is False
+        assert mode_module.read_last_fast_switch() == before
+
+    @pytest.mark.asyncio
+    async def test_cheap_to_fast_is_never_delayed(
+        self, mode_file, client, monkeypatch
+    ):
+        """Only fast->cheap is gated: cheap->fast applies immediately."""
+        mode_file.write_text("cheap\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_last_fast_switch(datetime.now())  # very recent fast
+
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "fast"})
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["mode"] == "fast"
+        assert mode_file.read_text().strip() == "fast"
+
+    @pytest.mark.asyncio
+    async def test_fail_open_without_timestamp(self, mode_file, client, monkeypatch):
+        """No persisted fast-switch timestamp -> the cooldown does not apply."""
+        mode_file.write_text("fast\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        assert mode_module.read_last_fast_switch() is None
+
+        async with client as c:
+            resp = await c.post(
+                "/admin/set-mode", content=json.dumps({"mode": "cheap"})
+            )
+
+        assert resp.status_code == 200
+        assert mode_file.read_text().strip() == "cheap"
+
+    def test_real_fast_transition_records_timestamp(self, mode_file, monkeypatch):
+        """A real transition to fast persists the cooldown clock; a no-op does not."""
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_mode("cheap")
+        assert mode_module.read_last_fast_switch() is None
+        mode_module.set_mode(
+            "fast", manual=True, schedule=mode_module.ModeScheduleConfig(None)
+        )
+        first = mode_module.read_last_fast_switch()
+        assert first is not None
+        # A no-op fast call leaves the recorded clock untouched.
+        mode_module.set_mode(
+            "fast", manual=True, schedule=mode_module.ModeScheduleConfig(None)
+        )
+        assert mode_module.read_last_fast_switch() == first
+
+    def test_persisted_timestamp_survives_fresh_read(self, mode_file, monkeypatch):
+        """Simulated restart: the timestamp written before the restart is
+        readable from the state file afterwards (no in-memory clock)."""
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        ts = datetime(2026, 9, 18, 8, 0, 0)
+        mode_module.write_mode("cheap")
+        mode_module.write_last_fast_switch(ts)
+        # Fresh process: nothing cached, read straight from disk.
+        assert mode_module.read_last_fast_switch() == ts
