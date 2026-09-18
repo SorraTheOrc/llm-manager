@@ -41,6 +41,17 @@ def _reset_drain_state(monkeypatch):
         mode_module._restart_pending = False
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cooldown_state(tmp_path, monkeypatch):
+    """Redirect the fast->cheap cooldown state file to a tmp path
+    (LP-0MU6MQIPP0058198) so drain tests never touch the real checkout."""
+    monkeypatch.setattr(
+        mode_module,
+        "last_fast_switch_file",
+        lambda: tmp_path / ".mode.last-fast-switch",
+    )
+
+
 @pytest.fixture
 def drain_config(monkeypatch):
     """Force the drain config section used by mode.py."""

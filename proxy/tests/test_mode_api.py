@@ -31,6 +31,14 @@ def _override_file(tmp_path, monkeypatch):
     writes into the real proxy directory (LP-0MSMF25V9002AY1J)."""
     path = tmp_path / ".mode.override-until"
     monkeypatch.setattr(mode_module, "override_until_file", lambda: path)
+    # Isolate the fast->cheap cooldown state (LP-0MU6MQIPP0058198) too: a
+    # test that transitions to fast must not write the real checkout state
+    # file (nor inherit a live cooldown from it).
+    monkeypatch.setattr(
+        mode_module,
+        "last_fast_switch_file",
+        lambda: tmp_path / ".mode.last-fast-switch",
+    )
     return path
 
 

@@ -479,7 +479,7 @@ def _mode_scheduler_step(
         # change; stand down instead of reverting it.
         return False
     try:
-        set_mode(expected)
+        set_mode(expected, bypass_cooldown=True)
     except RuntimeError:
         logger.debug("Mode scheduler: restart pending, retrying next cycle")
         return False
@@ -713,10 +713,62 @@ def restart_pending() -> bool:
         return _restart_pending
 
 
+class ModeSwitchCooldownError(Exception):
+    """Raised when a manual fast->cheap switch arrives inside the cooldown.
+
+    Competing mode-switch workers can otherwise revert a fresh ``fast``
+    switch within seconds; each revert is a full proxy restart that kills
+    in-flight streams. Carries the machine-readable
+    ``retry_after_seconds`` (rounded up to a whole second) so the API
+    handler can emit a ``Retry-After`` header without recomputing the
+    window (LP-0MU6MQIPP0058198).
+    """
+
+    def __init__(self, retry_after_seconds: float):
+        self.retry_after_seconds = max(1, int(math.ceil(retry_after_seconds)))
+        minutes = int(math.ceil(self.retry_after_seconds / 60))
+        super().__init__(
+            "fast mode was switched on less than "
+            f"{MODE_SWITCH_COOLDOWN_SECONDS // 60} minutes ago; refusing "
+            f"fast->cheap switch during the cooldown (retry in {minutes} minutes)"
+        )
+
+
+def _check_fast_to_cheap_cooldown(
+    mode: str, manual: bool, bypass_cooldown: bool
+) -> None:
+    """Reject a too-soon manual fast->cheap switch (call before mutating state).
+
+    The cooldown gates only the client/API fast->cheap direction:
+
+    - ``manual`` calls only — the scheduled path is never blocked, so the
+      operator's configured schedule still applies (requirement 5).
+    - ``bypass_cooldown`` lets the scheduler opt out unconditionally even
+      when a caller routes through the manual path.
+    - ``fast`` switches are never delayed (``fast`` is the escape hatch for
+      active agent work); only a revert to ``cheap`` is gated.
+
+    Fails open when no fast-switch timestamp is persisted (fresh install or
+    ``fast`` never recorded), so existing deployments are unchanged.
+    """
+    if not manual or bypass_cooldown or mode != MODE_CHEAP:
+        return
+    if read_mode() != MODE_FAST:
+        return
+    last = read_last_fast_switch()
+    if last is None:
+        return
+    elapsed = (datetime.now() - last).total_seconds()
+    if elapsed >= MODE_SWITCH_COOLDOWN_SECONDS:
+        return
+    raise ModeSwitchCooldownError(MODE_SWITCH_COOLDOWN_SECONDS - elapsed)
+
+
 def set_mode(
     mode: str,
     manual: bool = False,
     schedule: ModeScheduleConfig | None = None,
+    bypass_cooldown: bool = False,
 ) -> tuple[str, bool]:
     """Persist *mode* and arm a background restart when it changes.
 
@@ -736,7 +788,12 @@ def set_mode(
       restart (``scripts/start-proxy.sh --restart``) in the background.
 
     Raises ``RuntimeError`` when a mode-switch restart is already pending
-    and the requested mode differs (rejected to avoid restart loops).
+    and the requested mode differs (rejected to avoid restart loops), and
+    ``ModeSwitchCooldownError`` when a manual fast->cheap switch arrives
+    inside ``MODE_SWITCH_COOLDOWN_SECONDS`` of the last real transition to
+    ``fast`` (checked before any state mutation, so a rejected request never
+    arms a restart). ``bypass_cooldown`` skips that gate (used by the
+    scheduler, which must always apply the configured schedule).
     """
     global _restart_pending
     with _mode_lock:
@@ -746,6 +803,9 @@ def set_mode(
                     _write_override_expiry(schedule)
                 return mode, False
             raise RuntimeError("A mode-switch restart is already in progress")
+        # Cooldown gate: must run BEFORE any mutation (write_mode / drain) so
+        # a rejected request cannot trigger a restart (LP-0MU6MQIPP0058198).
+        _check_fast_to_cheap_cooldown(mode, manual, bypass_cooldown)
         if read_mode() == mode:
             if manual:
                 _write_override_expiry(schedule)
