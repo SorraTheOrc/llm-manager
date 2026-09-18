@@ -867,7 +867,12 @@ async def set_operating_mode(request: Request):
 
     Returns ``400`` for an invalid/missing mode, ``409`` when a
     mode-switch restart is already in progress and the requested mode
-    differs (avoids restart loops).
+    differs (avoids restart loops), and ``429`` when a manual fast->cheap
+    switch arrives inside the ``MODE_SWITCH_COOLDOWN_SECONDS`` cooldown
+    (LP-0MU6MQIPP0058198). A ``429`` response carries a ``Retry-After``
+    header and a ``retry_after_seconds`` body field so callers can back
+    off without another ``GET /admin/mode`` probe; the mode is unchanged
+    and no restart is armed.
     """
     try:
         body = await request.json()
@@ -885,6 +890,19 @@ async def set_operating_mode(request: Request):
         # alongside the mode.
         schedule = mode_module.ModeScheduleConfig.from_file()
         persisted, restart = mode_module.set_mode(mode, manual=True, schedule=schedule)
+    except mode_module.ModeSwitchCooldownError as exc:
+        # 429 Too Many Requests is the only status for which Retry-After is
+        # defined; the body repeats the hint machine-readably so the caller
+        # does not need a second probe (LP-0MU6MQIPP0058198). set_mode raised
+        # before mutating .mode or arming the drain, so nothing restarts.
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": str(exc),
+                "retry_after_seconds": exc.retry_after_seconds,
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
