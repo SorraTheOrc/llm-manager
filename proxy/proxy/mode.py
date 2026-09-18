@@ -70,6 +70,23 @@ MODE_CONFIG_FILES = {
 RESTART_DELAY_SECONDS = 1.5
 
 # ---------------------------------------------------------------------------
+# Fast -> cheap mode-switch cooldown (LP-0MU6MQIPP0058198)
+# ---------------------------------------------------------------------------
+# Every switch is a FULL proxy restart that kills in-flight streams. Competing
+# herdr mode-switch workers have independent idle clocks, so a stale worker can
+# undo an active worker's ``fast`` switch within seconds and repeatedly
+# interrupt live requests (10 switches in 12h, several fast->cheap reverts
+# 13-20s apart). A short, persisted cooldown on the fast->cheap direction,
+# enforced on the client/API path only, bounds how quickly a fresh ``fast``
+# switch can be reverted while leaving the operator's schedule intact. The
+# timestamp of the most recent REAL transition to ``fast`` is persisted to
+# ``proxy/.mode.last-fast-switch`` so the window survives the restart the
+# switch itself triggers. Fixed window (not operator-configurable) per
+# simplicity-first; ``fast`` is never delayed (the cooldown gates fast->cheap
+# only) and the scheduled path bypasses it.
+MODE_SWITCH_COOLDOWN_SECONDS = 30 * 60
+
+# ---------------------------------------------------------------------------
 # Bounded mode-switch drain (LP-0MT631JKW008WAKE / LP-0MT60S55M000TK1H AC2)
 # ---------------------------------------------------------------------------
 # A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode) restarts
@@ -536,6 +553,52 @@ def override_until_file() -> Path:
     return proxy_dir() / ".mode.override-until"
 
 
+def last_fast_switch_file() -> Path:
+    """Path to the last-fast-switch state file (``proxy/.mode.last-fast-switch``).
+
+    Holds an ISO-format naive local datetime marking the most recent actual
+    transition to ``fast`` (manual or scheduled). Absent file = no fast
+    switch recorded (cooldown does not apply — fail-open).
+    """
+    return proxy_dir() / ".mode.last-fast-switch"
+
+
+def read_last_fast_switch() -> datetime | None:
+    """Return the persisted last-fast-switch timestamp, or None when absent.
+
+    The timestamp is a naive local datetime written by ``write_last_fast_switch``
+    and must survive the mode-switch restart (which replaces the whole proxy
+    process). A missing, empty, or unparsable state file yields None, so the
+    cooldown fails open on a fresh install or if ``fast`` was never recorded.
+    """
+    try:
+        text = last_fast_switch_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        logger.warning(
+            "Ignoring unparsable last-fast-switch state %r, treating as none",
+            text,
+        )
+        return None
+
+
+def write_last_fast_switch(ts: datetime | None = None) -> None:
+    """Persist the last-fast-switch timestamp (defaults to now).
+
+    Writes an ISO-format naive local datetime to the state file. Called
+    whenever a non-noop transition to ``fast`` is persisted (manual or
+    scheduled), so the cooldown clock survives the restart the switch
+    itself triggers.
+    """
+    ts = ts or datetime.now()
+    last_fast_switch_file().write_text(ts.isoformat() + "\n", encoding="utf-8")
+
+
 def read_override_until() -> datetime | None:
     """Return the persisted manual-override expiry, or None when absent/invalid.
 
@@ -688,6 +751,11 @@ def set_mode(
                 _write_override_expiry(schedule)
             return mode, False
         write_mode(mode)
+        if mode == MODE_FAST:
+            # A REAL transition to fast (manual or scheduled) starts the
+            # fast->cheap cooldown clock. Persisted so it survives the
+            # restart this switch triggers (LP-0MU6MQIPP0058198).
+            write_last_fast_switch()
         if manual:
             _write_override_expiry(schedule)
         else:

@@ -41,6 +41,8 @@ proxy/proxy/session-recordings/
 # Operating-mode state file (fast/cheap) — runtime state, not committed
 proxy/.mode
 proxy/.mode.override-until
+# Last fast-mode transition timestamp (fast->cheap cooldown) — runtime state
+proxy/.mode.last-fast-switch
 # Session→model binding registry persisted by the proxy (grandfathering across mode switches) — runtime state, not committed
 proxy/grandfathering-state.json
 
