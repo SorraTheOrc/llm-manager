@@ -7,6 +7,7 @@ Uses lazy server import (_srv()) to avoid circular imports.
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -965,7 +966,48 @@ async def _do_proxy_openai_api(
     if path == "chat/completions":
         try:
             from proxy import mode as _mode_mod
+            import random as _random_mod
 
+            # --- Startup ramp (LP-0MU9ZXFQS0023DXT) ---
+            # After a mode-switch restart, competing herdr/agent workers
+            # reconnect simultaneously, creating a thundering-herd.
+            # Gate new requests with 503 + random Retry-After for
+            # ``startup_ramp.max_seconds`` after each process start.
+            ramp_cfg = _mode_mod._startup_ramp_config
+            if ramp_cfg and ramp_cfg.get("enabled") and ramp_cfg.get("max_seconds", 0) > 0:
+                elapsed = srv.PROXY_START_TIME and (
+                    time.monotonic() - srv.PROXY_START_TIME
+                )
+                if elapsed is not None and elapsed < ramp_cfg["max_seconds"]:
+                    jitter_min = ramp_cfg.get("jitter_min", 5.0)
+                    jitter_max = ramp_cfg.get("jitter_max", 15.0)
+                    retry_after = _random_mod.uniform(jitter_min, jitter_max)
+                    remaining = ramp_cfg["max_seconds"] - elapsed
+                    srv.logger.info(
+                        "Startup ramp: deferring chat request "
+                        "(elapsed=%.1fs, remaining=%.1fs, retry_after=%.0fs)",
+                        elapsed, remaining, retry_after,
+                    )
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": {
+                                "type": "startup_ramp",
+                                "code": "startup_ramp",
+                                "message": (
+                                    "Server is starting up; retry shortly."
+                                ),
+                            },
+                            "status": 503,
+                            "retry_after": int(retry_after + 3),  # +margin
+                        },
+                        headers={
+                            "Retry-After": str(int(retry_after + 3)),
+                            "Cache-Control": "no-store",
+                        },
+                    )
+
+            # --- Drain gate ---
             # Defer only while a mode-switch restart is pending AND the
             # bounded drain is active (restart_pending stays True from the
             # moment set_mode arms it, so the drain window alone bounds the
@@ -996,9 +1038,9 @@ async def _do_proxy_openai_api(
                     },
                 )
         except Exception:
-            # Never let the drain gate break request handling.
+            # Never let the ramp/drain gate break request handling.
             srv.logger.debug(
-                "Mode-switch drain gate failed; serving request normally",
+                "Startup ramp / mode-switch drain gate failed; serving request normally",
                 exc_info=True,
             )
 

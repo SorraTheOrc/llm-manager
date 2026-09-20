@@ -830,11 +830,30 @@ server:
   mode_switch_drain:
     enabled: true
     # Maximum seconds to wait for in-flight local streams before the restart
-    # kills the process.
-    max_seconds: 30
+    # kills the process. Increased from 30s to 90s so more complex
+    # grandfathering + slot-save operations can complete gracefully.
+    max_seconds: 90
     # Extra seconds added to the "Retry-After" header past the drain deadline
     # so clients retry after the restart has had time to complete.
     retry_after_margin_seconds: 15
+
+  # -----------------------------------------------------------------------
+  # Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
+  # -----------------------------------------------------------------------
+  # After a mode-switch restart, competing herdr/agent workers reconnect
+  # simultaneously, creating a thundering herd that overwhelms the freshly-
+  # started proxy. This gate returns 503 + random Retry-After (uniform
+  # jitter) so reconnects spread across the ramp window instead of hitting
+  # the server at once. Clients simply retry with the given delay.
+  startup_ramp:
+    enabled: true
+    # Maximum seconds after process start during which new chat requests
+    # are throttled with 503 + Retry-After.
+    max_seconds: 180
+    # Random jitter range for Retry-After (seconds). Each request gets a
+    # random value in [jitter_min, jitter_max] to desynchronise clients.
+    jitter_min: 5
+    jitter_max: 15
 
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).

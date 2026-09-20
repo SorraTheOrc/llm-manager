@@ -107,14 +107,98 @@ MODE_SWITCH_COOLDOWN_SECONDS = 30 * 60
 # window" property is preserved: new requests are refused only during the
 # drain (with a Retry-After), and ``enabled: false`` / ``max_seconds: 0``
 # restores the old "just restart" behavior.
-MODE_SWITCH_DRAIN_MAX_SECONDS = 30.0
+MODE_SWITCH_DRAIN_MAX_SECONDS = 90.0
 MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
+
+# ---------------------------------------------------------------------------
+# Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
+# ---------------------------------------------------------------------------
+# After a mode switch restart (or any proxy restart), a flurry of reconnects
+# from competing herdr/agent workers creates a thundering-herd that overwhelms
+# the freshly-started proxy. The startup-ramp gates new chat requests with
+# 503 + Retry-After for a short window after each restart, using random jitter
+# to desynchronise clients:
+#
+#   1. ``PROXY_START_TIME`` records when the new process started (set by
+#      server.py in the lifespan handler).
+#   2. While ``startup_ramp`` is active, every new chat request receives
+#      ``Retry-After = uniform(jitter_min, jitter_max)``.
+#   3. Clients simply retry after that delay, spreading the reconnects over
+#      the ramp window.
+#
+# Config lives in ``server.startup_ramp`` with defaults:
+#   enabled: true, max_seconds: 180, jitter: [5, 15]
+# Set ``enabled: false`` or ``max_seconds: 0`` to disable entirely.
+
+STARTUP_RAMP_DEFAULT_ENABLED = True
+STARTUP_RAMP_DEFAULT_MAX_SECONDS = 180.0
+STARTUP_RAMP_DEFAULT_JITTER_MIN = 5.0
+STARTUP_RAMP_DEFAULT_JITTER_MAX = 15.0
 
 # Serializes the drain state (separate from _mode_lock to avoid blocking the
 # set-mode lock while polling in-flight queries).
 _drain_lock = threading.Lock()
 _draining = False
 _drain_deadline: float | None = None
+
+# ---------------------------------------------------------------------------
+# Startup ramp state (module-level, updated by server.py)
+# ---------------------------------------------------------------------------
+
+_startup_ramp_config: dict | None = None  # resolved from config
+
+
+def set_startup_ramp_config(cfg: dict | None) -> None:
+    """Store the resolved startup_ramp config (called once at server startup).
+
+    *cfg* is a dict with ``enabled``, ``max_seconds``, ``jitter_min``,
+    ``jitter_max`` — or None to reset to defaults.
+    """
+    global _startup_ramp_config
+    if cfg is None:
+        _startup_ramp_config = {
+            "enabled": STARTUP_RAMP_DEFAULT_ENABLED,
+            "max_seconds": STARTUP_RAMP_DEFAULT_MAX_SECONDS,
+            "jitter_min": STARTUP_RAMP_DEFAULT_JITTER_MIN,
+            "jitter_max": STARTUP_RAMP_DEFAULT_JITTER_MAX,
+        }
+        return
+    _startup_ramp_config = cfg
+
+
+def _startup_ramp_config_section(server_config: dict | None) -> dict:
+    """Resolve the ``server.startup_ramp`` config with defaults.
+
+    Args:
+        server_config: The ``server`` section of the server config dict,
+            or None to read it from the live server module lazily.
+
+    Returns:
+        A dict with ``enabled``, ``max_seconds``, ``jitter_min``,
+        ``jitter_max`` keys.
+    """
+    if server_config is None:
+        server_config = {}
+    section = server_config.get("startup_ramp") or {}
+    enabled = bool(section.get("enabled", STARTUP_RAMP_DEFAULT_ENABLED))
+    try:
+        max_seconds = float(section.get("max_seconds", STARTUP_RAMP_DEFAULT_MAX_SECONDS) or 0)
+    except (TypeError, ValueError):
+        max_seconds = STARTUP_RAMP_DEFAULT_MAX_SECONDS
+    try:
+        jitter_min = float(section.get("jitter_min", STARTUP_RAMP_DEFAULT_JITTER_MIN) or 0)
+    except (TypeError, ValueError):
+        jitter_min = STARTUP_RAMP_DEFAULT_JITTER_MIN
+    try:
+        jitter_max = float(section.get("jitter_max", STARTUP_RAMP_DEFAULT_JITTER_MAX) or 0)
+    except (TypeError, ValueError):
+        jitter_max = STARTUP_RAMP_DEFAULT_JITTER_MAX
+    return {
+        "enabled": enabled,
+        "max_seconds": max(0.0, max_seconds),
+        "jitter_min": max(0.0, min(jitter_min, jitter_max)),
+        "jitter_max": max(0.0, max(jitter_min, jitter_max)),
+    }
 
 
 def _mode_switch_drain_config(server_config: dict | None) -> dict:

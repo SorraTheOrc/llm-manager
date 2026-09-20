@@ -48,6 +48,9 @@ model_switch_refcount_lock = threading.Lock()
 # Version information captured at startup (llama-server and ROCm)
 llama_server_version: str = "unknown"
 rocm_version: str = "unknown"
+# Monotonic timestamp of this process start (for startup-ramp throttling).
+# Set by the lifespan handler immediately before ``yield``.
+PROXY_START_TIME: float = 0.0
 
 # Session manager for incremental prompt ingestion
 session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
@@ -1150,6 +1153,14 @@ async def lifespan(app: FastAPI):
     _startup_initialize_grandfathering()
     _startup_launch_disconnect_reaper()
     _startup_launch_recording_prune()
+
+    # Record the monotonic start time for the startup-ramp gate.
+    global PROXY_START_TIME
+    PROXY_START_TIME = time.monotonic()
+    # Resolve and propagate the startup_ramp config to mode.py.
+    from proxy import mode as _mode_mod
+    _server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    _mode_mod.set_startup_ramp_config(_mode_mod._startup_ramp_config_section(_server_cfg))
 
     yield
 
