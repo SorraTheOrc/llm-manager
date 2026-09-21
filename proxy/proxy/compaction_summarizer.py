@@ -2,7 +2,7 @@
 Proxy-side local summarizer for session compaction (LP-0MTPMJG1P0038D32).
 
 Production ``Summarizer`` callable backed by the local llama-server
-(Qwen3). Used by the compaction planner (proxy/compaction.py) to fold
+(Qwen2.5-7B, LP-0MTXCQA8I0038J4X). Used by the compaction planner (proxy/compaction.py) to fold
 middle turns; fail-open so compaction never blocks dispatch.
 """
 
@@ -310,7 +310,7 @@ def build_local_summarizer(
     from proxy.provider import compaction_config
 
     cfg = compaction_config(config or {})
-    model_name = cfg.get("summarizer_model_name") or "Qwen3"
+    model_name = cfg.get("summarizer_model_name") or "Qwen2.5-7B"
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
     disable_thinking = bool(cfg.get("summarizer_disable_thinking", True))
     _system_default, _format_template, _update_template = _load_prompt_constants()

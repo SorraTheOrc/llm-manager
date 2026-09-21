@@ -653,11 +653,12 @@ server:
   # Operator request 2026-09-17: DISABLED. 0 disables (docs/llama-router.md);
   # the proxy no longer summarises/compacts sessions. Restore 0.70 to re-enable.
   compaction_trigger_ratio: 0
-  # Summariser model: local llama.cpp model used for in-proxy summarisation.
-  # Reuses the existing Qwen3 model — no new model download required.
+  # Summariser model: dedicated small model for in-proxy summarisation.
+  # LP-0MTXCQA8I0038J4X — isolates summarizer from main Qwen3 slot to
+  # avoid timeout under load (the summariser gets parallel=1 in models.ini).
   summarizer_model:
     type: local
-    llama_model: Qwen3
+    llama_model: Qwen2.5-7B
   # Summariser context size (tokens): sufficient for short summarisation prompt
   # + middle turns; avoids unnecessary KV cache footprint.
   summarizer_ctx_size: 8192

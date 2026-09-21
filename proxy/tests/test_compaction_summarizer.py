@@ -1,5 +1,6 @@
 """
-Tests for proxy-side local Qwen3 summarizer (LP-0MTPMJG1P0038D32).
+Tests for proxy-side local summarizer using dedicated small model
+(Qwen2.5-7B, LP-0MTXCQA8I0038J4X).
 
 Verifies the production Summarizer callable backed by the local
 llama-server: system-prompt wrapping, config-driven sizing,
@@ -24,7 +25,7 @@ def _make_config(**overrides):
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 3,
             "compaction_trigger_ratio": 0.70,
-            "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+            "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
             "summarizer_ctx_size": 8192,
             "summarizer_max_tokens": 512,
         }
@@ -69,7 +70,7 @@ class TestBuildLocalSummarizer:
             assert "http://localhost:8080/v1/chat/completions" in args[0]
             body = kwargs.get("json") or args[1] if len(args) > 1 else kwargs.get("json")
             # Body checks
-            assert body["model"] == "Qwen3"
+            assert body["model"] == "Qwen2.5-7B"
             assert body["max_tokens"] == 512
             assert body["stream"] is False
             # System prompt present (Pi role + guard rails only)
@@ -432,7 +433,7 @@ class TestCompactionDoesNotBlockEventLoop:
 
 
 class TestLocalSummarizerThinkingDisabled:
-    """Local Qwen3 thinking is disabled for the summarizer (LP-0MU58PBRD004OV1I)."""
+    """Local summarizer thinking is disabled via chat_template_kwargs (LP-0MU58PBRD004OV1I)."""
 
     def _body(self, cfg):
         from proxy.compaction_summarizer import build_local_summarizer

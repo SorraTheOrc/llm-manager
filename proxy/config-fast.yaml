@@ -575,7 +575,7 @@ server:
   compaction_trigger_ratio: 0
   summarizer_model:
     type: local
-    llama_model: Qwen3
+    llama_model: Qwen2.5-7B
   summarizer_ctx_size: 8192
   summarizer_max_tokens: 512
   # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):

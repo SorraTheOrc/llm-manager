@@ -49,7 +49,7 @@ class TestCompactionConfigDefaults:
         c = compaction_config(cfg)
         assert c["trigger_ratio"] == _DEFAULT_COMPACTION_TRIGGER_RATIO
         assert c["summarizer_model_type"] == "local"
-        assert c["summarizer_model_name"] == "Qwen3"
+        assert c["summarizer_model_name"] == "Qwen2.5-7B"
         assert c["summarizer_ctx_size"] == _DEFAULT_SUMMARIZER_CTX_SIZE
         assert c["summarizer_max_tokens"] == _DEFAULT_SUMMARIZER_MAX_TOKENS
         assert c["summarizer_system_prompt"] == _SUMMARIZER_SYSTEM_PROMPT
@@ -59,7 +59,7 @@ class TestCompactionConfigDefaults:
         cfg = {"server": {}}
         c = compaction_config(cfg)
         assert c["trigger_ratio"] == _DEFAULT_COMPACTION_TRIGGER_RATIO
-        assert c["summarizer_model_name"] == "Qwen3"
+        assert c["summarizer_model_name"] == "Qwen2.5-7B"
         assert c["summarizer_ctx_size"] == _DEFAULT_SUMMARIZER_CTX_SIZE
         assert c["summarizer_max_tokens"] == _DEFAULT_SUMMARIZER_MAX_TOKENS
 
@@ -112,7 +112,7 @@ class TestCompactionConfigOverrides:
                 "compaction_trigger_ratio": 0.70,
                 "summarizer_model": {
                     "type": "local",
-                    "llama_model": "Qwen3",
+                    "llama_model": "Qwen2.5-7B",
                 },
                 "summarizer_ctx_size": 8192,
                 "summarizer_max_tokens": 512,
@@ -121,7 +121,7 @@ class TestCompactionConfigOverrides:
         c = compaction_config(cfg)
         assert c["trigger_ratio"] == 0.70
         assert c["summarizer_model_type"] == "local"
-        assert c["summarizer_model_name"] == "Qwen3"
+        assert c["summarizer_model_name"] == "Qwen2.5-7B"
         assert c["summarizer_ctx_size"] == 8192
         assert c["summarizer_max_tokens"] == 512
 
@@ -322,7 +322,7 @@ class TestValidateCompactionConfig:
                 "compaction_trigger_ratio": 0.70,
                 "summarizer_model": {
                     "type": "local",
-                    "llama_model": "Qwen3",
+                    "llama_model": "Qwen2.5-7B",
                 },
                 "summarizer_ctx_size": 8192,
                 "summarizer_max_tokens": 512,
@@ -369,21 +369,21 @@ class TestValidateCompactionConfig:
             for p in problems
         )
 
-    def test_missing_llama_model_defaults_to_qwen3(self):
-        """summarizer_model without llama_model defaults to Qwen3."""
+    def test_missing_llama_model_defaults_to_qwen25_7b(self):
+        """summarizer_model without llama_model defaults to Qwen2.5-7B."""
         cfg = {
             "server": {
                 "summarizer_model": {"type": "local"},
             },
         }
         c = compaction_config(cfg)
-        assert c["summarizer_model_name"] == "Qwen3"
+        assert c["summarizer_model_name"] == "Qwen2.5-7B"
 
     def test_missing_summarizer_type_warns(self):
         """summarizer_model without type defaults to local."""
         cfg = {
             "server": {
-                "summarizer_model": {"llama_model": "Qwen3"},
+                "summarizer_model": {"llama_model": "Qwen2.5-7B"},
             },
         }
         problems = validate_compaction_config(cfg)
@@ -394,7 +394,7 @@ class TestValidateCompactionConfig:
         """Non-positive summarizer_ctx_size is FATAL."""
         cfg = {
             "server": {
-                "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+                "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
                 "summarizer_ctx_size": 0,
             },
         }
@@ -408,7 +408,7 @@ class TestValidateCompactionConfig:
         """Negative summarizer_ctx_size is FATAL."""
         cfg = {
             "server": {
-                "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+                "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
                 "summarizer_ctx_size": -100,
             },
         }
@@ -422,7 +422,7 @@ class TestValidateCompactionConfig:
         """Non-positive summarizer_max_tokens is FATAL."""
         cfg = {
             "server": {
-                "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+                "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
                 "summarizer_max_tokens": 0,
             },
         }
@@ -443,7 +443,7 @@ class TestValidateCompactionConfig:
         """Non-numeric summarizer_ctx_size falls back to default."""
         cfg = {
             "server": {
-                "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+                "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
                 "summarizer_ctx_size": "invalid",
             },
         }
@@ -454,7 +454,7 @@ class TestValidateCompactionConfig:
         """Non-numeric summarizer_max_tokens falls back to default."""
         cfg = {
             "server": {
-                "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+                "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
                 "summarizer_max_tokens": "not-a-number",
             },
         }
@@ -511,14 +511,14 @@ class TestLiveConfigsValidate:
             assert compaction_trigger_tokens(mode, cfg) == 0
             assert should_compact_session(10_000_000, mode, cfg) is False
 
-    def test_summarizer_uses_qwen3(self):
-        """Verify the summariser defaults to Qwen3 in config.yaml."""
+    def test_summarizer_uses_qwen25_7b(self):
+        """Verify the summariser uses Qwen2.5-7B in config.yaml (LP-0MTXCQA8I0038J4X)."""
         import yaml
         config_path = pathlib.Path(__file__).parent.parent / "config.yaml"
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
         c = compaction_config(cfg)
-        assert c["summarizer_model_name"] == "Qwen3"
+        assert c["summarizer_model_name"] == "Qwen2.5-7B"
 
     def test_summarizer_ctx_size_is_8192(self):
         """Verify the summariser ctx-size is 8192 in config.yaml."""

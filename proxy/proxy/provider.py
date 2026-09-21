@@ -909,7 +909,7 @@ def compaction_config(config: dict) -> dict:
     if not isinstance(model_cfg, dict):
         model_cfg = {}
     summarizer_model_type = model_cfg.get("type", "local")
-    summarizer_model_name = model_cfg.get("llama_model", "Qwen3")
+    summarizer_model_name = model_cfg.get("llama_model", "Qwen2.5-7B")
 
     # Summariser context size
     ctx_size = server.get("summarizer_ctx_size")
