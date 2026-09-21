@@ -4832,11 +4832,15 @@ async def _proxy_with_remote_fallback_cycle(
                     )
                     # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
                     # track consecutive empty/stall failures across cycles.
-                    # If the threshold is exceeded, the provider gets an
-                    # extended cooldown so the retry cycle permanently skips
-                    # it and tries siblings.
-                    _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
-                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    # Only poison the failure domain (skip same-endpoint
+                    # siblings) once the streak threshold is exceeded so a
+                    # single empty response does not block sibling API keys
+                    # on the same endpoint (LP-0MTVPJQ6T004EZ75).
+                    _threshold_exceeded = _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
+                    if _threshold_exceeded:
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -5998,8 +6002,11 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text, config,
                             )
-                            _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
-                            attempted_domains.add(_failure_domain_key(provider_cfg))
+                            _threshold_exceeded = _record_sibling_failure(
+                                provider_name, config, provider_cfg.get("provider")
+                            )
+                            if _threshold_exceeded:
+                                attempted_domains.add(_failure_domain_key(provider_cfg))
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
                             all_slot_exhaustion = False
@@ -6010,8 +6017,11 @@ async def _proxy_with_fallback_cycle(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text, config,
                         )
-                        _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
-                        attempted_domains.add(_failure_domain_key(provider_cfg))
+                        _threshold_exceeded = _record_sibling_failure(
+                            provider_name, config, provider_cfg.get("provider")
+                        )
+                        if _threshold_exceeded:
+                            attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "empty_response"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
