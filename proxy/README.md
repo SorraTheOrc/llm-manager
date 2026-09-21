@@ -1121,36 +1121,33 @@ before remote send:
   JSON error with `suggested_action` remediation is returned instead of the
   raw upstream body, so the opaque 400 never reaches the client.
 
-##### `"Thinking..."` placeholder for thinking-only responses (LP-0MSEHOE7B005DE08)
+##### Thinking preservation for thinking-only responses (LP-0MSEHOE7B005DE08,
+LP-0MTTSBT0R004HC6B)
 
 When a model emits **only** `reasoning_content` (thinking) with empty/null
-`content` and no tool call, the proxy does **not** promote the thinking text
-into `assistant.content`. Instead:
+`content` and no tool call, the proxy preserves thinking **only** in
+`reasoning_content` without synthesising any placeholder into `content`:
 
 - `_extract_assistant_content` (non-streaming) and
-  `_extract_assistant_content_from_sse` (streaming) return the literal
-  placeholder `"Thinking..."`.
+  `_extract_assistant_content_from_sse` (streaming) return `None` when
+  reasoning_content has no tool call. Thinking text is never promoted into
+  `content`.
 - The full thinking text stays **untouched** in `reasoning_content` and is
   persisted unchanged in session history — no thinking text is dropped or
   replayed as content on later turns.
 - Tool-call extraction from `reasoning_content` (`<function=...>...</function>`)
-  is unaffected: tool-call-only responses still return the tool call, never
-  the placeholder.
-- When real `content` is present, it is returned as-is — the placeholder is
-  only the no-content fallback.
+  is unaffected: tool-call-only responses still return the tool call.
+- When real `content` is present, it is returned as-is — the `None` return
+  only applies when there is no content and no tool call.
 
-**Rationale (context saving):** replaying the full thinking text as
-`assistant.content` in multi-turn session history wastes context on every
-subsequent turn. The short placeholder keeps clients' assistant messages
-non-empty (their UI shows `Thinking...` instead of blank content) while the
-thinking text remains available in `reasoning_content` without being
-re-sent as content.
+**Context saving:** replaying the full thinking text as `assistant.content`
+in multi-turn session history wastes context. By returning `None`, thinking
+remains exclusively in `reasoning_content`.
 
-**Empty-response semantics preserved:** a thinking-only response still counts
-as a non-empty success (content = `"Thinking..."`) for `_is_empty_response`
-and the provider fallback chain, so it never triggers cooldown/fallback
-retries. The placeholder behavior is hard-coded; there is no configuration
-option.
+**Empty-response semantics preserved:** `_is_empty_response` treats a
+non-empty `reasoning_content` (with no tool call) as **not empty** via its
+own reasoning-content check, so thinking-only responses never trigger
+cooldown/fallback retries. No placeholder synthesis is needed.
 
 ### Local Stream Timeout Configuration
 
