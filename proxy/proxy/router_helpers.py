@@ -1434,6 +1434,20 @@ async def _try_acquire_local_dispatch(
                     else:
                         if occupied_by_others >= max_local:
                             return (False, first_occupied_owner, occupied_by_others, max(1.0, lease_timeout))
+                else:
+                    # Lease-holding session re-acquisition (LP-0MU09CAL3001MP0Z).
+                    # No-preemption: allow this session to re-acquire, but
+                    # still respect the generating-only cap so that
+                    # ``active`` never exceeds ``max_local``.
+                    if has_generating_state and _generating_count >= max_local:
+                        active_owner = None
+                        for ek, er in srv.local_dispatch_records.items():
+                            if ek != record_key and er.get("active"):
+                                active_owner = _dispatch_key_session_id(ek)
+                                break
+                        if active_owner is None:
+                            active_owner = first_occupied_owner
+                        return (False, active_owner, _generating_count, max(1.0, lease_timeout))
 
 
                 srv.local_active_queries += 1
