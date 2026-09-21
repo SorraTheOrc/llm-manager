@@ -36,6 +36,80 @@ def _transport_failure_kind(exc: BaseException) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Slot-capacity probing (synchronous, for use inside _summarizer)
+#
+# Probes the llama-server ``/slots`` endpoint to report how many slots are
+# currently busy — useful diagnostic context for timeout logs (AC2).
+# ---------------------------------------------------------------------------
+
+def _probe_slot_capacity_sync(llama_port: int) -> tuple[int, int]:
+    """Probe the llama-server ``/slots`` endpoint for available/total slots.
+
+    Returns ``(available, total)``. Both default to ``0`` on any failure
+    (endpoint unreachable, HTTP error, unexpected JSON shape) so the
+    diagnostic log never crashes the summarizer.
+    """
+    try:
+        with httpx.Client(timeout=httpx.Timeout(2.0)) as client:
+            response = client.get(
+                f"http://localhost:{llama_port}/slots",
+            )
+            if response.status_code == 200:
+                slots_data = response.json()
+                if isinstance(slots_data, list):
+                    total = len(slots_data)
+                    available = sum(
+                        1 for s in slots_data if not s.get("is_processing", True)
+                    )
+                    return available, total
+    except Exception:
+        pass
+    return 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Token-count estimation (rough heuristic for diagnostic logging)
+#
+# Uses a simple character-based estimate (~4 chars per token for typical
+# English text).  Exact token counts require the tokenizer which may not
+# be available or desirable inside the hot summarizer loop.
+# ---------------------------------------------------------------------------
+
+_TOKEN_CHARS_ESTIMATE = 4.0  # rough chars-per-token heuristic
+
+
+def _estimate_payload_tokens(transcript: str, system_prompt: str,
+                             template: str,
+                             previous_summary: str | None) -> int:
+    """Return a rough estimate of the total prompt token count for the
+    summarizer call.
+
+    Combines system prompt, conversation transcript, optional previous
+    summary, and the formatting template into a single string and divides
+    by the chars-per-token heuristic.
+    """
+    parts = [system_prompt, transcript, template]
+    if previous_summary:
+        parts.append(f"<previous-summary>\n{previous_summary}\n</previous-summary>")
+    full = "\n".join(parts)
+    return max(1, int(len(full) / _TOKEN_CHARS_ESTIMATE))
+
+
+def _timeout_diagnostic(model_name: str, estimated_tokens: int,
+                        slot_avail: int, slot_total: int,
+                        attempt: int, attempts: int) -> str:
+    """Build the diagnostic suffix for timeout / transport-error logs.
+
+    Includes model name, estimated payload token count, slot saturation,
+    and attempt number — the four pieces of context operators need to
+    diagnose saturation-induced timeouts (AC2).
+    """
+    slots = f"slots={slot_avail}/{slot_total}"
+    return (f"model={model_name} tokens~{estimated_tokens} "
+            f"{slots} attempt={attempt}/{attempts}")
+
+
+# ---------------------------------------------------------------------------
 # File-operation tracking (R2, LP-0MTTPXI1Y003YFOU)
 #
 # Mirrors Pi's utils.js extractFileOpsFromMessage / computeFileLists /
@@ -370,20 +444,40 @@ def build_local_summarizer(
                         resp = client.post(url, json=body)
                 except httpx.TransportError as exc:
                     if attempt < retries:
+                        diag = _timeout_diagnostic(
+                            model_name,
+                            _estimate_payload_tokens(
+                                transcript, _system_prompt,
+                                _format_template, previous_summary,
+                            ),
+                            *(_probe_slot_capacity_sync(llama_port) if attempt == 0 else (0, 0)),
+                            attempt + 1, attempts,
+                        )
                         logger.warning(
-                            "local summarizer transport error (attempt %d/%d): %s; retrying in %.2fs",
+                            "local summarizer transport error (attempt %d/%d): %s; %s; retrying in %.2fs",
                             attempt + 1,
                             attempts,
                             exc,
+                            diag,
                             retry_delay,
                         )
                         if retry_delay > 0:
                             time.sleep(retry_delay)
                         continue
+                    diag = _timeout_diagnostic(
+                        model_name,
+                        _estimate_payload_tokens(
+                            transcript, _system_prompt,
+                            _format_template, previous_summary,
+                        ),
+                        *(_probe_slot_capacity_sync(llama_port)),
+                        attempts, attempts,
+                    )
                     logger.warning(
-                        "local summarizer call failed after %d attempts: %s",
+                        "local summarizer call failed after %d attempts: %s; %s",
                         attempts,
                         exc,
+                        diag,
                         exc_info=True,
                     )
                     return EmptySummary(_transport_failure_kind(exc), attempts)
@@ -428,7 +522,21 @@ def build_local_summarizer(
             ops = extract_file_operations(middle_messages)
             return content + format_file_operations(ops["read"], ops["modified"])
         except Exception as exc:
-            logger.warning("local summarizer call failed: %s", exc, exc_info=True)
+            diag = _timeout_diagnostic(
+                model_name,
+                _estimate_payload_tokens(
+                    transcript, _system_prompt,
+                    _format_template, previous_summary,
+                ),
+                *(_probe_slot_capacity_sync(llama_port)),
+                attempts, attempts,
+            )
+            logger.warning(
+                "local summarizer call failed: %s; %s",
+                exc,
+                diag,
+                exc_info=True,
+            )
             return EmptySummary(type(exc).__name__, attempts)
 
     return _summarizer
