@@ -1,9 +1,12 @@
-"""Tests for the post-restart startup ramp (LP-0MU9ZXFQS0023DXT).
+"""Tests for the post-restart startup ramp (LP-0MU9ZXFQS0023DXT, LP-0MUAY98ZR002JBAA).
 
 After a mode-switch restart, competing herdr/agent workers reconnect
 simultaneously, creating a thundering-herd that overwhelms the freshly-started
 proxy. The startup ramp gates new chat requests with 503 + random
-Retry-After for a configurable window after each process start.
+Retry-After only while local backends are not yet ready
+(``backend_ready=False``).  Once backends are ready the gate clears
+immediately, regardless of elapsed time.  ``max_seconds`` acts as a short
+safety ceiling so requests are never blocked indefinitely.
 
 Clients simply retry with the given delay, so reconnects spread across the
 ramp window instead of hitting the server all at once.
@@ -48,7 +51,7 @@ class TestStartupRampConfig:
         mode_module.set_startup_ramp_config(None)
         cfg = mode_module._startup_ramp_config_section({})
         assert cfg["enabled"] is True
-        assert cfg["max_seconds"] == 180.0
+        assert cfg["max_seconds"] == 30.0
         assert cfg["jitter_min"] == 5.0
         assert cfg["jitter_max"] == 15.0
 
@@ -115,8 +118,9 @@ class TestStartupRampApiGate:
         """New chat completions get 503 + Retry-After during the ramp."""
         import httpx
         import proxy.server as srv_mod
-        from proxy import mode as _mode_mod
         from proxy.server import app
+
+        from proxy import mode as _mode_mod
 
         # Verify config is active
         assert _mode_mod._startup_ramp_config is not None
@@ -125,6 +129,9 @@ class TestStartupRampApiGate:
         # Simulate a recent startup (within the ramp window).
         original_start_time = srv_mod.PROXY_START_TIME
         srv_mod.PROXY_START_TIME = time.monotonic() - 10  # 10s in
+        # Ensure backends are NOT ready — gate should defer.
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = False
 
         try:
             async with httpx.AsyncClient(
@@ -135,7 +142,7 @@ class TestStartupRampApiGate:
                     json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
                 )
             # The ramp is 30s max and we started 10s ago, so we should be
-            # throttled.
+            # throttled (backends not ready).
             assert resp.status_code == 503, f"Expected 503 from startup_ramp but got {resp.status_code}: {resp.text}"
             body = resp.json()
             assert body["error"]["type"] == "startup_ramp"
@@ -145,6 +152,7 @@ class TestStartupRampApiGate:
             assert 5 <= retry <= 23  # jitter 2-8 + margin 3
         finally:
             srv_mod.PROXY_START_TIME = original_start_time
+            srv_mod.backend_ready = original_backend_ready
 
     @pytest.mark.asyncio
     async def test_not_deferred_after_ramp_expires(self, ramp_config, monkeypatch):
@@ -240,6 +248,9 @@ class TestStartupRampApiGate:
         from proxy.server import app
 
         srv_mod.PROXY_START_TIME = time.monotonic() - 5
+        # Ensure backends are NOT ready — gate should defer.
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = False
 
         values = set()
         try:
@@ -257,4 +268,160 @@ class TestStartupRampApiGate:
             # distinct values (not the same every time).
             assert len(values) > 1, "Jitter should produce different Retry-After values"
         finally:
-            pass
+            srv_mod.backend_ready = original_backend_ready
+
+    # -----------------------------------------------------------------------
+    # Startup-ramp readiness-driven clear (LP-0MUAY98ZR002JBAA)
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_ready_early_clears_gate(self, monkeypatch):
+        """When backends are ready before the ramp expires, the gate clears
+        immediately — requests are served normally (AC1, AC4)."""
+        import httpx
+        import proxy.server as srv_mod
+        from proxy.server import app
+
+        mode_module.set_startup_ramp_config(
+            {"enabled": True, "max_seconds": 180.0, "jitter_min": 5.0, "jitter_max": 15.0}
+        )
+        # Simulate startup 120s ago — well past the old 180s window but
+        # backends are ready early at t=3.5s.
+        original_start_time = srv_mod.PROXY_START_TIME
+        srv_mod.PROXY_START_TIME = time.monotonic() - 120
+        # Simulate that backends are ready
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = True
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            # Not blocked by the ramp because backend_ready is True.
+            assert resp.status_code != 503 or resp.json().get("error", {}).get("type") != "startup_ramp"
+        finally:
+            srv_mod.PROXY_START_TIME = original_start_time
+            srv_mod.backend_ready = original_backend_ready
+            mode_module.set_startup_ramp_config(None)
+
+    @pytest.mark.asyncio
+    async def test_never_ready_holds_until_ceiling(self, monkeypatch):
+        """When backends never become ready, the gate still lifts at the
+        max_seconds ceiling so chat requests are never blocked
+        indefinitely (AC2, AC4)."""
+        import httpx
+        import proxy.server as srv_mod
+        from proxy.server import app
+
+        # Ceiling is 10s — short for test speed.
+        mode_module.set_startup_ramp_config(
+            {"enabled": True, "max_seconds": 10.0, "jitter_min": 2.0, "jitter_max": 5.0}
+        )
+        original_start_time = srv_mod.PROXY_START_TIME
+        srv_mod.PROXY_START_TIME = time.monotonic() - 5  # 5s in
+        # Simulate backends NOT ready
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = False
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            # Still within the 10s ceiling and backends not ready → 503.
+            assert resp.status_code == 503
+            assert resp.json()["error"]["type"] == "startup_ramp"
+        finally:
+            srv_mod.PROXY_START_TIME = original_start_time
+            srv_mod.backend_ready = original_backend_ready
+            mode_module.set_startup_ramp_config(None)
+
+    @pytest.mark.asyncio
+    async def test_ready_beyond_ceiling_serves_normal(self, monkeypatch):
+        """When max_seconds ceiling expires, the gate lifts even if
+        backends are still not ready (safety net — AC2)."""
+        import httpx
+        import proxy.server as srv_mod
+        from proxy.server import app
+
+        mode_module.set_startup_ramp_config(
+            {"enabled": True, "max_seconds": 5.0, "jitter_min": 1.0, "jitter_max": 3.0}
+        )
+        original_start_time = srv_mod.PROXY_START_TIME
+        srv_mod.PROXY_START_TIME = time.monotonic() - 20  # well past 5s ceiling
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = False  # backends never ready
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            # Ceiling expired → gate is lifted.
+            assert resp.status_code != 503 or resp.json().get("error", {}).get("type") != "startup_ramp"
+        finally:
+            srv_mod.PROXY_START_TIME = original_start_time
+            srv_mod.backend_ready = original_backend_ready
+            mode_module.set_startup_ramp_config(None)
+
+    @pytest.mark.asyncio
+    async def test_disabled_ramp_ignores_backend_ready(self, monkeypatch):
+        """enabled: false → no throttling regardless of backend_ready state.
+        (AC5)."""
+        import httpx
+        import proxy.server as srv_mod
+        from proxy.server import app
+
+        mode_module.set_startup_ramp_config({"enabled": False, "max_seconds": 180})
+        srv_mod.PROXY_START_TIME = time.monotonic()
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = False
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert resp.status_code != 503 or resp.json().get("error", {}).get("type") != "startup_ramp"
+        finally:
+            srv_mod.backend_ready = original_backend_ready
+            mode_module.set_startup_ramp_config(None)
+
+    @pytest.mark.asyncio
+    async def test_zero_max_seconds_ignores_backend_ready(self, monkeypatch):
+        """max_seconds: 0 → no throttling regardless of backend_ready.
+        (AC5)."""
+        import httpx
+        import proxy.server as srv_mod
+        from proxy.server import app
+
+        mode_module.set_startup_ramp_config({"max_seconds": 0})
+        srv_mod.PROXY_START_TIME = time.monotonic()
+        original_backend_ready = srv_mod.backend_ready
+        srv_mod.backend_ready = False
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert resp.status_code != 503 or resp.json().get("error", {}).get("type") != "startup_ramp"
+        finally:
+            srv_mod.backend_ready = original_backend_ready
+            mode_module.set_startup_ramp_config(None)

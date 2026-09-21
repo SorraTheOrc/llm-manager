@@ -847,9 +847,13 @@ server:
   # the server at once. Clients simply retry with the given delay.
   startup_ramp:
     enabled: true
-    # Maximum seconds after process start during which new chat requests
-    # are throttled with 503 + Retry-After.
-    max_seconds: 180
+    # Short safety ceiling (seconds) after process start. New chat requests
+    # are throttled with 503 + Retry-After only while local backends are
+    # not yet ready (``backend_ready=False``).  Once backends are ready the
+    # gate clears immediately regardless of elapsed time.  This value acts
+    # as a hard cap so requests are never blocked indefinitely if the
+    # backends fail to start.
+    max_seconds: 30
     # Random jitter range for Retry-After (seconds). Each request gets a
     # random value in [jitter_min, jitter_max] to desynchronise clients.
     jitter_min: 5

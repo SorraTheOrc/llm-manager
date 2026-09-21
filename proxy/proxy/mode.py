@@ -127,11 +127,11 @@ MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
 #      the ramp window.
 #
 # Config lives in ``server.startup_ramp`` with defaults:
-#   enabled: true, max_seconds: 180, jitter: [5, 15]
+#   enabled: true, max_seconds: 30, jitter: [5, 15]
 # Set ``enabled: false`` or ``max_seconds: 0`` to disable entirely.
 
 STARTUP_RAMP_DEFAULT_ENABLED = True
-STARTUP_RAMP_DEFAULT_MAX_SECONDS = 180.0
+STARTUP_RAMP_DEFAULT_MAX_SECONDS = 30.0
 STARTUP_RAMP_DEFAULT_JITTER_MIN = 5.0
 STARTUP_RAMP_DEFAULT_JITTER_MAX = 15.0
 
