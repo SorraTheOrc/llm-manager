@@ -425,3 +425,359 @@ class TestStartupRampApiGate:
         finally:
             srv_mod.backend_ready = original_backend_ready
             mode_module.set_startup_ramp_config(None)
+
+
+# ---------------------------------------------------------------------------
+# LP-0MUAY9AMS002O2ZO: ramp gates only local-bound chat requests
+# ---------------------------------------------------------------------------
+#
+# The startup ramp runs before any routing decision.  Before this change it
+# deferred *every* chat request while the gate was active — including requests
+# the router would have sent to a remote provider.  The gate now inspects the
+# model's provider chain and only defers requests that can *only* be served
+# by the local backend (a chain with no remote provider).
+
+LOCAL_ONLY_MODEL = {
+    "providers": [
+        {"name": "local-qwen", "type": "local", "llama_model": "Qwen3"},
+    ],
+}
+
+# Multiple LOCAL backends are still local-only: there is no remote escape.
+MULTI_LOCAL_MODEL = {
+    "providers": [
+        {"name": "local-a", "type": "local", "llama_model": "Qwen3"},
+        {"name": "local-b", "type": "local", "llama_model": "Qwen3"},
+    ],
+}
+
+LOCAL_WITH_REMOTE_FALLBACK_MODEL = {
+    "providers": [
+        {"name": "local-qwen", "type": "local", "llama_model": "Qwen3"},
+        {"name": "opencode-go", "type": "remote", "endpoint": "https://opencode.ai/zen/go"},
+    ],
+}
+
+REMOTE_ONLY_MODEL = {
+    "providers": [
+        {"name": "opencode-go", "type": "remote", "endpoint": "https://opencode.ai/zen/go"},
+    ],
+}
+
+
+def _set_models(monkeypatch, models, default_remote=None):
+    """Install a minimal server config with the given ``models`` mapping."""
+    import proxy.server as srv_mod
+
+    cfg = {"server": {}, "models": models}
+    if default_remote is not None:
+        cfg["default_remote"] = default_remote
+    monkeypatch.setattr(srv_mod, "config", cfg, raising=True)
+
+
+def _within_ramp(monkeypatch, seconds_in=10):
+    """Enter the ramp window with backends not yet ready.
+
+    ``seconds_in`` is how far into the window the process is; the default
+    (10 s) is inside the 30 s ``ramp_config`` window.  ``backend_ready`` is
+    forced False so the readiness-driven early clear does not short-circuit
+    the gate.
+    """
+    import proxy.server as srv_mod
+
+    monkeypatch.setattr(
+        srv_mod, "PROXY_START_TIME", time.monotonic() - seconds_in, raising=True
+    )
+    monkeypatch.setattr(srv_mod, "backend_ready", False, raising=True)
+
+
+@pytest.fixture
+def stub_dispatch(monkeypatch):
+    """Replace every downstream dispatch entry point with a 200 sentinel.
+
+    A gated request returns the ``startup_ramp`` 503 *before* dispatch; a
+    request that passes the gate reaches the sentinel (marked with the
+    ``X-Test-Dispatch`` header).  Any accidental reach of a real backend is
+    caught because the sentinel header would be absent.
+    """
+    from starlette.responses import JSONResponse
+
+    import proxy.provider as provider_mod
+    import proxy.server as srv_mod
+    import proxy.ui as ui_mod
+
+    async def _sentinel(*args, **kwargs):
+        return JSONResponse(
+            status_code=200,
+            content={"served": True},
+            headers={"X-Test-Dispatch": "stub"},
+        )
+
+    monkeypatch.setattr(ui_mod, "_dispatch_local_model_load", _sentinel, raising=True)
+    monkeypatch.setattr(
+        provider_mod, "proxy_with_remote_fallback", _sentinel, raising=True
+    )
+    monkeypatch.setattr(provider_mod, "proxy_with_fallback", _sentinel, raising=True)
+    monkeypatch.setattr(srv_mod, "proxy_to_remote", _sentinel, raising=True)
+    monkeypatch.setattr(srv_mod, "proxy_to_local", _sentinel, raising=True)
+    return _sentinel
+
+
+async def _post_chat(model):
+    """POST a minimal chat/completions request through the ASGI app."""
+    import httpx
+    from proxy.server import app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        return await client.post(
+            "/v1/chat/completions",
+            json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+
+def _is_ramp_503(resp) -> bool:
+    if resp.status_code != 503:
+        return False
+    try:
+        return resp.json().get("error", {}).get("type") == "startup_ramp"
+    except Exception:
+        return False
+
+
+class TestStartupRampLocalBoundGating:
+    """AC1/AC2: the ramp only defers requests that must dispatch locally."""
+
+    @pytest.mark.asyncio
+    async def test_local_only_model_deferred_during_ramp(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC2: a local-only chain is deferred with the unchanged 503 body."""
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("local-model")
+
+        assert _is_ramp_503(resp), f"expected startup_ramp 503: {resp.text}"
+        body = resp.json()
+        assert body["error"]["type"] == "startup_ramp"
+        assert body["error"]["code"] == "startup_ramp"
+        assert body["error"]["message"] == "Server is starting up; retry shortly."
+        assert body["status"] == 503
+        assert "Retry-After" in resp.headers
+        assert resp.headers["Cache-Control"] == "no-store"
+        # Gate blocked before dispatch.
+        assert resp.headers.get("X-Test-Dispatch") != "stub"
+
+    @pytest.mark.asyncio
+    async def test_multi_local_backend_deferred_during_ramp(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC3: multiple LOCAL providers have no remote escape → still gated."""
+        _set_models(monkeypatch, {"multi-local": MULTI_LOCAL_MODEL})
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("multi-local")
+
+        assert _is_ramp_503(resp), f"expected startup_ramp 503: {resp.text}"
+
+    @pytest.mark.asyncio
+    async def test_local_with_remote_fallback_served_during_ramp(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC1: a local+remote chain escapes the gate (matches the evidence)."""
+        _set_models(monkeypatch, {"hybrid-model": LOCAL_WITH_REMOTE_FALLBACK_MODEL})
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("hybrid-model")
+
+        assert not _is_ramp_503(resp), f"request was ramp-gated: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+    @pytest.mark.asyncio
+    async def test_remote_only_model_served_during_ramp(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC1: a remote-first chain never dispatches locally → served."""
+        _set_models(monkeypatch, {"remote-model": REMOTE_ONLY_MODEL})
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("remote-model")
+
+        assert not _is_ramp_503(resp), f"request was ramp-gated: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+    @pytest.mark.asyncio
+    async def test_unknown_model_with_default_remote_served(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """No model config + default_remote enabled → dispatch goes remote."""
+        _set_models(
+            monkeypatch,
+            {},
+            default_remote={
+                "enabled": True,
+                "endpoint": "https://opencode.ai/zen/go",
+                "model": "some-remote-model",
+            },
+        )
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("unknown-model-xyz")
+
+        assert not _is_ramp_503(resp), f"request was ramp-gated: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+
+class TestStartupRampWindowStillBounded:
+    """AC4: ramp-expired and ramp-disabled serve both local- and remote-bound."""
+
+    @pytest.mark.asyncio
+    async def test_local_only_served_after_ramp_expires(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        _within_ramp(monkeypatch, seconds_in=60)
+
+        resp = await _post_chat("local-model")
+
+        assert not _is_ramp_503(resp), f"ramp-expired request gated: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+    @pytest.mark.asyncio
+    async def test_remote_bound_served_after_ramp_expires(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        _set_models(monkeypatch, {"remote-model": REMOTE_ONLY_MODEL})
+        _within_ramp(monkeypatch, seconds_in=60)
+
+        resp = await _post_chat("remote-model")
+
+        assert not _is_ramp_503(resp), f"ramp-expired request gated: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+    @pytest.mark.asyncio
+    async def test_disabled_ramp_serves_local_and_remote(
+        self, stub_dispatch, monkeypatch
+    ):
+        import proxy.server as srv_mod
+
+        _set_models(
+            monkeypatch,
+            {
+                "local-model": LOCAL_ONLY_MODEL,
+                "remote-model": REMOTE_ONLY_MODEL,
+            },
+        )
+        monkeypatch.setattr(
+            srv_mod, "PROXY_START_TIME", time.monotonic(), raising=True
+        )
+        # Use monkeypatch (not ``set_startup_ramp_config``) so the prior
+        # ``_startup_ramp_config`` value is restored on teardown and this test
+        # does not leak an enabled ramp into subsequent test modules.
+        monkeypatch.setattr(
+            mode_module,
+            "_startup_ramp_config",
+            {"enabled": False, "max_seconds": 180},
+            raising=True,
+        )
+
+        resp_local = await _post_chat("local-model")
+        resp_remote = await _post_chat("remote-model")
+
+        assert not _is_ramp_503(resp_local), f"disabled ramp gated local: {resp_local.text}"
+        assert not _is_ramp_503(resp_remote), f"disabled ramp gated remote: {resp_remote.text}"
+        assert resp_local.headers.get("X-Test-Dispatch") == "stub"
+        assert resp_remote.headers.get("X-Test-Dispatch") == "stub"
+
+
+class TestStartupRampBackendReadyClearsGate:
+    """The readiness-driven clear (LP-0MUAY98ZR002JBAA) is orthogonal: when
+    backends are ready the gate clears for *every* model, local- or remote-bound.
+    """
+
+    @pytest.mark.asyncio
+    async def test_local_only_served_when_backends_ready(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        import proxy.server as srv_mod
+
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        monkeypatch.setattr(
+            srv_mod, "PROXY_START_TIME", time.monotonic() - 5, raising=True
+        )
+        monkeypatch.setattr(srv_mod, "backend_ready", True, raising=True)
+
+        resp = await _post_chat("local-model")
+
+        assert not _is_ramp_503(resp), f"ready backends should clear the gate: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+    @pytest.mark.asyncio
+    async def test_remote_bound_served_when_backends_ready(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        import proxy.server as srv_mod
+
+        _set_models(monkeypatch, {"remote-model": REMOTE_ONLY_MODEL})
+        monkeypatch.setattr(
+            srv_mod, "PROXY_START_TIME", time.monotonic() - 5, raising=True
+        )
+        monkeypatch.setattr(srv_mod, "backend_ready", True, raising=True)
+
+        resp = await _post_chat("remote-model")
+
+        assert not _is_ramp_503(resp), f"ready backends should clear the gate: {resp.text}"
+        assert resp.headers.get("X-Test-Dispatch") == "stub"
+
+
+class TestStartupRampNonChatUnaffected:
+    """AC5: non-chat endpoints are untouched by the refined gate."""
+
+    @pytest.mark.asyncio
+    async def test_non_chat_endpoint_not_gated(self, ramp_config, monkeypatch):
+        import httpx
+        from proxy.server import app
+
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        _within_ramp(monkeypatch)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/admin/mode")
+
+        assert resp.status_code == 200
+
+
+class TestModelCanRouteRemotePredicate:
+    """AC3: the gate predicate mirrors dispatch provider selection."""
+
+    def test_local_only_is_false(self):
+        from proxy.ui import _model_can_route_remote
+
+        assert _model_can_route_remote(LOCAL_ONLY_MODEL) is False
+
+    def test_multi_local_is_false(self):
+        from proxy.ui import _model_can_route_remote
+
+        assert _model_can_route_remote(MULTI_LOCAL_MODEL) is False
+
+    def test_local_with_remote_is_true(self):
+        from proxy.ui import _model_can_route_remote
+
+        assert _model_can_route_remote(LOCAL_WITH_REMOTE_FALLBACK_MODEL) is True
+
+    def test_remote_only_is_true(self):
+        from proxy.ui import _model_can_route_remote
+
+        assert _model_can_route_remote(REMOTE_ONLY_MODEL) is True
+
+    def test_missing_or_malformed_is_false(self):
+        from proxy.ui import _model_can_route_remote
+
+        assert _model_can_route_remote(None) is False
+        assert _model_can_route_remote({}) is False
+        assert _model_can_route_remote({"providers": []}) is False
+        assert _model_can_route_remote({"providers": "bad"}) is False
