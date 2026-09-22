@@ -771,6 +771,38 @@ def _get_prefill_lease_config(srv) -> tuple[float, float]:
         return 10.0, 30.0
 
 
+def _get_no_progress_timeout_seconds(srv) -> float:
+    """Return the no-progress watchdog timeout in seconds (default 180).
+
+    When a dispatch record has ``active=True`` but has had no observed
+    progress advance or first-byte arrival for this duration, the watchdog
+    treats it as a no-progress wedge and releases the lease (LP-0MUCEFB8E003YVFF).
+    Returns 0 to disable the watchdog entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_no_progress_timeout_seconds", 180)
+        return float(raw) if raw is not None else 180.0
+    except Exception:
+        return 180.0
+
+
+def _get_max_prefill_seconds(srv) -> float:
+    """Return the max prefill lifetime in seconds (default 900).
+
+    A hard ceiling on how long any single dispatch record may remain active
+    from its ``started_at`` timestamp. Exceeding this ceiling always releases
+    the lease regardless of observed progress (LP-0MUCEFB8E003YVFF).
+    Returns 0 to disable the ceiling entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_max_prefill_seconds", 900)
+        return float(raw) if raw is not None else 900.0
+    except Exception:
+        return 900.0
+
+
 async def _query_prefill_progress(
     srv,
     llama_port: int,
@@ -917,11 +949,13 @@ async def _extend_lease_during_prefill(
     - **Progress advance** — observed numeric progress (per-slot
       ``n_past``/``n_prompt_tokens_processed`` or aggregate
       ``kv_cache_tokens``) is greater than *last_progress*.
-    - **Liveness** — no numeric progress is reported by the llama.cpp build
-      (b8782 removed the fields from ``/slots``) but the slot is observed
-      actively processing (``is_processing``); the lease is extended on
-      liveness so streams are never orphaned mid-prefill just because the
-      build stopped reporting a counter (LP-0MSUO5Z0K007HBSS).
+
+    **Liveness-only extension is removed** (LP-0MUCEFB8E003YVFF). A slot
+    observed as alive (``is_processing``) but with no progress advance
+    no longer extends the lease. This prevents stuck requests from holding
+    the lease indefinitely when the backend produces no output. The
+    no-progress watchdog in ``_cleanup_stale_local_dispatch`` will release
+    such records after ``local_dispatch_no_progress_timeout_seconds``.
 
     Returns ``(last_progress, extended)``:
 
@@ -943,7 +977,11 @@ async def _extend_lease_during_prefill(
         endpoint=endpoint,
     )
     advancing = progress is not None and progress > last_progress
-    if not advancing and not alive:
+    # LP-0MUCEFB8E003YVFF: Only extend on progress advance.  Liveness-only
+    # extension is removed — a slot that is alive but not making progress
+    # will be caught by the no-progress watchdog instead of holding the
+    # lease indefinitely (the wedge condition).
+    if not advancing:
         # Unobservable or stalled: no extension. Unobservable keeps the
         # adaptive estimate applied at acquisition (fallback).
         return last_progress, False
@@ -958,28 +996,21 @@ async def _extend_lease_during_prefill(
                 )
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
+                    record["last_progress"] = progress
+                    record["last_progress_ts"] = time.monotonic()
                     extended = True
                     try:
-                        if advancing:
-                            srv.logger.info(
-                                "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                                session_key if session_key else "unknown",
-                                progress,
-                                buffer_seconds,
-                            )
-                        else:
-                            srv.logger.info(
-                                "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
-                                session_key if session_key else "unknown",
-                                buffer_seconds,
-                            )
+                        srv.logger.info(
+                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                            session_key if session_key else "unknown",
+                            progress,
+                            buffer_seconds,
+                        )
                     except Exception:
                         pass
     except Exception:
         pass
-    if advancing:
-        return progress, extended
-    return last_progress, extended
+    return progress, extended
 
 
 async def _decrement_local_active_queries(
@@ -1111,6 +1142,12 @@ async def _increment_local_active_queries(
                         "active": True,
                         "expires_at": time.monotonic() + lease_timeout,
                         "model_name": model_name,
+                        # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                        # A record that never makes progress is bounded by
+                        # ``local_dispatch_no_progress_timeout_seconds`` from
+                        # creation (no waiting on an unobservable signal).
+                        "last_progress": 0,
+                        "last_progress_ts": time.monotonic(),
                     }
         except Exception:
             pass
@@ -1458,6 +1495,9 @@ async def _try_acquire_local_dispatch(
                     "active": True,
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
+                    # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                    "last_progress": 0,
+                    "last_progress_ts": now,
                 }
                 # Register prefill hold for the prefill-aware guard.
                 try:
@@ -1620,10 +1660,66 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         return False
 
 
+def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
+    """Check whether a dispatch record has exceeded the no-progress timeout.
+
+    Returns ``True`` when the record qualifies for no-progress release:
+
+    - The record is ``active=True`` and carries a ``last_progress_ts``
+      baseline (always set at record creation by
+      ``_try_acquire_local_dispatch`` / ``_increment_local_active_queries``).
+    - ``local_dispatch_no_progress_timeout_seconds`` is non-zero and the
+      record's ``last_progress_ts`` is older than the timeout — meaning no
+      progress has been observed for that long.
+    - Or the record's ``started_at`` exceeds ``local_dispatch_max_prefill_seconds``
+      (hard ceiling on any single request's lifetime, even with progress).
+
+    Records without a ``last_progress_ts`` baseline (legacy records created
+    before this feature) return ``False`` — they fall through to the
+    pre-existing expiry/orphan-cleanup path rather than being released by the
+    watchdog. This keeps the change surgical and avoids misclassifying
+    records whose age was never tracked on a progress clock.
+
+    When ``True``, the caller should release the lease so the session can
+    fall through to the next backend (LP-0MUCEFB8E003YVFF).
+    """
+    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
+    max_prefill = _get_max_prefill_seconds(srv)
+    now = time.monotonic()
+
+    # The watchdog only has an opinion about records whose progress clock it
+    # owns (``last_progress_ts``). This is set at creation and refreshed on
+    # every observed progress advance / data chunk.
+    last_progress_ts = record.get("last_progress_ts")
+    if last_progress_ts is None:
+        return False
+
+    # No-progress timeout: no observed progress for longer than the timeout.
+    if no_progress_timeout > 0 and now - last_progress_ts > no_progress_timeout:
+        return True
+
+    # Max-prefill ceiling: total active time exceeds the ceiling.
+    if max_prefill > 0:
+        started_at = record.get("started_at")
+        if started_at is not None and now - started_at > max_prefill:
+            return True  # exceeded max prefill ceiling
+
+    return False
+
+
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    Two categories of stale records are cleaned:
+    Three categories of stale records are cleaned:
+
+    0. **Active records with no observed progress** (LP-0MUCEFB8E003YVFF) —
+       the no-progress watchdog releases any active record whose
+       ``last_progress_ts`` is older than
+       ``local_dispatch_no_progress_timeout_seconds``, or whose
+       ``started_at`` exceeds ``local_dispatch_max_prefill_seconds``, even
+       when ``expires_at`` is still in the future (a wedged request's
+       adaptive lease can be far out). Logged at WARNING level with
+       ``reason=no_progress_watchdog``.
 
     1. **Inactive records** whose *expires_at* has passed — these represent
        sessions that finished their request but whose idle lease timeout
@@ -1659,11 +1755,52 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     try:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
+                active = record.get("active", False)
+                # LP-0MUCEFB8E003YVFF: no-progress watchdog. Runs on every
+                # active record regardless of ``expires_at`` — a wedged
+                # record's lease may be far in the future (adaptive lease),
+                # so expiry alone cannot catch it. Pure time computation, so
+                # safe to run under the lock.
+                if active and _watchdog_no_progress(
+                    srv, _dispatch_key_session_id(sid), record
+                ):
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and _dispatch_key_session_id(sid) in _p:
+                            _p.pop(_dispatch_key_session_id(sid), None)
+                    except Exception:
+                        pass
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(
+                            _dispatch_key_session_id(sid),
+                            endpoint=_endpoint_from_record(record),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        srv.local_active_queries = max(
+                            0, int(getattr(srv, 'local_active_queries', 0) or 0) - 1
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        srv.logger.warning(
+                            "lease_released session=%s reason=no_progress_watchdog "
+                            "endpoint=%s",
+                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                            _endpoint_from_record(record) or "default",
+                        )
+                    except Exception:
+                        pass
+                    continue
+
                 expires_at = record.get("expires_at", 0)
                 if expires_at > now:
                     continue  # still within valid window
 
-                active = record.get("active", False)
                 if not active:
                     # Normal idle timeout for inactive records
                     del srv.local_dispatch_records[sid]
@@ -1702,7 +1839,8 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     # Phase 2 (outside the lock): verify which candidates still have a
     # processing slot on llama-server. A failed / unverifiable query means
     # "not verified alive" — the record is orphan-cleaned below (fail-open,
-    # matching pre-existing behaviour).
+    # matching pre-existing behaviour). The no-progress watchdog already ran
+    # in phase 1, so records reaching here have shown recent progress.
     alive: set[str] = set()
     for sid, record in verify_candidates:
         try:
@@ -1731,7 +1869,10 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         continue  # refreshed since phase 1 — preserved
                     if sid in alive:
                         # Slot still generating: extend the lease instead of
-                        # freeing (LP-0MSUO6XRP001MCB2).
+                        # freeing (LP-0MSUO6XRP001MCB2). The watchdog already
+                        # filtered out no-progress wedges above, so a slot
+                        # verified as alive at this point is making real
+                        # progress — extend on its behalf.
                         current["expires_at"] = (
                             time.monotonic() + _get_chunk_refresh_buffer_seconds(srv)
                         )

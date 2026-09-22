@@ -112,6 +112,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _extend_lease_during_prefill,
     _get_chunk_refresh_buffer_seconds,
     _get_lease_timeout_seconds,
+    _get_max_prefill_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
@@ -1211,13 +1212,29 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         stream_resp = await stream_cm.__aenter__()
                         return stream_cm, stream_resp
 
-                    # Enter the stream with bounded retries on transient backend failures
+                    # Enter the stream with bounded retries on transient backend failures.
+                    # LP-0MUCEFB8E003YVFF: bound the first-byte wait by
+                    # ``local_dispatch_max_prefill_seconds`` so a local request
+                    # that never reaches first byte is aborted server-side (lease
+                    # released by the cleanup path) and the client receives a
+                    # retryable 503 instead of hanging indefinitely.
+                    _first_byte_ceiling = _get_max_prefill_seconds(srv)
                     try:
-                        cm, response = await _call_with_backend_retries(
-                            _open_stream_once,
-                            path=path,
-                            stream=True,
-                        )
+                        if _first_byte_ceiling > 0:
+                            cm, response = await asyncio.wait_for(
+                                _call_with_backend_retries(
+                                    _open_stream_once,
+                                    path=path,
+                                    stream=True,
+                                ),
+                                timeout=_first_byte_ceiling,
+                            )
+                        else:
+                            cm, response = await _call_with_backend_retries(
+                                _open_stream_once,
+                                path=path,
+                                stream=True,
+                            )
                         srv.backend_ready = True
                         restore_signal_detected = _has_explicit_restore_signal(
                             dict(response.headers), None
@@ -1228,7 +1245,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     session_id
                                 )
                             )
-                    except Exception:
+                    except Exception as _exc:
+                        # LP-0MUCEFB8E003YVFF: distinct, observable log line
+                        # when the first-byte ceiling aborts a stuck prefill.
+                        if isinstance(_exc, asyncio.TimeoutError):
+                            try:
+                                srv.logger.warning(
+                                    "dispatch_first_byte_timeout session=%s "
+                                    "ceiling=%.0fs",
+                                    session_id if session_id else "unknown",
+                                    _first_byte_ceiling,
+                                )
+                            except Exception:
+                                pass
                         srv.backend_ready = False
                         await _cleanup_after_request(
                             srv, session_id,
@@ -1679,6 +1708,15 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 if _record_key in srv.local_dispatch_records:
                                                     srv.local_dispatch_records[_record_key]['expires_at'] = (
                                                         time.monotonic() + _lease_timeout
+                                                    )
+                                                    # LP-0MUCEFB8E003YVFF: a real
+                                                    # data chunk is forward
+                                                    # progress — reset the
+                                                    # no-progress watchdog so a
+                                                    # long silent generation is
+                                                    # not falsely released.
+                                                    srv.local_dispatch_records[_record_key]['last_progress_ts'] = (
+                                                        time.monotonic()
                                                     )
                                     except Exception:
                                         pass

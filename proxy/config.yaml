@@ -736,6 +736,20 @@ server:
   #   (LP-0MSUO6HLX0089MNQ). The same buffer extends the lease when orphan cleanup
   #   verifies a session's slot is still processing on llama-server (active-stream
   #   verification, LP-0MSUO6XRP001MCB2).
+  # local_dispatch_no_progress_timeout_seconds: No-progress watchdog timeout for
+  #   active dispatch leases (default 180s; 0 disables). When an active lease has
+  #   had no observed progress advance (``last_progress_ts`` not refreshed by
+  #   prefill extension or data chunks) for longer than this, the lease is released
+  #   so a wedged request cannot gate the local pool indefinitely. This breaks the
+  #   post-restart wedge where sessions hold leases while the backend is
+  #   "processing" but produces no output (LP-0MUCEFB8E003YVFF). Liveness-only
+  #   lease extension was removed in favour of this watchdog.
+  # local_dispatch_max_prefill_seconds: Hard ceiling on a single local dispatch
+  #   record's lifetime (default 900s; 0 disables). A record active for longer than
+  #   this is released regardless of observed progress. Also bounds the initial
+  #   first-byte wait: a local request that produces no first byte within this
+  #   window is aborted server-side with a retryable 503 + Retry-After
+  #   (LP-0MUCEFB8E003YVFF).
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
   # events) showed 100% of denies caused by idle lease holders, never GPU

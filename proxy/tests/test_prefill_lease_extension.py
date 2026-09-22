@@ -470,26 +470,33 @@ async def test_extend_lease_does_not_extend_when_progress_stalls(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_extend_lease_on_liveness_when_numeric_progress_absent(monkeypatch):
-    """llama.cpp b8782 failure mode: no numeric progress is reported, but the
-    slot is observed processing — the lease is still extended on liveness so
-    a long prefill never loses its lease mid-flight (LP-0MSUO5Z0K007HBSS AC2)."""
+async def test_extend_lease_does_not_extend_on_liveness_alone(monkeypatch):
+    """LP-0MUCEFB8E003YVFF: liveness-only extension is removed.
+
+    llama.cpp b8782 reports no numeric progress but the slot is observed
+    processing (is_processing=True). Previously this extended the lease
+    indefinitely, allowing a stuck (no-progress) request to hold the
+    dispatch pool forever. Now the lease is NOT extended on liveness alone;
+    the no-progress watchdog in ``_cleanup_stale_local_dispatch`` releases
+    such records after ``local_dispatch_no_progress_timeout_seconds``."""
     from proxy.router_helpers import _extend_lease_during_prefill
 
     now = time.monotonic()
+    original_expiry = now + 0.3
     srv = _make_srv(records={
-        "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": now + 0.3},
+        "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": original_expiry},
     })
     _install_fake_progress(monkeypatch, [(None, True)])
 
     last_progress, extended = await _extend_lease_during_prefill(
         srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
     )
-    assert extended is True, "Lease must be extended on liveness when progress is unobservable"
+    assert extended is False, (
+        "Lease must NOT be extended on liveness alone (no progress advance)"
+    )
     assert last_progress == 0
-    record = srv.local_dispatch_records["sess-1"]
-    assert record["expires_at"] - time.monotonic() >= 0.45
-    assert any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+    assert srv.local_dispatch_records["sess-1"]["expires_at"] == original_expiry
+    assert not any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
 
 
 @pytest.mark.asyncio
