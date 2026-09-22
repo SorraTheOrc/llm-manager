@@ -750,6 +750,12 @@ server:
   #   first-byte wait: a local request that produces no first byte within this
   #   window is aborted server-side with a retryable 503 + Retry-After
   #   (LP-0MUCEFB8E003YVFF).
+  # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
+  #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
+  #   warning. While awaiting the SSE response headers, the proxy polls prefill
+  #   progress concurrently (at ``local_dispatch_lease_prefill_poll_seconds``) so
+  #   progress is observable before the first byte and the wait is visible in
+  #   production (LP-0MUCEFC0T009V7ZY).
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
   # events) showed 100% of denies caused by idle lease holders, never GPU

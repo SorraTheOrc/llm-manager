@@ -905,3 +905,68 @@ async def test_stream_loop_adaptive_fallback_when_status_unobservable(monkeypatc
     assert not any(
         "lease_extended_during_prefill" in line for line in _info_log_lines(server.logger)
     ), "Unobservable progress must not log extension events"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pre-header observability: initial upstream response wait (LP-0MUCEFC0T009V7ZY)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_first_byte_wait_emits_threshold_warning(monkeypatch):
+    """LP-0MUCEFC0T009V7ZY: a first-byte wait longer than the observability
+    threshold emits ``prefill_wait_exceeds_threshold`` and polls prefill
+    progress concurrently with the initial ``__aenter__`` wait."""
+    from proxy.router import proxy_to_local
+
+    # Long pre-header wait (0.2s) with a 0.05s observability threshold.
+    server.config["server"]["local_dispatch_prefill_observability_warn_seconds"] = 0.05
+
+    progress = [0]
+    status_calls = []
+
+    async def _advancing_status():
+        progress[0] += 1000
+        status_calls.append(1)
+        return {
+            "llama_server_running": True,
+            "n_ctx": 32768,
+            "kv_cache_tokens": progress[0],
+            "router_mode": False,
+        }
+
+    monkeypatch.setattr("proxy.observability.query_llama_status", _advancing_status)
+
+    async def _slow_retries(*args, **kwargs):
+        # Simulate llama-server taking 0.2s to return SSE headers.
+        await asyncio.sleep(0.2)
+        cm, resp = _make_mock_cm(_immediate_chunks)
+        return cm, resp
+
+    async def _immediate_chunks():
+        yield b'data: {"choices": [{"delta": {"content": "Hi"}, "index": 0}]}\n\n'
+        yield b'data: {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    cm, resp = _make_mock_cm(_immediate_chunks)
+    monkeypatch.setattr("proxy.router._call_with_backend_retries", _slow_retries)
+    monkeypatch.setattr(
+        "proxy.router._call_with_empty_retry", AsyncMock(return_value=resp)
+    )
+    monkeypatch.setattr("proxy.router._update_session_and_slot", AsyncMock(return_value=None))
+
+    response = await proxy_to_local(
+        _dummy_request({"model": "test", "messages": [{"role": "user", "content": "hi"}]}, stream=True),
+        "v1/chat/completions",
+    )
+    collected = await _collect_streamed_chunks(response)
+    assert b"Hi" in collected
+
+    # AC2: the observable threshold warning was emitted during the wait.
+    warning_lines = [str(call) for call in server.logger.warning.call_args_list]
+    assert any("prefill_wait_exceeds_threshold" in line for line in warning_lines), (
+        f"Expected prefill_wait_exceeds_threshold warning, got: {warning_lines}"
+    )
+
+    # AC1: progress was observed before the first byte (concurrent poll).
+    assert status_calls, "Prefill progress must be polled during the pre-header wait"

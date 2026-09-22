@@ -97,6 +97,7 @@ from proxy.utils import (  # noqa: E402
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _apply_queue_wait_to_timeout,
+    _await_first_byte_with_prefill_monitor,
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _call_with_backend_retries,
@@ -1218,23 +1219,41 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     # that never reaches first byte is aborted server-side (lease
                     # released by the cleanup path) and the client receives a
                     # retryable 503 instead of hanging indefinitely.
+                    # LP-0MUCEFC0T009V7ZY: while awaiting the first byte, poll
+                    # prefill progress concurrently so progress is observable
+                    # before the SSE headers arrive (previously the poll sat
+                    # after ``stream_cm.__aenter__`` and never ran during a real
+                    # prefill).
                     _first_byte_ceiling = _get_max_prefill_seconds(srv)
+                    _first_byte_poll_seconds = float(
+                        server_config.get(
+                            "local_dispatch_lease_prefill_poll_seconds", 10
+                        )
+                        or 10
+                    )
+                    _first_byte_warn_seconds = float(
+                        server_config.get(
+                            "local_dispatch_prefill_observability_warn_seconds", 30
+                        )
+                        or 30
+                    )
                     try:
-                        if _first_byte_ceiling > 0:
-                            cm, response = await asyncio.wait_for(
-                                _call_with_backend_retries(
-                                    _open_stream_once,
-                                    path=path,
-                                    stream=True,
-                                ),
-                                timeout=_first_byte_ceiling,
-                            )
-                        else:
-                            cm, response = await _call_with_backend_retries(
+                        cm, response = await _await_first_byte_with_prefill_monitor(
+                            srv,
+                            _call_with_backend_retries(
                                 _open_stream_once,
                                 path=path,
                                 stream=True,
-                            )
+                            ),
+                            timeout=_first_byte_ceiling,
+                            poll_seconds=_first_byte_poll_seconds,
+                            warn_seconds=_first_byte_warn_seconds,
+                            session_id=session_id if session_explicit else None,
+                            endpoint=endpoint,
+                            llama_port=llama_port,
+                            model_name=model_name,
+                            slot_id=slot_id,
+                        )
                         srv.backend_ready = True
                         restore_signal_detected = _has_explicit_restore_signal(
                             dict(response.headers), None

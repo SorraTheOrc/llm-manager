@@ -1013,6 +1013,104 @@ async def _extend_lease_during_prefill(
     return progress, extended
 
 
+async def _await_first_byte_with_prefill_monitor(
+    srv,
+    open_coro,
+    *,
+    timeout: float = 0.0,
+    poll_seconds: float = 0.0,
+    warn_seconds: float = 30.0,
+    session_id: str | None = None,
+    endpoint: str | None = None,
+    llama_port: int = 8080,
+    model_name: str | None = None,
+    slot_id: int | None = None,
+) -> tuple:
+    """Await the initial upstream response while monitoring prefill progress.
+
+    ``stream_cm.__aenter__()`` blocks until llama-server returns the SSE
+    response headers, which for this build arrive with the first token.
+    The post-headers prefill-progress poll in the streaming loop therefore
+    never runs during a real prefill (LP-0MUCEFC0T009V7ZY).
+
+    This helper races *open_coro* (the first-byte wait) against a periodic
+    prefill-progress poll, so that:
+
+    - Progress observed before the first byte extends the dispatch lease via
+      ``_extend_lease_during_prefill`` (progress-only; liveness alone no
+      longer extends — LP-0MUCEFB8E003YVFF).
+    - A distinct ``prefill_wait_exceeds_threshold`` warning is emitted once
+      the initial wait exceeds *warn_seconds*, making a long pre-header wait
+      visible in production (previously this path was silent).
+    - *timeout* bounds the total wait (``local_dispatch_max_prefill_seconds``);
+      exceeding it raises ``asyncio.TimeoutError`` so the caller can abort the
+      request with a retryable status.
+
+    *open_coro* is awaited directly (no polling, no timeout) when both
+    *poll_seconds* and *timeout* are non-positive, preserving the previous
+    behaviour for disabled configurations.
+
+    The pending *open_coro* task is cancelled if this helper is cancelled or
+    raises, so a timed-out first-byte wait never leaks an upstream stream.
+    """
+    open_task = asyncio.ensure_future(open_coro)
+    waited = 0.0
+    warned = False
+    last_progress = 0
+    try:
+        while True:
+            if timeout > 0:
+                remaining = timeout - waited
+                if remaining <= 0:
+                    raise TimeoutError()
+                step = min(poll_seconds, remaining) if poll_seconds > 0 else remaining
+            else:
+                step = poll_seconds if poll_seconds > 0 else None
+
+            if step is None:
+                # No polling and no timeout: await directly.
+                return await open_task
+
+            done, _pending = await asyncio.wait({open_task}, timeout=step)
+            if open_task in done:
+                return open_task.result()
+
+            waited += step
+
+            # Poll prefill progress and extend the lease on genuine advance.
+            if session_id:
+                try:
+                    last_progress, _extended = await _extend_lease_during_prefill(
+                        srv,
+                        session_id,
+                        endpoint=endpoint,
+                        llama_port=llama_port,
+                        model_name=model_name,
+                        slot_id=slot_id,
+                        last_progress=last_progress,
+                    )
+                except Exception:
+                    pass
+
+            # Observable event once the initial wait exceeds the threshold.
+            if warn_seconds > 0 and not warned and waited >= warn_seconds:
+                warned = True
+                try:
+                    srv.logger.warning(
+                        "prefill_wait_exceeds_threshold session=%s waited=%.0fs "
+                        "progress=%s",
+                        session_id or "unknown",
+                        waited,
+                        last_progress,
+                    )
+                except Exception:
+                    pass
+    except BaseException:
+        if not open_task.done():
+            open_task.cancel()
+        raise
+
+
 async def _decrement_local_active_queries(
     srv,
     session_key: str | None = None,
