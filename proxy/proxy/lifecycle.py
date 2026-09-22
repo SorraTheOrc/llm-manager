@@ -31,6 +31,18 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 import proxy.metrics as metrics
+from proxy import cold_start
+
+
+def _note_model_loaded_cold_start() -> None:
+    """Arm the cold-start window after a model load/switch (LP-0MUCEFCAT005NFNN).
+
+    Best-effort: a failure here must never break model loading.
+    """
+    try:
+        cold_start.note_model_loaded()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1766,6 +1778,10 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
                    "llama_server_running": True
                })
                srv.backend_ready = True
+               # LP-0MUCEFCAT005NFNN: a router-mode model was just loaded —
+               # enter the cold window so concurrent large prefills are
+               # capped until the cache warms.
+               _note_model_loaded_cold_start()
                return True
 
            # Need to switch models or restart (single-model path)
@@ -1798,6 +1814,9 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
                    "llama_server_running": True
                })
                srv.backend_ready = True
+               # LP-0MUCEFCAT005NFNN: single-model load complete — arm the
+               # cold window.
+               _note_model_loaded_cold_start()
                return True
            else:
                # Broadcast failure
@@ -1974,6 +1993,10 @@ async def restart_services(
                     )
 
             srv.backend_ready = True
+            # LP-0MUCEFCAT005NFNN: a router-mode restart just reloaded the
+            # model cold — arm the cold window so the post-restart
+            # thundering-herd is admission-controlled.
+            _note_model_loaded_cold_start()
             srv.logger.info(
                 "restart_services: router-mode restart complete (%d slots)",
                 slot_count,

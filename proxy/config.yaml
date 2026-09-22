@@ -880,6 +880,25 @@ server:
     jitter_min: 5
     jitter_max: 15
 
+  # -----------------------------------------------------------------------
+  # Cold-start admission control (LP-0MUCEFCAT005NFNN)
+  # -----------------------------------------------------------------------
+  # After a restart the co-located llama-server reloads the model cold (no
+  # prompt cache). Several large-context sessions dispatching at once each
+  # issue a full GPU prefill concurrently; first bytes take minutes and the
+  # local pool wedges. While the backend is cold, concurrent local dispatches
+  # are capped (default 1) so only one large prefill runs at a time. The cap
+  # lifts as soon as the first prefill completes (first data byte) — or when
+  # the grace window elapses — so warm operation is unrestricted.
+  #
+  # local_cold_start_grace_seconds: Bounded cold window after the backend
+  #   becomes ready (default 120; 0 disables cold-start admission control).
+  #   Self-expiring: the cap is never permanent.
+  # local_cold_start_max_concurrent: Max concurrent local dispatches while
+  #   cold (default 1, minimum 1).
+  # local_cold_start_retry_after_seconds: Retry-After hint for a cold-start
+  #   deferral (default 15).
+
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
   # The effective timeout is base + session_slot_timeout_per_token_seconds x

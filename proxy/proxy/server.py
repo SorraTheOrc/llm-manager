@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
+from proxy import cold_start
 from proxy import mode as mode_module
 from proxy.disconnect_reaper import DisconnectReaperMiddleware
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
@@ -657,6 +658,12 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                     if not await wait_for_llama_server(config.get("server", {}).get("llama_startup_timeout", 300)):
                         raise RuntimeError("Router-mode llama-server failed to become ready")
                     backend_ready = True
+                    # LP-0MUCEFCAT005NFNN: router-mode server just became
+                    # ready at startup — arm the cold window.
+                    try:
+                        cold_start.note_model_loaded()
+                    except Exception:
+                        pass
 
                     resolved = []
                     if router_preload_list:
@@ -671,6 +678,12 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
 
                 if await ensure_model_loaded(default_model):
                     backend_ready = True
+                    # LP-0MUCEFCAT005NFNN: default model just loaded at
+                    # startup — arm the cold window.
+                    try:
+                        cold_start.note_model_loaded()
+                    except Exception:
+                        pass
                     logger.info(f"Default model '{default_model}' loaded successfully")
                     return
             except Exception as e:

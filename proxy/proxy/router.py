@@ -55,6 +55,7 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
 
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
+from proxy import cold_start  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
     _compute_adaptive_timeout,
     _is_self_healing_active,
@@ -1061,7 +1062,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     # -------------------------------------------------------------------
     acquired = False
     if session_id and session_explicit:
+        # LP-0MUCEFCAT005NFNN: cold-start admission control. The cold window
+        # is armed by the lifecycle load paths (``note_model_loaded``) when a
+        # model becomes ready, and lifts on the first completed prefill
+        # (``mark_warm``). While cold, cap concurrent local dispatches so a
+        # post-restart thundering-herd of large prefills cannot run at once.
+        # Warm state returns the configured max unchanged (no added latency).
         local_max = _get_local_max_concurrent_queries(server_config)
+        local_max = cold_start.effective_max_concurrent(server_config, local_max)
         backend_label = endpoint or "local"
         acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
             srv,
@@ -1072,13 +1080,43 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             model_name=model_name,
         )
         if not acquired:
+            _cold = cold_start.is_cold(server_config)
             srv.logger.info(
-                "local_dispatch_denied session=%s owner=%s active=%s",
+                "local_dispatch_denied session=%s owner=%s active=%s cold_start=%s",
                 session_id if session_id else "unknown",
                 owner if owner else "none",
                 active_count,
+                _cold,
             )
             _record_backend_signal("local_dispatch_denied")
+
+            if _cold:
+                # Retryable deferral with a short, cold-specific Retry-After
+                # so clients re-queue during the warmup rather than waiting
+                # for the (potentially adaptive) lease timeout.
+                _retry_after = cold_start.retry_after_seconds(server_config)
+                payload = {
+                    "error": {
+                        "type": "server_busy",
+                        "code": "cold_start",
+                        "message": (
+                            "Local backend is warming up after a restart; "
+                            "retry shortly."
+                        ),
+                    },
+                    "status": 503,
+                    "retry_after": _retry_after,
+                    "reason": "cold_start",
+                    "local_owner_session_id": owner,
+                }
+                return JSONResponse(
+                    status_code=503,
+                    content=payload,
+                    headers={
+                        "Retry-After": str(_retry_after),
+                        "Cache-Control": "no-store",
+                    },
+                )
 
             payload = {
                 "error": {
@@ -1696,6 +1734,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # lease extension — the chunk-refresh path
                                     # below takes over (LP-0MSE05J53004C6EL).
                                     _saw_actual_data = True
+                                    # LP-0MUCEFCAT005NFNN: the local prompt cache
+                                    # is now warm for this model; lift the
+                                    # cold-start admission cap so subsequent
+                                    # requests see the full concurrency.
+                                    try:
+                                        from proxy import cold_start as _cold_start
+
+                                        _cold_start.mark_warm()
+                                    except Exception:
+                                        pass
 
                                 # Refresh dispatch lease expiry for long-running
                                 # streams (LP-0MRDKV44T003FRBP).  Extend the lease
