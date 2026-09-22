@@ -45,6 +45,10 @@ proxy/.mode.override-until
 proxy/.mode.last-fast-switch
 # Session→model binding registry persisted by the proxy (grandfathering across mode switches) — runtime state, not committed
 proxy/grandfathering-state.json
+# llama-server signature recorded on start (model/parallel/router mode/config hash)
+# — runtime state used for restart-lifecycle preservation, not committed
+# (LP-0MUD2G0V8004EXXZ; was accidentally tracked by LP-0MUCEFCL6001ZXYN)
+proxy/.llama_server_signature.json
 
 
 bundles/

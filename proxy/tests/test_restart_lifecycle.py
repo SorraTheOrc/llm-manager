@@ -164,6 +164,25 @@ def test_read_signature_corrupt_returns_none(sig_path):
     assert lifecycle._read_llama_server_signature() is None
 
 
+def test_signature_file_is_gitignored():
+    """The runtime signature file must be untracked (LP-0MUD2G0V8004EXXZ).
+
+    It is written by ``_write_llama_server_signature`` on every llama-server
+    start and must never be committed (it dirtied the tree on every mode
+    switch when accidentally tracked by LP-0MUCEFCL6001ZXYN).
+    """
+    proxy_dir = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        ["git", "check-ignore", "proxy/.llama_server_signature.json"],
+        cwd=str(proxy_dir.parent),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        "proxy/.llama_server_signature.json must be gitignored"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Adoption
 # ═══════════════════════════════════════════════════════════════════════════════
