@@ -777,6 +777,12 @@ server:
   # Prevents stuck requests from starving subsequent requests indefinitely.
   # Default: 120 seconds.
   session_single_flight_queue_timeout_seconds: 120
+  # Duplicate-retry backoff (LP-0MUCEFCV5006UKSZ). When an identical request
+  # (same session + same messages hash) is already in flight, the retry is
+  # rejected with a retryable 409 + Retry-After instead of queueing behind
+  # (then re-prefilling) or cancelling the original prefill. This value is
+  # the Retry-After hint in seconds. Default: 10.
+  session_single_flight_duplicate_retry_after_seconds: 10
   # Directory for KV-cache slot snapshots written by slot save/restore
   # (llama-server prompt_save/prompt_load). Must be writable by the proxy
   # user; retention is handled by scripts/cleanup-slot-cache.sh.

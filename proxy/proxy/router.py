@@ -67,6 +67,7 @@ from proxy.observability import (  # noqa: E402
     _record_backend_signal,
 )
 from proxy.session import (  # noqa: E402
+    SessionSingleFlightDuplicateError,
     SessionSingleFlightRejectedError,
     _build_slot_context,
     _detect_restore_signal_from_llama_log,
@@ -121,6 +122,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_local_active_queries,
     _increment_per_model_query,
     _normalize_outgoing_headers,
+    _request_dedup_hash,
     _schedule_recv_token_increment,
     _schedule_token_increment,
     _schedule_traffic_recording,
@@ -1118,6 +1120,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     },
                 )
 
+            _lease_retry_after = max(1, int(retry_after))
             payload = {
                 "error": {
                     "type": "server_busy",
@@ -1129,11 +1132,20 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     ),
                 },
                 "status": 503,
-                "retry_after": max(1, int(retry_after)),
+                "retry_after": _lease_retry_after,
                 "reason": "local_lease_active",
                 "local_owner_session_id": owner,
             }
-            return JSONResponse(status_code=503, content=payload)
+            # LP-0MUCEFCV5006UKSZ: denied sessions must be able to honor
+            # Retry-After — surface it as a header (not just the JSON body).
+            return JSONResponse(
+                status_code=503,
+                content=payload,
+                headers={
+                    "Retry-After": str(_lease_retry_after),
+                    "Cache-Control": "no-store",
+                },
+            )
 
     # Check slot availability — skipped when the dispatch lease was acquired
     # (the lease already gates concurrency to session_slot_pool_size; the
@@ -1198,6 +1210,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         llama_log_offset = 0
 
     is_streaming = body_json.get("stream", False)
+    # LP-0MUCEFCV5006UKSZ: stable hash of the message list so a client retry
+    # of the same prompt can be detected while the original is in flight.
+    _dedup_hash = _request_dedup_hash(body_json if isinstance(body_json, dict) else None)
 
     # Compute request timeout (adaptive if enabled)
     request_timeout = _compute_request_timeout(server_config, body_json)
@@ -1216,6 +1231,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             single_flight_mode,
             single_flight_max_queue_depth,
             queue_timeout_seconds=single_flight_queue_timeout,
+            request_hash=_dedup_hash,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
@@ -2104,6 +2120,48 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         headers=outgoing_headers,
                         status_code=upstream_status,
                     )
+        except SessionSingleFlightDuplicateError as exc:
+            # LP-0MUCEFCV5006UKSZ: identical request already in flight — the
+            # original prefill continues. Return a retryable 409 + Retry-After
+            # so the client backs off instead of re-prefilling.
+            await _cleanup_after_request(
+                srv, session_id,
+                decrement_local=False,
+                model_name=model_name,
+                request=request,
+                backend=endpoint,
+            )
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            record_key = _dispatch_lease_key(endpoint, session_id)
+                            if record_key in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[record_key]
+                except Exception:
+                    pass
+            retry_after = int(
+                server_config.get("session_single_flight_duplicate_retry_after_seconds", 10)
+                or 10
+            )
+            payload = {
+                "error": {
+                    "type": "session_single_flight",
+                    "code": "duplicate_inflight",
+                    "message": "An identical request is already in flight for this session",
+                    "reason": exc.reason,
+                },
+                "status": 409,
+                "session_id": session_id,
+                "retry_after": retry_after,
+                "mode": single_flight_mode,
+            }
+            return JSONResponse(
+                status_code=409,
+                content=payload,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
@@ -2141,6 +2199,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             single_flight_mode,
             single_flight_max_queue_depth,
             queue_timeout_seconds=single_flight_queue_timeout,
+            request_hash=_dedup_hash,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
@@ -2285,6 +2344,44 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             request=request,
                             backend=endpoint,
                         )
+        except SessionSingleFlightDuplicateError as exc:
+            await _cleanup_after_request(
+                srv, session_id,
+                decrement_local=True,
+                request=request,
+                backend=endpoint,
+            )
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            record_key = _dispatch_lease_key(endpoint, session_id)
+                            if record_key in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[record_key]
+                except Exception:
+                    pass
+            retry_after = int(
+                server_config.get("session_single_flight_duplicate_retry_after_seconds", 10)
+                or 10
+            )
+            payload = {
+                "error": {
+                    "type": "session_single_flight",
+                    "code": "duplicate_inflight",
+                    "message": "An identical request is already in flight for this session",
+                    "reason": exc.reason,
+                },
+                "status": 409,
+                "session_id": session_id,
+                "retry_after": retry_after,
+                "mode": single_flight_mode,
+            }
+            return JSONResponse(
+                status_code=409,
+                content=payload,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,

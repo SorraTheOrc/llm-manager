@@ -97,6 +97,32 @@ def _endpoint_from_record(record: dict) -> str | None:
     return None
 
 
+def _request_dedup_hash(body_json: dict | None) -> str | None:
+    """Return a stable hash of a request's message list for retry dedup.
+
+    Used by the session single-flight coordinator to detect a client retry
+    of the *same* prompt while the original is still in flight
+    (LP-0MUCEFCV5006UKSZ). Only the ``messages`` list is hashed so retries
+    that differ only in sampling parameters (which clients may vary) still
+    collapse onto the original prefill. Returns None when there is no
+    usable message list (caller then skips duplicate detection).
+    """
+    try:
+        if not isinstance(body_json, dict):
+            return None
+        messages = body_json.get("messages")
+        if not isinstance(messages, list):
+            return None
+        canonical = json.dumps(
+            messages, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        import hashlib
+
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
 # ===================================================================
 # Request/response logging helpers
 # ===================================================================
