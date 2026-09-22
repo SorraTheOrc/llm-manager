@@ -651,6 +651,22 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                 return
             try:
                 if router_mode:
+                    _adopted_router = False
+                    if llama_process is None:
+                        # LP-0MUCEFCL6001ZXYN: adopt a router-mode
+                        # llama-server preserved across a proxy-only restart
+                        # instead of spawning a duplicate.
+                        try:
+                            import proxy.lifecycle as _lc
+                            import proxy.server as _srv_mod
+
+                            _adopted_router = await _lc._try_adopt_running_llama_server(
+                                _srv_mod, None, router_mode=True
+                            )
+                            if _adopted_router:
+                                llama_process = _srv_mod.llama_process
+                        except Exception:
+                            _adopted_router = False
                     if llama_process is None or llama_process.poll() is not None:
                         llama_process = start_llama_server(None)
                         if llama_process is None:
@@ -658,12 +674,14 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                     if not await wait_for_llama_server(config.get("server", {}).get("llama_startup_timeout", 300)):
                         raise RuntimeError("Router-mode llama-server failed to become ready")
                     backend_ready = True
-                    # LP-0MUCEFCAT005NFNN: router-mode server just became
-                    # ready at startup — arm the cold window.
-                    try:
-                        cold_start.note_model_loaded()
-                    except Exception:
-                        pass
+                    # LP-0MUCEFCAT005NFNN: arm the cold window only when the
+                    # server was freshly started — an adopted server keeps its
+                    # warm cache and must not be throttled.
+                    if not _adopted_router:
+                        try:
+                            cold_start.note_model_loaded()
+                        except Exception:
+                            pass
 
                     resolved = []
                     if router_preload_list:

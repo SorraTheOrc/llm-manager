@@ -307,15 +307,49 @@ def _end_drain() -> None:
         _drain_deadline = None
 
 
+def _count_in_flight_local_streams() -> int:
+    """Count real in-flight local streams for the drain wait.
+
+    The historical check used only ``srv.local_active_queries``, which can
+    read 0 even while streams are still running (e.g. the counter was
+    decremented early, or the stream is tracked only by its dispatch record).
+    The mode-switch restart then killed those streams with a client-visible
+    ``finish_reason: error`` (LP-0MUCEFCL6001ZXYN).
+
+    Counts the maximum of the active-queries counter and the number of
+    dispatch records still marked ``active=True`` so a real in-flight stream
+    always holds the drain open.
+
+    Best-effort / fail-open: any error returns the counter value (or 0).
+    """
+    counter = 0
+    try:
+        import proxy.server as srv
+
+        counter = int(getattr(srv, "local_active_queries", 0) or 0)
+        records = getattr(srv, "local_dispatch_records", None)
+        if isinstance(records, dict):
+            active_records = sum(
+                1
+                for record in records.values()
+                if isinstance(record, dict) and record.get("active")
+            )
+            return max(counter, active_records)
+    except Exception:
+        pass
+    return counter
+
+
 def _wait_for_in_flight_local_streams(
     deadline: float | None = None,
 ) -> None:
     """Wait (bounded) for in-flight local streams to finish before restart spawn.
 
-    Polls ``srv.local_active_queries`` until it reaches 0 or the drain
-    deadline elapses. The wait is deliberately SHORT and bounded — new
-    requests are deferred during the same window, and a stuck counter
-    cannot hold the restart hostage.
+    Waits until the number of real in-flight local streams (see
+    ``_count_in_flight_local_streams``) reaches 0 or the drain deadline
+    elapses. The wait is deliberately bounded — new requests are deferred
+    during the same window, and a stuck stream cannot hold the restart
+    hostage.
 
     Args:
         deadline: Monotonic deadline by which the wait must return. When
@@ -330,17 +364,8 @@ def _wait_for_in_flight_local_streams(
         # to wait for — proceed to the restart directly.
         _end_drain()
         return
-    try:
-        import proxy.server as srv
-    except Exception:
-        srv = None
     while True:
-        active = 0
-        if srv is not None:
-            try:
-                active = int(getattr(srv, "local_active_queries", 0) or 0)
-            except Exception:
-                active = 0
+        active = _count_in_flight_local_streams()
         if active <= 0 or time.monotonic() >= deadline:
             break
         time.sleep(0.25)

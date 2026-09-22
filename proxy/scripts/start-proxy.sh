@@ -6,6 +6,13 @@ set -euo pipefail
 #
 # Flags:
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
+#   --keep-llama-server
+#               Proxy-only restart: preserve the co-located llama-server so its
+#               warm KV / prompt cache survives (LP-0MUCEFCL6001ZXYN). With
+#               --restart and no explicit flag, llama-server is preserved
+#               automatically when its recorded signature matches the selected
+#               config (same mode + config hash); it is restarted when the
+#               model or parallel config actually changes.
 #   --verbose   Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO level)
 #
 # Automatically resolves required API keys from:
@@ -49,6 +56,7 @@ fi
 PORT="${PROXY_PORT:-${PORT:-8000}}"
 RESTART=0
 VERBOSE=0
+KEEP_LLAMA_SERVER=0
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
@@ -70,6 +78,11 @@ for arg in "$@"; do
         ;;
       --restart)
         RESTART=1
+        ;;
+      --keep-llama-server)
+        # LP-0MUCEFCL6001ZXYN: proxy-only restart — preserve the co-located
+        # llama-server so its warm KV / prompt cache survives.
+        KEEP_LLAMA_SERVER=1
         ;;
       --verbose)
         # Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO
@@ -144,9 +157,45 @@ _wait_for_port_release() {
 if [ "$RESTART" -eq 1 ]; then
   echo "Restart requested: stopping running proxy services..."
 
+  # LP-0MUCEFCL6001ZXYN: decide whether to preserve the co-located
+  # llama-server. A proxy-only restart (unchanged local backend config) must
+  # keep it running so the warm KV / prompt cache survives; a genuine
+  # model/parallel change (e.g. a mode switch) must restart it.
+  KEEP_LLAMA=0
+  if [ "$KEEP_LLAMA_SERVER" -eq 1 ]; then
+    KEEP_LLAMA=1
+  else
+    _sig_mode=""
+    _sig_sha=""
+    _restart_mode="fast"
+    if [ -f "$REPO_ROOT/.mode" ]; then
+      _restart_mode="$(tr -d '[:space:]' < "$REPO_ROOT/.mode")"
+    fi
+    _restart_cfg="$REPO_ROOT/config-$_restart_mode.yaml"
+    [ -f "$_restart_cfg" ] || _restart_cfg="$REPO_ROOT/config.yaml"
+    _restart_sha=""
+    if command -v sha256sum >/dev/null 2>&1 && [ -f "$_restart_cfg" ]; then
+      _restart_sha="$(sha256sum "$_restart_cfg" | cut -d' ' -f1)"
+    fi
+    _sig_file="$REPO_ROOT/.llama_server_signature.json"
+    if [ -f "$_sig_file" ] && [ -n "$_restart_sha" ]; then
+      _sig_mode="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('mode',''))" "$_sig_file" 2>/dev/null || true)"
+      _sig_sha="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('config_sha256',''))" "$_sig_file" 2>/dev/null || true)"
+    fi
+    if [ -n "$_sig_mode" ] && [ "$_sig_mode" = "$_restart_mode" ] && [ "$_sig_sha" = "$_restart_sha" ]; then
+      KEEP_LLAMA=1
+    fi
+  fi
+
+  if [ "$KEEP_LLAMA" -eq 1 ]; then
+    echo "Preserving running llama-server (unchanged local backend config)."
+  fi
+
   # Phase 1: graceful SIGTERM
   pkill -f 'uvicorn proxy\.server' 2>/dev/null || true
-  pkill -f 'llama-server' 2>/dev/null || true
+  if [ "$KEEP_LLAMA" -eq 0 ]; then
+    pkill -f 'llama-server' 2>/dev/null || true
+  fi
   pkill -f 'qwentts' 2>/dev/null || true
   pkill -f 'tts-server' 2>/dev/null || true
   sleep 3
@@ -154,20 +203,24 @@ if [ "$RESTART" -eq 1 ]; then
   # Phase 2: force-kill any survivors (graceful shutdown may hang — e.g.,
   # asyncio tasks that don't cancel cleanly leaving a zombie process).
   pkill -9 -f 'uvicorn proxy\.server' 2>/dev/null || true
-  pkill -9 -f 'llama-server' 2>/dev/null || true
+  if [ "$KEEP_LLAMA" -eq 0 ]; then
+    pkill -9 -f 'llama-server' 2>/dev/null || true
+  fi
   pkill -9 -f 'qwentts' 2>/dev/null || true
   pkill -9 -f 'tts-server' 2>/dev/null || true
   sleep 2
 
   # Phase 3: fuser fallback — kill any leftover processes holding our ports
   if command -v fuser >/dev/null 2>&1; then
-    fuser -k "$LLAMA_PORT/tcp" 2>/dev/null || true
+    if [ "$KEEP_LLAMA" -eq 0 ]; then
+      fuser -k "$LLAMA_PORT/tcp" 2>/dev/null || true
+    fi
     fuser -k "$TTS_PORT/tcp" 2>/dev/null || true
   fi
 
   # Phase 4: wait until all ports are confirmed free (blocking, up to 10s each)
   failed=0
-  if ! _wait_for_port_release "$LLAMA_PORT"; then
+  if [ "$KEEP_LLAMA" -eq 0 ] && ! _wait_for_port_release "$LLAMA_PORT"; then
     echo "Warning: llama-server port $LLAMA_PORT did NOT become free within 10s after kill" >&2
     failed=1
   fi
