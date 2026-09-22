@@ -196,7 +196,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -212,7 +211,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -228,7 +226,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -240,7 +237,6 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - plan*
     force_full_prompt: true
@@ -264,7 +260,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -280,7 +275,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -296,7 +290,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -308,7 +301,6 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - author
     force_full_prompt: true
@@ -330,7 +322,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -346,7 +337,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -362,7 +352,6 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
         #
@@ -374,7 +363,6 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
     force_full_prompt: true
@@ -406,7 +394,6 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
