@@ -207,6 +207,135 @@ def last_known_slot_counts() -> tuple[int, int] | None:
     return (available, total)
 
 
+# ===================================================================
+# /slots poll coalescing (LP-0MUCEFD5B003TURT)
+#
+# Every herdr client polls /llama/local/status, and each poll queries
+# llama-server /slots. Under N concurrent pollers that is N upstream
+# requests per poll interval, which amplifies load on an already-saturated
+# backend (4554 cancel-task warnings in the wedge window). A short-TTL
+# cache plus single-flight coalescing bounds upstream /slots volume by the
+# TTL instead of by N. A failed fetch is cached for a longer backoff window
+# so an unavailable backend is not hammered, and callers fall back to the
+# last-known counts (with the stale flag) via ``last_known_slot_counts``.
+# ===================================================================
+
+_slots_poll_cache: dict[str, tuple[float, int, object]] = {}
+_slots_poll_inflight: dict[str, "asyncio.Future"] = {}
+_slots_poll_lock: "asyncio.Lock | None" = None
+
+
+def _get_slots_poll_lock() -> "asyncio.Lock":
+    global _slots_poll_lock
+    if _slots_poll_lock is None:
+        _slots_poll_lock = asyncio.Lock()
+    return _slots_poll_lock
+
+
+def _slots_poll_ttl_seconds() -> float:
+    """Freshness window (seconds) for the coalesced /slots snapshot."""
+    import os
+
+    try:
+        return max(0.0, float(os.environ.get("SLOTS_POLL_TTL_SECONDS", "1.0")))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _slots_poll_failure_backoff_seconds() -> float:
+    """Backoff window (seconds) cached after a failed /slots fetch."""
+    import os
+
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("SLOTS_POLL_FAILURE_BACKOFF_SECONDS", "5.0")),
+        )
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def reset_slots_poll_cache() -> None:
+    """Clear the coalesced /slots cache (tests / config reload)."""
+    _slots_poll_cache.clear()
+
+
+def _cached_slots_payload(url: str) -> tuple[int, object] | None:
+    """Return the cached (status, data) for *url* when still fresh."""
+    cached = _slots_poll_cache.get(url)
+    if cached is None:
+        return None
+    ts, status, data = cached
+    ttl = _slots_poll_ttl_seconds()
+    if status != 200:
+        ttl = max(ttl, _slots_poll_failure_backoff_seconds())
+    if time.monotonic() - ts < ttl:
+        return status, data
+    return None
+
+
+async def _do_slots_fetch(
+    url: str, timeout: float, client=None
+) -> tuple[int, object]:
+    """Perform one raw /slots fetch, returning ``(status_code, parsed)``."""
+    if client is not None:
+        resp = await asyncio.wait_for(client.get(url), timeout=timeout)
+    else:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as _c:
+            resp = await asyncio.wait_for(_c.get(url), timeout=timeout)
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status == 200:
+        return status, await _safe_parse_json_response(resp)
+    return status, None
+
+
+async def _fetch_slots_payload(
+    url: str, timeout: float, client=None
+) -> tuple[int, object]:
+    """Fetch /slots with TTL caching and single-flight coalescing.
+
+    Concurrent callers for the same *url* share one upstream request; a
+    fresh cached result (within ``SLOTS_POLL_TTL_SECONDS``) is returned
+    without touching the backend. A non-200 result is cached for
+    ``SLOTS_POLL_FAILURE_BACKOFF_SECONDS`` so a failing backend is not
+    hammered. Returns ``(status_code, parsed_data)``.
+    """
+    cached = _cached_slots_payload(url)
+    if cached is not None:
+        return cached
+
+    lock = _get_slots_poll_lock()
+    leader = False
+    async with lock:
+        cached = _cached_slots_payload(url)
+        if cached is not None:
+            return cached
+        inflight = _slots_poll_inflight.get(url)
+        if inflight is not None:
+            fut = inflight
+        else:
+            fut = asyncio.get_event_loop().create_future()
+            _slots_poll_inflight[url] = fut
+            leader = True
+
+    if not leader:
+        return await fut
+
+    try:
+        status, data = await _do_slots_fetch(url, timeout, client)
+        _slots_poll_cache[url] = (time.monotonic(), status, data)
+        if not fut.done():
+            fut.set_result((status, data))
+        return status, data
+    except Exception as exc:
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
+    finally:
+        async with lock:
+            _slots_poll_inflight.pop(url, None)
+
+
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
@@ -240,9 +369,11 @@ async def _query_slots(
 
         if model:
             url = f"{url}?model={model}"
-        slots_resp = await asyncio.wait_for(client.get(url), timeout=timeout)
-        if slots_resp.status_code == 200:
-            slots_data = await _safe_parse_json_response(slots_resp)
+        # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls behind a
+        # short TTL so N status pollers produce a bounded number of upstream
+        # requests (not N per interval).
+        status, slots_data = await _fetch_slots_payload(url, timeout, client)
+        if status == 200:
             if isinstance(slots_data, list):
                 total_slots = len(slots_data)
                 available_slots = sum(
@@ -253,7 +384,7 @@ async def _query_slots(
                 return available_slots, total_slots
             _record_slots_query_failure("invalid_payload")
             return 0, 0
-        _record_slots_query_failure(f"http_{slots_resp.status_code}")
+        _record_slots_query_failure(f"http_{status}")
         return 0, 0
     except TimeoutError:
         _record_slots_query_failure("timeout")
@@ -319,29 +450,33 @@ async def _query_slots_detail(
             url = f"{url}?model={model}"
         if _client is not None:
             slots_resp = await _client.get(url)
+            if slots_resp.status_code == 200:
+                slots_data = await _safe_parse_json_response(slots_resp)
+            else:
+                slots_data = None
         else:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-                slots_resp = await client.get(url)
-        if slots_resp.status_code == 200:
-            slots_data = await _safe_parse_json_response(slots_resp)
-            if isinstance(slots_data, list):
-                result = []
-                for i, slot in enumerate(slots_data):
-                    is_processing = bool(slot.get("is_processing", False))
-                    next_token = slot.get("next_token")
-                    n_decoded = None
-                    if isinstance(next_token, dict):
-                        n_decoded = next_token.get("n_decoded")
-                    elif isinstance(next_token, list) and len(next_token) > 0:
-                        first = next_token[0]
-                        if isinstance(first, dict):
-                            n_decoded = first.get("n_decoded")
-                    result.append({
-                        "slot_id": slot.get("id", i),
-                        "is_processing": is_processing,
-                        "n_decoded": n_decoded,
-                    })
-                return result
+            # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls.
+            status, slots_data = await _fetch_slots_payload(url, timeout, None)
+            if status != 200:
+                slots_data = None
+        if isinstance(slots_data, list):
+            result = []
+            for i, slot in enumerate(slots_data):
+                is_processing = bool(slot.get("is_processing", False))
+                next_token = slot.get("next_token")
+                n_decoded = None
+                if isinstance(next_token, dict):
+                    n_decoded = next_token.get("n_decoded")
+                elif isinstance(next_token, list) and len(next_token) > 0:
+                    first = next_token[0]
+                    if isinstance(first, dict):
+                        n_decoded = first.get("n_decoded")
+                result.append({
+                    "slot_id": slot.get("id", i),
+                    "is_processing": is_processing,
+                    "n_decoded": n_decoded,
+                })
+            return result
     except Exception as exc:
         _srv().logger.debug(
             "Slot detail query failed [%s] for %s?model=%s: %s",
@@ -389,27 +524,31 @@ async def _query_slots_progress(
             url = f"{url}?model={model}"
         if _client is not None:
             slots_resp = await _client.get(url)
+            if slots_resp.status_code == 200:
+                slots_data = await _safe_parse_json_response(slots_resp)
+            else:
+                slots_data = None
         else:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-                slots_resp = await client.get(url)
-        if slots_resp.status_code == 200:
-            slots_data = await _safe_parse_json_response(slots_resp)
-            if isinstance(slots_data, list):
-                result: dict[int, dict] = {}
-                for i, slot in enumerate(slots_data):
-                    if not isinstance(slot, dict):
-                        continue
-                    sid = slot.get("id", i)
-                    candidates = [
-                        c for c in (slot.get("n_past"), slot.get("n_prompt_tokens_processed"))
-                        if isinstance(c, (int, float)) and c >= 0
-                    ]
-                    progress = int(max(candidates)) if candidates else None
-                    result[sid] = {
-                        "progress": progress,
-                        "processing": bool(slot.get("is_processing", False)),
-                    }
-                return result
+            # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls.
+            status, slots_data = await _fetch_slots_payload(url, timeout, None)
+            if status != 200:
+                slots_data = None
+        if isinstance(slots_data, list):
+            result: dict[int, dict] = {}
+            for i, slot in enumerate(slots_data):
+                if not isinstance(slot, dict):
+                    continue
+                sid = slot.get("id", i)
+                candidates = [
+                    c for c in (slot.get("n_past"), slot.get("n_prompt_tokens_processed"))
+                    if isinstance(c, (int, float)) and c >= 0
+                ]
+                progress = int(max(candidates)) if candidates else None
+                result[sid] = {
+                    "progress": progress,
+                    "processing": bool(slot.get("is_processing", False)),
+                }
+            return result
     except Exception as exc:
         _srv().logger.debug(
             "Slot progress query failed [%s] for %s: %s",

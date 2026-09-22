@@ -756,6 +756,15 @@ server:
   #   progress concurrently (at ``local_dispatch_lease_prefill_poll_seconds``) so
   #   progress is observable before the first byte and the wait is visible in
   #   production (LP-0MUCEFC0T009V7ZY).
+  # /slots poll coalescing (LP-0MUCEFD5B003TURT): every status poll queries
+  #   llama-server ``/slots``; under N concurrent pollers that is N requests
+  #   per interval. A short-TTL cache + single-flight coalescing bounds
+  #   upstream volume by the TTL. Tunable via environment variables:
+  #     SLOTS_POLL_TTL_SECONDS (default 1.0) — freshness window for a
+  #       coalesced /slots snapshot; callers within it share one request.
+  #     SLOTS_POLL_FAILURE_BACKOFF_SECONDS (default 5.0) — how long a failed
+  #       /slots fetch is cached so an unavailable backend is not hammered.
+  #   On failure callers fall back to the last-known counts with slots_stale.
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
   # events) showed 100% of denies caused by idle lease holders, never GPU
