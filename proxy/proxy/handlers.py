@@ -588,18 +588,6 @@ async def get_llama_local_status(request: Request):
     client_id = _resolve_client_id(request)
     if client_id:
         status_extra["client_id"] = client_id
-    # Contention-queue metrics (LP-0MSORQVK50012Q4D F4 AC1): queue depth,
-    # queued count/duration, fallback-after-queue count — only when the
-    # per-mode policy is queue (fast mode logs unchanged, F4 AC4).
-    try:
-        from proxy.contention_queue import status_fields
-
-        server_cfg_for_queue = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
-        _cq_fields = status_fields(server_cfg_for_queue)
-        if _cq_fields:
-            status_extra.update(_cq_fields)
-    except Exception:
-        pass
     logger.info("status_request", extra=status_extra)
 
     return {
@@ -620,27 +608,7 @@ async def get_llama_local_status(request: Request):
         "slots": slots,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
-        # Contention-queue snapshot (LP-0MSORQVK50012Q4D F4 AC3): live queue
-        # depth + cumulative queued/fallback counters, exposed for the 24h
-        # report aggregation (empty when policy != queue or mode != cheap).
-        **contention_queue_snapshot(srv.config),
     }
-
-
-def contention_queue_snapshot(server_config) -> dict:
-    """Live contention-queue metrics for the status payload.
-
-    Delegates to ``observability.contention_queue_snapshot`` (which calls
-    ``contention_queue.status_fields``) so the gating (queue policy + cheap
-    mode, F4 AC4) and field names stay consistent with the status_request
-    log line. Returns {} when queueing is inactive.
-    """
-    try:
-        from proxy.observability import contention_queue_snapshot as _cq_snap
-
-        return _cq_snap(server_config)
-    except Exception:
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +867,12 @@ async def set_operating_mode(request: Request):
 
     Returns ``400`` for an invalid/missing mode, ``409`` when a
     mode-switch restart is already in progress and the requested mode
-    differs (avoids restart loops).
+    differs (avoids restart loops), and ``429`` when a manual fast->cheap
+    switch arrives inside the ``MODE_SWITCH_COOLDOWN_SECONDS`` cooldown
+    (LP-0MU6MQIPP0058198). A ``429`` response carries a ``Retry-After``
+    header and a ``retry_after_seconds`` body field so callers can back
+    off without another ``GET /admin/mode`` probe; the mode is unchanged
+    and no restart is armed.
     """
     try:
         body = await request.json()
@@ -917,6 +890,19 @@ async def set_operating_mode(request: Request):
         # alongside the mode.
         schedule = mode_module.ModeScheduleConfig.from_file()
         persisted, restart = mode_module.set_mode(mode, manual=True, schedule=schedule)
+    except mode_module.ModeSwitchCooldownError as exc:
+        # 429 Too Many Requests is the only status for which Retry-After is
+        # defined; the body repeats the hint machine-readably so the caller
+        # does not need a second probe (LP-0MU6MQIPP0058198). set_mode raised
+        # before mutating .mode or arming the drain, so nothing restarts.
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": str(exc),
+                "retry_after_seconds": exc.retry_after_seconds,
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

@@ -66,8 +66,7 @@ def fallback_line(ts: str, wait: float, session: str = "sess-1") -> str:
 def status_line(ts: str, depth: int = 0, policy: str = "queue") -> str:
     return (
         f"{ts} INFO router.routing: status_request path=/v1/chat/completions "
-        f"contention_queue_policy={policy} contention_queue_depth={depth} "
-        f"contention_queued_count=1 contention_fallback_after_queue_count=2"
+        f"contention_queue_policy={policy} contention_queue_depth={depth}"
     )
 
 
@@ -142,9 +141,9 @@ class TestParseLine:
 
     def test_unrelated_lines_ignored(self):
         assert m.parse_line(f"{BASE_TS} INFO router.routing: something_else x=1") is None
-        # Status snapshot field name must not be confused with the event marker.
+        # Status snapshot lines are ignored (not contention events).
         assert m.parse_line(
-            f"{BASE_TS} INFO router.routing: status_request contention_fallback_after_queue_count=2"
+            f"{BASE_TS} INFO router.routing: status_request contention_queue_depth=0"
         ) is None
 
 

@@ -270,6 +270,79 @@ class TestLogLineParsing:
         assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST) is None
 
 
+class TestTtftParsing:
+    """TTFT (Time to First Token) log-line parsing.
+
+    Tests that both the local ``dispatch_first_byte_ms=`` and remote
+    ``ttft_seconds=`` log lines are correctly parsed into ``ttft`` events
+    (LP-0MTSSM5SO003PKU0).
+    """
+
+    def test_dispatch_first_byte_ms_local(self):
+        """Local stream dispatch_first_byte_ms line is parsed correctly."""
+        line = (
+            "2026-08-02 14:30:00,100 - INFO - "
+            "dispatch_first_byte_ms=45.2 dispatch_to_first_byte_ms=45.2 "
+            "session=abc123 model=qwen3-235b-a22b"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(45.2)
+        assert ev.session == "abc123"
+        assert ev.model == "qwen3-235b-a22b"
+
+    def test_dispatch_first_byte_ms_no_session(self):
+        """dispatch_first_byte_ms without session yields session=None."""
+        line = (
+            "2026-08-02 14:30:00,100 - INFO - "
+            "dispatch_first_byte_ms=120.5 dispatch_to_first_byte_ms=120.5 "
+            "model=qwen3-235b-a22b"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(120.5)
+        assert ev.session is None
+
+    def test_ttft_seconds_remote(self):
+        """Remote stream ttft_seconds line is parsed and converted to ms."""
+        line = (
+            "2026-08-02 14:35:00,200 - INFO - "
+            "ttft_seconds=0.823 session=def456 provider=opencode-go "
+            "model=deepseek-v4-flash"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(823.0)  # 0.823s → 823ms
+        assert ev.session == "def456"
+        assert ev.provider == "opencode-go"
+        assert ev.model == "deepseek-v4-flash"
+
+    def test_ttft_seconds_small_value(self):
+        """Small ttft_seconds values (< 1s) are converted correctly."""
+        line = (
+            "2026-08-02 14:35:00,200 - INFO - "
+            "ttft_seconds=0.045 session=ghi789 provider=deepseek "
+            "model=deepseek-v4-flash"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.ttft_ms == pytest.approx(45.0)
+
+    def test_ttft_lines_do_not_match_stream_started(self):
+        """TTFT lines are NOT captured by stream_started parsing."""
+        line = (
+            "2026-08-02 14:30:00,100 - INFO - "
+            "dispatch_first_byte_ms=45.2 dispatch_to_first_byte_ms=45.2 "
+            "session=abc123 model=qwen3-235b-a22b"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "ttft"
+        assert ev.kind != "stream_started"
+
+
 class TestErrorLineParsing:
     """Error events are parsed into distinct error kinds with the fields the
     taxonomy needs (error type, provider/model, session, entry, evidence)."""
@@ -3659,3 +3732,69 @@ class TestTotalTokens:
         # Model %s of total also sum to 100%
         model_total_share = sum(v[2] for v in s.token_by_model.values()) / total * 100 if total else 0
         assert model_total_share == pytest.approx(100.0, abs=0.1)
+
+
+class TestTtftReportSection:
+    """TTFT report section rendering tests (LP-0MTSSM5SO003PKU0)."""
+
+    def test_ttft_section_with_data(self):
+        """TTFT section renders a table with p10/median/p90 when data is present."""
+        from io import StringIO
+
+        output = StringIO()
+        ap = output.write
+        # Mix of local (ms) and remote (converted to ms) TTFT values
+        values = [45.0, 120.0, 80.0, 450.0, 60.0]
+        reporting._append_ttft_section(ap, values)
+        report = output.getvalue()
+        assert "## Time to first token" in report
+        assert "No TTFT data" not in report
+        assert "| Total | 5 |" in report
+        # Should contain percentiles in ms format
+        assert "ms" in report
+
+    def test_ttft_section_empty(self):
+        """TTFT section shows 'No TTFT data in window' when no data."""
+        from io import StringIO
+
+        output = StringIO()
+        ap = output.write
+        reporting._append_ttft_section(ap, [])
+        report = output.getvalue()
+        assert "## Time to first token" in report
+        assert "_No TTFT data in window._" in report
+
+    def test_ttft_json_with_data(self):
+        """TTFT JSON includes total percentiles when data exists."""
+        from unittest.mock import MagicMock
+
+        # Create mock TTFT events
+        mock_events = []
+        for ms in [45.0, 120.0, 80.0]:
+            ev = MagicMock()
+            ev.ttft_ms = ms
+            mock_events.append(ev)
+
+        result = reporting._ttft_json(mock_events)
+        assert result is not None
+        assert "total" in result
+        assert result["total"]["samples"] == 3
+        assert result["total"]["median"] is not None
+
+    def test_ttft_json_empty(self):
+        """TTFT JSON returns None when no data."""
+        result = reporting._ttft_json([])
+        assert result is None
+
+    def test_ttft_section_placement_before_ttc(self):
+        """TTFT section appears before Time to completion in the report."""
+        from io import StringIO
+
+        output = StringIO()
+        ap = output.write
+        reporting._append_ttft_section(ap, [50.0, 100.0])
+        reporting._append_ttc_section(ap, [])
+        report = output.getvalue()
+        ttft_pos = report.index("## Time to first token")
+        ttc_pos = report.index("## Time to completion")
+        assert ttft_pos < ttc_pos

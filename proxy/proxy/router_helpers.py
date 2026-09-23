@@ -97,6 +97,32 @@ def _endpoint_from_record(record: dict) -> str | None:
     return None
 
 
+def _request_dedup_hash(body_json: dict | None) -> str | None:
+    """Return a stable hash of a request's message list for retry dedup.
+
+    Used by the session single-flight coordinator to detect a client retry
+    of the *same* prompt while the original is still in flight
+    (LP-0MUCEFCV5006UKSZ). Only the ``messages`` list is hashed so retries
+    that differ only in sampling parameters (which clients may vary) still
+    collapse onto the original prefill. Returns None when there is no
+    usable message list (caller then skips duplicate detection).
+    """
+    try:
+        if not isinstance(body_json, dict):
+            return None
+        messages = body_json.get("messages")
+        if not isinstance(messages, list):
+            return None
+        canonical = json.dumps(
+            messages, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        import hashlib
+
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
 # ===================================================================
 # Request/response logging helpers
 # ===================================================================
@@ -771,6 +797,38 @@ def _get_prefill_lease_config(srv) -> tuple[float, float]:
         return 10.0, 30.0
 
 
+def _get_no_progress_timeout_seconds(srv) -> float:
+    """Return the no-progress watchdog timeout in seconds (default 180).
+
+    When a dispatch record has ``active=True`` but has had no observed
+    progress advance or first-byte arrival for this duration, the watchdog
+    treats it as a no-progress wedge and releases the lease (LP-0MUCEFB8E003YVFF).
+    Returns 0 to disable the watchdog entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_no_progress_timeout_seconds", 180)
+        return float(raw) if raw is not None else 180.0
+    except Exception:
+        return 180.0
+
+
+def _get_max_prefill_seconds(srv) -> float:
+    """Return the max prefill lifetime in seconds (default 900).
+
+    A hard ceiling on how long any single dispatch record may remain active
+    from its ``started_at`` timestamp. Exceeding this ceiling always releases
+    the lease regardless of observed progress (LP-0MUCEFB8E003YVFF).
+    Returns 0 to disable the ceiling entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_max_prefill_seconds", 900)
+        return float(raw) if raw is not None else 900.0
+    except Exception:
+        return 900.0
+
+
 async def _query_prefill_progress(
     srv,
     llama_port: int,
@@ -917,11 +975,13 @@ async def _extend_lease_during_prefill(
     - **Progress advance** — observed numeric progress (per-slot
       ``n_past``/``n_prompt_tokens_processed`` or aggregate
       ``kv_cache_tokens``) is greater than *last_progress*.
-    - **Liveness** — no numeric progress is reported by the llama.cpp build
-      (b8782 removed the fields from ``/slots``) but the slot is observed
-      actively processing (``is_processing``); the lease is extended on
-      liveness so streams are never orphaned mid-prefill just because the
-      build stopped reporting a counter (LP-0MSUO5Z0K007HBSS).
+
+    **Liveness-only extension is removed** (LP-0MUCEFB8E003YVFF). A slot
+    observed as alive (``is_processing``) but with no progress advance
+    no longer extends the lease. This prevents stuck requests from holding
+    the lease indefinitely when the backend produces no output. The
+    no-progress watchdog in ``_cleanup_stale_local_dispatch`` will release
+    such records after ``local_dispatch_no_progress_timeout_seconds``.
 
     Returns ``(last_progress, extended)``:
 
@@ -943,7 +1003,11 @@ async def _extend_lease_during_prefill(
         endpoint=endpoint,
     )
     advancing = progress is not None and progress > last_progress
-    if not advancing and not alive:
+    # LP-0MUCEFB8E003YVFF: Only extend on progress advance.  Liveness-only
+    # extension is removed — a slot that is alive but not making progress
+    # will be caught by the no-progress watchdog instead of holding the
+    # lease indefinitely (the wedge condition).
+    if not advancing:
         # Unobservable or stalled: no extension. Unobservable keeps the
         # adaptive estimate applied at acquisition (fallback).
         return last_progress, False
@@ -958,28 +1022,119 @@ async def _extend_lease_during_prefill(
                 )
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
+                    record["last_progress"] = progress
+                    record["last_progress_ts"] = time.monotonic()
                     extended = True
                     try:
-                        if advancing:
-                            srv.logger.info(
-                                "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
-                                session_key if session_key else "unknown",
-                                progress,
-                                buffer_seconds,
-                            )
-                        else:
-                            srv.logger.info(
-                                "lease_extended_during_prefill session=%s liveness=1 buffer=%.0fs",
-                                session_key if session_key else "unknown",
-                                buffer_seconds,
-                            )
+                        srv.logger.info(
+                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                            session_key if session_key else "unknown",
+                            progress,
+                            buffer_seconds,
+                        )
                     except Exception:
                         pass
     except Exception:
         pass
-    if advancing:
-        return progress, extended
-    return last_progress, extended
+    return progress, extended
+
+
+async def _await_first_byte_with_prefill_monitor(
+    srv,
+    open_coro,
+    *,
+    timeout: float = 0.0,
+    poll_seconds: float = 0.0,
+    warn_seconds: float = 30.0,
+    session_id: str | None = None,
+    endpoint: str | None = None,
+    llama_port: int = 8080,
+    model_name: str | None = None,
+    slot_id: int | None = None,
+) -> tuple:
+    """Await the initial upstream response while monitoring prefill progress.
+
+    ``stream_cm.__aenter__()`` blocks until llama-server returns the SSE
+    response headers, which for this build arrive with the first token.
+    The post-headers prefill-progress poll in the streaming loop therefore
+    never runs during a real prefill (LP-0MUCEFC0T009V7ZY).
+
+    This helper races *open_coro* (the first-byte wait) against a periodic
+    prefill-progress poll, so that:
+
+    - Progress observed before the first byte extends the dispatch lease via
+      ``_extend_lease_during_prefill`` (progress-only; liveness alone no
+      longer extends — LP-0MUCEFB8E003YVFF).
+    - A distinct ``prefill_wait_exceeds_threshold`` warning is emitted once
+      the initial wait exceeds *warn_seconds*, making a long pre-header wait
+      visible in production (previously this path was silent).
+    - *timeout* bounds the total wait (``local_dispatch_max_prefill_seconds``);
+      exceeding it raises ``asyncio.TimeoutError`` so the caller can abort the
+      request with a retryable status.
+
+    *open_coro* is awaited directly (no polling, no timeout) when both
+    *poll_seconds* and *timeout* are non-positive, preserving the previous
+    behaviour for disabled configurations.
+
+    The pending *open_coro* task is cancelled if this helper is cancelled or
+    raises, so a timed-out first-byte wait never leaks an upstream stream.
+    """
+    open_task = asyncio.ensure_future(open_coro)
+    waited = 0.0
+    warned = False
+    last_progress = 0
+    try:
+        while True:
+            if timeout > 0:
+                remaining = timeout - waited
+                if remaining <= 0:
+                    raise TimeoutError()
+                step = min(poll_seconds, remaining) if poll_seconds > 0 else remaining
+            else:
+                step = poll_seconds if poll_seconds > 0 else None
+
+            if step is None:
+                # No polling and no timeout: await directly.
+                return await open_task
+
+            done, _pending = await asyncio.wait({open_task}, timeout=step)
+            if open_task in done:
+                return open_task.result()
+
+            waited += step
+
+            # Poll prefill progress and extend the lease on genuine advance.
+            if session_id:
+                try:
+                    last_progress, _extended = await _extend_lease_during_prefill(
+                        srv,
+                        session_id,
+                        endpoint=endpoint,
+                        llama_port=llama_port,
+                        model_name=model_name,
+                        slot_id=slot_id,
+                        last_progress=last_progress,
+                    )
+                except Exception:
+                    pass
+
+            # Observable event once the initial wait exceeds the threshold.
+            if warn_seconds > 0 and not warned and waited >= warn_seconds:
+                warned = True
+                try:
+                    srv.logger.warning(
+                        "prefill_wait_exceeds_threshold session=%s waited=%.0fs "
+                        "progress=%s",
+                        session_id or "unknown",
+                        waited,
+                        last_progress,
+                    )
+                except Exception:
+                    pass
+    except BaseException:
+        if not open_task.done():
+            open_task.cancel()
+        raise
 
 
 async def _decrement_local_active_queries(
@@ -1111,6 +1266,12 @@ async def _increment_local_active_queries(
                         "active": True,
                         "expires_at": time.monotonic() + lease_timeout,
                         "model_name": model_name,
+                        # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                        # A record that never makes progress is bounded by
+                        # ``local_dispatch_no_progress_timeout_seconds`` from
+                        # creation (no waiting on an unobservable signal).
+                        "last_progress": 0,
+                        "last_progress_ts": time.monotonic(),
                     }
         except Exception:
             pass
@@ -1434,6 +1595,20 @@ async def _try_acquire_local_dispatch(
                     else:
                         if occupied_by_others >= max_local:
                             return (False, first_occupied_owner, occupied_by_others, max(1.0, lease_timeout))
+                else:
+                    # Lease-holding session re-acquisition (LP-0MU09CAL3001MP0Z).
+                    # No-preemption: allow this session to re-acquire, but
+                    # still respect the generating-only cap so that
+                    # ``active`` never exceeds ``max_local``.
+                    if has_generating_state and _generating_count >= max_local:
+                        active_owner = None
+                        for ek, er in srv.local_dispatch_records.items():
+                            if ek != record_key and er.get("active"):
+                                active_owner = _dispatch_key_session_id(ek)
+                                break
+                        if active_owner is None:
+                            active_owner = first_occupied_owner
+                        return (False, active_owner, _generating_count, max(1.0, lease_timeout))
 
 
                 srv.local_active_queries += 1
@@ -1444,6 +1619,9 @@ async def _try_acquire_local_dispatch(
                     "active": True,
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
+                    # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                    "last_progress": 0,
+                    "last_progress_ts": now,
                 }
                 # Register prefill hold for the prefill-aware guard.
                 try:
@@ -1606,10 +1784,66 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         return False
 
 
+def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
+    """Check whether a dispatch record has exceeded the no-progress timeout.
+
+    Returns ``True`` when the record qualifies for no-progress release:
+
+    - The record is ``active=True`` and carries a ``last_progress_ts``
+      baseline (always set at record creation by
+      ``_try_acquire_local_dispatch`` / ``_increment_local_active_queries``).
+    - ``local_dispatch_no_progress_timeout_seconds`` is non-zero and the
+      record's ``last_progress_ts`` is older than the timeout — meaning no
+      progress has been observed for that long.
+    - Or the record's ``started_at`` exceeds ``local_dispatch_max_prefill_seconds``
+      (hard ceiling on any single request's lifetime, even with progress).
+
+    Records without a ``last_progress_ts`` baseline (legacy records created
+    before this feature) return ``False`` — they fall through to the
+    pre-existing expiry/orphan-cleanup path rather than being released by the
+    watchdog. This keeps the change surgical and avoids misclassifying
+    records whose age was never tracked on a progress clock.
+
+    When ``True``, the caller should release the lease so the session can
+    fall through to the next backend (LP-0MUCEFB8E003YVFF).
+    """
+    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
+    max_prefill = _get_max_prefill_seconds(srv)
+    now = time.monotonic()
+
+    # The watchdog only has an opinion about records whose progress clock it
+    # owns (``last_progress_ts``). This is set at creation and refreshed on
+    # every observed progress advance / data chunk.
+    last_progress_ts = record.get("last_progress_ts")
+    if last_progress_ts is None:
+        return False
+
+    # No-progress timeout: no observed progress for longer than the timeout.
+    if no_progress_timeout > 0 and now - last_progress_ts > no_progress_timeout:
+        return True
+
+    # Max-prefill ceiling: total active time exceeds the ceiling.
+    if max_prefill > 0:
+        started_at = record.get("started_at")
+        if started_at is not None and now - started_at > max_prefill:
+            return True  # exceeded max prefill ceiling
+
+    return False
+
+
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
-    Two categories of stale records are cleaned:
+    Three categories of stale records are cleaned:
+
+    0. **Active records with no observed progress** (LP-0MUCEFB8E003YVFF) —
+       the no-progress watchdog releases any active record whose
+       ``last_progress_ts`` is older than
+       ``local_dispatch_no_progress_timeout_seconds``, or whose
+       ``started_at`` exceeds ``local_dispatch_max_prefill_seconds``, even
+       when ``expires_at`` is still in the future (a wedged request's
+       adaptive lease can be far out). Logged at WARNING level with
+       ``reason=no_progress_watchdog``.
 
     1. **Inactive records** whose *expires_at* has passed — these represent
        sessions that finished their request but whose idle lease timeout
@@ -1645,11 +1879,52 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     try:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
+                active = record.get("active", False)
+                # LP-0MUCEFB8E003YVFF: no-progress watchdog. Runs on every
+                # active record regardless of ``expires_at`` — a wedged
+                # record's lease may be far in the future (adaptive lease),
+                # so expiry alone cannot catch it. Pure time computation, so
+                # safe to run under the lock.
+                if active and _watchdog_no_progress(
+                    srv, _dispatch_key_session_id(sid), record
+                ):
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and _dispatch_key_session_id(sid) in _p:
+                            _p.pop(_dispatch_key_session_id(sid), None)
+                    except Exception:
+                        pass
+                    try:
+                        from proxy.session import _free_slot_assignment
+                        _free_slot_assignment(
+                            _dispatch_key_session_id(sid),
+                            endpoint=_endpoint_from_record(record),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        srv.local_active_queries = max(
+                            0, int(getattr(srv, 'local_active_queries', 0) or 0) - 1
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        srv.logger.warning(
+                            "lease_released session=%s reason=no_progress_watchdog "
+                            "endpoint=%s",
+                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                            _endpoint_from_record(record) or "default",
+                        )
+                    except Exception:
+                        pass
+                    continue
+
                 expires_at = record.get("expires_at", 0)
                 if expires_at > now:
                     continue  # still within valid window
 
-                active = record.get("active", False)
                 if not active:
                     # Normal idle timeout for inactive records
                     del srv.local_dispatch_records[sid]
@@ -1688,7 +1963,8 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     # Phase 2 (outside the lock): verify which candidates still have a
     # processing slot on llama-server. A failed / unverifiable query means
     # "not verified alive" — the record is orphan-cleaned below (fail-open,
-    # matching pre-existing behaviour).
+    # matching pre-existing behaviour). The no-progress watchdog already ran
+    # in phase 1, so records reaching here have shown recent progress.
     alive: set[str] = set()
     for sid, record in verify_candidates:
         try:
@@ -1717,7 +1993,10 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         continue  # refreshed since phase 1 — preserved
                     if sid in alive:
                         # Slot still generating: extend the lease instead of
-                        # freeing (LP-0MSUO6XRP001MCB2).
+                        # freeing (LP-0MSUO6XRP001MCB2). The watchdog already
+                        # filtered out no-progress wedges above, so a slot
+                        # verified as alive at this point is making real
+                        # progress — extend on its behalf.
                         current["expires_at"] = (
                             time.monotonic() + _get_chunk_refresh_buffer_seconds(srv)
                         )
@@ -2191,6 +2470,266 @@ def _evaluate_session_compaction(
         }
 
 
+async def evaluate_and_apply_compaction(
+    srv,
+    result: dict,
+    body_json: dict,
+    server_config: dict,
+    *,
+    session=None,
+    session_messages: list | None = None,
+    summarizer=None,
+    estimate_tokens=None,
+    mode: str | None = None,
+) -> dict:
+    """Evaluate session compaction and apply the decision to ``result``.
+
+    Shared by the local-dispatch path (``_handle_session``) and the router
+    bypass path (``_proxy_with_fallback_cycle``) so an oversized session is
+    always evaluated for compaction — including sessions the router skips
+    for local dispatch on size grounds (LP-0MU5ARWSP001BYYB).
+
+    On a live compact the helper mutates ``body_json`` in place to the
+    compacted history and sets the same ``result`` keys the inline
+    ``_handle_session`` block did: ``body_override``, ``compaction_applied``,
+    ``compaction_estimated_before``, ``compaction_reason``,
+    ``compaction_summary_text``, ``compaction_turns_summarized``,
+    ``compaction_recent_turns_kept``. On live ``remote_with_guidance`` it
+    sets ``result["compaction_remote_with_guidance"]``.
+
+    Idempotent: ``result["compaction_evaluated"]`` gates a second call in the
+    same request cycle so compaction never runs twice.
+
+    Fail-open: an exception is logged and leaves dispatch unchanged, exactly
+    like the inline block.
+
+    Args:
+        srv: Server object (config at ``srv.config``; session manager at
+            ``srv.session_manager``; logger at ``srv.logger``).
+        result: Per-request session result dict (mutated in place).
+        body_json: Parsed request body (mutated in place on live compact).
+        server_config: The ``server`` config mapping.
+        session: Optional session object exposing ``.messages``.
+        session_messages: Optional explicit stored history, used when
+            ``session`` is not available.
+        summarizer / estimate_tokens: Optional injectable production
+            callables (tests); built from config when omitted.
+        mode: Optional mode override; defaults to ``proxy.mode.read_mode()``.
+
+    Returns:
+        Outcome dict: ``evaluated``, ``action``, ``applied``, ``dry_run``,
+        ``estimated_before``, ``estimated_after``, ``reason``, and
+        ``messages`` (compacted messages when applied, else ``None``).
+    """
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "action": "noop",
+        "applied": False,
+        "dry_run": True,
+        "estimated_before": 0,
+        "estimated_after": 0,
+        "reason": None,
+        "messages": None,
+    }
+
+    # Idempotent gating — compaction already evaluated this cycle.
+    if result.get("compaction_evaluated"):
+        outcome["reason"] = "already_evaluated"
+        return outcome
+
+    try:
+        from proxy.compaction_summarizer import build_compact_summarizer
+        from proxy.mode import read_mode as _read_mode
+        from proxy.provider import (
+            _estimate_prompt_tokens_for_routing,
+            _get_tokenizer_for_model,
+        )
+
+        # Build the production summarizer + token estimator once per request
+        # so decide_session_compaction has real capabilities rather than the
+        # always-None defaults that caused the compaction hang
+        # (LP-0MTPK77WG009A4VH). build_compact_summarizer uses the
+        # remote-only ``models.compact`` chain (Muse -> DeepSeek) so summaries
+        # never contend with the local GPU slots; it falls back to the local
+        # summarizer when ``models.compact`` is absent (LP-0MTT0O74N009E7N2).
+        _llama_port = server_config.get("llama_server_port", 8080)
+        _top_cfg = getattr(srv, "config", None)
+        if not isinstance(_top_cfg, dict):
+            _top_cfg = {"server": dict(server_config)}
+        if summarizer is None:
+            summarizer = build_compact_summarizer(
+                _top_cfg,
+                llama_port=_llama_port,
+            )
+
+        # Resolve the native tokenizer for the model so the compaction
+        # trigger uses the same tokenizer + multiplier as routing
+        # (LP-0MU5A84YU003YOTY).
+        _model_name = body_json.get("model") if isinstance(body_json, dict) else None
+        _model_config: dict = {}
+        if _model_name:
+            try:
+                from proxy.lifecycle import get_model_config
+
+                _model_config = get_model_config(_model_name) or {}
+            except Exception:
+                _model_config = {}
+        _model_config = _model_config or {}
+        if estimate_tokens is None:
+            _tokenizer, _tok_multiplier = _get_tokenizer_for_model(
+                _model_config, server_config
+            )
+
+            # The summarizer timeout resolves inside build_local_summarizer
+            # from config (``compaction_summarizer_timeout``, default 600 s —
+            # ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s timeout could
+            # not wait for the single local slot to free up while a long
+            # generating request held it, so every compaction failed
+            # (summarizer_failed/timeout) and the session was routed remote
+            # with guidance, stalling until the 900 s upstream timeout. 600 s
+            # exceeds the observed worst-case stall (max
+            # dispatch_first_byte_ms 713 s). See LP-0MU1RXEY10075TUU.
+            def estimate_tokens(msgs):
+                return _estimate_prompt_tokens_for_routing(
+                    {"messages": msgs}, tokenizer=_tokenizer
+                )
+
+        # The full history this request produces: the persistent session
+        # history PLUS this request's new turn(s). Compaction must operate on
+        # this produced history — evaluating only the stored history would
+        # drop the current turn from the compacted dispatch body
+        # (LP-0MTVXP7DG00613ZB AC2).
+        _stored_messages = getattr(session, "messages", None)
+        if _stored_messages is None:
+            _stored_messages = session_messages
+        _delta_for_compaction = result.get("delta_messages")
+        if result.get("is_delta_request") and _delta_for_compaction:
+            _pre_compaction_messages = list(_stored_messages or []) + list(
+                _delta_for_compaction
+            )
+        else:
+            _pre_compaction_messages = list(
+                (body_json.get("messages") if isinstance(body_json, dict) else None)
+                or _stored_messages
+                or []
+            )
+
+        _session_id = result.get("session_id") or ""
+        _mode = mode if mode is not None else _read_mode()
+
+        # Mark evaluated BEFORE the await so a re-entrant call short-circuits.
+        result["compaction_evaluated"] = True
+
+        # The summarizer call blocks on the local llama-server slot (up to
+        # ``compaction_summarizer_timeout``, default 600 s on a 1-slot backend
+        # where a long generating request holds the slot). Run the whole
+        # evaluation in a worker thread so the event loop keeps serving other
+        # requests (notably the streaming request whose slot we are waiting
+        # on) instead of freezing for the whole wait (LP-0MU1RXEY10075TUU).
+        _compaction = await asyncio.to_thread(
+            _evaluate_session_compaction,
+            srv,
+            _session_id,
+            _pre_compaction_messages,
+            _mode,
+            summarizer=summarizer,
+            estimate_tokens=estimate_tokens,
+        )
+
+        outcome["action"] = _compaction.get("action", "noop")
+        outcome["applied"] = bool(_compaction.get("applied"))
+        outcome["dry_run"] = bool(_compaction.get("dry_run", True))
+        outcome["estimated_before"] = int(
+            _compaction.get("estimated_before", 0) or 0
+        )
+        outcome["estimated_after"] = int(
+            _compaction.get("estimated_after", 0) or 0
+        )
+        outcome["reason"] = _compaction.get("reason")
+        outcome["evaluated"] = True
+
+        if (
+            _compaction.get("action") == "compact"
+            and _compaction.get("applied")
+            and not _compaction.get("dry_run")
+        ):
+            # Live: dispatch the compacted history as a full prompt (its
+            # prefix no longer matches the client's history).
+            body_json["messages"] = list(_compaction["messages"])
+            body_json["cache_prompt"] = True
+            body_json["session_id"] = _session_id
+            result["body_override"] = json.dumps(body_json).encode("utf-8")
+            result["is_delta_request"] = False
+            result["delta_messages"] = None
+            result["compaction_applied"] = True
+            result["compaction_estimated_before"] = outcome["estimated_before"]
+            result["compaction_reason"] = _compaction.get("reason")
+            # LP-0MTYGZ1DI0004QP8: surface the compaction decision so
+            # proxy_to_local can emit the X-Compaction-* bridge headers.
+            # Set only on the live-applied path (AC6).
+            result["compaction_summary_text"] = _compaction.get("summary_text")
+            result["compaction_turns_summarized"] = int(
+                _compaction.get("turns_summarized", 0) or 0
+            )
+            result["compaction_recent_turns_kept"] = int(
+                _compaction.get("recent_turns_kept", 0) or 0
+            )
+            outcome["messages"] = list(_compaction["messages"])
+            _logger = getattr(srv, "logger", None)
+            if _logger is not None:
+                _logger.info(
+                    "session_compaction applied session=%s mode=%s "
+                    "est_before=%d est_after=%d",
+                    str(_session_id)[:8],
+                    _compaction.get("mode"),
+                    outcome["estimated_before"],
+                    outcome["estimated_after"],
+                )
+            # After compaction, update the session's message history so
+            # downstream token estimates (e.g. routing_estimate_session)
+            # reflect the compacted count, not the pre-compaction value, and
+            # record the client/base anchors the next request needs to heal
+            # the sync break (AC2).
+            try:
+                if _session_id:
+                    await srv.session_manager.update_messages(
+                        _session_id,
+                        list(_compaction["messages"]),
+                    )
+                    await srv.session_manager.mark_compacted(
+                        _session_id,
+                        len(_pre_compaction_messages),
+                        len(_compaction["messages"]),
+                    )
+            except Exception:
+                pass  # non-fatal: routing estimate still uses body messages
+        elif (
+            _compaction.get("action") == "remote_with_guidance"
+            and not _compaction.get("dry_run")
+        ):
+            # Never dispatch local near-full-slot when the session cannot be
+            # compacted; the dispatcher must escalate remote WITH guidance.
+            result["compaction_remote_with_guidance"] = True
+            result["compaction_estimated_before"] = outcome["estimated_before"]
+            result["compaction_reason"] = _compaction.get("reason")
+    except Exception:
+        # Fail-open: record that evaluation was attempted (so it is not
+        # retried this cycle) and leave dispatch unchanged.
+        result["compaction_evaluated"] = True
+        outcome["evaluated"] = True
+        outcome["reason"] = "evaluation_failed"
+        _logger = getattr(srv, "logger", None)
+        if _logger is not None:
+            _logger.warning(
+                "Compaction evaluation failed; continuing unchanged "
+                "(session=%s)",
+                str(result.get("session_id") or "")[:8],
+                exc_info=True,
+            )
+
+    return outcome
+
+
 def _apply_post_compaction_heal(
     srv,
     session,
@@ -2370,131 +2909,18 @@ async def _handle_session(
             # zero dispatch change. Opt-in live enforcement rewrites the
             # dispatch body to the compacted full history and marks the
             # request full-prompt so forward + persistence stay consistent.
-            try:
-                from proxy.compaction_summarizer import build_local_summarizer
-                from proxy.mode import read_mode as _read_mode
-                from proxy.provider import _estimate_prompt_tokens_for_routing
-
-                # Build the production summarizer + token estimator once
-                # per request so decide_session_compaction has real
-                # capabilities rather than the always-None defaults
-                # that caused the compaction hang (LP-0MTPK77WG009A4VH).
-                _llama_port = server_config.get("llama_server_port", 8080)
-                _top_cfg = getattr(srv, "config", None)
-                if not isinstance(_top_cfg, dict):
-                    _top_cfg = {"server": dict(server_config)}
-                _summarizer = build_local_summarizer(
-                    _top_cfg,
-                    llama_port=_llama_port,
-                )
-                # The summarizer timeout resolves inside build_local_summarizer
-                # from config (``compaction_summarizer_timeout``, default
-                # 600 s — ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``): a 30 s
-                # timeout could not wait for the single local slot to free up
-                # while a long generating request held it, so every compaction
-                # failed (summarizer_failed/timeout) and the session was
-                # routed remote with guidance, stalling until the 900 s
-                # upstream timeout. 600 s exceeds the observed worst-case
-                # stall (max dispatch_first_byte_ms 713 s). See
-                # LP-0MU1RXEY10075TUU.
-                def _estimate_fn(msgs):
-                    return _estimate_prompt_tokens_for_routing({"messages": msgs})
-
-                # The full history this request produces: the persistent
-                # session history PLUS this request's new turn(s). Compaction
-                # must operate on this produced history — evaluating only the
-                # stored history would drop the current turn from the
-                # compacted dispatch body (LP-0MTVXP7DG00613ZB AC2).
-                _delta_for_compaction = result.get("delta_messages")
-                if result.get("is_delta_request") and _delta_for_compaction:
-                    _pre_compaction_messages = list(
-                        getattr(session, "messages", None) or []
-                    ) + list(_delta_for_compaction)
-                else:
-                    _pre_compaction_messages = list(
-                        body_json.get("messages", [])
-                        or getattr(session, "messages", None)
-                        or []
-                    )
-
-                # The summarizer call blocks on the local llama-server slot
-                # (up to ``compaction_summarizer_timeout``, default 600 s on
-                # a 1-slot backend where a long generating request holds the
-                # slot). Run the whole evaluation in a worker thread so the
-                # event loop keeps serving other requests (notably the
-                # streaming request whose slot we are waiting on) instead of
-                # freezing for the whole wait (LP-0MU1RXEY10075TUU).
-                _compaction = await asyncio.to_thread(
-                    _evaluate_session_compaction,
-                    srv,
-                    result["session_id"],
-                    _pre_compaction_messages,
-                    _read_mode(),
-                    summarizer=_summarizer,
-                    estimate_tokens=_estimate_fn,
-                )
-                if (
-                    _compaction.get("action") == "compact"
-                    and _compaction.get("applied")
-                    and not _compaction.get("dry_run")
-                ):
-                    # Live: dispatch the compacted history as a full prompt
-                    # (its prefix no longer matches the client's history).
-                    body_json["messages"] = list(_compaction["messages"])
-                    body_json["cache_prompt"] = True
-                    body_json["session_id"] = result["session_id"]
-                    result["body_override"] = json.dumps(body_json).encode("utf-8")
-                    result["is_delta_request"] = False
-                    result["delta_messages"] = None
-                    result["compaction_applied"] = True
-                    result["compaction_estimated_before"] = int(
-                        _compaction.get("estimated_before", 0) or 0
-                    )
-                    result["compaction_reason"] = _compaction.get("reason")
-                    srv.logger.info(
-                        "session_compaction applied session=%s mode=%s "
-                        "est_before=%d est_after=%d",
-                        result["session_id"][:8],
-                        _compaction.get("mode"),
-                        _compaction.get("estimated_before", 0),
-                        _compaction.get("estimated_after", 0),
-                    )
-                    # After compaction, update the session's message history so
-                    # downstream token estimates (e.g. routing_estimate_session)
-                    # reflect the compacted count, not the pre-compaction value,
-                    # and record the client/base anchors the next request needs
-                    # to heal the sync break (AC2).
-                    try:
-                        await srv.session_manager.update_messages(
-                            result["session_id"],
-                            list(_compaction["messages"]),
-                        )
-                        await srv.session_manager.mark_compacted(
-                            result["session_id"],
-                            len(_pre_compaction_messages),
-                            len(_compaction["messages"]),
-                        )
-                    except Exception:
-                        pass  # non-fatal: routing estimate still uses body messages
-                elif (
-                    _compaction.get("action") == "remote_with_guidance"
-                    and not _compaction.get("dry_run")
-                ):
-                    # Never dispatch local near-full-slot when the session
-                    # cannot be compacted; the dispatcher must escalate
-                    # remote WITH guidance.
-                    result["compaction_remote_with_guidance"] = True
-                    result["compaction_estimated_before"] = int(
-                        _compaction.get("estimated_before", 0) or 0
-                    )
-                    result["compaction_reason"] = _compaction.get("reason")
-            except Exception:
-                srv.logger.warning(
-                    "Compaction evaluation failed; continuing unchanged "
-                    "(session=%s)",
-                    str(result.get("session_id") or "")[:8],
-                    exc_info=True,
-                )
+            #
+            # Extracted into the shared ``evaluate_and_apply_compaction``
+            # helper (LP-0MU5IBXD4000POV0) so the router bypass path can run
+            # the same evaluation for oversized sessions it would otherwise
+            # skip entirely (LP-0MU5ARWSP001BYYB).
+            await evaluate_and_apply_compaction(
+                srv,
+                result,
+                body_json,
+                server_config,
+                session=session,
+            )
 
             # Add session_id and cache_prompt to request body for llama-server
             body_json["cache_prompt"] = True

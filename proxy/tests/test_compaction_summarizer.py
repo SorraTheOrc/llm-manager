@@ -1,5 +1,6 @@
 """
-Tests for proxy-side local Qwen3 summarizer (LP-0MTPMJG1P0038D32).
+Tests for proxy-side local summarizer using dedicated small model
+(Qwen2.5-7B, LP-0MTXCQA8I0038J4X).
 
 Verifies the production Summarizer callable backed by the local
 llama-server: system-prompt wrapping, config-driven sizing,
@@ -24,7 +25,7 @@ def _make_config(**overrides):
             "local_model_ctx_size": 262144,
             "session_slot_pool_size": 3,
             "compaction_trigger_ratio": 0.70,
-            "summarizer_model": {"type": "local", "llama_model": "Qwen3"},
+            "summarizer_model": {"type": "local", "llama_model": "Qwen2.5-7B"},
             "summarizer_ctx_size": 8192,
             "summarizer_max_tokens": 512,
         }
@@ -69,7 +70,7 @@ class TestBuildLocalSummarizer:
             assert "http://localhost:8080/v1/chat/completions" in args[0]
             body = kwargs.get("json") or args[1] if len(args) > 1 else kwargs.get("json")
             # Body checks
-            assert body["model"] == "Qwen3"
+            assert body["model"] == "Qwen2.5-7B"
             assert body["max_tokens"] == 512
             assert body["stream"] is False
             # System prompt present (Pi role + guard rails only)
@@ -429,3 +430,182 @@ class TestCompactionDoesNotBlockEventLoop:
             f"event loop was blocked during compaction slot-wait "
             f"(heartbeats={heartbeats})"
         )
+
+
+class TestLocalSummarizerThinkingDisabled:
+    """Local summarizer thinking is disabled via chat_template_kwargs (LP-0MU58PBRD004OV1I)."""
+
+    def _body(self, cfg):
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        with patch("proxy.compaction_summarizer.httpx.Client") as mock_cls:
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.return_value = _mock_success_response("hi")
+            s = build_local_summarizer(cfg, llama_port=8080)
+            s([{"role": "user", "content": "hello"}])
+            _, kwargs = mock_client.post.call_args
+            return kwargs.get("json")
+
+    def test_default_disables_thinking(self):
+        body = self._body(_make_config())
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_override_false_omits_thinking_flag(self):
+        body = self._body(_make_config(summarizer_disable_thinking=False))
+        assert "chat_template_kwargs" not in body
+
+
+class TestTimeoutDiagnosticContext:
+    """AC2: Timeout errors logged with diagnostic context.
+
+    When a summarizer call times out, the warning log includes:
+    - model name
+    - payload token count (estimated)
+    - current slot saturation (available/total)
+    - retry attempt number
+    """
+
+    def test_timeout_diagnostic_includes_model_name(self):
+        from proxy.compaction_summarizer import _timeout_diagnostic
+
+        diag = _timeout_diagnostic("Qwen3-8B", 1500, 0, 1, 1, 3)
+        assert "model=Qwen3-8B" in diag
+
+    def test_timeout_diagnostic_includes_token_estimate(self):
+        from proxy.compaction_summarizer import _timeout_diagnostic
+
+        diag = _timeout_diagnostic("Qwen3-8B", 1500, 0, 1, 1, 3)
+        assert "tokens~1500" in diag
+
+    def test_timeout_diagnostic_includes_slot_saturation(self):
+        from proxy.compaction_summarizer import _timeout_diagnostic
+
+        diag = _timeout_diagnostic("Qwen3-8B", 1500, 0, 1, 1, 3)
+        assert "slots=0/1" in diag
+
+    def test_timeout_diagnostic_includes_attempt_count(self):
+        from proxy.compaction_summarizer import _timeout_diagnostic
+
+        diag = _timeout_diagnostic("Qwen3-8B", 1500, 0, 1, 2, 3)
+        assert "attempt=2/3" in diag
+
+    def test_slot_capacity_sync_returns_zero_on_failure(self):
+        from proxy.compaction_summarizer import _probe_slot_capacity_sync
+
+        # Port 19999 is unlikely to have a llama-server
+        avail, total = _probe_slot_capacity_sync(19999)
+        assert avail == 0
+        assert total == 0
+
+    def test_estimate_payload_tokens_produces_positive_int(self):
+        from proxy.compaction_summarizer import _estimate_payload_tokens
+
+        tokens = _estimate_payload_tokens(
+            "hello world", "system prompt", "format template", None,
+        )
+        assert isinstance(tokens, int)
+        assert tokens > 0
+
+    def test_estimate_payload_tokens_includes_previous_summary(self):
+        from proxy.compaction_summarizer import _estimate_payload_tokens
+
+        with_prev = _estimate_payload_tokens(
+            "hello", "sys", "fmt", "prev summary",
+        )
+        without = _estimate_payload_tokens(
+            "hello", "sys", "fmt", None,
+        )
+        assert with_prev > without  # previous summary adds tokens
+
+    def test_timeout_logs_include_diagnostic_on_exhausted_retries(self, caplog):
+        """Verify the exhausted-retries timeout log includes model, tokens, slots."""
+        import httpx
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        cfg = {"server": {
+            "compaction_summarizer_timeout": 600,
+            "summarizer_retries": 0,
+        }}
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.side_effect = httpx.ReadTimeout("timeout")
+
+            s = build_local_summarizer(cfg, llama_port=8080)
+            result = s([{"role": "user", "content": "test message content here"}])
+
+            assert result == ""
+
+        # Find the timeout warning log
+        timeout_warnings = [
+            rec for rec in caplog.records
+            if "local summarizer call failed after" in rec.message
+        ]
+        assert len(timeout_warnings) >= 1, (
+            "Expected a timeout warning with diagnostic context"
+        )
+        last_warning = timeout_warnings[-1]
+        msg = last_warning.message
+        assert "model=" in msg
+        assert "tokens~" in msg
+        assert "slots=" in msg
+        assert "attempt=" in msg
+
+    def test_timeout_logs_include_diagnostic_on_retry(self, caplog):
+        """Verify the per-retry timeout log includes diagnostic context."""
+        import httpx
+        from proxy.compaction_summarizer import build_local_summarizer
+
+        cfg = {"server": {
+            "compaction_summarizer_timeout": 600,
+            "summarizer_retries": 2,
+            "summarizer_retry_delay_seconds": 0,
+        }}
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.side_effect = httpx.ReadTimeout("timeout")
+
+            s = build_local_summarizer(cfg, llama_port=8080)
+            result = s([{"role": "user", "content": "test"}])
+
+            assert result == ""
+
+        transport_warnings = [
+            rec for rec in caplog.records
+            if "local summarizer transport error" in rec.message
+        ]
+        assert len(transport_warnings) >= 1
+        msg = transport_warnings[0].message
+        assert "model=" in msg
+        assert "tokens~" in msg
+        assert "slots=" in msg
+        assert "attempt=" in msg
+
+    def test_fail_open_still_returns_empty_summary(self, caplog):
+        """AC3: No regression in fail-open — still returns EmptySummary."""
+        import httpx
+        from proxy.compaction_summarizer import build_local_summarizer, EmptySummary
+
+        cfg = {"server": {"compaction_summarizer_timeout": 600}}
+        with (
+            patch("proxy.compaction_summarizer.httpx.Client") as mock_cls,
+            patch("proxy.compaction_summarizer.time.sleep"),
+        ):
+            mock_client = MagicMock()
+            mock_cls.return_value.__enter__.return_value = mock_client
+            mock_client.post.side_effect = httpx.ReadTimeout("timeout")
+
+            s = build_local_summarizer(cfg, llama_port=8080)
+            result = s([{"role": "user", "content": "test"}])
+
+            assert result == ""
+            assert isinstance(result, EmptySummary)
+            assert result.kind == "timeout"

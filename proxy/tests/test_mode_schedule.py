@@ -184,13 +184,21 @@ class TestModeSchedulerStep:
         monkeypatch.setattr(
             mode_module, "override_until_file", lambda: tmp_path / ".mode.override-until"
         )
+        # Cooldown state (LP-0MU6MQIPP0058198): isolate too, so a live fast
+        # switch in the checkout cannot make the scheduler-step tests
+        # environment-dependent.
+        monkeypatch.setattr(
+            mode_module,
+            "last_fast_switch_file",
+            lambda: tmp_path / ".mode.last-fast-switch",
+        )
 
     def test_applies_scheduled_mode_when_diverged(self, schedule, monkeypatch):
         """A manual override (cheap at 14:00) is reverted to the scheduled fast."""
         monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
         applied = []
         monkeypatch.setattr(
-            mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+            mode_module, "set_mode", lambda m, **kwargs: applied.append(m) or ("fast", True)
         )
         assert _mode_scheduler_step(schedule, now=T(14, 0)) is True
         assert applied == ["fast"]
@@ -198,7 +206,7 @@ class TestModeSchedulerStep:
     def test_noop_when_mode_matches(self, schedule, monkeypatch):
         monkeypatch.setattr(mode_module, "read_mode", lambda: "fast")
         applied = []
-        monkeypatch.setattr(mode_module, "set_mode", lambda m: applied.append(m))
+        monkeypatch.setattr(mode_module, "set_mode", lambda m, **kwargs: applied.append(m))
         assert _mode_scheduler_step(schedule, now=T(14, 0)) is False
         assert applied == []
 
@@ -206,7 +214,7 @@ class TestModeSchedulerStep:
         """A pending restart (RuntimeError from set_mode) is retried later."""
         monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
 
-        def reject(_mode):
+        def reject(_mode, **kwargs):
             raise RuntimeError("A mode-switch restart is already in progress")
 
         monkeypatch.setattr(mode_module, "set_mode", reject)
@@ -219,7 +227,7 @@ class TestModeSchedulerStep:
         ]})
         monkeypatch.setattr(mode_module, "read_mode", lambda: "fast")
         applied = []
-        monkeypatch.setattr(mode_module, "set_mode", lambda m: applied.append(m))
+        monkeypatch.setattr(mode_module, "set_mode", lambda m, **kwargs: applied.append(m))
         assert _mode_scheduler_step(schedule, now=T(14, 0)) is False
         assert applied == []
 
@@ -244,7 +252,7 @@ class TestModeSchedulerStep:
             monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
             applied = []
             monkeypatch.setattr(
-                mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+                mode_module, "set_mode", lambda m, **kwargs: applied.append(m) or ("fast", True)
             )
             assert _mode_scheduler_step(schedule, now=T(14, 0)) is True
             assert applied == ["fast"]
@@ -385,7 +393,7 @@ class TestModeSchedulerStepOverride:
         monkeypatch.setattr(mode_module, "read_mode", lambda: "fast")
         applied = []
         monkeypatch.setattr(
-            mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+            mode_module, "set_mode", lambda m, **kwargs: applied.append(m) or ("fast", True)
         )
         assert _mode_scheduler_step(schedule, now=T(2, 0)) is False
         assert applied == []
@@ -396,7 +404,7 @@ class TestModeSchedulerStepOverride:
         monkeypatch.setattr(mode_module, "read_mode", lambda: "cheap")
         applied = []
         monkeypatch.setattr(
-            mode_module, "set_mode", lambda m: applied.append(m) or ("fast", True)
+            mode_module, "set_mode", lambda m, **kwargs: applied.append(m) or ("fast", True)
         )
         assert _mode_scheduler_step(schedule, now=T(14, 0)) is True
         assert applied == ["fast"]

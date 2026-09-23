@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
+from proxy import cold_start
 from proxy import mode as mode_module
 from proxy.disconnect_reaper import DisconnectReaperMiddleware
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
@@ -48,6 +49,9 @@ model_switch_refcount_lock = threading.Lock()
 # Version information captured at startup (llama-server and ROCm)
 llama_server_version: str = "unknown"
 rocm_version: str = "unknown"
+# Monotonic timestamp of this process start (for startup-ramp throttling).
+# Set by the lifespan handler immediately before ``yield``.
+PROXY_START_TIME: float = 0.0
 
 # Session manager for incremental prompt ingestion
 session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
@@ -647,6 +651,22 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                 return
             try:
                 if router_mode:
+                    _adopted_router = False
+                    if llama_process is None:
+                        # LP-0MUCEFCL6001ZXYN: adopt a router-mode
+                        # llama-server preserved across a proxy-only restart
+                        # instead of spawning a duplicate.
+                        try:
+                            import proxy.lifecycle as _lc
+                            import proxy.server as _srv_mod
+
+                            _adopted_router = await _lc._try_adopt_running_llama_server(
+                                _srv_mod, None, router_mode=True
+                            )
+                            if _adopted_router:
+                                llama_process = _srv_mod.llama_process
+                        except Exception:
+                            _adopted_router = False
                     if llama_process is None or llama_process.poll() is not None:
                         llama_process = start_llama_server(None)
                         if llama_process is None:
@@ -654,6 +674,14 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                     if not await wait_for_llama_server(config.get("server", {}).get("llama_startup_timeout", 300)):
                         raise RuntimeError("Router-mode llama-server failed to become ready")
                     backend_ready = True
+                    # LP-0MUCEFCAT005NFNN: arm the cold window only when the
+                    # server was freshly started — an adopted server keeps its
+                    # warm cache and must not be throttled.
+                    if not _adopted_router:
+                        try:
+                            cold_start.note_model_loaded()
+                        except Exception:
+                            pass
 
                     resolved = []
                     if router_preload_list:
@@ -668,6 +696,12 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
 
                 if await ensure_model_loaded(default_model):
                     backend_ready = True
+                    # LP-0MUCEFCAT005NFNN: default model just loaded at
+                    # startup — arm the cold window.
+                    try:
+                        cold_start.note_model_loaded()
+                    except Exception:
+                        pass
                     logger.info(f"Default model '{default_model}' loaded successfully")
                     return
             except Exception as e:
@@ -1150,6 +1184,14 @@ async def lifespan(app: FastAPI):
     _startup_initialize_grandfathering()
     _startup_launch_disconnect_reaper()
     _startup_launch_recording_prune()
+
+    # Record the monotonic start time for the startup-ramp gate.
+    global PROXY_START_TIME
+    PROXY_START_TIME = time.monotonic()
+    # Resolve and propagate the startup_ramp config to mode.py.
+    from proxy import mode as _mode_mod
+    _server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    _mode_mod.set_startup_ramp_config(_mode_mod._startup_ramp_config_section(_server_cfg))
 
     yield
 

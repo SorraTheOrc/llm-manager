@@ -71,18 +71,18 @@
 #                     ranges (e.g. "22:00-02:00") wrap past midnight.
 #                     Omit the field (or use an empty list) to leave a
 #                     provider unrestricted. Malformed entries are logged and
-#                     ignored (fail-open). The deepseek-v4-flash provider
+#                     ignored (fail-open). The deepseek-v4.1-flash provider
 #                     (direct api.deepseek.com entry and all opencode-hosted
 #                     deepseek entries: opencode-go-3-deepseek, opencode-go-2-
 #                     deepseek, opencode-go-deepseek)
 #                     are currently timed to off-peak UTC windows
 #                     (see their entries).
 #                     Example:
-#                       - name: deepseek-v4-flash
+#                       - name: deepseek-v4.1-flash
 #                         type: remote
 #                         endpoint: https://api.deepseek.com
 #                         api_key_env: DEEPSEEK_API_KEY
-#                         model: deepseek-v4-flash
+#                         model: deepseek-v4.1-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
 #
 # Responses-API mode (optional, remote providers only):
@@ -189,20 +189,20 @@ session_recording:
 # ---------------------------------------------------------------------------
 # The audit skill (skill/audit/) uses these settings to determine which
 # model to call for audit operations. The resolver maps short names to
-# provider-prefixed model IDs (e.g., ``deepseek-v4-flash`` →
-# ``opencode/deepseek-v4-flash``).
+# provider-prefixed model IDs (e.g., ``deepseek-v4.1-flash`` →
+# ``opencode/deepseek-v4.1-flash``).
 #
 # Canonical model IDs (discovered via ``pi --list-models``):
-#   opencode/deepseek-v4-flash
-#   opencode-go/deepseek-v4-flash
-#   openrouter/deepseek/deepseek-v4-flash
+#   opencode/deepseek-v4.1-flash
+#   opencode-go/deepseek-v4.1-flash
+#   openrouter/deepseek/deepseek-flash
 #
 # See proxy/provider_resolver.py for the full mapping table.
-audit_model: "deepseek-v4-flash"
+audit_model: "deepseek-v4.1-flash"
 audit_model_fallbacks:
   # Mirrors plan's paid-tier fallbacks (the opencode free zen-muse tier
   # was removed: OpenCode's free tier errors outside the OpenCode app).
-  - "deepseek-v4-flash"
+  - "deepseek-v4.1-flash"
 
 models:
   # Multi-backend local providers (LP-0MRPILSMW004T4H8): a ``type: local``
@@ -245,14 +245,14 @@ models:
         #
         # Deepseek
         #
-        # IMPORTANT: deepseek-v4-flash via api.deepseek.com has available_times
+        # IMPORTANT: deepseek-flash via api.deepseek.com has available_times
         # windows that leave gaps (UTC 01:00-04:00 and 06:00-10:00). During
         # these gaps the provider is skipped and requests fall to the next
         # available provider (or enter chain-hold retry). The 10:00-00:00
         # window covers 14 hours; the 3+2 hour gaps are accepted risk.
         # (LP-0MU1RXEPL005CK97)
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -268,7 +268,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -284,7 +284,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -320,7 +320,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -336,7 +336,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -352,7 +352,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -386,7 +386,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -402,7 +402,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -418,7 +418,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
+        model: deepseek-v4.1-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -437,6 +437,33 @@ models:
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
+
+  # Remote-only compaction summarizer chain (LP-0MTT0O74N009E7N2): the
+  # proxy-side session compaction summarizer routes through here instead of
+  # the local llama-server, whose slot is frequently saturated (causing every
+  # summarizer call to time out). Muse via opencode-go is the primary tier,
+  # DeepSeek direct the fallback. No local tier — summarization never
+  # contends with the GPU slots. Selected programmatically by
+  # build_compact_summarizer (proxy/proxy/compaction_summarizer.py); not a
+  # user-facing alias. The direct-DeepSeek model id is ``deepseek-flash``
+  # (renamed from deepseek-v4.1-flash in ade62534), mirroring plan/author/code.
+  compact:
+    providers:
+      - name: opencode-go-compact
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.3-contributor
+        api: openai-responses
+        forward_session_headers: false
+      - name: deepseek-flash-compact
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-flash
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
@@ -622,17 +649,34 @@ server:
   # trigger_ratio: fires when est_tokens > ratio × per-slot threshold
   #   (fast: 0.70 × 258,048 = 180,634 → target ≤ 117K)
   #   (cheap: 0.70 × 83,285 = 58,300 → target ≤ 38K)
-  compaction_trigger_ratio: 0.70
-  # Summariser model: local llama.cpp model used for in-proxy summarisation.
-  # Reuses the existing Qwen3 model — no new model download required.
+  #
+  # Operator request 2026-09-17: DISABLED. 0 disables (docs/llama-router.md);
+  # the proxy no longer summarises/compacts sessions. Restore 0.70 to re-enable.
+  compaction_trigger_ratio: 0
+  # Summariser model: dedicated small model for in-proxy summarisation.
+  # LP-0MTXCQA8I0038J4X — isolates summarizer from main Qwen3 slot to
+  # avoid timeout under load (the summariser gets parallel=1 in models.ini).
   summarizer_model:
     type: local
-    llama_model: Qwen3
+    llama_model: Qwen2.5-7B
   # Summariser context size (tokens): sufficient for short summarisation prompt
   # + middle turns; avoids unnecessary KV cache footprint.
   summarizer_ctx_size: 8192
   # Max output tokens for the summariser: concise summary budget.
   summarizer_max_tokens: 512
+  # Reasoning effort for the compaction summarizer tiers (LP-0MU58PBRD004OV1I).
+  # Reasoning models (Muse via opencode-go, DeepSeek) share
+  # summarizer_max_tokens with their reasoning tokens; at the upstream default
+  # effort (Muse: "high") they can spend the whole budget on reasoning and
+  # return an empty completion, which fails compaction and forces remote-only
+  # dispatch. "minimal" leaves room for the summary text. Mapped to
+  # ``reasoning.effort`` for openai-responses providers. Set to null to use the
+  # upstream default (not recommended for Muse).
+  summarizer_reasoning_effort: minimal
+  # Disable Qwen3 "thinking" for the local summarizer via the llama-server
+  # chat_template_kwargs.enable_thinking flag. Harmless when the remote
+  # ``compact`` chain is in use (LP-0MU58PBRD004OV1I).
+  summarizer_disable_thinking: true
   # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
   # advisory logging only, zero dispatch change. TRUE until the AC8
   # enforcement gate passes (experiment bar + client-side compaction
@@ -692,6 +736,35 @@ server:
   #   (LP-0MSUO6HLX0089MNQ). The same buffer extends the lease when orphan cleanup
   #   verifies a session's slot is still processing on llama-server (active-stream
   #   verification, LP-0MSUO6XRP001MCB2).
+  # local_dispatch_no_progress_timeout_seconds: No-progress watchdog timeout for
+  #   active dispatch leases (default 180s; 0 disables). When an active lease has
+  #   had no observed progress advance (``last_progress_ts`` not refreshed by
+  #   prefill extension or data chunks) for longer than this, the lease is released
+  #   so a wedged request cannot gate the local pool indefinitely. This breaks the
+  #   post-restart wedge where sessions hold leases while the backend is
+  #   "processing" but produces no output (LP-0MUCEFB8E003YVFF). Liveness-only
+  #   lease extension was removed in favour of this watchdog.
+  # local_dispatch_max_prefill_seconds: Hard ceiling on a single local dispatch
+  #   record's lifetime (default 900s; 0 disables). A record active for longer than
+  #   this is released regardless of observed progress. Also bounds the initial
+  #   first-byte wait: a local request that produces no first byte within this
+  #   window is aborted server-side with a retryable 503 + Retry-After
+  #   (LP-0MUCEFB8E003YVFF).
+  # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
+  #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
+  #   warning. While awaiting the SSE response headers, the proxy polls prefill
+  #   progress concurrently (at ``local_dispatch_lease_prefill_poll_seconds``) so
+  #   progress is observable before the first byte and the wait is visible in
+  #   production (LP-0MUCEFC0T009V7ZY).
+  # /slots poll coalescing (LP-0MUCEFD5B003TURT): every status poll queries
+  #   llama-server ``/slots``; under N concurrent pollers that is N requests
+  #   per interval. A short-TTL cache + single-flight coalescing bounds
+  #   upstream volume by the TTL. Tunable via environment variables:
+  #     SLOTS_POLL_TTL_SECONDS (default 1.0) — freshness window for a
+  #       coalesced /slots snapshot; callers within it share one request.
+  #     SLOTS_POLL_FAILURE_BACKOFF_SECONDS (default 5.0) — how long a failed
+  #       /slots fetch is cached so an unavailable backend is not hammered.
+  #   On failure callers fall back to the last-known counts with slots_stale.
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
   # events) showed 100% of denies caused by idle lease holders, never GPU
@@ -713,6 +786,12 @@ server:
   # Prevents stuck requests from starving subsequent requests indefinitely.
   # Default: 120 seconds.
   session_single_flight_queue_timeout_seconds: 120
+  # Duplicate-retry backoff (LP-0MUCEFCV5006UKSZ). When an identical request
+  # (same session + same messages hash) is already in flight, the retry is
+  # rejected with a retryable 409 + Retry-After instead of queueing behind
+  # (then re-prefilling) or cancelling the original prefill. This value is
+  # the Retry-After hint in seconds. Default: 10.
+  session_single_flight_duplicate_retry_after_seconds: 10
   # Directory for KV-cache slot snapshots written by slot save/restore
   # (llama-server prompt_save/prompt_load). Must be writable by the proxy
   # user; retention is handled by scripts/cleanup-slot-cache.sh.
@@ -787,11 +866,53 @@ server:
   mode_switch_drain:
     enabled: true
     # Maximum seconds to wait for in-flight local streams before the restart
-    # kills the process.
-    max_seconds: 30
+    # kills the process. Increased from 30s to 90s so more complex
+    # grandfathering + slot-save operations can complete gracefully.
+    max_seconds: 90
     # Extra seconds added to the "Retry-After" header past the drain deadline
     # so clients retry after the restart has had time to complete.
     retry_after_margin_seconds: 15
+
+  # -----------------------------------------------------------------------
+  # Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
+  # -----------------------------------------------------------------------
+  # After a mode-switch restart, competing herdr/agent workers reconnect
+  # simultaneously, creating a thundering herd that overwhelms the freshly-
+  # started proxy. This gate returns 503 + random Retry-After (uniform
+  # jitter) so reconnects spread across the ramp window instead of hitting
+  # the server at once. Clients simply retry with the given delay.
+  startup_ramp:
+    enabled: true
+    # Short safety ceiling (seconds) after process start. New chat requests
+    # are throttled with 503 + Retry-After only while local backends are
+    # not yet ready (``backend_ready=False``).  Once backends are ready the
+    # gate clears immediately regardless of elapsed time.  This value acts
+    # as a hard cap so requests are never blocked indefinitely if the
+    # backends fail to start.
+    max_seconds: 30
+    # Random jitter range for Retry-After (seconds). Each request gets a
+    # random value in [jitter_min, jitter_max] to desynchronise clients.
+    jitter_min: 5
+    jitter_max: 15
+
+  # -----------------------------------------------------------------------
+  # Cold-start admission control (LP-0MUCEFCAT005NFNN)
+  # -----------------------------------------------------------------------
+  # After a restart the co-located llama-server reloads the model cold (no
+  # prompt cache). Several large-context sessions dispatching at once each
+  # issue a full GPU prefill concurrently; first bytes take minutes and the
+  # local pool wedges. While the backend is cold, concurrent local dispatches
+  # are capped (default 1) so only one large prefill runs at a time. The cap
+  # lifts as soon as the first prefill completes (first data byte) — or when
+  # the grace window elapses — so warm operation is unrestricted.
+  #
+  # local_cold_start_grace_seconds: Bounded cold window after the backend
+  #   becomes ready (default 120; 0 disables cold-start admission control).
+  #   Self-expiring: the cap is never permanent.
+  # local_cold_start_max_concurrent: Max concurrent local dispatches while
+  #   cold (default 1, minimum 1).
+  # local_cold_start_retry_after_seconds: Retry-After hint for a cold-start
+  #   deferral (default 15).
 
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
@@ -877,14 +998,14 @@ server:
   # and retrying with bounded exponential backoff.
   # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
   # Raised from 30s to 120s to tolerate long reasoning pauses from remote
-  # reasoning models (e.g. opencode-go/deepseek-v4-flash on large contexts)
+  # reasoning models (e.g. opencode-go/deepseek-v4.1-flash on large contexts)
   # which can pause >30s between chunks while still being alive
   # (LP-0MS9FR9LG002AJ4C). Matches the local stream_idle_timeout_seconds
   # (120s) used for Qwen3 reasoning pauses (LP-0MS14PM7J003XPS8).
   # Since retries now only occur while zero content has been delivered, a
   # genuinely dead upstream fails fast once content starts flowing.
   # Raised from 120 to 240s (LP-0MSF5I7XN009ENWQ / LP-0MSF1PUM90099ZSW F4):
-  # opencode-go/deepseek-v4-flash frequently pause >120s mid-generation while
+  # opencode-go/deepseek-v4.1-flash frequently pause >120s mid-generation while
   # still alive, so the lower bound produced false stalls (~31% of requests).
   # Trade-off: true failures are detected more slowly (up to 30s of silence).
   # Bounded by upstream_request_timeout_seconds (120s) — the idle timeout

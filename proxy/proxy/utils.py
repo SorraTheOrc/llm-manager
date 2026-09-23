@@ -121,18 +121,17 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
 
     Prefer explicit message.content when it is non-empty. If message.content
     is present but empty/whitespace-only, treat it as absent and fall back to
-    reasoning_content extraction (tool call extraction, or a short hard-coded
-    placeholder for plain thinking text). This handles models that write
-    replies into reasoning_content during their 'thinking' phase.
+    reasoning_content extraction (tool call extraction).
 
     Plain (non-tool) reasoning text is **not** promoted into content
-    (LP-0MSEHOE7B005DE08): replaying the full thinking text in history wastes
-    context on later turns. Instead the literal placeholder ``"Thinking..."``
-    is returned so clients still receive a non-empty assistant message; the
-    full thinking text remains untouched in ``reasoning_content``.
+    (LP-0MTTSBT0R004HC6B): the full thinking text stays untouched in
+    ``reasoning_content`` (session history persists it unchanged) and
+    ``None`` is returned when no tool call is found. The presence of
+    reasoning_content is checked separately by ``_is_empty_response`` to
+    avoid classifying thinking-only turns as empty (no retry/fallback).
 
-    Returns extracted content string, the placeholder, or None when no usable
-    content is found.
+    Returns extracted content string, tool call string, or None when no
+    usable content is found.
     """
     srv = _srv()
     try:
@@ -165,19 +164,10 @@ def _extract_assistant_content(resp_json: dict) -> str | None:
                 return tool_call
 
             # Plain (non-tool) reasoning text is NOT promoted into content
-            # (LP-0MSEHOE7B005DE08): the full thinking text stays in
-            # reasoning_content (session history persists it unchanged) and a
-            # short hard-coded placeholder is returned instead, so clients
-            # receive a non-empty assistant message without context bloat.
-            try:
-                if reasoning_content and isinstance(reasoning_content, str):
-                    if reasoning_content.strip():
-                        srv.logger.info(
-                            "No content; reasoning_content present without tool call - emitting 'Thinking...' placeholder",
-                        )
-                        return "Thinking..."
-            except Exception:
-                pass
+            # (LP-0MTTSBT0R004HC6B): the full thinking text stays in
+            # reasoning_content (session history persists it unchanged).
+            # Return None; _is_empty_response treats thinking-only as
+            # non-empty via its own reasoning_content check.
     except Exception:
         pass
     return None
@@ -210,12 +200,17 @@ def _is_empty_response(response_text: str, resp_json: dict | None = None) -> boo
     """Check if a response is effectively empty (no content, no tool calls).
 
     Used to detect cases where the model generates thinking content but
-    produces no actual output. Returns True if the response has no usable
-    content.
+    produces no actual output. Returns True only if the response has no
+    usable content, tool calls, or reasoning_content.
+
+    Thinking-only responses (non-empty reasoning_content with no content
+    or tool calls) are treated as non-empty (LP-0MTTSBT0R004HC6B): the
+    thinking text is preserved in reasoning_content and should not trigger
+    retry/fallback. This eliminates the need for placeholder synthesis.
 
     When resp_json is provided (OpenAI-style response), emptiness is determined
-    by the presence of assistant content (text or tool calls) in the JSON
-    structure, not by the raw text length.
+    by the presence of assistant content (text or tool calls) or
+    reasoning_content in the JSON structure, not by the raw text length.
     When resp_json is not provided, falls back to checking if response_text
     is blank or whitespace-only.
     """
@@ -224,13 +219,18 @@ def _is_empty_response(response_text: str, resp_json: dict | None = None) -> boo
         content = _extract_assistant_content(resp_json)
         if content:
             return False
-        # Check reasoning_content for tool calls
+        # Check reasoning_content: tool calls count as content
+        # and non-empty plain reasoning_content means the response is not empty
         try:
             choices = resp_json.get("choices", [])
             if choices:
                 message = choices[0].get("message", {})
                 rc = message.get("reasoning_content")
                 if rc and _extract_tool_call_from_reasoning(rc):
+                    return False
+                # Thinking-only (no tool call): non-empty reasoning_content
+                # means the response is not empty (LP-0MTTSBT0R004HC6B).
+                if rc and isinstance(rc, str) and rc.strip():
                     return False
         except Exception:
             pass
@@ -245,18 +245,18 @@ def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
     """Extract concatenated assistant content from SSE stream text.
 
     Parses 'data: {json}' lines, extracting delta.content from each chunk.
-    If no content is found, falls back to checking delta.reasoning_content
-    for embedded tool call XML patterns (<function=...>...</function>), or
-    returns the literal placeholder ``"Thinking..."`` when the stream only
-    carried plain thinking text (LP-0MSEHOE7B005DE08).
+    If no content is found, falls back to checking accumulated
+    delta.reasoning_content for embedded tool call XML patterns
+    (<function=...>...</function>).
 
-    Plain (non-tool) reasoning text is **not** promoted into content: the
-    full thinking text stays in ``reasoning_content`` (session history
-    persists it unchanged) and the placeholder keeps clients' assistant
-    messages non-empty without inflating context.
+    Plain (non-tool) reasoning text is **not** promoted into content:
+    the full thinking text stays in ``reasoning_content`` (session history
+    persists it unchanged) and None is returned when no tool call is found.
+    The presence of reasoning_content is checked separately by
+    ``_is_empty_response`` to avoid classifying thinking-only turns as
+    empty (no retry/fallback).
 
-    Returns concatenated content string, tool call string, the placeholder,
-    or None.
+    Returns concatenated content string, tool call string, or None.
     """
     srv = _srv()
     parts: list[str] = []
@@ -296,17 +296,10 @@ def _extract_assistant_content_from_sse(sse_text: str) -> str | None:
             )
             return tool_call
         # Plain (non-tool) reasoning text is NOT promoted into content
-        # (LP-0MSEHOE7B005DE08): the full thinking text stays in
-        # reasoning_content (session history persists it unchanged) and a
-        # short hard-coded placeholder is returned instead, so clients
-        # receive a non-empty assistant message without context bloat.
-        try:
-            if full_reasoning.strip():
-                srv.logger.info(
-                    "No content; streaming reasoning_content present without tool call - emitting 'Thinking...' placeholder",
-                )
-                return "Thinking..."
-        except Exception:
+        # (LP-0MTTSBT0R004HC6B): the full thinking text stays in
+        # reasoning_content (session history persists it unchanged).
+        # Return None; _is_empty_response treats thinking-only as
+        # non-empty via its own reasoning_content check.
             pass
 
     return None

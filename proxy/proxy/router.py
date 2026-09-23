@@ -12,6 +12,7 @@ Functions in this module:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -54,6 +55,7 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
 
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
+from proxy import cold_start  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
     _compute_adaptive_timeout,
     _is_self_healing_active,
@@ -65,6 +67,7 @@ from proxy.observability import (  # noqa: E402
     _record_backend_signal,
 )
 from proxy.session import (  # noqa: E402
+    SessionSingleFlightDuplicateError,
     SessionSingleFlightRejectedError,
     _build_slot_context,
     _detect_restore_signal_from_llama_log,
@@ -96,6 +99,7 @@ from proxy.utils import (  # noqa: E402
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _apply_queue_wait_to_timeout,
+    _await_first_byte_with_prefill_monitor,
     _build_backend_error_response,
     _build_backend_unavailable_response,
     _call_with_backend_retries,
@@ -111,12 +115,14 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _extend_lease_during_prefill,
     _get_chunk_refresh_buffer_seconds,
     _get_lease_timeout_seconds,
+    _get_max_prefill_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
     _increment_local_active_queries,
     _increment_per_model_query,
     _normalize_outgoing_headers,
+    _request_dedup_hash,
     _schedule_recv_token_increment,
     _schedule_token_increment,
     _schedule_traffic_recording,
@@ -256,6 +262,43 @@ def _build_session_headers(
         if session_fallback_reason:
             headers["X-Session-Fallback-Reason"] = session_fallback_reason
     return headers
+
+
+def _build_compaction_headers(session_result: dict) -> dict:
+    """Build the compaction metadata response headers (LP-0MTYGZ1DI0004QP8).
+
+    Returns an empty dict unless live compaction was applied *and* the
+    summary text is available. ``X-Compaction-Marker`` is the base64 encoding
+    of the exact summary message the proxy injected into the compacted history
+    (``_SUMMARY_MARKER`` / ``_SUMMARY_MARKER_END`` delimiters included), so
+    clients never replicate the marker format and can never drift from it.
+
+    Fail-safe (AC4): any error yields no headers and never affects dispatch —
+    the emission is additive, after compaction has already been applied.
+    """
+    try:
+        if not session_result.get("compaction_applied"):
+            return {}
+        summary_text = session_result.get("compaction_summary_text")
+        if not isinstance(summary_text, str) or not summary_text:
+            return {}
+        from proxy.compaction import _SUMMARY_MARKER, _SUMMARY_MARKER_END
+
+        marker_message = f"{_SUMMARY_MARKER}{summary_text}{_SUMMARY_MARKER_END}"
+        marker_b64 = base64.b64encode(marker_message.encode("utf-8")).decode("ascii")
+        return {
+            "X-Compaction-Occurred": "true",
+            "X-Compaction-Marker": marker_b64,
+            "X-Compaction-Turns-Summarized": str(
+                int(session_result.get("compaction_turns_summarized", 0) or 0)
+            ),
+            "X-Compaction-Recent-Turns-Kept": str(
+                int(session_result.get("compaction_recent_turns_kept", 0) or 0)
+            ),
+        }
+    except Exception:
+        logger.debug("Failed to build compaction headers; omitting", exc_info=True)
+        return {}
 
 
 def _get_guardrail_config(server_config: dict) -> dict:
@@ -1021,7 +1064,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     # -------------------------------------------------------------------
     acquired = False
     if session_id and session_explicit:
+        # LP-0MUCEFCAT005NFNN: cold-start admission control. The cold window
+        # is armed by the lifecycle load paths (``note_model_loaded``) when a
+        # model becomes ready, and lifts on the first completed prefill
+        # (``mark_warm``). While cold, cap concurrent local dispatches so a
+        # post-restart thundering-herd of large prefills cannot run at once.
+        # Warm state returns the configured max unchanged (no added latency).
         local_max = _get_local_max_concurrent_queries(server_config)
+        local_max = cold_start.effective_max_concurrent(server_config, local_max)
         backend_label = endpoint or "local"
         acquired, owner, active_count, retry_after = await _try_acquire_local_dispatch(
             srv,
@@ -1032,14 +1082,45 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             model_name=model_name,
         )
         if not acquired:
+            _cold = cold_start.is_cold(server_config)
             srv.logger.info(
-                "local_dispatch_denied session=%s owner=%s active=%s",
+                "local_dispatch_denied session=%s owner=%s active=%s cold_start=%s",
                 session_id if session_id else "unknown",
                 owner if owner else "none",
                 active_count,
+                _cold,
             )
             _record_backend_signal("local_dispatch_denied")
 
+            if _cold:
+                # Retryable deferral with a short, cold-specific Retry-After
+                # so clients re-queue during the warmup rather than waiting
+                # for the (potentially adaptive) lease timeout.
+                _retry_after = cold_start.retry_after_seconds(server_config)
+                payload = {
+                    "error": {
+                        "type": "server_busy",
+                        "code": "cold_start",
+                        "message": (
+                            "Local backend is warming up after a restart; "
+                            "retry shortly."
+                        ),
+                    },
+                    "status": 503,
+                    "retry_after": _retry_after,
+                    "reason": "cold_start",
+                    "local_owner_session_id": owner,
+                }
+                return JSONResponse(
+                    status_code=503,
+                    content=payload,
+                    headers={
+                        "Retry-After": str(_retry_after),
+                        "Cache-Control": "no-store",
+                    },
+                )
+
+            _lease_retry_after = max(1, int(retry_after))
             payload = {
                 "error": {
                     "type": "server_busy",
@@ -1051,11 +1132,20 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     ),
                 },
                 "status": 503,
-                "retry_after": max(1, int(retry_after)),
+                "retry_after": _lease_retry_after,
                 "reason": "local_lease_active",
                 "local_owner_session_id": owner,
             }
-            return JSONResponse(status_code=503, content=payload)
+            # LP-0MUCEFCV5006UKSZ: denied sessions must be able to honor
+            # Retry-After — surface it as a header (not just the JSON body).
+            return JSONResponse(
+                status_code=503,
+                content=payload,
+                headers={
+                    "Retry-After": str(_lease_retry_after),
+                    "Cache-Control": "no-store",
+                },
+            )
 
     # Check slot availability — skipped when the dispatch lease was acquired
     # (the lease already gates concurrency to session_slot_pool_size; the
@@ -1120,6 +1210,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         llama_log_offset = 0
 
     is_streaming = body_json.get("stream", False)
+    # LP-0MUCEFCV5006UKSZ: stable hash of the message list so a client retry
+    # of the same prompt can be detected while the original is in flight.
+    _dedup_hash = _request_dedup_hash(body_json if isinstance(body_json, dict) else None)
 
     # Compute request timeout (adaptive if enabled)
     request_timeout = _compute_request_timeout(server_config, body_json)
@@ -1138,6 +1231,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             single_flight_mode,
             single_flight_max_queue_depth,
             queue_timeout_seconds=single_flight_queue_timeout,
+            request_hash=_dedup_hash,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
@@ -1173,12 +1267,46 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         stream_resp = await stream_cm.__aenter__()
                         return stream_cm, stream_resp
 
-                    # Enter the stream with bounded retries on transient backend failures
+                    # Enter the stream with bounded retries on transient backend failures.
+                    # LP-0MUCEFB8E003YVFF: bound the first-byte wait by
+                    # ``local_dispatch_max_prefill_seconds`` so a local request
+                    # that never reaches first byte is aborted server-side (lease
+                    # released by the cleanup path) and the client receives a
+                    # retryable 503 instead of hanging indefinitely.
+                    # LP-0MUCEFC0T009V7ZY: while awaiting the first byte, poll
+                    # prefill progress concurrently so progress is observable
+                    # before the SSE headers arrive (previously the poll sat
+                    # after ``stream_cm.__aenter__`` and never ran during a real
+                    # prefill).
+                    _first_byte_ceiling = _get_max_prefill_seconds(srv)
+                    _first_byte_poll_seconds = float(
+                        server_config.get(
+                            "local_dispatch_lease_prefill_poll_seconds", 10
+                        )
+                        or 10
+                    )
+                    _first_byte_warn_seconds = float(
+                        server_config.get(
+                            "local_dispatch_prefill_observability_warn_seconds", 30
+                        )
+                        or 30
+                    )
                     try:
-                        cm, response = await _call_with_backend_retries(
-                            _open_stream_once,
-                            path=path,
-                            stream=True,
+                        cm, response = await _await_first_byte_with_prefill_monitor(
+                            srv,
+                            _call_with_backend_retries(
+                                _open_stream_once,
+                                path=path,
+                                stream=True,
+                            ),
+                            timeout=_first_byte_ceiling,
+                            poll_seconds=_first_byte_poll_seconds,
+                            warn_seconds=_first_byte_warn_seconds,
+                            session_id=session_id if session_explicit else None,
+                            endpoint=endpoint,
+                            llama_port=llama_port,
+                            model_name=model_name,
+                            slot_id=slot_id,
                         )
                         srv.backend_ready = True
                         restore_signal_detected = _has_explicit_restore_signal(
@@ -1190,7 +1318,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     session_id
                                 )
                             )
-                    except Exception:
+                    except Exception as _exc:
+                        # LP-0MUCEFB8E003YVFF: distinct, observable log line
+                        # when the first-byte ceiling aborts a stuck prefill.
+                        if isinstance(_exc, asyncio.TimeoutError):
+                            try:
+                                srv.logger.warning(
+                                    "dispatch_first_byte_timeout session=%s "
+                                    "ceiling=%.0fs",
+                                    session_id if session_id else "unknown",
+                                    _first_byte_ceiling,
+                                )
+                            except Exception:
+                                pass
                         srv.backend_ready = False
                         await _cleanup_after_request(
                             srv, session_id,
@@ -1282,6 +1422,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     )
                     # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                     outgoing_headers["X-Resolved-Model"] = f"local/{model_name}"
+                    # LP-0MTYGZ1DI0004QP8: Surface server-side compaction metadata
+                    # so the Pi client can mirror the compacted dispatch base.
+                    outgoing_headers.update(_build_compaction_headers(session_result))
                     media_type = response.headers.get(
                         "content-type", "text/event-stream"
                     )
@@ -1607,6 +1750,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # lease extension — the chunk-refresh path
                                     # below takes over (LP-0MSE05J53004C6EL).
                                     _saw_actual_data = True
+                                    # LP-0MUCEFCAT005NFNN: the local prompt cache
+                                    # is now warm for this model; lift the
+                                    # cold-start admission cap so subsequent
+                                    # requests see the full concurrency.
+                                    try:
+                                        from proxy import cold_start as _cold_start
+
+                                        _cold_start.mark_warm()
+                                    except Exception:
+                                        pass
 
                                 # Refresh dispatch lease expiry for long-running
                                 # streams (LP-0MRDKV44T003FRBP).  Extend the lease
@@ -1638,6 +1791,15 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 if _record_key in srv.local_dispatch_records:
                                                     srv.local_dispatch_records[_record_key]['expires_at'] = (
                                                         time.monotonic() + _lease_timeout
+                                                    )
+                                                    # LP-0MUCEFB8E003YVFF: a real
+                                                    # data chunk is forward
+                                                    # progress — reset the
+                                                    # no-progress watchdog so a
+                                                    # long silent generation is
+                                                    # not falsely released.
+                                                    srv.local_dispatch_records[_record_key]['last_progress_ts'] = (
+                                                        time.monotonic()
                                                     )
                                     except Exception:
                                         pass
@@ -1958,6 +2120,48 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         headers=outgoing_headers,
                         status_code=upstream_status,
                     )
+        except SessionSingleFlightDuplicateError as exc:
+            # LP-0MUCEFCV5006UKSZ: identical request already in flight — the
+            # original prefill continues. Return a retryable 409 + Retry-After
+            # so the client backs off instead of re-prefilling.
+            await _cleanup_after_request(
+                srv, session_id,
+                decrement_local=False,
+                model_name=model_name,
+                request=request,
+                backend=endpoint,
+            )
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            record_key = _dispatch_lease_key(endpoint, session_id)
+                            if record_key in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[record_key]
+                except Exception:
+                    pass
+            retry_after = int(
+                server_config.get("session_single_flight_duplicate_retry_after_seconds", 10)
+                or 10
+            )
+            payload = {
+                "error": {
+                    "type": "session_single_flight",
+                    "code": "duplicate_inflight",
+                    "message": "An identical request is already in flight for this session",
+                    "reason": exc.reason,
+                },
+                "status": 409,
+                "session_id": session_id,
+                "retry_after": retry_after,
+                "mode": single_flight_mode,
+            }
+            return JSONResponse(
+                status_code=409,
+                content=payload,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,
@@ -1995,6 +2199,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             single_flight_mode,
             single_flight_max_queue_depth,
             queue_timeout_seconds=single_flight_queue_timeout,
+            request_hash=_dedup_hash,
         )
         slot_guard = slot_lock_coordinator.acquire(slot_id)
         try:
@@ -2123,6 +2328,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             )
                             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                             resp_headers["X-Resolved-Model"] = f"local/{model_name}"
+                            # LP-0MTYGZ1DI0004QP8: Surface server-side compaction metadata.
+                            resp_headers.update(_build_compaction_headers(session_result))
 
                             return Response(
                                 content=response.content,
@@ -2137,6 +2344,44 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             request=request,
                             backend=endpoint,
                         )
+        except SessionSingleFlightDuplicateError as exc:
+            await _cleanup_after_request(
+                srv, session_id,
+                decrement_local=True,
+                request=request,
+                backend=endpoint,
+            )
+            if session_explicit and session_id:
+                try:
+                    lock = getattr(srv, "local_dispatch_records_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            record_key = _dispatch_lease_key(endpoint, session_id)
+                            if record_key in getattr(srv, "local_dispatch_records", {}):
+                                del srv.local_dispatch_records[record_key]
+                except Exception:
+                    pass
+            retry_after = int(
+                server_config.get("session_single_flight_duplicate_retry_after_seconds", 10)
+                or 10
+            )
+            payload = {
+                "error": {
+                    "type": "session_single_flight",
+                    "code": "duplicate_inflight",
+                    "message": "An identical request is already in flight for this session",
+                    "reason": exc.reason,
+                },
+                "status": 409,
+                "session_id": session_id,
+                "retry_after": retry_after,
+                "mode": single_flight_mode,
+            }
+            return JSONResponse(
+                status_code=409,
+                content=payload,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
         except SessionSingleFlightRejectedError as exc:
             await _cleanup_after_request(
                 srv, session_id,

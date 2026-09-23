@@ -48,6 +48,22 @@ def reset_cooldown_state():
     yield
 
 
+@pytest.fixture(autouse=True)
+def pin_fast_mode(monkeypatch):
+    """Pin the operating mode to ``fast`` for this module.
+
+    These tests were written against the fast/default profile.  The mode is
+    pinned here so the effective per-slot hard-routing cap (which is
+    mode-aware via ``compute_hard_routing_cap``) and any future mode-gated
+    thresholds are deterministic regardless of any persisted ``proxy/.mode``
+    state in the checkout.  Economic-bypass recovery
+    (LP-0MU5A4QBR003YJM0) is config-driven
+    (``local_large_context_economic_bypass_serves_local``), so it is not
+    enabled by this fixture.
+    """
+    monkeypatch.setattr("proxy.mode.read_mode", lambda: "fast")
+
+
 @pytest.fixture
 def sample_model_config():
     """A model config with an ordered providers list (remote only)."""

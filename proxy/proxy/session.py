@@ -44,6 +44,7 @@ session_restore_observability: dict = {
 session_single_flight_observability: dict = {
     "queue_events_total": 0,
     "reject_events_total": 0,
+    "duplicate_events_total": 0,
     "active_sessions_current": 0,
     "queue_depth_current": 0,
 }
@@ -1309,6 +1310,36 @@ class SessionSingleFlightRejectedError(Exception):
         self.reason = reason
 
 
+class SessionSingleFlightDuplicateError(Exception):
+    """Raised when an identical request is already in flight for a session.
+
+    Distinct from ``SessionSingleFlightRejectedError``: a duplicate is a
+    retry of the *same* prompt while the original prefill is still running.
+    The router returns a retryable 409 + Retry-After instead of queueing the
+    retry (which would later re-prefill) or cancelling the original
+    (LP-0MUCEFCV5006UKSZ).
+    """
+
+    def __init__(self, reason: str = "duplicate_inflight") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _record_single_flight_duplicate() -> None:
+    srv = _srv()
+    try:
+        srv.session_single_flight_observability["duplicate_events_total"] = (
+            int(
+                srv.session_single_flight_observability.get(
+                    "duplicate_events_total", 0
+                )
+            )
+            + 1
+        )
+    except Exception:
+        pass
+
+
 class SessionSingleFlightCoordinator:
     def __init__(self) -> None:
         self._state_lock = asyncio.Lock()
@@ -1318,11 +1349,16 @@ class SessionSingleFlightCoordinator:
         async with self._state_lock:
             state = self._states.get(session_id)
             if state is None:
-                state = {"lock": asyncio.Lock(), "waiters": 0, "active": False}
+                state = {
+                    "lock": asyncio.Lock(),
+                    "waiters": 0,
+                    "active": False,
+                    "request_hash": None,
+                }
                 self._states[session_id] = state
             return state
 
-    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int, queue_timeout_seconds: float | None = None):
+    def acquire(self, session_id: str | None, mode: str, max_queue_depth: int, queue_timeout_seconds: float | None = None, request_hash: str | None = None):
         @asynccontextmanager
         async def _guard():
             if not session_id:
@@ -1337,6 +1373,14 @@ class SessionSingleFlightCoordinator:
             is_waiting = False
             async with self._state_lock:
                 if state["lock"].locked():
+                    # LP-0MUCEFCV5006UKSZ: an identical request (same session +
+                    # same messages hash) is a client retry of the prompt
+                    # already being prefilled. Reject it as a duplicate so it
+                    # neither queues behind (then re-prefills) nor cancels the
+                    # original.
+                    if request_hash is not None and state.get("request_hash") == request_hash:
+                        _record_single_flight_duplicate()
+                        raise SessionSingleFlightDuplicateError("duplicate_inflight")
                     if mode_norm == "reject":
                         _record_single_flight_reject()
                         raise SessionSingleFlightRejectedError("active_inflight")
@@ -1364,6 +1408,7 @@ class SessionSingleFlightCoordinator:
                 if is_waiting:
                     state["waiters"] = max(0, state["waiters"] - 1)
                 state["active"] = True
+                state["request_hash"] = request_hash
                 session_single_flight_observability["active_sessions_current"] = sum(
                     1 for s in self._states.values() if s.get("active")
                 )
@@ -1377,6 +1422,7 @@ class SessionSingleFlightCoordinator:
                 state["lock"].release()
                 async with self._state_lock:
                     state["active"] = False
+                    state["request_hash"] = None
                     if not state["lock"].locked() and state["waiters"] == 0:
                         self._states.pop(session_id, None)
                     session_single_flight_observability["active_sessions_current"] = sum(

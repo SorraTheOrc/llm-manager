@@ -24,14 +24,11 @@ plus a like-for-like overnight (cheap-mode) comparison against the baseline.
 
 ## Measurement method
 
-- The proxy-usage-analysis skill parses `status_request` / dispatch log lines:
+- The proxy-usage-analysis skill parses the dispatch log lines:
   - `contention_queue_dispatch` lines carry `queued_duration`, `policy`, `depth`
   - `contention_queue_fallback_after_queue` lines carry `queued_duration`
-  - `status_request` lines merge the queue snapshot: `queue_policy`, queue
-    depth, queued count, `contention_queued_duration_seconds`
-- Prometheus counters: `llama_contention_queued_total`,
-  `llama_contention_queued_duration_seconds`,
-  `llama_contention_fallback_after_queue_total`.
+  (`status_request` queue snapshots were removed in LP-0MU4NACW9001WKBP — the
+  cumulative queued count / queued-duration fields are no longer emitted.)
 - Per-mode bucketing via the request's `read_mode()` (cheap/fast).
 
 ## Results

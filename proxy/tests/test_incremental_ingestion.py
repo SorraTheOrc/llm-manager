@@ -1077,8 +1077,9 @@ class TestToolCallFromReasoning:
         assert 'ls -la' in result
 
     def test_extract_assistant_content_from_sse_reasoning_no_tool_call(self):
-        """When reasoning_content has no tool call, emit the 'Thinking...'
-        placeholder instead of promoting the thinking text into content."""
+        """When reasoning_content has no tool call, return None (no
+        placeholder) — thinking stays in reasoning_content only
+        (LP-0MTTSBT0R004HC6B)."""
         from proxy.server import _extract_assistant_content_from_sse
 
         sse_text = (
@@ -1087,10 +1088,10 @@ class TestToolCallFromReasoning:
             'data: [DONE]\n'
         )
         result = _extract_assistant_content_from_sse(sse_text)
-        # The thinking text is NOT promoted into content (LP-0MSEHOE7B005DE08):
-        # a short hard-coded placeholder is returned instead to avoid
-        # bloating session history with replayed thinking text.
-        assert result == "Thinking..."
+        # Thinking-only: no tool call, no content → None (LP-0MTTSBT0R004HC6B).
+        # _is_empty_response treats this as non-empty via its own
+        # reasoning_content check, so no retry/fallback is triggered.
+        assert result is None
 
     def test_extract_assistant_content_from_sse_prefers_content_over_reasoning(self):
         """When both content and reasoning_content are present, prefer content."""
@@ -1126,8 +1127,9 @@ class TestToolCallFromReasoning:
         assert 'echo hi' in result
 
     def test_extract_assistant_content_non_streaming_reasoning_no_tool_call(self):
-        """Non-streaming: when reasoning_content has no tool call, emit the
-        'Thinking...' placeholder instead of promoting the thinking text."""
+        """Non-streaming: when reasoning_content has no tool call, return
+        None (no placeholder) — thinking stays in reasoning_content only
+        (LP-0MTTSBT0R004HC6B)."""
         from proxy.server import _extract_assistant_content
 
         resp = {
@@ -1142,14 +1144,15 @@ class TestToolCallFromReasoning:
             ]
         }
         result = _extract_assistant_content(resp)
-        # The thinking text is NOT promoted into content (LP-0MSEHOE7B005DE08):
-        # a short hard-coded placeholder is returned instead to avoid
-        # bloating session history with replayed thinking text.
-        assert result == "Thinking..."
+        # Thinking-only: no tool call, no content → None (LP-0MTTSBT0R004HC6B).
+        # _is_empty_response treats this as non-empty via its own
+        # reasoning_content check, so no retry/fallback is triggered.
+        assert result is None
 
     def test_extract_assistant_content_non_streaming_empty_string_content_with_reasoning(self):
-        """Non-streaming: empty-string content plus reasoning text yields the
-        placeholder, not the thinking text (LP-0MSEHOE7B005DE08)."""
+        """Non-streaming: empty-string content plus reasoning text yields
+        None (no placeholder) — thinking stays in reasoning_content only
+        (LP-0MTTSBT0R004HC6B)."""
         from proxy.server import _extract_assistant_content
 
         resp = {
@@ -1164,11 +1167,13 @@ class TestToolCallFromReasoning:
             ]
         }
         result = _extract_assistant_content(resp)
-        assert result == "Thinking..."
+        # Empty string content treated as missing; reasoning text not
+        # promoted → None (LP-0MTTSBT0R004HC6B).
+        assert result is None
 
     def test_extract_assistant_content_non_streaming_whitespace_content_with_reasoning(self):
         """Non-streaming: whitespace-only content plus reasoning text yields
-        the placeholder, not the thinking text (LP-0MSEHOE7B005DE08)."""
+        None (LP-0MTTSBT0R004HC6B)."""
         from proxy.server import _extract_assistant_content
 
         resp = {
@@ -1238,9 +1243,9 @@ class TestToolCallFromReasoning:
         assert _is_empty_response(None, resp) is False
 
     def test_is_empty_response_with_plain_reasoning_not_empty(self):
-        """Thinking-only response (no tool call) is NOT empty: the placeholder
-        counts as content, preserving the promoted-success semantics so the
-        fallback chain does not trigger cooldown/retry (LP-0MSEHOE7B005DE08)."""
+        """Thinking-only response (no tool call) is NOT empty: non-empty
+        reasoning_content alone is sufficient (LP-0MTTSBT0R004HC6B).
+        No placeholder synthesis is needed."""
         from proxy.server import _is_empty_response
 
         resp = {

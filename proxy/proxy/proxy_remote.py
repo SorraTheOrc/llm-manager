@@ -1324,6 +1324,11 @@ async def _handle_remote_streaming(
             headers=_err_headers,
         )
 
+    # TTFT start timestamp for remote-stream latency measurement (LP-0MTSSM5SO003PKU0).
+    # Captured right after the upstream 200 OK with SSE content-type, before any
+    # data chunks are read. This is the "dispatch" point for remote streams.
+    _ttft_start = time.monotonic()
+
     outgoing_headers = _normalize_outgoing_headers(dict(response.headers), buffered=False)
     if "cache-control" not in {k.lower() for k in outgoing_headers.keys()}:
         outgoing_headers["Cache-Control"] = "no-cache"
@@ -1356,6 +1361,10 @@ async def _handle_remote_streaming(
         # _has_content is set when a chunk carries meaningful output: non-empty
         # content, tool_calls, or reasoning_content (LP-0MS8XAPXT009W3CL).
         _has_content = False
+        # TTFT emission guard (LP-0MTSSM5SO003PKU0): True after the first
+        # content-bearing chunk, preventing duplicate TTFT log lines on
+        # retry/reconnect loops.
+        _ttft_emitted = False
         # Diagnostic flags for empty-retry logging (LP-0MS8XAPXT009W3CL)
         _saw_tool_calls = False
         _saw_reasoning = False
@@ -1826,6 +1835,24 @@ async def _handle_remote_streaming(
                                     delta = choice.get("delta", {})
                                     if _delta_has_content(delta):
                                         _has_content = True
+                                        # TTFT: emit structured log line the first
+                                        # time a content-bearing chunk arrives.
+                                        # Format: ttft_seconds=<float> session=<id>
+                                        # provider=<provider> model=<model>
+                                        # (LP-0MTSSM5SO003PKU0)
+                                        if not _ttft_emitted:
+                                            _ttft_emitted = True
+                                            try:
+                                                _ttft_secs = time.monotonic() - _ttft_start
+                                                _srv().logger.info(
+                                                    "ttft_seconds=%.3f session=%s provider=%s model=%s",
+                                                    _ttft_secs,
+                                                    session_id or "unknown",
+                                                    provider or "remote",
+                                                    model_name,
+                                                )
+                                            except Exception:
+                                                pass
                                         # Content-bearing chunk = activity
                                         # progress (LP-0MSVP7ZML003XZTJ):
                                         # resets the activity watchdog.

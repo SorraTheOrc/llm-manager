@@ -710,3 +710,200 @@ async def test_proxy_to_local_denies_when_generating_at_pool_cap(monkeypatch):
     payload = json.loads(resp.body)
     assert payload["error"]["code"] == "no_slots_available"
     assert payload["local_owner_session_id"] == "sess-a"
+
+
+# ---------------------------------------------------------------------------
+# AC1: Lease-holding session still respects the generating cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lease_holding_session_respects_generating_cap():
+    """A session that already holds a lease must not exceed max_local generating slots.
+
+    Regression test for LP-0MU09CAL3001MP0Z: when session A holds an inactive
+    (cooldown) lease and session B starts generating, A's re-acquisition must
+    still check the generating-only count against max_local. Previously the
+    cap check was skipped for lease-holders, allowing active=2 > max_local=1.
+
+    Scenario:
+    1. Session A acquires a lease and enters generating phase (generating=1).
+    2. Session A finishes its response, decrementing generating count to 0,
+       but the lease remains active (expires_at in the future).
+    3. Session B acquires a lease and enters generating phase (generating=1).
+    4. Session A tries to re-acquire while B is generating — must be DENIED
+       because generating count (1) >= max_local (1).
+    """
+    from proxy.router_helpers import (
+        _decrement_generating_only_slot,
+        _decrement_local_active_queries,
+        _get_generating_only_count,
+        _increment_generating_only_slot,
+        _try_acquire_local_dispatch,
+    )
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 30}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_generating_queries=0,
+        local_generating_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    # Step 1: Session A acquires and enters generating phase
+    acquired_a1, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-a", backend="local"
+    )
+    assert acquired_a1 is True
+    await _increment_generating_only_slot(srv, session_key="sess-a")
+    assert _get_generating_only_count(srv) == 1
+
+    # Step 2: Session A finishes response — generating count drops to 0
+    # but the lease is kept alive (marked inactive with future expires_at)
+    await _decrement_generating_only_slot(srv, session_key="sess-a")
+    assert _get_generating_only_count(srv) == 0
+
+    # Mark the lease as inactive (cooldown) but still valid
+    await _decrement_local_active_queries(
+        srv, session_key="sess-a", backend="local"
+    )
+    # Verify the lease record exists and is inactive but unexpired
+    a_record = srv.local_dispatch_records.get("sess-a")
+    assert a_record is not None
+    assert a_record["active"] is False
+    assert a_record["expires_at"] > time.monotonic()
+
+    # Step 3: Session B acquires (A's lease is inactive, so B has no own_has_lease)
+    acquired_b, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-b", backend="local"
+    )
+    assert acquired_b is True, (
+        "Session B should acquire when generating count is 0"
+    )
+    await _increment_generating_only_slot(srv, session_key="sess-b")
+    assert _get_generating_only_count(srv) == 1
+
+    # Step 4: Session A tries to re-acquire — must be DENIED
+    # because session B is already generating and max_local=1
+    # The bug: own_has_lease is True for A, so the cap check was skipped,
+    # allowing active=2.
+    acquired_a2, owner_a, active_a, _ = await _try_acquire_local_dispatch(
+        srv, max_local=1, session_key="sess-a", backend="local"
+    )
+
+    assert acquired_a2 is False, (
+        "Session A should be denied when sess-b is generating (generating=1/1) "
+        "even though A holds an inactive lease"
+    )
+    assert owner_a == "sess-b", (
+        "The active owner should be sess-b"
+    )
+    assert active_a == 1, (
+        "The active generating count should be 1 (only sess-b)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_holding_session_re_acquires_when_free():
+    """A lease-holding session can re-acquire when the pool is not full.
+
+    When generating count is below max_local, a session with an inactive
+    lease should be allowed to re-acquire (no-preemption for own session).
+    """
+    from proxy.router_helpers import (
+        _decrement_generating_only_slot,
+        _decrement_local_active_queries,
+        _get_generating_only_count,
+        _increment_generating_only_slot,
+        _try_acquire_local_dispatch,
+    )
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 30}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_generating_queries=0,
+        local_generating_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    # Session A acquires and enters generating phase
+    acquired_a1, _, _, _ = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-a", backend="local"
+    )
+    assert acquired_a1 is True
+    await _increment_generating_only_slot(srv, session_key="sess-a")
+    assert _get_generating_only_count(srv) == 1
+
+    # Session A finishes (generating=0), lease goes to cooldown
+    await _decrement_generating_only_slot(srv, session_key="sess-a")
+    await _decrement_local_active_queries(
+        srv, session_key="sess-a", backend="local"
+    )
+    a_record = srv.local_dispatch_records.get("sess-a")
+    assert a_record["active"] is False
+
+    # Session A re-acquires — pool is free (generating=0 < max_local=2)
+    acquired_a2, owner_a, active_a, _ = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-a", backend="local"
+    )
+
+    assert acquired_a2 is True, (
+        "Session A should re-acquire when pool is not full"
+    )
+    assert active_a == 1
+
+
+@pytest.mark.asyncio
+async def test_lease_holding_session_bypasses_old_bugs():
+    """Verify the old buggy behavior is fixed: lease holder cannot exceed cap.
+
+    This test directly verifies the AC1 condition: with session_slot_pool_size=N,
+    the proxy never reports active=2 (or >N) generating sessions, including when
+    sessions already hold inactive leases.
+    """
+    from proxy.router_helpers import (
+        _decrement_generating_only_slot,
+        _decrement_local_active_queries,
+        _get_generating_only_count,
+        _increment_generating_only_slot,
+        _try_acquire_local_dispatch,
+    )
+
+    srv = SimpleNamespace(
+        config={"server": {"local_dispatch_lease_timeout_seconds": 30}},
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_generating_queries=0,
+        local_generating_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+    )
+
+    max_local = 1
+
+    # Session A: acquire, generate, finish, cooldown
+    await _try_acquire_local_dispatch(srv, max_local, "sess-a", "local")
+    await _increment_generating_only_slot(srv, "sess-a")
+    await _decrement_generating_only_slot(srv, "sess-a")
+    await _decrement_local_active_queries(srv, "sess-a", "local")
+    assert _get_generating_only_count(srv) == 0
+
+    # Session B: acquire and start generating
+    await _try_acquire_local_dispatch(srv, max_local, "sess-b", "local")
+    await _increment_generating_only_slot(srv, "sess-b")
+    assert _get_generating_only_count(srv) == 1
+
+    # Session A: try to re-acquire — MUST NOT exceed cap
+    # The old bug allowed this, making active=2
+    result = await _try_acquire_local_dispatch(srv, max_local, "sess-a", "local")
+    assert result[0] is False, (
+        f"AC1 violated: generating count ({_get_generating_only_count(srv)}) "
+        "should never exceed max_local when a lease-holder tries to re-acquire"
+    )
+
+    # Verify active count stayed at 1, not 2
+    assert _get_generating_only_count(srv) == 1

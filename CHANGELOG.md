@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.1.19 (2026-09-23)
+
 ## v0.1.18 (2026-09-16)
 ### Features
 - Slot counts: default and fast -> 1 slot, cheap -> 3 slots (LP-0MU03AL730000B5W)
