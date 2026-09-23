@@ -2,6 +2,40 @@
 
 ## v0.1.19 (2026-09-23)
 
+### Features
+
+- Cheap mode: prevent slot-contention fallback (bounded queue); keep context fallback (LP-0MSORQVK50012Q4D)
+- Add Time to First Token section to proxy usage report (LP-0MTSSM5SO003PKU0)
+- Add 'compact' model (Muse → DeepSeek) and wire proxy-side compaction to it (LP-0MTT0O74N009E7N2)
+- Avoid promoting thinking to content for empty responses (LP-0MTTSBT0R004HC6B)
+- Surface proxy-side compaction metadata in responses (Pi client bridge) (LP-0MTYGZ1DI0004QP8)
+- Add fast→cheap mode-switch cooldown to stop flip-flopping (LP-0MU6MQIPP0058198)
+- Post-restart startup ramp: gate new chat requests with 503 + Retry-After (thundering-herd mitigation) (LP-0MU9ZXFQS0023DXT)
+- Startup ramp: shorten the window and clear the gate when backends are ready (LP-0MUAY98ZR002JBAA)
+- Startup ramp: only gate chat requests that would dispatch locally (LP-0MUAY9AMS002O2ZO)
+
+### Bug Fixes
+
+- Unkown errors from Muse (LP-0MTV77DAT0018ZUS)
+- Fix local summarizer timeout causing compaction failures (LP-0MTVJF5HU007ISP1)
+- Bug: generating-only slot pool over-subscribes local Qwen (active=2 with session_slot_pool_size=1) (LP-0MU09CAL3001MP0Z)
+- Compaction summarizer: minimise reasoning (reasoning_effort=minimal / disable Qwen3 thinking) to eliminate empty_completion (LP-0MU58PBRD004OV1I)
+- Cheap mode must serve economically-bypassed large contexts locally (fast mode keeps remote fallback) (LP-0MU5A4QBR003YJM0)
+- Compaction trigger and routing pressure use different token estimates (advisory says compact, trigger says noop) (LP-0MU5A84YU003YOTY)
+- Server-side compaction is unreachable for oversized sessions (routing bypass runs before session handling) (LP-0MU5ARWSP001BYYB)
+- Proxy mode flapping: four mode-switch restarts in 5 minutes at the 10:00 schedule boundary (herdr set-mode suspected) (LP-0MU5BOK3P0090O0V)
+
+### Other
+
+- Refactor: Formatting in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MTPMJGC3007YG0S-add-live-summarizer-wiring-to-router-hel/proxy/proxy/router_helpers.py (LP-0MTRWI65I005VXOC)
+- Refactor: Unused Import in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MRPILSMW004T4H8-multi-backend-support-multiple-local-lla/proxy/tests/test_multi_backend.py (LP-0MTT1054U001OMWR)
+- Only poison failure domain after 2nd consecutive empty_response (LP-0MTVPJQ6T004EZ75)
+- [CRITICAL] Dedicated small summarizer model for proxy-side session compaction (LP-0MTXCQA8I0038J4X)
+- Disable proxy-side (server-side) session compaction (LP-0MU61IRVC003RRN6)
+- Restart-resilient local dispatch: prevent post-restart pool wedge from no-progress prefills (LP-0MUCEEZ6B003NZH5)
+- Untrack runtime llama-server signature state file and gitignore it (LP-0MUD2G0V8004EXXZ)
+- Validate: downtime dispatcher per-slot owner-lease gate in cheap mode (proxy per-slot identity contract) (LP-0MUD3A4Q000313D3)
+
 ## v0.1.18 (2026-09-16)
 ### Features
 - Slot counts: default and fast -> 1 slot, cheap -> 3 slots (LP-0MU03AL730000B5W)
