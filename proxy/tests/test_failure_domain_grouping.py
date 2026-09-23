@@ -9,6 +9,13 @@ entry on the same broken gateway.  Router endpoints (e.g.
 ``https://opencode.ai/zen/go``) can now distinguish between different upstream
 models — a failure for model A does not exclude model B on the same gateway.
 
+Hierarchical exclusion (LP-0MTVMB8DW0067H9A) adds a second scope: a
+connection-ESTABLISHMENT failure (``ConnectError``/``ConnectTimeout``/
+``RemoteProtocolError``) is gateway-wide and excludes EVERY entry sharing the
+endpoint regardless of model, while request-level failures (HTTP 5xx,
+``finish_reason:error``, empty/zero-content, ``ReadTimeout``) stay
+model-scoped.
+
 Covers (parent AC1-AC4 / F1 AC1-AC6, F4 AC1-AC3, F5 AC1-AC2):
 
 - F4 integration tests: per-model sibling fallback — different models on
@@ -30,8 +37,10 @@ Covers (parent AC1-AC4 / F1 AC1-AC6, F4 AC1-AC3, F5 AC1-AC2):
 
 import json
 import logging
+import time
 from unittest.mock import patch
 
+import httpx
 import proxy.provider as provider
 import pytest
 from fastapi import Response
@@ -824,3 +833,440 @@ def test_resolve_skips_same_model_same_gateway_logs_scope(opencode_same_gateway_
         and domain in record.getMessage()
         for record in caplog.records
     ), f"Expected log with domain={domain}, got: {caplog.text}"
+
+
+# ===========================================================================
+# Hierarchical failure-domain exclusion (LP-0MTVMB8DW0067H9A)
+#
+# Connection-establishment failures (ConnectError / ConnectTimeout /
+# RemoteProtocolError) poison the WHOLE gateway (endpoint-only scope) while
+# request-level failures (HTTP 5xx, stall, empty response, ReadTimeout)
+# remain model-scoped.
+# ===========================================================================
+
+
+@pytest.fixture
+def multi_model_same_gateway_chain():
+    """Two DIFFERENT upstream models on the SAME gateway (opencode.ai/zen/go)
+    followed by a different gateway (api.deepseek.com)."""
+    return {
+        "providers": [
+            {
+                "name": "opencode-go-muse",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_API_KEY",
+                "model": "muse-spark-1.3-contributor",
+            },
+            {
+                "name": "opencode-go-deepseek",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_2_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+            {
+                "name": "deepseek-v4-flash",
+                "type": "remote",
+                "provider": "deepseek",
+                "endpoint": "https://api.deepseek.com",
+                "api_key_env": "DEEPSEEK_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ],
+        "aliases": ["test*"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# _gateway_domain_key: endpoint-only scope
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_domain_key_is_endpoint_only_multi_model():
+    """AC1: the gateway key is the normalized endpoint, WITHOUT the model, so
+    every upstream model on that gateway shares it."""
+    muse = {"name": "m", "type": "remote", "endpoint": "https://opencode.ai/zen/go",
+            "model": "muse-spark"}
+    deepseek = {"name": "d", "type": "remote", "endpoint": "https://opencode.ai/zen/go",
+                "model": "deepseek-v4-flash"}
+    assert provider._gateway_domain_key(muse) == "https://opencode.ai/zen/go"
+    assert provider._gateway_domain_key(muse) == provider._gateway_domain_key(deepseek)
+    # Distict from the model-scoped failure domain
+    assert provider._gateway_domain_key(muse) != provider._failure_domain_key(muse)
+
+
+def test_gateway_domain_key_normalizes_endpoint():
+    """AC1: endpoint normalization (case/port/trailing slash) applies."""
+    cfg = {"name": "a", "type": "remote",
+           "endpoint": "HTTPS://Opencode.AI:443/Zen/Go/", "model": "x"}
+    assert provider._gateway_domain_key(cfg) == "https://opencode.ai/Zen/Go"
+
+
+def test_gateway_domain_key_local_falls_back_to_brand_then_name():
+    """Local/no-endpoint entries mirror ``_failure_domain_key`` fallbacks."""
+    assert provider._gateway_domain_key(
+        {"name": "local-qwen3", "type": "local", "provider": "qwen"}
+    ) == "qwen"
+    assert provider._gateway_domain_key(
+        {"name": "local-qwen3", "type": "local"}
+    ) == "local-qwen3"
+
+
+def test_gateway_domain_key_distinct_endpoints_differ():
+    """Endpoints with different paths are different gateways (no over-grouping)."""
+    a = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai/zen"}
+    b = {"name": "b", "type": "remote", "endpoint": "https://opencode.ai/zen/go"}
+    assert provider._gateway_domain_key(a) != provider._gateway_domain_key(b)
+
+
+# ---------------------------------------------------------------------------
+# _is_gateway_level_error: connection-level vs request-level classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("exc", [
+    httpx.ConnectError("refused"),
+    httpx.ConnectTimeout("connect timed out"),
+    httpx.RemoteProtocolError("server disconnected"),
+])
+def test_is_gateway_level_error_true_for_connection_establishment(exc):
+    """AC1: DNS/refused (ConnectError), connect timeout and protocol errors
+    are gateway-wide."""
+    assert provider._is_gateway_level_error(exc) is True
+
+
+@pytest.mark.parametrize("exc", [
+    httpx.ReadTimeout("read timed out"),
+    httpx.WriteTimeout("write timed out"),
+    httpx.ReadError("read failed"),
+    httpx.WriteError("write failed"),
+    httpx.NetworkError("generic network error"),
+    ValueError("not a network error"),
+])
+def test_is_gateway_level_error_false_for_request_level(exc):
+    """AC2: post-connection/ambiguous failures stay model-scoped.
+
+    ``ReadTimeout`` is explicitly NOT gateway-wide (the work-item calls this
+    out as ambiguous); ``NetworkError`` itself (parent of Connect/Read/Write
+    errors) is also not treated as gateway-wide.
+    """
+    assert provider._is_gateway_level_error(exc) is False
+
+
+def test_connection_error_domain_key_selects_scope():
+    """ConnectError maps to the gateway scope; ReadTimeout to the model scope."""
+    cfg = {"name": "a", "type": "remote", "endpoint": "https://opencode.ai/zen/go",
+           "model": "muse-spark"}
+    assert provider._connection_error_domain_key(cfg, httpx.ConnectError("x")) == (
+        provider._gateway_domain_key(cfg)
+    )
+    assert provider._connection_error_domain_key(cfg, httpx.ReadTimeout("x")) == (
+        provider._failure_domain_key(cfg)
+    )
+
+
+# ---------------------------------------------------------------------------
+# _is_domain_excluded / _resolve_provider_with_exclusions: gateway scope
+# ---------------------------------------------------------------------------
+
+
+def test_is_domain_excluded_gateway_key_excludes_different_model(
+    multi_model_same_gateway_chain,
+):
+    """AC1: a gateway (endpoint-only) key excludes a different model on the
+    same gateway."""
+    deepseek_entry = multi_model_same_gateway_chain["providers"][1]
+    gateway = provider._gateway_domain_key(deepseek_entry)
+    assert provider._is_domain_excluded(deepseek_entry, {gateway}) == gateway
+
+
+def test_is_domain_excluded_model_key_does_not_exclude_different_model(
+    multi_model_same_gateway_chain,
+):
+    """AC2: a model-scoped key does not exclude a different model on the same
+    gateway."""
+    muse_entry = multi_model_same_gateway_chain["providers"][0]
+    deepseek_entry = multi_model_same_gateway_chain["providers"][1]
+    muse_domain = provider._failure_domain_key(muse_entry)
+    assert provider._is_domain_excluded(deepseek_entry, {muse_domain}) is None
+
+
+def test_resolve_with_exclusions_gateway_key_skips_all_models(
+    multi_model_same_gateway_chain,
+):
+    """AC1: excluding the gateway key makes resolution skip BOTH same-gateway
+    models and return the different gateway."""
+    gateway = provider._gateway_domain_key(
+        multi_model_same_gateway_chain["providers"][0]
+    )
+    result = provider._resolve_provider_with_exclusions(
+        multi_model_same_gateway_chain,
+        excluded_provider_names={"opencode-go-muse"},
+        excluded_domains={gateway},
+    )
+    assert result is not None
+    assert result["name"] == "deepseek-v4-flash"
+
+
+def test_resolve_with_exclusions_gateway_skip_logs_gateway_domain(
+    multi_model_same_gateway_chain, caplog,
+):
+    """The skip log line reports the gateway (endpoint-only) domain."""
+    gateway = provider._gateway_domain_key(
+        multi_model_same_gateway_chain["providers"][0]
+    )
+    with caplog.at_level(logging.INFO, logger="llama-proxy.provider"):
+        provider._resolve_provider_with_exclusions(
+            multi_model_same_gateway_chain,
+            excluded_provider_names={"opencode-go-muse"},
+            excluded_domains={gateway},
+        )
+    assert any(
+        "same failure domain as" in record.getMessage()
+        and gateway in record.getMessage()
+        for record in caplog.records
+    ), f"Expected gateway-scope skip log with domain={gateway}, got: {caplog.text}"
+
+
+def test_gateway_key_does_not_trip_usage_limit_account_check(
+    multi_model_same_gateway_chain,
+):
+    """AC5: gateway-scoped exclusion is independent of usage-limit account
+    quarantine — an account key is not mistaken for a gateway/domain key."""
+    entry = multi_model_same_gateway_chain["providers"][1]
+    account = provider._usage_limit_account_key(entry)
+    assert account != provider._gateway_domain_key(entry)
+    assert account != provider._failure_domain_key(entry)
+    # A gateway exclusion does not exclude the usage-limit account key.
+    assert account not in {provider._gateway_domain_key(entry)}
+
+
+# ---------------------------------------------------------------------------
+# Integration: connection-level vs request-level exclusion across the matrix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_error_excludes_gateway_across_models(
+    multi_model_same_gateway_chain,
+):
+    """AC1: a ConnectError on model A excludes model B on the SAME gateway for
+    the rest of the request; the chain routes to the different gateway."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            raise httpx.ConnectError("Connection refused")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            multi_model_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-muse", "deepseek-v4-flash"], (
+        f"ConnectError must exclude the whole gateway, got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_excludes_gateway_across_models(
+    multi_model_same_gateway_chain,
+):
+    """AC1: ConnectTimeout is likewise gateway-wide."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            raise httpx.ConnectTimeout("connect timed out")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            multi_model_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-muse", "deepseek-v4-flash"], (
+        f"ConnectTimeout must exclude the whole gateway, got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_stays_model_scoped(multi_model_same_gateway_chain):
+    """AC2: ReadTimeout is ambiguous and stays model-scoped — a different
+    model on the same reachable gateway remains eligible."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            raise httpx.ReadTimeout("read timed out")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            multi_model_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-muse", "opencode-go-deepseek"], (
+        f"ReadTimeout must stay model-scoped, got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_http_5xx_stays_model_scoped(multi_model_same_gateway_chain):
+    """AC2: an HTTP 5xx after connection stays model-scoped — a different
+    model on the same gateway remains eligible."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            return Response(status_code=502, content=b"bad gateway")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            multi_model_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-muse", "opencode-go-deepseek"], (
+        f"HTTP 5xx must stay model-scoped, got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_connect_error_excludes_same_model_siblings(
+    opencode_same_gateway_chain,
+):
+    """AC1: a ConnectError excludes same-model same-gateway siblings too."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-2-deepseek":
+            raise httpx.ConnectError("Connection refused")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            opencode_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-2-deepseek", "deepseek-v4-flash"], (
+        f"ConnectError must skip same-model siblings, got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# _record_sibling_failure / _entry_cooldown_key: hierarchical quarantine (AC4)
+# ---------------------------------------------------------------------------
+
+
+def _sibling_cfg(name, model, api_key="K"):
+    return {
+        "name": name,
+        "type": "remote",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": api_key,
+        "model": model,
+    }
+
+
+def test_record_sibling_failure_quarantines_domain_not_brand():
+    """AC4: a model-specific (empty/stall) failure quarantines the model-scoped
+    domain, not the whole brand — other models on the same gateway stay
+    eligible, while same-model siblings are skipped."""
+    provider._sibling_failure_count.clear()
+    provider._sibling_failure_streak_start.clear()
+    muse = _sibling_cfg("opencode-go-muse", "muse-spark", "K1")
+    muse_sibling = _sibling_cfg("opencode-go-muse-2", "muse-spark", "K2")
+    deepseek = _sibling_cfg("opencode-go-deepseek", "deepseek-v4-flash", "K3")
+    domain = provider._failure_domain_key(muse)
+
+    with patch("time.monotonic", return_value=1000.0), patch("time.time", return_value=1000.0):
+        assert provider._record_sibling_failure(
+            "opencode-go-muse", {}, brand="opencode-go", domain_key=domain,
+        ) is False
+        assert provider._record_sibling_failure(
+            "opencode-go-muse", {}, brand="opencode-go", domain_key=domain,
+        ) is True
+
+        assert provider._is_provider_unavailable("opencode-go-muse")
+        assert provider._is_provider_unavailable(domain)
+        # The brand is NOT quarantined: healthy models on the same gateway stay up.
+        assert not provider._is_provider_unavailable("opencode-go")
+        assert provider._entry_cooldown_key(deepseek) is None
+        # Same-model sibling shares the quarantined domain and is skipped.
+        assert provider._entry_cooldown_key(muse_sibling) == domain
+
+
+def test_record_sibling_failure_brand_fallback_without_domain():
+    """AC4 regression guard: without a domain key the legacy brand quarantine
+    still applies (entries with no endpoint/model)."""
+    provider._sibling_failure_count.clear()
+    provider._sibling_failure_streak_start.clear()
+    with patch("time.monotonic", return_value=1000.0), patch("time.time", return_value=1000.0):
+        provider._record_sibling_failure("opencode-go-2", {}, brand="opencode-go")
+        assert provider._record_sibling_failure(
+            "opencode-go-2", {}, brand="opencode-go"
+        ) is True
+        assert provider._is_provider_unavailable("opencode-go")
+
+
+@pytest.mark.asyncio
+async def test_empty_response_stays_model_scoped_after_threshold(
+    multi_model_same_gateway_chain,
+):
+    """AC2/AC4: an empty response that trips the sibling breaker quarantines
+    only the model-scoped domain — a different model on the same gateway stays
+    eligible (the brand is NOT quarantined)."""
+    provider._sibling_failure_count.clear()
+    provider._sibling_failure_streak_start.clear()
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            return Response(
+                content=json.dumps({"choices": []}),
+                status_code=200,
+                media_type="application/json",
+            )
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            multi_model_same_gateway_chain,
+            {"provider_cooldown_seconds": 60, "sibling_fallback_threshold": 1},
+        )
+
+    assert call_order == ["opencode-go-muse", "opencode-go-deepseek"], (
+        f"Empty response must stay model-scoped, got {call_order}"
+    )
+    assert result.status_code == 200
+    # The brand stays healthy for other models.
+    assert not provider._is_provider_unavailable("opencode-go")

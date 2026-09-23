@@ -1904,6 +1904,13 @@ def _entry_cooldown_key(provider_cfg: dict) -> str | None:
     name = provider_cfg.get("name", "")
     if _is_provider_unavailable(name):
         return name
+    # Model-scoped failure-domain quarantine: the sibling-fallback circuit
+    # breaker marks ``normalized_endpoint:model`` so same-model siblings on a
+    # shared gateway are skipped WITHOUT over-quarantining other models on the
+    # same gateway (LP-0MTVMB8DW0067H9A AC4).
+    domain = _failure_domain_key(provider_cfg)
+    if domain != name and _is_provider_unavailable(domain):
+        return domain
     brand = provider_cfg.get("provider")
     if brand and _is_provider_unavailable(brand):
         return brand
@@ -2255,6 +2262,7 @@ def _record_sibling_failure(
     provider_name: str,
     config: dict,
     brand: str | None = None,
+    domain_key: str | None = None,
 ) -> bool:
     """Record a consecutive empty_response/stall failure for *provider_name*.
 
@@ -2267,20 +2275,26 @@ def _record_sibling_failure(
     ``_reset_sibling_failure_count()``) or when the window expires
     without failures.
 
-    When *brand* is provided (the entry's ``provider`` field, e.g.
-    ``"opencode-go"``), the extended cooldown is applied to BOTH the entry
-    name and the brand.  ``_entry_cooldown_key`` checks the brand of every
-    entry, so quarantining the brand blocks all same-gateway sibling
-    entries (``opencode-go-2``/``opencode-go-3``) from being retried
-    through other API keys on the same failing endpoint
-    (LP-0MTPMF03P0046MFG) — mirroring how the Tier-3 stall circuit breaker
-    marks the provider brand.
+    When *domain_key* is provided (the entry's model-scoped failure domain,
+    e.g. ``https://opencode.ai/zen/go:deepseek-v4-flash``), the extended
+    cooldown is applied to the entry name AND that domain. ``_entry_cooldown_key``
+    checks the domain of every entry, so quarantining the MODEL-scoped domain
+    blocks same-model same-gateway siblings without over-quarantining other
+    upstream models on the same gateway (LP-0MTVMB8DW0067H9A AC4).
+
+    When *brand* is provided and no *domain_key* is available (entries with no
+    endpoint/model), the extended cooldown is applied to BOTH the entry name
+    and the brand (legacy behavior, LP-0MTPMF03P0046MFG).
 
     Args:
         provider_name: Provider entry name (e.g. ``"opencode-go"``).
         config: Server configuration (to read threshold/window).
         brand: Optional provider brand (``provider_cfg.get("provider")``)
             shared by same-gateway sibling entries.
+        domain_key: Optional model-scoped failure-domain key
+            (``_failure_domain_key(provider_cfg)``). When present, it is
+            quarantined instead of *brand* so other models on the same
+            gateway stay eligible (LP-0MTVMB8DW0067H9A AC4).
 
     Returns:
         ``True`` if the extended cooldown threshold was exceeded.
@@ -2311,10 +2325,15 @@ def _record_sibling_failure(
     if count >= threshold:
         cooldown = _get_sibling_fallback_cooldown_seconds(config)
         mark_provider_unavailable(provider_name, cooldown)
-        # Also quarantine the shared brand so same-gateway sibling entries
-        # are not retried via other API keys (LP-0MTPMF03P0046MFG).
-        if brand and str(brand) != provider_name:
-            mark_provider_unavailable(str(brand), cooldown)
+        # Also quarantine the shared failure domain so same-model siblings are
+        # not retried via other API keys. Prefer the MODEL-scoped domain
+        # (``endpoint:model``) over the whole brand so healthy models on the
+        # same gateway are not over-quarantined (LP-0MTVMB8DW0067H9A AC4).
+        # Entries without an endpoint/model fall back to the brand (legacy
+        # behavior, LP-0MTPMF03P0046MFG).
+        quarantine_key = domain_key or brand
+        if quarantine_key and str(quarantine_key) != provider_name:
+            mark_provider_unavailable(str(quarantine_key), cooldown)
         logger.warning(
             "Sibling-fallback circuit breaker triggered: "
             "provider=%s brand=%s consecutive_failures=%d "
@@ -2724,6 +2743,36 @@ def _is_connection_error(exc: Exception) -> bool:
         httpx.RemoteProtocolError,
         httpx.NetworkError,
     ))
+
+
+# Connection-ESTABLISHMENT failures poison the whole gateway: the TCP/TLS
+# connection could not be made (DNS resolution, refused connection, connect
+# timeout) or the wire protocol failed before a usable HTTP exchange.
+# ``ReadTimeout``/``WriteTimeout`` are deliberately excluded: they can occur
+# after the connection is established and may be specific to the upstream
+# model, so they stay model-scoped (LP-0MTVMB8DW0067H9A).
+_GATEWAY_LEVEL_ERROR_TYPES: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+def _is_gateway_level_error(exc: Exception) -> bool:
+    """Return True when *exc* indicates the gateway itself is unreachable.
+
+    A ``True`` result means failure-domain exclusion must use the
+    endpoint-wide scope (``_gateway_domain_key``): every provider entry
+    sharing the endpoint is skipped for the rest of the request, regardless
+    of upstream model (LP-0MTVMB8DW0067H9A AC1).
+
+    ``ConnectError`` covers DNS resolution failures and refused connections;
+    ``ConnectTimeout`` covers TCP/TLS connect timeouts; ``RemoteProtocolError``
+    covers malformed/closes-before-response wire failures. ``ReadTimeout`` is
+    intentionally NOT included — it is ambiguous (connect vs post-connect) and
+    is treated as request-level/model-scoped (AC2).
+    """
+    return isinstance(exc, _GATEWAY_LEVEL_ERROR_TYPES)
 
 
 def _is_http_error_status(status_code: int) -> bool:
@@ -3214,6 +3263,60 @@ def _normalize_endpoint_for_failure_domain(endpoint: str) -> str | None:
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
+def _gateway_domain_key(provider_cfg: dict) -> str:
+    """Return the endpoint-only failure-domain key for a provider entry.
+
+    Unlike ``_failure_domain_key`` (which appends ``:model``), this key
+    identifies the whole gateway: a connection-level failure poisons it so
+    ALL entries sharing the endpoint are excluded for the rest of the request,
+    regardless of upstream model (LP-0MTVMB8DW0067H9A AC1).
+
+    Remote entries key on the normalized endpoint; local/no-endpoint entries
+    fall back to the brand, then the entry name (mirroring
+    ``_failure_domain_key`` so local domains stay unchanged).
+    """
+    endpoint = provider_cfg.get("endpoint")
+    if endpoint:
+        normalized = _normalize_endpoint_for_failure_domain(str(endpoint))
+        if normalized:
+            return normalized
+    brand = provider_cfg.get("provider")
+    if brand:
+        return str(brand)
+    return str(provider_cfg.get("name") or "unknown")
+
+
+def _is_domain_excluded(provider_cfg: dict, excluded_domains: set[str]) -> str | None:
+    """Return the excluded key matching *provider_cfg*, or ``None``.
+
+    Checks BOTH the model-scoped failure domain (``endpoint:model``) and the
+    endpoint-wide gateway domain (``endpoint``): a connection-level failure
+    records the latter so every model on the dead gateway is skipped
+    (LP-0MTVMB8DW0067H9A AC1), while request-level failures record the former
+    (AC2).
+    """
+    domain = _failure_domain_key(provider_cfg)
+    if domain in excluded_domains:
+        return domain
+    gateway = _gateway_domain_key(provider_cfg)
+    if gateway != domain and gateway in excluded_domains:
+        return gateway
+    return None
+
+
+def _connection_error_domain_key(provider_cfg: dict, exc: Exception) -> str:
+    """Return the failure-domain key to record for a connection exception.
+
+    Connection-establishment failures exclude the whole gateway
+    (``_gateway_domain_key``); ambiguous connection-ish failures such as
+    ``ReadTimeout`` stay model-scoped (``_failure_domain_key``)
+    (LP-0MTVMB8DW0067H9A AC1/AC2).
+    """
+    if _is_gateway_level_error(exc):
+        return _gateway_domain_key(provider_cfg)
+    return _failure_domain_key(provider_cfg)
+
+
 def _usage_limit_account_key(provider_cfg: dict) -> str:
     """Return a canonical key identifying the upstream ACCOUNT for usage-limit
     quarantine (LP-0MSMBWB23009XYPW).
@@ -3257,13 +3360,13 @@ def _resolve_provider_with_exclusions(
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
             continue
-        domain = _failure_domain_key(provider_cfg)
-        if domain in excluded_domains:
+        matched_domain = _is_domain_excluded(provider_cfg, excluded_domains)
+        if matched_domain is not None:
             logger.info(
                 "Skipping provider=%s: same failure domain as an already-failed "
                 "entry (domain=%s)",
                 name,
-                domain,
+                matched_domain,
             )
             continue
         # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
@@ -4655,7 +4758,8 @@ async def _proxy_with_remote_fallback_cycle(
                     # failure streak so the provider gets an extended cooldown
                     # after the threshold and the retry cycle skips to a sibling.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
@@ -4682,7 +4786,8 @@ async def _proxy_with_remote_fallback_cycle(
                     # count toward the streak so it is skipped for a sibling
                     # after the threshold.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
@@ -4837,7 +4942,8 @@ async def _proxy_with_remote_fallback_cycle(
                     # single empty response does not block sibling API keys
                     # on the same endpoint (LP-0MTVPJQ6T004EZ75).
                     _threshold_exceeded = _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     if _threshold_exceeded:
                         attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -4863,7 +4969,7 @@ async def _proxy_with_remote_fallback_cycle(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
-                attempted_domains.add(_failure_domain_key(provider_cfg))
+                attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -5137,7 +5243,7 @@ async def _proxy_with_fallback_cycle(
                 candidate_name = candidate.get("name", "")
                 if candidate_name in attempted_provider_names:
                     continue
-                if _failure_domain_key(candidate) in attempted_domains:
+                if _is_domain_excluded(candidate, attempted_domains) is not None:
                     continue
                 if candidate.get("type") != "remote":
                     continue
@@ -5566,7 +5672,8 @@ async def _proxy_with_fallback_cycle(
                     # failure streak so the provider gets an extended cooldown
                     # after the threshold and the retry cycle skips to a sibling.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
@@ -5593,7 +5700,8 @@ async def _proxy_with_fallback_cycle(
                     # count toward the streak so it is skipped for a sibling
                     # after the threshold.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
@@ -6003,7 +6111,8 @@ async def _proxy_with_fallback_cycle(
                                 cooldown_seconds, attempts, body_text, config,
                             )
                             _threshold_exceeded = _record_sibling_failure(
-                                provider_name, config, provider_cfg.get("provider")
+                                provider_name, config, provider_cfg.get("provider"),
+                                domain_key=_failure_domain_key(provider_cfg)
                             )
                             if _threshold_exceeded:
                                 attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -6018,7 +6127,8 @@ async def _proxy_with_fallback_cycle(
                             cooldown_seconds, attempts, body_text, config,
                         )
                         _threshold_exceeded = _record_sibling_failure(
-                            provider_name, config, provider_cfg.get("provider")
+                            provider_name, config, provider_cfg.get("provider"),
+                            domain_key=_failure_domain_key(provider_cfg)
                         )
                         if _threshold_exceeded:
                             attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -6048,7 +6158,7 @@ async def _proxy_with_fallback_cycle(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
-                attempted_domains.add(_failure_domain_key(provider_cfg))
+                attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
