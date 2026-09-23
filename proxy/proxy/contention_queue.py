@@ -37,11 +37,6 @@ from collections.abc import Callable
 _waiters: deque = deque()  # deque of (enqueued_at, asyncio.Event)
 _condition: asyncio.Condition | None = None
 
-# Metrics (F4 AC1/AC8): queued count, queued duration, fallback-after-queue
-queued_count = 0
-queued_duration_seconds = 0.0
-fallback_after_queue_count = 0
-
 
 def _get_condition() -> asyncio.Condition:
     global _condition
@@ -52,52 +47,14 @@ def _get_condition() -> asyncio.Condition:
 
 def reset() -> None:
     """Reset all queue state (test helper)."""
-    global _waiters, _condition, queued_count, queued_duration_seconds, fallback_after_queue_count
+    global _waiters, _condition
     _waiters = deque()
     _condition = None
-    queued_count = 0
-    queued_duration_seconds = 0.0
-    fallback_after_queue_count = 0
 
 
 def queue_depth() -> int:
     """Current number of waiters in the cross-session queue."""
     return len(_waiters)
-
-
-def metrics() -> dict:
-    """Cumulative queue metrics for the status_request / dispatch logs."""
-    return {
-        "contention_queue_depth": len(_waiters),
-        "contention_queued_count": queued_count,
-        "contention_queued_duration_seconds": round(queued_duration_seconds, 3),
-        "contention_fallback_after_queue_count": fallback_after_queue_count,
-    }
-
-
-def status_fields(server_config: dict) -> dict:
-    """Queue fields for the status_request log line.
-
-    Returns an empty dict when the per-mode policy is not ``queue``.
-    Otherwise exposes queue depth, queued count, queued duration, and
-    fallback-after-queue count (F4 AC1). The policy gate is the only
-    check — per-mode config (config-fast.yaml vs config-cheap.yaml)
-    determines the depth/wait caps, and both modes can declare ``queue``
-    (LP-0MTQYIK4Z008XF2V).
-    """
-    policy = str(
-        (server_config or {}).get("contention_queue_policy", "fallback") or "fallback"
-    ).strip().lower()
-    if policy != "queue":
-        return {}
-    m = metrics()
-    return {
-        "contention_queue_policy": "queue",
-        "contention_queue_depth": m["contention_queue_depth"],
-        "contention_queued_count": m["contention_queued_count"],
-        "contention_queued_duration_seconds": m["contention_queued_duration_seconds"],
-        "contention_fallback_after_queue_count": m["contention_fallback_after_queue_count"],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -148,30 +105,25 @@ async def wait_for_local_slot(
     *slot_free_check* is a zero-arg callable returning True when a local
     slot is currently free (e.g. ``lambda: _get_local_concurrency_info(config)[0] < max_local``).
     """
-    global queued_count, queued_duration_seconds, fallback_after_queue_count
     cond = _get_condition()
     started = time.monotonic()
     async with cond:
         if len(_waiters) >= max_depth:
             # Depth cap exceeded — don't even enqueue; fall back immediately.
-            fallback_after_queue_count += 1
             return None
         if slot_free_check():
             # Slot already free (race between the decision point and here).
             return 0.0
         ev = asyncio.Event()
         _waiters.append((started, ev))
-        queued_count += 1
     try:
         while True:
             remaining = max_wait_seconds - (time.monotonic() - started)
             if remaining <= 0:
-                fallback_after_queue_count += 1
                 return None
             try:
                 await asyncio.wait_for(ev.wait(), timeout=remaining)
             except TimeoutError:
-                fallback_after_queue_count += 1
                 return None
             if slot_free_check():
                 return time.monotonic() - started
@@ -184,4 +136,3 @@ async def wait_for_local_slot(
                 if e is ev:
                     del _waiters[i]
                     break
-            queued_duration_seconds += time.monotonic() - started

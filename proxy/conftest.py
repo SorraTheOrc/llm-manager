@@ -27,6 +27,21 @@ def _reset_slot_counts_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_slots_poll_cache():
+    """Reset the coalesced /slots poll cache before every test.
+
+    ``_fetch_slots_payload()`` caches /slots responses behind a short TTL
+    (LP-0MUCEFD5B003TURT). Tests stub the HTTP client and expect each call to
+    be observed, so the cache must not leak between tests.
+    """
+    import proxy.observability as obs
+
+    obs.reset_slots_poll_cache()
+    yield
+    obs.reset_slots_poll_cache()
+
+
+@pytest.fixture(autouse=True)
 def _reset_server_global_state(monkeypatch):
     """Reset global server counters that leak across tests.
 

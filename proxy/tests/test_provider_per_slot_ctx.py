@@ -102,9 +102,10 @@ class TestEffectiveLargeContextThresholds:
         update_cached_ratio("Qwen3", "sess_a", cached_tokens=96, prompt_tokens=100)
         phrase = "test message content for token estimation "
         body = {"messages": [{"role": "user", "content": phrase * 7300}]}  # ~43.7K tokens
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "sess_a", body, cold, warm_cache_threshold=warm
-        ) is True
+        )
+        assert skip is True
 
 
 class TestColdWarmBandReachable:
@@ -165,9 +166,10 @@ class TestColdWarmBandReachable:
         # 15.6K new tokens <= cold 38000, so routes local.
         update_cached_ratio("Qwen3", "band_sess", cached_tokens=60, prompt_tokens=100)
         body = {"messages": [{"role": "user", "content": "x " * 39000}]}  # ~39K est
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "band_sess", body, cold, warm_cache_threshold=warm
-        ) is False
+        )
+        assert skip is False
 
     def test_check2_cold_ratio_bypasses_in_band(self):
         """AC2: the same band request with a cold cache (ratio 0 -> all 39K
@@ -178,9 +180,10 @@ class TestColdWarmBandReachable:
 
         # Cold cache (ratio 0.0): unknown session defaults to conservative.
         body = {"messages": [{"role": "user", "content": "x " * 39000}]}  # ~39K est
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is True
+        )
+        assert skip is True
 
     def test_check2_warm_ratio_high_new_tokens_bypasses(self):
         """AC2: even with a warm cache, if the uncached (new) token count
@@ -193,9 +196,10 @@ class TestColdWarmBandReachable:
         # > cold 38000, so local is bypassed despite a warm-ish cache.
         update_cached_ratio("Qwen3", "band_sess2", cached_tokens=3, prompt_tokens=100)
         body = {"messages": [{"role": "user", "content": "x " * 39500}]}  # ~39.5K est
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "band_sess2", body, cold, warm_cache_threshold=warm
-        ) is True
+        )
+        assert skip is True
 
     def test_35k_cold_cache_now_routes_local(self):
         """AC3 (fast mode): a cold-cache prompt at ~35K tokens now routes
@@ -205,9 +209,10 @@ class TestColdWarmBandReachable:
         cold, warm = _effective_large_context_thresholds(config)
         # Cold cache: unknown session, ratio defaults to 0.0 (conservative).
         body = {"messages": [{"role": "user", "content": "x " * 35000}]}  # ~35K est
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is False
+        )
+        assert skip is False
 
     def test_45k_cold_cache_still_bypasses(self):
         """AC3 (fast mode): a cold-cache prompt at ~45K tokens still
@@ -217,9 +222,10 @@ class TestColdWarmBandReachable:
         config = self._production_config()
         cold, warm = _effective_large_context_thresholds(config)
         body = {"messages": [{"role": "user", "content": "x " * 45000}]}  # ~45K est
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is True
+        )
+        assert skip is True
 
 
 class TestCheapModeColdThreshold:
@@ -241,12 +247,14 @@ class TestCheapModeColdThreshold:
 
     def _cheap_config(self):
         """Mirror the live proxy/config-cheap.yaml routing settings (cold
-        raised to 42000 per LP-0MT50WCCP000DU00)."""
+        raised to 42000 per LP-0MT50WCCP000DU00; economic-bypass recovery
+        flag per LP-0MU5A4QBR003YJM0)."""
         return {"server": {
             "local_large_context_cold_cache_threshold": 42000,
             "local_large_context_warm_cache_threshold": 100000,
             "local_model_ctx_size": 131072,
             "session_slot_pool_size": 2,
+            "local_large_context_economic_bypass_serves_local": True,
         }}
 
     def test_cheap_cold_below_effective_warm(self):
@@ -302,55 +310,102 @@ class TestCheapModeColdThreshold:
         local — below the raised cold 42000, 35K new tokens are under the
         threshold (recaptured band (42K, 100K]; 35K < 42K so it routes
         local, LP-0MT50WCCP000DU00)."""
-        from proxy.provider import _effective_large_context_thresholds, _should_skip_local
+        from proxy.provider import (
+            _economic_bypass_serves_local,
+            _effective_large_context_thresholds,
+            _should_skip_local,
+        )
 
         config = self._cheap_config()
         cold, warm = _effective_large_context_thresholds(config)
         body = {"messages": [{"role": "user", "content": "x " * 35000}]}  # ~35K est
-        assert _should_skip_local(
-            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is False
+        skip, _ = _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm,
+            economic_bypass_serves_local=_economic_bypass_serves_local(config),
+        )
+        assert skip is False
 
-    def test_cheap_45k_cold_cache_still_bypasses(self):
-        """AC3 (cheap mode): a cold-cache prompt at ~45K tokens still
-        bypasses — above the recaptured cold 42000, so all ~45K tokens are
-        new and exceed the threshold (recaptured band (42K, 100K];
-        LP-0MT50WCCP000DU00)."""
+    def test_cheap_45k_economic_bypass_served_locally(self):
+        """AC1 (cheap mode, LP-0MU5A4QBR003YJM0): a cold-cache prompt at
+        ~45K tokens (above cold 42000, below warm 61440) is an economic
+        bypass — with the cheap profile's recovery flag the request proceeds
+        to local (skip=False) rather than falling back to a paid remote."""
+        from proxy.provider import (
+            _economic_bypass_serves_local,
+            _effective_large_context_thresholds,
+            _should_skip_local,
+        )
+
+        config = self._cheap_config()
+        cold, warm = _effective_large_context_thresholds(config)
+        body = {"messages": [{"role": "user", "content": "x " * 45000}]}  # ~45K est
+        skip, reason = _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm,
+            economic_bypass_serves_local=_economic_bypass_serves_local(config),
+        )
+        assert skip is False
+        assert reason is None
+
+    def test_fast_45k_economic_bypass_still_skips(self):
+        """AC2 (fast mode, LP-0MU5A4QBR003YJM0): the same ~45K economic
+        bypass without the recovery flag (fast/default) still skips local
+        (large_context_bypass) and falls back to remote for tail latency."""
         from proxy.provider import _effective_large_context_thresholds, _should_skip_local
 
         config = self._cheap_config()
         cold, warm = _effective_large_context_thresholds(config)
         body = {"messages": [{"role": "user", "content": "x " * 45000}]}  # ~45K est
-        assert _should_skip_local(
-            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is True
+        skip, reason = _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm,
+            economic_bypass_serves_local=False,
+        )
+        assert skip is True
+        assert reason == "large_context_bypass"
 
     def test_cheap_110k_cold_cache_still_bypasses(self):
-        """AC3 (cheap mode): a cold-cache prompt at ~110K tokens still
-        bypasses — above the warm 100000 (context_too_large, physical
-        capacity)."""
+        """AC3 (both modes): a cold-cache prompt at ~110K tokens still
+        bypasses — above the warm 61440 (context_too_large, physical
+        capacity) with or without the recovery flag."""
         from proxy.provider import _effective_large_context_thresholds, _should_skip_local
 
         config = self._cheap_config()
         cold, warm = _effective_large_context_thresholds(config)
         body = {"messages": [{"role": "user", "content": "x " * 110000}]}  # ~110K est
-        assert _should_skip_local(
-            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is True
+        for flag in (True, False):
+            skip, reason = _should_skip_local(
+                "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm,
+                economic_bypass_serves_local=flag,
+            )
+            assert skip is True, f"physical capacity must bypass (flag={flag})"
+            assert reason == "context_too_large"
 
-    def test_cheap_cold_cache_bypasses_only_above_cold_in_band(self):
-        """AC3 (cheap mode): inside the (42000, 100000] band with a cold
-        cache, a prompt whose new tokens exceed cold 42000 still bypasses —
-        cold-cache recapture only applies up to the cold threshold."""
-        from proxy.provider import _effective_large_context_thresholds, _should_skip_local
+    def test_cheap_cold_cache_band_served_locally(self):
+        """AC1 (cheap mode): inside the (42000, 61440] band with a cold
+        cache, a prompt whose new tokens exceed cold 42000 is recovered
+        locally (skip=False) with the recovery flag; without it, it
+        bypasses."""
+        from proxy.provider import (
+            _economic_bypass_serves_local,
+            _effective_large_context_thresholds,
+            _should_skip_local,
+        )
 
         config = self._cheap_config()
         cold, warm = _effective_large_context_thresholds(config)
-        # 43K is in (42000, 100000]; cold cache -> 43K new tokens > cold 42000
+        # 43K is in (42000, 61440]; cold cache -> 43K new tokens > cold 42000
         body = {"messages": [{"role": "user", "content": "x " * 43000}]}  # ~43K est
-        assert _should_skip_local(
-            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm
-        ) is True
+        skip_cheap, reason_cheap = _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm,
+            economic_bypass_serves_local=_economic_bypass_serves_local(config),
+        )
+        assert skip_cheap is False
+        assert reason_cheap is None
+        skip_fast, reason_fast = _should_skip_local(
+            "Qwen3", "never_seen", body, cold, warm_cache_threshold=warm,
+            economic_bypass_serves_local=False,
+        )
+        assert skip_fast is True
+        assert reason_fast == "large_context_bypass"
 
 
 class TestGetActiveLocalCtxSize:
@@ -505,6 +560,7 @@ class TestEffectiveLargeContextThresholds1Slot:
         cold, warm = _effective_large_context_thresholds(config)
         # 110K > warm 100K → context_too_large → skip local
         body = {"messages": [{"role": "user", "content": "x " * 110000}]}
-        assert _should_skip_local(
+        skip, _ = _should_skip_local(
             "Qwen3", "large_sess", body, cold, warm_cache_threshold=warm
-        ) is True
+        )
+        assert skip is True

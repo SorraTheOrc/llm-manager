@@ -272,11 +272,12 @@ class TestCheapConfigProfile:
         LP-0MSORQVK50012Q4D F2 / LP-0MTQYIK4Z008XF2V), the cold-cache
         threshold (cheap 42000 raised from 38000, LP-0MSOMVOPH004ATAK
         / LP-0MSRM54YO007YG0K AC7 / LP-0MSY0V4ZO002ANPL / LP-0MT50SMU1005ZAD6;
-        fast/default stays 38000 — cheap-only change, LP-0MT50WCCP000DU00), and
-        the persistence cap (cheap 126976 vs fast 83285, each pinned to its
-        mode's routing clamp, LP-0MTBTCB8D000OQ0C). Everything else
-        (models, warm threshold) is identical. There is no slot_schedule in
-        either profile (LP-0MTZRM5HV0007S0V)."""
+        fast/default stays 38000 — cheap-only change, LP-0MT50WCCP000DU00),
+        the economic-bypass recovery flag (cheap true, fast absent,
+        LP-0MU5A4QBR003YJM0), and the persistence cap (cheap 126976 vs fast
+        83285, each pinned to its mode's routing clamp, LP-0MTBTCB8D000OQ0C).
+        Everything else (models, warm threshold) is identical. There is no
+        slot_schedule in either profile (LP-0MTZRM5HV0007S0V)."""
         cheap = _load("config-cheap.yaml")
         fast = _load("config-fast.yaml")
         cheap_srv = dict(cheap["server"])
@@ -298,6 +299,11 @@ class TestCheapConfigProfile:
         # cheap 42000, fast 38000 (asymmetric — cheap-only change).
         cheap_srv.pop("local_large_context_cold_cache_threshold", None)
         fast_srv.pop("local_large_context_cold_cache_threshold", None)
+        # Economic-bypass recovery flag (LP-0MU5A4QBR003YJM0): cheap enables
+        # local recovery of the economic cold-cache bypass; fast omits the
+        # key (default false).  Intended cheap-only difference.
+        cheap_srv.pop("local_large_context_economic_bypass_serves_local", None)
+        fast_srv.pop("local_large_context_economic_bypass_serves_local", None)
         # Persistence cap derived per profile from each mode's hard-routing
         # cap (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4): static 0
         # (derive) in both.
@@ -329,6 +335,15 @@ class TestCheapConfigProfile:
         assert fast["server"]["contention_queue_max_depth"] < cheap["server"]["contention_queue_max_depth"]
         assert fast["server"]["contention_queue_max_wait_seconds"] < cheap["server"]["contention_queue_max_wait_seconds"]
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
+        # Economic-bypass recovery flag (LP-0MU5A4QBR003YJM0): cheap enables
+        # local recovery; fast omits the key (defaults to false).
+        assert (
+            cheap["server"]["local_large_context_economic_bypass_serves_local"]
+            is True
+        )
+        assert (
+            "local_large_context_economic_bypass_serves_local" not in fast["server"]
+        )
         # Per-mode persistence caps derive from each profile's hard-routing
         # cap when enabled (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4)
         # but the cap is DISABLED in the revert (LP-0MTLB1LK80098R43 per

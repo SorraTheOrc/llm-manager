@@ -21,6 +21,8 @@ drain, with a Retry-After, and ``enabled: false`` restores the old
 import math
 import threading
 import time
+from datetime import datetime
+from datetime import time as dt_time
 
 import pytest
 
@@ -39,6 +41,17 @@ def _reset_drain_state(monkeypatch):
         mode_module._drain_deadline = None
     with mode_module._mode_lock:
         mode_module._restart_pending = False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cooldown_state(tmp_path, monkeypatch):
+    """Redirect the fast->cheap cooldown state file to a tmp path
+    (LP-0MU6MQIPP0058198) so drain tests never touch the real checkout."""
+    monkeypatch.setattr(
+        mode_module,
+        "last_fast_switch_file",
+        lambda: tmp_path / ".mode.last-fast-switch",
+    )
 
 
 @pytest.fixture
@@ -281,3 +294,61 @@ class TestDrainApiGate:
                 json={"model": "plan", "messages": [{"role": "user", "content": "hi"}]},
             )
         assert resp.status_code != 503 or resp.json().get("error", {}).get("type") != "mode_switch_drain"
+
+
+# ---------------------------------------------------------------------------
+# Fast -> cheap cooldown across a mode-switch restart (LP-0MU6MQIPP0058198)
+# ---------------------------------------------------------------------------
+
+
+class TestCooldownAcrossRestart:
+    """The cooldown clock is file-persisted (an in-memory clock would be wiped
+    by the very restart the fast switch triggers) and the scheduled path
+    bypasses it so the operator's schedule still applies."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_mode_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: tmp_path / ".mode")
+        monkeypatch.setattr(
+            mode_module,
+            "override_until_file",
+            lambda: tmp_path / ".mode.override-until",
+        )
+
+    def test_timestamp_survives_restart_and_blocks_revert(self, monkeypatch):
+        """A fast switch records the clock; after the (simulated) restart the
+        persisted timestamp still refuses a manual fast->cheap revert."""
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_mode("cheap")
+        mode_module.set_mode("fast")  # real transition -> records the clock
+        recorded = mode_module.read_last_fast_switch()
+        assert recorded is not None
+        # Simulated process restart: the in-memory restart flag is gone.
+        with mode_module._mode_lock:
+            mode_module._restart_pending = False
+        assert mode_module.read_mode() == "fast"
+        assert mode_module.read_last_fast_switch() == recorded
+        with pytest.raises(mode_module.ModeSwitchCooldownError):
+            mode_module.set_mode("cheap", manual=True)
+
+    def test_scheduler_bypasses_cooldown(self, monkeypatch):
+        """The scheduled cheap transition applies even inside the cooldown
+        window, while a manual revert in the same window is refused."""
+        monkeypatch.setattr(mode_module, "_spawn_restart", lambda: None)
+        mode_module.write_mode("fast")
+        mode_module.write_last_fast_switch(datetime.now())
+        schedule = mode_module.ModeScheduleConfig(
+            {
+                "enabled": True,
+                "entries": [
+                    {"time": "01:00", "mode": "cheap"},
+                    {"time": "10:00", "mode": "fast"},
+                ],
+            }
+        )
+        # Sanity: a manual revert in the same window is refused.
+        with pytest.raises(mode_module.ModeSwitchCooldownError):
+            mode_module.set_mode("cheap", manual=True)
+        # Scheduler path bypasses the cooldown and applies the schedule.
+        assert mode_module._mode_scheduler_step(schedule, now=dt_time(1, 0)) is True
+        assert mode_module.read_mode() == "cheap"

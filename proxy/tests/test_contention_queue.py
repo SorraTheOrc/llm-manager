@@ -19,8 +19,7 @@ Covered acceptance criteria (F1 LP-0MSOZESW90057SRR):
   slot-persistence / lease release.
 - AC7: queued wait subtracts from the client-visible adaptive timeout budget
   (Q2=a).
-- AC8: queue metrics (queued count, queued duration, fallback-after-queue
-  count) are emitted when policy is queue; not emitted when fallback.
+- AC8: queue depth is logged on dispatch; no cumulative counters exposed.
 
 Time mocking: the 60s wait cap is exercised with tiny caps (0.05-0.2s) or by
 patching ``_get_contention_queue_config`` — never a real 60s sleep.
@@ -208,12 +207,8 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
 
     assert result.status_code == 200
     assert call_log == ["local"], "queued request must dispatch local"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 1
-    assert metrics["contention_queued_duration_seconds"] >= 0.0
-    assert metrics["contention_fallback_after_queue_count"] == 0
 
-    # F4 AC1: the dispatch log line carries queue depth + policy.
+    # F1 AC1: the dispatch log line carries queue depth + policy.
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_dispatch" in messages
     assert "policy=queue" in messages
@@ -264,11 +259,8 @@ async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
 
     assert result.status_code == 200
     assert call_log == ["remote"], "wait-cap exceeded must fall back to remote"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 1
-    assert metrics["contention_fallback_after_queue_count"] == 1
 
-    # F4 AC2: the fallback-after-queue log line carries the elapsed wait.
+    # F1 AC2: the fallback-after-queue log line carries the elapsed wait.
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages
     assert "queued_duration=" in messages
@@ -300,8 +292,6 @@ async def test_queue_module_depth_cap_returns_none():
         5.0, max_depth=1, slot_free_check=_slot_free
     )
     assert result is None
-    metrics = contention_queue.metrics()
-    assert metrics["contention_fallback_after_queue_count"] == 1
     assert contention_queue.queue_depth() == 1, "second request must not enqueue"
 
     # Cleanup: cancel the held waiter.
@@ -358,8 +348,6 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
         )
         assert result2.status_code == 200
         assert "remote" in call_log
-        metrics = contention_queue.metrics()
-        assert metrics["contention_fallback_after_queue_count"] >= 1
 
         # Free the slot → the queued first request dispatches local.
         concurrency.active = 0
@@ -376,9 +364,9 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
 
 @pytest.mark.asyncio
 async def test_context_bypass_never_queued(mixed_model_config):
-    """A request that would be context-bypassed (context_too_large /
-    large_context_bypass) must NEVER wait in the contention queue — it falls
-    back exactly as today."""
+    """A physically-oversized request (context_too_large) must NEVER wait in
+    the contention queue — it falls back exactly as today in every mode
+    (LP-0MSORQVK50012Q4D AC4, LP-0MU5A4QBR003YJM0 AC3)."""
     concurrency = _MutableConcurrency(active=1, max_=1)
     call_log = []
 
@@ -399,13 +387,13 @@ async def test_context_bypass_never_queued(mixed_model_config):
     cfg = _queue_cfg(
         local_large_context_cold_cache_threshold=100,
         local_large_context_warm_cache_threshold=200,
+        local_large_context_economic_bypass_serves_local=True,
     )
 
     with (
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -413,10 +401,168 @@ async def test_context_bypass_never_queued(mixed_model_config):
 
     assert result.status_code == 200
     assert call_log == ["remote"], "context bypass must fall back to remote"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 0, "context bypass must not queue"
     assert contention_queue.queue_depth() == 0
-    assert metrics["contention_fallback_after_queue_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC2: config-driven economic bypass recovery (LP-0MU5A4QBR003YJM0)
+# ---------------------------------------------------------------------------
+
+
+def _economic_bypass_body() -> bytes:
+    """A body whose estimate sits between a small cold threshold and a large
+    warm threshold — an economic (not physical) bypass."""
+    phrase = "test message content for token estimation "
+    return json.dumps(
+        {"model": "test", "messages": [{"role": "user", "content": phrase * 2000}]}
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_cheap_mode_economic_bypass_serves_local(mixed_model_config, caplog):
+    """AC1 (LP-0MU5A4QBR003YJM0): with the cheap profile's recovery flag an
+    economic bypass (new_tokens > cold, total <= warm) is served locally — no
+    remote attempt.  A distinct ``routing_economic_bypass_local`` log line
+    records the recovery (AC5).
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    # Slots available → local dispatch directly.
+    concurrency = _MutableConcurrency(active=0, max_=1)
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(body=_economic_bypass_body())
+    cfg = _queue_cfg(
+        local_large_context_cold_cache_threshold=100,
+        local_large_context_warm_cache_threshold=100_000,
+        local_large_context_economic_bypass_serves_local=True,
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["local"], (
+        "cheap mode must serve the economic bypass locally (no remote)"
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_economic_bypass_local" in messages
+    assert "routing_skip_local" not in messages
+
+
+@pytest.mark.asyncio
+async def test_cheap_mode_economic_bypass_queues_when_busy(mixed_model_config):
+    """AC1 (LP-0MU5A4QBR003YJM0): with the recovery flag an economic bypass
+    enters the existing contention queue when all slots are busy and
+    dispatches local when a slot frees — it never falls back to a paid
+    remote."""
+    concurrency = _MutableConcurrency(active=1, max_=1)
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(body=_economic_bypass_body())
+    cfg = _queue_cfg(
+        local_large_context_cold_cache_threshold=100,
+        local_large_context_warm_cache_threshold=100_000,
+        local_large_context_economic_bypass_serves_local=True,
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+    ):
+        task = asyncio.create_task(
+            provider.proxy_with_fallback(
+                request, "v1/chat/completions", mixed_model_config, cfg
+            )
+        )
+        for _ in range(200):
+            if contention_queue.queue_depth() > 0:
+                break
+            await asyncio.sleep(0.005)
+        assert contention_queue.queue_depth() == 1, (
+            "economic bypass must queue behind the busy slot in cheap mode"
+        )
+
+        concurrency.active = 0
+        await contention_queue.wake_all()
+        result = await asyncio.wait_for(task, timeout=5)
+
+    assert result.status_code == 200
+    assert call_log == ["local"], (
+        "queued economic bypass must dispatch local, not remote"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fast_mode_economic_bypass_falls_back_remote(
+    mixed_model_config, caplog
+):
+    """AC2 (LP-0MU5A4QBR003YJM0): without the recovery flag (fast/default
+    profile) the same economic bypass still skips local
+    (``large_context_bypass``) and falls back to the next remote provider —
+    no local attempt, no queue."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    concurrency = _MutableConcurrency(active=0, max_=1)
+    call_log = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(body=_economic_bypass_body())
+    cfg = _queue_cfg(
+        local_large_context_cold_cache_threshold=100,
+        local_large_context_warm_cache_threshold=100_000,
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", concurrency),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, cfg
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["remote"], (
+        "fast mode must keep the economic bypass remote fallback"
+    )
+    assert contention_queue.queue_depth() == 0
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_skip_local" in messages
+    assert "reason=large_context_bypass" in messages
+    assert "routing_economic_bypass_local" not in messages
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +606,6 @@ async def test_fast_mode_fallback_policy_unchanged(mixed_model_config):
 
     assert result.status_code == 200
     assert call_log == ["remote"], "fast mode falls back immediately, no queue"
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 0
-    assert metrics["contention_fallback_after_queue_count"] == 0
     assert contention_queue.queue_depth() == 0
     # F1 AC5 byte-for-byte: the client-visible response is byte-identical to
     # what the remote provider returned (no queue layer mutates the payload).
@@ -533,9 +676,6 @@ async def test_fast_mode_fallback_dispatch_bytes_unchanged(mixed_model_config):
     )
     # No queue involvement in fast mode.
     assert contention_queue.queue_depth() == 0
-    metrics = contention_queue.metrics()
-    assert metrics["contention_queued_count"] == 0
-    assert metrics["contention_fallback_after_queue_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -561,7 +701,7 @@ async def test_absent_contention_keys_default_to_fallback(mixed_model_config):
 
     assert result.status_code == 200
     assert call_log == ["remote"]
-    assert contention_queue.metrics()["contention_queued_count"] == 0
+    assert contention_queue.queue_depth() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -694,55 +834,6 @@ async def test_queued_dispatch_marks_request_budget(mixed_model_config):
 # ---------------------------------------------------------------------------
 # AC8: metrics emitted when policy is queue; not when fallback
 # ---------------------------------------------------------------------------
-
-
-def test_metrics_not_emitted_when_fallback_policy():
-    """status_request fields helper returns no queue fields for fallback."""
-    from proxy.contention_queue import status_fields
-
-    assert status_fields({"contention_queue_policy": "fallback"}) == {}
-
-
-def test_metrics_emitted_when_queue_policy():
-    """status_request fields helper exposes queue metrics for queue policy
-    while in cheap mode."""
-    from proxy.contention_queue import status_fields
-
-    with patch("proxy.mode.read_mode", return_value="cheap"):
-        fields = status_fields(
-            {
-                "contention_queue_policy": "queue",
-                "contention_queue_max_wait_seconds": 60,
-                "contention_queue_max_depth": 4,
-            }
-        )
-    assert fields.get("contention_queue_policy") == "queue"
-    assert "contention_queue_depth" in fields
-    assert "contention_queued_count" in fields
-    assert "contention_queued_duration_seconds" in fields
-    assert "contention_fallback_after_queue_count" in fields
-
-
-def test_metrics_emitted_when_queue_policy_in_fast_mode():
-    """status_fields emits queue metrics when policy is queue, regardless of
-    operating mode (LP-0MTQYIK4Z008XF2V): fast mode can also declare queue
-    with smaller caps.
-
-    Previously (pre-LP-0MTQYIK4Z008XF2V) the mode gate suppressed queue
-    fields in fast mode. Now both modes use the policy gate only.
-    """
-    from proxy.contention_queue import status_fields
-
-    with patch("proxy.mode.read_mode", return_value="fast"):
-        fields = status_fields(
-            {
-                "contention_queue_policy": "queue",
-                "contention_queue_max_wait_seconds": 60,
-                "contention_queue_max_depth": 4,
-            }
-        )
-    assert fields.get("contention_queue_policy") == "queue"
-    assert "contention_queue_depth" in fields
 
 
 @pytest.mark.asyncio

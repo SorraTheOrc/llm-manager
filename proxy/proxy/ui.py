@@ -7,6 +7,7 @@ Uses lazy server import (_srv()) to avoid circular imports.
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -52,6 +53,30 @@ def _has_fallback_providers(model_cfg):
         return True
     first = providers[0] if providers else {}
     return isinstance(first, dict) and first.get("type") == "remote"
+
+
+def _model_can_route_remote(model_cfg) -> bool:
+    """Return True when *model_cfg*'s chain contains a remote provider.
+
+    This mirrors the dispatch path's provider selection: both
+    ``_dispatch_local_model_load`` and ``proxy_with_fallback`` iterate the
+    model's ``providers`` list and can only ever reach a remote provider when
+    that list contains one.  A purely local chain (single local provider or
+    multiple local backends) has no remote escape hatch, so a request for it
+    can only be served by the local backend.
+
+    Used by the startup ramp gate (LP-0MUAY9AMS002O2ZO) so the gate is driven
+    by the same provider-chain structure the router dispatches on — the two
+    cannot diverge: no remote provider in the chain means no remote dispatch.
+    """
+    if not isinstance(model_cfg, dict):
+        return False
+    providers = model_cfg.get("providers") or []
+    if not isinstance(providers, list):
+        return False
+    return any(
+        isinstance(p, dict) and p.get("type") == "remote" for p in providers
+    )
 
 
 def _current_mode() -> str:
@@ -964,8 +989,118 @@ async def _do_proxy_openai_api(
     # synthetic ``finish_reason: error`` to the client).
     if path == "chat/completions":
         try:
+            import random as _random_mod
+
             from proxy import mode as _mode_mod
 
+            # --- Early body parse for ramp gate routing check (LP-0MUAY9AMS002O2ZO) ---
+            # Parse the body before the ramp gate so we can determine whether
+            # the request would actually be dispatched locally.  Requests bound
+            # for remote providers should pass through the ramp unblocked (AC1).
+            _ramp_body_json: dict = {}
+            _ramp_model_name: str | None = None
+            if body:
+                try:
+                    _parsed_ramp_body = json.loads(body)
+                    if isinstance(_parsed_ramp_body, dict):
+                        _ramp_body_json = _parsed_ramp_body
+                        _ramp_model_name = _ramp_body_json.get("model")
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+            # Fall back to the currently loaded model when the request omits one.
+            if not _ramp_model_name and srv.current_model:
+                _ramp_model_name = srv.current_model
+            _ramp_model_cfg = (
+                srv.get_model_config(_ramp_model_name) if _ramp_model_name else None
+            )
+
+            # --- Startup ramp (LP-0MU9ZXFQS0023DXT, LP-0MUAY98ZR002JBAA,
+            # refined LP-0MUAY9AMS002O2ZO) ---
+            # After a mode-switch restart, competing herdr/agent workers
+            # reconnect simultaneously, creating a thundering-herd.
+            # Gate new requests with 503 + random Retry-After until either
+            # (a) local backends are ready (``backend_ready`` becomes True)
+            # or (b) ``startup_ramp.max_seconds`` elapses (safety ceiling).
+            # ``max_seconds`` defaults to 30 s — a short safety cap; the
+            # gate normally clears much earlier when backends are ready.
+            #
+            # LP-0MUAY9AMS002O2ZO: only block requests that would
+            # actually dispatch locally — if the model has remote
+            # providers in its fallback chain the request will
+            # naturally escalate to a remote provider when local
+            # dispatch fails during ramp, so blocking it adds pure
+            # latency with no protective benefit.
+            ramp_cfg = _mode_mod._startup_ramp_config
+            if ramp_cfg and ramp_cfg.get("enabled") and ramp_cfg.get("max_seconds", 0) > 0:
+                elapsed = srv.PROXY_START_TIME and (
+                    time.monotonic() - srv.PROXY_START_TIME
+                )
+                if elapsed is not None and elapsed < ramp_cfg["max_seconds"]:
+                    if srv.backend_ready:
+                        # Backends are ready — clear the gate immediately.
+                        pass  # fall through to normal handling
+                    else:
+                        # Determine whether this request could reach a remote
+                        # provider.  Driven by the same provider-chain
+                        # structure the dispatch path selects from (AC3).
+                        _model_type = (
+                            get_model_type(_ramp_model_cfg) if _ramp_model_cfg else None
+                        )
+                        _legacy_remote = (
+                            isinstance(_ramp_model_cfg, dict)
+                            and _ramp_model_cfg.get("type") == "remote"
+                        )
+                        # Decide whether to apply the ramp gate, mirroring the
+                        # dispatch-path resolution in the body of this function.
+                        if _model_type == "remote" or _legacy_remote:
+                            # Remote dispatch path: never local-bound.
+                            _should_gate = False
+                        elif _model_type == "local":
+                            # Local model: gate only if no remote fallback.
+                            _should_gate = not _model_can_route_remote(_ramp_model_cfg)
+                        elif _ramp_model_cfg is None:
+                            # Dispatch path: ``model_cfg is None`` →
+                            # default_remote when enabled, else
+                            # current_model (local) or a 400.
+                            _dr = srv.config.get("default_remote", {}) or {}
+                            _should_gate = not _dr.get("enabled", False)
+                        else:
+                            # Invalid/unknown config (no resolvable provider
+                            # type): dispatch will raise; let the error
+                            # surface instead of masking it behind a ramp 503.
+                            _should_gate = False
+
+                        if _should_gate:
+                            jitter_min = ramp_cfg.get("jitter_min", 5.0)
+                            jitter_max = ramp_cfg.get("jitter_max", 15.0)
+                            retry_after = _random_mod.uniform(jitter_min, jitter_max)
+                            remaining = ramp_cfg["max_seconds"] - elapsed
+                            srv.logger.info(
+                                "Startup ramp: deferring chat request "
+                                "(elapsed=%.1fs, remaining=%.1fs, "
+                                "backend_ready=False, retry_after=%.0fs)",
+                                elapsed, remaining, retry_after,
+                            )
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "error": {
+                                        "type": "startup_ramp",
+                                        "code": "startup_ramp",
+                                        "message": (
+                                            "Server is starting up; retry shortly."
+                                        ),
+                                    },
+                                    "status": 503,
+                                    "retry_after": int(retry_after + 3),  # +margin
+                                },
+                                headers={
+                                    "Retry-After": str(int(retry_after + 3)),
+                                    "Cache-Control": "no-store",
+                                },
+                            )
+
+            # --- Drain gate ---
             # Defer only while a mode-switch restart is pending AND the
             # bounded drain is active (restart_pending stays True from the
             # moment set_mode arms it, so the drain window alone bounds the
@@ -996,9 +1131,9 @@ async def _do_proxy_openai_api(
                     },
                 )
         except Exception:
-            # Never let the drain gate break request handling.
+            # Never let the ramp/drain gate break request handling.
             srv.logger.debug(
-                "Mode-switch drain gate failed; serving request normally",
+                "Startup ramp / mode-switch drain gate failed; serving request normally",
                 exc_info=True,
             )
 

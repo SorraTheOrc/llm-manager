@@ -207,3 +207,70 @@ in `proxy/provider.py`), resolved through
 - The evaluation is offloaded with `asyncio.to_thread` in
   `_handle_session` so a long slot wait does not freeze the event loop
   (which would also stall the very stream whose slot is being waited on).
+
+### 7.2 Remote-only `compact` summarizer chain (LP-0MTT0O74N009E7N2)
+
+Waiting on the local slot is bounded but not free: under sustained load the
+slot is saturated and every summarizer call can time out (49/49 observed at
+30 s). To decouple summarization from the GPU slots, compaction now routes
+through a dedicated remote-only model, `models.compact`, built by
+`build_compact_summarizer` in `proxy/proxy/compaction_summarizer.py`:
+
+1. **Muse** (`muse-spark-1.3-contributor` via `opencode-go`,
+   `https://opencode.ai/zen/go`, `api: openai-responses`),
+2. **DeepSeek** (`deepseek-flash` via `deepseek`,
+   `https://api.deepseek.com`, `DEEPSEEK_API_KEY`).
+
+The chain declares **no local tier**, so summarization never contends with
+the GPU slots (no second llama-server is required). Providers are resolved
+with `resolve_provider`, so cooldowns, `available_times` windows and
+failure-domain grouping behave exactly as on the normal dispatch path. Each
+failed tier is logged at WARNING with its reason (`http_<status>`,
+`timeout`, `empty_completion`, …) before the next tier is tried; when every
+tier fails the summarizer returns a falsy `EmptySummary`, so compaction
+falls back to `remote_with_guidance` instead of blocking dispatch.
+
+- **Timeout:** each tier uses `models.compact.timeout_seconds` when set,
+  otherwise `server.compaction_summarizer_timeout` (default 600 s).
+- **Backward compatibility:** when `models.compact` is absent,
+  `build_compact_summarizer` delegates to `build_local_summarizer`, so
+  operators still using `server.summarizer_model: {type: local, llama_model:
+  Qwen3}` keep the previous behaviour. When `models.compact` is present,
+  `server.summarizer_model` is ignored for compaction (the compact model owns
+  its own provider config).
+- The chain is declared identically in `config.yaml`, `config-fast.yaml` and
+  `config-cheap.yaml` (the active mode config is what the proxy loads).
+### 7.3 Compaction metadata response headers — Pi client bridge (LP-0MTYGZ1DI0004QP8)
+
+Server-side compaction rewrites the dispatch base to
+`[system, first_user, summary_marker, recent...]`, but the client keeps
+sending its full un-compacted history. Without visibility the client↔proxy
+views diverge, forcing `history_mismatch` fallbacks and CREATION
+re-summarization on every turn.
+
+When live compaction is applied, `_handle_session` surfaces the decision on
+the session result (`compaction_summary_text`,
+`compaction_turns_summarized`, `compaction_recent_turns_kept`) and
+`proxy_to_local` emits the bridge headers — on both the streaming SSE and
+buffered response paths, next to `X-Resolved-Model`:
+
+| Header | Value |
+|---|---|
+| `X-Compaction-Occurred` | `true` |
+| `X-Compaction-Marker` | base64 of the exact injected summary message |
+| `X-Compaction-Turns-Summarized` | decimal integer |
+| `X-Compaction-Recent-Turns-Kept` | decimal integer |
+
+- The marker is built from the proxy's own `_SUMMARY_MARKER` /
+  `_SUMMARY_MARKER_END` delimiters, so clients never replicate (or drift
+  from) the marker format; it decodes to the verbatim message content the
+  proxy injected.
+- Emission is fail-safe and additive: any error (or missing summary text)
+  yields no compaction headers and never changes dispatch. Non-compaction
+  paths (noop / below-trigger / dry-run / `remote_with_guidance`) set none of
+  the headers.
+- Consumer: the Pi client extension (SorraAgents SA-0MTYGZIWF000ZLU0) mirrors
+  the compacted view in its dispatch layer; JSONL storage is untouched.
+- Header-size caveat: summaries are base64'd into a single header. Summaries
+  beyond a few KB should move to a sidecar endpoint
+  (`GET /sessions/<id>/compaction`).

@@ -79,8 +79,7 @@ def status_line(ts: str, depth: int = 0, slots: int = 2, policy: str = "queue") 
     return (
         f"{ts} INFO router.routing: status_request path=/v1/chat/completions "
         f"available_slots={slots} total_slots=2 "
-        f"contention_queue_policy={policy} contention_queue_depth={depth} "
-        f"contention_queued_count=1 contention_fallback_after_queue_count=2"
+        f"contention_queue_policy={policy} contention_queue_depth={depth}"
     )
 
 

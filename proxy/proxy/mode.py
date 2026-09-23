@@ -70,6 +70,23 @@ MODE_CONFIG_FILES = {
 RESTART_DELAY_SECONDS = 1.5
 
 # ---------------------------------------------------------------------------
+# Fast -> cheap mode-switch cooldown (LP-0MU6MQIPP0058198)
+# ---------------------------------------------------------------------------
+# Every switch is a FULL proxy restart that kills in-flight streams. Competing
+# herdr mode-switch workers have independent idle clocks, so a stale worker can
+# undo an active worker's ``fast`` switch within seconds and repeatedly
+# interrupt live requests (10 switches in 12h, several fast->cheap reverts
+# 13-20s apart). A short, persisted cooldown on the fast->cheap direction,
+# enforced on the client/API path only, bounds how quickly a fresh ``fast``
+# switch can be reverted while leaving the operator's schedule intact. The
+# timestamp of the most recent REAL transition to ``fast`` is persisted to
+# ``proxy/.mode.last-fast-switch`` so the window survives the restart the
+# switch itself triggers. Fixed window (not operator-configurable) per
+# simplicity-first; ``fast`` is never delayed (the cooldown gates fast->cheap
+# only) and the scheduled path bypasses it.
+MODE_SWITCH_COOLDOWN_SECONDS = 30 * 60
+
+# ---------------------------------------------------------------------------
 # Bounded mode-switch drain (LP-0MT631JKW008WAKE / LP-0MT60S55M000TK1H AC2)
 # ---------------------------------------------------------------------------
 # A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode) restarts
@@ -90,14 +107,98 @@ RESTART_DELAY_SECONDS = 1.5
 # window" property is preserved: new requests are refused only during the
 # drain (with a Retry-After), and ``enabled: false`` / ``max_seconds: 0``
 # restores the old "just restart" behavior.
-MODE_SWITCH_DRAIN_MAX_SECONDS = 30.0
+MODE_SWITCH_DRAIN_MAX_SECONDS = 90.0
 MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
+
+# ---------------------------------------------------------------------------
+# Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
+# ---------------------------------------------------------------------------
+# After a mode switch restart (or any proxy restart), a flurry of reconnects
+# from competing herdr/agent workers creates a thundering-herd that overwhelms
+# the freshly-started proxy. The startup-ramp gates new chat requests with
+# 503 + Retry-After for a short window after each restart, using random jitter
+# to desynchronise clients:
+#
+#   1. ``PROXY_START_TIME`` records when the new process started (set by
+#      server.py in the lifespan handler).
+#   2. While ``startup_ramp`` is active, every new chat request receives
+#      ``Retry-After = uniform(jitter_min, jitter_max)``.
+#   3. Clients simply retry after that delay, spreading the reconnects over
+#      the ramp window.
+#
+# Config lives in ``server.startup_ramp`` with defaults:
+#   enabled: true, max_seconds: 30, jitter: [5, 15]
+# Set ``enabled: false`` or ``max_seconds: 0`` to disable entirely.
+
+STARTUP_RAMP_DEFAULT_ENABLED = True
+STARTUP_RAMP_DEFAULT_MAX_SECONDS = 30.0
+STARTUP_RAMP_DEFAULT_JITTER_MIN = 5.0
+STARTUP_RAMP_DEFAULT_JITTER_MAX = 15.0
 
 # Serializes the drain state (separate from _mode_lock to avoid blocking the
 # set-mode lock while polling in-flight queries).
 _drain_lock = threading.Lock()
 _draining = False
 _drain_deadline: float | None = None
+
+# ---------------------------------------------------------------------------
+# Startup ramp state (module-level, updated by server.py)
+# ---------------------------------------------------------------------------
+
+_startup_ramp_config: dict | None = None  # resolved from config
+
+
+def set_startup_ramp_config(cfg: dict | None) -> None:
+    """Store the resolved startup_ramp config (called once at server startup).
+
+    *cfg* is a dict with ``enabled``, ``max_seconds``, ``jitter_min``,
+    ``jitter_max`` — or None to reset to defaults.
+    """
+    global _startup_ramp_config
+    if cfg is None:
+        _startup_ramp_config = {
+            "enabled": STARTUP_RAMP_DEFAULT_ENABLED,
+            "max_seconds": STARTUP_RAMP_DEFAULT_MAX_SECONDS,
+            "jitter_min": STARTUP_RAMP_DEFAULT_JITTER_MIN,
+            "jitter_max": STARTUP_RAMP_DEFAULT_JITTER_MAX,
+        }
+        return
+    _startup_ramp_config = cfg
+
+
+def _startup_ramp_config_section(server_config: dict | None) -> dict:
+    """Resolve the ``server.startup_ramp`` config with defaults.
+
+    Args:
+        server_config: The ``server`` section of the server config dict,
+            or None to read it from the live server module lazily.
+
+    Returns:
+        A dict with ``enabled``, ``max_seconds``, ``jitter_min``,
+        ``jitter_max`` keys.
+    """
+    if server_config is None:
+        server_config = {}
+    section = server_config.get("startup_ramp") or {}
+    enabled = bool(section.get("enabled", STARTUP_RAMP_DEFAULT_ENABLED))
+    try:
+        max_seconds = float(section.get("max_seconds", STARTUP_RAMP_DEFAULT_MAX_SECONDS) or 0)
+    except (TypeError, ValueError):
+        max_seconds = STARTUP_RAMP_DEFAULT_MAX_SECONDS
+    try:
+        jitter_min = float(section.get("jitter_min", STARTUP_RAMP_DEFAULT_JITTER_MIN) or 0)
+    except (TypeError, ValueError):
+        jitter_min = STARTUP_RAMP_DEFAULT_JITTER_MIN
+    try:
+        jitter_max = float(section.get("jitter_max", STARTUP_RAMP_DEFAULT_JITTER_MAX) or 0)
+    except (TypeError, ValueError):
+        jitter_max = STARTUP_RAMP_DEFAULT_JITTER_MAX
+    return {
+        "enabled": enabled,
+        "max_seconds": max(0.0, max_seconds),
+        "jitter_min": max(0.0, min(jitter_min, jitter_max)),
+        "jitter_max": max(0.0, max(jitter_min, jitter_max)),
+    }
 
 
 def _mode_switch_drain_config(server_config: dict | None) -> dict:
@@ -206,15 +307,49 @@ def _end_drain() -> None:
         _drain_deadline = None
 
 
+def _count_in_flight_local_streams() -> int:
+    """Count real in-flight local streams for the drain wait.
+
+    The historical check used only ``srv.local_active_queries``, which can
+    read 0 even while streams are still running (e.g. the counter was
+    decremented early, or the stream is tracked only by its dispatch record).
+    The mode-switch restart then killed those streams with a client-visible
+    ``finish_reason: error`` (LP-0MUCEFCL6001ZXYN).
+
+    Counts the maximum of the active-queries counter and the number of
+    dispatch records still marked ``active=True`` so a real in-flight stream
+    always holds the drain open.
+
+    Best-effort / fail-open: any error returns the counter value (or 0).
+    """
+    counter = 0
+    try:
+        import proxy.server as srv
+
+        counter = int(getattr(srv, "local_active_queries", 0) or 0)
+        records = getattr(srv, "local_dispatch_records", None)
+        if isinstance(records, dict):
+            active_records = sum(
+                1
+                for record in records.values()
+                if isinstance(record, dict) and record.get("active")
+            )
+            return max(counter, active_records)
+    except Exception:
+        pass
+    return counter
+
+
 def _wait_for_in_flight_local_streams(
     deadline: float | None = None,
 ) -> None:
     """Wait (bounded) for in-flight local streams to finish before restart spawn.
 
-    Polls ``srv.local_active_queries`` until it reaches 0 or the drain
-    deadline elapses. The wait is deliberately SHORT and bounded — new
-    requests are deferred during the same window, and a stuck counter
-    cannot hold the restart hostage.
+    Waits until the number of real in-flight local streams (see
+    ``_count_in_flight_local_streams``) reaches 0 or the drain deadline
+    elapses. The wait is deliberately bounded — new requests are deferred
+    during the same window, and a stuck stream cannot hold the restart
+    hostage.
 
     Args:
         deadline: Monotonic deadline by which the wait must return. When
@@ -229,17 +364,8 @@ def _wait_for_in_flight_local_streams(
         # to wait for — proceed to the restart directly.
         _end_drain()
         return
-    try:
-        import proxy.server as srv
-    except Exception:
-        srv = None
     while True:
-        active = 0
-        if srv is not None:
-            try:
-                active = int(getattr(srv, "local_active_queries", 0) or 0)
-            except Exception:
-                active = 0
+        active = _count_in_flight_local_streams()
         if active <= 0 or time.monotonic() >= deadline:
             break
         time.sleep(0.25)
@@ -462,7 +588,7 @@ def _mode_scheduler_step(
         # change; stand down instead of reverting it.
         return False
     try:
-        set_mode(expected)
+        set_mode(expected, bypass_cooldown=True)
     except RuntimeError:
         logger.debug("Mode scheduler: restart pending, retrying next cycle")
         return False
@@ -534,6 +660,52 @@ def override_until_file() -> Path:
     expires (the next scheduled mode transition). Absent file = no override.
     """
     return proxy_dir() / ".mode.override-until"
+
+
+def last_fast_switch_file() -> Path:
+    """Path to the last-fast-switch state file (``proxy/.mode.last-fast-switch``).
+
+    Holds an ISO-format naive local datetime marking the most recent actual
+    transition to ``fast`` (manual or scheduled). Absent file = no fast
+    switch recorded (cooldown does not apply — fail-open).
+    """
+    return proxy_dir() / ".mode.last-fast-switch"
+
+
+def read_last_fast_switch() -> datetime | None:
+    """Return the persisted last-fast-switch timestamp, or None when absent.
+
+    The timestamp is a naive local datetime written by ``write_last_fast_switch``
+    and must survive the mode-switch restart (which replaces the whole proxy
+    process). A missing, empty, or unparsable state file yields None, so the
+    cooldown fails open on a fresh install or if ``fast`` was never recorded.
+    """
+    try:
+        text = last_fast_switch_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        logger.warning(
+            "Ignoring unparsable last-fast-switch state %r, treating as none",
+            text,
+        )
+        return None
+
+
+def write_last_fast_switch(ts: datetime | None = None) -> None:
+    """Persist the last-fast-switch timestamp (defaults to now).
+
+    Writes an ISO-format naive local datetime to the state file. Called
+    whenever a non-noop transition to ``fast`` is persisted (manual or
+    scheduled), so the cooldown clock survives the restart the switch
+    itself triggers.
+    """
+    ts = ts or datetime.now()
+    last_fast_switch_file().write_text(ts.isoformat() + "\n", encoding="utf-8")
 
 
 def read_override_until() -> datetime | None:
@@ -650,10 +822,62 @@ def restart_pending() -> bool:
         return _restart_pending
 
 
+class ModeSwitchCooldownError(Exception):
+    """Raised when a manual fast->cheap switch arrives inside the cooldown.
+
+    Competing mode-switch workers can otherwise revert a fresh ``fast``
+    switch within seconds; each revert is a full proxy restart that kills
+    in-flight streams. Carries the machine-readable
+    ``retry_after_seconds`` (rounded up to a whole second) so the API
+    handler can emit a ``Retry-After`` header without recomputing the
+    window (LP-0MU6MQIPP0058198).
+    """
+
+    def __init__(self, retry_after_seconds: float):
+        self.retry_after_seconds = max(1, int(math.ceil(retry_after_seconds)))
+        minutes = int(math.ceil(self.retry_after_seconds / 60))
+        super().__init__(
+            "fast mode was switched on less than "
+            f"{MODE_SWITCH_COOLDOWN_SECONDS // 60} minutes ago; refusing "
+            f"fast->cheap switch during the cooldown (retry in {minutes} minutes)"
+        )
+
+
+def _check_fast_to_cheap_cooldown(
+    mode: str, manual: bool, bypass_cooldown: bool
+) -> None:
+    """Reject a too-soon manual fast->cheap switch (call before mutating state).
+
+    The cooldown gates only the client/API fast->cheap direction:
+
+    - ``manual`` calls only — the scheduled path is never blocked, so the
+      operator's configured schedule still applies (requirement 5).
+    - ``bypass_cooldown`` lets the scheduler opt out unconditionally even
+      when a caller routes through the manual path.
+    - ``fast`` switches are never delayed (``fast`` is the escape hatch for
+      active agent work); only a revert to ``cheap`` is gated.
+
+    Fails open when no fast-switch timestamp is persisted (fresh install or
+    ``fast`` never recorded), so existing deployments are unchanged.
+    """
+    if not manual or bypass_cooldown or mode != MODE_CHEAP:
+        return
+    if read_mode() != MODE_FAST:
+        return
+    last = read_last_fast_switch()
+    if last is None:
+        return
+    elapsed = (datetime.now() - last).total_seconds()
+    if elapsed >= MODE_SWITCH_COOLDOWN_SECONDS:
+        return
+    raise ModeSwitchCooldownError(MODE_SWITCH_COOLDOWN_SECONDS - elapsed)
+
+
 def set_mode(
     mode: str,
     manual: bool = False,
     schedule: ModeScheduleConfig | None = None,
+    bypass_cooldown: bool = False,
 ) -> tuple[str, bool]:
     """Persist *mode* and arm a background restart when it changes.
 
@@ -673,7 +897,12 @@ def set_mode(
       restart (``scripts/start-proxy.sh --restart``) in the background.
 
     Raises ``RuntimeError`` when a mode-switch restart is already pending
-    and the requested mode differs (rejected to avoid restart loops).
+    and the requested mode differs (rejected to avoid restart loops), and
+    ``ModeSwitchCooldownError`` when a manual fast->cheap switch arrives
+    inside ``MODE_SWITCH_COOLDOWN_SECONDS`` of the last real transition to
+    ``fast`` (checked before any state mutation, so a rejected request never
+    arms a restart). ``bypass_cooldown`` skips that gate (used by the
+    scheduler, which must always apply the configured schedule).
     """
     global _restart_pending
     with _mode_lock:
@@ -683,11 +912,19 @@ def set_mode(
                     _write_override_expiry(schedule)
                 return mode, False
             raise RuntimeError("A mode-switch restart is already in progress")
+        # Cooldown gate: must run BEFORE any mutation (write_mode / drain) so
+        # a rejected request cannot trigger a restart (LP-0MU6MQIPP0058198).
+        _check_fast_to_cheap_cooldown(mode, manual, bypass_cooldown)
         if read_mode() == mode:
             if manual:
                 _write_override_expiry(schedule)
             return mode, False
         write_mode(mode)
+        if mode == MODE_FAST:
+            # A REAL transition to fast (manual or scheduled) starts the
+            # fast->cheap cooldown clock. Persisted so it survives the
+            # restart this switch triggers (LP-0MU6MQIPP0058198).
+            write_last_fast_switch()
         if manual:
             _write_override_expiry(schedule)
         else:

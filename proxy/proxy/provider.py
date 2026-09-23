@@ -546,6 +546,34 @@ def _get_warm_cache_threshold(config: dict) -> int:
         return 0
 
 
+def _economic_bypass_serves_local(config: dict) -> bool:
+    """Whether the economic cold-cache bypass should be recovered locally.
+
+    Mode-gated via the active mode-profile config (LP-0MU5A4QBR003YJM0):
+    ``config-cheap.yaml`` sets
+    ``local_large_context_economic_bypass_serves_local: true`` so economic
+    bypasses (``new_tokens > cold_threshold`` while the prompt still fits the
+    per-slot KV capacity) are served locally — entering the contention queue
+    when all slots are busy — instead of falling back to a paid remote.
+
+    Fast/default profiles omit the key (or set it false), preserving the
+    remote-fallback behaviour for tail latency.  This is an explicit
+    mode-aware flag, not a hardcoded mode string branch: the active config
+    file selected by the mode decides the behaviour.
+
+    Supports both nested (``server:``) and flat config keys for test
+    compatibility.  Default: false.
+    """
+    val = config.get("local_large_context_economic_bypass_serves_local")
+    if val is None:
+        val = config.get("server", {}).get(
+            "local_large_context_economic_bypass_serves_local", False
+        )
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
 def _get_local_model_ctx_size(config: dict) -> int:
     """Read the local model's total context size (across all slots).
 
@@ -698,6 +726,21 @@ _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS = 600.0
 # ``server.compaction_summarizer_retry_delay_seconds``; 0 disables retries.
 _DEFAULT_SUMMARIZER_RETRIES = 2
 _DEFAULT_SUMMARIZER_RETRY_DELAY_SECONDS = 0.5
+
+# Reasoning suppression for the compaction summarizer (LP-0MU58PBRD004OV1I).
+# Reasoning models (Muse via opencode-go, DeepSeek) share the
+# ``summarizer_max_tokens`` output budget with their reasoning tokens. With
+# the upstream default effort (Muse: "high") they can spend the entire budget
+# on reasoning and return an empty completion — which fails compaction and
+# forces remote-only dispatch. "minimal" leaves room for the summary text.
+# Configurable via ``server.summarizer_reasoning_effort``; an explicit
+# ``null`` disables the override (use the upstream default).
+_DEFAULT_SUMMARIZER_REASONING_EFFORT = "minimal"
+
+# Disable Qwen3 "thinking" for the local summarizer via the llama-server
+# ``chat_template_kwargs.enable_thinking`` request flag (LP-0MU58PBRD004OV1I).
+# Configurable via ``server.summarizer_disable_thinking``.
+_DEFAULT_SUMMARIZER_DISABLE_THINKING = True
 
 # Dedicated system prompt for the proxy-side compaction summariser.
 #
@@ -866,7 +909,7 @@ def compaction_config(config: dict) -> dict:
     if not isinstance(model_cfg, dict):
         model_cfg = {}
     summarizer_model_type = model_cfg.get("type", "local")
-    summarizer_model_name = model_cfg.get("llama_model", "Qwen3")
+    summarizer_model_name = model_cfg.get("llama_model", "Qwen2.5-7B")
 
     # Summariser context size
     ctx_size = server.get("summarizer_ctx_size")
@@ -885,6 +928,23 @@ def compaction_config(config: dict) -> dict:
         max_tokens = int(max_tokens)
     except (ValueError, TypeError):
         max_tokens = _DEFAULT_SUMMARIZER_MAX_TOKENS
+
+    # Summariser reasoning effort (reasoning models only; explicit null disables)
+    if "summarizer_reasoning_effort" in server:
+        reasoning_effort = server.get("summarizer_reasoning_effort")
+    elif "summarizer_reasoning_effort" in config:
+        reasoning_effort = config.get("summarizer_reasoning_effort")
+    else:
+        reasoning_effort = _DEFAULT_SUMMARIZER_REASONING_EFFORT
+    if isinstance(reasoning_effort, str):
+        reasoning_effort = reasoning_effort.strip() or None
+
+    # Disable local Qwen3 thinking for the summarizer (chat-template flag)
+    disable_thinking = server.get("summarizer_disable_thinking")
+    if disable_thinking is None:
+        disable_thinking = config.get("summarizer_disable_thinking")
+    if not isinstance(disable_thinking, bool):
+        disable_thinking = _DEFAULT_SUMMARIZER_DISABLE_THINKING
 
     # Summarizer retries (transient failures only; 0 disables)
     retries = server.get("compaction_summarizer_retries")
@@ -922,6 +982,8 @@ def compaction_config(config: dict) -> dict:
         "summarizer_model_name": summarizer_model_name,
         "summarizer_ctx_size": ctx_size,
         "summarizer_max_tokens": max_tokens,
+        "summarizer_reasoning_effort": reasoning_effort,
+        "summarizer_disable_thinking": disable_thinking,
         "summarizer_system_prompt": _SUMMARIZER_SYSTEM_PROMPT,
         "summarizer_retries": retries,
         "summarizer_retry_delay_seconds": retry_delay,
@@ -1446,7 +1508,8 @@ def _should_skip_local(
     cold_cache_threshold: int,
     estimated_tokens: int | None = None,
     warm_cache_threshold: int = 0,
-) -> bool:
+    economic_bypass_serves_local: bool = False,
+) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
     Implements a two-tier check:
@@ -1461,6 +1524,19 @@ def _should_skip_local(
        tokens: ``new_tokens = int(estimated_tokens * (1 - cached_ratio))``.
        If ``new_tokens > cold_cache_threshold``, the prefill is too
        expensive, so bypass local.  Otherwise route local.
+
+    Config-driven mode behaviour (LP-0MU5A4QBR003YJM0):
+
+    - **``economic_bypass_serves_local is True``** (set by the active mode
+      config — ``config-cheap.yaml``): when the *only* trigger is the
+      economic cold-cache check (``large_context_bypass``), the request is
+      served locally instead of being skipped.  This preserves cheap mode's
+      intent to avoid paid remote calls by waiting in the contention queue
+      rather than falling back.  The physical-capacity check
+      (``context_too_large``) still applies in both modes.
+    - **``economic_bypass_serves_local is False``** (default; fast profile):
+      behaviour is unchanged — the economic check still causes a skip
+      (``large_context_bypass``).
 
     This replaces the old binary ``ratio < 1.0`` check which was effectively
     always true (there is always new content in a conversation), causing
@@ -1482,27 +1558,49 @@ def _should_skip_local(
         cold_cache_threshold: Token threshold for bypass. 0 = disabled.
         estimated_tokens: Optional pre-computed estimate.
         warm_cache_threshold: Hard cap on total context. 0 = disabled.
+        economic_bypass_serves_local: Config-driven flag (from the active
+            mode profile) enabling cheap-mode economic-bypass recovery.
 
     Returns:
-        True if local should be skipped, False for normal local routing.
+        A tuple ``(skip, reason)`` where:
+
+        - ``skip`` is True if local should be skipped, False for normal
+          local routing.
+        - ``reason`` is the skip reason when ``skip`` is True
+          (``"context_too_large"`` or ``"large_context_bypass"``), or None
+          when ``skip`` is False.  When ``economic_bypass_serves_local`` is
+          True and the economic check would normally trigger but physical
+          capacity is available, ``(False, None)`` is returned so the
+          request proceeds to local (with contention-queue wait if slots
+          are busy).
     """
     if cold_cache_threshold <= 0:
-        return False
+        return (False, None)
     if estimated_tokens is None:
         estimated_tokens = _estimate_prompt_tokens_for_routing(body_json)
 
     # Check 1: Warm-cache threshold (hard cap on total context)
     if warm_cache_threshold > 0 and estimated_tokens > warm_cache_threshold:
-        return True
+        return (True, "context_too_large")
 
     # If estimated tokens are below cold cache threshold, always route local
     if estimated_tokens <= cold_cache_threshold:
-        return False
+        return (False, None)
 
     # Check 2: Dynamic new-token calculation
     ratio = _get_cached_ratio(model_name, session_id)
     new_tokens = int(estimated_tokens * (1 - ratio))
-    return new_tokens > cold_cache_threshold
+    if new_tokens <= cold_cache_threshold:
+        return (False, None)
+
+    # Economic cold-cache bypass (large_context_bypass)
+    if economic_bypass_serves_local:
+        # Active mode profile recovers economic bypasses locally. The
+        # contention queue (if enabled) will wait for a slot when all are
+        # busy.
+        return (False, None)
+
+    return (True, "large_context_bypass")
 
 
 # ---------------------------------------------------------------------------
@@ -2855,9 +2953,10 @@ async def _queue_context_bypass(
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
-    Used ONLY at the contention-queue decision point so context bypasses
-    (``context_too_large`` / ``large_context_bypass``) are NEVER queued — they
-    fall back exactly as today (LP-0MSORQVK50012Q4D AC4). Keeps the same
+    Used ONLY at the contention-queue decision point.  In cheap mode,
+    ``large_context_bypass`` is recovered (the request proceeds to local
+    and may queue); only ``context_too_large`` is a hard bypass
+    (LP-0MU5A4QBR003YJM0).  Keeps the same
     thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
     smart-routing block below; returns ``(skip_local, skip_reason)``.
     """
@@ -2869,18 +2968,15 @@ async def _queue_context_bypass(
     )
     if _multiplier != 1.0:
         _estimated_tokens = int(_estimated_tokens * _multiplier)
-    _skip_local = _should_skip_local(
+    # Pass the config-driven recovery flag so the cheap profile can recover
+    # economic bypasses (LP-0MU5A4QBR003YJM0)
+    _recover_economic = _economic_bypass_serves_local(config)
+    _skip_local, _skip_reason = _should_skip_local(
         _llama_model, session_id, body_json, _cold_threshold,
         estimated_tokens=_estimated_tokens,
         warm_cache_threshold=_warm_threshold,
+        economic_bypass_serves_local=_recover_economic,
     )
-    if _skip_local:
-        if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
-            _skip_reason = "context_too_large"
-        else:
-            _skip_reason = "large_context_bypass"
-    else:
-        _skip_reason = None
     return _skip_local, _skip_reason
 
 
@@ -4068,15 +4164,15 @@ def _resolve_reasoning_content_promotion(
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
 
-    Consistency note (LP-0MSEHOE7B005DE08): since the placeholder change,
-    thinking-only responses (``reasoning_content`` present, no tool call)
-    are extracted as the non-empty placeholder ``"Thinking..."`` by
-    ``_extract_assistant_content``, so ``_is_empty_response`` returns False
-    and the fallback chain treats them as plain successes without reaching
-    this function. This function remains the safety net for bodies whose raw
-    text contains the ``reasoning_content`` key but where extraction found
-    nothing usable (e.g. an empty ``reasoning_content`` value) - those still
-    count as promoted successes rather than triggering cooldown/fallback.
+    Consistency note (LP-0MTTSBT0R004HC6B): thinking-only responses
+    (``reasoning_content`` present, no tool call) are now treated as
+    non-empty directly by ``_is_empty_response`` (which checks
+    ``reasoning_content`` independently), so the fallback chain treats
+    them as plain successes without reaching this function. This function
+    remains the safety net for bodies whose raw text contains the
+    ``reasoning_content`` key but where extraction found nothing usable
+    (e.g. an empty ``reasoning_content`` value) - those still count as
+    promoted successes rather than triggering cooldown/fallback.
     """
     body_l = (body_text or "").lower()
     if "reasoning_content" in body_l:
@@ -4736,11 +4832,15 @@ async def _proxy_with_remote_fallback_cycle(
                     )
                     # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG):
                     # track consecutive empty/stall failures across cycles.
-                    # If the threshold is exceeded, the provider gets an
-                    # extended cooldown so the retry cycle permanently skips
-                    # it and tries siblings.
-                    _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
-                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    # Only poison the failure domain (skip same-endpoint
+                    # siblings) once the streak threshold is exceeded so a
+                    # single empty response does not block sibling API keys
+                    # on the same endpoint (LP-0MTVPJQ6T004EZ75).
+                    _threshold_exceeded = _record_sibling_failure(
+                        provider_name, config, provider_cfg.get("provider")
+                    )
+                    if _threshold_exceeded:
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = "empty_response"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -4855,6 +4955,87 @@ async def proxy_with_remote_fallback(
     return await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_remote_fallback_cycle,
     )
+
+
+async def _evaluate_compaction_for_bypass(
+    config: dict,
+    provider_name: str,
+    body_json: dict,
+    session_id: str | None,
+) -> dict:
+    """Evaluate server-side session compaction in the local-bypass path.
+
+    LP-0MU5ARWSP001BYYB: the bypass path used to ``continue`` before any
+    session handling, so oversized sessions — the ones that need compaction
+    most — were never evaluated. This delegates to the shared
+    :func:`proxy.router_helpers.evaluate_and_apply_compaction` so the bypass
+    path and the local-dispatch path share one implementation.
+
+    The helper mutates ``body_json`` in place when a live compaction is
+    applied (rewriting ``messages`` to the compacted history) and also
+    updates the persisted session history.
+
+    Fail-open: any error is logged and a noop outcome is returned so routing
+    continues unchanged.
+    """
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "action": "noop",
+        "applied": False,
+        "estimated_before": 0,
+        "estimated_after": 0,
+        "reason": None,
+        "messages": None,
+    }
+    try:
+        import proxy.server as _server
+        from proxy.router_helpers import evaluate_and_apply_compaction
+
+        server_config = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        result = {"session_id": session_id}
+        return await evaluate_and_apply_compaction(
+            _server,
+            result,
+            body_json,
+            server_config,
+        )
+    except Exception:
+        logger.warning(
+            "Bypass compaction evaluation failed; continuing unchanged "
+            "(provider=%s session=%s)",
+            provider_name,
+            str(session_id or "")[:8],
+            exc_info=True,
+        )
+        return outcome
+
+
+def _refresh_request_body(
+    request,
+    body_json: dict,
+    provider_name: str,
+    session_id: str | None,
+) -> None:
+    """Replace the cached request body with the compacted ``body_json``.
+
+    ``proxy_to_local`` reads ``await request.body()``; Starlette caches the
+    parsed bytes in ``Request._body``. Re-serialising the compacted body into
+    that cache lets the ordinary local-dispatch path below forward the
+    compacted history without a second ``_dispatch_local`` call
+    (LP-0MU5ARWSP001BYYB).
+    """
+    try:
+        request._body = json.dumps(body_json).encode("utf-8")
+    except Exception:
+        logger.warning(
+            "compaction_local_redispatch body refresh failed provider=%s "
+            "session=%s",
+            provider_name,
+            str(session_id or "")[:8],
+            exc_info=True,
+        )
 
 
 async def _proxy_with_fallback_cycle(
@@ -5009,22 +5190,16 @@ async def _proxy_with_fallback_cycle(
                         try:
                             from proxy import contention_queue
 
-                            _cq_m = contention_queue.metrics()
+                            _cq_depth = contention_queue.queue_depth()
                         except Exception:
-                            _cq_m = {}
+                            _cq_depth = 0
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
-                            _cq_m.get("contention_queue_depth", 0),
+                            _cq_depth,
                         )
-                        try:
-                            from proxy.metrics import record_contention_queued
-
-                            record_contention_queued(_cq_elapsed or 0.0)
-                        except Exception:
-                            pass
                     elif _cq_action == "fallback":
                         # Caps exceeded — fall back to the next remote provider
                         # exactly as today (fallback-after-queue recorded with
@@ -5047,12 +5222,6 @@ async def _proxy_with_fallback_cycle(
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                         )
-                        try:
-                            from proxy.metrics import record_contention_fallback_after_queue
-
-                            record_contention_fallback_after_queue()
-                        except Exception:
-                            pass
                         continue
                     elif _cq_action == "context_bypass":
                         # Context bypasses never queue (AC4): fall back exactly
@@ -5160,24 +5329,20 @@ async def _proxy_with_fallback_cycle(
                         ),
                         _get_context_pressure_warn_ratio(config),
                     )
-                _skip_local = _should_skip_local(
+                # Resolve the config-driven economic-bypass recovery flag
+                # (LP-0MU5A4QBR003YJM0): set by config-cheap.yaml, absent/
+                # false in fast/default profiles.
+                _recover_economic = _economic_bypass_serves_local(config)
+                _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
                     body_json,
                     _cold_threshold,
                     estimated_tokens=_estimated_tokens,
                     warm_cache_threshold=_warm_threshold,
+                    economic_bypass_serves_local=_recover_economic,
                 )
                 if _skip_local:
-                    # Determine reason: the context-too-large hard cap fires
-                    # when estimated_tokens > warm_cache_threshold (total
-                    # context too large regardless of cache state), logged as
-                    # ``context_too_large`` (LP-0MSF8XDG7000PERM).  Otherwise
-                    # the cold-cache new-token check triggered.
-                    if _warm_threshold > 0 and _estimated_tokens > _warm_threshold:
-                        _skip_reason = "context_too_large"
-                    else:
-                        _skip_reason = "large_context_bypass"
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
@@ -5209,7 +5374,134 @@ async def _proxy_with_fallback_cycle(
                     fallback_reason = _skip_reason
                     prev_provider = provider_name
                     all_slot_exhaustion = False
-                    continue
+
+                    # Server-side compaction rescue (LP-0MU5ARWSP001BYYB).
+                    # The bypass used to ``continue`` here, before any session
+                    # handling, so oversized sessions were never evaluated for
+                    # compaction. Always evaluate now; a successful compaction
+                    # may bring the session back under the local thresholds.
+                    _bypass_compaction = await _evaluate_compaction_for_bypass(
+                        config, provider_name, body_json, _session_id,
+                    )
+                    _rescued_local = False
+                    if _bypass_compaction["applied"]:
+                        # Re-run local eligibility against the compacted size so
+                        # a session bypassed purely for size can return to
+                        # local on this same request (AC2).
+                        _compacted_tokens = (
+                            await _estimate_effective_prompt_tokens_for_routing(
+                                request, body_json, tokenizer=_tokenizer,
+                            )
+                        )
+                        if _multiplier != 1.0:
+                            _compacted_tokens = int(_compacted_tokens * _multiplier)
+                        _skip_after, _skip_after_reason = _should_skip_local(
+                            _llama_model,
+                            _session_id,
+                            body_json,
+                            _cold_threshold,
+                            estimated_tokens=_compacted_tokens,
+                            warm_cache_threshold=_warm_threshold,
+                            economic_bypass_serves_local=_recover_economic,
+                        )
+                        if _skip_after:
+                            logger.info(
+                                "routing_compaction_still_oversized provider=%s "
+                                "model=%s est_before=%d est_after=%d "
+                                "reason=%s session=%s",
+                                provider_name,
+                                _llama_model or "unknown",
+                                _bypass_compaction["estimated_before"],
+                                _bypass_compaction["estimated_after"],
+                                _skip_after_reason,
+                                _session_id or "unknown",
+                            )
+                        else:
+                            logger.info(
+                                "routing_compaction_local_redispatch provider=%s "
+                                "model=%s est_before=%d est_after=%d "
+                                "skip_reason=%s session=%s",
+                                provider_name,
+                                _llama_model or "unknown",
+                                _bypass_compaction["estimated_before"],
+                                _bypass_compaction["estimated_after"],
+                                _skip_reason,
+                                _session_id or "unknown",
+                            )
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="compaction_local_redispatch",
+                                estimated_tokens=_compacted_tokens,
+                                reason="compaction_reenabled_local",
+                            )
+                            # Refresh the cached body so the ordinary local
+                            # dispatch below forwards the compacted history.
+                            # Its own session handling re-evaluates compaction,
+                            # but the compacted history is below the trigger so
+                            # that evaluation is a cheap no-op — no second
+                            # summarisation and only one local dispatch.
+                            _refresh_request_body(
+                                request, body_json, provider_name, _session_id,
+                            )
+                            _rescued_local = True
+                    else:
+                        logger.info(
+                            "compaction_bypass_eval provider=%s model=%s "
+                            "evaluated=%s action=%s reason=%s est_before=%d "
+                            "est_after=%d session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _bypass_compaction["evaluated"],
+                            _bypass_compaction["action"],
+                            _bypass_compaction.get("reason"),
+                            _bypass_compaction["estimated_before"],
+                            _bypass_compaction["estimated_after"],
+                            _session_id or "unknown",
+                        )
+                    if not _rescued_local:
+                        # No rescue — preserve the original bypass behaviour
+                        # and continue to the next (remote) provider.
+                        continue
+                    # Rescued: fall through to the ordinary local dispatch
+                    # below with the compacted body.
+
+                # Cheap-mode economic-bypass recovery: log when a request
+                # that would have been cold-cache-bypassed proceeds to local
+                # (LP-0MU5A4QBR003YJM0).  The `_recover_economic` /
+                # `_cold_threshold` variables are available from the scope
+                # above.
+                if (
+                    _recover_economic
+                    and _cold_threshold > 0
+                    and _routing_new_tokens > _cold_threshold
+                ):
+                    logger.info(
+                        "routing_economic_bypass_local provider=%s model=%s "
+                        "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
+                        "new_tokens=%d cached_ratio=%.2f session=%s",
+                        provider_name,
+                        _llama_model or "unknown",
+                        _estimated_tokens,
+                        _cold_threshold,
+                        _warm_threshold,
+                        _routing_new_tokens,
+                        _routing_cached_ratio,
+                        _session_id or "unknown",
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="economic_bypass_local_serve",
+                        estimated_tokens=_estimated_tokens,
+                        cold_threshold=_cold_threshold,
+                        warm_threshold=_warm_threshold,
+                        new_tokens=_routing_new_tokens,
+                        cached_ratio=_routing_cached_ratio,
+                        reason="economic_bypass_local_serve",
+                    )
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
@@ -5710,8 +6002,11 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text, config,
                             )
-                            _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
-                            attempted_domains.add(_failure_domain_key(provider_cfg))
+                            _threshold_exceeded = _record_sibling_failure(
+                                provider_name, config, provider_cfg.get("provider")
+                            )
+                            if _threshold_exceeded:
+                                attempted_domains.add(_failure_domain_key(provider_cfg))
                             fallback_reason = "empty_response"
                             prev_provider = provider_name
                             all_slot_exhaustion = False
@@ -5722,8 +6017,11 @@ async def _proxy_with_fallback_cycle(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text, config,
                         )
-                        _record_sibling_failure(provider_name, config, provider_cfg.get("provider"))
-                        attempted_domains.add(_failure_domain_key(provider_cfg))
+                        _threshold_exceeded = _record_sibling_failure(
+                            provider_name, config, provider_cfg.get("provider")
+                        )
+                        if _threshold_exceeded:
+                            attempted_domains.add(_failure_domain_key(provider_cfg))
                         fallback_reason = "empty_response"
                         prev_provider = provider_name
                         all_slot_exhaustion = False

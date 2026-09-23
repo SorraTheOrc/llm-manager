@@ -116,6 +116,9 @@ class AnalysisResult:
     speed: object | None = None
     # Local-model utilization (busy time etc.); None when no local traffic.
     busy: BusyStats | None = None
+    # TTFT (Time to First Token) events parsed from log lines
+    # (LP-0MTSSM5SO003PKU0).
+    ttft_events: list[LogEvent] = field(default_factory=list)
 
     @property
     def total_requests(self) -> int:
@@ -749,6 +752,8 @@ def aggregate(
     contention_dispatch_events: list[LogEvent] = []
     contention_fallback_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
+    # TTFT events (LP-0MTSSM5SO003PKU0)
+    ttft_events: list[LogEvent] = []
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -806,6 +811,9 @@ def aggregate(
         if ev.kind in ("compaction_event", "compaction_backstop", "compaction_churn"):
             compaction_events.append(ev)
             continue
+        if ev.kind == "ttft":
+            ttft_events.append(ev)
+            continue
         if ev.kind in ("stream_started", "stream_finished"):
             if not ev.session:
                 unattributed += 1
@@ -844,4 +852,5 @@ def aggregate(
         contention_fallback_events=contention_fallback_events,
         compaction_events=compaction_events,
         busy=busy,
+        ttft_events=ttft_events,
     )

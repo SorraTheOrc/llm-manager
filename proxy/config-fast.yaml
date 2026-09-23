@@ -46,14 +46,14 @@
 #                     ranges (e.g. "22:00-02:00") wrap past midnight.
 #                     Omit the field (or use an empty list) to leave a
 #                     provider unrestricted. Malformed entries are logged and
-#                     ignored (fail-open). The deepseek-v4-flash provider is
+#                     ignored (fail-open). The deepseek-v4.1-flash provider is
 #                     currently timed to off-peak UTC windows (see its entries).
 #                     Example:
-#                       - name: deepseek-v4-flash
+#                       - name: deepseek-v4.1-flash
 #                         type: remote
 #                         endpoint: https://api.deepseek.com
 #                         api_key_env: DEEPSEEK_API_KEY
-#                         model: deepseek-v4-flash
+#                         model: deepseek-v4.1-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
 #
 # Example with providers list:
@@ -146,20 +146,20 @@ session_recording:
 # ---------------------------------------------------------------------------
 # The audit skill (skill/audit/) uses these settings to determine which
 # model to call for audit operations. The resolver maps short names to
-# provider-prefixed model IDs (e.g., ``deepseek-v4-flash`` →
-# ``opencode/deepseek-v4-flash``).
+# provider-prefixed model IDs (e.g., ``deepseek-v4.1-flash`` →
+# ``opencode/deepseek-v4.1-flash``).
 #
 # Canonical model IDs (discovered via ``pi --list-models``):
-#   opencode/deepseek-v4-flash
-#   opencode-go/deepseek-v4-flash
-#   openrouter/deepseek/deepseek-v4-flash
+#   opencode/deepseek-v4.1-flash
+#   opencode-go/deepseek-v4.1-flash
+#   openrouter/deepseek/deepseek-v4.1-flash
 #
 # See proxy/provider_resolver.py for the full mapping table.
-audit_model: "deepseek-v4-flash"
+audit_model: "deepseek-v4.1-flash"
 audit_model_fallbacks:
   # Mirrors plan's paid-tier fallbacks (the opencode free zen-muse tier
   # was removed: OpenCode's free tier errors outside the OpenCode app).
-  - "deepseek-v4-flash"
+  - "deepseek-v4.1-flash"
 
 models:
   embed:
@@ -195,8 +195,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -211,8 +210,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -227,8 +225,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -240,7 +237,6 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - plan*
     force_full_prompt: true
@@ -263,8 +259,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -279,8 +274,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -295,8 +289,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -308,7 +301,6 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - author
     force_full_prompt: true
@@ -329,8 +321,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -345,8 +336,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -361,8 +351,7 @@ models:
         #
         # Deepseek
         #
-        model: deepseek-v4-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        model: deepseek-v4.1-flash
         #
         # Muse
         #
@@ -374,12 +363,37 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
     aliases:
     - code
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
+
+  # Remote-only compaction summarizer chain (LP-0MTT0O74N009E7N2): the
+  # proxy-side session compaction summarizer routes through here instead of
+  # the local llama-server, whose slot is frequently saturated (causing every
+  # summarizer call to time out). Muse via opencode-go is the primary tier,
+  # DeepSeek direct the fallback. No local tier — summarization never
+  # contends with the GPU slots. Selected programmatically by
+  # build_compact_summarizer (proxy/proxy/compaction_summarizer.py); not a
+  # user-facing alias. The direct-DeepSeek model id is ``deepseek-flash``
+  # (renamed from deepseek-v4.1-flash in ade62534), mirroring plan/author/code.
+  compact:
+    providers:
+      - name: opencode-go-compact
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        model: muse-spark-1.3-contributor
+        api: openai-responses
+        forward_session_headers: false
+      - name: deepseek-flash-compact
+        type: remote
+        provider: deepseek
+        endpoint: https://api.deepseek.com
+        api_key_env: DEEPSEEK_API_KEY
+        model: deepseek-flash
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
@@ -499,6 +513,12 @@ server:
   # NOTE: cheap mode raised its cold threshold to 42000 (LP-0MT50SMU1005ZAD6 /
   # LP-0MT50WCCP000DU00) but fast/default stay at 38000 — cheap-only change.
   local_large_context_cold_cache_threshold: 38000
+  # FAST MODE: The economic cold-cache bypass threshold.  Unlike cheap mode
+  # (LP-0MU5A4QBR003YJM0), fast mode retains the traditional behaviour:
+  # requests exceeding this threshold are skipped locally (``large_context_bypass``)
+  # and fall back to the next remote provider for tail-latency.  The cheap
+  # profile's ``local_large_context_economic_bypass_serves_local: true`` flag
+  # is intentionally omitted here (defaults to false).
 
   # Large-context warm-cache bypass threshold (LP-0MRE4NBQ5009V5BX).
   # When the slot cache is warm (cached prefix) but estimated prompt tokens
@@ -538,10 +558,11 @@ server:
   # `context_pressure_warn_ratio` knob is retired.
 
   # --- Session compaction config (LP-0MTG6RW3L003X122) ---
-  compaction_trigger_ratio: 0.70
+  # Operator request 2026-09-17: DISABLED (0 disables — docs/llama-router.md).
+  compaction_trigger_ratio: 0
   summarizer_model:
     type: local
-    llama_model: Qwen3
+    llama_model: Qwen2.5-7B
   summarizer_ctx_size: 8192
   summarizer_max_tokens: 512
   # Warn-only dry-run mode (LP-0MTGBPICV003JMXI/LP-0MTGBQ01A000ZFT9):
@@ -655,6 +676,10 @@ server:
   # so burst requests get a short local wait before falling back to remotes
   # — reducing tail latency while still utilising the local model. Cheap
   # mode (config-cheap.yaml) declares ``queue`` with larger caps (8/120).
+  #
+  # Context bypasses in fast mode (LP-0MU5A4QBR003YJM0):
+  #   Both ``context_too_large`` and ``large_context_bypass`` cause the
+  #   request to skip local and fall back to remote providers.
   contention_queue_policy: queue
   contention_queue_max_wait_seconds: 45
   contention_queue_max_depth: 3
@@ -772,14 +797,14 @@ server:
   # and retrying with bounded exponential backoff.
   # Must be shorter than the httpx read_timeout to fire before ReadTimeout.
   # Raised from 30s to 120s to tolerate long reasoning pauses from remote
-  # reasoning models (e.g. opencode-go/deepseek-v4-flash on large contexts)
+  # reasoning models (e.g. opencode-go/deepseek-v4.1-flash on large contexts)
   # which can pause >30s between chunks while still being alive
   # (LP-0MS9FR9LG002AJ4C). Matches the local stream_idle_timeout_seconds
   # (120s) used for Qwen3 reasoning pauses (LP-0MS14PM7J003XPS8).
   # Since retries now only occur while zero content has been delivered, a
   # genuinely dead upstream fails fast once content starts flowing.
   # Raised from 120 to 240s (LP-0MSF5I7XN009ENWQ / LP-0MSF1PUM90099ZSW F4):
-  # opencode-go/deepseek-v4-flash frequently pause >120s mid-generation while
+  # opencode-go/deepseek-v4.1-flash frequently pause >120s mid-generation while
   # still alive, so the lower bound produced false stalls (~31% of requests).
   # Trade-off: true failures are detected more slowly (up to 240s of silence).
   # The stall-gap distribution analysis (LP-0MSF5IAXE005BG33) will refine this.

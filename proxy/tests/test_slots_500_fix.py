@@ -33,6 +33,24 @@ from proxy.observability import (
     last_known_slot_counts,
 )
 
+
+@pytest.fixture(autouse=True)
+def _disable_slots_poll_cache(monkeypatch):
+    """Disable the /slots poll coalescing cache for these tests.
+
+    These tests simulate back-to-back success-then-failure queries and expect
+    each to hit the backend. The production coalescing cache
+    (LP-0MUCEFD5B003TURT) is exercised by test_slots_poll_coalescing.py; here
+    it is disabled (TTL=0) so the sequential-query semantics are preserved.
+    """
+    from proxy import observability as _obs
+
+    monkeypatch.setenv("SLOTS_POLL_TTL_SECONDS", "0")
+    monkeypatch.setenv("SLOTS_POLL_FAILURE_BACKOFF_SECONDS", "0")
+    _obs.reset_slots_poll_cache()
+    yield
+    _obs.reset_slots_poll_cache()
+
 # ======================================================================
 # Helpers — fake httpx responses
 # ======================================================================

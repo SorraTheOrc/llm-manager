@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
+import json
 import logging
 import os
 import re
@@ -31,6 +33,162 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 import proxy.metrics as metrics
+from proxy import cold_start
+
+# ---------------------------------------------------------------------------
+# llama-server reuse across proxy-only restarts (LP-0MUCEFCL6001ZXYN)
+# ---------------------------------------------------------------------------
+# A proxy-only restart (same mode / same local model + parallel config) must
+# not kill the co-located llama-server: reusing it keeps the KV / prompt
+# cache warm and avoids the post-restart cold-prefill thundering-herd. The
+# proxy records the running server's signature (model, parallel, router mode,
+# config hash, mode label) when it starts llama-server; a new proxy process
+# adopts an already-running server whose signature matches instead of
+# spawning a duplicate.
+
+
+def _llama_server_signature_path() -> Path:
+    """Path to the recorded llama-server signature (``proxy/.llama_server_signature.json``)."""
+    return Path(__file__).resolve().parent.parent / ".llama_server_signature.json"
+
+
+def _read_mode_label() -> str:
+    """Read the persisted mode label (``proxy/.mode``); defaults to ``fast``."""
+    try:
+        return (
+            Path(__file__).resolve().parent.parent
+            .joinpath(".mode")
+            .read_text(encoding="utf-8")
+            .strip()
+            or "fast"
+        )
+    except Exception:
+        return "fast"
+
+
+def _config_file_sha256() -> str:
+    """sha256 of the active config file (empty when unknown)."""
+    try:
+        config_path = os.environ.get("LLAMA_PROXY_CONFIG")
+        if not config_path:
+            return ""
+        return hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _write_llama_server_signature(
+    model: str | None, parallel: int, router_mode: bool
+) -> None:
+    """Record the signature of the llama-server we just started.
+
+    Best-effort: a failure must never break server startup.
+    """
+    try:
+        payload = {
+            "mode": _read_mode_label(),
+            "model": "router" if router_mode else (model or ""),
+            "parallel": int(parallel or 1),
+            "router_mode": bool(router_mode),
+            "config_sha256": _config_file_sha256(),
+        }
+        _llama_server_signature_path().write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _read_llama_server_signature() -> dict | None:
+    """Read the recorded llama-server signature, or None when absent/corrupt."""
+    try:
+        raw = _llama_server_signature_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+class _AdoptedLlamaProcess:
+    """Sentinel ``llama_process`` for a llama-server adopted across a restart.
+
+    Exposes the minimal ``poll()`` / ``pid`` interface the rest of the code
+    uses to decide whether the server is alive. ``poll()`` returns None
+    (running); ``stop_llama_server`` must not try to kill an adopted server
+    because this proxy did not spawn it.
+    """
+
+    adopted = True
+
+    def __init__(self, pid: int = 0, port: int = 0) -> None:
+        self.pid = pid
+        self.port = port
+
+    def poll(self):
+        return None
+
+
+async def _try_adopt_running_llama_server(
+    srv, requested_model: str | None, router_mode: bool = False
+) -> bool:
+    """Adopt an already-running llama-server preserved across a restart.
+
+    Returns True when a server matching the requested signature is already
+    reachable on the configured port; the caller then skips spawning a
+    duplicate and (for router mode) still ensures the requested model is
+    loaded. The preserved KV / prompt cache is marked warm.
+
+    Returns False when there is no matching running server, in which case the
+    caller proceeds with a normal start. Fail-open: any error returns False.
+    """
+    try:
+        signature = _read_llama_server_signature()
+        if not signature:
+            return False
+        if bool(signature.get("router_mode")) != bool(router_mode):
+            return False
+        recorded_model = signature.get("model") or ""
+        if not router_mode and recorded_model != (requested_model or ""):
+            return False
+        server_config = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+        llama_port = int(server_config.get("llama_server_port", 8080) or 8080)
+        if not await _probe_backend_reachable(llama_port):
+            return False
+        # Adopt: mark ready and treat the preserved KV / prompt cache as warm
+        # so cold-start admission control does not needlessly throttle the
+        # first request.
+        srv.llama_process = _AdoptedLlamaProcess(port=llama_port)
+        if not router_mode:
+            srv.current_model = requested_model
+        srv.backend_ready = True
+        try:
+            cold_start.mark_warm()
+        except Exception:
+            pass
+        try:
+            srv.logger.info(
+                "Adopted running llama-server (model=%s parallel=%s "
+                "router_mode=%s); preserving warm prompt cache",
+                recorded_model or "router",
+                signature.get("parallel"),
+                router_mode,
+            )
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _note_model_loaded_cold_start() -> None:
+    """Arm the cold-start window after a model load/switch (LP-0MUCEFCAT005NFNN).
+
+    Best-effort: a failure here must never break model loading.
+    """
+    try:
+        cold_start.note_model_loaded()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1267,9 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
     mode_label = "router" if router_mode else f"model: {model}"
     srv.logger.info(f"Starting llama-server with {mode_label}")
+    # LP-0MUCEFCL6001ZXYN: record what we started so a later proxy-only
+    # restart can detect an unchanged local backend and preserve it.
+    _write_llama_server_signature(model, slot_pool_size, router_mode)
 
     # Rotate llama-server logs (keep last 15)
     if srv.log_dir:
@@ -1287,7 +1448,23 @@ def stop_llama_server():
        # a real subprocess (has terminate/kill/wait methods). If it's a
        # test mock or invalid object, skip process cleanup.
        is_real_process = hasattr(srv.llama_process, 'terminate') or hasattr(srv.llama_process, 'kill')
-       if is_real_process:
+       is_adopted = bool(getattr(srv.llama_process, 'adopted', False))
+       if is_adopted:
+           # LP-0MUCEFCL6001ZXYN: this proxy adopted an already-running
+           # llama-server. A real stop (e.g. a genuine model/parallel change)
+           # must still terminate it, but state cleanup differs (we never
+           # owned the Popen handle). Kill by port, then clear state.
+           adopted_port = int(getattr(srv.llama_process, 'port', 0) or 0)
+           if adopted_port > 0:
+               try:
+                   _kill_process_on_port(adopted_port, srv.logger)
+               except Exception:
+                   pass
+           srv.llama_process = None
+           srv.current_model = None
+           srv.backend_ready = False
+           srv.logger.info("Adopted llama-server stopped (port killed)")
+       elif is_real_process:
            previous_model = srv.current_model
            _kill_process_group(srv.llama_process, srv.logger)
            srv.llama_process = None
@@ -1670,6 +1847,15 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
     server_config = srv.config.get("server", {})
     router_mode = server_config.get("llama_router_mode", False)
 
+    # LP-0MUCEFCL6001ZXYN: reuse a llama-server preserved across a proxy-only
+    # restart instead of spawning a duplicate (which would discard the warm
+    # KV / prompt cache and risk a port-bind conflict).
+    _adopted_preserved_server = False
+    if srv.llama_process is None:
+        _adopted_preserved_server = await _try_adopt_running_llama_server(
+            srv, llama_model, router_mode
+        )
+
     # Use a try/finally around the model switch lock so we can reliably
     # decrement the global refcount if this invocation incremented it.
     incremented_here = False
@@ -1766,6 +1952,18 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
                    "llama_server_running": True
                })
                srv.backend_ready = True
+               if _adopted_preserved_server:
+                   # LP-0MUCEFCL6001ZXYN: the adopted server's KV / prompt
+                   # cache is already warm — do not arm the cold window.
+                   try:
+                       cold_start.mark_warm()
+                   except Exception:
+                       pass
+               else:
+                   # LP-0MUCEFCAT005NFNN: a router-mode model was just loaded
+                   # — enter the cold window so concurrent large prefills are
+                   # capped until the cache warms.
+                   _note_model_loaded_cold_start()
                return True
 
            # Need to switch models or restart (single-model path)
@@ -1798,6 +1996,9 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
                    "llama_server_running": True
                })
                srv.backend_ready = True
+               # LP-0MUCEFCAT005NFNN: single-model load complete — arm the
+               # cold window.
+               _note_model_loaded_cold_start()
                return True
            else:
                # Broadcast failure
@@ -1974,6 +2175,10 @@ async def restart_services(
                     )
 
             srv.backend_ready = True
+            # LP-0MUCEFCAT005NFNN: a router-mode restart just reloaded the
+            # model cold — arm the cold window so the post-restart
+            # thundering-herd is admission-controlled.
+            _note_model_loaded_cold_start()
             srv.logger.info(
                 "restart_services: router-mode restart complete (%d slots)",
                 slot_count,
