@@ -42,6 +42,23 @@ def _reset_slots_poll_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_slot_details_cache():
+    """Reset the last-known per-slot detail cache before every test.
+
+    ``_last_slot_details_cache`` is populated by the broadcast/SSE paths and
+    consumed as a fallback by the ``/llama/local/status`` handler when the
+    fresh per-slot query fails (LP-0MUFSVXID0039ZAQ). Without a reset, an
+    earlier test that populated the cache would make a later test observing a
+    stubbed failure see cached detail instead of ``[]``.
+    """
+    import proxy.observability as obs
+
+    obs._last_slot_details_cache = []
+    yield
+    obs._last_slot_details_cache = []
+
+
+@pytest.fixture(autouse=True)
 def _reset_server_global_state(monkeypatch):
     """Reset global server counters that leak across tests.
 

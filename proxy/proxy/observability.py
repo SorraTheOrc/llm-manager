@@ -577,8 +577,9 @@ _last_slot_details_cache: list[dict] = []
 """Last successful result from ``_query_slots_detail()``.
 
 Updated by ``_periodic_broadcast_loop()`` on each successful query.
-Read by ``status_events()`` in ``proxy.ui`` as a fallback when the
-initial /slots query times out.
+Read by ``status_events()`` in ``proxy.ui`` and by the
+``/llama/local/status`` handler (``proxy.handlers``) as a fallback when
+the initial /slots query fails or times out (LP-0MUFSVXID0039ZAQ).
 """
 
 

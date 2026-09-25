@@ -387,19 +387,21 @@ async def get_llama_local_status(request: Request):
     restart), the last known slot counts are served instead of 0/0
     (graceful degradation, LP-0MSVP7XJ6008QPKX), bounded by
     ``SLOT_COUNTS_STALE_AFTER_SECONDS`` (default 1h). ``slots_stale`` is
-    ``true`` whenever the served counts came from that cache rather than a
-    fresh query, so a future silent failure (worker alive but zero
-    dispatches across an idle window) is observable.
+    ``true`` whenever the served slot data came from that cache rather than
+    a fresh query — counts or per-slot detail — so a future silent failure
+    (worker alive but zero dispatches across an idle window) is observable.
 
     ``slots`` carries the per-slot details (``slot_id``, ``is_processing``,
     ``n_decoded``) from llama-server's ``/slots`` endpoint so consumers such
     as herdr's downtime worker can track the SAME slots staying free across
-    polls (LP-0MSORPUMX002LLIA). It is an empty array when llama-server is
-    not running, no model is loaded yet, or the slots query fails or times
-    out — never a malformed payload. The fetch reuses
-    ``_query_slots_detail()``'s own httpx timeout bounded by the
-    ``STATUS_QUERY_TIMEOUT`` window so a slow /slots response cannot blow the
-    endpoint's response budget.
+    polls (LP-0MSORPUMX002LLIA). When the fresh per-slot query fails or
+    returns nothing, the last-known per-slot detail cache is served instead
+    so slot identity survives transient failures (LP-0MUFSVXID0039ZAQ); when
+    that cache is also empty the field is an empty array. It is an empty
+    array when llama-server is not running or no model is loaded yet — never
+    a malformed payload. The fetch reuses ``_query_slots_detail()``'s own
+    httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
+    /slots response cannot blow the endpoint's response budget.
 
     ``local_active_query`` mirrors ``active_query`` but is derived from the
     local-only counter (``local_active_queries``), so remote provider
@@ -482,11 +484,12 @@ async def get_llama_local_status(request: Request):
     available_slots = 0
     total_slots = 0
     slots: list[dict] = []
-    # slots_stale: True when the served counts came from the last-known cache
-    # because the fresh /slots query failed (LP-0MSVP7XJ6008QPKX). Set in the
-    # counts block below; logged and returned in the payload so a future
-    # silent failure (worker alive, zero dispatches across an idle window)
-    # is observable.
+    # slots_stale: True when the served slot data (counts or per-slot
+    # detail) came from the last-known cache because the fresh /slots query
+    # failed (LP-0MSVP7XJ6008QPKX, LP-0MUFSVXID0039ZAQ). Set in the counts
+    # block below and by the per-slot detail fallback; logged and returned in
+    # the payload so a future silent failure (worker alive, zero dispatches
+    # across an idle window) is observable.
     slots_stale = False
     if llama_running:
         try:
@@ -509,7 +512,12 @@ async def get_llama_local_status(request: Request):
                 if child_port is not None:
                     llama_port = child_port
                 client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                from proxy.observability import _query_slots, _query_slots_detail, last_known_slot_counts
+                from proxy.observability import (
+                    _last_slot_details_cache,
+                    _query_slots,
+                    _query_slots_detail,
+                    last_known_slot_counts,
+                )
                 available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
                 # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
                 # (e.g. HTTP 500 during a model reload after cheap-mode restart)
@@ -528,9 +536,24 @@ async def get_llama_local_status(request: Request):
                 # STATUS_QUERY_TIMEOUT window via the helper's own httpx
                 # timeout, so a slow /slots response cannot blow the
                 # endpoint's response budget (AC3).
-                detail = await _query_slots_detail(llama_port, timeout=timeout, model=cm)
-                if isinstance(detail, list):
+                try:
+                    detail = await _query_slots_detail(llama_port, timeout=timeout, model=cm)
+                except Exception:
+                    detail = None
+                if isinstance(detail, list) and detail:
                     slots = detail
+                else:
+                    # Graceful degradation for per-slot detail
+                    # (LP-0MUFSVXID0039ZAQ): the fresh query failed or
+                    # returned nothing, so serve the last-known per-slot
+                    # detail (updated by _periodic_broadcast_loop() and the
+                    # SSE handlers) instead of blanking slot identity. Mirrors
+                    # the counts fallback above; when the cache is empty the
+                    # payload stays a well-formed empty array (AC3).
+                    cached_detail = _last_slot_details_cache
+                    if cached_detail:
+                        slots = list(cached_detail)
+                        slots_stale = True
             except Exception:
                 # slots query is best-effort; default to 0 on failure
                 pass
@@ -598,13 +621,16 @@ async def get_llama_local_status(request: Request):
         "llama_server_running": bool(llama_running),
         "available_slots": available_slots,
         "total_slots": total_slots,
-        # True when the counts came from the last-known cache because the
-        # fresh /slots query failed (LP-0MSVP7XJ6008QPKX). Additive field;
+        # True when the served slot data (counts or per-slot detail) came from
+        # the last-known cache because the fresh /slots query failed
+        # (LP-0MSVP7XJ6008QPKX, LP-0MUFSVXID0039ZAQ). Additive field;
         # consumers that ignore unknown fields are unaffected.
         "slots_stale": bool(slots_stale),
         # Per-slot details (LP-0MSORPUMX002LLIA): compact slot dicts from
-        # llama-server's /slots endpoint, empty when not running / no model /
-        # query failure, so herdr can track same-slot idleness.
+        # llama-server's /slots endpoint, falling back to the last-known
+        # detail cache on a transient failure (LP-0MUFSVXID0039ZAQ); empty
+        # when not running / no model / no cached data, so herdr can track
+        # same-slot idleness.
         "slots": slots,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
