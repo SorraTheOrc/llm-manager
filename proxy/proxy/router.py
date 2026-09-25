@@ -1309,6 +1309,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             slot_id=slot_id,
                         )
                         srv.backend_ready = True
+                        # LP-0MUGQHPJ50046LV8: pin the stream context manager
+                        # on the dispatch record so the watchdog can cancel the
+                        # upstream request when releasing a wedged dispatch.
+                        try:
+                            _record_key = _dispatch_lease_key(
+                                endpoint, session_id
+                            )
+                            async with srv.local_dispatch_records_lock:
+                                if _record_key in srv.local_dispatch_records:
+                                    srv.local_dispatch_records[_record_key]["stream_cm"] = cm
+                        except Exception:
+                            pass
                         restore_signal_detected = _has_explicit_restore_signal(
                             dict(response.headers), None
                         )
