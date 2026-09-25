@@ -228,6 +228,18 @@ models:
         endpoint: https://models.inference.ai.azure.com
     aliases:
     - github-*
+  # Private model: local-only, no remote fallback at all.
+  # Uses the Qwen3 llama_model. When the local slot is busy the request
+  # is queued / deferred — it never falls through to a paid provider.
+  private:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+    aliases:
+    - private
+    force_full_prompt: true
+    tokenizer: qwen3
   # Cascading fallback: local Qwen3 first, then OpenCode Go, OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
