@@ -23,10 +23,12 @@ import json
 import os
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import proxy.provider as provider
 import proxy.server as server
 import pytest
+from fastapi import Response
 
 
 @pytest.fixture(autouse=True)
@@ -42,9 +44,11 @@ def _isolate_provider_state(tmp_path, monkeypatch):
     )
     provider._provider_unavailable_until.clear()
     provider._usage_reset_at.clear()
+    provider._provider_failure_count.clear()
     yield
     provider._provider_unavailable_until.clear()
     provider._usage_reset_at.clear()
+    provider._provider_failure_count.clear()
 
 
 def _write_state(path: Path, payload) -> None:
@@ -496,3 +500,203 @@ class TestStartupRestore:
         server._startup_launch_persistence_tasks()
 
         assert "key@domain" in provider._usage_reset_at
+
+
+class TestPersistOnMutation:
+    """Mutations persist the availability maps (LP-0MUIGX4HF003NWS5).
+
+    Both mutation sites are covered end-to-end: the provider cooldown setter
+    and the two usage-limit quarantine assignments (streaming and
+    non-streaming fallback paths). A persistence failure must be logged and
+    swallowed, never raised into the routing/fallback path.
+    """
+
+    _CHAIN = {
+        "providers": [
+            {
+                "name": "acme-primary",
+                "type": "remote",
+                "provider": "acme",
+                "endpoint": "https://acme.example/v1",
+                "api_key_env": "ACME_API_KEY",
+                "model": "m1",
+            },
+            {
+                "name": "acme-backup",
+                "type": "remote",
+                "provider": "acme-backup",
+                "endpoint": "https://backup.example/v1",
+                "api_key_env": "BACKUP_API_KEY",
+                "model": "m1",
+            },
+        ],
+    }
+
+    class _DummyRequest:
+        def __init__(self, body: bytes = b'{"model":"test"}'):
+            self._body = body
+            self.headers = {}
+            self.method = "POST"
+            self.url = type("U", (), {"path": "/v1/chat/completions"})()
+
+        async def body(self):
+            return self._body
+
+    @staticmethod
+    def _gousage_429() -> Response:
+        body = json.dumps(
+            {
+                "error": {
+                    "type": "GoUsageLimitError",
+                    "message": "Weekly usage limit reached. Resets in 2 hours.",
+                },
+                "metadata": {"limitName": "weekly"},
+            }
+        )
+        return Response(
+            status_code=429, content=body.encode("utf-8"),
+            media_type="application/json",
+        )
+
+    @staticmethod
+    def _ok() -> Response:
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    def _persisted(self) -> dict:
+        return json.loads(
+            provider.default_provider_state_file().read_text(encoding="utf-8")
+        )
+
+    def test_mark_provider_unavailable_persists_cooldown_round_trip(self):
+        before = time.time()
+
+        provider.mark_provider_unavailable("acme-primary", 120)
+
+        raw = self._persisted()
+        persisted_expiry = raw["provider_unavailable_until"]["acme-primary"]
+        assert before + 119 <= persisted_expiry <= before + 122
+
+        # Reloading from disk (simulated restart) restores the same absolute
+        # expiry — neither extended nor reset.
+        provider._provider_unavailable_until.clear()
+        assert provider.load_provider_state() == (1, 0)
+        assert provider._provider_unavailable_until["acme-primary"] == (
+            persisted_expiry
+        )
+
+    def test_mark_provider_unavailable_does_not_persist_failure_count(self):
+        provider.mark_provider_unavailable(
+            "acme-primary", 120, use_exponential_backoff=True
+        )
+
+        # The backoff counter is updated in memory but must NOT be persisted.
+        assert provider._provider_failure_count["acme-primary"] == 1
+        raw = self._persisted()
+        assert "provider_failure_count" not in raw
+        assert "_provider_failure_count" not in raw
+
+    def test_mark_provider_unavailable_save_failure_is_swallowed(
+        self, caplog, monkeypatch
+    ):
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(provider, "save_provider_state", _boom)
+
+        with caplog.at_level("WARNING"):
+            provider.mark_provider_unavailable("acme-primary", 60)
+
+        # The cooldown is still applied in memory and nothing raised.
+        assert "acme-primary" in provider._provider_unavailable_until
+        assert any(
+            "failed to persist availability state" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_usage_limit_site_persists_quarantine(self):
+        account_key = provider._usage_limit_account_key(
+            self._CHAIN["providers"][0]
+        )
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if provider_cfg.get("name") == "acme-primary":
+                return self._gousage_429()
+            return self._ok()
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            result = await provider.proxy_with_remote_fallback(
+                self._DummyRequest(), "v1/chat/completions", self._CHAIN,
+                {"provider_cooldown_seconds": 60},
+            )
+
+        assert result.status_code == 200
+        assert call_count == 2
+        raw = self._persisted()
+        assert account_key in raw["usage_reset_at"]
+        assert raw["usage_reset_at"][account_key] == pytest.approx(
+            provider._usage_reset_at[account_key]
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_usage_limit_site_persists_quarantine(self):
+        account_key = provider._usage_limit_account_key(
+            self._CHAIN["providers"][0]
+        )
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if provider_cfg.get("name") == "acme-primary":
+                return self._gousage_429()
+            return self._ok()
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            result = await provider.proxy_with_fallback(
+                self._DummyRequest(), "v1/chat/completions", self._CHAIN,
+                {"provider_cooldown_seconds": 60},
+            )
+
+        assert result.status_code == 200
+        assert call_count == 2
+        raw = self._persisted()
+        assert account_key in raw["usage_reset_at"]
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_save_failure_does_not_break_fallback(
+        self, caplog, monkeypatch
+    ):
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(provider, "save_provider_state", _boom)
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if provider_cfg.get("name") == "acme-primary":
+                return self._gousage_429()
+            return self._ok()
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            with caplog.at_level("WARNING"):
+                result = await provider.proxy_with_remote_fallback(
+                    self._DummyRequest(), "v1/chat/completions",
+                    self._CHAIN, {"provider_cooldown_seconds": 60},
+                )
+
+        # The fallback still succeeded despite the persist failure.
+        assert result.status_code == 200
+        assert any(
+            "failed to persist availability state" in r.message
+            for r in caplog.records
+        )

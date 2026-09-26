@@ -293,6 +293,23 @@ def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
     return len(cooldowns), len(quarantine)
 
 
+def _persist_provider_state_best_effort() -> None:
+    """Persist the availability maps, swallowing (but logging) any failure.
+
+    Called on the cold path — a provider failing or an upstream 429. The write
+    must never raise into the routing/fallback path: a failed persist only
+    means the cooldown/quarantine is lost on the next restart, which is no
+    worse than the pre-persistence behaviour.
+    """
+    try:
+        save_provider_state()
+    except Exception:
+        logger.warning(
+            "provider-state: failed to persist availability state",
+            exc_info=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Default sibling-fallback constants
 # ---------------------------------------------------------------------------
@@ -2026,6 +2043,7 @@ def mark_provider_unavailable(
         _provider_failure_count[provider_name] = count + 1
 
     _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
+    _persist_provider_state_best_effort()
 
 
 def _reset_provider_failure_count(provider_name: str) -> None:
@@ -5300,6 +5318,7 @@ async def _proxy_with_remote_fallback_cycle(
                 if _reset_seconds is not None:
                     _reset_account = _usage_limit_account_key(provider_cfg)
                     _usage_reset_at[_reset_account] = time.time() + _reset_seconds
+                    _persist_provider_state_best_effort()
                     fallback_reason = "usage_limit_reset"
                     prev_provider = provider_name
                     attempted_domains.add(_reset_account)
@@ -6538,6 +6557,7 @@ async def _proxy_with_fallback_cycle(
                     if _reset_seconds is not None:
                         _reset_account = _usage_limit_account_key(provider_cfg)
                         _usage_reset_at[_reset_account] = time.time() + _reset_seconds
+                        _persist_provider_state_best_effort()
                         fallback_reason = "usage_limit_reset"
                         prev_provider = provider_name
                         attempted_domains.add(_reset_account)
