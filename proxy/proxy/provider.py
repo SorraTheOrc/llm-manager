@@ -21,10 +21,13 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -101,6 +104,194 @@ _PERIOD_DEFAULT_SECONDS = {
     "weekly": 7 * 24 * 3600,
     "monthly": 30 * 24 * 3600,
 }
+
+# ---------------------------------------------------------------------------
+# Provider availability persistence (LP-0MUI6KB67005X44B)
+#
+# Provider availability is process state: upstream cooldowns
+# (_provider_unavailable_until) and usage-limit account quarantine
+# (_usage_reset_at) previously lived only in memory, so every proxy restart
+# wiped them and re-exposed an already-exhausted upstream. Both maps are
+# persisted to a small versioned JSON document beside proxy/.mode and
+# restored on startup.
+#
+# Scope boundary: _provider_failure_count (the exponential-backoff counter)
+# and the sibling-failure / local-400 streak state are deliberately NOT
+# persisted — backoff restarts at its base interval after a restart and those
+# counters are cheap to re-learn.
+#
+# The write path is atomic (temp file + os.replace) and runs only on the cold
+# path (a provider failing / an upstream 429). The read path is
+# corruption-tolerant: any error leaves the maps empty and never blocks
+# startup.
+# ---------------------------------------------------------------------------
+
+# On-disk schema version for the persisted provider-availability document.
+_PROVIDER_STATE_VERSION = 1
+
+# Environment override for the state-file path (used by tests and non-default
+# deployments). When unset, the file lives beside proxy/.mode.
+_PROVIDER_STATE_FILE_ENV = "LLAMA_PROXY_PROVIDER_STATE_FILE"
+
+# Top-level keys of the persisted document.
+_PROVIDER_STATE_COOLDOWNS_KEY = "provider_unavailable_until"
+_PROVIDER_STATE_QUARANTINE_KEY = "usage_reset_at"
+
+
+def default_provider_state_file() -> Path:
+    """Return the persisted provider-availability state-file path.
+
+    Defaults to ``proxy/provider-state.json`` (beside ``proxy/.mode`` and
+    ``proxy/grandfathering-state.json``). Override with the
+    ``LLAMA_PROXY_PROVIDER_STATE_FILE`` environment variable.
+    """
+    override = os.environ.get(_PROVIDER_STATE_FILE_ENV)
+    if override:
+        return Path(override)
+    return Path(__file__).parent.parent / "provider-state.json"
+
+
+def _prune_expired_expiries(
+    mapping: dict[str, float], now: float
+) -> dict[str, float]:
+    """Return a copy of *mapping* without entries expired at *now*."""
+    return {key: expiry for key, expiry in mapping.items() if expiry > now}
+
+
+def save_provider_state(path: str | Path | None = None) -> None:
+    """Persist provider cooldowns and usage-limit quarantine atomically.
+
+    Serialises both availability maps to a versioned JSON document and writes
+    it via a temp file in the target directory plus ``os.replace`` so a
+    concurrent reader never observes a partial file. Already-expired entries
+    are excluded from the payload so the file does not grow with stale keys.
+
+    The write is synchronous: callers invoke it on the cold path (a provider
+    failing or an upstream 429), where a small atomic write is inexpensive.
+    A failure is raised to the caller, which is expected to persist
+    best-effort without letting the error reach the routing path.
+
+    Args:
+        path: Target state-file path (defaults to
+            :func:`default_provider_state_file`).
+    """
+    target = Path(path) if path else default_provider_state_file()
+    now = time.time()
+    payload = {
+        "version": _PROVIDER_STATE_VERSION,
+        _PROVIDER_STATE_COOLDOWNS_KEY: _prune_expired_expiries(
+            _provider_unavailable_until, now
+        ),
+        _PROVIDER_STATE_QUARANTINE_KEY: _prune_expired_expiries(
+            _usage_reset_at, now
+        ),
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _coerce_expiry_map(raw: Any) -> dict[str, float]:
+    """Coerce a persisted mapping to ``{str: float}``, dropping bad entries.
+
+    A non-dict payload, a non-string key, or a non-numeric expiry is skipped
+    rather than raising, so a single malformed entry never discards the rest
+    of the map.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        result[key] = float(value)
+    return result
+
+
+def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
+    """Restore provider cooldowns and usage-limit quarantine from disk.
+
+    Reads the state file written by :func:`save_provider_state`, drops any
+    entry whose absolute epoch expiry is at or before ``time.time()``, and
+    installs the remainder into the module-level maps. Both maps are replaced
+    (not merged) so a reload is deterministic.
+
+    Corruption tolerance: a missing, unreadable, malformed, or non-dict file
+    leaves the maps empty and logs a warning; a malformed entry is skipped
+    while valid siblings survive. This function never raises.
+
+    Args:
+        path: Source state-file path (defaults to
+            :func:`default_provider_state_file`).
+
+    Returns:
+        ``(restored_cooldowns, restored_quarantine)`` — the number of entries
+        restored into each map.
+    """
+    target = Path(path) if path else default_provider_state_file()
+    now = time.time()
+    cooldowns: dict[str, float] = {}
+    quarantine: dict[str, float] = {}
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        logger.warning(
+            "provider-state: no state file at %s; starting with empty "
+            "cooldown/quarantine state",
+            target,
+        )
+        raw = None
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "provider-state: ignoring unreadable state file %s: %s",
+            target,
+            exc,
+        )
+        raw = None
+    else:
+        if not isinstance(raw, dict):
+            logger.warning(
+                "provider-state: ignoring malformed state file %s "
+                "(top-level payload is not an object)",
+                target,
+            )
+            raw = None
+
+    if isinstance(raw, dict):
+        cooldowns = _prune_expired_expiries(
+            _coerce_expiry_map(raw.get(_PROVIDER_STATE_COOLDOWNS_KEY)), now
+        )
+        quarantine = _prune_expired_expiries(
+            _coerce_expiry_map(raw.get(_PROVIDER_STATE_QUARANTINE_KEY)), now
+        )
+
+    _provider_unavailable_until.clear()
+    _provider_unavailable_until.update(cooldowns)
+    _usage_reset_at.clear()
+    _usage_reset_at.update(quarantine)
+
+    logger.info(
+        "provider-state: restored %d cooldown entries and %d usage-limit "
+        "quarantine entries from %s",
+        len(cooldowns),
+        len(quarantine),
+        target,
+    )
+    return len(cooldowns), len(quarantine)
+
 
 # ---------------------------------------------------------------------------
 # Default sibling-fallback constants
