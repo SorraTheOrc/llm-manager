@@ -1038,3 +1038,191 @@ def test_fast_queue_caps_strictly_less_than_cheap():
         f"fast wait {fast['contention_queue_max_wait_seconds']} must be < cheap wait "
         f"{cheap['contention_queue_max_wait_seconds']}"
     )
+
+
+# ===================================================================
+# Post-dispatch local-lease denial → queue before remote fallback
+# (LP-0MU5BOMJM008F17C)
+# ===================================================================
+
+
+def _lease_active_response() -> Response:
+    """The synthetic 503 returned when the local dispatch lease is held by
+    another session (router: server_busy / reason=local_lease_active)."""
+    return Response(
+        content=json.dumps({
+            "error": {
+                "code": "no_slots_available",
+                "type": "server_busy",
+                "message": "Local dispatch lease is held by another session",
+            },
+            "total_slots": 1,
+            "available_slots": 0,
+            "reason": "local_lease_active",
+        }).encode("utf-8"),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
+def _free_concurrency() -> "_MutableConcurrency":
+    """Concurrency stub reporting a free slot so the pre-dispatch queue path
+    is not taken (the denial is a post-dispatch lease race)."""
+    return _MutableConcurrency(active=0, max_=1)
+
+
+@pytest.fixture
+def lease_state():
+    """Isolate cooldown/quarantine state for the lease-denial tests."""
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+    yield
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_queue_admits_and_redispatches_local(lease_state, caplog):
+    """AC1/AC2: a post-dispatch lease denial queues for the protected local
+    slot; when it frees within the budget the request is served locally."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [{"name": "local-llama", "type": "local", "llama_model": "Qwen3"}]
+    }
+    local_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        local_calls.append(1)
+        if len(local_calls) == 1:
+            return _lease_active_response()
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("dispatch", None, 0.5)),
+        ),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert result.status_code == 200
+    assert len(local_calls) == 2, "lease denial must re-dispatch local after the wait"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_dispatch" in messages
+    assert "reason=local_lease_active" in messages
+    assert "queued_duration=0.50s" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_queue_budget_expires_falls_back_to_remote(lease_state, caplog):
+    """AC1: when the queue budget expires, the request falls back to an
+    available remote provider (normal fallback, not a silent hold)."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    remote_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        remote_calls.append(1)
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("fallback", None, 300.0)),
+        ),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert result.status_code == 200
+    assert remote_calls == [1], "remote fallback must run after the queue budget expires"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_fallback_after_queue" in messages
+    assert "reason=local_lease_active" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_budget_expires_all_remotes_out_of_window_terminal(lease_state, caplog):
+    """AC3/AC4: lease denial + budget expiry + all remotes out of window
+    yields a prompt terminal error (with a stable code), never a silent
+    multi-cycle hold."""
+    import logging
+    from datetime import UTC, datetime
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-windowed", "type": "remote",
+             "endpoint": "https://api.example.com/v1",
+             "available_times": ["00:00-01:00"]},
+        ]
+    }
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 5, 13, 0, 0, tzinfo=UTC)
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        raise AssertionError("out-of-window remote must not be dispatched")
+
+    # chain-hold enabled with a large budget: the window edge (11h) exceeds it,
+    # so the hold must not run at all (LP-0MU56ZKQD005SX08).
+    cfg = _queue_cfg()
+    cfg["chain_hold_seconds"] = 300
+    cfg["chain_hold_max_cycles"] = 3
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.datetime", _FixedDateTime),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("fallback", None, 300.0)),
+        ),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, cfg
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == "All providers exhausted"
+    assert body["code"] == "all_exhausted", (
+        "a lease-denied provider makes this generic exhaustion, not a window one"
+    )
+    assert "local_lease_active" in json.dumps(body.get("diagnostics", []))
+    assert "contention_queue_fallback_after_queue" in " ".join(
+        r.getMessage() for r in caplog.records
+    )

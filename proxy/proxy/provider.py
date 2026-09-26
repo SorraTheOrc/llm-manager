@@ -6040,12 +6040,103 @@ async def _proxy_with_fallback_cycle(
                         status="local_lease_active",
                         slot_info=slot_info,
                     )
-                    all_slot_exhaustion = False
-                    continue
+                    # A lease denial is a LOCAL CAPACITY condition, not a
+                    # provider failure. With the queue policy, wait for the
+                    # protected local slot (bounded by
+                    # contention_queue_max_wait_seconds) before falling
+                    # through to a remote chain that may be entirely out of
+                    # window (LP-0MU5BOMJM008F17C).
+                    _lease_cur, _lease_max = _local_concurrency_info(
+                        config, endpoint=local_endpoint
+                    )
+                    _lease_action, _lease_reason, _lease_elapsed = (
+                        await _maybe_queue_for_local_slot(
+                            config, _lease_cur, _lease_max, request, body_json,
+                            model_config, provider_cfg, _session_id,
+                        )
+                    )
+                    if _lease_action == "dispatch":
+                        # A slot freed within the budget: re-dispatch local
+                        # with the queue wait subtracted from the adaptive
+                        # timeout budget.
+                        _set_queue_wait_on_request(request, _lease_elapsed)
+                        try:
+                            from proxy import contention_queue as _cq_mod
+                            _lease_depth = _cq_mod.queue_depth()
+                        except Exception:
+                            _lease_depth = 0
+                        logger.info(
+                            "contention_queue_dispatch provider=%s session=%s "
+                            "queued_duration=%.2fs policy=queue depth=%d "
+                            "reason=local_lease_active",
+                            provider_name,
+                            _session_id or "unknown",
+                            _lease_elapsed or 0.0,
+                            _lease_depth,
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_lease_queued",
+                            elapsed_wait_seconds=round(_lease_elapsed or 0.0, 3),
+                        )
+                        response = await _dispatch_local(
+                            ptr_local, request, path, local_endpoint
+                        )
+                        body_text = _response_body_text(response)
+                        slot_info = _parse_slot_exhaustion(response)
+                        if slot_info is not None and _is_local_lease_active_response(
+                            response
+                        ):
+                            # Still denied after the wait: fall through to the
+                            # remote chain (bounded, no further waiting).
+                            all_slot_exhaustion = False
+                            continue
+                        # Slot freed — evaluate the fresh response below.
+                    elif _lease_action == "fallback":
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="fallback_after_queue",
+                            elapsed_wait_seconds=round(_lease_elapsed or 0.0, 3),
+                        )
+                        logger.info(
+                            "contention_queue_fallback_after_queue provider=%s "
+                            "session=%s queued_duration=%.2fs "
+                            "reason=local_lease_active",
+                            provider_name,
+                            _session_id or "unknown",
+                            _lease_elapsed or 0.0,
+                        )
+                        all_slot_exhaustion = False
+                        continue
+                    elif _lease_action == "context_bypass":
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="cached_tokens_skip",
+                            reason=_lease_reason,
+                        )
+                        fallback_reason = _lease_reason
+                        all_slot_exhaustion = False
+                        continue
+                    else:
+                        # Queue disabled / fallback policy: preserve the
+                        # pre-existing immediate remote fallback.
+                        all_slot_exhaustion = False
+                        continue
 
+                # A successful post-dispatch lease re-dispatch clears
+                # ``slot_info``; fall through to the common response handling
+                # instead of the slot-retry paths (LP-0MU5BOMJM008F17C).
+                if slot_info is None:
+                    pass
                 # Optional local retry window for startup races where router/model
                 # is loaded but slot probes briefly report 0 available.
-                if provider_type == "local" and local_slot_retry_attempts > 0:
+                elif provider_type == "local" and local_slot_retry_attempts > 0:
                     resolved_after_retry = False
                     for retry_idx in range(1, local_slot_retry_attempts + 1):
                         if local_slot_retry_delay_seconds > 0:
