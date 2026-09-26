@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 import proxy.provider as provider
+import proxy.server as server
 import pytest
 
 
@@ -329,3 +330,169 @@ class TestAtomicWrite:
         # The original file is untouched and no partial temp file is left.
         assert json.loads(path.read_text(encoding="utf-8"))["marker"] == "original"
         assert list(tmp_path.glob("state.json.*.tmp")) == []
+
+
+class TestStartupRestore:
+    """Startup restore + first-routing-decision behaviour (LP-0MUIGX4H80051MYG).
+
+    The startup helper (``server._startup_restore_provider_state``) is the
+    process-start hook that reloads the persisted maps; ``resolve_provider``
+    is then exercised to prove the restored entries force a skip with the
+    existing log lines and no provider is returned for the request.
+    """
+
+    @staticmethod
+    def _provider_cfg(**overrides) -> dict:
+        cfg = {
+            "name": "acme-primary",
+            "type": "remote",
+            "provider": "acme",
+            "endpoint": "https://acme.example/v1",
+            "model": "m1",
+            "api_key_env": "ACME_API_KEY",
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_restored_quarantine_skips_account_without_dispatch(
+        self, caplog, tmp_path, monkeypatch
+    ):
+        cfg = self._provider_cfg()
+        usage_key = provider._usage_limit_account_key(cfg)
+        far_future = time.time() + 30 * 24 * 3600
+        provider._usage_reset_at[usage_key] = far_future
+        provider.save_provider_state()
+        # Wipe in-memory state to simulate a restart before restore.
+        provider._usage_reset_at.clear()
+
+        restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 1)
+        assert provider._usage_reset_at == {usage_key: far_future}
+
+        model_config = {"providers": [cfg]}
+        with caplog.at_level("INFO"):
+            resolved = provider.resolve_provider(model_config)
+
+        # No provider returned => the request would make no upstream call.
+        assert resolved is None
+        assert any(
+            "usage_limit_reset_pending" in record.message
+            and "acme-primary" in record.message
+            for record in caplog.records
+        )
+
+    def test_restored_cooldown_skips_provider_without_dispatch(self, caplog):
+        provider._provider_unavailable_until["acme-primary"] = (
+            time.time() + 3600
+        )
+        provider.save_provider_state()
+        provider._provider_unavailable_until.clear()
+
+        restored = server._startup_restore_provider_state()
+
+        assert restored == (1, 0)
+
+        model_config = {"providers": [self._provider_cfg()]}
+        with caplog.at_level("INFO"):
+            resolved = provider.resolve_provider(model_config)
+
+        assert resolved is None
+        assert any(
+            "in cooldown" in record.message
+            and "acme-primary" in record.message
+            for record in caplog.records
+        )
+
+    def test_expired_restored_entries_are_dropped_and_do_not_skip(self):
+        cfg = self._provider_cfg()
+        usage_key = provider._usage_limit_account_key(cfg)
+        now = time.time()
+        # Write directly: save() prunes expired entries, and this test needs
+        # the loader itself to drop them.
+        _write_state(
+            provider.default_provider_state_file(),
+            {
+                "version": 1,
+                "provider_unavailable_until": {"acme-primary": now - 5},
+                "usage_reset_at": {usage_key: now - 5},
+            },
+        )
+
+        restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        # The provider is available again, so it is returned (not skipped).
+        assert provider.resolve_provider({"providers": [cfg]}) == cfg
+
+    def test_restore_logs_counts_at_info(self, caplog):
+        provider._provider_unavailable_until["acme-primary"] = (
+            time.time() + 60
+        )
+        provider._usage_reset_at["key@domain"] = time.time() + 600
+        provider.save_provider_state()
+        provider._provider_unavailable_until.clear()
+        provider._usage_reset_at.clear()
+
+        with caplog.at_level("INFO"):
+            server._startup_restore_provider_state()
+
+        assert any(
+            "restored 1 cooldown entries and 1 usage-limit quarantine entries"
+            in record.message
+            for record in caplog.records
+        )
+
+    def test_missing_file_never_blocks_startup(self, caplog):
+        assert not provider.default_provider_state_file().exists()
+
+        with caplog.at_level("WARNING"):
+            restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any("no state file" in r.message for r in caplog.records)
+
+    def test_corrupt_file_never_blocks_startup(self, caplog):
+        provider.default_provider_state_file().write_text(
+            "{ corrupt", encoding="utf-8"
+        )
+
+        with caplog.at_level("WARNING"):
+            restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any(
+            "unreadable state file" in r.message for r in caplog.records
+        )
+
+    def test_unexpected_loader_error_is_swallowed(self, caplog, monkeypatch):
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated loader failure")
+
+        monkeypatch.setattr(server, "load_provider_state", _boom)
+
+        with caplog.at_level("WARNING"):
+            restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert any(
+            "Failed to restore provider availability state" in r.message
+            for r in caplog.records
+        )
+
+    def test_startup_persistence_tasks_invoke_restore(self):
+        provider._usage_reset_at["key@domain"] = time.time() + 600
+        provider.save_provider_state()
+        provider._usage_reset_at.clear()
+
+        # The real startup hook must reach the loader (no event loop here:
+        # the task-spawning section is guarded by RuntimeError).
+        server._startup_launch_persistence_tasks()
+
+        assert "key@domain" in provider._usage_reset_at

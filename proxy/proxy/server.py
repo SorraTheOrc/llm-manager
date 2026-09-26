@@ -769,11 +769,36 @@ def _startup_launch_watchdog_tasks():
         model_health_task = loop.create_task(_router_model_health_loop())
 
 
+def _startup_restore_provider_state() -> tuple[int, int]:
+    """Restore persisted provider cooldowns and usage-limit quarantine.
+
+    Best-effort: the loader is corruption-tolerant and never raises, but this
+    wrapper additionally swallows any unexpected error so a bad state file can
+    never block proxy startup. The loader logs the restored entry counts at
+    INFO (``provider-state: restored N cooldown entries and M usage-limit
+    quarantine entries``) — see LP-0MUI6KB67005X44B.
+
+    Returns:
+        ``(restored_cooldowns, restored_quarantine)``; ``(0, 0)`` when the
+        restore fails.
+    """
+    try:
+        return load_provider_state()
+    except Exception:
+        logger.warning(
+            "Failed to restore provider availability state; starting with "
+            "empty cooldown/quarantine state",
+            exc_info=True,
+        )
+        return (0, 0)
+
+
 def _startup_launch_persistence_tasks():
     """Load persisted counts and spawn background persist/broadcast loops."""
     global counts_persist_task, tokens_persist_task, periodic_broadcast_task
     load_counts()
     load_token_counts()
+    _startup_restore_provider_state()
     try:
         loop = asyncio.get_running_loop()
         if counts_persist_task is None:
@@ -1482,6 +1507,7 @@ from .provider import (  # noqa: E402, F401
     _is_slot_exhaustion_response,
     _parse_retry_after,
     _provider_unavailable_until,
+    load_provider_state,
     mark_provider_unavailable,
     proxy_with_fallback,
     proxy_with_remote_fallback,
