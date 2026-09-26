@@ -2771,15 +2771,36 @@ def _build_time_window_exhausted_response(
 
     The distinguishable response is used only when time windows are the *only*
     reason nothing could be used: no provider was actually tried (no errors, no
-    cooldown recorded this request) and no provider is currently in cooldown.
+    cooldown recorded this request), no provider is currently in cooldown, and
+    every recorded skip is an ``outside_time_window`` skip. A usage-limit
+    quarantine, a local/compaction skip, an error or any other non-window
+    reason means the window is not the sole cause (LP-0MU56ZFII004L7OO).
     Otherwise ``None`` is returned and the caller falls through to the generic
     exhausted response (whose diagnostics still expose any
     ``outside_time_window`` skips).
     """
     if any_provider_tried or unavailable:
         return None
-    if not any(a.get("status") == "outside_time_window" for a in attempts):
+    # Sole-cause check (LP-0MU56ZFII004L7OO): require at least one window skip
+    # AND that every recorded attempt is a window skip. A single
+    # ``usage_limit_reset`` / local-skip / error diagnostic means the window is
+    # not the only blocker and the generic exhausted response must be used.
+    if not attempts or any(
+        a.get("status") != "outside_time_window" for a in attempts
+    ):
         return None
+    # Defensive completeness check: when the chain is known, every provider
+    # must have been window-skipped. A provider skipped for an unrecorded
+    # reason (e.g. a router-level local/compaction skip) must not yield the
+    # window-specific message either.
+    if model_config is not None:
+        window_names = {
+            a.get("provider") for a in attempts
+            if a.get("status") == "outside_time_window"
+        }
+        for p in (model_config.get("providers") or []):
+            if isinstance(p, dict) and p.get("name") not in window_names:
+                return None
 
     retry_after = _compute_retry_after(unavailable, model_config=model_config)
     payload: dict[str, Any] = {

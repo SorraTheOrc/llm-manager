@@ -4301,6 +4301,12 @@ class _FakeDatetime:
     def now(cls, tz=None):
         return cls._now
 
+    @classmethod
+    def fromtimestamp(cls, ts, tz=None):
+        # Delegated to the real datetime so quarantine reset timestamps
+        # (LP-0MU56ZFII004L7OO tests) still format as ISO-8601.
+        return datetime.fromtimestamp(ts, tz)
+
 
 def _patch_utc_now(dt):
     _FakeDatetime._now = dt
@@ -4704,6 +4710,92 @@ async def test_proxy_with_fallback_all_time_window_skipped_distinguishable_503()
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
     )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_window_plus_quarantine_returns_generic():
+    """LP-0MU56ZFII004L7OO AC1: a usage-limit quarantined provider mixed with
+    window-skipped providers must produce the generic exhausted response, not
+    the time-window-specific message, while diagnostics still expose both
+    reasons."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    quarantined = {
+        "name": "quarantined",
+        "type": "remote",
+        "endpoint": "https://quota.example/v1",
+        "api_key_env": "QUOTA_KEY",
+        "model": "m1",
+        "available_times": ["00:00-01:00"],
+    }
+    model_config = {
+        "providers": [
+            quarantined,
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+        ]
+    }
+    provider._usage_reset_at[provider._usage_limit_account_key(quarantined)] = (
+        time.time() + 3600
+    )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        raise AssertionError("No provider should be called")
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == "All providers exhausted", (
+        f"Quarantine+window mix must be generic, got: {body}"
+    )
+    statuses = {a.get("provider"): a.get("status") for a in body.get("diagnostics", [])}
+    assert statuses["quarantined"] == "usage_limit_reset"
+    assert statuses["timed"] == "outside_time_window"
+
+
+def test_time_window_response_suppressed_by_local_skip():
+    """LP-0MU56ZFII004L7OO AC4: when a local provider was skipped for a
+    non-window reason (recorded as a local/compaction skip diagnostic), the
+    window-specific response must not be emitted."""
+    attempts = [
+        {"provider": "local", "type": "local", "status": "cached_tokens_skip",
+         "reason": "cold_cache"},
+        {"provider": "remote", "type": "remote", "status": "outside_time_window"},
+    ]
+    result = provider._build_time_window_exhausted_response(
+        attempts, {}, False,
+        model_config={
+            "providers": [
+                {"name": "local", "type": "local"},
+                {"name": "remote", "type": "remote"},
+            ]
+        },
+    )
+    assert result is None
+
+
+def test_time_window_response_suppressed_by_unrecorded_provider_skip():
+    """LP-0MU56ZFII004L7OO: a provider that was skipped without a recorded
+    window diagnostic (e.g. a router-level local/compaction skip) suppresses
+    the window-specific response."""
+    attempts = [
+        {"provider": "remote", "type": "remote", "status": "outside_time_window"},
+    ]
+    result = provider._build_time_window_exhausted_response(
+        attempts, {}, False,
+        model_config={
+            "providers": [
+                {"name": "local", "type": "local"},
+                {"name": "remote", "type": "remote"},
+            ]
+        },
+    )
+    assert result is None
+
 
 # ===================================================================
 # Additional 2-retry tests (LP-0MSORQKKM005MJ31)
