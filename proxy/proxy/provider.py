@@ -4556,8 +4556,16 @@ async def _hold_sleep(request, seconds: float) -> bool:
     checks.
 
     Returns True when the client disconnected during the hold (caller should
-    abort the hold, AC4), False when the full hold elapsed.
+    abort the hold, AC4), False when the full hold elapsed. A zero-length hold
+    still checks for a disconnect so an instant-retry (``retry_after == 0``)
+    loop with ``chain_hold_max_cycles == 0`` cannot spin forever on a gone
+    client (LP-0MU56ZKQD005SX08).
     """
+    try:
+        if await request.is_disconnected():
+            return True
+    except Exception:
+        pass
     if seconds <= 0:
         return False
     interval = min(1.0, max(0.05, seconds / 20))
@@ -4583,6 +4591,11 @@ async def _hold_feedback(request, hold_seconds: float, comment: str):
     start.
     """
     comment_bytes = (comment + "\n\n").encode("utf-8")
+    try:
+        if await request.is_disconnected():
+            return
+    except Exception:
+        pass
     if hold_seconds <= 0:
         yield comment_bytes
         return
@@ -4665,6 +4678,65 @@ def _get_chain_hold_cycle(request) -> int:
         return 0
 
 
+def _exhaustion_retry_after(response: Response) -> int | None:
+    """Return an exhaustion response's ``Retry-After`` in seconds.
+
+    Prefers the ``Retry-After`` header; falls back to the JSON
+    ``retry_after`` field. Returns ``None`` when neither is present/parsable
+    (unknown wait — the caller then preserves the legacy full hold).
+    """
+    try:
+        header = response.headers.get("Retry-After")
+        if header is not None:
+            return max(0, int(float(header)))
+    except Exception:
+        pass
+    try:
+        body = _response_body_text(response)
+        payload = json.loads(body) if body else None
+        if isinstance(payload, dict) and "retry_after" in payload:
+            return max(0, int(float(payload["retry_after"])))
+    except Exception:
+        pass
+    return None
+
+
+def _bounded_hold_seconds(
+    hold_seconds: float, response: Response, max_cycles: int
+) -> float | None:
+    """Bound a chain hold by the exhaustion response's real ``retry_after``.
+
+    Semantics (LP-0MU56ZKQD005SX08): a hold only helps when a provider can
+    become available within the configured hold budget. Returns:
+
+    - ``None`` when the chain must NOT hold — ``retry_after`` exceeds the
+      total budget ``hold_seconds * max_cycles`` (a window edge / usage-limit
+      reset hours away), so holding would only add latency before an
+      inevitable exhaustion. The response is returned immediately with its
+      accurate ``Retry-After``.
+    - ``min(hold_seconds, retry_after)`` when ``retry_after`` is within the
+      budget, so the next cycle runs as soon as a provider can serve. A
+      ``retry_after`` of 0 (instant cooldown expiry) returns ``0.0`` — retry
+      immediately without latency.
+    - ``hold_seconds`` (legacy behaviour) when ``retry_after`` is unknown
+      (non-JSON error responses), so existing short-cooldown recovery is
+      preserved.
+    """
+    retry_after = _exhaustion_retry_after(response)
+    if retry_after is None:
+        return hold_seconds
+    if retry_after <= 0:
+        # No known wait (e.g. instant cooldown expiry): retry immediately
+        # without adding latency.
+        return 0.0
+    total_budget = (
+        hold_seconds * max_cycles if max_cycles and max_cycles > 0 else hold_seconds
+    )
+    if retry_after > total_budget:
+        return None
+    return min(hold_seconds, float(retry_after))
+
+
 def _build_streaming_hold_response(
     request,
     path: str,
@@ -4692,13 +4764,21 @@ def _build_streaming_hold_response(
         cycle = next_cycle
         current_exhaustion = exhaustion_response
         while True:
-            _log_chain_hold_start(path, hold_seconds, cycle, max_cycles)
+            effective_hold = _bounded_hold_seconds(
+                hold_seconds, current_exhaustion, max_cycles
+            )
+            if effective_hold is None:
+                # retry_after exceeds the budget — surface the exhaustion
+                # immediately instead of holding through doomed cycles.
+                yield _response_to_sse_bytes(current_exhaustion)
+                return
+            _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             comment = _build_chain_hold_comment(
                 first_provider,
-                hold_seconds,
+                effective_hold,
                 _exhaustion_diagnostics(current_exhaustion),
             )
-            async for c in _hold_feedback(request, hold_seconds, comment):
+            async for c in _hold_feedback(request, effective_hold, comment):
                 yield c
             try:
                 if await request.is_disconnected():
@@ -4781,7 +4861,16 @@ async def _run_chain_cycles(
         except ChainExhaustedError as exc:
             if max_cycles != 0 and cycle >= max_cycles:
                 return exc.response
-            _log_chain_hold_start(path, hold_seconds, cycle, max_cycles)
+            effective_hold = _bounded_hold_seconds(
+                hold_seconds, exc.response, max_cycles
+            )
+            if effective_hold is None:
+                # retry_after exceeds the hold budget (or is 0): holding could
+                # not make the next cycle succeed, so return the exhaustion
+                # response immediately with its accurate Retry-After
+                # (LP-0MU56ZKQD005SX08).
+                return exc.response
+            _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             if await _request_is_streaming(request):
                 # Streaming: return a streaming response that emits SSE hold
                 # comments, sleeps, then runs the remaining cycles inside the
@@ -4799,7 +4888,7 @@ async def _run_chain_cycles(
                 )
             # Non-streaming: silent (deferred) hold, then a new cycle from
             # the first provider.
-            if await _hold_sleep(request, hold_seconds):
+            if await _hold_sleep(request, effective_hold):
                 # Client disconnected during the hold — abort (AC4).
                 return exc.response
             cycle += 1
