@@ -433,6 +433,16 @@ class TestErrorLineParsing:
         assert ev.provider == "opencode"
         assert ev.model is None
 
+    def test_upstream_429_go_usage_limit(self):
+        ev = log_parser.parse_log_line(fixtures.UPSTREAM_429_GO_USAGE_LIMIT)
+        assert ev is not None
+        assert ev.kind == "upstream_http_error"
+        assert ev.status == 429
+        # Only the error type is extracted; metadata.limitName / reset are not.
+        assert ev.error == "GoUsageLimitError"
+        assert ev.provider == "opencode"
+        assert ev.model is None
+
     def test_upstream_url_provider_mapping(self):
         cases = [
             ("url=https://opencode.ai/zen/go/v1/chat/completions", "opencode-go"),
@@ -1377,7 +1387,65 @@ class TestErrorRecommendations:
         recs = recommendations.generate_recommendations(res, config=None)
         titles = " | ".join(r.title.lower() for r in recs)
         assert "429" in titles, f"expected 429/cooldown recommendation, got: {titles}"
-        assert "LP-0MRGU0I91006ODFD" in " | ".join(r.detail for r in recs)
+        detail = " | ".join(r.detail for r in recs)
+        assert "LP-0MRGU0I91006ODFD" in detail, f"expected 3-hour cooldown citation, got: {detail}"
+        # A FreeUsageLimitError without a computable reset cites the cooldown
+        # only; the account quarantine path (LP-0MSLJPOCC0001ROJ) is not claimed.
+        assert "LP-0MSLJPOCC0001ROJ" not in detail, f"unexpected quarantine citation: {detail}"
+
+    def test_upstream_429_go_usage_limit_cites_account_quarantine(self):
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="GoUsageLimitError", status=429)
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        detail = " | ".join(r.detail for r in recs)
+        assert "LP-0MSLJPOCC0001ROJ" in detail, f"expected account quarantine citation, got: {detail}"
+        # The Go path must NOT claim the 3-hour cooldown that does not apply.
+        assert "LP-0MRGU0I91006ODFD" not in detail, f"unexpected cooldown citation: {detail}"
+        assert "3-hour" not in detail, f"unexpected 3-hour cooldown mention: {detail}"
+        # The mechanism names how the period is derived (parser cannot cite it).
+        assert "metadata.limitName" in detail, f"expected limitName guidance, got: {detail}"
+
+    def test_upstream_429_unknown_error_type_uses_generic_wording(self):
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="UnknownError", status=429)
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        detail = " | ".join(r.detail for r in recs)
+        assert "check the upstream provider quota or usage limits" in detail, \
+            f"expected generic 429 wording, got: {detail}"
+        # No recognised type: neither mechanism may be fabricated.
+        assert "LP-0MSLJPOCC0001ROJ" not in detail, f"fabricated quarantine citation: {detail}"
+        assert "LP-0MRGU0I91006ODFD" not in detail, f"fabricated cooldown citation: {detail}"
+
+    def test_upstream_429_without_error_type_uses_generic_wording(self):
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, status=429)
+            for _ in range(2)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        detail = " | ".join(r.detail for r in recs)
+        assert "check the upstream provider quota or usage limits" in detail, \
+            f"expected generic 429 wording, got: {detail}"
+        assert "LP-0MSLJPOCC0001ROJ" not in detail, f"fabricated quarantine citation: {detail}"
+        assert "LP-0MRGU0I91006ODFD" not in detail, f"fabricated cooldown citation: {detail}"
+
+    def test_upstream_429_mixed_types_describe_both_mechanisms(self):
+        errors = [
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="GoUsageLimitError", status=429),
+            log_parser.LogEvent("upstream_http_error", ERROR_WINDOW_START, error="FreeUsageLimitError", status=429),
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        detail = " | ".join(r.detail for r in recs)
+        # A bucket mixing both must describe both, never silently drop the Go path.
+        assert "LP-0MSLJPOCC0001ROJ" in detail, f"expected account quarantine citation, got: {detail}"
+        assert "LP-0MRGU0I91006ODFD" in detail, f"expected cooldown citation, got: {detail}"
 
     def test_upstream_402_triggers_balance_recommendation(self):
         # Status 402 (Insufficient Balance) must NOT be reported as a

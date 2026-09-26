@@ -178,6 +178,19 @@ UPSTREAM_429 = (
     "\"message\":\"Rate limit exceeded. Please try again later.\"},\"metadata\":{}}"
 )
 
+# Upstream HTTP 429 (GoUsageLimitError, account-level quota). The proxy takes
+# the usage-limit reset quarantine path (_usage_limit_reset_seconds ->
+# _usage_reset_at, LP-0MSLJPOCC0001ROJ) rather than the 3-hour per-model
+# cooldown (LP-0MRGU0I91006ODFD). The parser extracts only error.type; the
+# message reset duration / metadata.limitName are not parsed today.
+UPSTREAM_429_GO_USAGE_LIMIT = (
+    "2026-09-26 12:00:00,000 - WARNING - [remote] upstream error status=429 "
+    "url=https://opencode.ai/zen/v1/chat/completions "
+    "body={\"type\":\"error\",\"error\":{\"type\":\"GoUsageLimitError\","
+    "\"message\":\"Monthly usage limit reached. Resets in 29 days.\"},"
+    "\"metadata\":{\"limitName\":\"monthly\"}}"
+)
+
 # --- Lines the parser must ignore -------------------------------------------
 
 # Operating-mode scheduler lines (LP-0MSM5K4TX004MICX): the applied-mode

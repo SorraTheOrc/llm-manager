@@ -412,9 +412,17 @@ run (`Previous outputs archived to …`).
     (LP-0MSAOQTJS000FFVM).
   - `backend_retry` — upstream connect/read timeouts during retry backoff;
     transient unless clustered.
-  - `upstream error` (HTTP 429) — the 3-hour per-model cooldown
-    (LP-0MRGU0I91006ODFD) should suppress repeat fallbacks; persistent 429s
-    indicate an upstream quota/rate-limit issue.
+  - `upstream error` (HTTP 429) — the mechanism depends on the error type,
+    mirroring the proxy's precedence. A `GoUsageLimitError` (or any
+    usage-limit error with a computable reset) takes the account-level
+    usage-limit reset quarantine (LP-0MSLJPOCC0001ROJ); its duration is
+    derived from the message's reset time or `metadata.limitName`
+    (daily/weekly/monthly). A `FreeUsageLimitError` with no computable reset
+    falls back to the 3-hour per-model cooldown (LP-0MRGU0I91006ODFD).
+    Persistent 429s indicate an upstream quota/rate-limit issue; a bucket
+    mixing both error types is reported with both mechanisms. The log parser
+    extracts only `error.type`, so the report names the mechanism rather than
+    echoing the computed period.
   - `upstream error` (HTTP 402) — account balance or subscription issue;
     the proxy cannot recover — top up the account or switch provider.
   - `upstream error` (HTTP 5xx) — server-side upstream error; monitor for
