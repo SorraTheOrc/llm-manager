@@ -243,6 +243,50 @@ Per-mode config lets you trade local utilisation for tail latency:
 See `proxy/docs/routing.md` for the full contention-queue semantics and
 metrics.
 
+Multiple local llama-server backends
+-------------------------------------
+
+Each `type: local` provider may declare its own `endpoint` URL (host:port)
+pointing at a **pre-existing** llama-server instance. Listing several local
+providers with different endpoints pools their GPU slot capacity: the proxy
+routes to the first local provider and falls through to the next when it is
+busy or unhealthy (sequential fallback — no load balancing).
+
+```yaml
+models:
+  qwen3:
+    providers:
+      - name: local-qwen3-server-1
+        type: local
+        llama_model: Qwen3
+        endpoint: http://192.168.0.199:8080
+      - name: local-qwen3-server-2
+        type: local
+        llama_model: Qwen3
+        endpoint: http://192.168.0.200:8080
+      - name: remote-fallback
+        type: remote
+        endpoint: https://api.provider-a.com/v1
+        api_key_env: PROVIDER_A_KEY
+```
+
+- **Backward compatible:** omitting `endpoint` keeps the legacy behaviour —
+  the provider routes to `http://localhost:{server.llama_server_port}`.
+- **Per-endpoint dispatch leases:** each server independently tracks its own
+  active session leases, keyed by `(endpoint, session_id)`, so a session
+  holding a lease on one server does not consume a slot on another.
+- **Per-endpoint slot persistence:** slot snapshots are saved under
+  `{session_slot_save_path}/{host}-{port}/`, so slot state from one server
+  never collides with another.
+- **Health probes:** each local backend gets an HTTP `/health` probe, GPU OOM
+  error-pattern detection, and slot-capacity awareness (available vs total
+  GPU slots).
+- **No lifecycle management:** the proxy assumes the llama-server instances
+  are already running; starting/stopping multiple backends is out of scope.
+  Single-server startup via `start-llama.sh` is unchanged.
+
+See `proxy/MODEL_ADD.md` for the full provider-entry field reference.
+
 Contributing
 - Open issues and PRs in the `SorraTheOrc/llm-manager` repo. If you want changes merged upstream to `rgardler/llm`, open a PR from this repo to the upstream repository.
 
