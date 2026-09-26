@@ -122,8 +122,12 @@ MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
 #   1. ``PROXY_START_TIME`` records when the new process started (set by
 #      server.py in the lifespan handler).
 #   2. While ``startup_ramp`` is active, every new chat request receives
-#      ``Retry-After = uniform(jitter_min, jitter_max)``.
-#   3. Clients simply retry after that delay, spreading the reconnects over
+#      ``Retry-After = uniform(jitter_min, jitter_max)`` plus a 3 s margin.
+#   3. The 503 body also carries ``ramp_ends_at`` (ISO-8601 UTC ceiling) and
+#      ``ramp_remaining_seconds`` (non-negative whole seconds) so clients and
+#      operators can see when the ramp ends rather than guessing from the
+#      jittered ``Retry-After`` (LP-0MU9Z7O8M0053Y0K).
+#   4. Clients simply retry after that delay, spreading the reconnects over
 #      the ramp window.
 #
 # Config lives in ``server.startup_ramp`` with defaults:

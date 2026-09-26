@@ -6,13 +6,18 @@ proxy. The startup ramp gates new chat requests with 503 + random
 Retry-After only while local backends are not yet ready
 (``backend_ready=False``).  Once backends are ready the gate clears
 immediately, regardless of elapsed time.  ``max_seconds`` acts as a short
-safety ceiling so requests are never blocked indefinitely.
+safety ceiling so requests are never blocked indefinitely.  The 503 body
+also reports the ceiling as ``ramp_ends_at`` (ISO-8601 UTC) plus
+``ramp_remaining_seconds`` (LP-0MU9Z7O8M0053Y0K).
 
 Clients simply retry with the given delay, so reconnects spread across the
 ramp window instead of hitting the server all at once.
 """
 
+import math
+import re
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -545,6 +550,100 @@ def _is_ramp_503(resp) -> bool:
         return False
 
 
+class TestStartupRampResponseEndTime:
+    """AC1-AC4: the 503 body advertises when the ramp ends.
+
+    ``ramp_ends_at`` is the guaranteed ceiling (process start +
+    ``max_seconds``) rendered as ISO-8601 UTC; ``ramp_remaining_seconds`` is
+    the non-negative whole-second remainder, derived from the same integer so
+    the two fields are internally consistent.  ``retry_after`` / ``Retry-After``
+    keep their jittered semantics.
+    """
+
+    _ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    @pytest.mark.asyncio
+    async def test_ramp_end_fields_present_typed_and_consistent(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC1/AC2/AC5: both fields present, correctly typed and consistent."""
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        _within_ramp(monkeypatch, seconds_in=10)  # 20s of the 30s ceiling left
+
+        resp = await _post_chat("local-model")
+        assert _is_ramp_503(resp), f"expected startup_ramp 503: {resp.text}"
+        body = resp.json()
+
+        # AC1: absolute end time, ISO-8601 UTC with a ``Z`` suffix.
+        ramp_ends_at = body["ramp_ends_at"]
+        assert isinstance(ramp_ends_at, str)
+        assert self._ISO_UTC_RE.match(ramp_ends_at), ramp_ends_at
+
+        # AC2: non-negative integer seconds remaining, distinct from retry_after.
+        ramp_remaining = body["ramp_remaining_seconds"]
+        assert isinstance(ramp_remaining, int) and not isinstance(ramp_remaining, bool)
+        assert ramp_remaining >= 0
+        assert "retry_after" in body
+        # ~20s left of the 30s ceiling (allow scheduling/parse drift).
+        assert 18 <= ramp_remaining <= 21
+
+        # AC5: ramp_ends_at ~= now + ramp_remaining_seconds (tolerance ~2s).
+        parsed = datetime.strptime(ramp_ends_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=UTC
+        )
+        expected = datetime.now(UTC) + timedelta(seconds=ramp_remaining)
+        assert abs((parsed - expected).total_seconds()) <= 2.0
+
+    @pytest.mark.asyncio
+    async def test_ramp_remaining_never_underreports(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC2/A3: ``ceil`` of a fractional remainder is used (never under-report)."""
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        # 29.4s in -> 0.6s left; ceil => 1 (a plain int() would say 0).
+        _within_ramp(monkeypatch, seconds_in=29.4)
+
+        resp = await _post_chat("local-model")
+        assert _is_ramp_503(resp), f"expected startup_ramp 503: {resp.text}"
+        body = resp.json()
+
+        assert body["ramp_remaining_seconds"] == 1
+        assert body["ramp_remaining_seconds"] == math.ceil(body["ramp_remaining_seconds"])
+
+    @pytest.mark.asyncio
+    async def test_message_states_when_ramp_ends(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC3: the human-readable message names the ramp end."""
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("local-model")
+        assert _is_ramp_503(resp), f"expected startup_ramp 503: {resp.text}"
+        body = resp.json()
+        message = body["error"]["message"]
+
+        assert "ramp ends" in message.lower()
+        assert body["ramp_ends_at"] in message
+        assert f"{body['ramp_remaining_seconds']}s" in message
+
+    @pytest.mark.asyncio
+    async def test_retry_after_semantics_unchanged(
+        self, ramp_config, stub_dispatch, monkeypatch
+    ):
+        """AC4: ``retry_after`` / ``Retry-After`` remain jitter + 3s margin."""
+        _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
+        _within_ramp(monkeypatch)
+
+        resp = await _post_chat("local-model")
+        assert _is_ramp_503(resp), f"expected startup_ramp 503: {resp.text}"
+        body = resp.json()
+
+        # jitter_min=2.0, jitter_max=8.0 in the ramp_config fixture + 3s margin.
+        assert 5 <= body["retry_after"] <= 11
+        assert resp.headers["Retry-After"] == str(body["retry_after"])
+
+
 class TestStartupRampLocalBoundGating:
     """AC1/AC2: the ramp only defers requests that must dispatch locally."""
 
@@ -552,7 +651,7 @@ class TestStartupRampLocalBoundGating:
     async def test_local_only_model_deferred_during_ramp(
         self, ramp_config, stub_dispatch, monkeypatch
     ):
-        """AC2: a local-only chain is deferred with the unchanged 503 body."""
+        """AC2: a local-only chain is deferred with the enriched 503 body."""
         _set_models(monkeypatch, {"local-model": LOCAL_ONLY_MODEL})
         _within_ramp(monkeypatch)
 
@@ -562,7 +661,7 @@ class TestStartupRampLocalBoundGating:
         body = resp.json()
         assert body["error"]["type"] == "startup_ramp"
         assert body["error"]["code"] == "startup_ramp"
-        assert body["error"]["message"] == "Server is starting up; retry shortly."
+        assert "ramp ends" in body["error"]["message"].lower()
         assert body["status"] == 503
         assert "Retry-After" in resp.headers
         assert resp.headers["Cache-Control"] == "no-store"

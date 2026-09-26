@@ -892,7 +892,11 @@ server:
   # simultaneously, creating a thundering herd that overwhelms the freshly-
   # started proxy. This gate returns 503 + random Retry-After (uniform
   # jitter) so reconnects spread across the ramp window instead of hitting
-  # the server at once. Clients simply retry with the given delay.
+  # the server at once. Clients simply retry with the given delay. The 503
+  # body also includes ``ramp_ends_at`` (ISO-8601 UTC, the guaranteed ceiling)
+  # and ``ramp_remaining_seconds`` (whole seconds) so clients can sleep for a
+  # deterministic upper bound instead of inferring one from the jitter
+  # (LP-0MU9Z7O8M0053Y0K).
   startup_ramp:
     enabled: true
     # Short safety ceiling (seconds) after process start. New chat requests

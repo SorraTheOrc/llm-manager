@@ -7,7 +7,9 @@ Uses lazy server import (_srv()) to avoid circular imports.
 
 import asyncio
 import json
+import math
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -1024,6 +1026,15 @@ async def _do_proxy_openai_api(
             # ``max_seconds`` defaults to 30 s — a short safety cap; the
             # gate normally clears much earlier when backends are ready.
             #
+            # LP-0MU9Z7O8M0053Y0K: the 503 body advertises the ramp end as
+            # ``ramp_ends_at`` (ISO-8601 UTC, the guaranteed ceiling =
+            # process start + ``max_seconds``) and
+            # ``ramp_remaining_seconds`` (whole seconds remaining), and the
+            # ``message`` states both.  ``ramp_ends_at`` is an upper bound,
+            # not a prediction of the early-clear instant, which is
+            # unknowable while ``backend_ready`` is False; ``retry_after``
+            # and the ``Retry-After`` header keep their jittered semantics.
+            #
             # LP-0MUAY9AMS002O2ZO: only block requests that would
             # actually dispatch locally — if the model has remote
             # providers in its fallback chain the request will
@@ -1075,11 +1086,29 @@ async def _do_proxy_openai_api(
                             jitter_max = ramp_cfg.get("jitter_max", 15.0)
                             retry_after = _random_mod.uniform(jitter_min, jitter_max)
                             remaining = ramp_cfg["max_seconds"] - elapsed
+                            # LP-0MU9Z7O8M0053Y0K: advertise when the ramp
+                            # ends.  ``ramp_ends_at`` is the guaranteed
+                            # ceiling (process start + ``max_seconds``), not
+                            # the early-clear instant, which is unknowable
+                            # while ``backend_ready`` is False.  Both fields
+                            # derive from the same rounded integer
+                            # (``ceil``, clamped at 0) so they stay
+                            # internally consistent.
+                            ramp_remaining_seconds = max(0, math.ceil(remaining))
+                            ramp_ends_at = (
+                                datetime.now(UTC)
+                                + timedelta(seconds=ramp_remaining_seconds)
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
                             srv.logger.info(
                                 "Startup ramp: deferring chat request "
                                 "(elapsed=%.1fs, remaining=%.1fs, "
+                                "ramp_ends_at=%s, ramp_remaining_seconds=%ds, "
                                 "backend_ready=False, retry_after=%.0fs)",
-                                elapsed, remaining, retry_after,
+                                elapsed,
+                                remaining,
+                                ramp_ends_at,
+                                ramp_remaining_seconds,
+                                retry_after,
                             )
                             return JSONResponse(
                                 status_code=503,
@@ -1088,11 +1117,15 @@ async def _do_proxy_openai_api(
                                         "type": "startup_ramp",
                                         "code": "startup_ramp",
                                         "message": (
-                                            "Server is starting up; retry shortly."
+                                            "Server is starting up; the ramp "
+                                            f"ends at {ramp_ends_at} "
+                                            f"(about {ramp_remaining_seconds}s)."
                                         ),
                                     },
                                     "status": 503,
                                     "retry_after": int(retry_after + 3),  # +margin
+                                    "ramp_ends_at": ramp_ends_at,
+                                    "ramp_remaining_seconds": ramp_remaining_seconds,
                                 },
                                 headers={
                                     "Retry-After": str(int(retry_after + 3)),
