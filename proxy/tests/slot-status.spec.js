@@ -320,6 +320,86 @@ test.describe('Slot Status Section', () => {
     await expect(thirdStatus).toContainText('100');
   });
 
+  test('stable tokens during prefill keep the Processed increment, not Working', async ({ page }) => {
+    // WL-0MSZVB902004AZZN: a stable n_tokens value must not be read as
+    // completion while prefill is still incomplete. Two slots are checked:
+    // the first is stable but far from its total (must stay 'Processed'),
+    // the second is stable and within 20 tokens of its total (may show
+    // 'Working'). Inlined deterministic EventSource stub.
+    await page.addInitScript(({ payload, delayMs }) => {
+      const listeners = { message: [] };
+      window.EventSource = function () {
+        const es = {
+          onmessage: null,
+          addEventListener(type, cb) {
+            (listeners[type] || (listeners[type] = [])).push(cb);
+          },
+          dispatchEvent(evt) {
+            if (evt.type === 'message') {
+              if (es.onmessage) es.onmessage.call(es, evt);
+              (listeners.message || []).forEach((cb) => cb.call(es, evt));
+            }
+            return true;
+          },
+          close() {},
+        };
+        setTimeout(() => {
+          es.dispatchEvent(
+            new MessageEvent('message', { data: JSON.stringify(payload) })
+          );
+        }, delayMs);
+        return es;
+      };
+    }, {
+      payload: {
+        type: 'status',
+        slots: [
+          {
+            slot_id: 0,
+            is_processing: true,
+            n_tokens: 2000,
+            progress: 0.5,
+            total_tokens: 4000,
+            session_id: 'aaaaaaaa-1111-2222-3333-444444444444',
+            generation_done: false,
+          },
+          {
+            slot_id: 1,
+            is_processing: false,
+            n_tokens: 993,
+            progress: 0.993,
+            total_tokens: 1000,
+            session_id: 'bbbbbbbb-1111-2222-3333-444444444444',
+            generation_done: true,
+          },
+        ],
+        llama_server_running: true,
+        current_model: 'test-model',
+        n_ctx: 4096,
+        kv_cache_tokens: 128,
+        total_sent: 0,
+        total_recv: 0,
+        per_model_queries: {},
+      },
+      delayMs: 100,
+    });
+
+    await page.goto('/');
+
+    const slotCards = page.locator('.slot-card');
+    await expect(slotCards).toHaveCount(2);
+
+    // Stable tokens mid-prefill must keep the increment note.
+    const prefillStatus = slotCards.nth(0).locator('.slot-status-badge');
+    await expect(prefillStatus).toContainText('Processed');
+    await expect(prefillStatus).toContainText('2000');
+    await expect(prefillStatus).not.toContainText('Working');
+
+    // Stable tokens at prefill completion show 'Working'.
+    const workingStatus = slotCards.nth(1).locator('.slot-status-badge');
+    await expect(workingStatus).toHaveText('Working');
+  });
+
   test('slot identifier is displayed per card', async ({ page }) => {
     // Deterministic fake EventSource with two slots (inlined stub).
     await page.addInitScript(({ payload, delayMs }) => {
