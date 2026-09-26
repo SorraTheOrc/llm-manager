@@ -66,9 +66,22 @@ from pathlib import Path
 
 from analyze_context_distribution import (
     TS_FMT,
-    discover_log_files,
     iter_log_lines,
     parse_routing_sample,
+)
+
+# Shared proxy-log discovery/opening (project-owned, stdlib-only) lives in the
+# repo-root ``scripts/lib`` package. It handles both rotation schemes —
+# in-process ``proxy.log.*`` and logrotate ``proxy.log-*`` — plus gzip
+# compression; importing it directly replaces the dot-only copy inherited via
+# ``analyze_context_distribution`` (LP-0MU148SHI004WHQM).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SHARED_SCRIPTS_DIR = _REPO_ROOT / "scripts"
+if str(_SHARED_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SCRIPTS_DIR))
+
+from lib.proxy_logs import (  # noqa: E402
+    discover_proxy_log_files as discover_log_files,
 )
 
 FAST_CAP = 83285  # per-slot cap, fast (87.4K / 3 - 4096 headroom)

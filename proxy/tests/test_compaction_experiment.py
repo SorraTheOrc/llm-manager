@@ -771,3 +771,43 @@ class TestDryRunExecution:
         )
         assert result.status == "success"
         assert result.compaction_strategy == CHEAP_STRATEGY
+
+
+class TestSharedLogDiscovery:
+    """Regression (LP-0MU148SHI004WHQM): every rotated variant is read.
+
+    The script's local discovery only matched the in-process ``proxy.log.*``
+    scheme, so logrotate ``proxy.log-*`` files (and therefore the daytime
+    window) were silently dropped. These tests assert the rotated file's
+    breach contributes to ``extract_tasks_from_logs`` output.
+    """
+
+    _ROUTING = (
+        "2026-08-29 10:15:33,100 - INFO - routing_check "
+        "provider=local-qwen3 model=Qwen3 estimated_tokens=100000 "
+        "cold_threshold=38000 warm_threshold=83285 new_tokens=1200 "
+        "cached_ratio=0.82 messages=45 session=dash-gz-session"
+    )
+
+    def _extract(self, tmp_path):
+        return extract_tasks_from_logs(
+            tmp_path, modes=[Mode.FAST], min_tasks=0, min_extreme=0,
+        )
+
+    def test_dash_named_rotated_file_contributes_tasks(self, tmp_path):
+        (tmp_path / "proxy.log-2026-08-29_10").write_text(
+            self._ROUTING + "\n", encoding="utf-8"
+        )
+        tasks = self._extract(tmp_path)
+        assert [t.session_id for t in tasks] == ["dash-gz-session"]
+        assert tasks[0].estimated_tokens == 100000
+
+    def test_dash_named_gzip_file_contributes_tasks(self, tmp_path):
+        import gzip as gz
+
+        with gz.open(
+            tmp_path / "proxy.log-2026-08-29_09.gz", "wt", encoding="utf-8"
+        ) as fh:
+            fh.write(self._ROUTING + "\n")
+        tasks = self._extract(tmp_path)
+        assert [t.session_id for t in tasks] == ["dash-gz-session"]

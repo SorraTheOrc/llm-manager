@@ -272,3 +272,24 @@ class TestDiscoverLogFiles:
             fh.write(ROUTING_CHEAP + "\n")
         res = analyzer.analyze_day(tmp_path, DAY)
         assert any(agg.mode == "cheap" for agg in res.sessions.values())
+
+    def test_dash_named_rotated_file_content_is_read(self, tmp_path):
+        """Regression (LP-0MU148SHI004WHQM): logrotate dash-named files count.
+
+        Before migration the dot-only discovery silently dropped
+        ``proxy.log-*`` files, which carry the daytime window.
+        """
+        _write_log(tmp_path, [ROUTING_FAST_SMALL], name="proxy.log-2026-08-25_12")
+        res = analyzer.analyze_day(tmp_path, DAY)
+        agg = res.sessions["herdr-1787669217-851654-15207"]
+        assert agg.count == 1
+        assert agg.max_tokens == 49912
+
+    def test_dash_named_gzip_content_is_read(self, tmp_path):
+        """Regression (LP-0MU148SHI004WHQM): dash + .gz content is decompressed."""
+        import gzip as gz_mod
+        gz = tmp_path / "proxy.log-2026-08-25_12.gz"
+        with gz_mod.open(gz, "wt", encoding="utf-8") as fh:
+            fh.write(ROUTING_CHEAP + "\n")
+        res = analyzer.analyze_day(tmp_path, DAY)
+        assert res.sessions["herdr-1787669217-851654-15208"].mode == "cheap"

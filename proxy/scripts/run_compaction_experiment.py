@@ -50,7 +50,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
-import gzip
 import json
 import math
 import re
@@ -62,6 +61,21 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+
+# Shared proxy-log discovery/opening (project-owned, stdlib-only) lives in the
+# repo-root ``scripts/lib`` package. It handles both rotation schemes —
+# in-process ``proxy.log.*`` and logrotate ``proxy.log-*`` — plus gzip
+# compression; importing it replaces the local dot-only copy that silently
+# dropped dash-named rotated files (LP-0MU148SHI004WHQM).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SHARED_SCRIPTS_DIR = _REPO_ROOT / "scripts"
+if str(_SHARED_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SCRIPTS_DIR))
+
+from lib.proxy_logs import (  # noqa: E402
+    discover_proxy_log_files as discover_log_files,
+)
+from lib.proxy_logs import open_proxy_log_text  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants (mirrors design doc §4 / F3/F4 thresholds)
@@ -230,16 +244,6 @@ class Task:
 # ---------------------------------------------------------------------------
 
 
-def discover_log_files(log_dir: Path) -> list[Path]:
-    """All proxy log files in ``log_dir``, sorted by name."""
-    if not log_dir.is_dir():
-        return []
-    return sorted(
-        p for p in log_dir.iterdir()
-        if p.is_file() and (p.name == "proxy.log" or p.name.startswith("proxy.log."))
-    )
-
-
 def discover_recording_dirs(recordings_dir: Path) -> list[Path]:
     """All session-recording directories under ``recordings_dir``."""
     if not recordings_dir.is_dir():
@@ -305,9 +309,13 @@ def read_recording_session(rec_dir: Path) -> tuple[list[dict] | None, str | None
 
 
 def iter_log_lines(path: Path):
-    """Yield text lines from a proxy log (transparent .gz handling)."""
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+    """Yield parseable proxy-log lines via the shared gzip-aware opener.
+
+    The opener (plain or ``.gz``) comes from ``lib.proxy_logs``; the cheap
+    prefix filter stays here. Per-line filtering is the authoritative window
+    boundary — the shared helper deliberately performs no time filtering.
+    """
+    with open_proxy_log_text(path) as fh:
         for line in fh:
             if len(line) < 24 or not line[:4].isdigit():
                 continue
