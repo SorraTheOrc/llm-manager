@@ -90,6 +90,29 @@ def _reset_server_global_state(monkeypatch):
     server.local_generating_queries = 0
 
 
+@pytest.fixture(autouse=True)
+def _isolate_startup_ramp_config():
+    """Isolate the process-global startup-ramp config between tests.
+
+    ``proxy.mode._startup_ramp_config`` is a module-level variable mutated
+    by ``set_startup_ramp_config()``.  A test that calls
+    ``set_startup_ramp_config(None)`` installs the *enabled* defaults
+    (``{"enabled": True, ...}``), not a disabled state — so a teardown that
+    does ``set_startup_ramp_config(None)`` leaves the global enabled and
+    causes 503-gate failures in all subsequent tests that expect the process
+    default of ``None``.
+
+    This autouse fixture saves the value before each test and restores it
+    afterwards, preventing any test from inheriting a leaked enabled ramp
+    configuration (LP-0MUD0D0DU005R2VQ).
+    """
+    import proxy.mode as mode_module
+
+    saved = mode_module._startup_ramp_config
+    yield
+    mode_module._startup_ramp_config = saved
+
+
 def _find_live_e2e_summary_data() -> tuple[dict[str, Any] | None, str | None]:
     """Locate live E2E summary payload and best available text rendering."""
     module_names = (
