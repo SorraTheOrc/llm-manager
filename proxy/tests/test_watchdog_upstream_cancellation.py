@@ -193,18 +193,16 @@ async def test_watchdog_counter_clean():
     # (2 → 1, because we only removed one record).
     assert srv.local_active_queries == 1
 
-    # No reconciliation warning should be emitted
+    # No reconciliation warning should be emitted: the counter is correct by
+    # construction on the watchdog path.
     warnings = [
         call for call in srv.logger.warning.call_args_list
         if "counter recovered" in str(call).lower()
-        and "no_progress_watchdog" in str(call).lower()
+        and "no_progress" in str(call).lower()
     ]
-    # We should not see a reconciliation warning for the watchdog path
-    # (the counter is correct by construction).
-    for w in srv.logger.warning.call_args_list:
-        assert "counter recovered" not in str(w).lower() or "no_progress" not in str(w).lower(), (
-            f"Unexpected reconciliation warning for watchdog: {w}"
-        )
+    assert warnings == [], (
+        f"Unexpected reconciliation warning for watchdog: {warnings}"
+    )
 
 
 @pytest.mark.asyncio
@@ -274,12 +272,15 @@ async def test_watchdog_idempotent_no_stream_cm():
     )
 
     srv = _make_srv()
-    record = _create_dispatch_record(
+    # Register the record for its side effect only; the binding is unused
+    # because this case exercises a record with no stream_cm key (e.g. one
+    # created before the fix).
+    _create_dispatch_record(
         srv, "session-d", "local",
         elapsed_since_start=200,
         progress_at_start=0,
     )
-    # No stream_cm key — e.g. record created before the fix.
+    assert "session-d" in srv.local_dispatch_records
 
     # Should not raise and should still clean up
     removed = await _cleanup_stale_local_dispatch(srv)
