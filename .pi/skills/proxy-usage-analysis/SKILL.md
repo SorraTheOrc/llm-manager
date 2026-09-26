@@ -143,15 +143,22 @@ Outputs written to:
   provider breakdown),
   **Summary by hour** (rendered at the top of the report, before the
   Session summary and always — regardless of local traffic): one row per
-  hour of the report window (partial first/last hours truncated to the
-  window edges, idle hours included as `0s`) with busy time / busy-%
-  columns — busy seconds ÷ window-bounded bucket duration — plus three
-  per-session classification columns (Started local, completed local /
-  Started local, fell back / Started remote-only) counting the sessions
-  whose **first request** started in that hour, each cell as `n (pct%)` of
-  that hour's starts; a **Totals** row gives the window busy totals plus
-  the overall classification percentages (matching the Session summary
-  table), **Local model
+  **absolute wall-clock hour** of the report window (partial first/last hours
+  truncated to the window edges, idle hours included as `0s`) with busy time
+  / busy-% columns — busy seconds ÷ window-bounded bucket duration,
+  defensively clamped to 100% — plus five per-hour **activity** columns
+  counted by each event's own timestamp within the bucket: `Requests started`
+  (all `Stream started` events), `Local attempts` (`Stream started` with
+  `provider=local`), `Local served` (`Stream finished` with
+  `provider=local`), `Fallbacks` (`Fallback triggered` events), and
+  `Local-skip` (`routing_skip_local` events); a **Totals** row gives the
+  window busy totals plus the sum of each activity column over the window.
+  Absolute-hour buckets keep the two edge partials of a rolling window
+  distinct, so no busy duration is double-counted and no row exceeds 100%
+  (the previous hour-of-day keying could collide them and emit impossible
+  >100% rows, LP-0MTYAZFGN003BYQS); the `--json` summary exposes the same
+  per-hour activity as `hourly_activity`, plus `hourly_busy` and
+  `hourly_session_classification`, all keyed by absolute hour, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
   fast/cheap split — when the window has local traffic), **Decode speed** and
@@ -225,24 +232,26 @@ run (`Previous outputs archived to …`).
    the window, and merged. Busy time is the union of active intervals (at
    least one slot generating), total compute is the sum of clipped stream
    durations (slot-seconds), and peak concurrency comes from a sweep over
-   interval endpoints. Busy seconds are attributed to hours and to
-   fast/cheap periods (slot schedule) by splitting at hour and period
+   interval endpoints. Busy seconds are attributed to **absolute** hours and
+   to fast/cheap periods (slot schedule) by splitting at hour and period
    boundaries. The top-of-report **Summary by hour** table
-   (LP-0MTFO210Q0044TTF) then renders one row per hour of the report window
-   — the first/last rows truncated to the window edges and every hour listed
-   even when idle — with a busy-% column (busy seconds ÷ window-bounded
-   bucket duration) plus the per-session classification columns: sessions
-   are counted once by the hour in which their **first request** started and
-   bucketed by journey (started local and completed local / started local
-   and fell back / started remote-only), each cell showing `n (pct%)` of
-   that hour's starts; a final totals row gives the window busy totals plus
-   the overall classification percentages (matching the Session summary
-   table). It renders regardless of local traffic (busy columns read `0s` /
-   `0.0%` when the window has no local streams; with no sessions a "No
-   data" note is shown). The bucket
-   keys are hour-of-day, so windows longer than 24 hours that cover
-   the same hour twice would collide; the daily report (24h) never hits this
-   (documented limitation). Streams whose start has no paired finish are counted in
+   (LP-0MTFO210Q0044TTF, reworked by LP-0MTYAZFGN003BYQS) then renders one
+   row per **absolute wall-clock hour** of the report window — the first/last
+   rows truncated to the window edges and every hour listed even when idle —
+   with a busy-% column (busy seconds ÷ window-bounded bucket duration,
+   clamped to 100%) plus five per-hour activity columns counted by each
+   event's own timestamp in the bucket: `Requests started` (all
+   `Stream started`), `Local attempts` (local `Stream started`), `Local
+   served` (local `Stream finished`), `Fallbacks` (`Fallback triggered`), and
+   `Local-skip` (`routing_skip_local`); a final totals row gives the window
+   busy totals plus the sum of each activity column. Counting by event
+   timestamp means long-running sessions contribute to every hour they touch,
+   not just their first-request hour. It renders regardless of local traffic
+   (busy columns read `0s` / `0.0%` when the window has no local streams;
+   with no events a "No data" note is shown). Absolute-hour bucket keys keep
+   the two edge partials of a window straddling an hour distinct, so no busy
+   duration is double-counted and no row exceeds 100% (the previous
+   hour-of-day keying collided them). Streams whose start has no paired finish are counted in
    `unfinished_streams` **only when they started inside the window or within
    `BUSY_WINDOW_MARGIN` (1h) before it**; streams started earlier are stale
    pre-window leftovers from earlier windows, tracked separately in
@@ -356,12 +365,11 @@ run (`Previous outputs archived to …`).
   least one local slot generating. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
-  hour** table at the top of the report shows per-hour busy % across exactly
-  the report window (idle hours included) alongside the per-session
-  classification of that hour's request starts (local-only / fell back /
-  remote-only), so a glance at the hourly pattern correlates demand with
-  provider usage and shows when local was saturated vs idle; the totals row
-  gives the window-wide busy % and the overall classification percentages. `context_too_large`
+  hour** table at the top of the report shows per-hour busy % and per-hour
+  activity across exactly the report window (idle hours included), so a
+  glance at the hourly pattern correlates demand with provider usage and
+  shows when local was saturated vs idle; the totals row gives the
+  window-wide busy % and the summed activity counts. `context_too_large`
   is the largest lever: despite the legacy name (`warm_cache_bypass`) it
   fires when the *estimated context* exceeds the effective warm-cache
   threshold (the per-slot clamp,

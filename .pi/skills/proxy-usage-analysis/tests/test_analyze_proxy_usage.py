@@ -1839,14 +1839,15 @@ class TestBusyStats:
         assert busy.cheap_window_seconds == 3600.0
         assert busy.fast_window_seconds == 3600.0
         hourly = dict(busy.hourly_busy)
-        assert hourly[9] == 10.0
-        assert hourly[10] == 15.0
+        assert hourly[datetime(2026, 8, 2, 9, 0, 0)] == 10.0
+        assert hourly[datetime(2026, 8, 2, 10, 0, 0)] == 15.0
 
     def test_hourly_attribution_window_bounded_non_aligned(self):
         # Window 09:30-10:45 is not hour-aligned: hourly_busy values must be
-        # window-correct per hour-of-day (partial first/last hours truncated
-        # to the window edges), so the report can render window-bounded
-        # buckets from them unchanged (LP-0MSVMLM7G009N74N AC2/AC5).
+        # window-correct per absolute hour (partial first/last hours
+        # truncated to the window edges), so the report can render
+        # window-bounded buckets from them unchanged (LP-0MSVMLM7G009N74N
+        # AC2/AC5, absolute-hour keying LP-0MTYAZFGN003BYQS).
         start = datetime(2026, 8, 2, 9, 30, 0)
         end = datetime(2026, 8, 2, 10, 45, 0)
         events = [
@@ -1861,18 +1862,22 @@ class TestBusyStats:
         assert busy is not None
         assert busy.busy_seconds == 45.0
         hourly = dict(busy.hourly_busy)
-        assert hourly[9] == 30.0
-        assert hourly[10] == 15.0
+        # Keys are absolute top-of-hour datetimes, not hour-of-day integers.
+        assert hourly[datetime(2026, 8, 2, 9, 0, 0)] == 30.0
+        assert hourly[datetime(2026, 8, 2, 10, 0, 0)] == 15.0
+        assert set(hourly) == {datetime(2026, 8, 2, 9, 0, 0), datetime(2026, 8, 2, 10, 0, 0)}
 
     def test_report_summary_by_hour_table_window_bounded_with_pct_and_totals(self):
-        # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF:
-        # the hourly profile is now the top-of-report ``## Summary by hour``
-        # table — it spans exactly the report window (partial first/last
-        # rows truncated to the window edges), lists every hour including
-        # idle ones, carries a % column (busy / window-bounded bucket
-        # duration), adds the three per-session classification columns
-        # (counted per start hour), and ends with a totals row matching the
-        # summary's overall busy % and classification percentages.
+        # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF and
+        # reworked by LP-0MTYAZFGN003BYQS: the hourly profile is the
+        # top-of-report ``## Summary by hour`` table — it spans exactly the
+        # report window (partial first/last rows truncated to the window
+        # edges), lists every hour including idle ones, carries a % column
+        # (busy / window-bounded bucket duration, clamped to 100%), and its
+        # per-hour columns are now activity counts keyed by event timestamp
+        # rather than session-first-hour journey classifications. It ends with
+        # a totals row: window busy totals plus the sum of each activity
+        # column over the window.
         start = datetime(2026, 8, 2, 9, 30, 0)
         end = datetime(2026, 8, 2, 11, 45, 0)
         lines = [
@@ -1890,15 +1895,15 @@ class TestBusyStats:
         # AC1: renamed, moved to the top of the report (before Session summary).
         assert "Busy time by hour:" not in md
         assert md.index("## Summary by hour") < md.index("## Session summary")
-        # AC2: window-bounded rows with a % column; idle middle hour listed;
-        # classification cells added (both sessions are local-only).
-        assert "| Hour | Busy | % | Started local, completed local | Started local, fell back | Started remote-only |" in section
-        assert "| 09:30-10:00 | 30s | 1.7% | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
-        assert "| 10:00-11:00 | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |" in section
-        assert "| 11:00-11:45 | 15s | 0.6% | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        # AC2/AC1: window-bounded rows with a % column; idle middle hour
+        # listed; activity columns replace the classification columns.
+        assert "| Hour | Busy | % | Requests started | Local attempts | Local served | Fallbacks | Local-skip |" in section
+        assert "| 09:30-10:00 | 30s | 1.7% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| 11:00-11:45 | 15s | 0.6% | 1 | 1 | 1 | 0 | 0 |" in section
         # AC3: totals row = total busy over the window and overall busy % plus
-        # the overall classification percentages (Session summary style).
-        assert "| Totals | 45s | 0.6% | 2 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        # the sum of each activity column over the window.
+        assert "| Totals | 45s | 0.6% | 2 | 2 | 2 | 0 | 0 |" in section
         # The Local model utilization section no longer hosts the hourly table.
         util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
         assert "| Hour | Busy |" not in util
@@ -1917,14 +1922,17 @@ class TestBusyStats:
         assert res.busy.peak_concurrency == 2
 
 
-class TestSummaryByHourClassification:
-    """Per-hour session-journey classification in the top-of-report
-    ``## Summary by hour`` table (LP-0MTFO210Q0044TTF).
+class TestSummaryByHourActivity:
+    """Per-hour activity columns in the top-of-report ``## Summary by hour``
+    table (LP-0MTYAZFGN003BYQS).
 
-    Each session is counted once, in the hour its **first request** started,
-    classified by its journey (local-only / fell back / remote-only); cells
-    render ``n (pct%)`` where pct is of the sessions started in that hour,
-    matching the Session summary table's style.
+    Activity is counted by each event's own timestamp inside its absolute-hour
+    bucket: ``Requests started`` (all Stream started), ``Local attempts``
+    (Stream started with provider=local), ``Local served`` (Stream finished
+    with provider=local), ``Fallbacks`` (Fallback triggered), and
+    ``Local-skip`` (routing_skip_local). The former session-first-hour
+    classification columns are gone from the table; the journey split remains
+    available in the JSON summary as ``hourly_session_classification``.
     """
 
     WINDOW_START = datetime(2026, 8, 2, 9, 0, 0)
@@ -1932,14 +1940,17 @@ class TestSummaryByHourClassification:
 
     def _lines(self) -> list[str]:
         # s1: local-only, first request 09:40 (hour 9).
-        # s2: starts local 10:30 then falls back (hour 10).
+        # s2: starts local 10:30 then falls back (hour 10): a session-less
+        #     Fallback triggered event plus its own routing_skip_local.
         # s3: remote-only, first request 11:30 (hour 11).
         return [
             "2026-08-02 09:40:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
             "2026-08-02 09:40:30,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
             "2026-08-02 10:30:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s2 request=[]",
             "2026-08-02 10:30:05,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
-            "2026-08-02 10:30:06,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+            "2026-08-02 10:30:06,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=local_concurrency_limit",
+            "2026-08-02 10:30:06,500 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
             "estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 new_tokens=50 cached_ratio=0.50 "
             "reason=local_concurrency_limit → skipping local, routing to next remote provider session=s2",
             "2026-08-02 10:30:07,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s2 request=[]",
@@ -1953,37 +1964,61 @@ class TestSummaryByHourClassification:
             _events(self._lines()), self.WINDOW_START, self.WINDOW_END, _schedule()
         )
 
-    def test_hourly_classification_counts(self):
-        # Unit-level: the counting helper buckets each session once by its
-        # first-request hour with the Session summary's classification
-        # definitions (local_only / fell_back / remote_only).
+    def test_activity_counted_by_event_timestamp(self):
+        # Unit-level: each activity counter is keyed by the event's own
+        # absolute-hour bucket; s2's remote attempt lands in hour 10 (its
+        # event hour), never in a session's first-request hour.
         summary = self._summary()
-        by_hour = reporting._hourly_session_classification(list(summary.sessions.values()))
-        assert by_hour[9].get("local_only") == 1
-        assert by_hour[9].get("fell_back", 0) == 0
-        assert by_hour[9].get("remote_only", 0) == 0
-        assert by_hour[10].get("local_only", 0) == 0
-        assert by_hour[10].get("fell_back") == 1
-        assert by_hour[10].get("remote_only", 0) == 0
-        assert by_hour[11].get("local_only", 0) == 0
-        assert by_hour[11].get("fell_back", 0) == 0
-        assert by_hour[11].get("remote_only") == 1
+        h9 = summary.hourly_activity[datetime(2026, 8, 2, 9, 0, 0)]
+        assert h9["requests_started"] == 1
+        assert h9["local_attempts"] == 1
+        assert h9["local_served"] == 1
+        assert h9["fallbacks"] == 0
+        assert h9["local_skip"] == 0
+        h10 = summary.hourly_activity[datetime(2026, 8, 2, 10, 0, 0)]
+        assert h10["requests_started"] == 2
+        assert h10["local_attempts"] == 1
+        assert h10["local_served"] == 1
+        assert h10["fallbacks"] == 1
+        assert h10["local_skip"] == 1
+        h11 = summary.hourly_activity[datetime(2026, 8, 2, 11, 0, 0)]
+        assert h11["requests_started"] == 1
+        assert h11["local_attempts"] == 0
+        assert h11["local_served"] == 0
 
-    def test_table_renders_classification_per_start_hour(self):
-        # Each session lands in its START hour's row, in its journey column,
-        # with n (pct%) of the sessions started in that hour; busy % columns
-        # are unchanged (busy / window-bounded bucket duration).
+    def test_table_renders_activity_per_hour(self):
+        # Rows carry the five activity columns; busy % stays busy /
+        # window-bounded bucket duration.
         md = reporting.build_report(self._summary(), None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 09:00-10:00 | 30s | 0.8% | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) |" in section
-        assert "| 10:00-11:00 | 5s | 0.1% | 0 (0.0%) | 1 (100.0%) | 0 (0.0%) |" in section
-        assert "| 11:00-12:00 | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) |" in section
-        # Totals row: overall busy + classification % matching Session summary.
-        assert "| Totals | 35s | 0.3% | 1 (33.3%) | 1 (33.3%) | 1 (33.3%) |" in section
+        assert "| Hour | Busy | % | Requests started | Local attempts | Local served | Fallbacks | Local-skip |" in section
+        assert "| 09:00-10:00 | 30s | 0.8% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | 5s | 0.1% | 2 | 1 | 1 | 1 | 1 |" in section
+        assert "| 11:00-12:00 | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | 35s | 0.3% | 4 | 2 | 2 | 1 | 1 |" in section
 
-    def test_multiple_sessions_same_hour_share_pct(self):
-        # Two sessions start in the same hour: each cell shows its n and its
-        # % of that hour's starts (per-session count, not per-request).
+    def test_long_running_session_contributes_to_each_hour(self):
+        # A single session whose requests start in different hours: the second
+        # request is counted in hour 10 (its event timestamp) rather than
+        # being lumped into the session's first-request hour — the
+        # session-first-hour attribution bug LP-0MTYAZFGN003BYQS fixes.
+        lines = [
+            "2026-08-02 09:50:00,000 - INFO - Stream started: provider=local model=Qwen3 session=long request=[]",
+            "2026-08-02 09:50:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=long provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:20:00,000 - INFO - Stream started: provider=local model=Qwen3 session=long request=[]",
+            "2026-08-02 10:20:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=long provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
+        assert summary.hourly_activity[datetime(2026, 8, 2, 9, 0, 0)]["requests_started"] == 1
+        assert summary.hourly_activity[datetime(2026, 8, 2, 10, 0, 0)]["requests_started"] == 1
+        md = reporting.build_report(summary, None)
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        assert "| 09:00-10:00 | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 |" in section
+
+    def test_multiple_requests_same_hour_sum_activity(self):
+        # Two local requests in hour 10 (s2 + s4): activity columns sum the
+        # events, while the busy column reflects the merged local time.
         lines = self._lines() + [
             "2026-08-02 10:45:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s4 request=[]",
             "2026-08-02 10:45:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s4 provider=local model=Qwen3 request=[]",
@@ -1991,9 +2026,8 @@ class TestSummaryByHourClassification:
         summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        # Hour 10: s2 (fell back) + s4 (local-only) → 2 sessions, 50/50.
-        assert "| 10:00-11:00 | 15s | 0.4% | 1 (50.0%) | 1 (50.0%) | 0 (0.0%) |" in section
-        assert "| Totals | 45s | 0.4% | 2 (50.0%) | 1 (25.0%) | 1 (25.0%) |" in section
+        assert "| 10:00-11:00 | 15s | 0.4% | 3 | 2 | 2 | 1 | 1 |" in section
+        assert "| Totals | 45s | 0.4% | 5 | 3 | 3 | 1 | 1 |" in section
 
     def test_renders_without_local_traffic(self):
         # No local streams (busy is None): the table still renders at the top
@@ -2009,8 +2043,8 @@ class TestSummaryByHourClassification:
         md = reporting.build_report(summary, None)
         assert md.index("## Summary by hour") < md.index("## Session summary")
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) |" in section
-        assert "| Totals | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) |" in section
+        assert "| 10:00-11:00 | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
         assert "## Local model utilization" not in md
 
     def test_no_sessions_renders_no_data_note(self):
@@ -2019,19 +2053,122 @@ class TestSummaryByHourClassification:
         summary = aggregation.aggregate([], self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| _No session data in window._ | - | - | - | - | - |" in section
-        assert "| Totals | 0s | 0.0% | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |" in section
+        assert "| _No session data in window._ | - | - | - | - | - | - | - |" in section
+        assert "| Totals | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 |" in section
 
-    def test_json_summary_exposes_hourly_classification(self):
-        # The machine-readable summary exposes the same per-hour
-        # classification so agents can query it without scraping the report.
+    def test_json_summary_exposes_hourly_activity_and_classification(self):
+        # The machine-readable summary exposes per-hour activity (matching the
+        # table) plus the retained journey classification, both keyed by
+        # absolute hour and self-describing.
         data = reporting.summary_to_json(self._summary())
+        assert data["hourly_activity"] == [
+            {"hour": "2026-08-02 09:00:00", "requests_started": 1, "local_attempts": 1,
+             "local_served": 1, "fallbacks": 0, "local_skip": 0},
+            {"hour": "2026-08-02 10:00:00", "requests_started": 2, "local_attempts": 1,
+             "local_served": 1, "fallbacks": 1, "local_skip": 1},
+            {"hour": "2026-08-02 11:00:00", "requests_started": 1, "local_attempts": 0,
+             "local_served": 0, "fallbacks": 0, "local_skip": 0},
+        ]
         assert data["hourly_session_classification"] == [
-            {"hour": 9, "local_only": 1, "fell_back": 0, "remote_only": 0},
-            {"hour": 10, "local_only": 0, "fell_back": 1, "remote_only": 0},
-            {"hour": 11, "local_only": 0, "fell_back": 0, "remote_only": 1},
+            {"hour": "2026-08-02 09:00:00", "local_only": 1, "fell_back": 0, "remote_only": 0},
+            {"hour": "2026-08-02 10:00:00", "local_only": 0, "fell_back": 1, "remote_only": 0},
+            {"hour": "2026-08-02 11:00:00", "local_only": 0, "fell_back": 0, "remote_only": 1},
+        ]
+        # hourly_busy is keyed by absolute hour and self-describing too.
+        assert data["local_busy"]["hourly_busy"] == [
+            {"hour": "2026-08-02 09:00:00", "seconds": 30.0},
+            {"hour": "2026-08-02 10:00:00", "seconds": 5.0},
         ]
         json.dumps(data)  # round-trips
+
+
+class TestHourlyRollingWindow:
+    """AC3 regression (LP-0MTYAZFGN003BYQS): a rolling 24h window starting at
+    ``HH:04`` emits one row per **absolute** hour. The two edge partials share
+    an hour-of-day (both are 11:00 buckets on different days) but must not
+    share a bucket, so busy time is never double-counted and no row exceeds
+    100%.
+    """
+
+    WINDOW_START = datetime(2026, 9, 11, 11, 4, 0)
+    WINDOW_END = datetime(2026, 9, 12, 11, 4, 0)
+
+    def _lines(self) -> list[str]:
+        def local(session: str, start: datetime, secs: int) -> list[str]:
+            end = start + timedelta(seconds=secs)
+            return [
+                f"{start:%Y-%m-%d %H:%M:%S},000 - INFO - Stream started: "
+                f"provider=local model=Qwen3 session={session} request=[]",
+                f"{end:%Y-%m-%d %H:%M:%S},000 - INFO - Stream finished: "
+                f"reason=stop tokens=100/10/110 session={session} provider=local model=Qwen3 request=[]",
+            ]
+
+        d = datetime
+        lines: list[str] = []
+        # Two streams share hour-of-day 11 on different days (the duplicate
+        # bucket trap): a short Sep 11 11:30 stream and a longer Sep 12 11:00
+        # stream clipped to the window end at 11:04.
+        lines += local("h1", d(2026, 9, 11, 11, 30, 0), 7)
+        lines += local("h2", d(2026, 9, 12, 11, 0, 0), 180)
+        # Afternoon streams, one per hour 12..18, with distinct durations.
+        for hour, secs, sid in [
+            (12, 30, "a1"), (13, 60, "a2"), (14, 120, "a3"), (15, 10, "a4"),
+            (16, 20, "a5"), (17, 40, "a6"), (18, 5, "a7"),
+        ]:
+            lines += local(sid, d(2026, 9, 11, hour, 0, 0), secs)
+        return lines
+
+    def _rows(self) -> dict[str, list[str]]:
+        md = reporting.build_report(
+            aggregation.aggregate(_events(self._lines()), self.WINDOW_START, self.WINDOW_END, _schedule()),
+            None,
+        )
+        section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
+        rows: dict[str, list[str]] = {}
+        for line in section.splitlines():
+            if not line.startswith("| ") or "---" in line:
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if cells[0] == "Hour":
+                continue
+            rows[cells[0]] = cells
+        return rows
+
+    def test_afternoon_rows_non_zero_and_requests_total_matches_fixture(self):
+        # (a) The 12:00–18:00 rows are non-zero and their Requests started
+        # total matches the fixture (7 afternoon streams, one per hour).
+        rows = self._rows()
+        expected_busy = {
+            "12:00-13:00": "30s",
+            "13:00-14:00": "1m 00s",
+            "14:00-15:00": "2m 00s",
+            "15:00-16:00": "10s",
+            "16:00-17:00": "20s",
+            "17:00-18:00": "40s",
+            "18:00-19:00": "5s",
+        }
+        for hour, busy in expected_busy.items():
+            assert hour in rows, f"missing row {hour}"
+            assert rows[hour][1] == busy, f"{hour} busy {rows[hour][1]} != {busy}"
+            # Requests started | Local attempts | Local served | Fallbacks | Local-skip
+            assert rows[hour][3:8] == ["1", "1", "1", "0", "0"], hour
+        afternoon_started = sum(int(rows[h][3]) for h in expected_busy)
+        assert afternoon_started == 7
+
+    def test_no_row_exceeds_100_percent_and_no_duplicate_busy_duration(self):
+        # (b) No row busy% exceeds 100%, and the two hour-of-day-11 edge
+        # partials do not share a busy duration (7s vs 3m 00s), proving
+        # absolute-hour keying rather than hour-of-day collision.
+        rows = self._rows()
+        assert rows["11:04-12:00"][1] == "7s"
+        assert rows["11:04-12:00"][2] == "0.2%"
+        assert rows["11:00-11:04"][1] == "3m 00s"
+        assert rows["11:00-11:04"][2] == "75.0%"
+        pcts = [float(cell.rstrip("%")) for cell in (r[2] for r in rows.values())]
+        assert pcts and all(p <= 100.0 for p in pcts)
+        busy_cells = [r[1] for label, r in rows.items() if label != "Totals"]
+        non_zero = [b for b in busy_cells if b != "0s"]
+        assert len(non_zero) == len(set(non_zero))
 
 
 class TestIterEventsMargin:
