@@ -69,6 +69,12 @@ def reset_cooldown_state():
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
     yield
+    # Clear AFTER the test too: usage-limit resets / cooldowns set by a test
+    # would otherwise leak into later test modules and cause order-dependent
+    # failures (e.g. test_honest_retry_after.py:test_empty_returns_zero).
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1270,3 +1276,137 @@ async def test_empty_response_stays_model_scoped_after_threshold(
     assert result.status_code == 200
     # The brand stays healthy for other models.
     assert not provider._is_provider_unavailable("opencode-go")
+
+
+# ---------------------------------------------------------------------------
+# AC3/AC5: usage-limit behaviour across the failure-matrix topologies
+#
+# Usage-limit quarantine is ACCOUNT-scoped (``api_key_env@endpoint:model``,
+# LP-0MSMBWB23009XYPW) and stays independent of the hierarchical failure-domain
+# logic: a 429 ``GoUsageLimitError`` is a request-level failure, so it must NOT
+# poison the gateway (that is the connection-error scope, AC1) and must not
+# exclude a different model on the same gateway (AC2).
+# ---------------------------------------------------------------------------
+
+
+def _gousage_429(message: str, limit_name: str = "weekly") -> Response:
+    """Build the observed opencode 429 ``GoUsageLimitError`` response."""
+    body = json.dumps({
+        "type": "error",
+        "error": {"type": "GoUsageLimitError", "message": message},
+        "metadata": {"limitName": limit_name},
+    })
+    return Response(status_code=429, content=body.encode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_same_gateway_same_model_is_account_scoped(
+    opencode_same_gateway_chain,
+):
+    """AC3/AC5: same-gateway SAME-model entries with different accounts have
+    independent limits — a usage-limit on one must not skip the other, and the
+    gateway scope must NOT be poisoned (unlike a connection error)."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-2-deepseek":
+            return _gousage_429("Weekly usage limit reached. Resets in 22hr 43min.")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            opencode_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-2-deepseek", "opencode-go-deepseek"], (
+        f"Usage-limit must stay account-scoped, got {call_order}"
+    )
+    assert result.status_code == 200
+    # Only the failing account carries a reset window; neither the gateway
+    # (connection-level) nor the model-scoped failure domain is quarantined.
+    failing = opencode_same_gateway_chain["providers"][0]
+    assert provider._usage_limit_account_key(failing) in provider._usage_reset_at
+    assert not provider._is_provider_unavailable(provider._gateway_domain_key(failing))
+    assert not provider._is_provider_unavailable(provider._failure_domain_key(failing))
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_same_gateway_different_model_keeps_model_eligible(
+    multi_model_same_gateway_chain,
+):
+    """AC3/AC5: a usage-limit on model A must not exclude model B on the same
+    gateway — the account key is model-scoped and the gateway is not poisoned."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "opencode-go-muse":
+            return _gousage_429("Weekly usage limit reached. Resets in 22hr 43min.")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions",
+            multi_model_same_gateway_chain, {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["opencode-go-muse", "opencode-go-deepseek"], (
+        f"Different model on same gateway must remain eligible, got {call_order}"
+    )
+    assert result.status_code == 200
+    muse = multi_model_same_gateway_chain["providers"][0]
+    assert not provider._is_provider_unavailable(provider._gateway_domain_key(muse))
+    assert not provider._is_provider_unavailable(provider._failure_domain_key(muse))
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_different_gateway_falls_through():
+    """AC3/AC5: a usage-limit on one gateway falls through to a different
+    gateway without poisoning either scope."""
+    chain = {
+        "providers": [
+            {
+                "name": "gateway-a-model",
+                "type": "remote",
+                "provider": "gw-a",
+                "endpoint": "https://gw-a.example.com/v1",
+                "api_key_env": "GW_A_KEY",
+                "model": "model-a",
+            },
+            {
+                "name": "gateway-b-model",
+                "type": "remote",
+                "provider": "gw-b",
+                "endpoint": "https://gw-b.example.com/v1",
+                "api_key_env": "GW_B_KEY",
+                "model": "model-b",
+            },
+        ],
+        "aliases": ["test*"],
+    }
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "gateway-a-model":
+            return _gousage_429("Weekly usage limit reached. Resets in 22hr 43min.")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["gateway-a-model", "gateway-b-model"], (
+        f"Usage-limit must fall through to the other gateway, got {call_order}"
+    )
+    assert result.status_code == 200
+    first = chain["providers"][0]
+    assert provider._usage_limit_account_key(first) in provider._usage_reset_at
+    assert not provider._is_provider_unavailable(provider._gateway_domain_key(first))
