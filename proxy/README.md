@@ -657,6 +657,26 @@ When all providers are exhausted:
 - **Other errors**: Returns HTTP 503 with a JSON body containing `error: "All providers exhausted"`, a stable `code`, and `retry_after`.
 - **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable by `code: "outside_time_window"`; the window-specific prose lives in `detail`, while `error` stays the client-recognised `"All providers exhausted"`. The `diagnostics` entries carry `status: "outside_time_window"`. Mixed cases (a provider in cooldown, a usage-limit quarantine, or an error plus a time-window skip) keep the generic `code: "all_exhausted"` response, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible (LP-0MU56ZM0K005F69G).
 
+The response contract is **additive-only**: the legacy `error` prose is retained for older clients, the stable `code` discriminator is what new clients should key on, and `retry_after` / the `Retry-After` header, `unavailable_providers` and `diagnostics` remain present where available.
+
+##### Exhaustion taxonomy (response + log)
+
+| Cause | `diagnostics` status | `unavailable_providers` | Log line |
+|-------|----------------------|-------------------------|----------|
+| Outside `available_times` window | `outside_time_window` | — (window-skipped) | `Skipping provider=<p>: outside its available_times window (UTC)` |
+| Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending` / `usage_limit_reset=` on the exhaustion line |
+| Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
+| All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
+| Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |
+
+##### Triage runbook
+
+1. **Read the `code`** in the 503 body (or the `Retry-After` header). `all_exhausted` → generic; `outside_time_window` → the schedule is the sole cause; `all_slots_exhausted` → local slot exhaustion (429).
+2. **Check `diagnostics`** for the dominant `status` values and `unavailable_providers` for cooldown/quarantine seconds. A `usage_limit_reset` entry with hours of `reset_in` is a quota block, not a schedule gap.
+3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown).
+4. **In `proxy.log`**, follow the `routing_check` / `routing_skip_local` / `compaction_bypass_eval` lines for the session; each carries the model, estimate, cached ratio and — for held requests — `chain_hold_cycle=N`.
+5. **Distinguish a hold cycle from new demand**: a line with `chain_hold_cycle>0` belongs to one held request being retried, not a new client request. `proxy-usage-analysis` should exclude those from demand counts (LP-0MUIEO6IP0030CT3).
+
 #### Chain-Hold Retry (deferred exhaustion)
 
 Most chain exhaustion is transient — 60s provider cooldowns, 180s stall
@@ -672,7 +692,25 @@ provider. `0` retries immediately (no wait).
 - **`server.chain_hold_max_cycles`** (default `3`; `0` = infinite) — how many
 hold-retry cycles are allowed before the existing exhaustion/error response
 is returned unchanged. With the defaults, the chain runs at most 4 times
-(initial run + 3 holds) and the total wait is bounded by ~15 minutes.
+(initial run + 3 holds).
+- **`retry_after` bound** (LP-0MU56ZKQD005SX08) — the hold never waits longer
+than the exhaustion response's real `retry_after`: each hold waits at most
+`min(chain_hold_seconds, retry_after)`, and when `retry_after` exceeds the
+total budget (`chain_hold_seconds × chain_hold_max_cycles`) the terminal
+response is returned immediately with its accurate `Retry-After` instead of
+sleeping through doomed cycles. A `retry_after` of `0` retries immediately.
+- **Cycle observability** (LP-0MU5AIAAY003KVM0) — every hold cycle re-runs the
+full chain (local routing + compaction evaluation). `routing_check`,
+`routing_skip_local`, `compaction_bypass_eval` and the hold line carry
+`chain_hold_cycle=N` so repeated lines from one held request are not mistaken
+for new client demand.
+- **Local lease denial** (LP-0MU5BOMJM008F17C) — a `local_lease_active` denial
+is a capacity condition, not a provider failure: with
+`contention_queue_policy: queue` the request waits up to
+`contention_queue_max_wait_seconds` for the protected local slot before
+falling back to the remote chain (`contention_queue_dispatch ...
+reason=local_lease_active` when admitted, `contention_queue_fallback_after_queue`
+on budget expiry).
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines

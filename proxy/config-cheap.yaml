@@ -741,7 +741,11 @@ server:
 
   # Per-mode contention policy (LP-0MSORQVK50012Q4D): when all local slots
   # are busy, QUEUE the request (bounded, cross-session) instead of
-  # immediately falling back to the next remote provider.
+  # immediately falling back to the next remote provider. A post-dispatch
+  # ``local_lease_active`` denial (the generating lease is held by another
+  # session) also queues here before remote fallback, so a capacity block is
+  # not mistaken for a provider failure (LP-0MU5BOMJM008F17C); only when the
+  # caps are exceeded does the request fall through to the remote chain.
   #
   # Context bypasses (LP-0MU5A4QBR003YJM0):
   #   - ``context_too_large``: physical capacity limit → always bypass

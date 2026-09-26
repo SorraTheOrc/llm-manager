@@ -566,6 +566,16 @@ server:
   # (default 300) instead of erroring immediately, then start a NEW cycle from
   # the FIRST provider — giving short cooldowns (60s provider cooldown, 180s
   # stall circuit breaker, available_times window edges) time to expire.
+  #   - The hold is BOUNDED by the exhaustion response's real ``retry_after``
+  #     (LP-0MU56ZKQD005SX08): each hold waits at most the sooner of
+  #     chain_hold_seconds and retry_after; when retry_after exceeds the total
+  #     budget (chain_hold_seconds x chain_hold_max_cycles) the terminal 503
+  #     is returned immediately with its accurate Retry-After instead of
+  #     holding through cycles that cannot succeed.
+  #   - Each hold cycle re-runs the full chain, including local routing and
+  #     compaction evaluation; every routing/compaction/hold log line carries
+  #     ``chain_hold_cycle=N`` so re-emissions are not read as new demand
+  #     (LP-0MU5AIAAY003KVM0).
   #   - Streaming requests receive periodic SSE feedback comments
   #     (`: chain exhausted (...); retrying from <first> in <Ns>`) so clients
   #     can surface live progress (companion item SA-0MSHAKSEA001LQ6T).
