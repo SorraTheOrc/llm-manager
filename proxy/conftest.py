@@ -113,6 +113,37 @@ def _isolate_startup_ramp_config():
     mode_module._startup_ramp_config = saved
 
 
+@pytest.fixture(autouse=True)
+def _isolate_provider_availability_state(tmp_path, monkeypatch):
+    """Isolate persisted provider availability state between tests.
+
+    Provider cooldowns and the usage-limit account quarantine are persisted
+    to ``proxy/provider-state.json`` and restored at startup
+    (LP-0MUI6KB67005X44B). ``mark_provider_unavailable()`` and the
+    usage-limit quarantine sites now write on every cold-path mutation, so
+    without a redirect a test would write the real runtime file and leak
+    availability state across test modules.
+
+    Point the loader/saver at a per-test temporary file (via
+    ``LLAMA_PROXY_PROVIDER_STATE_FILE``) and clear the in-memory maps so every
+    test starts from a clean, empty availability state. Tests can still read
+    and write a state file — they just never touch the real one.
+    """
+    import proxy.provider as provider
+
+    monkeypatch.setenv(
+        provider._PROVIDER_STATE_FILE_ENV,
+        str(tmp_path / "provider-state.json"),
+    )
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+    yield
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+
+
 def _find_live_e2e_summary_data() -> tuple[dict[str, Any] | None, str | None]:
     """Locate live E2E summary payload and best available text rendering."""
     module_names = (
