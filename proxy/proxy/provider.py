@@ -15,6 +15,9 @@ Provides:
 - Cooldown tracking: Mark providers as temporarily unavailable after failures
 - Timed access: Skip providers outside their configured `available_times` UTC
   windows (LP-0MS4ETBNO0022QAC)
+- Availability persistence: provider cooldowns and usage-limit account
+  quarantine survive proxy restarts via `proxy/provider-state.json`
+  (LP-0MUI6KB67005X44B)
 """
 
 import asyncio

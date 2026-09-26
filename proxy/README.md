@@ -599,11 +599,46 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
-- **State**: Cooldown state is in-memory only and resets when the proxy restarts
+- **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as
   unavailable until the cooldown expires. Multi-worker deployments (multiple
   proxy processes) have independent cooldown state per worker.
+
+##### Provider Availability Persistence (LP-0MUI6KB67005X44B)
+
+Provider availability state — the per-provider/brand cooldown and the
+usage-limit account quarantine — is persisted across proxy restarts so a
+restart does not re-expose an already-exhausted upstream account and emit a
+fresh HTTP 429.
+
+- **State file**: `proxy/provider-state.json`, beside `proxy/.mode` and
+  `proxy/grandfathering-state.json` (gitignored runtime state).
+- **Persisted**: the provider/brand/entry/failure-domain cooldowns
+  (`_provider_unavailable_until`) and the usage-limit account quarantine
+  (`_usage_reset_at`). Absolute epoch expiries are written, so wall-clock time
+  is the source of truth across the restart boundary — a restart neither
+  extends nor resets a cooldown/quarantine.
+- **Written**: atomically (temp file + `os.replace`) on every availability
+  mutation — the cold path (a provider failing or an upstream 429). Already
+  expired entries are omitted from the payload. A write failure is logged and
+  ignored; it never breaks routing.
+- **Restored**: at startup, alongside the request/token counters. Expired
+  entries are dropped at load and the number of restored entries is logged at
+  INFO (`provider-state: restored N cooldown entries and M usage-limit
+  quarantine entries`). A missing, corrupt or unparsable state file is handled
+  safely: the maps start empty and a warning is logged; startup is never
+  blocked.
+- **Not persisted**: `_provider_failure_count` (the exponential-backoff
+  failure counter) and the sibling-failure / local-400 streak state. Backoff
+  deliberately restarts at its base interval after a restart; those counters
+  are cheap to re-learn and persisting them would over-extend transient
+  backoff.
+- **Override**: set `LLAMA_PROXY_PROVIDER_STATE_FILE` to use a different path
+  (used by tests).
+- **Scope**: the state is per proxy process. A single proxy instance per host
+  is assumed; two processes sharing one state file would be last-writer-wins
+  (there is no file locking).
 
 ##### Cross-Request Stall Circuit Breaker (Tier 3)
 
@@ -624,7 +659,9 @@ repeatedly across requests is quarantined after the threshold is exceeded.
   - `server.upstream_stall_window_seconds` (default: 300)
   - `server.upstream_stall_threshold` (default: 3)
   - `server.upstream_stall_cooldown_seconds` (default: 180)
-- **State**: In-memory only, resets on proxy restart. Shared across all sessions.
+- **State**: The stall sliding-window counters are in-memory only and reset on
+  proxy restart; a triggered cooldown expiry is persisted via the shared
+  Provider Availability Persistence state above. Shared across all sessions.
 - **Integration**: Uses the same `mark_provider_unavailable()` mechanism as Tier 2.
   Stalls during cooldown are recorded but do not extend the cooldown.
 
@@ -1045,6 +1082,7 @@ before now, wrapping circularly" rule.
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
 | `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
+| `LLAMA_PROXY_PROVIDER_STATE_FILE` | Override the provider-availability state file (default: `proxy/provider-state.json`). Used by tests; `_provider_unavailable_until` and `_usage_reset_at` are persisted here |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
@@ -2267,6 +2305,7 @@ Logs are written with time-based rotation:
 | `llama-server.log` | llama-server stdout/stderr | On each restart, last 15 kept |
 | `request_counts.json` | Persisted request counters (endpoint keys) | Updated periodically and on reset |
 | `token_counts.json` | Persisted token counters (endpoint keys + totals) | Updated periodically and on reset |
+| `provider-state.json` | Persisted provider cooldowns and usage-limit account quarantine (beside `proxy/.mode`, **not** in the log directory) | Rewritten atomically on each availability change; expired entries pruned; restored at startup |
 
 ### Proxy Log Settings
 - **Rotation**: Every 6 hours
