@@ -2085,22 +2085,89 @@ def _compute_retry_after(
     return int(max(candidates))
 
 
+def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
+    """Return provider entries quarantined by a pending usage-limit reset.
+
+    Usage-limit quarantine (``_usage_reset_at``, keyed by
+    ``_usage_limit_account_key``) does not populate the cooldown map
+    (``_provider_unavailable_until``), so it was previously invisible to
+    exhaustion diagnostics. This helper exposes it with the remaining reset
+    seconds and the true reason (quarantine before window/cooldown),
+    (LP-0MU56ZFVD001LP0H).
+
+    Each entry contains ``name``, ``type``, ``account``, ``reset_in`` (whole
+    seconds) and ``reset_at`` (ISO-8601 UTC). Entries sharing a quarantined
+    account are each returned; expired entries are pruned by
+    ``_usage_reset_remaining``.
+    """
+    result: list[dict[str, Any]] = []
+    for p in model_config.get("providers") or []:
+        if not isinstance(p, dict):
+            continue
+        account = _usage_limit_account_key(p)
+        remaining = _usage_reset_remaining(account)
+        if remaining <= 0:
+            continue
+        result.append({
+            "name": p.get("name", "unknown"),
+            "type": p.get("type", "remote"),
+            "account": account,
+            "reset_in": int(remaining),
+            "reset_at": datetime.fromtimestamp(
+                _usage_reset_at[account], tz=UTC
+            ).isoformat(),
+        })
+    return result
+
+
+def _record_quarantine_attempts(
+    attempts: list[dict[str, Any]], model_config: dict
+) -> list[dict[str, Any]]:
+    """Append ``usage_limit_reset`` diagnostics for quarantined providers.
+
+    Called before window-skip diagnostics so a provider that is both
+    quarantined and outside its window is represented once, as a quota reset
+    (quarantine takes precedence over the window reason). Returns the
+    quarantined entries for callers that want to log them
+    (LP-0MU56ZFVD001LP0H).
+    """
+    quarantined = _quarantined_providers(model_config)
+    for q in quarantined:
+        _record_attempt(
+            attempts,
+            provider=q["name"],
+            type=q["type"],
+            status="usage_limit_reset",
+            reset_in=q["reset_in"],
+            reset_at=q["reset_at"],
+        )
+    return quarantined
+
+
 def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     """Return ``{name, type}`` pairs for providers whose ``available_times``
     window excludes the current UTC time.
 
     Used to record ``outside_time_window`` diagnostics when a fallback chain is
     exhausted. Providers actually attempted this request cannot be outside
-    their window (they were selected), so this set is exactly the providers
-    skipped solely due to time windows.
+    their window (they were selected), so this set is (absent quarantine)
+    exactly the providers skipped solely due to time windows. A provider that
+    is also usage-limit quarantined is excluded: quarantine is the true reason
+    and is reported once as ``usage_limit_reset`` by
+    ``_record_quarantine_attempts`` (LP-0MU56ZFVD001LP0H).
     """
     result: list[dict[str, str]] = []
     for p in model_config.get("providers") or []:
-        if isinstance(p, dict) and not _is_within_allowed_window(p):
-            result.append({
-                "name": p.get("name", "unknown"),
-                "type": p.get("type", "remote"),
-            })
+        if not isinstance(p, dict):
+            continue
+        if _is_within_allowed_window(p):
+            continue
+        if _usage_reset_remaining(_usage_limit_account_key(p)) > 0:
+            continue  # quarantine takes precedence over the window reason
+        result.append({
+            "name": p.get("name", "unknown"),
+            "type": p.get("type", "remote"),
+        })
     return result
 
 
@@ -4311,6 +4378,7 @@ def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
     when all providers are exhausted (LP-0MSG45LOO007K236).
     """
     unavailable: dict[str, int] = {}
+    quarantined: list[dict[str, Any]] = []
     try:
         providers = model_config.get("providers", []) or []
         for p in providers:
@@ -4322,7 +4390,21 @@ def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
                 remaining = _provider_cooldown_remaining(key)
                 if remaining > 0:
                     unavailable[key] = remaining
-        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
+        # Usage-limit quarantine does not populate the cooldown map; surface
+        # it explicitly so operators can distinguish a quota block from a
+        # transient cooldown. Quarantine overrides a cooldown on the same
+        # provider because the resolver checks it first
+        # (LP-0MU56ZFVD001LP0H).
+        quarantined = _quarantined_providers(model_config)
+        for q in quarantined:
+            unavailable[q["name"]] = q["reset_in"]
+        logger.warning(
+            "All providers exhausted for model=%s; unavailable=%s; "
+            "usage_limit_reset=%s",
+            path,
+            unavailable,
+            {q["name"]: q["reset_in"] for q in quarantined} or None,
+        )
     except Exception:
         pass
     return unavailable
@@ -4979,6 +5061,11 @@ async def _proxy_with_remote_fallback_cycle(
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
+
+    # Usage-limit quarantine takes precedence over the window reason, so it
+    # is recorded first; the window loop below skips providers already
+    # quarantined (LP-0MU56ZFVD001LP0H).
+    _record_quarantine_attempts(attempts, model_config)
 
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
@@ -6259,6 +6346,11 @@ async def _proxy_with_fallback_cycle(
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
+
+    # Usage-limit quarantine takes precedence over the window reason, so it
+    # is recorded first; the window loop below skips providers already
+    # quarantined (LP-0MU56ZFVD001LP0H).
+    _record_quarantine_attempts(attempts, model_config)
 
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
