@@ -193,6 +193,13 @@ The config is validated at startup (`validate_compaction_config` in
 `llama_model`, or non-positive ctx/max-token values fail startup with a clear
 error. See `proxy/tests/test_compaction_config.py`.
 
+> **Current deployment (2026-09):** the shipped profiles use the remote-only
+> `models.compact` chain (`opencode-go-compact` Muse → `deepseek-flash-compact`)
+> and `compaction_trigger_ratio: 0` (disabled) — see
+> [local-llm-responses-api-investigation-LP-0MTY7EKZC006T893.md](local-llm-responses-api-investigation-LP-0MTY7EKZC006T893.md).
+> The local-summariser example above is retained for the backwards-compatible
+> path used only when `models.compact` is absent.
+
 ## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
 
 The smart-routing clamp (`_effective_large_context_thresholds` in
