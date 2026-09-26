@@ -36,6 +36,13 @@ CLI::
         --replay experiment-results/run-20260830.jsonl \\
         --score-only
 
+Log discovery
+
+Proxy logs are discovered and opened through the shared project-owned helper
+``scripts/lib/proxy_logs.py``, covering both rotation schemes
+(``proxy.log.YYYY-MM-DD_HH`` and ``proxy.log-YYYY-MM-DD_HH``) and gzip
+compression (LP-0MU148SHI004WHQM).
+
 Deliverables written on successful run:
   - ``<output-dir>/run-<timestamp>.jsonl``  — raw per-task results
   - ``<output-dir>/metrics.csv``           — aggregated metrics per arm/mode

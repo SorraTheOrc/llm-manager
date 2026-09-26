@@ -43,6 +43,13 @@ Correlation outputs (see AC1-AC3):
   full although the context can never be resident in one slot — the KV
   persists nothing useful and the next turn re-prefills again).
 
+Log discovery
+
+Rotated proxy logs are discovered and opened through the shared project-owned
+helper ``scripts/lib/proxy_logs.py``, covering both rotation schemes
+(``proxy.log.YYYY-MM-DD_HH`` and ``proxy.log-YYYY-MM-DD_HH``) and gzip
+compression (LP-0MU148SHI004WHQM). llama-server logs keep their own iterator.
+
 CLI::
 
     python3 proxy/scripts/correlate_oversized_sessions.py \\

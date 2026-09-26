@@ -20,6 +20,13 @@ Produced corpus entries:
   - slot_cache_inventory — files in session_slot_save_path with sizes,
                            mtimes, age
 
+Log discovery
+
+Proxy logs (live and rotated) are discovered and opened through the shared
+project-owned helper ``scripts/lib/proxy_logs.py``: in-process
+``proxy.log.YYYY-MM-DD_HH`` and logrotate ``proxy.log-YYYY-MM-DD_HH``, plain
+or ``.gz`` (LP-0MU148SHI004WHQM). llama-server logs keep their own iterator.
+
 Usage:
   ./scripts/slot-persistence-harness.py                              # defaults
   ./scripts/slot-persistence-harness.py --log-dir /var/log/llama-proxy

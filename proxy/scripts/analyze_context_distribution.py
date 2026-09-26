@@ -33,6 +33,13 @@ Breach caps (from the parent AC1 / F1 AC2):
     fast  83285  (per-slot cap, 87.4K-slot / 3 - 4096 headroom)
     cheap 61440  (static clamp)
 
+Log discovery
+
+Discovery and gzip-aware opening use the project-owned shared helper
+``scripts/lib/proxy_logs.py``: it matches the in-process dot rotation scheme
+(``proxy.log.YYYY-MM-DD_HH``) and the logrotate dash scheme
+(``proxy.log-YYYY-MM-DD_HH``), plain or ``.gz`` (LP-0MU148SHI004WHQM).
+
 CLI::
 
     python3 proxy/scripts/analyze_context_distribution.py \\

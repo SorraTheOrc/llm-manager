@@ -14,6 +14,14 @@ maps proxy-side slot_save/slot_restore events to:
    (llama-server logs lack timestamps, so this is a count, not a timing;
    the F1 proxy instrumentation adds per-request elapsed time going forward).
 
+Log discovery
+
+Proxy logs (live and rotated) are discovered and opened through the shared
+project-owned helper ``scripts/lib/proxy_logs.py``, so both rotation schemes
+(``proxy.log.YYYY-MM-DD_HH`` and ``proxy.log-YYYY-MM-DD_HH``) and gzip
+compression are read (LP-0MU148SHI004WHQM). llama-server logs keep their own
+iterator.
+
 Usage:
   ./scripts/slot-persistence-correlate.py                          # default /var/log/llama-proxy
   ./scripts/slot-persistence-correlate.py --log-dir /var/log/llama-proxy

@@ -35,7 +35,11 @@ python3 scripts/slot_persistence_harness.py --schema
 
 The harness reads the log directory as-is (live + rotated, plain and
 gzip-compressed files) — there is no dependency on a running proxy or
-llama-server. Copy the log files to a snapshot directory and rerun for
+llama-server. Proxy-log discovery and gzip-aware opening are centralised in the
+project-owned `scripts/lib/proxy_logs.py` helper (covering both the in-process
+`proxy.log.YYYY-MM-DD_HH` and logrotate `proxy.log-YYYY-MM-DD_HH` schemes),
+shared with the other analysis scripts (LP-0MU148SHI004WHQM). Copy the log
+files to a snapshot directory and rerun for
 reproducible corpora (the `meta.generated` timestamp is the only field that
 changes between runs over the same snapshot; all `baseline_metrics`,
 `llama_files_seen` and event counts are deterministic).
