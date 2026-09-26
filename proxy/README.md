@@ -653,9 +653,9 @@ every turn) routed remote invisibly turn after turn.
 #### All Providers Exhausted
 
 When all providers are exhausted:
-- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 (Too Many Requests) with `Content-Type: text/plain` and body `"Model server busy: 0/<total_slots> slots available. Retry later."` (no `Retry-After` header).
-- **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
-- **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable — `error` is `"All providers unavailable: no provider is available during the current scheduled time window"` and the `diagnostics` entries carry `status: "outside_time_window"` instead of the generic `"All providers exhausted"`. Mixed cases (a provider in cooldown or an error plus a time-window skip) keep the generic message, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible.
+- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 with a JSON body `{"error": "All providers exhausted", "code": "all_slots_exhausted", "message": "Model server busy: 0/<total_slots> slots available. Retry later."}` (no `Retry-After` header).
+- **Other errors**: Returns HTTP 503 with a JSON body containing `error: "All providers exhausted"`, a stable `code`, and `retry_after`.
+- **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable by `code: "outside_time_window"`; the window-specific prose lives in `detail`, while `error` stays the client-recognised `"All providers exhausted"`. The `diagnostics` entries carry `status: "outside_time_window"`. Mixed cases (a provider in cooldown, a usage-limit quarantine, or an error plus a time-window skip) keep the generic `code: "all_exhausted"` response, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible (LP-0MU56ZM0K005F69G).
 
 #### Chain-Hold Retry (deferred exhaustion)
 

@@ -4546,10 +4546,12 @@ async def test_remote_fallback_all_time_window_skipped_distinguishable_503():
     assert call_log == [], "No provider should have been called"
     assert result.status_code == 503
     body = json.loads(result.body)
-    assert body["error"] == (
-        "All providers unavailable: no provider is available during the current scheduled time window"
-    ), f"Expected time-window message, got: {body}"
-    assert "All providers exhausted" not in result.body.decode("utf-8")
+    # LP-0MU56ZM0K005F69G: the stable code carries the discriminator; the
+    # window-specific prose moves to ``detail`` and ``error`` is the
+    # client-recognised generic string.
+    assert body["error"] == "All providers exhausted", f"got: {body}"
+    assert body["code"] == "outside_time_window", f"got: {body}"
+    assert "scheduled time window" in body["detail"], f"got: {body}"
     diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
@@ -4702,10 +4704,9 @@ async def test_proxy_with_fallback_all_time_window_skipped_distinguishable_503()
     assert call_log == [], "No provider should have been called"
     assert result.status_code == 503
     body = json.loads(result.body)
-    assert body["error"] == (
-        "All providers unavailable: no provider is available during the current scheduled time window"
-    ), f"Expected time-window message, got: {body}"
-    assert "All providers exhausted" not in result.body.decode("utf-8")
+    assert body["error"] == "All providers exhausted", f"got: {body}"
+    assert body["code"] == "outside_time_window", f"got: {body}"
+    assert "scheduled time window" in body["detail"], f"got: {body}"
     diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"

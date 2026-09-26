@@ -248,5 +248,6 @@ class TestExhaustionPayloadQuarantine:
             result = await _exhaust({"providers": [p1, p2]})
 
         body = json.loads(result.body)
-        assert "scheduled time window" in body["error"]
+        assert body["code"] == "outside_time_window"
+        assert "scheduled time window" in body["detail"]
         assert _statuses(body)["w1"] == "outside_time_window"

@@ -2715,6 +2715,14 @@ def _build_reasoning_content_roundtrip_error() -> Response:
     )
 
 
+# Stable machine-readable exhaustion codes (LP-0MU56ZM0K005F69G). Clients must
+# discriminate on ``code`` (never on the human-readable ``error``/``detail``
+# prose); the existing ``error`` text is retained for older clients.
+EXHAUSTION_CODE_ALL = "all_exhausted"
+EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
+EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -2723,21 +2731,36 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
                                    slot exhaustion (returns HTTP 429).
                                    Otherwise, returns HTTP 503 with JSON body.
         total_slots: Total number of slots across local providers (used only
-                     for the slot-exhaustion 429 text body).
+                     for the slot-exhaustion 429 body).
         unavailable_providers: Optional mapping of provider -> remaining cooldown seconds
                                to include in the 503 JSON payload for diagnostics.
         diagnostics: Optional list of per-provider attempt diagnostics (order-preserving)
+
+    The JSON body carries a stable ``code`` (``all_exhausted`` or
+    ``all_slots_exhausted``) so clients can classify exhaustion without relying
+    on the ``error`` prose, whose meaning is preserved for older clients
+    (LP-0MU56ZM0K005F69G).
     """
     if all_local_slot_exhaustion:
-        # total_slots may be 0 if unknown; still format per acceptance criteria
+        # total_slots may be 0 if unknown; still format per acceptance criteria.
+        # JSON keeps the machine-readable ``code`` alongside the retained prose.
+        slot_payload: dict[str, Any] = {
+            "error": "All providers exhausted",
+            "code": EXHAUSTION_CODE_SLOTS,
+            "message": f"Model server busy: 0/{int(total_slots)} slots available. Retry later.",
+        }
         return Response(
-            content=(f"Model server busy: 0/{int(total_slots)} slots available. Retry later.").encode(),
+            content=json.dumps(slot_payload).encode("utf-8"),
             status_code=429,
-            media_type="text/plain",
+            media_type="application/json",
         )
 
     retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
-    payload: dict[str, Any] = {"error": "All providers exhausted", "retry_after": retry_after}
+    payload: dict[str, Any] = {
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_ALL,
+        "retry_after": retry_after,
+    }
     if unavailable_providers:
         # Attach diagnostic info about which providers are in cooldown
         try:
@@ -2804,7 +2827,9 @@ def _build_time_window_exhausted_response(
 
     retry_after = _compute_retry_after(unavailable, model_config=model_config)
     payload: dict[str, Any] = {
-        "error": "All providers unavailable: no provider is available during the current scheduled time window",
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_TIME_WINDOW,
+        "detail": "no provider is available during the current scheduled time window",
         "retry_after": retry_after,
     }
     if attempts:
