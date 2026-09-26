@@ -4,7 +4,10 @@ __pycache__/
 *.pyc
 
 # Node
-node_modules/
+# Ignore both directories and symlinks: the implement framework symlinks the
+# main checkout's node_modules into worktrees, and a trailing-slash pattern
+# only matches directories (LP-0MUIH7FYS0010MLT).
+node_modules
 
 # Runtime artifacts
 logs/
