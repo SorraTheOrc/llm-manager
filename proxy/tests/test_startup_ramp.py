@@ -500,11 +500,10 @@ def stub_dispatch(monkeypatch):
     ``X-Test-Dispatch`` header).  Any accidental reach of a real backend is
     caught because the sentinel header would be absent.
     """
-    from starlette.responses import JSONResponse
-
     import proxy.provider as provider_mod
     import proxy.server as srv_mod
     import proxy.ui as ui_mod
+    from starlette.responses import JSONResponse
 
     async def _sentinel(*args, **kwargs):
         return JSONResponse(
