@@ -4633,12 +4633,36 @@ def _log_chain_hold_start(path: str, hold_seconds: float, cycle: int, max_cycles
     re-route / exhausted log lines)."""
     logger.warning(
         "Chain exhausted for model=%s; holding %.0fs before restarting cycle "
-        "from the first provider (cycle=%d, max_cycles=%s)",
+        "from the first provider (chain_hold_cycle=%d, cycle=%d, max_cycles=%s)",
         path,
         hold_seconds,
         cycle,
+        cycle,
         max_cycles if max_cycles else "infinite",
     )
+
+
+def _set_chain_hold_cycle(request, cycle: int) -> None:
+    """Record the current chain-hold cycle index on the request.
+
+    Cycle 0 is the first (pre-hold) cycle; every hold-restart increments it.
+    The value is surfaced on routing / skip / compaction / hold log lines so a
+    single held request re-emitted across cycles is distinguishable from
+    genuine new client demand (LP-0MU5AIAAY003KVM0 AC4). Fail-open: requests
+    without a ``state`` (test stubs) simply do not carry the field.
+    """
+    try:
+        request.state.chain_hold_cycle = int(cycle)
+    except Exception:
+        pass
+
+
+def _get_chain_hold_cycle(request) -> int:
+    """Return the current chain-hold cycle index (0 when unset)."""
+    try:
+        return int(getattr(request.state, "chain_hold_cycle", 0))
+    except Exception:
+        return 0
 
 
 def _build_streaming_hold_response(
@@ -4682,6 +4706,7 @@ def _build_streaming_hold_response(
             except Exception:
                 pass
             try:
+                _set_chain_hold_cycle(request, cycle)
                 result = await cycle_fn(request, path, model_config, config)
             except ChainExhaustedError as exc:
                 if max_cycles != 0 and cycle >= max_cycles:
@@ -4738,9 +4763,20 @@ async def _run_chain_cycles(
     hold_seconds = _get_chain_hold_seconds(config)
     max_cycles = _get_chain_hold_max_cycles(config)
 
+    # Semantics (LP-0MU5AIAAY003KVM0, option (a) — decided): every hold cycle
+    # re-runs the FULL fallback cycle, including local routing and compaction
+    # evaluation. Local session handling (``_handle_session``) runs whenever a
+    # cycle dispatches local; when local is bypassed, the bypass path still
+    # re-evaluates compaction (``_evaluate_compaction_for_bypass``). A
+    # summarizer failure in one cycle therefore does NOT pin the request: a
+    # later cycle re-evaluates compaction, and a success refreshes the request
+    # body before dispatch. ``_set_chain_hold_cycle`` stamps each cycle so the
+    # repeated routing_check / compaction log lines are attributable to one
+    # held request (AC4/AC5).
     cycle = 0
     while True:
         try:
+            _set_chain_hold_cycle(request, cycle)
             return await cycle_fn(request, path, model_config, config)
         except ChainExhaustedError as exc:
             if max_cycles != 0 and cycle >= max_cycles:
@@ -5531,7 +5567,8 @@ async def _proxy_with_fallback_cycle(
                 logger.info(
                     "routing_check provider=%s model=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s",
+                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s "
+                    "chain_hold_cycle=%d",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
@@ -5541,6 +5578,7 @@ async def _proxy_with_fallback_cycle(
                     _routing_cached_ratio,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
+                    _get_chain_hold_cycle(request),
                 )
                 # Context-pressure compaction signal (LP-0MSDCLQ2W001LGWC):
                 # KV reads scale linearly with context (20 KB/token at f16),
@@ -5587,7 +5625,7 @@ async def _proxy_with_fallback_cycle(
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                         "new_tokens=%d cached_ratio=%.2f "
                         "reason=%s → skipping local, routing to next remote provider "
-                        "session=%s",
+                        "session=%s chain_hold_cycle=%d",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -5597,6 +5635,7 @@ async def _proxy_with_fallback_cycle(
                         _routing_cached_ratio,
                         _skip_reason,
                         _session_id or "unknown",
+                        _get_chain_hold_cycle(request),
                     )
                     _record_attempt(
                         attempts,
@@ -5689,7 +5728,7 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "compaction_bypass_eval provider=%s model=%s "
                             "evaluated=%s action=%s reason=%s est_before=%d "
-                            "est_after=%d session=%s",
+                            "est_after=%d session=%s chain_hold_cycle=%d",
                             provider_name,
                             _llama_model or "unknown",
                             _bypass_compaction["evaluated"],
@@ -5698,6 +5737,7 @@ async def _proxy_with_fallback_cycle(
                             _bypass_compaction["estimated_before"],
                             _bypass_compaction["estimated_after"],
                             _session_id or "unknown",
+                            _get_chain_hold_cycle(request),
                         )
                     if not _rescued_local:
                         # No rescue — preserve the original bypass behaviour
