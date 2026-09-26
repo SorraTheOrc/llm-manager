@@ -6,6 +6,7 @@ concurrent local load and the adaptive-timeout cadence. These tests run the
 script against a synthetic log directory so no production logs are needed.
 """
 
+import gzip
 import json
 import os
 import subprocess
@@ -119,3 +120,27 @@ def test_script_empty_logs(tmp_path):
     assert report["totals"]["slot_save_failed"] == 0
     assert report["failures"] == []
     assert report["load_context"]["failures_with_local_streams"] == 0
+
+
+def test_script_reads_dash_named_and_gzip_rotated_logs(tmp_path):
+    """Regression (LP-0MUIEK66C003VGO1): dash-named and .gz rotated logs count.
+
+    The script previously globbed only ``proxy.log.*`` and opened plain files,
+    silently dropping the logrotate dash scheme and every compressed file.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "proxy.log-2026-08-06_01").write_text(SYNTH_PROXY, encoding="utf-8")
+    with gzip.open(
+        log_dir / "proxy.log.2026-08-06_02.gz", "wt", encoding="utf-8"
+    ) as fh:
+        fh.write(SYNTH_PROXY)
+
+    proc = _run(log_dir)
+    assert proc.returncode == 0, f"script failed: {proc.stderr}"
+    report = json.loads(proc.stdout)
+
+    # Each rotated file carries the full synthetic day; both must contribute.
+    assert report["totals"]["slot_save_failed"] == 6
+    assert report["totals"]["slot_save_success"] == 2
+    assert report["totals"]["slot_restore_success"] == 2

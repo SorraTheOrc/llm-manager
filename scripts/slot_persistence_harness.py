@@ -43,6 +43,12 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# Shared proxy-log discovery/opening (live + dot/dash rotated, plain/.gz) lives
+# in the project-owned ``scripts/lib`` package; this script runs with
+# ``scripts/`` as sys.path[0], so the sibling package resolves directly
+# (LP-0MU148SHI004WHQM).
+from lib.proxy_logs import discover_proxy_log_files, iter_proxy_log_lines
+
 # ---------------------------------------------------------------------------
 # Timestamp parsing
 # ---------------------------------------------------------------------------
@@ -58,19 +64,14 @@ def _parse_ts(value: str) -> dt.datetime:
 # Log file iteration (live + rotated, oldest-first)
 # ---------------------------------------------------------------------------
 
-def _iter_proxy_files(log_dir: Path) -> list[Path]:
-    """Proxy log files (live + rotated), oldest-first.
+def _iter_proxy_logs(log_dir: Path):
+    """Yield lines from every proxy log (live, dot/dash rotated, plain/.gz).
 
-    Two rotation naming schemes coexist:
-      old: proxy.log.2026-08-22_01.gz
-      new: proxy.log-2026-08-27_00.gz
+    Discovery and gzip-aware opening come from the shared project helper; this
+    wrapper adapts its ``(path, line)`` generator to the line-only consumer.
     """
-    live = log_dir / "proxy.log"
-    rotated = sorted(
-        list(log_dir.glob("proxy.log.*")) + list(log_dir.glob("proxy.log-*")),
-        key=lambda p: p.name,
-    )
-    return ([live] if live.exists() else []) + rotated
+    for _path, line in iter_proxy_log_lines(log_dir):
+        yield line
 
 
 def _iter_llama_files(log_dir: Path) -> list[Path]:
@@ -102,23 +103,6 @@ def _match_llama_files(log_dir: Path, name_glob: str | None) -> list[Path]:
     import fnmatch
 
     return [p for p in files if fnmatch.fnmatch(p.name, name_glob)]
-
-
-def _iter_proxy_logs(log_dir: Path):
-    """Yield (path, line) from proxy.log then rotated proxy.log.* (oldest first).
-
-    Handles both plain and gzip-compressed rotated logs.
-    """
-    import gzip as gz
-
-    files = _iter_proxy_files(log_dir)
-    for path in files:
-        try:
-            opener = gz.open if path.suffix == ".gz" else open
-            with opener(path, "rt", errors="replace") as fh:
-                yield from fh
-        except OSError as exc:
-            print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
 
 
 def _iter_llama_logs(log_dir: Path, name_glob: str | None = None):
@@ -764,7 +748,7 @@ def analyze(
             "generated": dt.datetime.now().strftime(_TS_FMT),
             "proxy_lines_read": files_read["proxy"],
             "llama_lines_read": files_read["llama"],
-            "proxy_files": len(_iter_proxy_files(log_dir)),
+            "proxy_files": len(discover_proxy_log_files(log_dir)),
             "llama_files": len(list(_match_llama_files(log_dir, llama_file_glob))),
         },
         "slot_save_events": slot_save_events,

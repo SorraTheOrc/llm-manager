@@ -36,6 +36,12 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+# Shared proxy-log discovery/opening (live + dot/dash rotated, plain/.gz) lives
+# in the project-owned ``scripts/lib`` package; this script runs with
+# ``scripts/`` as sys.path[0], so the sibling package resolves directly
+# (LP-0MU148SHI004WHQM).
+from lib.proxy_logs import iter_proxy_log_lines
+
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
@@ -78,19 +84,13 @@ def _parse_ts(value: str) -> dt.datetime:
 
 
 def _iter_proxy_logs(log_dir: Path):
-    """Yield lines from proxy.log then rotated proxy.log.* (oldest last)."""
-    live = log_dir / "proxy.log"
-    rotated = sorted(
-        (p for p in log_dir.glob("proxy.log.*") if p.is_file()),
-        key=lambda p: p.name,
-    )
-    files = [live] + rotated if live.exists() else rotated
-    for path in files:
-        try:
-            with path.open(errors="replace") as fh:
-                yield from fh
-        except OSError as exc:
-            print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
+    """Yield lines from every proxy log (live, dot/dash rotated, plain/.gz).
+
+    Discovery and gzip-aware opening come from the shared project helper; this
+    wrapper adapts its ``(path, line)`` generator to the line-only consumer.
+    """
+    for _path, line in iter_proxy_log_lines(log_dir):
+        yield line
 
 
 def _iter_llama_logs(log_dir: Path):
