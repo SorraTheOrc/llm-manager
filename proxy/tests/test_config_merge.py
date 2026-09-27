@@ -580,3 +580,38 @@ class TestConfigTestUtilsHelper:
         ] == 42000
         assert get_merged_config("fast")["server"]["session_slot_pool_size"] == 1
         assert get_merged_config("fast")["server"]["contention_queue_max_depth"] == 3
+
+
+# ---------------------------------------------------------------------------
+# F10 (LP-0MUI681PK00893A4): post-consumer verification gate
+# ---------------------------------------------------------------------------
+
+
+class TestPostMergeVerificationGate:
+    """After F5/F6/F7/F9 landed, every merge path must still resolve the
+    shipped overlays to the F3 golden merged config for each mode."""
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_shipped_overlay_and_merge_entry_points_agree_with_golden(self, mode):
+        from proxy.config_merge import load_merged
+        from proxy.mode import mode_config_file, proxy_dir
+        from proxy.utils import load_merged_config
+
+        base_path = proxy_dir() / "config.yaml"
+        overlay_path = mode_config_file(mode)
+        golden = _fixture(f"merged_config_{mode}.json")
+
+        # 1. Pure helper over the SHIPPED (deduplicated) overlay.
+        assert deep_merge(_base_config(), _read_yaml(overlay_path)) == golden
+        # 2. Dependency-light shell/analytics entry point.
+        assert load_merged(base_path, overlay_path) == golden
+        # 3. Production loader (validates then returns the merged config).
+        assert load_merged_config(str(overlay_path)) == golden
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_golden_is_base_plus_pre_dedup_overlay(self, mode):
+        """The frozen golden remains exactly the pre-dedup merge, so it is a
+        valid contract for the shipped overlays to be checked against."""
+        assert deep_merge(
+            _base_config(), _fixture(f"prededup_raw_{mode}.json")
+        ) == _fixture(f"merged_config_{mode}.json")
