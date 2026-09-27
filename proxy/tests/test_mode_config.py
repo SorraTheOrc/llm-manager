@@ -20,6 +20,7 @@ import os
 import pytest
 import yaml
 from proxy.utils import load_config
+from tests.config_test_utils import load_profile
 
 from proxy import mode as mode_module
 
@@ -118,9 +119,8 @@ class TestHomePageModeDisplay:
 
 
 def _load(name: str) -> dict:
-    path = mode_module.proxy_dir() / name
-    with open(path) as fh:
-        return yaml.safe_load(fh)
+    """Return a profile as seen at runtime (see ``load_profile``)."""
+    return load_profile(name)
 
 
 def _opencode_deepseek_names(models: dict) -> set:

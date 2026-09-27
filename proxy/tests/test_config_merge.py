@@ -420,3 +420,86 @@ class TestGoldenMergedConfig:
 
         for path, value in _leaf_paths(raw).items():
             assert _get_path(golden, path) == value
+
+
+def _find_base_duplicates(base, overlay, prefix=""):
+    """Dotted paths of overlay leaves that duplicate the base value.
+
+    Recurses through mappings; a list is treated as a leaf (it replaces the
+    base list wholesale, so its inner entries may legitimately repeat base).
+    """
+    duplicates = []
+    for key, value in overlay.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if key not in base:
+            continue
+        base_value = base[key]
+        if isinstance(value, dict) and isinstance(base_value, dict):
+            duplicates.extend(_find_base_duplicates(base_value, value, path))
+        elif value == base_value:
+            duplicates.append(path)
+    return duplicates
+
+
+class TestDeduplicatedModeFiles:
+    """F4: the mode files retain only values that differ from ``config.yaml``."""
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_no_base_duplicates_remain(self, mode):
+        from proxy.mode import proxy_dir
+
+        base = _base_config()
+        overlay = _read_yaml(proxy_dir() / f"config-{mode}.yaml")
+
+        assert _find_base_duplicates(base, overlay) == []
+
+    @pytest.mark.parametrize(
+        "mode,expected_top_keys",
+        [("fast", {"models", "server"}), ("cheap", {"server"})],
+    )
+    def test_residue_shape(self, mode, expected_top_keys):
+        from proxy.mode import proxy_dir
+
+        overlay = _read_yaml(proxy_dir() / f"config-{mode}.yaml")
+        assert set(overlay) == expected_top_keys
+
+    @pytest.mark.parametrize(
+        "mode,expected_server_keys",
+        [
+            (
+                "fast",
+                {
+                    "contention_queue_policy",
+                    "contention_queue_max_wait_seconds",
+                    "contention_queue_max_depth",
+                    "mode_switch_drain",
+                    "upstream_idle_timeout_seconds",
+                },
+            ),
+            (
+                "cheap",
+                {
+                    "local_large_context_cold_cache_threshold",
+                    "local_large_context_economic_bypass_serves_local",
+                    "session_slot_pool_size",
+                    "contention_queue_policy",
+                    "contention_queue_max_wait_seconds",
+                    "contention_queue_max_depth",
+                    "mode_switch_drain",
+                    "upstream_idle_timeout_seconds",
+                },
+            ),
+        ],
+    )
+    def test_residue_server_keys(self, mode, expected_server_keys):
+        from proxy.mode import proxy_dir
+
+        overlay = _read_yaml(proxy_dir() / f"config-{mode}.yaml")
+        assert set(overlay["server"]) == expected_server_keys
+
+    def test_cheap_models_section_is_gone(self):
+        """cheap's models are identical to base and are inherited."""
+        from proxy.mode import proxy_dir
+
+        overlay = _read_yaml(proxy_dir() / "config-cheap.yaml")
+        assert "models" not in overlay

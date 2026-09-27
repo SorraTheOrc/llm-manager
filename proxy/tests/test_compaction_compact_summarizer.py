@@ -318,10 +318,9 @@ class TestShippedCompactConfig:
         ["config.yaml", "config-fast.yaml", "config-cheap.yaml"],
     )
     def test_compact_model_declares_remote_chain(self, config_name):
-        import yaml
+        from tests.config_test_utils import load_profile
 
-        config_path = Path(__file__).resolve().parents[2] / "proxy" / config_name
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config = load_profile(config_name)
         compact = config["models"]["compact"]
         providers = compact["providers"]
 

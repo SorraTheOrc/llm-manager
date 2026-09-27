@@ -32,11 +32,10 @@ MTP_HF_REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 
 
 def _load_config(path):
-    """Load a YAML config and return the raw parsed dict."""
-    import yaml
+    """Load a profile as seen at runtime (raw base, merged mode overlays)."""
+    from tests.config_test_utils import load_profile
 
-    with open(path) as f:
-        return yaml.safe_load(f)
+    return load_profile(os.path.basename(path))
 
 
 # ---------------------------------------------------------------------------
