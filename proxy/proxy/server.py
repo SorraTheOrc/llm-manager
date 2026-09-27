@@ -873,7 +873,12 @@ def _startup_initialize_grandfathering():
             else mode_module.MODE_CHEAP
         )
         other_path = mode_module.mode_config_file(other_mode)
-        other_mode_config = load_config(str(other_path))
+        # Explicit merged load: the mode overlays are deduplicated, so the
+        # other-mode config must inherit the base `models` section for
+        # grandfathering's remote-provider comparison to be correct.
+        # `load_config(explicit_path=...)` stays raw for backward compat
+        # (AC1), hence the dedicated merged entry point.
+        other_mode_config = load_merged_config(str(other_path))
         logger.info(
             "Grandfathering: enabled; other-mode config %s (current=%s)",
             other_path.name,
@@ -1592,6 +1597,7 @@ from .utils import (  # noqa: E402, F401
     _normalize_outgoing_headers,
     count_text_tokens,
     load_config,
+    load_merged_config,
     normalize_provider_name,
     setup_logging,
 )

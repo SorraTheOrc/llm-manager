@@ -528,14 +528,37 @@ def load_config(config_path: str | None = None) -> dict:
         if cfg is None:
             cfg = {}
 
+    _validate_config(cfg)
+
+    return cfg
+
+
+def load_merged_config(config_path) -> dict:
+    """Load *config_path* deep-merged on top of the authoritative base config.
+
+    Unlike :func:`load_config`, this never returns a raw overlay: the base
+    ``proxy/config.yaml`` is always merged underneath *config_path* (unless
+    *config_path* is the base itself, in which case it is loaded once). This
+    is the entry point for consumers that must see a **complete** config for
+    a mode other than the active one — currently the mode-switch
+    grandfathering other-mode load (``server._startup_initialize_
+    grandfathering``), which compares remote-provider counts between modes.
+
+    The merged config is validated exactly like :func:`load_config`.
+    """
+    cfg = _load_merged_config(config_path)
+    _validate_config(cfg)
+    return cfg
+
+
+def _validate_config(cfg: dict) -> None:
+    """Run the standard config validators on *cfg* (raises ``ValueError``)."""
     # Validate system_prompt configurations
     _validate_prompt_configs(cfg)
     # Validate chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5)
     _validate_chain_hold_config(cfg)
     # Validate compaction configuration (LP-0MTG6RW3L003X122)
     _validate_compaction_config(cfg)
-
-    return cfg
 
 
 def _validate_chain_hold_config(cfg: dict) -> None:
