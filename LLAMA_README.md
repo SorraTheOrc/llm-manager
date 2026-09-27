@@ -180,6 +180,13 @@ sudo cmake --install build
 Ensure the server is started with `--slot-save-path /home/rgardler/projects/llm/slot-cache`
 (see `start-llama.sh` + `models.ini`) so the slot endpoints return 200.
 
+Alternatively, `scripts/rebuild-llama.sh` automates clone + HIP build + deploy:
+it stops any running `llama-server` first, copies the binary **and** its sibling
+shared libraries, patches the deployed artifacts' `RUNPATH` to `$ORIGIN`, then
+sanity-runs `--version`. Use `--deploy-only` to re-deploy an already-built
+artifact without rebuilding (it needs `patchelf` but not `cmake`). See
+`UPGRADE_ROCM.md` step 5 for the full flags and ordering contract.
+
 If OpenSSL is not available, install it first:
 ```bash
 # Fedora/RHEL
