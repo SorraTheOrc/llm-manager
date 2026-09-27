@@ -13,7 +13,9 @@ it. These tests pin the helper's semantics *before* the loader is wired to it
 """
 
 import copy
+import json
 import logging
+from pathlib import Path
 
 import pytest
 import yaml
@@ -295,3 +297,126 @@ class TestLoadConfigMerge:
 
         _select_mode(monkeypatch, mode_file, "cheap")
         assert isinstance(load_config(), dict)
+
+
+# ---------------------------------------------------------------------------
+# F3: golden equivalence regression (merge + the later F4 dedup)
+# ---------------------------------------------------------------------------
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+#: Server keys present in ``config.yaml`` but absent from both pre-dedup mode
+#: files. Merging the base into fast/cheap intentionally inherits exactly
+#: these (the "config.yaml authoritative" behavioural change).
+BASE_ONLY_SERVER_KEYS = {
+    "session_single_flight_duplicate_retry_after_seconds",
+    "session_slot_availability_timeout_seconds",
+    "sibling_fallback_cooldown_seconds",
+    "sibling_fallback_threshold",
+    "sibling_fallback_window_seconds",
+    "startup_ramp",
+    "summarizer_disable_thinking",
+    "summarizer_reasoning_effort",
+    "timeout_graceful_shutdown",
+    "timeout_keep_alive",
+    "upstream_activity_timeout_seconds",
+    "upstream_empty_retry_timeout_seconds",
+    "upstream_max_stream_duration_seconds",
+}
+
+
+def _fixture(name):
+    with open(FIXTURES / name) as fh:
+        return json.load(fh)
+
+
+def _leaf_paths(obj, prefix=""):
+    """Map every leaf of a nested config to its dotted path."""
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            out.update(_leaf_paths(value, f"{prefix}.{key}" if prefix else str(key)))
+        return out
+    return {prefix: obj}
+
+
+def _get_path(obj, dotted):
+    for part in dotted.split("."):
+        obj = obj[part]
+    return obj
+
+
+def _dedup_overlay(base, overlay):
+    """Return *overlay* with every key-value pair equal to *base* removed.
+
+    Mirrors the F4 dedup of the mode files: dicts are compared recursively
+    (a partially-differing dict keeps only its differing keys), every other
+    value (scalar, list, ``None``) is dropped when it equals the base value.
+    """
+    result = {}
+    for key, value in overlay.items():
+        if key in base:
+            base_value = base[key]
+            if isinstance(value, dict) and isinstance(base_value, dict):
+                nested = _dedup_overlay(base_value, value)
+                if nested:
+                    result[key] = nested
+                continue
+            if value == base_value:
+                continue
+        result[key] = value
+    return result
+
+
+class TestGoldenMergedConfig:
+    """Merge (and the later dedup) must be behaviour-preserving.
+
+    ``merged_config_<mode>.json`` is a golden snapshot of the merged config
+    taken *before* the mode files are deduplicated, and
+    ``prededup_raw_<mode>.json`` is the corresponding pre-dedup overlay.
+    Together they fix the expected merged surface so F4's dedup can be proven
+    to change nothing.
+    """
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_load_config_matches_golden(self, mode, mode_file, monkeypatch):
+        from proxy.utils import load_config
+
+        _select_mode(monkeypatch, mode_file, mode)
+        assert load_config() == _fixture(f"merged_config_{mode}.json")
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_dedup_is_behaviour_preserving(self, mode):
+        """Removing base-equal entries from the overlay cannot change the
+        merge result (this is the gate F4 must not break)."""
+        base = _base_config()
+        raw = _fixture(f"prededup_raw_{mode}.json")
+        golden = _fixture(f"merged_config_{mode}.json")
+
+        assert deep_merge(base, _dedup_overlay(base, raw)) == golden
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_only_documented_base_keys_are_inherited(self, mode):
+        raw = _fixture(f"prededup_raw_{mode}.json")
+        golden = _fixture(f"merged_config_{mode}.json")
+
+        inherited = set(golden["server"]) - set(raw["server"])
+        assert inherited == BASE_ONLY_SERVER_KEYS
+        # No top-level section is introduced by the merge.
+        assert set(golden) - set(raw) == set()
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_inherited_values_match_base(self, mode):
+        base = _base_config()
+        golden = _fixture(f"merged_config_{mode}.json")
+
+        for key in BASE_ONLY_SERVER_KEYS:
+            assert golden["server"][key] == base["server"][key]
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_overlay_values_still_win(self, mode):
+        raw = _fixture(f"prededup_raw_{mode}.json")
+        golden = _fixture(f"merged_config_{mode}.json")
+
+        for path, value in _leaf_paths(raw).items():
+            assert _get_path(golden, path) == value
