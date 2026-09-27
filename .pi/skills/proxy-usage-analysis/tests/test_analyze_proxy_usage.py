@@ -1703,6 +1703,103 @@ server:
         assert configs["analysis_mode"] is None
         assert configs["analysis_config"] is configs["profiles"]["default"]
 
+    # -- base + overlay merge (LP-0MUI681CH00653DT) ----------------------
+
+    def test_load_proxy_config_merges_base_for_mode_overlay(self, tmp_path):
+        """A deduplicated mode overlay inherits base values it no longer
+        repeats (LP-0MUI681CH00653DT)."""
+        d = tmp_path / "proxy"
+        d.mkdir()
+        (d / "config.yaml").write_text(
+            "server:\n"
+            "  local_model_ctx_size: 262144\n"
+            "  session_slot_pool_size: 1\n"
+        )
+        (d / "config-cheap.yaml").write_text(
+            "server:\n  session_slot_pool_size: 3\n"
+        )
+        cfg = config_loader.load_proxy_config(d / "config-cheap.yaml")
+        assert cfg["local_model_ctx_size"] == 262144  # inherited from base
+        assert cfg["session_slot_pool_size"] == 3  # overlay wins
+
+    def test_load_proxy_config_merges_models_from_base(self, tmp_path):
+        """The merged profile exposes the full model surface of the base."""
+        d = tmp_path / "proxy"
+        d.mkdir()
+        (d / "config.yaml").write_text(
+            "models:\n"
+            "  embed:\n"
+            "    providers:\n"
+            "      - name: local-embed\n"
+            "        type: local\n"
+            "  plan:\n"
+            "    providers:\n"
+            "      - name: base-plan\n"
+            "        type: remote\n"
+            "server:\n"
+            "  local_model_ctx_size: 262144\n"
+        )
+        (d / "config-fast.yaml").write_text(
+            "models:\n"
+            "  plan:\n"
+            "    providers:\n"
+            "      - name: fast-plan\n"
+            "        type: remote\n"
+        )
+        cfg = config_loader.load_proxy_config(d / "config-fast.yaml")
+        assert set(cfg["models"]) == {"embed", "plan"}  # base model kept
+        assert cfg["models"]["plan"]["providers"][0]["name"] == "fast-plan"
+
+    def test_base_config_loads_without_merge(self, tmp_path):
+        d = tmp_path / "proxy"
+        d.mkdir()
+        (d / "config.yaml").write_text(
+            "server:\n  local_model_ctx_size: 131072\n"
+        )
+        cfg = config_loader.load_proxy_config(d / "config.yaml")
+        assert cfg["local_model_ctx_size"] == 131072
+
+    def test_discover_configs_profiles_are_merged(self, tmp_path):
+        """discover_configs resolves every profile against the base, so a
+        deduplicated overlay still carries inherited values/models."""
+        d = tmp_path / "proxy"
+        d.mkdir()
+        (d / "config.yaml").write_text(
+            "models:\n"
+            "  embed:\n"
+            "    providers:\n"
+            "      - name: local-embed\n"
+            "        type: local\n"
+            "server:\n"
+            "  local_model_ctx_size: 262144\n"
+            "  session_slot_pool_size: 1\n"
+        )
+        (d / "config-cheap.yaml").write_text(
+            "server:\n  session_slot_pool_size: 3\n"
+        )
+        (d / "config-fast.yaml").write_text(
+            "server:\n  upstream_idle_timeout_seconds: 240\n"
+        )
+        (d / ".mode").write_text("cheap\n")
+
+        configs = config_loader.discover_configs(start=tmp_path)
+
+        assert configs["profiles"]["cheap"]["local_model_ctx_size"] == 262144
+        assert configs["profiles"]["cheap"]["models"]  # inherited from base
+        assert configs["analysis_config"]["local_model_ctx_size"] == 262144
+        assert configs["profiles"]["fast"]["local_model_ctx_size"] == 262144
+
+    def test_real_profiles_ctx_sizes_match_pre_dedup(self):
+        """The merged loader yields the same per-mode ctx sizes the proxy
+        uses, so bucketing attribution is unchanged (LP-0MUI681CH00653DT)."""
+        repo_root = Path(__file__).resolve().parents[4]
+        configs = config_loader.discover_configs(start=repo_root)
+        schedules = bucketing.ModeScheduleMap.from_profiles(
+            configs["profiles"], configs["analysis_mode"], None
+        )
+        assert schedules.ctx_for("fast") == 262144
+        assert schedules.ctx_for("cheap") == 262144
+
 
 # ---------------------------------------------------------------------------
 # End-to-end run over fixture log files

@@ -46,6 +46,11 @@ def _normalize(cfg: dict | None) -> dict | None:
         value = _find_nested(cfg, key)
         if value is not None:
             result[key] = int(value)
+    models = _find_nested(cfg, "models")
+    if isinstance(models, dict):
+        # Carried through so a deduplicated mode overlay still exposes the
+        # full model/provider surface of the merged config.
+        result["models"] = models
     schedule = _find_nested(cfg, "slot_schedule")
     if isinstance(schedule, dict):
         entries = []
@@ -67,17 +72,54 @@ def _normalize(cfg: dict | None) -> dict | None:
     return result or None
 
 
-def parse_config_text(text: str) -> dict | None:
-    """Parse config YAML text into the normalized dict the skill uses."""
+def _parse_config_raw(text: str) -> dict:
+    """Parse config YAML text into a raw dict (yaml, else the regex parser)."""
     try:
         import yaml  # type: ignore
 
         cfg = yaml.safe_load(text)
     except Exception:  # intentionally broad: fall back to the regex parser
         cfg = None
-    if cfg is None:
+    if not isinstance(cfg, dict):
         cfg = _parse_config_text_regex(text)
-    return _normalize(cfg)
+    return cfg
+
+
+def parse_config_text(text: str) -> dict | None:
+    """Parse config YAML text into the normalized dict the skill uses."""
+    return _normalize(_parse_config_raw(text))
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge *overlay* onto *base* (scalars/lists replace).
+
+    Mirrors ``proxy.config_merge.deep_merge`` so the standalone skill resolves
+    the same base+overlay config the proxy does (LP-0MU0W548B0029255).
+    """
+    result = dict(base)
+    for key, value in overlay.items():
+        existing = result.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            result[key] = _deep_merge(existing, value)
+        else:
+            result[key] = value
+    return result
+
+
+_MODE_OVERLAY_RE = re.compile(r"^config-(?:fast|cheap)\.yaml$")
+
+
+def _base_for_overlay(path: Path) -> Path | None:
+    """Sibling ``config.yaml`` when *path* is a deduplicated mode overlay.
+
+    The mode profiles are overlays that no longer repeat base-inherited values
+    (for example ``local_model_ctx_size``), so the loader must merge them onto
+    the base to see the effective config.
+    """
+    if _MODE_OVERLAY_RE.match(path.name):
+        base = path.parent / "config.yaml"
+        return base if base.is_file() else None
+    return None
 
 
 def _parse_config_text_regex(text: str) -> dict:
@@ -252,8 +294,20 @@ def _mode_preferred_config(config_yaml: Path) -> Path:
 
 
 def load_proxy_config(path: Path | None) -> dict | None:
-    """Load and normalize the proxy config from ``path`` (``None`` if absent)."""
+    """Load and normalize the proxy config from ``path`` (``None`` if absent).
+
+    A deduplicated mode overlay (``config-fast.yaml`` / ``config-cheap.yaml``)
+    is deep-merged onto its sibling ``config.yaml`` base first, so inherited
+    values such as ``local_model_ctx_size`` are present.
+    """
     if path is None or not Path(path).is_file():
         return None
-    text = Path(path).read_text(encoding="utf-8", errors="replace")
-    return parse_config_text(text)
+    path = Path(path)
+    cfg = _parse_config_raw(path.read_text(encoding="utf-8", errors="replace"))
+    base_path = _base_for_overlay(path)
+    if base_path is not None:
+        base_cfg = _parse_config_raw(
+            base_path.read_text(encoding="utf-8", errors="replace")
+        )
+        cfg = _deep_merge(base_cfg, cfg)
+    return _normalize(cfg)
