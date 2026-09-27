@@ -992,29 +992,25 @@ def test_contention_queue_config_logs_invalid_values(caplog):
 
 
 def test_cheap_config_declares_queue_policy():
-    """config-cheap.yaml declares queue policy + tuned caps (F2 AC1, caps
-    tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN)."""
-    import yaml
-    from proxy.mode import proxy_dir
+    """The merged cheap profile declares queue policy + tuned caps (F2 AC1,
+    caps tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN)."""
+    from tests.config_test_utils import get_merged_config
 
-    with open(proxy_dir() / "config-cheap.yaml") as fh:
-        server = yaml.safe_load(fh)["server"]
+    server = get_merged_config("cheap")["server"]
     assert server["contention_queue_policy"] == "queue"
     assert server["contention_queue_max_wait_seconds"] == 120
     assert server["contention_queue_max_depth"] == 8
 
 
 def test_fast_config_declares_small_queue_policy():
-    """config-fast.yaml declares a small queue (depth 3, wait 45s) — LP-0MTQYIK4Z008XF2V.
+    """The merged fast profile declares a small queue (depth 3, wait 45s) — LP-0MTQYIK4Z008XF2V.
 
     Fast mode uses a smaller queue than cheap (depth 3 vs 8, wait 45s vs 120s)
     so burst traffic spills to remotes sooner during peak hours.
     """
-    import yaml
-    from proxy.mode import proxy_dir
+    from tests.config_test_utils import get_merged_config
 
-    with open(proxy_dir() / "config-fast.yaml") as fh:
-        server = yaml.safe_load(fh)["server"]
+    server = get_merged_config("fast")["server"]
     assert server["contention_queue_policy"] == "queue"
     assert server["contention_queue_max_wait_seconds"] == 45
     assert server["contention_queue_max_depth"] == 3
@@ -1022,13 +1018,10 @@ def test_fast_config_declares_small_queue_policy():
 
 def test_fast_queue_caps_strictly_less_than_cheap():
     """Fast mode queue caps are strictly less than cheap (LP-0MTQYIK4Z008XF2V AC1)."""
-    import yaml
-    from proxy.mode import proxy_dir
+    from tests.config_test_utils import get_merged_config
 
-    with open(proxy_dir() / "config-cheap.yaml") as fh:
-        cheap = yaml.safe_load(fh)["server"]
-    with open(proxy_dir() / "config-fast.yaml") as fh:
-        fast = yaml.safe_load(fh)["server"]
+    cheap = get_merged_config("cheap")["server"]
+    fast = get_merged_config("fast")["server"]
 
     assert fast["contention_queue_max_depth"] < cheap["contention_queue_max_depth"], (
         f"fast depth {fast['contention_queue_max_depth']} must be < cheap depth "

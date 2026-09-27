@@ -535,3 +535,48 @@ class TestLoadMergedHelper:
 
         with pytest.raises(FileNotFoundError):
             load_merged(tmp_path / "missing-base.yaml", tmp_path / "missing-overlay.yaml")
+
+
+# ---------------------------------------------------------------------------
+# F5: shared test helper for the merged config surface
+# ---------------------------------------------------------------------------
+
+
+class TestConfigTestUtilsHelper:
+    """``proxy/tests/config_test_utils`` provides the merged runtime surface.
+
+    Tests must assert against this helper rather than parsing the raw mode
+    overlays, so a value deduplicated into the base can never silently drop
+    out of a profile assertion.
+    """
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_get_merged_config_matches_golden(self, mode):
+        from tests.config_test_utils import get_merged_config
+
+        assert get_merged_config(mode) == _fixture(f"merged_config_{mode}.json")
+
+    def test_load_profile_returns_raw_base(self):
+        from tests.config_test_utils import load_profile
+
+        assert load_profile("config.yaml") == _base_config()
+
+    @pytest.mark.parametrize(
+        "mode,name",
+        [("fast", "config-fast.yaml"), ("cheap", "config-cheap.yaml")],
+    )
+    def test_load_profile_returns_merged_mode(self, mode, name):
+        from tests.config_test_utils import get_merged_config, load_profile
+
+        assert load_profile(name) == get_merged_config(mode)
+
+    def test_overlay_specific_values_are_explicit(self):
+        """Genuinely overlay-specific facts are still asserted exactly."""
+        from tests.config_test_utils import get_merged_config
+
+        assert get_merged_config("cheap")["server"]["session_slot_pool_size"] == 3
+        assert get_merged_config("cheap")["server"][
+            "local_large_context_cold_cache_threshold"
+        ] == 42000
+        assert get_merged_config("fast")["server"]["session_slot_pool_size"] == 1
+        assert get_merged_config("fast")["server"]["contention_queue_max_depth"] == 3
