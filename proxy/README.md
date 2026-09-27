@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Per-Mode Slot Counts**: Each operating-mode profile (`config.yaml` / `config-fast.yaml` / `config-cheap.yaml`) defines its own local llama-server slot count via `session_slot_pool_size` — one definition per mode, no time-based slot schedule. See [Slot configuration](#slot-configuration) below.
+- **Base + overlay config model**: `config.yaml` is the authoritative base; `config-fast.yaml` / `config-cheap.yaml` are overlays deep-merged on top of it by `load_config()`. The resolved profile defines its local llama-server slot count via `session_slot_pool_size` (fast inherits 1 from the base, cheap overrides 3) — no time-based slot schedule. See [Config model: base + mode overlays](#config-model-base--mode-overlays) and [Slot configuration](#slot-configuration) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -914,18 +914,44 @@ localhost (127.0.0.1).
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and requests can
-  fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
-  1-slot pool).
+  fall back to cloud tiers (`proxy/config-fast.yaml`, a 1-slot pool inherited
+  from the base).
 - **cheap** — 3-slot local pool with the same models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (`proxy/config-cheap.yaml`,
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
-  local slot pool (2 vs 3).
+  local slot pool (1 vs 3).
+
+#### Config model: base + mode overlays
+
+`proxy/config.yaml` is the **authoritative base** config. The mode profiles
+`proxy/config-fast.yaml` and `proxy/config-cheap.yaml` are **overlays**: a
+`load_config()` call with no explicit path deep-merges the mode overlay on top
+of the base. Merge semantics are a recursive dict merge — scalars, lists and
+`null` in the overlay replace the base value wholesale (lists are never merged
+element-wise).
+
+Each overlay therefore declares only the values that genuinely differ from the
+base, and deleting an overlay makes `mode_config_file()` fall back to
+`config.yaml`:
+
+- `config-fast.yaml` keeps the `models` provider lists whose `available_times`
+  differ from the base plus 5 `server` overrides — 18 raw server-level
+  differences from base (5 overridden/added + 13 inherited).
+- `config-cheap.yaml` keeps 8 `server` overrides and inherits `models`
+  entirely (its models are identical to the base) — the same 13 base keys
+  were previously omitted.
+
+Because `config.yaml` is authoritative, every base-only key (for example
+`startup_ramp`, `sibling_fallback_*`, `summarizer_*` and the `upstream_*`
+timeouts) is now inherited by fast and cheap mode instead of silently falling
+back to code defaults. This is the intended effect of making the base
+config authoritative.
 
 The active mode is persisted in `proxy/.mode` (gitignored runtime state);
 when absent the mode defaults to **fast** (current behavior). The mode
-survives restarts: `scripts/start-proxy.sh` reads the persisted mode at
-startup, selects the matching config profile, and exports
+survives restarts: `proxy/scripts/start-proxy.sh` reads the persisted mode at
+startup, selects the matching config overlay, and exports
 `LLAMA_PROXY_CONFIG` so the server and API-key resolution use the same
 profile.
 
@@ -1076,7 +1102,7 @@ before now, wrapping circularly" rule.
 
 | Variable | Description |
 |----------|-------------|
-| `LLAMA_PROXY_CONFIG` | Path to config file. When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml` (default fallback: `./config.yaml`) |
+| `LLAMA_PROXY_CONFIG` | Path to a config file. When set, the file is treated as an overlay and deep-merged onto the authoritative base `proxy/config.yaml`; if it points at `config.yaml` itself the file is loaded once (no second load). When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml`, which is merged onto `config.yaml` (default fallback: `./config.yaml`) |
 | `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
 | `LLAMA_START_SCRIPT` | Override the start script path |
 | `OPENAI_API_KEY` | API key for OpenAI |
@@ -1090,13 +1116,14 @@ before now, wrapping circularly" rule.
 ### Slot configuration
 
 Each operating-mode profile defines its local llama-server slot count
-**once** via `session_slot_pool_size` (the pool size / `--parallel N`):
+**once** via `session_slot_pool_size` (the pool size / `--parallel N`), as
+resolved after the base + overlay merge:
 
-| Profile | Slots |
-|---------|-------|
-| `config.yaml` (default/fallback) | 1 |
-| `config-fast.yaml` | 1 |
-| `config-cheap.yaml` | 3 |
+| Profile | Slots | Notes |
+|---------|-------|-------|
+| `config.yaml` (default/fallback) | 1 | authoritative base |
+| `config-fast.yaml` | 1 | inherits the base value |
+| `config-cheap.yaml` | 3 | overlay override |
 
 There is **no time-based slot schedule** (the previous `slot_schedule`
 mechanism was removed, LP-0MTZRM5HV0007S0V): the slot count changes only
@@ -1310,11 +1337,11 @@ proxy CPU spent on log I/O (LP-0MS9GAN2P002NR4M).
 Enable verbose chunk logging for debugging stream issues with any of:
 
 ```bash
-# start-proxy.sh flag (recommended)
-./scripts/start-proxy.sh --verbose
+# start-proxy.sh flag (recommended; run from the repository root)
+proxy/scripts/start-proxy.sh --verbose
 
 # Environment variable (works with any launcher, including direct uvicorn)
-LLAMA_PROXY_VERBOSE=1 ./scripts/start-proxy.sh
+LLAMA_PROXY_VERBOSE=1 proxy/scripts/start-proxy.sh
 
 # Config key in config.yaml
 #   logging:
@@ -1940,11 +1967,12 @@ local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 
 local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
 ```
 
-The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`,
-the default `config.yaml`, and `config-cheap.yaml` all use `38000` (cheap is
-symmetric with fast after the initial 60000 raise breached the cheap queue
-guardrails and was reverted — LP-0MSRM54YO007YG0K AC7 — then re-raised to
-38000, LP-0MSY0V4ZO002ANPL).
+The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK) and follows the
+base + overlay model: the base `config.yaml` (and therefore the fast overlay,
+which does not override it) uses `38000`; `config-cheap.yaml` overrides it to
+`42000` (LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00, after the initial 60000
+raise breached the cheap queue guardrails and was reverted —
+LP-0MSRM54YO007YG0K AC7).
 Each value stays below its mode's effective warm clamp (fast resolves to
 `min(100000, 262144//1 − 4096 = 258048) = 100000`; cheap resolves to
 `min(100000, 262144//3 − 4096 = 83285) = 83285`) so the (cold, warm] band never

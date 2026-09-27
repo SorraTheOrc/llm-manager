@@ -238,8 +238,11 @@ falls back to `remote_with_guidance` instead of blocking dispatch.
   Qwen3}` keep the previous behaviour. When `models.compact` is present,
   `server.summarizer_model` is ignored for compaction (the compact model owns
   its own provider config).
-- The chain is declared identically in `config.yaml`, `config-fast.yaml` and
-  `config-cheap.yaml` (the active mode config is what the proxy loads).
+- The chain is declared in the authoritative base `config.yaml` and inherited
+  by the mode overlays: `config-fast.yaml` retains the compact provider list
+  because its `available_times` differ, while `config-cheap.yaml` inherits the
+  base list unchanged. The active mode config is the base merged with its
+  overlay (`load_config()`), not a standalone file.
 ### 7.3 Compaction metadata response headers — Pi client bridge (LP-0MTYGZ1DI0004QP8)
 
 Server-side compaction rewrites the dispatch base to
