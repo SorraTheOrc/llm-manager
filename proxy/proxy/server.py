@@ -1293,6 +1293,16 @@ async def tail_logs(
 ):
     return await _ui_tail_logs(request, lines, source, slot, session)
 
+@app.get("/logs/tail/slot")
+async def tail_slot_logs(
+    request: Request,
+    lines: int = 100,
+    slot: int = 0,
+    session: str | None = None,
+):
+    return await _ui_tail_slot_logs(request, lines, slot, session)
+
+
 @app.get("/logs")
 async def view_logs(request: Request):
     return await _ui_view_logs(request)
@@ -1582,6 +1592,9 @@ from .ui import (  # noqa: E402
 )
 from .ui import (  # noqa: E402
     tail_logs as _ui_tail_logs,
+)
+from .ui import (  # noqa: E402
+    tail_slot_logs as _ui_tail_slot_logs,
 )
 from .ui import (  # noqa: E402
     view_logs as _ui_view_logs,

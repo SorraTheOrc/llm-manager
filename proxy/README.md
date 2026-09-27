@@ -2399,6 +2399,17 @@ Streaming reuses the existing `/logs/tail` SSE fan-out: the optional `slot` and
 (`/logs/tail?source=llama&slot=2&session=<uuid>`), and the unfiltered
 `source=proxy|llama` behaviour is unchanged when those params are omitted.
 
+The Slots tab uses **one** SSE connection per slot —
+`/logs/tail/slot?slot=<n>&session=<uuid>` — which carries both the slot's
+`proxy.log` and `llama-server.log` lines, each message tagged with `source`.
+Two connections per slot (plus the two raw All Logs panes and the `/events`
+status stream) exhausted the browser's ~6-connections-per-origin budget, so
+most slot panes never received any log output (LP-0MUJZHTCN006IZRW). The raw
+All Logs panes now connect only while that tab is active, and the follow loop
+streams appended lines even while counts/tokens updates are delivered
+continuously (the previous fast path starved the file check during active
+generation).
+
 ## TTS (Text-to-Speech) /v1/audio/speech
 
 The proxy supports text-to-speech synthesis via the OpenAI-compatible
