@@ -503,3 +503,35 @@ class TestDeduplicatedModeFiles:
 
         overlay = _read_yaml(proxy_dir() / "config-cheap.yaml")
         assert "models" not in overlay
+
+
+class TestLoadMergedHelper:
+    """``config_merge.load_merged`` is the dependency-light shell entry point."""
+
+    def test_load_merged_merges_overlay_onto_base(self, tmp_path):
+        from proxy.config_merge import load_merged
+
+        base = tmp_path / "base.yaml"
+        base.write_text("server:\n  a: 1\n  nested:\n    x: 1\n")
+        overlay = tmp_path / "overlay.yaml"
+        overlay.write_text("server:\n  b: 2\n  nested:\n    y: 2\n")
+
+        assert load_merged(base, overlay) == {
+            "server": {"a": 1, "b": 2, "nested": {"x": 1, "y": 2}}
+        }
+
+    def test_load_merged_empty_documents_are_dicts(self, tmp_path):
+        from proxy.config_merge import load_merged
+
+        base = tmp_path / "base.yaml"
+        base.write_text("")
+        overlay = tmp_path / "overlay.yaml"
+        overlay.write_text("server:\n  a: 1\n")
+
+        assert load_merged(base, overlay) == {"server": {"a": 1}}
+
+    def test_load_merged_missing_file_raises(self, tmp_path):
+        from proxy.config_merge import load_merged
+
+        with pytest.raises(FileNotFoundError):
+            load_merged(tmp_path / "missing-base.yaml", tmp_path / "missing-overlay.yaml")

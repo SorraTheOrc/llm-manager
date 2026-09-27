@@ -256,8 +256,11 @@ fi
 # the config profile: fast -> config-fast.yaml, cheap -> config-cheap.yaml.
 # Absent/invalid state defaults to fast (current behavior). LLAMA_PROXY_CONFIG
 # is exported so the server's load_config() uses the same profile, and API
-# keys are resolved from the SELECTED config (cheap mode has no remote
-# providers, so missing cloud keys must not fail startup).
+# keys are resolved from the MERGED config (base config.yaml + the selected
+# mode overlay), so keys declared only in the base are still resolved; a key
+# that is genuinely absent everywhere still fails startup loudly. The mode
+# overlays no longer repeat inherited values, so reading the raw mode file
+# alone would miss every base-declared api_key_env.
 
 MODE_FILE="$REPO_ROOT/.mode"
 MODE="fast"
@@ -282,7 +285,8 @@ AUTH_FILE="$HOME/.pi/agent/auth.json"
 resolve_api_keys() {
   local missing=()
 
-  # Extract all unique api_key_env values from config.yaml
+  # Extract all unique api_key_env values from the MERGED config
+  # (base config.yaml + the selected mode overlay).
   while IFS='' read -r env_var; do
     [[ -z "$env_var" ]] && continue
 
@@ -292,22 +296,25 @@ resolve_api_keys() {
       continue
     fi
 
-    # Try to resolve from pi's auth.json
-    if [[ -f "$AUTH_FILE" ]]; then
-      resolved="$(resolve_from_auth_json "$env_var")"
-      if [[ -n "$resolved" ]]; then
-        export "$env_var=$resolved"
-        echo "[env] $env_var resolved from ~/.pi/agent/auth.json"
-        continue
-      fi
+    # Try to resolve from pi's auth.json. Keep the call inside the `if`
+    # condition: `resolve_from_auth_json` exits non-zero when the key is
+    # absent, and a bare `resolved="$(...)"` assignment would trip `set -e`
+    # and abort before the missing-key report below is printed.
+    if [[ -f "$AUTH_FILE" ]] \
+      && resolved="$(resolve_from_auth_json "$env_var")" \
+      && [[ -n "$resolved" ]]; then
+      export "$env_var=$resolved"
+      echo "[env] $env_var resolved from ~/.pi/agent/auth.json"
+      continue
     fi
 
     # Not found anywhere — annotate with which model(s) need it
     local models_using
     models_using="$($PY_BIN -c "
-import yaml
-with open('$CONFIG_FILE') as f:
-    cfg = yaml.safe_load(f)
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from config_merge import load_merged
+cfg = load_merged('$REPO_ROOT/config.yaml', '$CONFIG_FILE')
 models = []
 for name, model in cfg.get('models', {}).items():
     for p in model.get('providers', []):
@@ -317,9 +324,10 @@ print(', '.join(models))
 " 2>/dev/null || echo 'unknown')"
     missing+=("$env_var  (required by: $models_using)")
   done < <($PY_BIN -c "
-import yaml
-with open('$CONFIG_FILE') as f:
-    cfg = yaml.safe_load(f)
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from config_merge import load_merged
+cfg = load_merged('$REPO_ROOT/config.yaml', '$CONFIG_FILE')
 keys = set()
 for name, model in cfg.get('models', {}).items():
     for p in model.get('providers', []):

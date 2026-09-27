@@ -4,7 +4,7 @@
 (``config-fast.yaml`` / ``config-cheap.yaml``) are overlays that override only
 the values that genuinely differ; :func:`deep_merge` composes the two.
 
-This module is intentionally dependency-light — stdlib plus nothing else — so
+This module is intentionally dependency-light — stdlib plus ``yaml`` only — so
 the shell entry point ``proxy/scripts/start-proxy.sh`` can reuse the merge
 semantics from a tiny inline Python snippet without importing the full
 ``proxy`` package (which pulls in FastAPI, httpx, tiktoken, …).
@@ -30,7 +30,10 @@ Typical use::
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 def deep_merge(base: dict, overlay: dict) -> dict:
@@ -69,3 +72,25 @@ def deep_merge(base: dict, overlay: dict) -> dict:
         else:
             result[key] = deepcopy(value)
     return result
+
+
+def load_yaml_config(path) -> dict:
+    """Load a YAML config file as a ``dict`` (empty document -> ``{}``)."""
+    with open(path) as fh:
+        data = yaml.safe_load(fh) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_merged(base_path, overlay_path) -> dict:
+    """Load *base_path* and deep-merge *overlay_path* on top of it.
+
+    A dependency-light convenience for shell consumers (``start-proxy.sh``
+    and its test) that must resolve the effective config without importing
+    the full ``proxy`` package. Mirrors ``proxy.utils._load_merged_config``
+    for the common case where the overlay exists; callers that need the
+    missing-overlay fallback and warning should use that loader instead.
+    """
+    return deep_merge(
+        load_yaml_config(Path(base_path)),
+        load_yaml_config(Path(overlay_path)),
+    )
