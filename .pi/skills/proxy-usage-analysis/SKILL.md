@@ -161,7 +161,12 @@ Outputs written to:
   `hourly_session_classification`, all keyed by absolute hour, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split — when the window has local traffic), **Decode speed** and
+  fast/cheap split — when the window has local traffic), **Time to first
+  token** (p10 / median / p90 of dispatch → first-token latency, split into
+  **Total / Fast / Cheap** rows using the same mode-aware session bucketing as
+  the other breakdowns, from local `dispatch_first_byte_ms=` and remote
+  `ttft_seconds=` log lines; the `--json` summary exposes the same split under
+  `ttft` with `total` / `fast` / `cheap` sub-objects), **Decode speed** and
   **Prompt eval speed** sections (median / p90 / p10 tok/s from llama-server
   eval-timing lines, split Total / Fast / Cheap), and highlighted
   recommendations. Percentages in the Total/Fast/Cheap columns are

@@ -413,11 +413,9 @@ def build_report(
         ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, total_fast_sessions):.1f}%) | "
            f"{cheap} ({_pct(cheap, total_cheap_sessions):.1f}%) | {reqs} | {fb} |")
 
-    # TTFT section: collect all parsed TTFT values (LP-0MTSSM5SO003PKU0)
-    ttft_values: list[float] = [
-        e.ttft_ms for e in summary.ttft_events if e.ttft_ms is not None
-    ]
-    _append_ttft_section(ap, ttft_values)
+    # TTFT section: Total / Fast / Cheap split by session bucket
+    # (LP-0MTSSM5SO003PKU0, LP-0MUI56OCI008EGML).
+    _append_ttft_section(ap, summary.ttft_events, summary.sessions)
     _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
@@ -1173,20 +1171,49 @@ def _ttft_cell(value: float | None) -> str:
     return f"{value:.0f}ms"
 
 
+def _ttft_buckets(
+    ttft_events: list[log_parser.LogEvent],
+    sessions: dict[str, SessionStats],
+) -> dict[str, list[float]]:
+    """Partition TTFT samples (ms) into ``total`` / ``fast`` / ``cheap`` lists.
+
+    Uses the same mode-aware session bucketing as the rest of the report:
+    ``_bucket_key(session.bucket)``, where any non-``cheap`` bucket counts as
+    fast. Every sample lands in ``total``; ``fast`` and ``cheap`` partition the
+    samples whose session resolves against *sessions*. A sample whose session is
+    absent (e.g. a TTFT line whose stream started outside the window) is counted
+    in ``total`` only, so ``fast + cheap`` may be less than ``total`` in that
+    rare case.
+    """
+    buckets: dict[str, list[float]] = {"total": [], "fast": [], "cheap": []}
+    for event in ttft_events:
+        value = event.ttft_ms
+        if value is None:
+            continue
+        buckets["total"].append(value)
+        session = sessions.get(event.session) if event.session else None
+        if session is not None:
+            buckets[_bucket_key(session.bucket)].append(value)
+    return buckets
+
+
 def _append_ttft_section(
     ap,
-    ttft_values: list[float],
+    ttft_events: list[log_parser.LogEvent],
+    sessions: dict[str, SessionStats],
 ) -> None:
     """Append the ``## Time to first token`` section to the report.
 
-    Shows p10 / median / p90 of TTFT (dispatch → first token),
-    parsed from both local ``dispatch_first_byte_ms=`` and remote
-    ``ttft_seconds=`` log lines.
+    Shows p10 / median / p90 of TTFT (dispatch → first token), parsed from both
+    local ``dispatch_first_byte_ms=`` and remote ``ttft_seconds=`` log lines,
+    split into Total / Fast / Cheap rows using the mode-aware session bucketing
+    (``_bucket_key``, LP-0MUI56OCI008EGML).
     """
     ap("")
     ap("## Time to first token")
     ap("")
-    if not ttft_values:
+    buckets = _ttft_buckets(ttft_events, sessions)
+    if not buckets["total"]:
         ap("_No TTFT data in window._")
         return
     ap("Percentiles of time from dispatch to first token (ms), from local")
@@ -1194,11 +1221,12 @@ def _append_ttft_section(
     ap("")
     ap("| Bucket | Samples | p10 | Median | p90 |")
     ap("|---|---|---|---|---|")
-    p10 = _percentile(ttft_values, 10)
-    med = _percentile(ttft_values, 50)
-    p90 = _percentile(ttft_values, 90)
-    ap(f"| Total | {len(ttft_values)} | "
-       f"{_ttft_cell(p10)} | {_ttft_cell(med)} | {_ttft_cell(p90)} |")
+    for label, bucket_key in (("Total", "total"), ("Fast", "fast"), ("Cheap", "cheap")):
+        values = buckets[bucket_key]
+        ap(f"| {label} | {len(values)} | "
+           f"{_ttft_cell(_percentile(values, 10))} | "
+           f"{_ttft_cell(_percentile(values, 50))} | "
+           f"{_ttft_cell(_percentile(values, 90))} |")
     ap("")
 
 
@@ -1469,7 +1497,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
-        "ttft": _ttft_json(summary.ttft_events),
+        "ttft": _ttft_json(summary.ttft_events, summary.sessions),
     }
 
 
@@ -1510,34 +1538,35 @@ def _hourly_activity_json(summary: AnalysisResult) -> list[dict]:
     ]
 
 
-def _ttft_json(ttft_events: list[object]) -> dict | None:
+def _ttft_json(
+    ttft_events: list[log_parser.LogEvent],
+    sessions: dict[str, SessionStats],
+) -> dict | None:
     """Machine-readable TTFT summary for ``summary_to_json``.
 
-    Returns p10 / median / p90 in milliseconds for Total/Fast/Cheak buckets,
-    or ``None`` when no TTFT data is available.
+    Returns p10 / median / p90 in milliseconds for Total/Fast/Cheap buckets
+    (Fast/Cheap via mode-aware session bucketing, LP-0MUI56OCI008EGML), with
+    ``null`` percentiles for a bucket that has no samples; returns ``None`` when
+    no TTFT data is available.
     """
-    values = [e.ttft_ms for e in ttft_events if e.ttft_ms is not None]
-    if not values:
+    buckets = _ttft_buckets(ttft_events, sessions)
+    if not buckets["total"]:
         return None
-    return {
-        "total": {
+
+    def _stats(values: list[float]) -> dict:
+        if not values:
+            return {"samples": 0, "p10": None, "median": None, "p90": None}
+        return {
             "samples": len(values),
             "p10": round(_percentile(values, 10), 1),
             "median": round(_percentile(values, 50), 1),
             "p90": round(_percentile(values, 90), 1),
-        },
-        "fast": {
-            "samples": 0,
-            "p10": None,
-            "median": None,
-            "p90": None,
-        },
-        "cheap": {
-            "samples": 0,
-            "p10": None,
-            "median": None,
-            "p90": None,
-        },
+        }
+
+    return {
+        "total": _stats(buckets["total"]),
+        "fast": _stats(buckets["fast"]),
+        "cheap": _stats(buckets["cheap"]),
     }
 
 

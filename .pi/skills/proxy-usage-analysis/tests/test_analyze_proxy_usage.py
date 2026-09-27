@@ -3939,24 +3939,70 @@ class TestTotalTokens:
         assert model_total_share == pytest.approx(100.0, abs=0.1)
 
 
-class TestTtftReportSection:
-    """TTFT report section rendering tests (LP-0MTSSM5SO003PKU0)."""
+def _ttft_events(*spec: tuple[str, float]) -> list:
+    """Build TTFT ``LogEvent``s from ``(session_id, ttft_ms)`` pairs."""
+    return [
+        log_parser.LogEvent("stream_started", WINDOW_START, session=sid, ttft_ms=ms)
+        for sid, ms in spec
+    ]
 
-    def test_ttft_section_with_data(self):
-        """TTFT section renders a table with p10/median/p90 when data is present."""
+
+def _ttft_sessions(*spec: tuple[str, str]) -> dict:
+    """Build the analysis-session mapping from ``(session_id, bucket)`` pairs."""
+    return {
+        sid: aggregation.SessionStats(**_session(sid, bucket=bucket))
+        for sid, bucket in spec
+    }
+
+
+class TestTtftReportSection:
+    """TTFT report section rendering tests (LP-0MTSSM5SO003PKU0, LP-0MUI56OCI008EGML)."""
+
+    # Mixed fast/cheap sample set shared by the rendering and JSON tests.
+    EVENTS = _ttft_events(
+        ("fast-1", 45.0),
+        ("fast-2", 120.0),
+        ("cheap-1", 80.0),
+        ("cheap-2", 450.0),
+        ("cheap-3", 60.0),
+    )
+    SESSIONS = _ttft_sessions(
+        ("fast-1", "fast"),
+        ("fast-2", "fast"),
+        ("cheap-1", "cheap"),
+        ("cheap-2", "cheap"),
+        ("cheap-3", "cheap"),
+    )
+
+    def test_ttft_section_renders_total_fast_cheap_rows(self):
+        """TTFT section renders Total/Fast/Cheap rows with per-bucket counts."""
         from io import StringIO
 
         output = StringIO()
         ap = output.write
-        # Mix of local (ms) and remote (converted to ms) TTFT values
-        values = [45.0, 120.0, 80.0, 450.0, 60.0]
-        reporting._append_ttft_section(ap, values)
+        reporting._append_ttft_section(ap, self.EVENTS, self.SESSIONS)
         report = output.getvalue()
         assert "## Time to first token" in report
         assert "No TTFT data" not in report
+        # Total counts every sample; Fast/Cheap partition them.
         assert "| Total | 5 |" in report
-        # Should contain percentiles in ms format
+        assert "| Fast | 2 |" in report
+        assert "| Cheap | 3 |" in report
+        # Percentiles render in the existing ms/seconds format.
         assert "ms" in report
+
+    def test_ttft_section_unattributed_session_counted_in_total_only(self):
+        """A TTFT event with an unknown session counts in Total but not Fast/Cheap."""
+        from io import StringIO
+
+        events = self.EVENTS + _ttft_events(("ghost", 999.0))
+        output = StringIO()
+        ap = output.write
+        reporting._append_ttft_section(ap, events, self.SESSIONS)
+        report = output.getvalue()
+        assert "| Total | 6 |" in report
+        assert "| Fast | 2 |" in report
+        assert "| Cheap | 3 |" in report
 
     def test_ttft_section_empty(self):
         """TTFT section shows 'No TTFT data in window' when no data."""
@@ -3964,32 +4010,54 @@ class TestTtftReportSection:
 
         output = StringIO()
         ap = output.write
-        reporting._append_ttft_section(ap, [])
+        reporting._append_ttft_section(ap, [], {})
         report = output.getvalue()
         assert "## Time to first token" in report
         assert "_No TTFT data in window._" in report
 
-    def test_ttft_json_with_data(self):
-        """TTFT JSON includes total percentiles when data exists."""
-        from unittest.mock import MagicMock
-
-        # Create mock TTFT events
-        mock_events = []
-        for ms in [45.0, 120.0, 80.0]:
-            ev = MagicMock()
-            ev.ttft_ms = ms
-            mock_events.append(ev)
-
-        result = reporting._ttft_json(mock_events)
+    def test_ttft_json_populates_fast_and_cheap(self):
+        """TTFT JSON carries per-bucket samples/percentiles, not zero/null stubs."""
+        result = reporting._ttft_json(self.EVENTS, self.SESSIONS)
         assert result is not None
-        assert "total" in result
-        assert result["total"]["samples"] == 3
-        assert result["total"]["median"] is not None
+        assert result["total"] == {
+            "samples": 5, "p10": 51.0, "median": 80.0, "p90": 318.0,
+        }
+        assert result["fast"] == {
+            "samples": 2, "p10": 52.5, "median": 82.5, "p90": 112.5,
+        }
+        assert result["cheap"] == {
+            "samples": 3, "p10": 64.0, "median": 80.0, "p90": 376.0,
+        }
+
+    def test_ttft_json_single_bucket_leaves_other_empty(self):
+        """A window with only fast samples leaves the cheap bucket empty."""
+        events = self.EVENTS[:2]
+        result = reporting._ttft_json(events, self.SESSIONS)
+        assert result["fast"]["samples"] == 2
+        assert result["cheap"] == {
+            "samples": 0, "p10": None, "median": None, "p90": None,
+        }
 
     def test_ttft_json_empty(self):
         """TTFT JSON returns None when no data."""
-        result = reporting._ttft_json([])
+        result = reporting._ttft_json([], {})
         assert result is None
+
+    def test_summary_to_json_exposes_ttft_fast_cheap_split(self):
+        """The JSON summary's ``ttft`` object carries the fast/cheap split (AC3)."""
+        res = _result_with_sessions([
+            _session("fast-1", bucket="fast"),
+            _session("cheap-1", bucket="cheap"),
+        ])
+        res.ttft_events = _ttft_events(("fast-1", 45.0), ("cheap-1", 80.0))
+        data = reporting.summary_to_json(res)
+        assert data["ttft"]["total"]["samples"] == 2
+        assert data["ttft"]["fast"] == {
+            "samples": 1, "p10": 45.0, "median": 45.0, "p90": 45.0,
+        }
+        assert data["ttft"]["cheap"] == {
+            "samples": 1, "p10": 80.0, "median": 80.0, "p90": 80.0,
+        }
 
     def test_ttft_section_placement_before_ttc(self):
         """TTFT section appears before Time to completion in the report."""
@@ -3997,7 +4065,7 @@ class TestTtftReportSection:
 
         output = StringIO()
         ap = output.write
-        reporting._append_ttft_section(ap, [50.0, 100.0])
+        reporting._append_ttft_section(ap, self.EVENTS, self.SESSIONS)
         reporting._append_ttc_section(ap, [])
         report = output.getvalue()
         ttft_pos = report.index("## Time to first token")
