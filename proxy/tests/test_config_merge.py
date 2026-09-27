@@ -13,8 +13,10 @@ it. These tests pin the helper's semantics *before* the loader is wired to it
 """
 
 import copy
+import logging
 
 import pytest
+import yaml
 from proxy.config_merge import deep_merge
 
 
@@ -141,3 +143,155 @@ class TestInputValidation:
     def test_non_dict_overlay_raises_type_error(self, overlay):
         with pytest.raises(TypeError):
             deep_merge({"a": 1}, overlay)
+
+
+# ---------------------------------------------------------------------------
+# F2: load_config() merges the base config with the mode overlay
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mode_file(tmp_path):
+    """Temp path used as the persisted mode state file."""
+    return tmp_path / ".mode"
+
+
+def _read_yaml(path):
+    with open(path) as fh:
+        return yaml.safe_load(fh)
+
+
+def _base_config():
+    from proxy.mode import proxy_dir
+
+    return _read_yaml(proxy_dir() / "config.yaml")
+
+
+def _select_mode(monkeypatch, mode_file, mode):
+    """Persist *mode* and clear the env override for the no-path case."""
+    from proxy import mode as mode_module
+
+    monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+    monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
+    mode_file.write_text(mode + "\n")
+
+
+class TestLoadConfigMerge:
+    """``load_config()`` with no path merges ``config.yaml`` with the
+    mode overlay; an explicit path keeps today's raw single-file load."""
+
+    def test_no_path_merges_overlay_onto_base(self, mode_file, monkeypatch):
+        from proxy.mode import proxy_dir
+        from proxy.utils import load_config
+
+        _select_mode(monkeypatch, mode_file, "fast")
+        cfg = load_config()
+
+        overlay = _read_yaml(proxy_dir() / "config-fast.yaml")
+        base = _base_config()
+
+        # Overlay value wins (fast raises the idle timeout 30 -> 240).
+        assert overlay["server"]["upstream_idle_timeout_seconds"] == 240
+        assert cfg["server"]["upstream_idle_timeout_seconds"] == 240
+        # Base-only keys survive because ``server`` is merged recursively,
+        # not replaced wholesale.
+        assert "startup_ramp" not in overlay["server"]
+        assert cfg["server"]["startup_ramp"] == base["server"]["startup_ramp"]
+        assert cfg["server"]["timeout_keep_alive"] == base["server"]["timeout_keep_alive"]
+
+    def test_no_path_merge_inherits_base_only_keys_in_cheap_mode(
+        self, mode_file, monkeypatch
+    ):
+        from proxy.utils import load_config
+
+        _select_mode(monkeypatch, mode_file, "cheap")
+        cfg = load_config()
+
+        base = _base_config()
+        assert cfg["server"]["session_slot_pool_size"] == 3  # overlay wins
+        assert cfg["server"]["summarizer_disable_thinking"] == base["server"]["summarizer_disable_thinking"]
+        assert cfg["server"]["upstream_activity_timeout_seconds"] == base["server"]["upstream_activity_timeout_seconds"]
+
+    def test_explicit_path_does_not_merge(self, monkeypatch):
+        from proxy.mode import proxy_dir
+        from proxy.utils import load_config
+
+        monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
+        raw = _read_yaml(proxy_dir() / "config-fast.yaml")
+        cfg = load_config(config_path=str(proxy_dir() / "config-fast.yaml"))
+
+        assert cfg == raw
+        assert "startup_ramp" not in cfg["server"]
+
+    def test_missing_overlay_falls_back_to_base_with_warning(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        from proxy.utils import load_config
+
+        missing = tmp_path / "does-not-exist.yaml"
+        monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(missing))
+
+        with caplog.at_level(logging.WARNING, logger="llama-proxy"):
+            cfg = load_config()
+
+        assert cfg == _base_config()
+        assert any("does-not-exist.yaml" in r.getMessage() for r in caplog.records)
+
+    def test_env_overlay_merges_onto_base(self, monkeypatch, tmp_path):
+        from proxy.utils import load_config
+
+        overlay_path = tmp_path / "custom-overlay.yaml"
+        overlay_path.write_text(
+            "server:\n  timeout_keep_alive: 7\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(overlay_path))
+
+        cfg = load_config()
+
+        assert cfg["server"]["timeout_keep_alive"] == 7
+        assert cfg["server"]["startup_ramp"] == _base_config()["server"]["startup_ramp"]
+
+    def test_env_pointing_at_base_loads_the_file_once(self, monkeypatch):
+        import proxy.utils as utils
+        from proxy.mode import proxy_dir
+
+        monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(proxy_dir() / "config.yaml"))
+
+        # Read the expected base before patching the loader so the count only
+        # observes load_config()'s own YAML reads.
+        expected = _base_config()
+        calls = {"n": 0}
+        real_safe_load = yaml.safe_load
+
+        def counting_safe_load(stream):
+            calls["n"] += 1
+            return real_safe_load(stream)
+
+        monkeypatch.setattr(utils.yaml, "safe_load", counting_safe_load)
+
+        cfg = utils.load_config()
+
+        assert cfg == expected
+        assert calls["n"] == 1  # base only: no second load of the same file
+
+    def test_validation_runs_once_on_the_merged_config(
+        self, mode_file, monkeypatch
+    ):
+        import proxy.utils as utils
+
+        _select_mode(monkeypatch, mode_file, "fast")
+
+        calls = []
+        monkeypatch.setattr(utils, "_validate_prompt_configs", lambda cfg: calls.append("prompt"))
+        monkeypatch.setattr(utils, "_validate_chain_hold_config", lambda cfg: calls.append("chain"))
+        monkeypatch.setattr(utils, "_validate_compaction_config", lambda cfg: calls.append("compaction"))
+
+        utils.load_config()
+
+        assert calls == ["prompt", "chain", "compaction"]
+
+    def test_returns_a_dict(self, mode_file, monkeypatch):
+        from proxy.utils import load_config
+
+        _select_mode(monkeypatch, mode_file, "cheap")
+        assert isinstance(load_config(), dict)

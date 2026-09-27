@@ -451,6 +451,59 @@ def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dic
 # Config loading
 # ===================================================================
 
+def _config_base_path() -> Path:
+    """Return the authoritative base config path (``proxy/config.yaml``)."""
+    from proxy.mode import proxy_dir
+
+    return proxy_dir() / "config.yaml"
+
+
+def _load_merged_config(overlay_path) -> dict:
+    """Load the base config and deep-merge *overlay_path* on top of it.
+
+    ``proxy/config.yaml`` is authoritative; a mode profile
+    (``config-fast.yaml`` / ``config-cheap.yaml``) is an overlay that
+    overrides only the values that differ. Merge semantics live in
+    :func:`proxy.config_merge.deep_merge` (recursive dict merge; every other
+    value replaces the base value wholesale).
+
+    Special cases:
+
+    * The overlay resolves to the base file itself (e.g.
+      ``LLAMA_PROXY_CONFIG=proxy/config.yaml``) -> the file is loaded once and
+      returned unchanged (no second load, no double validation).
+    * The overlay file does not exist -> the base config alone is returned
+      and a warning is logged.
+    """
+    from proxy.config_merge import deep_merge
+
+    base_path = _config_base_path()
+    with open(base_path) as f:
+        base = yaml.safe_load(f) or {}
+
+    overlay = Path(overlay_path)
+    try:
+        same_file = overlay.resolve() == base_path.resolve()
+    except OSError:
+        same_file = False
+    if same_file:
+        return base
+
+    if not overlay.is_file():
+        logging.getLogger("llama-proxy").warning(
+            "Config overlay %s not found; falling back to base config %s",
+            overlay,
+            base_path,
+        )
+        return base
+
+    with open(overlay) as f:
+        overlay_cfg = yaml.safe_load(f) or {}
+    if not isinstance(overlay_cfg, dict):
+        return base
+    return deep_merge(base, overlay_cfg)
+
+
 def load_config(config_path: str | None = None) -> dict:
     """Load configuration from YAML file.
 
@@ -458,15 +511,22 @@ def load_config(config_path: str | None = None) -> dict:
     ``proxy.mode.resolve_config_path()``: ``LLAMA_PROXY_CONFIG`` env var if
     set (start-proxy.sh exports it from the persisted mode), else the
     mode-selected profile (``config-fast.yaml`` / ``config-cheap.yaml``),
-    else ``proxy/config.yaml`` (default/fallback).
+    else ``proxy/config.yaml`` (default/fallback). The resolved file is then
+    deep-merged **on top of** the authoritative base config
+    (``proxy/config.yaml``), so every base-only key is inherited.
+
+    When *config_path* is given explicitly, only that file is loaded
+    (unchanged backward-compatible behaviour — no merge with the base).
     """
     if config_path is None:
         from proxy.mode import resolve_config_path
 
-        config_path = str(resolve_config_path())
-
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = _load_merged_config(resolve_config_path())
+    else:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        if cfg is None:
+            cfg = {}
 
     # Validate system_prompt configurations
     _validate_prompt_configs(cfg)
