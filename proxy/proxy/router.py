@@ -90,6 +90,7 @@ from proxy.session import (  # noqa: E402
 record_http_error = metrics.record_http_error
 
 from proxy.utils import (  # noqa: E402
+    SSEEventReframer,
     _extract_assistant_content,
     _extract_assistant_content_from_sse,
     _extract_delta_text_from_sse_chunk,
@@ -1496,6 +1497,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # Client disconnect detection (LP-0MQTHP828000JYM6)
                         disconnected = False
                         _disconnect_check_count = 0
+                        # Re-frame upstream bytes to SSE event boundaries
+                        # (LP-0MUOBUPBC002GYTL): only complete events reach the
+                        # client; a trailing partial is dropped before the
+                        # synthesised terminal events.
+                        _reframer = SSEEventReframer()
 
                         # Log stream started with session context (LP-0MR90HJED005WI1Z)
                         try:
@@ -1881,8 +1887,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     except Exception:
                                         pass
 
-                                yield chunk
-                                log_response_chunk(chunk, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+                                # Re-frame the raw backend read to SSE event
+                                # boundaries (LP-0MUOBUPBC002GYTL): complete events
+                                # are flushed immediately; a trailing partial is
+                                # held until complete and dropped on any stop.
+                                for _event in _reframer.feed(chunk):
+                                    yield _event
+                                    log_response_chunk(_event, session_id=session_id, model=model_name, provider="local", body_json=body_json)
 
                                 # Prepare the next anext task
                                 _stream_iter = asyncio.ensure_future(
@@ -1891,6 +1902,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
                             # Synthesize final SSE event if upstream closed without finish marker.
                             if not disconnected and not saw_done and not saw_finish:
+                                # Drop any trailing partial so the synthetic
+                                # terminal events are standalone
+                                # (LP-0MUOBUPBC002GYTL).
+                                _reframer.discard_pending()
                                 finish_reason = (
                                     "stop"
                                     if not guardrail_reason
@@ -1967,6 +1982,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     )
                             except Exception:
                                 pass
+                            # Drop any trailing partial so the synthetic error is
+                            # emitted as its own event (LP-0MUOBUPBC002GYTL).
+                            _reframer.discard_pending()
                             # Synthesize a final SSE event so the client receives a
                             # proper finish_reason marker even on stream error.
                             final_obj = _build_stream_error_event(

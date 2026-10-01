@@ -1206,6 +1206,44 @@ impact (recovery-first avoids the pre-content window; informative-error
 covers 100% of client-visible errors), and the emission-site audit
 (`proxy/docs/sse-error-emission-audit.md`).
 
+##### SSE event re-framing guarantee (LP-0MUOBUPBC002GYTL)
+
+Upstream `aiter_bytes()` reads are arbitrary — a single read can contain a
+complete event **plus the start of the next**, or end mid-event. The proxy
+previously forwarded those raw bytes and then appended synthetic/retry events,
+so a dangling partial could be concatenated with the next `data:` line. The
+client's SSE decoder merged both into one event whose payload was not valid
+JSON, surfacing as:
+
+```
+Error: Unrecognized error: Error reading response: malformed server-sent event JSON.
+```
+
+Every client-facing byte stream (the remote path in `proxy_remote.py` and the
+local path in `router.py`) is now re-framed through the shared
+`SSEEventReframer` helper in `proxy/utils.py`:
+
+- **Only complete events are forwarded.** Bytes are emitted up to a blank-line
+  boundary (`\n\n` or `\r\n\r\n`); a trailing partial event is buffered and
+  released once its boundary arrives. Complete events are still flushed as
+  soon as they are read, so streaming latency is unchanged.
+- **Partials are dropped on every stream transition.** Stall retry,
+  empty-response retry, provider re-route, watchdog/synthetic terminal and
+  error events, and a clean stop after `finish_reason` all call
+  `discard_pending()` before emitting anything new. An abandoned attempt's
+  partial can never be concatenated with the next stream's first event.
+- **Synthetic events are standalone.** Proxy-synthesised terminal/error events
+  are emitted as their own well-formed `data: <json>\n\n` events, never merged
+  with pre-existing bytes.
+- **The held partial is bounded (fail closed).** A single event larger than
+  `SSEEventReframer.DEFAULT_MAX_PENDING_BYTES` (8 MiB) raises
+  `SSEFrameOverflowError`, clearing the buffer so the stream terminates with a
+  synthetic error instead of buffering unbounded or forwarding a truncated
+  tail as if it were a new event.
+
+Well-formed upstreams are unaffected: event content, ordering, and
+`data: [DONE]` semantics are byte-identical to the upstream stream.
+
 ##### `reasoning_content` round-trip repair (LP-0MSGU3JNU0092AFQ)
 
 Remote thinking-mode providers (Console `opencode.ai/zen`, Console Go

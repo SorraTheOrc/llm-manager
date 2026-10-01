@@ -336,6 +336,111 @@ def _extract_delta_text_from_sse_chunk(chunk_text: str) -> str:
 
 
 # ===================================================================
+# SSE event re-framing
+# ===================================================================
+
+# An SSE event is terminated by a blank line: either LF LF or CR LF CR LF.
+_SSE_EVENT_SEPARATOR_RE = re.compile(rb"\r\n\r\n|\n\n")
+
+
+class SSEFrameOverflowError(ValueError):
+    """Raised when a single SSE event exceeds the re-framer's buffer cap."""
+
+    def __init__(self, pending_bytes: int, max_bytes: int):
+        self.pending_bytes = pending_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            "SSE event exceeded the maximum buffered size "
+            f"({pending_bytes} > {max_bytes} bytes); refusing to buffer further"
+        )
+
+
+class SSEEventReframer:
+    """Re-frame an arbitrary byte stream into complete SSE events.
+
+    Upstream ``aiter_bytes()`` reads are arbitrary: a single read may contain a
+    complete event plus the start of the next, or end mid-event. Forwarding
+    those bytes verbatim lets a later synthetic/retry event concatenate with
+    the dangling partial, which the client's SSE decoder merges into one event
+    whose ``data:`` payload is not valid JSON ("malformed server-sent event
+    JSON").
+
+    :meth:`feed` buffers trailing partial data and only returns bytes up to a
+    complete event boundary (``\\n\\n`` or ``\\r\\n\\r\\n``), so complete
+    events are still flushed as soon as they are read. A held partial is
+    dropped on a stream transition via :meth:`discard_pending`, guaranteeing
+    the next stream cannot be concatenated with the abandoned attempt.
+
+    ``max_pending_bytes`` bounds the held partial. When a single event exceeds
+    it, :meth:`feed` raises :class:`SSEFrameOverflowError` and clears the
+    buffer: the framing can no longer be trusted, so the caller must fail
+    closed (terminate the stream with an error) rather than buffer unbounded or
+    forward a truncated tail as if it were a new event.
+    """
+
+    # A few MB is far larger than any well-formed OpenAI-compatible SSE event;
+    # exceeding it means the upstream is not speaking event-framed SSE.
+    DEFAULT_MAX_PENDING_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, max_pending_bytes: int | None = None):
+        self.max_pending_bytes = (
+            int(max_pending_bytes)
+            if max_pending_bytes is not None
+            else self.DEFAULT_MAX_PENDING_BYTES
+        )
+        self._pending = b""
+        # Cumulative bytes dropped via discard_pending()/overflow (diagnostics).
+        self.discarded_bytes = 0
+
+    @property
+    def pending(self) -> bytes:
+        """The currently buffered trailing partial event (may be empty)."""
+        return self._pending
+
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """Return the complete events contained in *chunk*.
+
+        Any trailing partial event is retained in :attr:`pending` and returned
+        by a later call once its boundary arrives. Raises
+        :class:`SSEFrameOverflowError` if the retained partial exceeds
+        ``max_pending_bytes``.
+        """
+        if not chunk:
+            return []
+        if isinstance(chunk, (bytearray, memoryview)):
+            chunk = bytes(chunk)
+        self._pending += chunk
+        events: list[bytes] = []
+        start = 0
+        for match in _SSE_EVENT_SEPARATOR_RE.finditer(self._pending):
+            events.append(self._pending[start:match.end()])
+            start = match.end()
+        if start:
+            self._pending = self._pending[start:]
+        if len(self._pending) > self.max_pending_bytes:
+            overflow = self._pending
+            self._pending = b""
+            self.discarded_bytes += len(overflow)
+            raise SSEFrameOverflowError(len(overflow), self.max_pending_bytes)
+        return events
+
+    def discard_pending(self) -> bytes:
+        """Drop any buffered partial event and return the dropped bytes.
+
+        Call on every stream transition (retry, re-route, synthetic event,
+        clean stop) so an abandoned attempt's partial can never be
+        concatenated with the next stream's bytes.
+        """
+        dropped = self._pending
+        self._pending = b""
+        self.discarded_bytes += len(dropped)
+        return dropped
+
+
+# ===================================================================
 # Empty response retry helper
 # ===================================================================
 
