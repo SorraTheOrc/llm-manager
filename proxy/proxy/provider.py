@@ -2542,6 +2542,7 @@ def _record_sibling_failure(
     config: dict,
     brand: str | None = None,
     domain_key: str | None = None,
+    provider_type: str | None = None,
 ) -> bool:
     """Record a consecutive empty_response/stall failure for *provider_name*.
 
@@ -2574,10 +2575,26 @@ def _record_sibling_failure(
             (``_failure_domain_key(provider_cfg)``). When present, it is
             quarantined instead of *brand* so other models on the same
             gateway stay eligible (LP-0MTVMB8DW0067H9A AC4).
+        provider_type: Optional provider type (``"local"`` / ``"remote"``).
+            ``"local"`` exempts the provider from the sibling-fallback
+            breaker entirely (no streak increment, no quarantine); ``None``
+            and ``"remote"`` both keep the remote behaviour so existing
+            callers are unchanged (LP-0MUNTOGLB005LUKY AC1/AC2).
 
     Returns:
         ``True`` if the extended cooldown threshold was exceeded.
     """
+    # AC4 (LP-0MUNTOGLB005LUKY): local providers are exempt from the
+    # sibling-fallback circuit breaker.  The 600s quarantine was designed
+    # for remote siblings sharing a dead gateway — it has no meaning for
+    # a local entry (no sibling keys), and when it fires it removes the
+    # only healthy local capacity, forcing requests onto exhausted remote
+    # providers.  Local providers keep their existing normal handling:
+    # empty_response_max_cooldown_seconds cap (10s), slot-exhaustion
+    # retry, no-progress watchdog, and dispatch lease.
+    if provider_type == "local":
+        return False
+
     now = time.monotonic()
     window = _get_sibling_fallback_window_seconds(config)
 
@@ -5407,9 +5424,12 @@ async def _proxy_with_remote_fallback_cycle(
                     # siblings) once the streak threshold is exceeded so a
                     # single empty response does not block sibling API keys
                     # on the same endpoint (LP-0MTVPJQ6T004EZ75).
+                    # LP-0MUNTOGLB005LUKY: pass provider_type so the breaker
+                    # can skip local providers entirely.
                     _threshold_exceeded = _record_sibling_failure(
                         provider_name, config, provider_cfg.get("provider"),
-                        domain_key=_failure_domain_key(provider_cfg)
+                        domain_key=_failure_domain_key(provider_cfg),
+                        provider_type=provider_type,
                     )
                     if _threshold_exceeded:
                         attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -6677,9 +6697,12 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text, config,
                             )
+                            # LP-0MUNTOGLB005LUKY: pass provider_type so the
+                            # breaker can skip local providers entirely.
                             _threshold_exceeded = _record_sibling_failure(
                                 provider_name, config, provider_cfg.get("provider"),
-                                domain_key=_failure_domain_key(provider_cfg)
+                                domain_key=_failure_domain_key(provider_cfg),
+                                provider_type=provider_type,
                             )
                             if _threshold_exceeded:
                                 attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -6693,9 +6716,12 @@ async def _proxy_with_fallback_cycle(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text, config,
                         )
+                        # LP-0MUNTOGLB005LUKY: pass provider_type so the
+                        # breaker can skip local providers entirely.
                         _threshold_exceeded = _record_sibling_failure(
                             provider_name, config, provider_cfg.get("provider"),
-                            domain_key=_failure_domain_key(provider_cfg)
+                            domain_key=_failure_domain_key(provider_cfg),
+                            provider_type=provider_type,
                         )
                         if _threshold_exceeded:
                             attempted_domains.add(_failure_domain_key(provider_cfg))
