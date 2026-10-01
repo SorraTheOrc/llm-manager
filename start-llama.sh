@@ -314,7 +314,9 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj --jinja"
+    # --swa-full removed (LP-0MUPPAC7R0053J8L AC8): no-op on this hybrid
+    # (attention+recurrent) arch; n_swa = 0, memory path is llama_memory_hybrid.
+    EXTRA_CMD_SWITCHES="--presence-penalty 0.0 --min-p 0.0 --flash-attn on --no-mmproj --jinja"
     # recommended switched not included: -sm rows --no-context-shift -fa on -sm rows
     ;;
   qwen3-mtp)
@@ -339,7 +341,8 @@ case "$model" in
     TOP_K=20
     MIN_P=0
 
-    EXTRA_CMD_SWITCHES="--spec-type draft-mtp --spec-draft-n-max 2 --presence-penalty 0.0 --min-p 0.0 --flash-attn on --swa-full --no-mmproj --jinja"
+    # --swa-full removed (LP-0MUPPAC7R0053J8L AC8): no-op on this hybrid arch.
+    EXTRA_CMD_SWITCHES="--spec-type draft-mtp --spec-draft-n-max 2 --presence-penalty 0.0 --min-p 0.0 --flash-attn on --no-mmproj --jinja"
     ;;
   mxbai-embed)
     REPOID=magicunicorn
