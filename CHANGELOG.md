@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.1.20 (2026-10-03)
+### Features
+- Release post-step ran without a release: 74 items mislabeled 'Shipped in v0.1.18' and v0.1.19 changelog empty (LP-0MUEALIM60037F1S)
+- Time-based automatic mode switching (cheap 00:01-10:00, fast 10:00-00:01) (LP-0MSM5K4TX004MICX)
+- Add a fallback to the fast and cheap configs (LP-0MU0W548B0029255)
+- Hierarchical failure-domain exclusion: gateway-wide versus model-specific failures (LP-0MTVMB8DW0067H9A)
+- Guessed usage-limit quarantine locks opencode-go accounts for up to 30 days when the gateway omits the reset duration (LP-0MUQTCMW2001VXH8)
+- Fix: no-progress watchdog releases local lease but never cancels the upstream prefill (wedged llama-server slot) (LP-0MUGQHPJ50046LV8)
+- Correct proxy-usage-analysis 429 recommendation: GoUsageLimitError uses account quarantine, not the 3-hour cooldown (LP-0MUI6KL3F0094YBS)
+- Startup-ramp 503: include the ramp end time in the response (LP-0MU9Z7O8M0053Y0K)
+- promoting thinking to content (LP-0MSEHOE7B005DE08)
+- Split Time to first token by cheap/fast (LP-0MUI56OCI008EGML)
+- Multi-backend: support multiple local llama-server instances with provider-level fallback (LP-0MRPILSMW004T4H8)
+### Bug Fixes
+- [test-failure] tests/test_rebuild_llama.py — failing test (LP-0MUK0KYMV003TIWV)
+- Proxy usage analysis: fast/cheap bucketing uses analysis-time config, not the mode active during the window (LP-0MSPZUD4G007IYGH)
+- render_report.py reads auditResult but wl show exposes audit under 'audit' (report always shows 'Audit: not run') (LP-0MU6U1VLR001LEX6)
+- Bug: proxy-usage-analysis file discovery silently excludes rotated logs whose name-encoded rotation time precedes window start (LP-0MSISZS1O004KJRR)
+- proxy-usage-analysis: hourly table hides real activity (session-first-hour attribution, no per-hour traffic columns, duplicate hour-of-day buckets give >100% rows) (LP-0MTYAZFGN003BYQS)
+- llama-proxy: serve cached per-slot detail when /slots counts are stale (slots_stale) so herdr per-slot dispatch keeps slot identity (LP-0MUFSVXID0039ZAQ)
+- test runner changed-scope selects DELETED test files, failing the implement.py changed-scope gate (LP-0MTZYRTNF0092JKW)
+- Exempt local providers from the sibling-fallback circuit breaker (600s quarantine) (LP-0MUNTOGLB005LUKY)
+- Proxy emits malformed SSE: re-frame upstream bytes to event boundaries and drop partial events on stream transition (LP-0MUOBUPBC002GYTL)
+- StatusLifecycle.require_claimed rejects wl's in-progress status (hyphen vs underscore) (LP-0MUESDZVW006YJ1N)
+### Other
+- Waiting for 2026-08-13: 24h proxy report — contention-fallback share vs 2026-08-11 baseline (LP-0MSQ1ZL6Y000N6AP)
+- Consolidate proxy log-file discovery: 4 sibling scripts still hardcode dot-only naming and miss gzipped/dash logs (LP-0MU148SHI004WHQM)
+- Remove accidentally committed proxy/node_modules symlink; harden gitignore (LP-0MUIH7FYS0010MLT)
+- RCA: llama-proxy reported busy for entire 7h09m idle window (2026-08-07/08) — zero herdr downtime dispatch; investigate and design fix (LP-0MSU72I2V009YN79)
+- Add local-only 'private' model (no remote fallback) to proxy configs (LP-0MUGXAWLT007KEFG)
+- Overnight remote-chain exhaustion: accurate diagnostics, quarantine visibility, bounded chain-hold (LP-0MU56Z3XY001I0NO)
+- skill/skill/shared committed absolute symlink causes duplicate/inconsistent test collection in worktrees (LP-0MUHOHP82006NT3W)
+- Fix test-isolation leak in test_mode_grandfathering_integration.py subset runs (LP-0MUD0D0DU005R2VQ)
+
 ## v0.1.19 (2026-09-23)
 
 ## v0.1.18 (2026-09-16)
