@@ -59,6 +59,8 @@ def reset_cooldown_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_guessed.clear()
+    provider._usage_limit_last_probe.clear()
     yield
 
 
@@ -169,23 +171,27 @@ def test_usage_limit_reset_seconds_gousage_with_message():
     assert seconds == pytest.approx(22 * 3600 + 43 * 60 + 120)
 
 
-def test_usage_limit_reset_seconds_limit_name_fallback():
-    """AC2: message without reset time falls back to metadata.limitName."""
-    # daily -> 24h + 2m
+def test_usage_limit_reset_seconds_limit_name_fallback_is_capped():
+    """AC2 (updated for LP-0MUQTCMW2001VXH8): a message without an explicit
+    reset time falls back to ``metadata.limitName``, but the guessed period is
+    capped at the 24h guess cap instead of the full 7d/30d period."""
+    cap = provider._USAGE_LIMIT_GUESS_MAX_SECONDS
+    # daily (24h) is naturally within the cap
     resp = _gousage_429("Daily usage limit reached.", "daily")
     assert provider._usage_limit_reset_seconds(resp, resp.body.decode()) == pytest.approx(
-        24 * 3600 + 120
+        min(24 * 3600, cap) + 120
     )
-    # weekly -> 7d + 2m
+    # weekly (7d) is capped at 24h
     resp = _gousage_429("Weekly usage limit reached.", "weekly")
     assert provider._usage_limit_reset_seconds(resp, resp.body.decode()) == pytest.approx(
-        7 * 24 * 3600 + 120
+        cap + 120
     )
-    # monthly -> 30d + 2m
+    # monthly (30d) is capped at 24h, never the full period
     resp = _gousage_429("Monthly usage limit reached.", "monthly")
     assert provider._usage_limit_reset_seconds(resp, resp.body.decode()) == pytest.approx(
-        30 * 24 * 3600 + 120
+        cap + 120
     )
+    assert provider._usage_limit_reset_seconds(resp, resp.body.decode()) < 30 * 24 * 3600
 
 
 def test_usage_limit_reset_seconds_requires_429_and_usage_error_type():

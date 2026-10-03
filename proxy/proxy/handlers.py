@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from proxy import mode as mode_module
-from proxy.provider import get_model_type
+from proxy.provider import clear_usage_limit_quarantine, get_model_type
 
 logger = logging.getLogger("llama-proxy")
 
@@ -1030,6 +1030,41 @@ async def reload_config():
         return {"status": "success", "message": "Configuration reloaded"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# /admin/clear-usage-limit  —  runtime quarantine escape hatch
+# ---------------------------------------------------------------------------
+
+@router.post("/admin/clear-usage-limit")
+async def admin_clear_usage_limit(request: Request):
+    """Clear usage-limit quarantine entries at runtime (LP-0MUQTCMW2001VXH8).
+
+    Body (optional JSON): ``{"account": "<account-key>"}``. When the body is
+    empty or ``account`` is omitted, every pending quarantine entry is
+    cleared. Returns the cleared account keys so an operator can reintroduce
+    a recovered account without restarting the proxy.
+    """
+    account = None
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        account = body.get("account")
+    if account is not None and not isinstance(account, str):
+        raise HTTPException(
+            status_code=400,
+            detail="'account' must be a string when provided",
+        )
+    cleared = clear_usage_limit_quarantine(account or None)
+    logger.info(
+        "admin: cleared %d usage-limit quarantine entr%s (account=%s)",
+        len(cleared),
+        "y" if len(cleared) == 1 else "ies",
+        account or "<all>",
+    )
+    return {"status": "success", "cleared": cleared, "count": len(cleared)}
 
 
 # ---------------------------------------------------------------------------

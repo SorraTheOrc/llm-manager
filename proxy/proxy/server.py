@@ -1435,6 +1435,7 @@ def main():
 # Backward-compatibility re-exports for tests that import these from server
 # ---------------------------------------------------------------------------
 from .handlers import (  # noqa: E402, F401
+    admin_clear_usage_limit,
     admin_delete_session,
     admin_dump_counts,
     admin_metrics,

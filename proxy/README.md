@@ -599,6 +599,7 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
+- **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8)**: A 429 usage-limit error (`GoUsageLimitError`, or a `FreeUsageLimitError` carrying a reset time) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** `Resets in …` duration is honoured in full (plus a 2-minute margin). A **guessed** duration — derived from `metadata.limitName` alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
 - **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as
@@ -615,10 +616,13 @@ fresh HTTP 429.
 - **State file**: `proxy/provider-state.json`, beside `proxy/.mode` and
   `proxy/grandfathering-state.json` (gitignored runtime state).
 - **Persisted**: the provider/brand/entry/failure-domain cooldowns
-  (`_provider_unavailable_until`) and the usage-limit account quarantine
-  (`_usage_reset_at`). Absolute epoch expiries are written, so wall-clock time
-  is the source of truth across the restart boundary — a restart neither
-  extends nor resets a cooldown/quarantine.
+  (`_provider_unavailable_until`) and the **explicit-duration** usage-limit
+  account quarantine (`_usage_reset_at`). Absolute epoch expiries are written,
+  so wall-clock time is the source of truth across the restart boundary — a
+  restart neither extends nor resets a cooldown/quarantine. **Guessed**
+  (period-name-only) quarantines are deliberately excluded: a `limitName` is
+  weak evidence and must not survive a restart as a long-lived lockout
+  (LP-0MUQTCMW2001VXH8).
 - **Written**: atomically (temp file + `os.replace`) on every availability
   mutation — the cold path (a provider failing or an upstream 429). Already
   expired entries are omitted from the payload. A write failure is logged and
@@ -1108,7 +1112,8 @@ before now, wrapping circularly" rule.
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
 | `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
-| `LLAMA_PROXY_PROVIDER_STATE_FILE` | Override the provider-availability state file (default: `proxy/provider-state.json`). Used by tests; `_provider_unavailable_until` and `_usage_reset_at` are persisted here |
+| `LLAMA_PROXY_PROVIDER_STATE_FILE` | Override the provider-availability state file (default: `proxy/provider-state.json`). Used by tests; `_provider_unavailable_until` and the explicit-duration `_usage_reset_at` quarantine are persisted here (guessed quarantines are not) |
+| `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` | Cap (seconds) applied to a guessed (period-name-only) usage-limit quarantine; default 24h. Overridden by `server.usage_limit_guess_cap_seconds` |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
@@ -1706,6 +1711,22 @@ curl -X POST http://localhost:8000/admin/reset-counts
 ```
 
 Resets in-memory request/token counters and triggers immediate persistence.
+
+#### Clear Usage-Limit Quarantine
+```bash
+# Clear every pending usage-limit quarantine
+curl -X POST http://localhost:8000/admin/clear-usage-limit
+
+# Clear one account (the key is shown in the exhaustion diagnostics)
+curl -X POST http://localhost:8000/admin/clear-usage-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"account": "OPENCODE_2_API_KEY@https://opencode.ai/zen/go"}'
+```
+
+Clears pending usage-limit quarantine entries and persists the change, so a
+recovered account is reintroduced without a proxy restart. Returns
+`{"status": "success", "cleared": [<account-keys>], "count": N}`
+(LP-0MUQTCMW2001VXH8).
 
 ## Client Disconnect Detection
 

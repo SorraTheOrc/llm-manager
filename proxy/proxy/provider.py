@@ -28,10 +28,11 @@ import os
 import re
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -95,6 +96,14 @@ _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
 # are skipped by every routing decision until the reset time passes.
 _usage_reset_at: dict[str, float] = {}
 
+# Accounts whose quarantine duration was GUESSED from ``metadata.limitName``
+# alone — the upstream 429 carried no explicit "Resets in ..." duration. A
+# period name is a weak signal (all observed opencode 429s are duration-less),
+# so guessed quarantines are (a) capped to a short window and (b) never
+# persisted: an account that recovered must not stay locked out for weeks
+# after a restart (LP-0MUQTCMW2001VXH8).
+_usage_reset_guessed: set[str] = set()
+
 # 2-minute safety margin added to the computed usage-limit reset time so a
 # clock-skewed upstream does not start re-serving 429s the moment the limit
 # nominally resets.
@@ -107,6 +116,28 @@ _PERIOD_DEFAULT_SECONDS = {
     "weekly": 7 * 24 * 3600,
     "monthly": 30 * 24 * 3600,
 }
+
+# Upper bound applied to a GUESSED (period-name-only) quarantine. The full
+# period (up to 30 days) is never used without an explicit duration from the
+# gateway; a guess is capped at this short window. Override with
+# ``server.usage_limit_guess_cap_seconds`` or the env var below
+# (LP-0MUQTCMW2001VXH8).
+_USAGE_LIMIT_GUESS_MAX_SECONDS = 24 * 3600
+_USAGE_LIMIT_GUESS_CAP_ENV = "LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS"
+
+# Self-healing probe: re-validate a guessed quarantine at most once per this
+# interval per account, so a recovered account is reintroduced promptly
+# without hammering the upstream on every request.
+_USAGE_LIMIT_PROBE_INTERVAL_SECONDS = 300.0
+_usage_limit_last_probe: dict[str, float] = {}
+
+# Per-probe request timeout (seconds). A probe must never hang a request.
+_USAGE_LIMIT_PROBE_TIMEOUT_SECONDS = 15.0
+
+# Injectable probe transport: an async ``(provider_cfg) -> bool`` returning
+# True when the account is usable again. Left ``None`` in production (the
+# httpx default is used); tests replace it to avoid real network calls.
+_usage_limit_probe_transport: Callable[[dict], Awaitable[bool]] | None = None
 
 # ---------------------------------------------------------------------------
 # Provider availability persistence (LP-0MUI6KB67005X44B)
@@ -180,13 +211,22 @@ def save_provider_state(path: str | Path | None = None) -> None:
     """
     target = Path(path) if path else default_provider_state_file()
     now = time.time()
+    # Guessed (period-name-only) quarantines are deliberately NOT persisted:
+    # they are weak evidence and must not outlive a restart as a long-lived
+    # lockout. Only explicit-duration quarantines are written
+    # (LP-0MUQTCMW2001VXH8).
+    persistable_quarantine = {
+        key: expiry
+        for key, expiry in _usage_reset_at.items()
+        if key not in _usage_reset_guessed
+    }
     payload = {
         "version": _PROVIDER_STATE_VERSION,
         _PROVIDER_STATE_COOLDOWNS_KEY: _prune_expired_expiries(
             _provider_unavailable_until, now
         ),
         _PROVIDER_STATE_QUARANTINE_KEY: _prune_expired_expiries(
-            _usage_reset_at, now
+            persistable_quarantine, now
         ),
     }
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -285,6 +325,10 @@ def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
     _provider_unavailable_until.update(cooldowns)
     _usage_reset_at.clear()
     _usage_reset_at.update(quarantine)
+    # Loaded entries are always explicit/hard (guessed quarantines are never
+    # persisted), so no stale guessed markers survive a reload.
+    _usage_reset_guessed.clear()
+    _usage_limit_last_probe.clear()
 
     logger.info(
         "provider-state: restored %d cooldown entries and %d usage-limit "
@@ -3859,16 +3903,60 @@ def _parse_resets_in(message: str) -> float | None:
     return total if found else None
 
 
-def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | None:
-    """Return seconds until the usage limit resets for a 429 usage-limit error.
+class _UsageLimitReset(NamedTuple):
+    """Resolved usage-limit reset for a 429 response.
+
+    ``explicit`` is True only when the gateway message carried an actual
+    ``Resets in ...`` duration; a duration guessed from ``metadata.limitName``
+    is ``explicit=False`` and is capped and treated as soft/re-checkable
+    (LP-0MUQTCMW2001VXH8).
+    """
+
+    seconds: float
+    explicit: bool
+    limit_name: str | None
+
+
+def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
+    """Return the cap applied to a guessed (period-name-only) quarantine.
+
+    Resolution order: ``server.usage_limit_guess_cap_seconds`` (accepting a
+    flat or nested ``server:`` config), then the
+    ``LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS`` env override, then the
+    24-hour default. Invalid/non-positive values fall through to the default.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get("usage_limit_guess_cap_seconds"))
+    candidates.append(os.environ.get(_USAGE_LIMIT_GUESS_CAP_ENV))
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return float(_USAGE_LIMIT_GUESS_MAX_SECONDS)
+
+
+def _usage_limit_reset_info(
+    response: Response, body_text: str, config: dict | None = None
+) -> _UsageLimitReset | None:
+    """Return the resolved usage-limit reset for a 429 error response.
 
     Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
     error variant that carries a reset duration in its message (including
-    ``FreeUsageLimitError`` responses that include one). The reset duration is
-    parsed from the provider message (``Resets in 22hr 43min``); when the
-    message has no explicit duration, ``metadata.limitName``
-    (daily/weekly/monthly) supplies the period. The 2-minute safety margin is
-    added to the returned duration.
+    ``FreeUsageLimitError`` responses that include one). An explicit
+    ``Resets in 22hr 43min`` duration is honoured in full. When the message
+    has no explicit duration, ``metadata.limitName`` (daily/weekly/monthly)
+    supplies a GUESSED period that is capped at
+    :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
+    period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). The
+    2-minute safety margin is added to the returned duration.
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -3905,11 +3993,75 @@ def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | No
         return None
 
     seconds = _parse_resets_in(message) if message else None
-    if seconds is None and limit_name in _PERIOD_DEFAULT_SECONDS:
-        seconds = _PERIOD_DEFAULT_SECONDS[limit_name]
-    if seconds is None:
-        return None
-    return float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS
+    if seconds is not None:
+        return _UsageLimitReset(
+            float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, True, limit_name
+        )
+    if limit_name in _PERIOD_DEFAULT_SECONDS:
+        guessed = min(
+            float(_PERIOD_DEFAULT_SECONDS[limit_name]),
+            _usage_limit_guess_cap_seconds(config),
+        )
+        return _UsageLimitReset(
+            guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, limit_name
+        )
+    return None
+
+
+def _usage_limit_reset_seconds(
+    response: Response, body_text: str, config: dict | None = None
+) -> float | None:
+    """Backwards-compatible wrapper returning only the reset duration.
+
+    See :func:`_usage_limit_reset_info` for the explicit-vs-guessed detail.
+    """
+    info = _usage_limit_reset_info(response, body_text, config)
+    return info.seconds if info is not None else None
+
+
+def _set_usage_limit_quarantine(
+    account: str, reset: _UsageLimitReset
+) -> None:
+    """Record a usage-limit quarantine and persist it (best effort).
+
+    Guessed (period-name-only) quarantines are tagged in
+    ``_usage_reset_guessed`` so they are capped at read time, skipped by the
+    persistence layer, and eligible for self-healing probes
+    (LP-0MUQTCMW2001VXH8).
+    """
+    _usage_reset_at[account] = time.time() + reset.seconds
+    if reset.explicit:
+        _usage_reset_guessed.discard(account)
+    else:
+        _usage_reset_guessed.add(account)
+    _persist_provider_state_best_effort()
+
+
+def clear_usage_limit_quarantine(account: str | None = None) -> list[str]:
+    """Clear pending usage-limit quarantine entries at runtime.
+
+    With ``account`` set, clears just that account (a no-op when absent).
+    With ``account`` ``None``, clears every pending entry. Returns the list of
+    cleared account keys and persists the change (best effort). This backs the
+    ``POST /admin/clear-usage-limit`` escape hatch so an operator can
+    reintroduce a healthy account without restarting the proxy
+    (LP-0MUQTCMW2001VXH8).
+    """
+    if account is None:
+        cleared = list(_usage_reset_at)
+        _usage_reset_at.clear()
+        _usage_reset_guessed.clear()
+        _usage_limit_last_probe.clear()
+    elif account in _usage_reset_at:
+        del _usage_reset_at[account]
+        _usage_reset_guessed.discard(account)
+        _usage_limit_last_probe.pop(account, None)
+        cleared = [account]
+    else:
+        cleared = []
+    if cleared:
+        _persist_provider_state_best_effort()
+    return cleared
 
 
 def _usage_reset_remaining(failure_domain: str) -> float:
@@ -3926,8 +4078,126 @@ def _usage_reset_remaining(failure_domain: str) -> float:
     remaining = expiry - time.time()
     if remaining <= 0:
         del _usage_reset_at[failure_domain]
+        _usage_reset_guessed.discard(failure_domain)
+        _usage_limit_last_probe.pop(failure_domain, None)
         return 0.0
     return remaining
+
+
+# ---------------------------------------------------------------------------
+# Usage-limit self-healing probe (LP-0MUQTCMW2001VXH8)
+# ---------------------------------------------------------------------------
+
+
+async def _default_usage_limit_probe_transport(provider_cfg: dict) -> bool:
+    """Send a cheap probe request to the provider's upstream.
+
+    Returns True on any 2xx response (the account can serve again). A missing
+    endpoint/api key, a non-2xx status, or any transport error returns False —
+    the caller then keeps the quarantine. Never raises.
+    """
+    endpoint = str(provider_cfg.get("endpoint", "") or "").rstrip("/")
+    if not endpoint:
+        return False
+    api_key = None
+    api_key_env = provider_cfg.get("api_key_env")
+    if api_key_env:
+        api_key = os.environ.get(api_key_env)
+    if not api_key:
+        api_key = provider_cfg.get("api_key")
+    if not api_key:
+        return False
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    try:
+        # opencode gateways reject requests without a session id header.
+        from .proxy_remote import _is_opencode_upstream
+
+        if _is_opencode_upstream(endpoint):
+            headers["x-opencode-session"] = "usage-limit-probe"
+    except Exception:
+        pass
+    model = provider_cfg.get("model") or provider_cfg.get("name") or "probe"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_USAGE_LIMIT_PROBE_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{endpoint}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+    except Exception:
+        logger.info(
+            "usage-limit probe transport error for account=%s",
+            _usage_limit_account_key(provider_cfg),
+            exc_info=True,
+        )
+        return False
+    return 200 <= int(response.status_code) < 300
+
+
+async def _probe_usage_limit_account(provider_cfg: dict) -> bool:
+    """Return True when a quarantined account is usable again.
+
+    Uses the injectable ``_usage_limit_probe_transport`` when set (tests),
+    otherwise :func:`_default_usage_limit_probe_transport`. Never raises: any
+    error is treated as "still unavailable" (False).
+    """
+    transport = _usage_limit_probe_transport
+    try:
+        if transport is not None:
+            return bool(await transport(provider_cfg))
+        return bool(await _default_usage_limit_probe_transport(provider_cfg))
+    except Exception:
+        logger.info(
+            "usage-limit probe failed for account=%s (keeping quarantine)",
+            _usage_limit_account_key(provider_cfg),
+            exc_info=True,
+        )
+        return False
+
+
+async def _maybe_probe_quarantined_accounts(model_config: dict) -> None:
+    """Self-heal guessed usage-limit quarantines before routing.
+
+    For each provider whose account carries a GUESSED quarantine that is due
+    for a probe (interval-gated), issue a cheap probe and clear the
+    quarantine on success, so the recovered account is routed to within the
+    same request cycle. Hard (explicit-duration) quarantines are left alone.
+    Never raises.
+    """
+    if not _usage_reset_guessed:
+        return
+    now = time.time()
+    seen: set[str] = set()
+    for provider_cfg in (model_config.get("providers") or []):
+        if not isinstance(provider_cfg, dict):
+            continue
+        account = _usage_limit_account_key(provider_cfg)
+        if account in seen or account not in _usage_reset_guessed:
+            continue
+        seen.add(account)
+        if account not in _usage_reset_at:
+            _usage_reset_guessed.discard(account)
+            continue
+        last = _usage_limit_last_probe.get(account, 0.0)
+        if now - last < _USAGE_LIMIT_PROBE_INTERVAL_SECONDS:
+            continue
+        _usage_limit_last_probe[account] = now
+        if await _probe_usage_limit_account(provider_cfg):
+            logger.info(
+                "usage-limit probe succeeded; clearing quarantine for "
+                "account=%s",
+                account,
+            )
+            clear_usage_limit_quarantine(account)
 
 
 # ---------------------------------------------------------------------------
@@ -5154,6 +5424,10 @@ async def _proxy_with_remote_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
+    # Self-healing: re-validate guessed (period-name-only) usage-limit
+    # quarantines so a recovered account is reintroduced within this request
+    # cycle (LP-0MUQTCMW2001VXH8).
+    await _maybe_probe_quarantined_accounts(model_config)
     cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
@@ -5334,11 +5608,10 @@ async def _proxy_with_remote_fallback_cycle(
                 # API-key ACCOUNT until the computed reset time + 2m margin.
                 # Not the whole endpoint: distinct api_key_env entries on the
                 # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                _reset_seconds = _usage_limit_reset_seconds(response, body_text)
-                if _reset_seconds is not None:
+                _reset_info = _usage_limit_reset_info(response, body_text, config)
+                if _reset_info is not None:
                     _reset_account = _usage_limit_account_key(provider_cfg)
-                    _usage_reset_at[_reset_account] = time.time() + _reset_seconds
-                    _persist_provider_state_best_effort()
+                    _set_usage_limit_quarantine(_reset_account, _reset_info)
                     fallback_reason = "usage_limit_reset"
                     prev_provider = provider_name
                     attempted_domains.add(_reset_account)
@@ -5349,7 +5622,7 @@ async def _proxy_with_remote_fallback_cycle(
                         status="usage_limit_reset",
                         status_code=int(response.status_code),
                         body_snippet=(body_text[:512] if body_text else None),
-                        reset_in_seconds=int(_reset_seconds),
+                        reset_in_seconds=int(_reset_info.seconds),
                     )
                     all_slot_exhaustion = False
                     continue
@@ -5667,6 +5940,10 @@ async def _proxy_with_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
+    # Self-healing: re-validate guessed (period-name-only) usage-limit
+    # quarantines so a recovered account is reintroduced within this request
+    # cycle (LP-0MUQTCMW2001VXH8).
+    await _maybe_probe_quarantined_accounts(model_config)
     cooldown_seconds = _get_cooldown_seconds(config)
     local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
     local_slot_retry_delay_seconds = _get_local_slot_retry_delay_seconds(config)
@@ -6576,11 +6853,10 @@ async def _proxy_with_fallback_cycle(
                     # API-key ACCOUNT until the computed reset time + 2m margin.
                     # Not the whole endpoint: distinct api_key_env entries on the
                     # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                    _reset_seconds = _usage_limit_reset_seconds(response, body_text)
-                    if _reset_seconds is not None:
+                    _reset_info = _usage_limit_reset_info(response, body_text, config)
+                    if _reset_info is not None:
                         _reset_account = _usage_limit_account_key(provider_cfg)
-                        _usage_reset_at[_reset_account] = time.time() + _reset_seconds
-                        _persist_provider_state_best_effort()
+                        _set_usage_limit_quarantine(_reset_account, _reset_info)
                         fallback_reason = "usage_limit_reset"
                         prev_provider = provider_name
                         attempted_domains.add(_reset_account)
@@ -6591,7 +6867,7 @@ async def _proxy_with_fallback_cycle(
                             status="usage_limit_reset",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
-                            reset_in_seconds=int(_reset_seconds),
+                            reset_in_seconds=int(_reset_info.seconds),
                         )
                         all_slot_exhaustion = False
                         continue
