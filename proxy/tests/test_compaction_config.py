@@ -476,14 +476,10 @@ class TestLiveConfigsValidate:
         "config-cheap.yaml",
     ])
     def test_live_configs_pass_compaction_validation(self, config_file):
-        """All live config files validate without FATAL errors."""
-        config_dir = pathlib.Path(__file__).parent.parent
-        config_path = config_dir / config_file
-        if not config_path.exists():
-            pytest.skip(f"{config_file} not found")
-        import yaml
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
+        """All live config profiles validate without FATAL errors."""
+        from tests.config_test_utils import load_profile
+
+        cfg = load_profile(config_file)
         problems = validate_compaction_config(cfg)
         fatal = [p for p in problems if p.startswith("FATAL:")]
         assert fatal == [], f"{config_file} has FATAL compaction issues: {fatal}"
@@ -502,10 +498,9 @@ class TestLiveConfigsValidate:
         context-pressure advisory and the 429 gate (all driven by this single
         knob) are off.
         """
-        import yaml
-        config_path = pathlib.Path(__file__).parent.parent / config_file
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
+        from tests.config_test_utils import load_profile
+
+        cfg = load_profile(config_file)
         assert compaction_config(cfg)["trigger_ratio"] == 0
         for mode in ("fast", "cheap"):
             assert compaction_trigger_tokens(mode, cfg) == 0

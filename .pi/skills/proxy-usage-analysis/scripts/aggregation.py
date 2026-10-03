@@ -116,6 +116,14 @@ class AnalysisResult:
     speed: object | None = None
     # Local-model utilization (busy time etc.); None when no local traffic.
     busy: BusyStats | None = None
+    # Per-hour activity counters for the report's ``## Summary by hour``
+    # table (LP-0MTYAZFGN003BYQS): absolute top-of-hour datetime -> Counter
+    # over ``requests_started`` / ``local_attempts`` / ``local_served`` /
+    # ``fallbacks`` / ``local_skip``. Counted by each event's own timestamp
+    # rather than by session start hour, so a long-running session
+    # contributes to every hour it touches. Includes in-window stream events
+    # that carry no session UUID.
+    hourly_activity: dict[datetime, Counter] = field(default_factory=dict)
     # TTFT (Time to First Token) events parsed from log lines
     # (LP-0MTSSM5SO003PKU0).
     ttft_events: list[LogEvent] = field(default_factory=list)
@@ -240,12 +248,17 @@ class BusyStats:
     # windows, tracked separately from in-window aborts (LP-0MSVRRO3L0056N6C).
     pre_window_unfinished: int
     # Busy seconds attributed to fast/cheap periods (from the slot schedule)
-    # and to each hour of the window (hour-of-day -> seconds).
+    # and to each absolute wall-clock hour of the window (top-of-hour
+    # datetime -> seconds, LP-0MTYAZFGN003BYQS). Absolute-hour keying (not
+    # hour-of-day) keeps rolling-window buckets distinct: a 24h window that
+    # straddles an hour yields two edge partial buckets with different
+    # absolute-hour keys, so no busy duration is double-counted and no row
+    # can exceed 100%.
     fast_busy_seconds: float
     cheap_busy_seconds: float
     fast_window_seconds: float
     cheap_window_seconds: float
-    hourly_busy: list[tuple[int, float]]
+    hourly_busy: list[tuple[datetime, float]]
 
     @property
     def busy_pct(self) -> float:
@@ -466,10 +479,15 @@ def _attribute_interval(
     periods: list[bucketing.SlotPeriod],
     label_at,
     bucket_busy: dict[str, float],
-    hourly: dict[int, float],
+    hourly: dict[datetime, float],
 ) -> None:
     """Add one merged busy interval's seconds to the fast/cheap and hourly
-    buckets it overlaps, splitting at hour and period boundaries."""
+    buckets it overlaps, splitting at hour and period boundaries.
+
+    ``hourly`` is keyed by the segment's **absolute top-of-hour** datetime
+    (not hour-of-day). ``_segment_boundaries`` already splits at hour
+    boundaries, so each segment lies inside a single absolute hour
+    (LP-0MTYAZFGN003BYQS)."""
     b = _segment_boundaries(interval_start, interval_end, periods)
     for lo, hi in zip(b, b[1:]):
         if hi <= lo:
@@ -477,7 +495,8 @@ def _attribute_interval(
         mid = lo + (hi - lo) / 2
         label = label_at(mid)
         bucket_busy[label] = bucket_busy.get(label, 0.0) + (hi - lo).total_seconds()
-        hourly[mid.hour] = hourly.get(mid.hour, 0.0) + (hi - lo).total_seconds()
+        hour_key = mid.replace(minute=0, second=0, microsecond=0)
+        hourly[hour_key] = hourly.get(hour_key, 0.0) + (hi - lo).total_seconds()
 
 
 def compute_busy_stats(
@@ -566,7 +585,7 @@ def compute_busy_stats(
         return _period_label_at(mid, schedule, mode_map)
 
     bucket_busy: dict[str, float] = {}
-    hourly: dict[int, float] = {}
+    hourly: dict[datetime, float] = {}
     for s, e in merged:
         _attribute_interval(s, e, periods, label_at, bucket_busy, hourly)
 
@@ -754,6 +773,9 @@ def aggregate(
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
+    # Per-hour activity counters (LP-0MTYAZFGN003BYQS): absolute top-of-hour
+    # datetime -> Counter, counted by each event's own timestamp.
+    hourly_activity: dict[datetime, Counter] = {}
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -778,6 +800,21 @@ def aggregate(
         if not (window_start <= ev.ts <= window_end):
             continue
         total_lines += 1
+        # Per-hour activity counters (LP-0MTYAZFGN003BYQS): count by the
+        # event's own timestamp, so a long-running session contributes to
+        # every hour it touches rather than only its first-request hour.
+        hour_key = ev.ts.replace(minute=0, second=0, microsecond=0)
+        if ev.kind == "stream_started":
+            counts = hourly_activity.setdefault(hour_key, Counter())
+            counts["requests_started"] += 1
+            if ev.provider == LOCAL_PROVIDER:
+                counts["local_attempts"] += 1
+        elif ev.kind == "stream_finished" and ev.provider == LOCAL_PROVIDER:
+            hourly_activity.setdefault(hour_key, Counter())["local_served"] += 1
+        elif ev.kind == "fallback":
+            hourly_activity.setdefault(hour_key, Counter())["fallbacks"] += 1
+        elif ev.kind == "routing_skip":
+            hourly_activity.setdefault(hour_key, Counter())["local_skip"] += 1
         if ev.kind in (
             "stream_error",
             "stream_finish_error",
@@ -852,5 +889,6 @@ def aggregate(
         contention_fallback_events=contention_fallback_events,
         compaction_events=compaction_events,
         busy=busy,
+        hourly_activity=hourly_activity,
         ttft_events=ttft_events,
     )

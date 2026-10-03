@@ -165,11 +165,9 @@ class TestUnifiedDetectionKnob:
         ["config.yaml", "config-fast.yaml", "config-cheap.yaml"],
     )
     def test_live_configs_expose_one_detection_knob(self, config_file):
-        import yaml
+        from tests.config_test_utils import load_profile
 
-        proxy_dir = Path(__file__).resolve().parent.parent
-        with open(proxy_dir / config_file) as fh:
-            cfg = yaml.safe_load(fh)
+        cfg = load_profile(config_file)
         server = cfg["server"]
         assert "context_pressure_warn_ratio" not in server, config_file
         assert "local_hard_routing_cap_ratio_fast" not in server, config_file

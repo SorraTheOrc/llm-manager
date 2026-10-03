@@ -283,11 +283,9 @@ class TestLiveConfigsValidate:
     """
 
     def _load(self, name: str) -> dict:
-        import yaml
-        from proxy.mode import proxy_dir
+        from tests.config_test_utils import load_profile
 
-        with open(proxy_dir() / name) as fh:
-            return yaml.safe_load(fh)
+        return load_profile(name)
 
     @pytest.mark.parametrize("config_file", ["config.yaml", "config-fast.yaml", "config-cheap.yaml"])
     def test_live_configs_pass_validation(self, config_file):
@@ -344,11 +342,9 @@ class TestLiveConfigPersistenceCap:
     """
 
     def _load(self, name: str) -> dict:
-        import yaml
-        from proxy.mode import proxy_dir
+        from tests.config_test_utils import load_profile
 
-        with open(proxy_dir() / name) as fh:
-            return yaml.safe_load(fh)
+        return load_profile(name)
 
     @pytest.mark.parametrize(
         "config_file,mode,ratio_key",

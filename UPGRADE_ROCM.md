@@ -71,6 +71,20 @@ Run: scripts/build-llama-test.sh --dry-run --json
 
 - scripts/rebuild-llama.sh --dry-run --json
   - Clone latest master, build with HIP flags, deploy binary to /home/rgardler/llama.cpp/build/bin/llama-server and attempt to restart using start-llama.sh
+  - The deploy step stops any running `llama-server` **before** copying (matching by
+    process name, `pkill -x llama-server`), copies the binary **and** its sibling
+    shared libraries (`libggml*.so*`, `libllama*.so*`, `libmtmd*.so*`), rewrites the
+    deployed artifacts' `RUNPATH` to `$ORIGIN` (plus the ROCm lib dirs) with
+    `patchelf`, then sanity-runs `--version`. Stopping the server first avoids
+    `ETXTBSY` ("Text file busy") when replacing a live binary, and matching by name
+    (not by path) avoids killing the invoking wrapper shell.
+  - `--deploy-only` re-deploys an already-built artifact (skips clone, `cmake` and
+    build) and is used by `rebuild-and-restart-mtp.sh` to re-attempt the copy after
+    the proxy stack restarts. It requires `patchelf` (and `pkill`/`pgrep`) but **not**
+    `cmake`; `git` is optional (the reported commit falls back to `unknown`).
+  - `--json` emits a machine-readable summary (`ok`, `git_commit`, `version`,
+    `deployed_libs`, `planned_steps`, `errors`). This behaviour is covered by
+    `tests/test_rebuild_llama.py`.
 
 6) Host ROCm upgrade (manual step recommended)
 

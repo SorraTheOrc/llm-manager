@@ -769,11 +769,36 @@ def _startup_launch_watchdog_tasks():
         model_health_task = loop.create_task(_router_model_health_loop())
 
 
+def _startup_restore_provider_state() -> tuple[int, int]:
+    """Restore persisted provider cooldowns and usage-limit quarantine.
+
+    Best-effort: the loader is corruption-tolerant and never raises, but this
+    wrapper additionally swallows any unexpected error so a bad state file can
+    never block proxy startup. The loader logs the restored entry counts at
+    INFO (``provider-state: restored N cooldown entries and M usage-limit
+    quarantine entries``) — see LP-0MUI6KB67005X44B.
+
+    Returns:
+        ``(restored_cooldowns, restored_quarantine)``; ``(0, 0)`` when the
+        restore fails.
+    """
+    try:
+        return load_provider_state()
+    except Exception:
+        logger.warning(
+            "Failed to restore provider availability state; starting with "
+            "empty cooldown/quarantine state",
+            exc_info=True,
+        )
+        return (0, 0)
+
+
 def _startup_launch_persistence_tasks():
     """Load persisted counts and spawn background persist/broadcast loops."""
     global counts_persist_task, tokens_persist_task, periodic_broadcast_task
     load_counts()
     load_token_counts()
+    _startup_restore_provider_state()
     try:
         loop = asyncio.get_running_loop()
         if counts_persist_task is None:
@@ -848,7 +873,12 @@ def _startup_initialize_grandfathering():
             else mode_module.MODE_CHEAP
         )
         other_path = mode_module.mode_config_file(other_mode)
-        other_mode_config = load_config(str(other_path))
+        # Explicit merged load: the mode overlays are deduplicated, so the
+        # other-mode config must inherit the base `models` section for
+        # grandfathering's remote-provider comparison to be correct.
+        # `load_config(explicit_path=...)` stays raw for backward compat
+        # (AC1), hence the dedicated merged entry point.
+        other_mode_config = load_merged_config(str(other_path))
         logger.info(
             "Grandfathering: enabled; other-mode config %s (current=%s)",
             other_path.name,
@@ -1263,6 +1293,16 @@ async def tail_logs(
 ):
     return await _ui_tail_logs(request, lines, source, slot, session)
 
+@app.get("/logs/tail/slot")
+async def tail_slot_logs(
+    request: Request,
+    lines: int = 100,
+    slot: int = 0,
+    session: str | None = None,
+):
+    return await _ui_tail_slot_logs(request, lines, slot, session)
+
+
 @app.get("/logs")
 async def view_logs(request: Request):
     return await _ui_view_logs(request)
@@ -1395,6 +1435,7 @@ def main():
 # Backward-compatibility re-exports for tests that import these from server
 # ---------------------------------------------------------------------------
 from .handlers import (  # noqa: E402, F401
+    admin_clear_usage_limit,
     admin_delete_session,
     admin_dump_counts,
     admin_metrics,
@@ -1482,6 +1523,7 @@ from .provider import (  # noqa: E402, F401
     _is_slot_exhaustion_response,
     _parse_retry_after,
     _provider_unavailable_until,
+    load_provider_state,
     mark_provider_unavailable,
     proxy_with_fallback,
     proxy_with_remote_fallback,
@@ -1553,6 +1595,9 @@ from .ui import (  # noqa: E402
     tail_logs as _ui_tail_logs,
 )
 from .ui import (  # noqa: E402
+    tail_slot_logs as _ui_tail_slot_logs,
+)
+from .ui import (  # noqa: E402
     view_logs as _ui_view_logs,
 )
 from .utils import (  # noqa: E402, F401
@@ -1566,6 +1611,7 @@ from .utils import (  # noqa: E402, F401
     _normalize_outgoing_headers,
     count_text_tokens,
     load_config,
+    load_merged_config,
     normalize_provider_name,
     setup_logging,
 )

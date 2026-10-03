@@ -228,6 +228,18 @@ models:
         endpoint: https://models.inference.ai.azure.com
     aliases:
     - github-*
+  # Private model: local-only, no remote fallback at all.
+  # Uses the Qwen3 llama_model. When the local slot is busy the request
+  # is queued / deferred — it never falls through to a paid provider.
+  private:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+    aliases:
+    - private
+    force_full_prompt: true
+    tokenizer: qwen3
   # Cascading fallback: local Qwen3 first, then OpenCode Go, OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
@@ -554,6 +566,16 @@ server:
   # (default 300) instead of erroring immediately, then start a NEW cycle from
   # the FIRST provider — giving short cooldowns (60s provider cooldown, 180s
   # stall circuit breaker, available_times window edges) time to expire.
+  #   - The hold is BOUNDED by the exhaustion response's real ``retry_after``
+  #     (LP-0MU56ZKQD005SX08): each hold waits at most the sooner of
+  #     chain_hold_seconds and retry_after; when retry_after exceeds the total
+  #     budget (chain_hold_seconds x chain_hold_max_cycles) the terminal 503
+  #     is returned immediately with its accurate Retry-After instead of
+  #     holding through cycles that cannot succeed.
+  #   - Each hold cycle re-runs the full chain, including local routing and
+  #     compaction evaluation; every routing/compaction/hold log line carries
+  #     ``chain_hold_cycle=N`` so re-emissions are not read as new demand
+  #     (LP-0MU5AIAAY003KVM0).
   #   - Streaming requests receive periodic SSE feedback comments
   #     (`: chain exhausted (...); retrying from <first> in <Ns>`) so clients
   #     can surface live progress (companion item SA-0MSHAKSEA001LQ6T).
@@ -880,7 +902,11 @@ server:
   # simultaneously, creating a thundering herd that overwhelms the freshly-
   # started proxy. This gate returns 503 + random Retry-After (uniform
   # jitter) so reconnects spread across the ramp window instead of hitting
-  # the server at once. Clients simply retry with the given delay.
+  # the server at once. Clients simply retry with the given delay. The 503
+  # body also includes ``ramp_ends_at`` (ISO-8601 UTC, the guaranteed ceiling)
+  # and ``ramp_remaining_seconds`` (whole seconds) so clients can sleep for a
+  # deterministic upper bound instead of inferring one from the jitter
+  # (LP-0MU9Z7O8M0053Y0K).
   startup_ramp:
     enabled: true
     # Short safety ceiling (seconds) after process start. New chat requests

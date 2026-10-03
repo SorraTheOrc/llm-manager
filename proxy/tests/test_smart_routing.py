@@ -545,14 +545,11 @@ class TestEconomicBypassRecoveryFlag:
 
     # AC4: the shipped mode profiles declare the intended flag values
     def test_shipped_profiles_declare_flag(self):
-        """config-cheap.yaml enables the flag; config-fast.yaml omits it."""
-        from pathlib import Path
+        """The merged cheap profile enables the flag; merged fast omits it."""
+        from tests.config_test_utils import get_merged_config
 
-        import yaml
-
-        proxy_dir = Path(__file__).resolve().parent.parent
-        cheap = yaml.safe_load((proxy_dir / "config-cheap.yaml").read_text())
-        fast = yaml.safe_load((proxy_dir / "config-fast.yaml").read_text())
+        cheap = get_merged_config("cheap")
+        fast = get_merged_config("fast")
         assert cheap["server"][
             "local_large_context_economic_bypass_serves_local"
         ] is True

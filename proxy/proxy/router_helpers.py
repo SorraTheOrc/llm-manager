@@ -1869,6 +1869,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     now = time.monotonic()
     removed = 0
     verify_candidates: list[tuple[str, dict]] = []
+    # LP-0MUGQHPJ50046LV8: deferred watchdog-released records (stream_cm, slot
+    # freeing, preflight tracking) — processed after releasing the lock.
+    deferred_watchdog: list[tuple[str, str, str | None, object]] = []
 
     # Phase 1 (under lock): collect expired records. Inactive records are
     # freed immediately; expired ACTIVE records are deferred to phase 3 so
@@ -1888,22 +1891,16 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 if active and _watchdog_no_progress(
                     srv, _dispatch_key_session_id(sid), record
                 ):
+                    session_key = _dispatch_key_session_id(sid)
+                    endpoint_from_record = _endpoint_from_record(record)
+                    # LP-0MUGQHPJ50046LV8: capture the upstream stream context
+                    # manager before deleting the record so we can cancel the
+                    # in-flight request after releasing the lock.
+                    stream_cm = record.pop("stream_cm", None)
                     del srv.local_dispatch_records[sid]
                     removed += 1
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-                    except Exception:
-                        pass
-                    try:
-                        from proxy.session import _free_slot_assignment
-                        _free_slot_assignment(
-                            _dispatch_key_session_id(sid),
-                            endpoint=_endpoint_from_record(record),
-                        )
-                    except Exception:
-                        pass
+                    # Decrement counter while still under the lock for
+                    # atomicity (LP-0MUCEFB8E003YVFF).
                     try:
                         srv.local_active_queries = max(
                             0, int(getattr(srv, 'local_active_queries', 0) or 0) - 1
@@ -1914,11 +1911,14 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         srv.logger.warning(
                             "lease_released session=%s reason=no_progress_watchdog "
                             "endpoint=%s",
-                            _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
-                            _endpoint_from_record(record) or "default",
+                            session_key if session_key else "unknown",
+                            endpoint_from_record or "default",
                         )
                     except Exception:
                         pass
+                    # Deferred: free slot assignment and preflight tracking
+                    # after the lock, and close the upstream stream.
+                    deferred_watchdog.append((sid, session_key, endpoint_from_record, stream_cm))
                     continue
 
                 expires_at = record.get("expires_at", 0)
@@ -2055,6 +2055,37 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
         except Exception:
             pass
+    # LP-0MUGQHPJ50046LV8: close upstream streams for watchdog-released
+    # records and free their slot assignments (deferred past the lock).
+    if deferred_watchdog:
+        for sid, session_key, endpoint_from_record, stream_cm in deferred_watchdog:
+            try:
+                # Close the upstream httpx stream to cancel the in-flight
+                # request so the llama-server slot is actually freed.
+                if stream_cm is not None:
+                    try:
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
+                        # Idempotent — harmless if the stream already closed.
+                        pass
+            except Exception:
+                pass
+            # Free the slot registry entry (LP-0MSB0RP7F000U0WJ).
+            try:
+                from proxy.session import _free_slot_assignment
+                _free_slot_assignment(
+                    session_key,
+                    endpoint=endpoint_from_record,
+                )
+            except Exception:
+                pass
+            # Pop from preflight tracking.
+            try:
+                _p = getattr(srv, "local_prefill_in_flight", None)
+                if _p is not None and session_key in _p:
+                    _p.pop(session_key, None)
+            except Exception:
+                pass
     # Removed stale leases frees slots — wake the cross-session contention
     # queue (LP-0MSORQVK50012Q4D AC2).
     if removed > 0:

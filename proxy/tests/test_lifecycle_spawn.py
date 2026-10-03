@@ -476,9 +476,18 @@ class TestStartTtsServerPathResolution:
         assert os.path.isabs(checked), (
             f"Expected absolute path, got {checked!r}"
         )
-        # It should NOT contain double proxy/proxy
-        assert "proxy/proxy/scripts" not in checked, (
-            f"Path should not have duplicate proxy/ segment: {checked!r}"
+        # It must resolve against the repo root exactly once: the path relative
+        # to the repo root is the configured relative path with no duplicated
+        # "proxy/" segment (regression: proxy/proxy/scripts/...). Comparing the
+        # relative path avoids false positives when the repo/worktree root
+        # itself ends in "proxy" (LP-0MUHW5HH00082I9Y).
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        rel = os.path.relpath(checked, repo_root)
+        assert rel == os.path.join("proxy", "scripts", "start-qwentts.sh"), (
+            f"Expected path relative to repo root to be "
+            f"'proxy/scripts/start-qwentts.sh', got {rel!r}"
         )
 
     @pytest.mark.asyncio

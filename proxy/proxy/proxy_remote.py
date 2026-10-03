@@ -21,7 +21,7 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
 # Import utils functions used by this module
-from proxy.utils import count_text_tokens
+from proxy.utils import SSEEventReframer, count_text_tokens
 
 from .router_helpers import (
     _compute_request_timeout,
@@ -1376,6 +1376,11 @@ async def _handle_remote_streaming(
         # Capture raw upstream body from the first stream for body-snippet logging
         # (LP-0MTVPJWWZ000REYU) — independent of session recording.
         _first_stream_body = b""
+        # Re-frame upstream bytes to SSE event boundaries (LP-0MUOBUPBC002GYTL):
+        # only complete events reach the client; a trailing partial is held and
+        # explicitly discarded on every stream transition so it can never be
+        # concatenated with the next synthetic/retry event.
+        _reframer = SSEEventReframer()
 
         # Log stream started with session context (LP-0MR90HJED005WI1Z)
         try:
@@ -1423,6 +1428,11 @@ async def _handle_remote_streaming(
         # iteration 0; retries are iterations 1..max_retries) or
         # empty-response retry (LP-0MRF77A0E0026B9T).
         while True:
+            # Every outer-loop iteration is a stream transition (initial attempt
+            # or a stall/empty-retry reconnect). Drop any buffered partial from
+            # the previous attempt before this attempt can emit bytes
+            # (LP-0MUOBUPBC002GYTL).
+            _reframer.discard_pending()
             # Bounded provider failover budget (LP-0MU1RXEPL005CK97): once a
             # provider has spent its retry budget without delivering any
             # content, stop retrying and yield a terminal error so the
@@ -1893,16 +1903,25 @@ async def _handle_remote_streaming(
                         except Exception:
                             pass
 
-                    if collected_chunks is not None:
-                        collected_chunks.append(chunk)
-                    # Capture first stream body for body-snippet logging (LP-0MTVPJWWZ000REYU)
-                    _first_stream_body += chunk
-                    yield chunk
-                    log_response_chunk(chunk, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
+                    # Re-frame the raw upstream read to SSE event boundaries
+                    # (LP-0MUOBUPBC002GYTL): complete events are flushed as soon
+                    # as they are read; a trailing partial is buffered until its
+                    # boundary arrives and is dropped on any stream transition.
+                    for _event in _reframer.feed(chunk):
+                        if collected_chunks is not None:
+                            collected_chunks.append(_event)
+                        # Capture first stream body for body-snippet logging (LP-0MTVPJWWZ000REYU)
+                        _first_stream_body += _event
+                        yield _event
+                        log_response_chunk(_event, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
 
                     if saw_done or saw_finish:
                         break
 
+                # The inner read loop has ended (terminal event, stall,
+                # watchdog, or disconnect): drop any trailing partial before
+                # the post-loop synthesised events (LP-0MUOBUPBC002GYTL).
+                _reframer.discard_pending()
                 if disconnected:
                     # Client disconnected — stop streaming entirely, no retry
                     break
@@ -2004,6 +2023,10 @@ async def _handle_remote_streaming(
                     _should_retry = True
 
             except StopAsyncIteration:
+                # Drop any buffered partial: the upstream closed, so a partial
+                # will never complete and must not be forwarded
+                # (LP-0MUOBUPBC002GYTL).
+                _reframer.discard_pending()
                 # Normal exhaustion of the upstream iterator (no [DONE] received).
                 # Synthesize final stop event as in the original code.
                 if not saw_done and not saw_finish:
@@ -2048,6 +2071,9 @@ async def _handle_remote_streaming(
                         log_response_chunk(_final_stop_bytes, session_id=session_id, model=model_name, provider=provider, body_json=body_json, entry=entry)
                 break
             except httpx.ReadTimeout:
+                # Drop any buffered partial before the retry/terminate decision
+                # (LP-0MUOBUPBC002GYTL).
+                _reframer.discard_pending()
                 # httpx ReadTimeout before idle timeout (edge case). Content-
                 # aware retry: only retry while zero content was delivered
                 # (LP-0MS9FR9LG002AJ4C); after content, terminate immediately.
@@ -2069,6 +2095,9 @@ async def _handle_remote_streaming(
                 # Skip the final event yield and proceed directly to cleanup.
                 break
             except Exception as exc:
+                # Drop any buffered partial so the synthetic error is emitted as
+                # its own event (LP-0MUOBUPBC002GYTL).
+                _reframer.discard_pending()
                 # httpx stream error (e.g. RemoteProtocolError).
                 # Yield a synthetic final SSE event so the client receives a
                 # proper finish_reason marker even on stream error.
@@ -2125,6 +2154,9 @@ async def _handle_remote_streaming(
             # whole request (LP-0MS9FR9LG002AJ4C). The client sees a clear
             # terminal state quickly and can retry with full context.
             if _terminate_after_content:
+                # Drop any buffered partial so the synthetic stall error is a
+                # standalone event (LP-0MUOBUPBC002GYTL).
+                _reframer.discard_pending()
                 try:
                     _srv().logger.warning(
                         "Upstream stall after content delivered: terminating "
@@ -2174,6 +2206,11 @@ async def _handle_remote_streaming(
 
             # If _should_retry is True, the outer loop will handle backoff
             # and reconnect on next iteration.
+
+        # The stream has ended (clean stop, terminal event, or error): drop any
+        # remaining partial so a truncated event is never left for the client
+        # (LP-0MUOBUPBC002GYTL).
+        _reframer.discard_pending()
 
         # Finally block outside the while loop: ensures final cleanup of
         # the last active connection.

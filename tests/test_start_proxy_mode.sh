@@ -8,7 +8,7 @@
 #   3. A missing mode config file falls back to config.yaml (with a warning)
 #   4. An invalid .mode value warns and defaults to fast
 #   5. LLAMA_PROXY_CONFIG is exported so the server loads the same profile,
-#      and API-key resolution reads from the SELECTED config
+#      and API-key resolution reads from the MERGED config (base + overlay)
 #
 # Fixture fidelity (LP-0MSX2FMN5006HYN5): the sandbox cheap/fast configs are
 # built from the REAL config-cheap.yaml / config-fast.yaml at test time (slot
@@ -64,9 +64,24 @@ chmod +x "$PROXY_DIR/scripts/start-proxy.sh"
 # profiles fails the test instead of passing with fabricated numbers.
 REAL_CONFIG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/proxy"
 
-# server-level scalar value (2-space indent), e.g. session_slot_pool_size
+# The sandboxed start-proxy.sh imports the dependency-light merge helper from
+# its repo root (proxy/proxy/config_merge.py); mirror it so the merged-config
+# API-key path is actually exercised rather than silently skipped.
+mkdir -p "$PROXY_DIR/proxy"
+cp "$REAL_CONFIG_DIR/proxy/config_merge.py" "$PROXY_DIR/proxy/config_merge.py"
+
+# Effective server-level value from the MERGED profile (base config.yaml +
+# the mode overlay). Mode files are overlays that no longer repeat inherited
+# values, so a raw grep would miss base-declared keys such as
+# local_model_ctx_size / session_slot_pool_size.
 server_val() {
-    grep -E "^  ${2}:" "$1" | head -1 | sed "s/.*${2}: *//" | tr -d '[:space:]'
+    /usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '$REAL_CONFIG_DIR/proxy')
+from config_merge import load_merged
+cfg = load_merged('$REAL_CONFIG_DIR/config.yaml', '$1')
+print(cfg.get('server', {}).get('$2', ''))
+"
 }
 
 CHEAP_SLOTS="$(server_val "$REAL_CONFIG_DIR/config-cheap.yaml" session_slot_pool_size)"
@@ -271,9 +286,8 @@ test_invalid_mode() {
 # ---- Test 6: API-key resolution reads the SELECTED config ------------------
 test_api_keys_resolve_from_selected_config() {
     echo "--- Test: API-key resolution reads the selected config ---"
-    # config-cheap.yaml has no api_key_env -> resolve_api_keys must succeed
-    # even though config-fast.yaml carries one (cheap must not fail on
-    # missing cloud keys).
+    # The sandbox profiles declare no api_key_env -> resolve_api_keys must
+    # succeed in cheap mode even though the fast fixture exists.
     cat >> "$PROXY_DIR/config-fast.yaml" <<'YAML'
     # api_key_env marker: OPENCODE_API_KEY (must NOT be required in cheap mode)
 YAML
@@ -289,6 +303,45 @@ YAML
     # rich fast fixture carries the real ctx/policy/threshold values that
     # later tests (per-slot context) assert on)
     cp "$PROXY_DIR/config-fast.yaml.pristine" "$PROXY_DIR/config-fast.yaml"
+}
+
+# ---- Test 9: base-declared api_key_env is read from the merged config ------
+test_api_keys_from_merged_base() {
+    echo "--- Test: api_key_env declared only in the base config is detected ---"
+    # The mode overlays no longer repeat api_key_env entries; a regression to
+    # raw-mode-file reads would silently miss this base-only key.
+    cp "$PROXY_DIR/config.yaml" "$PROXY_DIR/config.yaml.bak"
+    cat > "$PROXY_DIR/config.yaml" <<YAML
+models:
+  test:
+    providers:
+      - name: local
+        type: local
+        llama_model: Test
+  only-base:
+    providers:
+      - name: missing-remote
+        type: remote
+        endpoint: https://example.invalid
+        api_key_env: TEST_MERGE_MISSING_KEY_XYZ
+server:
+  session_slot_pool_size: $BASE_SLOTS
+YAML
+    printf 'fast\n' > "$PROXY_DIR/.mode"
+    local out
+    out=$(run_script)
+    if echo "$out" | grep -q "TEST_MERGE_MISSING_KEY_XYZ"; then
+        pass "base-only api_key_env detected via the merged config"
+    else
+        fail "base-only api_key_env not detected: $out"
+    fi
+    if echo "$out" | grep -q "FAKE_UVICORN"; then
+        fail "proxy started despite a genuinely missing API key"
+    else
+        pass "startup aborted on the genuinely missing API key"
+    fi
+    cp "$PROXY_DIR/config.yaml.bak" "$PROXY_DIR/config.yaml"
+    rm -f "$PROXY_DIR/config.yaml.bak"
 }
 
 # ---- Test 7: per-slot context matches provider.py formula -----------------
@@ -346,5 +399,6 @@ test_missing_mode
 test_missing_mode_config_fallback
 test_invalid_mode
 test_api_keys_resolve_from_selected_config
+test_api_keys_from_merged_base
 test_per_slot_context
 test_web_ui_slots_text

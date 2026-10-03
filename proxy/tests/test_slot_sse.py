@@ -574,27 +574,109 @@ class TestSlotProgressCache:
         assert result[0]["generation_done"] is False
 
     def test_enrich_detects_generation_complete(self):
-        """When n_tokens is stable for > 3s, sets generation_done=True."""
+        """When n_tokens is stable for > 3s at prefill completion, sets
+        generation_done=True (WL-0MSZVB902004AZZN: completion requires
+        prefill to be complete too).
+        """
         from proxy.observability import (
             _enrich_slot_details_with_progress,
             _slot_progress_cache,
             _slot_stable_tracker,
         )
         self._clear_stable_tracker()
-        # First call: seed the tracker
-        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.99, "timestamp": 1000.0}
+        # First call: seed the tracker at 100% prefill (progress=1.0)
+        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 1.0, "timestamp": 1000.0}
         slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 4096}]
         with _patch_time(1000.0):
             result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["generation_done"] is False  # first sighting
 
         # Second call: same n_tokens, 4s later (past the 3s threshold)
-        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 0.99, "timestamp": 1004.0}
+        _slot_progress_cache[3] = {"n_tokens": 4096, "progress": 1.0, "timestamp": 1004.0}
         slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 4096}]
         with _patch_time(1004.0):
             result = _enrich_slot_details_with_progress(slot_details)
         assert result[0]["generation_done"] is True
         assert result[0]["is_processing"] is False  # overridden to False
+
+    def test_enrich_keeps_prefill_progress_while_tokens_stable(self):
+        """WL-0MSZVB902004AZZN: a prefill-phase pause must NOT read as complete.
+
+        During prompt prefill, n_tokens can pause for >3s while the batch is
+        still being processed. The slot must stay in the 'Processed x of y'
+        state (generation_done=False) until prefill is within 20 tokens of
+        total, otherwise the UI flips to 'Working' and back again.
+        """
+        from proxy.observability import (
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
+        )
+        self._clear_stable_tracker()
+        # First sighting: 2000 of 4000 tokens prefilled
+        _slot_progress_cache[3] = {"n_tokens": 2000, "progress": 0.5, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 2000}]
+        with _patch_time(1000.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["generation_done"] is False
+
+        # Second sighting: n_tokens stable for 5s, but prefill is far from done
+        _slot_progress_cache[3] = {"n_tokens": 2000, "progress": 0.5, "timestamp": 1005.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 2000}]
+        with _patch_time(1005.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["generation_done"] is False
+        assert result[0]["is_processing"] is True
+        assert result[0]["n_tokens"] == 2000
+        assert result[0]["total_tokens"] == 4000
+
+    def test_enrich_complete_within_20_tokens_of_total(self):
+        """WL-0MSZVB902004AZZN AC1: at or within 20 tokens of total is complete.
+
+        993 of 1000 tokens is 7 short of total, so stable n_tokens means
+        generation is genuinely done and 'Working' may be shown.
+        """
+        from proxy.observability import (
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
+        )
+        self._clear_stable_tracker()
+        _slot_progress_cache[3] = {"n_tokens": 993, "progress": 0.993, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 993}]
+        with _patch_time(1000.0):
+            _enrich_slot_details_with_progress(slot_details)
+
+        _slot_progress_cache[3] = {"n_tokens": 993, "progress": 0.993, "timestamp": 1004.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 993}]
+        with _patch_time(1004.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["total_tokens"] == 1000
+        assert result[0]["generation_done"] is True
+        assert result[0]["is_processing"] is False
+
+    def test_enrich_not_complete_21_tokens_short_of_total(self):
+        """WL-0MSZVB902004AZZN AC1 boundary: 21 short of total is NOT complete.
+
+        The threshold is 'within 20', so 979 of an adjusted 1000-token total
+        (21 short) must remain in the prefill-increment state.
+        """
+        from proxy.observability import (
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
+        )
+        self._clear_stable_tracker()
+        # progress chosen so total_tokens rounds to exactly 1000
+        _slot_progress_cache[3] = {"n_tokens": 979, "progress": 0.979, "timestamp": 1000.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 979}]
+        with _patch_time(1000.0):
+            _enrich_slot_details_with_progress(slot_details)
+
+        _slot_progress_cache[3] = {"n_tokens": 979, "progress": 0.979, "timestamp": 1004.0}
+        slot_details = [{"slot_id": 3, "is_processing": True, "n_decoded": 979}]
+        with _patch_time(1004.0):
+            result = _enrich_slot_details_with_progress(slot_details)
+        assert result[0]["total_tokens"] == 1000
+        assert result[0]["generation_done"] is False
+        assert result[0]["is_processing"] is True
 
     def test_enrich_ignores_stale_progress(self):
         """Ignores progress data older than 60 seconds."""

@@ -7,7 +7,9 @@ Uses lazy server import (_srv()) to avoid circular imports.
 
 import asyncio
 import json
+import math
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -380,6 +382,174 @@ async def status_events():
 
 
 
+def _read_last_n_lines(log_path: Path, n: int) -> tuple[str, int]:
+    """Read the last *n* lines of *log_path*.
+
+    Returns ``(text, end_offset)`` where ``end_offset`` is the file size at the
+    moment of the read.  Following from ``end_offset`` guarantees no appended
+    line is skipped, even one written between the read and the next poll.
+    """
+    with open(log_path, "rb") as f:
+        f.seek(0, 2)
+        end_offset = f.tell()
+        filesize = end_offset
+        block_size = 1024
+        data = b""
+        # Read backwards until we have enough lines or hit BOF
+        while filesize > 0 and data.count(b"\n") <= n:
+            read_size = min(block_size, filesize)
+            f.seek(filesize - read_size)
+            chunk = f.read(read_size)
+            data = chunk + data
+            filesize -= read_size
+        lines_bytes = data.splitlines()[-n:]
+        return b"\n".join(lines_bytes).decode("utf-8", errors="replace"), end_offset
+
+
+def _sse_headers() -> dict:
+    return {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+
+async def _sse_tail_logs(
+    srv,
+    sources: list[str],
+    lines: int,
+    slot: int | None = None,
+    session: str | None = None,
+):
+    """Yield SSE ``data:`` chunks tailing one or more log sources.
+
+    ``sources`` is a list of ``"proxy"`` / ``"llama"`` names.  When ``slot`` is
+    provided every streamed line is filtered to that slot (via
+    :mod:`proxy.slot_log_filter`) and each message carries a ``slot`` field, so
+    a single connection can serve one slot's proxy **and** llama panes.
+
+    The follow loop polls each file for appended data regardless of whether a
+    counts/tokens update was forwarded this iteration.  The update fast path
+    must not starve the file checks: during active generation the counts queue
+    is continuously non-empty, and the previous ``continue`` meant no log lines
+    were ever streamed (LP-0MUJZHTCN006IZRW).
+    """
+    from proxy.slot_log_filter import filter_log_lines_for_slot, line_matches_slot
+
+    def _filter_initial(text: str, source: str) -> str:
+        if slot is None:
+            return text
+        kept = filter_log_lines_for_slot(
+            text.splitlines() if text else [],
+            slot,
+            session_id=session,
+            source=source,
+        )
+        return "\n".join(kept)
+
+    _local_counts_queue = None
+    try:
+        # Each entry is [source, log_path, last_pos]
+        entries: list[list] = []
+        for source in sources:
+            log_path = srv._resolve_log_path(source)
+            if not log_path.exists():
+                err = {"error": "log_not_found", "path": str(log_path), "source": source}
+                if slot is not None:
+                    err["slot"] = slot
+                yield f"data: {json.dumps(err)}\n\n"
+                continue
+
+            initial, end_offset = await asyncio.to_thread(_read_last_n_lines, log_path, lines)
+            initial = _filter_initial(initial, source)
+            msg = {"initial": initial, "source": source}
+            if slot is not None:
+                msg["slot"] = slot
+            yield f"data: {json.dumps(msg)}\n\n"
+            # Follow from the exact end offset of the initial read, so a line
+            # appended in between is still streamed.
+            entries.append([source, log_path, end_offset])
+
+        if not entries:
+            return
+
+        # Register for counts updates
+        counts_queue: asyncio.Queue | None = None
+        try:
+            counts_queue = asyncio.Queue(maxsize=10)
+            srv.log_tail_clients.add(counts_queue)
+        except Exception:
+            counts_queue = None
+        _local_counts_queue = counts_queue
+
+        while True:
+            # Wait briefly for any counts/tokens updates to arrive on the queue.
+            try:
+                update = None
+                if _local_counts_queue is not None:
+                    try:
+                        update = await asyncio.wait_for(_local_counts_queue.get(), timeout=0.25)
+                    except TimeoutError:
+                        update = None
+                else:
+                    await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                break
+
+            if update is not None:
+                # Forward counts/tokens promptly, then fall through to the file
+                # checks below — do NOT `continue` (that starves the tail).
+                try:
+                    yield f"data: {json.dumps(update)}\n\n"
+                except Exception:
+                    pass
+
+            sent_any = False
+            for entry in entries:
+                source, log_path, last_pos = entry
+                try:
+                    cur_stat = log_path.stat()
+                except FileNotFoundError:
+                    # File disappeared; notify and exit (the client's
+                    # EventSource reconnects and re-reads the initial block).
+                    yield f"data: {json.dumps({'info': 'log_rotated_or_removed', 'source': source})}\n\n"
+                    return
+
+                cur_size = cur_stat.st_size
+                if cur_size < last_pos:
+                    # File truncated/rotated
+                    last_pos = 0
+
+                if cur_size > last_pos:
+                    try:
+                        with open(log_path, encoding="utf-8", errors="replace") as f:
+                            f.seek(last_pos)
+                            new = f.read()
+                    except OSError:
+                        continue
+                    last_pos = cur_size
+                    entry[2] = last_pos
+                    for line in new.splitlines():
+                        if slot is not None and not line_matches_slot(line, slot, session_id=session, source=source):
+                            continue
+                        msg = {"line": line, "source": source}
+                        if slot is not None:
+                            msg["slot"] = slot
+                        yield f"data: {json.dumps(msg)}\n\n"
+                        sent_any = True
+
+            if not sent_any:
+                # No new file data; send keepalive
+                yield ": keepalive\n\n"
+    finally:
+        # Cleanup
+        try:
+            if _local_counts_queue is not None:
+                srv.log_tail_clients.discard(_local_counts_queue)
+        except Exception:
+            pass
+
+
 async def tail_logs(
     request: Request,
     lines: int = 100,
@@ -404,150 +574,37 @@ async def tail_logs(
     `lines` lines, then streams new lines as they are appended with key
     `line`. Includes a `source` field to identify which log the data belongs to.
     """
-    # Validate source parameter
     srv = _srv()
     if source not in ("proxy", "llama"):
         source = "proxy"
-
-    log_path = srv._resolve_log_path(source)
-
-    # Optional per-slot relevance filter (slot-aware /logs/tail).
-    from proxy.slot_log_filter import filter_log_lines_for_slot, line_matches_slot
-
-    def filter_lines(text: str) -> str:
-        if slot is None:
-            return text
-        kept = filter_log_lines_for_slot(
-            text.splitlines() if text else [], slot, session_id=session, source=source
-        )
-        return "\n".join(kept)
-
-    async def event_generator():
-        # local reference to counts queue for cleanup in finally - ensure always defined
-        _local_counts_queue = None
-
-        try:
-            if not log_path.exists():
-                err = {"error": "log_not_found", "path": str(log_path)}
-                yield f"data: {json.dumps(err)}\n\n"
-                return
-
-            # Helper to read last N lines in a thread
-            def read_last_n(n: int) -> str:
-                # Read in binary for efficient seeking
-                with open(log_path, "rb") as f:
-                    f.seek(0, 2)
-                    filesize = f.tell()
-                    block_size = 1024
-                    data = b""
-                    # Read backwards until we have enough lines or hit BOF
-                    while filesize > 0 and data.count(b"\n") <= n:
-                        read_size = min(block_size, filesize)
-                        f.seek(filesize - read_size)
-                        chunk = f.read(read_size)
-                        data = chunk + data
-                        filesize -= read_size
-                    lines_bytes = data.splitlines()[-n:]
-                    return b"\n".join(lines_bytes).decode("utf-8", errors="replace")
-
-            # Send initial block of lines
-            initial = await asyncio.to_thread(read_last_n, lines)
-            initial = filter_lines(initial)
-            msg = {"initial": initial, "source": source}
-            if slot is not None:
-                msg["slot"] = slot
-            yield f"data: {json.dumps(msg)}\n\n"
-
-            # Register for counts updates
-            counts_queue: asyncio.Queue | None = None
-            try:
-                counts_queue = asyncio.Queue(maxsize=10)
-                srv.log_tail_clients.add(counts_queue)
-            except Exception:
-                counts_queue = None
-
-            # Start following the file
-            last_pos = log_path.stat().st_size
-            # local reference to the counts queue
-            _local_counts_queue = counts_queue if counts_queue is not None else None
-
-            while True:
-                # If client disconnected, stop
-                if await asyncio.sleep(0):
-                    pass
-
-                # Small sleep / wait for counts updates to avoid busy loop
-                try:
-                    # Wait briefly for any counts/tokens updates to arrive on the queue.
-                    update = None
-                    if _local_counts_queue is not None:
-                        try:
-                            update = await asyncio.wait_for(_local_counts_queue.get(), timeout=0.25)
-                        except TimeoutError:
-                            update = None
-                    else:
-                        await asyncio.sleep(0.25)
-                except asyncio.CancelledError:
-                    break
-
-                # If we got an update, send it immediately and continue (don't wait for file checks)
-                if update is not None:
-                    try:
-                        yield f"data: {json.dumps(update)}\n\n"
-                    except Exception:
-                        pass
-                    continue
-                # If file was rotated/recreated, reset position
-                try:
-                    cur_stat = log_path.stat()
-                except FileNotFoundError:
-                    # File disappeared; notify and exit
-                    yield f"data: {json.dumps({'info': 'log_rotated_or_removed', 'source': source})}\n\n"
-                    break
-
-                cur_size = cur_stat.st_size
-                if cur_size < last_pos:
-                    # File truncated/rotated
-                    last_pos = 0
-
-                if cur_size > last_pos:
-                    # Read new data
-                    with open(log_path, encoding="utf-8", errors="replace") as f:
-                        f.seek(last_pos)
-                        new = f.read()
-                    last_pos = cur_size
-
-                    # Send each new line as its own SSE message
-                    for line in new.splitlines():
-                        if slot is not None and not line_matches_slot(
-                            line, slot, session_id=session, source=source
-                        ):
-                            continue
-                        msg = {"line": line, "source": source}
-                        if slot is not None:
-                            msg["slot"] = slot
-                        yield f"data: {json.dumps(msg)}\n\n"
-                else:
-                    # No new file data; send keepalive
-                    yield ": keepalive\n\n"
-        finally:
-            # Cleanup
-            try:
-                if _local_counts_queue is not None:
-                    srv.log_tail_clients.discard(_local_counts_queue)
-            except Exception:
-                pass
-            return
-
     return StreamingResponse(
-        event_generator(),
+        _sse_tail_logs(srv, [source], lines, slot=slot, session=session),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=_sse_headers(),
     )
+
+
+async def tail_slot_logs(
+    request: Request,
+    lines: int = 100,
+    slot: int = 0,
+    session: str | None = None,
+):
+    """Stream **both** proxy.log and llama-server.log for one slot.
+
+    One SSE connection carries the slot's proxy pane *and* its llama pane
+    (messages tagged with ``source``), so the Slots tab uses a single connection
+    per slot instead of two.  This keeps the page within the browser's
+    per-origin HTTP/1.1 connection budget (LP-0MUJZHTCN006IZRW).
+    """
+    srv = _srv()
+    return StreamingResponse(
+        _sse_tail_logs(srv, ["proxy", "llama"], lines, slot=slot, session=session),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
+
+
 
 
 
@@ -1024,6 +1081,15 @@ async def _do_proxy_openai_api(
             # ``max_seconds`` defaults to 30 s — a short safety cap; the
             # gate normally clears much earlier when backends are ready.
             #
+            # LP-0MU9Z7O8M0053Y0K: the 503 body advertises the ramp end as
+            # ``ramp_ends_at`` (ISO-8601 UTC, the guaranteed ceiling =
+            # process start + ``max_seconds``) and
+            # ``ramp_remaining_seconds`` (whole seconds remaining), and the
+            # ``message`` states both.  ``ramp_ends_at`` is an upper bound,
+            # not a prediction of the early-clear instant, which is
+            # unknowable while ``backend_ready`` is False; ``retry_after``
+            # and the ``Retry-After`` header keep their jittered semantics.
+            #
             # LP-0MUAY9AMS002O2ZO: only block requests that would
             # actually dispatch locally — if the model has remote
             # providers in its fallback chain the request will
@@ -1075,11 +1141,29 @@ async def _do_proxy_openai_api(
                             jitter_max = ramp_cfg.get("jitter_max", 15.0)
                             retry_after = _random_mod.uniform(jitter_min, jitter_max)
                             remaining = ramp_cfg["max_seconds"] - elapsed
+                            # LP-0MU9Z7O8M0053Y0K: advertise when the ramp
+                            # ends.  ``ramp_ends_at`` is the guaranteed
+                            # ceiling (process start + ``max_seconds``), not
+                            # the early-clear instant, which is unknowable
+                            # while ``backend_ready`` is False.  Both fields
+                            # derive from the same rounded integer
+                            # (``ceil``, clamped at 0) so they stay
+                            # internally consistent.
+                            ramp_remaining_seconds = max(0, math.ceil(remaining))
+                            ramp_ends_at = (
+                                datetime.now(UTC)
+                                + timedelta(seconds=ramp_remaining_seconds)
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
                             srv.logger.info(
                                 "Startup ramp: deferring chat request "
                                 "(elapsed=%.1fs, remaining=%.1fs, "
+                                "ramp_ends_at=%s, ramp_remaining_seconds=%ds, "
                                 "backend_ready=False, retry_after=%.0fs)",
-                                elapsed, remaining, retry_after,
+                                elapsed,
+                                remaining,
+                                ramp_ends_at,
+                                ramp_remaining_seconds,
+                                retry_after,
                             )
                             return JSONResponse(
                                 status_code=503,
@@ -1088,11 +1172,15 @@ async def _do_proxy_openai_api(
                                         "type": "startup_ramp",
                                         "code": "startup_ramp",
                                         "message": (
-                                            "Server is starting up; retry shortly."
+                                            "Server is starting up; the ramp "
+                                            f"ends at {ramp_ends_at} "
+                                            f"(about {ramp_remaining_seconds}s)."
                                         ),
                                     },
                                     "status": 503,
                                     "retry_after": int(retry_after + 3),  # +margin
+                                    "ramp_ends_at": ramp_ends_at,
+                                    "ramp_remaining_seconds": ramp_remaining_seconds,
                                 },
                                 headers={
                                     "Retry-After": str(int(retry_after + 3)),

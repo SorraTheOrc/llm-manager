@@ -4301,6 +4301,12 @@ class _FakeDatetime:
     def now(cls, tz=None):
         return cls._now
 
+    @classmethod
+    def fromtimestamp(cls, ts, tz=None):
+        # Delegated to the real datetime so quarantine reset timestamps
+        # (LP-0MU56ZFII004L7OO tests) still format as ISO-8601.
+        return datetime.fromtimestamp(ts, tz)
+
 
 def _patch_utc_now(dt):
     _FakeDatetime._now = dt
@@ -4540,10 +4546,12 @@ async def test_remote_fallback_all_time_window_skipped_distinguishable_503():
     assert call_log == [], "No provider should have been called"
     assert result.status_code == 503
     body = json.loads(result.body)
-    assert body["error"] == (
-        "All providers unavailable: no provider is available during the current scheduled time window"
-    ), f"Expected time-window message, got: {body}"
-    assert "All providers exhausted" not in result.body.decode("utf-8")
+    # LP-0MU56ZM0K005F69G: the stable code carries the discriminator; the
+    # window-specific prose moves to ``detail`` and ``error`` is the
+    # client-recognised generic string.
+    assert body["error"] == "All providers exhausted", f"got: {body}"
+    assert body["code"] == "outside_time_window", f"got: {body}"
+    assert "scheduled time window" in body["detail"], f"got: {body}"
     diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
@@ -4696,14 +4704,99 @@ async def test_proxy_with_fallback_all_time_window_skipped_distinguishable_503()
     assert call_log == [], "No provider should have been called"
     assert result.status_code == 503
     body = json.loads(result.body)
-    assert body["error"] == (
-        "All providers unavailable: no provider is available during the current scheduled time window"
-    ), f"Expected time-window message, got: {body}"
-    assert "All providers exhausted" not in result.body.decode("utf-8")
+    assert body["error"] == "All providers exhausted", f"got: {body}"
+    assert body["code"] == "outside_time_window", f"got: {body}"
+    assert "scheduled time window" in body["detail"], f"got: {body}"
     diag_statuses = [a.get("status") for a in body.get("diagnostics", [])]
     assert diag_statuses == ["outside_time_window", "outside_time_window"], (
         f"Expected outside_time_window diagnostics, got: {body.get('diagnostics')}"
     )
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_window_plus_quarantine_returns_generic():
+    """LP-0MU56ZFII004L7OO AC1: a usage-limit quarantined provider mixed with
+    window-skipped providers must produce the generic exhausted response, not
+    the time-window-specific message, while diagnostics still expose both
+    reasons."""
+    request = _DummyRequest()
+    cfg = {"provider_cooldown_seconds": 60}
+    quarantined = {
+        "name": "quarantined",
+        "type": "remote",
+        "endpoint": "https://quota.example/v1",
+        "api_key_env": "QUOTA_KEY",
+        "model": "m1",
+        "available_times": ["00:00-01:00"],
+    }
+    model_config = {
+        "providers": [
+            quarantined,
+            {"name": "timed", "type": "remote", "available_times": ["00:00-01:00"]},
+        ]
+    }
+    provider._usage_reset_at[provider._usage_limit_account_key(quarantined)] = (
+        time.time() + 3600
+    )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        raise AssertionError("No provider should be called")
+
+    with _patch_utc_now(_FIXED_NOW_13_UTC), \
+         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", model_config, cfg
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["error"] == "All providers exhausted", (
+        f"Quarantine+window mix must be generic, got: {body}"
+    )
+    statuses = {a.get("provider"): a.get("status") for a in body.get("diagnostics", [])}
+    assert statuses["quarantined"] == "usage_limit_reset"
+    assert statuses["timed"] == "outside_time_window"
+
+
+def test_time_window_response_suppressed_by_local_skip():
+    """LP-0MU56ZFII004L7OO AC4: when a local provider was skipped for a
+    non-window reason (recorded as a local/compaction skip diagnostic), the
+    window-specific response must not be emitted."""
+    attempts = [
+        {"provider": "local", "type": "local", "status": "cached_tokens_skip",
+         "reason": "cold_cache"},
+        {"provider": "remote", "type": "remote", "status": "outside_time_window"},
+    ]
+    result = provider._build_time_window_exhausted_response(
+        attempts, {}, False,
+        model_config={
+            "providers": [
+                {"name": "local", "type": "local"},
+                {"name": "remote", "type": "remote"},
+            ]
+        },
+    )
+    assert result is None
+
+
+def test_time_window_response_suppressed_by_unrecorded_provider_skip():
+    """LP-0MU56ZFII004L7OO: a provider that was skipped without a recorded
+    window diagnostic (e.g. a router-level local/compaction skip) suppresses
+    the window-specific response."""
+    attempts = [
+        {"provider": "remote", "type": "remote", "status": "outside_time_window"},
+    ]
+    result = provider._build_time_window_exhausted_response(
+        attempts, {}, False,
+        model_config={
+            "providers": [
+                {"name": "local", "type": "local"},
+                {"name": "remote", "type": "remote"},
+            ]
+        },
+    )
+    assert result is None
+
 
 # ===================================================================
 # Additional 2-retry tests (LP-0MSORQKKM005MJ31)
@@ -5045,3 +5138,222 @@ def test_empty_response_local_provider_unaffected():
             assert cooldown == 5.0, (
                 f"Local provider should use cooldown_seconds=5, got {cooldown}"
             )
+
+
+# ===================================================================
+# AC4: Local exemption from sibling-fallback circuit breaker
+# AC3: Local fallback recovery after empty responses
+# ===================================================================
+
+
+class TestLocalSiblingFallbackExemption:
+    """Local providers are exempt from the sibling-fallback quarantine.
+
+    AC4: A local provider with repeated empty responses never yields a
+    600s unavailability, while an identical remote provider does.
+    AC3:  Recovery after local empties works — a subsequent success resets
+          the streak and the provider becomes eligible again.
+    """
+
+    def _make_local_config(self) -> dict:
+        return {
+            "server": {
+                "empty_response_max_cooldown_seconds": 10.0,
+                "sibling_fallback_threshold": 2,
+            }
+        }
+
+    # -- AC4: local exempt, remote still quarantined -------------------
+
+    def test_local_provider_never_quarantined_by_sibling_breaker(self):
+        """provider_type='local' with repeated empty responses never
+        triggers a 600s sibling-fallback cooldown (AC4)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        local_cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0), \
+             patch('time.time', return_value=1000.0):
+            for i in range(10):
+                result = provider._record_sibling_failure(
+                    "local-qwen3",
+                    local_cfg,
+                    brand="local-qwen3",
+                    provider_type="local",
+                )
+                assert result is False, (
+                    f"Local should never return True at iteration {i}"
+                )
+                assert not provider._is_provider_unavailable(
+                    "local-qwen3"
+                ), f"local-qwen3 should not be unavailable at iteration {i}"
+
+    def test_local_no_streak_increment(self):
+        """provider_type='local' does not increment the consecutive-failure
+        streak for the sibling breaker (AC4)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        local_cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0):
+            provider._record_sibling_failure(
+                "local-test",
+                local_cfg,
+                provider_type="local",
+            )
+            provider._record_sibling_failure(
+                "local-test",
+                local_cfg,
+                provider_type="local",
+            )
+        # The streak dict should not contain the local provider
+        assert (
+            "local-test" not in provider._sibling_failure_count
+        ), "Local provider streak should not be incremented"
+
+    def test_remote_provider_still_quarantined(self):
+        """Remote providers under identical input still get the extended
+        cooldown (AC2, AC4 — regression guard)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        remote_cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0), \
+             patch('time.time', return_value=1000.0):
+            provider._record_sibling_failure(
+                "opencode-go",
+                remote_cfg,
+                brand="opencode-go",
+                provider_type="remote",
+            )
+            result = provider._record_sibling_failure(
+                "opencode-go",
+                remote_cfg,
+                brand="opencode-go",
+                provider_type="remote",
+            )
+            assert result is True, (
+                "Remote provider should trigger extended cooldown at threshold"
+            )
+            remaining = provider._provider_cooldown_remaining("opencode-go")
+            assert remaining >= 590 and remaining <= 610, (
+                f"Expected ~600s cooldown for remote, got {remaining}s"
+            )
+
+    def test_local_vs_remote_side_by_side(self):
+        """Identical inputs: local exempt, remote quarantined (AC4
+        regression)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0), \
+             patch('time.time', return_value=1000.0):
+            # Remote: threshold=2, triggers at 2nd call
+            provider._record_sibling_failure(
+                "remote-a", cfg, provider_type="remote",
+            )
+            assert not provider._is_provider_unavailable("remote-a")
+            provider._record_sibling_failure(
+                "remote-a", cfg, provider_type="remote",
+            )
+            assert provider._is_provider_unavailable("remote-a")
+
+            # Local: same threshold, never triggers
+            provider._record_sibling_failure(
+                "local-a", cfg, provider_type="local",
+            )
+            assert not provider._is_provider_unavailable("local-a")
+            provider._record_sibling_failure(
+                "local-a", cfg, provider_type="local",
+            )
+            assert not provider._is_provider_unavailable("local-a")
+            provider._record_sibling_failure(
+                "local-a", cfg, provider_type="local",
+            )
+            assert not provider._is_provider_unavailable("local-a")
+
+    # -- AC3: local recovery after empties ----------------------------
+
+    def test_local_recovery_after_empty_responses(self):
+        """Consecutive local empties followed by a successful recovery
+        works normally (AC3)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        local_cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0), \
+             patch('time.time', return_value=1000.0):
+            # Two empty responses from local
+            provider._record_sibling_failure(
+                "local-recover", local_cfg, provider_type="local",
+            )
+            provider._record_sibling_failure(
+                "local-recover", local_cfg, provider_type="local",
+            )
+            # A success resets the streak
+            provider._reset_sibling_failure_count("local-recover")
+            # Provider should be available
+            assert not provider._is_provider_unavailable("local-recover")
+            # A subsequent single failure should NOT trigger cooldown
+            with patch('time.monotonic', return_value=1010.0), \
+                 patch('time.time', return_value=1010.0):
+                result = provider._record_sibling_failure(
+                    "local-recover", local_cfg, provider_type="local",
+                )
+                assert result is False
+                assert not provider._is_provider_unavailable("local-recover")
+
+    # -- Backward compatibility (existing tests must still pass) -------
+
+    def test_provider_type_none_defaults_to_remote(self):
+        """provider_type=None (default) preserves existing behaviour —
+        remote semantics (backward compat for existing callers)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0), \
+             patch('time.time', return_value=1000.0):
+            # No provider_type arg — behaves as remote
+            provider._record_sibling_failure("old-style", cfg)
+            assert provider._record_sibling_failure("old-style", cfg) is True
+            assert provider._is_provider_unavailable("old-style")
+
+    def test_brand_still_quarantined_for_remote(self):
+        """When threshold trips on a remote provider, brand is still
+        quarantined alongside the entry (existing behaviour)."""
+        provider._sibling_failure_count.clear()
+        provider._sibling_failure_streak_start.clear()
+        provider._provider_failure_count.clear()
+        provider._provider_unavailable_until.clear()
+
+        cfg = self._make_local_config()
+        with patch('time.monotonic', return_value=1000.0), \
+             patch('time.time', return_value=1000.0):
+            provider._record_sibling_failure(
+                "opencode-go-2",
+                cfg,
+                brand="opencode-go",
+                provider_type="remote",
+            )
+            assert provider._record_sibling_failure(
+                "opencode-go-2",
+                cfg,
+                brand="opencode-go",
+                provider_type="remote",
+            ) is True
+            assert provider._is_provider_unavailable("opencode-go-2")
+            assert provider._is_provider_unavailable("opencode-go")

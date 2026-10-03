@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Per-Mode Slot Counts**: Each operating-mode profile (`config.yaml` / `config-fast.yaml` / `config-cheap.yaml`) defines its own local llama-server slot count via `session_slot_pool_size` — one definition per mode, no time-based slot schedule. See [Slot configuration](#slot-configuration) below.
+- **Base + overlay config model**: `config.yaml` is the authoritative base; `config-fast.yaml` / `config-cheap.yaml` are overlays deep-merged on top of it by `load_config()`. The resolved profile defines its local llama-server slot count via `session_slot_pool_size` (fast inherits 1 from the base, cheap overrides 3) — no time-based slot schedule. See [Config model: base + mode overlays](#config-model-base--mode-overlays) and [Slot configuration](#slot-configuration) below.
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -599,11 +599,50 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
-- **State**: Cooldown state is in-memory only and resets when the proxy restarts
+- **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8)**: A 429 usage-limit error (`GoUsageLimitError`, or a `FreeUsageLimitError` carrying a reset time) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** `Resets in …` duration is honoured in full (plus a 2-minute margin). A **guessed** duration — derived from `metadata.limitName` alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
+- **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as
   unavailable until the cooldown expires. Multi-worker deployments (multiple
   proxy processes) have independent cooldown state per worker.
+
+##### Provider Availability Persistence (LP-0MUI6KB67005X44B)
+
+Provider availability state — the per-provider/brand cooldown and the
+usage-limit account quarantine — is persisted across proxy restarts so a
+restart does not re-expose an already-exhausted upstream account and emit a
+fresh HTTP 429.
+
+- **State file**: `proxy/provider-state.json`, beside `proxy/.mode` and
+  `proxy/grandfathering-state.json` (gitignored runtime state).
+- **Persisted**: the provider/brand/entry/failure-domain cooldowns
+  (`_provider_unavailable_until`) and the **explicit-duration** usage-limit
+  account quarantine (`_usage_reset_at`). Absolute epoch expiries are written,
+  so wall-clock time is the source of truth across the restart boundary — a
+  restart neither extends nor resets a cooldown/quarantine. **Guessed**
+  (period-name-only) quarantines are deliberately excluded: a `limitName` is
+  weak evidence and must not survive a restart as a long-lived lockout
+  (LP-0MUQTCMW2001VXH8).
+- **Written**: atomically (temp file + `os.replace`) on every availability
+  mutation — the cold path (a provider failing or an upstream 429). Already
+  expired entries are omitted from the payload. A write failure is logged and
+  ignored; it never breaks routing.
+- **Restored**: at startup, alongside the request/token counters. Expired
+  entries are dropped at load and the number of restored entries is logged at
+  INFO (`provider-state: restored N cooldown entries and M usage-limit
+  quarantine entries`). A missing, corrupt or unparsable state file is handled
+  safely: the maps start empty and a warning is logged; startup is never
+  blocked.
+- **Not persisted**: `_provider_failure_count` (the exponential-backoff
+  failure counter) and the sibling-failure / local-400 streak state. Backoff
+  deliberately restarts at its base interval after a restart; those counters
+  are cheap to re-learn and persisting them would over-extend transient
+  backoff.
+- **Override**: set `LLAMA_PROXY_PROVIDER_STATE_FILE` to use a different path
+  (used by tests).
+- **Scope**: the state is per proxy process. A single proxy instance per host
+  is assumed; two processes sharing one state file would be last-writer-wins
+  (there is no file locking).
 
 ##### Cross-Request Stall Circuit Breaker (Tier 3)
 
@@ -624,7 +663,9 @@ repeatedly across requests is quarantined after the threshold is exceeded.
   - `server.upstream_stall_window_seconds` (default: 300)
   - `server.upstream_stall_threshold` (default: 3)
   - `server.upstream_stall_cooldown_seconds` (default: 180)
-- **State**: In-memory only, resets on proxy restart. Shared across all sessions.
+- **State**: The stall sliding-window counters are in-memory only and reset on
+  proxy restart; a triggered cooldown expiry is persisted via the shared
+  Provider Availability Persistence state above. Shared across all sessions.
 - **Integration**: Uses the same `mark_provider_unavailable()` mechanism as Tier 2.
   Stalls during cooldown are recorded but do not extend the cooldown.
 
@@ -653,9 +694,29 @@ every turn) routed remote invisibly turn after turn.
 #### All Providers Exhausted
 
 When all providers are exhausted:
-- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 (Too Many Requests) with `Content-Type: text/plain` and body `"Model server busy: 0/<total_slots> slots available. Retry later."` (no `Retry-After` header).
-- **Other errors**: Returns HTTP 503 with JSON body containing `retry_after` field.
-- **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable — `error` is `"All providers unavailable: no provider is available during the current scheduled time window"` and the `diagnostics` entries carry `status: "outside_time_window"` instead of the generic `"All providers exhausted"`. Mixed cases (a provider in cooldown or an error plus a time-window skip) keep the generic message, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible.
+- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 with a JSON body `{"error": "All providers exhausted", "code": "all_slots_exhausted", "message": "Model server busy: 0/<total_slots> slots available. Retry later."}` (no `Retry-After` header).
+- **Other errors**: Returns HTTP 503 with a JSON body containing `error: "All providers exhausted"`, a stable `code`, and `retry_after`.
+- **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable by `code: "outside_time_window"`; the window-specific prose lives in `detail`, while `error` stays the client-recognised `"All providers exhausted"`. The `diagnostics` entries carry `status: "outside_time_window"`. Mixed cases (a provider in cooldown, a usage-limit quarantine, or an error plus a time-window skip) keep the generic `code: "all_exhausted"` response, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible (LP-0MU56ZM0K005F69G).
+
+The response contract is **additive-only**: the legacy `error` prose is retained for older clients, the stable `code` discriminator is what new clients should key on, and `retry_after` / the `Retry-After` header, `unavailable_providers` and `diagnostics` remain present where available.
+
+##### Exhaustion taxonomy (response + log)
+
+| Cause | `diagnostics` status | `unavailable_providers` | Log line |
+|-------|----------------------|-------------------------|----------|
+| Outside `available_times` window | `outside_time_window` | — (window-skipped) | `Skipping provider=<p>: outside its available_times window (UTC)` |
+| Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending` / `usage_limit_reset=` on the exhaustion line |
+| Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
+| All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
+| Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |
+
+##### Triage runbook
+
+1. **Read the `code`** in the 503 body (or the `Retry-After` header). `all_exhausted` → generic; `outside_time_window` → the schedule is the sole cause; `all_slots_exhausted` → local slot exhaustion (429).
+2. **Check `diagnostics`** for the dominant `status` values and `unavailable_providers` for cooldown/quarantine seconds. A `usage_limit_reset` entry with hours of `reset_in` is a quota block, not a schedule gap.
+3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown).
+4. **In `proxy.log`**, follow the `routing_check` / `routing_skip_local` / `compaction_bypass_eval` lines for the session; each carries the model, estimate, cached ratio and — for held requests — `chain_hold_cycle=N`.
+5. **Distinguish a hold cycle from new demand**: a line with `chain_hold_cycle>0` belongs to one held request being retried, not a new client request. `proxy-usage-analysis` should exclude those from demand counts (LP-0MUIEO6IP0030CT3).
 
 #### Chain-Hold Retry (deferred exhaustion)
 
@@ -672,7 +733,25 @@ provider. `0` retries immediately (no wait).
 - **`server.chain_hold_max_cycles`** (default `3`; `0` = infinite) — how many
 hold-retry cycles are allowed before the existing exhaustion/error response
 is returned unchanged. With the defaults, the chain runs at most 4 times
-(initial run + 3 holds) and the total wait is bounded by ~15 minutes.
+(initial run + 3 holds).
+- **`retry_after` bound** (LP-0MU56ZKQD005SX08) — the hold never waits longer
+than the exhaustion response's real `retry_after`: each hold waits at most
+`min(chain_hold_seconds, retry_after)`, and when `retry_after` exceeds the
+total budget (`chain_hold_seconds × chain_hold_max_cycles`) the terminal
+response is returned immediately with its accurate `Retry-After` instead of
+sleeping through doomed cycles. A `retry_after` of `0` retries immediately.
+- **Cycle observability** (LP-0MU5AIAAY003KVM0) — every hold cycle re-runs the
+full chain (local routing + compaction evaluation). `routing_check`,
+`routing_skip_local`, `compaction_bypass_eval` and the hold line carry
+`chain_hold_cycle=N` so repeated lines from one held request are not mistaken
+for new client demand.
+- **Local lease denial** (LP-0MU5BOMJM008F17C) — a `local_lease_active` denial
+is a capacity condition, not a provider failure: with
+`contention_queue_policy: queue` the request waits up to
+`contention_queue_max_wait_seconds` for the protected local slot before
+falling back to the remote chain (`contention_queue_dispatch ...
+reason=local_lease_active` when admitted, `contention_queue_fallback_after_queue`
+on budget expiry).
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines
@@ -839,18 +918,44 @@ localhost (127.0.0.1).
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and requests can
-  fall back to cloud tiers (current day settings; `proxy/config-fast.yaml`,
-  1-slot pool).
+  fall back to cloud tiers (`proxy/config-fast.yaml`, a 1-slot pool inherited
+  from the base).
 - **cheap** — 3-slot local pool with the same models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (`proxy/config-cheap.yaml`,
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
-  local slot pool (2 vs 3).
+  local slot pool (1 vs 3).
+
+#### Config model: base + mode overlays
+
+`proxy/config.yaml` is the **authoritative base** config. The mode profiles
+`proxy/config-fast.yaml` and `proxy/config-cheap.yaml` are **overlays**: a
+`load_config()` call with no explicit path deep-merges the mode overlay on top
+of the base. Merge semantics are a recursive dict merge — scalars, lists and
+`null` in the overlay replace the base value wholesale (lists are never merged
+element-wise).
+
+Each overlay therefore declares only the values that genuinely differ from the
+base, and deleting an overlay makes `mode_config_file()` fall back to
+`config.yaml`:
+
+- `config-fast.yaml` keeps the `models` provider lists whose `available_times`
+  differ from the base plus 5 `server` overrides — 18 raw server-level
+  differences from base (5 overridden/added + 13 inherited).
+- `config-cheap.yaml` keeps 8 `server` overrides and inherits `models`
+  entirely (its models are identical to the base) — the same 13 base keys
+  were previously omitted.
+
+Because `config.yaml` is authoritative, every base-only key (for example
+`startup_ramp`, `sibling_fallback_*`, `summarizer_*` and the `upstream_*`
+timeouts) is now inherited by fast and cheap mode instead of silently falling
+back to code defaults. This is the intended effect of making the base
+config authoritative.
 
 The active mode is persisted in `proxy/.mode` (gitignored runtime state);
 when absent the mode defaults to **fast** (current behavior). The mode
-survives restarts: `scripts/start-proxy.sh` reads the persisted mode at
-startup, selects the matching config profile, and exports
+survives restarts: `proxy/scripts/start-proxy.sh` reads the persisted mode at
+startup, selects the matching config overlay, and exports
 `LLAMA_PROXY_CONFIG` so the server and API-key resolution use the same
 profile.
 
@@ -1001,12 +1106,14 @@ before now, wrapping circularly" rule.
 
 | Variable | Description |
 |----------|-------------|
-| `LLAMA_PROXY_CONFIG` | Path to config file. When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml` (default fallback: `./config.yaml`) |
+| `LLAMA_PROXY_CONFIG` | Path to a config file. When set, the file is treated as an overlay and deep-merged onto the authoritative base `proxy/config.yaml`; if it points at `config.yaml` itself the file is loaded once (no second load). When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml`, which is merged onto `config.yaml` (default fallback: `./config.yaml`) |
 | `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
 | `LLAMA_START_SCRIPT` | Override the start script path |
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
 | `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
+| `LLAMA_PROXY_PROVIDER_STATE_FILE` | Override the provider-availability state file (default: `proxy/provider-state.json`). Used by tests; `_provider_unavailable_until` and the explicit-duration `_usage_reset_at` quarantine are persisted here (guessed quarantines are not) |
+| `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` | Cap (seconds) applied to a guessed (period-name-only) usage-limit quarantine; default 24h. Overridden by `server.usage_limit_guess_cap_seconds` |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
@@ -1014,13 +1121,14 @@ before now, wrapping circularly" rule.
 ### Slot configuration
 
 Each operating-mode profile defines its local llama-server slot count
-**once** via `session_slot_pool_size` (the pool size / `--parallel N`):
+**once** via `session_slot_pool_size` (the pool size / `--parallel N`), as
+resolved after the base + overlay merge:
 
-| Profile | Slots |
-|---------|-------|
-| `config.yaml` (default/fallback) | 1 |
-| `config-fast.yaml` | 1 |
-| `config-cheap.yaml` | 3 |
+| Profile | Slots | Notes |
+|---------|-------|-------|
+| `config.yaml` (default/fallback) | 1 | authoritative base |
+| `config-fast.yaml` | 1 | inherits the base value |
+| `config-cheap.yaml` | 3 | overlay override |
 
 There is **no time-based slot schedule** (the previous `slot_schedule`
 mechanism was removed, LP-0MTZRM5HV0007S0V): the slot count changes only
@@ -1102,6 +1210,44 @@ Both changes are tracked as follow-up work items from the analysis; see
 impact (recovery-first avoids the pre-content window; informative-error
 covers 100% of client-visible errors), and the emission-site audit
 (`proxy/docs/sse-error-emission-audit.md`).
+
+##### SSE event re-framing guarantee (LP-0MUOBUPBC002GYTL)
+
+Upstream `aiter_bytes()` reads are arbitrary — a single read can contain a
+complete event **plus the start of the next**, or end mid-event. The proxy
+previously forwarded those raw bytes and then appended synthetic/retry events,
+so a dangling partial could be concatenated with the next `data:` line. The
+client's SSE decoder merged both into one event whose payload was not valid
+JSON, surfacing as:
+
+```
+Error: Unrecognized error: Error reading response: malformed server-sent event JSON.
+```
+
+Every client-facing byte stream (the remote path in `proxy_remote.py` and the
+local path in `router.py`) is now re-framed through the shared
+`SSEEventReframer` helper in `proxy/utils.py`:
+
+- **Only complete events are forwarded.** Bytes are emitted up to a blank-line
+  boundary (`\n\n` or `\r\n\r\n`); a trailing partial event is buffered and
+  released once its boundary arrives. Complete events are still flushed as
+  soon as they are read, so streaming latency is unchanged.
+- **Partials are dropped on every stream transition.** Stall retry,
+  empty-response retry, provider re-route, watchdog/synthetic terminal and
+  error events, and a clean stop after `finish_reason` all call
+  `discard_pending()` before emitting anything new. An abandoned attempt's
+  partial can never be concatenated with the next stream's first event.
+- **Synthetic events are standalone.** Proxy-synthesised terminal/error events
+  are emitted as their own well-formed `data: <json>\n\n` events, never merged
+  with pre-existing bytes.
+- **The held partial is bounded (fail closed).** A single event larger than
+  `SSEEventReframer.DEFAULT_MAX_PENDING_BYTES` (8 MiB) raises
+  `SSEFrameOverflowError`, clearing the buffer so the stream terminates with a
+  synthetic error instead of buffering unbounded or forwarding a truncated
+  tail as if it were a new event.
+
+Well-formed upstreams are unaffected: event content, ordering, and
+`data: [DONE]` semantics are byte-identical to the upstream stream.
 
 ##### `reasoning_content` round-trip repair (LP-0MSGU3JNU0092AFQ)
 
@@ -1234,11 +1380,11 @@ proxy CPU spent on log I/O (LP-0MS9GAN2P002NR4M).
 Enable verbose chunk logging for debugging stream issues with any of:
 
 ```bash
-# start-proxy.sh flag (recommended)
-./scripts/start-proxy.sh --verbose
+# start-proxy.sh flag (recommended; run from the repository root)
+proxy/scripts/start-proxy.sh --verbose
 
 # Environment variable (works with any launcher, including direct uvicorn)
-LLAMA_PROXY_VERBOSE=1 ./scripts/start-proxy.sh
+LLAMA_PROXY_VERBOSE=1 proxy/scripts/start-proxy.sh
 
 # Config key in config.yaml
 #   logging:
@@ -1566,6 +1712,22 @@ curl -X POST http://localhost:8000/admin/reset-counts
 
 Resets in-memory request/token counters and triggers immediate persistence.
 
+#### Clear Usage-Limit Quarantine
+```bash
+# Clear every pending usage-limit quarantine
+curl -X POST http://localhost:8000/admin/clear-usage-limit
+
+# Clear one account (the key is shown in the exhaustion diagnostics)
+curl -X POST http://localhost:8000/admin/clear-usage-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"account": "OPENCODE_2_API_KEY@https://opencode.ai/zen/go"}'
+```
+
+Clears pending usage-limit quarantine entries and persists the change, so a
+recovered account is reintroduced without a proxy restart. Returns
+`{"status": "success", "cleared": [<account-keys>], "count": N}`
+(LP-0MUQTCMW2001VXH8).
+
 ## Client Disconnect Detection
 
 The proxy automatically detects when a client disconnects during a streaming response and performs cleanup to prevent resource leaks and false overload signals.
@@ -1864,11 +2026,12 @@ local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 
 local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
 ```
 
-The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK): `config-fast.yaml`,
-the default `config.yaml`, and `config-cheap.yaml` all use `38000` (cheap is
-symmetric with fast after the initial 60000 raise breached the cheap queue
-guardrails and was reverted — LP-0MSRM54YO007YG0K AC7 — then re-raised to
-38000, LP-0MSY0V4ZO002ANPL).
+The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK) and follows the
+base + overlay model: the base `config.yaml` (and therefore the fast overlay,
+which does not override it) uses `38000`; `config-cheap.yaml` overrides it to
+`42000` (LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00, after the initial 60000
+raise breached the cheap queue guardrails and was reverted —
+LP-0MSRM54YO007YG0K AC7).
 Each value stays below its mode's effective warm clamp (fast resolves to
 `min(100000, 262144//1 − 4096 = 258048) = 100000`; cheap resolves to
 `min(100000, 262144//3 − 4096 = 83285) = 83285`) so the (cold, warm] band never
@@ -2229,6 +2392,7 @@ Logs are written with time-based rotation:
 | `llama-server.log` | llama-server stdout/stderr | On each restart, last 15 kept |
 | `request_counts.json` | Persisted request counters (endpoint keys) | Updated periodically and on reset |
 | `token_counts.json` | Persisted token counters (endpoint keys + totals) | Updated periodically and on reset |
+| `provider-state.json` | Persisted provider cooldowns and usage-limit account quarantine (beside `proxy/.mode`, **not** in the log directory) | Rewritten atomically on each availability change; expired entries pruned; restored at startup |
 
 ### Proxy Log Settings
 - **Rotation**: Every 6 hours
@@ -2293,6 +2457,17 @@ Streaming reuses the existing `/logs/tail` SSE fan-out: the optional `slot` and
 `session` query params filter a single file tail server-side
 (`/logs/tail?source=llama&slot=2&session=<uuid>`), and the unfiltered
 `source=proxy|llama` behaviour is unchanged when those params are omitted.
+
+The Slots tab uses **one** SSE connection per slot —
+`/logs/tail/slot?slot=<n>&session=<uuid>` — which carries both the slot's
+`proxy.log` and `llama-server.log` lines, each message tagged with `source`.
+Two connections per slot (plus the two raw All Logs panes and the `/events`
+status stream) exhausted the browser's ~6-connections-per-origin budget, so
+most slot panes never received any log output (LP-0MUJZHTCN006IZRW). The raw
+All Logs panes now connect only while that tab is active, and the follow loop
+streams appended lines even while counts/tokens updates are delivered
+continuously (the previous fast path starved the file check during active
+generation).
 
 ## TTS (Text-to-Speech) /v1/audio/speech
 

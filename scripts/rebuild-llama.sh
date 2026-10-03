@@ -92,10 +92,15 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-# Non-dry-run checks
+# Non-dry-run checks. Only the build path needs git/cmake; --deploy-only
+# re-uses an existing artifact and never invokes either, so requiring them
+# there aborted the script with "cmake missing" on hosts/CI images without a
+# compiler (LP-0MUK0KYMV003TIWV). patchelf is needed for both paths.
 errors=()
-if ! command -v git >/dev/null 2>&1; then errors+=("git missing"); fi
-if ! command -v cmake >/dev/null 2>&1; then errors+=("cmake missing"); fi
+if [[ $DEPLOY_ONLY -eq 0 ]]; then
+  if ! command -v git >/dev/null 2>&1; then errors+=("git missing"); fi
+  if ! command -v cmake >/dev/null 2>&1; then errors+=("cmake missing"); fi
+fi
 if ! command -v patchelf >/dev/null 2>&1; then errors+=("patchelf missing (install with: sudo apt-get install -y patchelf)"); fi
 
 if [[ ${#errors[@]} -gt 0 ]]; then
