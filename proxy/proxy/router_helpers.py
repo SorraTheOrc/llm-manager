@@ -700,11 +700,11 @@ def _apply_queue_wait_to_timeout(
 def _get_lease_timeout_seconds(srv) -> float:
     """Return the configured lease timeout in seconds (default 180)."""
     try:
-        server_cfg = srv.config.get("server", {})
+        server_cfg = (srv.config or {}).get("server", {})
         return float(
             server_cfg.get("local_dispatch_lease_timeout_seconds", 60) or 60
         )
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return 60.0
 
 
